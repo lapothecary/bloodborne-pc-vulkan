@@ -93,7 +93,6 @@ jobs:
             mingw-w64-clang-x86_64-boost
             mingw-w64-clang-x86_64-robin-map
             mingw-w64-clang-x86_64-xxhash
-            mingw-w64-clang-x86_64-miniz
             mingw-w64-clang-x86_64-zydis
             mingw-w64-clang-x86_64-python
 
