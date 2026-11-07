@@ -192,7 +192,21 @@ def main() -> None:
 
     # 4. Copy & strip bb-probe.exe and bb-gpu-capabilities.exe + collect MSYS2 CLANG64 DLLs
     build_gpu = root / "build_win32_gpu"
-    clang64_bin = Path("C:/msys64/clang64/bin")
+    candidates = []
+    if os.environ.get("MSYS2_CLANG64_BIN"):
+        candidates.append(Path(os.environ["MSYS2_CLANG64_BIN"]))
+    if os.environ.get("RUNNER_TEMP"):
+        candidates.append(Path(os.environ["RUNNER_TEMP"]) / "msys64" / "clang64" / "bin")
+    candidates.extend([
+        Path("D:/a/_temp/msys64/clang64/bin"),
+        Path("C:/msys64/clang64/bin"),
+    ])
+    clang64_bin = next((c for c in candidates if c.is_dir()), Path("C:/msys64/clang64/bin"))
+    print(f"=== Using MSYS2 CLANG64 bin directory: {clang64_bin} (exists={clang64_bin.is_dir()}) ===", flush=True)
+    if not clang64_bin.is_dir():
+        emit_error(f"Could not locate MSYS2 clang64/bin directory among {[str(c) for c in candidates]}")
+        sys.exit(1)
+
     llvm_strip = clang64_bin / "llvm-strip.exe"
 
     for exe_name in ("bb-probe.exe", "bb-gpu-capabilities.exe"):
@@ -208,12 +222,11 @@ def main() -> None:
         else:
             shutil.copy2(src_exe, dst_exe)
 
-    # Map case-insensitive DLLs in C:/msys64/clang64/bin
+    # Map case-insensitive DLLs in clang64/bin
     clang_dll_map: dict[str, Path] = {}
-    if clang64_bin.is_dir():
-        for p in clang64_bin.iterdir():
-            if p.is_file() and p.suffix.lower() == ".dll":
-                clang_dll_map[p.name.lower()] = p
+    for p in clang64_bin.iterdir():
+        if p.is_file() and p.suffix.lower() == ".dll":
+            clang_dll_map[p.name.lower()] = p
 
     queue = [stage / "bin" / "bb-probe.exe", stage / "bin" / "bb-gpu-capabilities.exe"]
     seen: set[str] = {"vulkan-1.dll"}
@@ -233,6 +246,9 @@ def main() -> None:
                 queue.append(dst_dll)
 
     print(f"=== Bundled {len(copied_dlls)} MSYS2 CLANG64 runtime DLLs: {', '.join(sorted(copied_dlls))} ===", flush=True)
+    if len(copied_dlls) < 8 or not (stage / "bin" / "SDL3.dll").is_file() or not (stage / "bin" / "libc++.dll").is_file():
+        emit_error(f"Failed to bundle required MSYS2 DLLs (only {len(copied_dlls)} found in {clang64_bin})")
+        sys.exit(1)
 
     # 5. Create zip archive + sha256
     zip_path = root / "bloodborne-pc-vulkan-windows-x86_64-prebuilt.zip"

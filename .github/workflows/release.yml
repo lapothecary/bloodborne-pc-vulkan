@@ -116,30 +116,35 @@ jobs:
 
       - name: Build Windows x86_64 bb-probe.exe & bb-gpu-capabilities.exe
         run: |
+          echo "MSYS2_CLANG64_BIN=$(cygpath -w /clang64/bin)" >> "$GITHUB_ENV"
           if [ ! -f our_cpp_100000_source/build_win32/libbb_gx_engine_native.a ]; then
             python3 tools/build_gx_win32_coff.py
           fi
-          if [ ! -f build_win32_gpu/build.ninja ]; then
-            if ! cmake -S gpu -B build_win32_gpu -G Ninja \
-              -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-              -DBB_LTO=OFF -DBB_PGO=off -DBB_NET=OFF > cmake_win32.log 2>&1; then
+          if [ ! -f build_win32_gpu/bb-probe.exe ]; then
+            if [ ! -f build_win32_gpu/build.ninja ]; then
+              if ! cmake -S gpu -B build_win32_gpu -G Ninja \
+                -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+                -DBB_LTO=OFF -DBB_PGO=off -DBB_NET=OFF > cmake_win32.log 2>&1; then
+                cat cmake_win32.log
+                grep -E "CMake Error|error:|not found|Could NOT" cmake_win32.log | head -n 15 | while IFS= read -r line; do
+                  echo "::error::CMAKE: $line"
+                done
+                exit 1
+              fi
               cat cmake_win32.log
-              grep -E "CMake Error|error:|not found|Could NOT" cmake_win32.log | head -n 15 | while IFS= read -r line; do
-                echo "::error::CMAKE: $line"
+            fi
+            if ! ninja -C build_win32_gpu bb-probe > ninja_win32.log 2>&1; then
+              tail -n 120 ninja_win32.log
+              grep -E "error:|undefined symbol:|ld.lld: error:|FAILED:" ninja_win32.log | head -n 15 | while IFS= read -r line; do
+                echo "::error::NINJA: $line"
               done
               exit 1
             fi
-            cat cmake_win32.log
           fi
-          if ! ninja -C build_win32_gpu bb-probe > ninja_win32.log 2>&1; then
-            tail -n 120 ninja_win32.log
-            grep -E "error:|undefined symbol:|ld.lld: error:|FAILED:" ninja_win32.log | head -n 15 | while IFS= read -r line; do
-              echo "::error::NINJA: $line"
-            done
-            exit 1
+          if [ ! -f build_win32_gpu/bb-gpu-capabilities.exe ]; then
+            clang -std=c11 -O2 -Wall -Wextra -I/clang64/include tools/gpu_capabilities.c \
+              -L/clang64/lib -lvulkan-1 -lSDL3 -o build_win32_gpu/bb-gpu-capabilities.exe
           fi
-          clang -std=c11 -O2 -Wall -Wextra -I/clang64/include tools/gpu_capabilities.c \
-            -L/clang64/lib -lvulkan-1 -lSDL3 -o build_win32_gpu/bb-gpu-capabilities.exe
 
       - name: Build Windows WPF Launcher, Freeze Runner & Package ZIP
         shell: pwsh
