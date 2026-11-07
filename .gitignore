@@ -19,9 +19,6 @@ __pycache__/
 /our_cpp_100000_source/shaders/*/
 
 # Nested upstream third-party git clones & bundled local assets/mods
-/gpu/third_party/fsr-vulkan/
-/gpu/third_party/imgui/
-/third_party/LibAtrac9/
 /bundled/
 /mods/
 /shader_catalog/

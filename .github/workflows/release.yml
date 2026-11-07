@@ -106,27 +106,6 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Fetch third-party submodules & apply FSR-Vulkan patches
-        run: |
-          if [ ! -f gpu/third_party/fsr-vulkan/CMakeLists.txt ]; then
-            rm -rf gpu/third_party/fsr-vulkan
-            git clone https://github.com/FireBurn/FSR-Vulkan.git gpu/third_party/fsr-vulkan
-            git -C gpu/third_party/fsr-vulkan checkout c64f093404125e960813f95f1996c14780f0dd69
-            for p in gpu/patches/fsr-vulkan/*.patch; do
-              git -C gpu/third_party/fsr-vulkan apply "$PWD/$p"
-            done
-          fi
-          if [ ! -f gpu/third_party/imgui/imgui.h ]; then
-            rm -rf gpu/third_party/imgui
-            git clone https://github.com/ocornut/imgui.git gpu/third_party/imgui
-            git -C gpu/third_party/imgui checkout f1cc2ae15e53a861a874c3034aae6798fde194ab
-          fi
-          if [ ! -d third_party/LibAtrac9/C/src ]; then
-            rm -rf third_party/LibAtrac9
-            git clone https://github.com/Thealexbarney/LibAtrac9.git third_party/LibAtrac9
-            git -C third_party/LibAtrac9 checkout efca2e3af35562a09a9bb6deed90e45b4b824dc4
-          fi
-
       - name: Build Windows x86_64 bb-probe.exe & bb-gpu-capabilities.exe
         run: |
           if [ ! -f our_cpp_100000_source/build_win32/libbb_gx_engine_native.a ]; then
