@@ -2027,47 +2027,69 @@ void Install(RangeCallback on_gpu_range_allocated) {
         constexpr u64 CharaStep = 0x1c43ee0;
         constexpr std::array<u8, 6> CharaStepEntry = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57};
 
-        auto play_hook = +[](u64, const Core::GuestRegisterSnapshot* r) -> void {
-            static double carry_ms = 0.0;
-            auto* regs = const_cast<Core::GuestRegisterSnapshot*>(r);
-            float ms = 0.0f;
-            std::memcpy(&ms, regs->ymm[0].data(), sizeof(ms));
-            const double total = double(ms) + carry_ms;
-            if (!(total > 0.0) || total > 60000.0) {
-                carry_ms = 0.0;
-                return;
+        struct EngineFixHooks {
+            static void PS4_SYSV_ABI PlayHook(u64, const Core::GuestRegisterSnapshot* r) {
+                static double carry_ms = 0.0;
+                auto* regs = const_cast<Core::GuestRegisterSnapshot*>(r);
+                float ms = 0.0f;
+                std::memcpy(&ms, regs->ymm[0].data(), sizeof(ms));
+                const double total = double(ms) + carry_ms;
+                if (!(total > 0.0) || total > 60000.0) {
+                    carry_ms = 0.0;
+                    return;
+                }
+                const double whole = double(u64(total));
+                carry_ms = total - whole;
+                const float out = float(whole);
+                std::memcpy(regs->ymm[0].data(), &out, sizeof(out));
             }
-            const double whole = double(u64(total));
-            carry_ms = total - whole;
-            const float out = float(whole);
-            std::memcpy(regs->ymm[0].data(), &out, sizeof(out));
-        };
-        static auto hit_slow_redirect = +[](u64 raw_array) noexcept -> u64 {
-            const auto* array = reinterpret_cast<const u8*>(raw_array);
-            std::int32_t size = 0;
-            if (array) {
-                std::memcpy(&size, array + 0x28, sizeof(size));
-            }
-            struct alignas(16) HitScratchSlot {
-                alignas(16) std::array<u8, 96> hit{};
-                u8 head[0x20]{};
-                void* data = nullptr;
+
+            static u64 PS4_SYSV_ABI HitSlowRedirect(u64 raw_array) noexcept {
+                const auto* array = reinterpret_cast<const u8*>(raw_array);
                 std::int32_t size = 0;
-                std::int32_t capacity = 1;
-            };
-            thread_local std::unique_ptr<HitScratchSlot> tls_slot;
-            if (!tls_slot) {
-                tls_slot = std::make_unique<HitScratchSlot>();
+                if (array) {
+                    std::memcpy(&size, array + 0x28, sizeof(size));
+                }
+                struct alignas(16) HitScratchSlot {
+                    alignas(16) std::array<u8, 96> hit{};
+                    u8 head[0x20]{};
+                    void* data = nullptr;
+                    std::int32_t size = 0;
+                    std::int32_t capacity = 1;
+                };
+                thread_local std::unique_ptr<HitScratchSlot> tls_slot;
+                if (!tls_slot) {
+                    tls_slot = std::make_unique<HitScratchSlot>();
+                }
+                tls_slot->data = tls_slot->hit.data();
+                tls_slot->size = 0;
+                tls_slot->capacity = 1;
+                static std::atomic<u64> hits_dropped{0};
+                if (hits_dropped.fetch_add(1, std::memory_order_relaxed) == 0) {
+                    std::printf("Engine fixes: a hit collector reached %d hits: further hits dropped\n",
+                                int(size));
+                }
+                return reinterpret_cast<u64>(&tls_slot->head[0]);
             }
-            tls_slot->data = tls_slot->hit.data();
-            tls_slot->size = 0;
-            tls_slot->capacity = 1;
-            static std::atomic<u64> hits_dropped{0};
-            if (hits_dropped.fetch_add(1, std::memory_order_relaxed) == 0) {
-                std::printf("Engine fixes: a hit collector reached %d hits: further hits dropped\n",
-                            int(size));
+
+            static void PS4_SYSV_ABI CharaHook(u64, const Core::GuestRegisterSnapshot*) {
+                constexpr u64 GameDataMan = 0x553b130;
+                u64 manager = 0, player = 0, id = 0;
+                std::memcpy(&manager, reinterpret_cast<const void*>(ImageBase + GameDataMan), sizeof(manager));
+                if (manager < 0x100000000ull) return;
+                std::memcpy(&player, reinterpret_cast<const void*>(manager + 0x8), sizeof(player));
+                if (player < 0x100000000ull) return;
+                auto* field = reinterpret_cast<u8*>(player + 0x690);
+                std::memcpy(&id, field, sizeof(id));
+                if (id == 0x8000000000000000ull) {
+                    const u64 none = 0;
+                    std::memcpy(field, &none, sizeof(none));
+                    static std::atomic<u64> cleared{0};
+                    if (cleared.fetch_add(1, std::memory_order_relaxed) == 0) {
+                        std::printf("Engine fixes: an invalid character id cleared before a save\n");
+                    }
+                }
             }
-            return reinterpret_cast<u64>(&tls_slot->head[0]);
         };
         auto install_fast_hit_hook = [&]() -> bool {
             if (!stub_page) return false;
@@ -2097,7 +2119,7 @@ void Install(RangeCallback on_gpu_range_allocated) {
             e.Bytes({0x83, 0x7f, 0x28, 0x00, 0x74, 0xe6});
             // 0x2a (slow): push rsi; movabs rax, fn; call rax; mov rdi, rax; pop rsi; jmp fast_ok (19 bytes)
             e.Bytes({0x56, 0x48, 0xb8});
-            e.U64(reinterpret_cast<u64>(hit_slow_redirect));
+            e.U64(reinterpret_cast<u64>(&EngineFixHooks::HitSlowRedirect));
             e.Bytes({0xff, 0xd0, 0x48, 0x89, 0xc7, 0x5e, 0xeb, 0xd3});
             const u64 stub = PlaceStub(e);
             std::uint32_t rel = 0;
@@ -2111,32 +2133,14 @@ void Install(RangeCallback on_gpu_range_allocated) {
             WriteJumpOverTrap(address, 0xe9, rel);
             return true;
         };
-        auto chara_hook = +[](u64, const Core::GuestRegisterSnapshot*) -> void {
-            constexpr u64 GameDataMan = 0x553b130;
-            u64 manager = 0, player = 0, id = 0;
-            std::memcpy(&manager, reinterpret_cast<const void*>(ImageBase + GameDataMan), sizeof(manager));
-            if (manager < 0x100000000ull) return;
-            std::memcpy(&player, reinterpret_cast<const void*>(manager + 0x8), sizeof(player));
-            if (player < 0x100000000ull) return;
-            auto* field = reinterpret_cast<u8*>(player + 0x690);
-            std::memcpy(&id, field, sizeof(id));
-            if (id == 0x8000000000000000ull) {
-                const u64 none = 0;
-                std::memcpy(field, &none, sizeof(none));
-                static std::atomic<u64> cleared{0};
-                if (cleared.fetch_add(1, std::memory_order_relaxed) == 0) {
-                    std::printf("Engine fixes: an invalid character id cleared before a save\n");
-                }
-            }
-        };
 
         const bool play_ok = enabled("BB_FIX_PLAY_TIME") &&
             Core::InstallGuestCodeHook(reinterpret_cast<void*>(ImageBase + PlayTimeConvert),
-                                       PlayTimeConvertCode, PlayTimeConvert, play_hook);
+                                       PlayTimeConvertCode, PlayTimeConvert, &EngineFixHooks::PlayHook);
         const bool hits_ok = enabled("BB_FIX_HIT_COLLECTOR") && install_fast_hit_hook();
         const bool chara_ok = enabled("BB_FIX_CHARA_ID") &&
             Core::InstallGuestCodeHook(reinterpret_cast<void*>(ImageBase + CharaStep),
-                                       CharaStepEntry, CharaStep, chara_hook);
+                                       CharaStepEntry, CharaStep, &EngineFixHooks::CharaHook);
         if (stub_page) {
             mprotect(stub_page, StubPageSize, PROT_READ | PROT_EXEC);
         }
