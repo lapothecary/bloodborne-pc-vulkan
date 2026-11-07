@@ -16,6 +16,8 @@ public:
         float gamma = 1.0f;
         u32 hdr = 0;
         u32 srgb_input = 0;
+        /// RCAS strength (0: none) on the finished frame: sharpening without an upscaler.
+        float sharpen = 0.0f;
     };
 
     EncodePass(vk::Device device, vk::Format output_format);

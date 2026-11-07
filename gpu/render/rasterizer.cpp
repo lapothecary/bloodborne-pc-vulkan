@@ -2465,6 +2465,9 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
     const auto& cs = pipeline->GetStage(Shader::SwStage::Compute);
     // After the resource binding: its transfers (image uploads, downloads) mark themselves.
     const auto mark = [&] {
+        GpuProfiler::HudMarkPass(&scheduler, cs.pgm_hash == 0x9a9cf8a9ull
+                                                 ? BbStats::GpuCat_PostFxYebis
+                                                 : BbStats::GpuCat_ComputeCopies);
         if (auto* profiler = GpuProfiler::Get()) {
             profiler->Mark(cs.pgm_hash ^ 0xD15Aull, [&] {
                 return fmt::format("dispatch cs {:016x} ({}x{}x{} groups)", cs.pgm_hash,
@@ -2642,6 +2645,7 @@ void Rasterizer::DispatchIndirectRecord(const ComputePipeline* pipeline, VAddr a
         runtime.FlushBarriers(false);
     }
     const auto& cs_crumb = pipeline->GetStage(Shader::SwStage::Compute);
+    GpuProfiler::HudMarkPass(&scheduler, BbStats::GpuCat_ComputeCopies);
     if (auto* profiler = GpuProfiler::Get()) {
         profiler->Mark(cs_crumb.pgm_hash ^ 0xD15B0000ull, [&] {
             return fmt::format("dispatch indirect cs {:016x}", cs_crumb.pgm_hash);
@@ -2760,20 +2764,84 @@ void Rasterizer::OnSubmit() {
     runtime.TickFrame();
 }
 
+namespace {
+
+u8 ClassifyHudRenderPass(u64 vs_hash, u64 ps_hash, u32 width, u32 height, u32 num_mrts,
+                         bool has_depth, bool in_ui_phase) noexcept {
+    // 10. UI (Scaleform) & Present (final gamma/LUT1D display blit or UI phase)
+    if (in_ui_phase || vs_hash == 0x34e8a281ull || ps_hash == 0x38d65b32ull ||
+        UiComposition::MovieShader(vs_hash)) {
+        return BbStats::GpuCat_UiPresent;
+    }
+    // 9. Anti-Aliasing (in-game DLAA / FXAA / FXAA3 / FXAA3HQ passes)
+    if (ps_hash == 0xda1faca9ull || ps_hash == 0x894de4ceull || ps_hash == 0x309a6f67ull ||
+        ps_hash == 0x6c5edb96ull) {
+        return BbStats::GpuCat_AntiAliasing;
+    }
+    // 2. G-Buffer (5/6/7-MRT deferred geometry & foliage)
+    if (num_mrts >= 4) {
+        return BbStats::GpuCat_GBuffer;
+    }
+    // 5. Water / Reflections (SSR raymarching, Hi-Z depth downsample, mip blur & IBL combine)
+    if (ps_hash == 0x6c2323c2ull || ps_hash == 0x6320bb24ull || ps_hash == 0xe820ee9dull ||
+        ps_hash == 0x3fe9e964ull || ps_hash == 0x01ae5388ull) {
+        return BbStats::GpuCat_Ssr;
+    }
+    // 3. SSAO (Ambient Occlusion generation & bilateral depth-aware blur)
+    if (ps_hash == 0xcbbca5dcull || ps_hash == 0x11ffdfb5ull || ps_hash == 0x83da8467ull ||
+        ps_hash == 0xabf92450ull || ps_hash == 0xc45c51cbull) {
+        return BbStats::GpuCat_Ssao;
+    }
+    // 1. Shadow Maps (4096x4096 CSM/spot shadow atlas, depth-only passes, VSM moments/blur, CSM PCF)
+    if ((width == 4096 && height == 4096) || (num_mrts == 0 && has_depth) ||
+        vs_hash == 0x167daba6ull || ps_hash == 0x1ae03d75ull || ps_hash == 0x0f61fd27ull ||
+        ps_hash == 0xf55643deull || ps_hash == 0x006c079bull || ps_hash == 0xa0e88f56ull ||
+        ps_hash == 0x4fd8db00ull || ps_hash == 0x9837d1c8ull || ps_hash == 0x92852ef3ull ||
+        ps_hash == 0x7cde8e5full || ps_hash == 0xa2108f5eull) {
+        return BbStats::GpuCat_Shadows;
+    }
+    // 4. Deferred PBR Lighting, Light Volumes & Sky/Atmospheric Fog / Godrays
+    if (num_mrts == 2 || ps_hash == 0xd92266b9ull || ps_hash == 0xdda49e89ull ||
+        ps_hash == 0x32e47788ull || ps_hash == 0x765450dfull || ps_hash == 0xe55e45ebull ||
+        vs_hash == 0x637500e0ull || ps_hash == 0xa291c498ull) {
+        return BbStats::GpuCat_DeferredLight;
+    }
+    // 6. Forward Alpha (Hair, Blood, Cloth, Mist, Half-Res Soft Particles — 1 MRT + depth)
+    if (has_depth) {
+        return BbStats::GpuCat_ForwardAlpha;
+    }
+    // 8. Yebis 2 Post-FX (DoF, Motion Blur, Bloom Pyramid, 3D LUT, Tonemap — 1 MRT without depth)
+    return BbStats::GpuCat_PostFxYebis;
+}
+
+} // namespace
+
 void Rasterizer::MarkPass(const GraphicsPipeline* pipeline, const RenderState& state) {
+    const bool will_begin = scheduler.WillBeginRendering(state);
     auto* profiler = GpuProfiler::Get();
-    if (!profiler) {
+    if (!will_begin && !profiler) {
         return;
     }
     const auto& vs = pipeline->GetStage(Shader::SwStage::Vertex);
     const auto* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+    const u64 ps_hash = ps ? ps->pgm_hash : 0;
+    if (will_begin) {
+        const u8 cat = ClassifyHudRenderPass(
+            vs.pgm_hash, ps_hash, state.width, state.height, state.num_color_attachments,
+            state.depth_stencil_attachment.has_depth,
+            ui_pass_started || (upscaler && upscaler->InUiPhase()));
+        GpuProfiler::HudSetNextPassCat(&scheduler, cat);
+    }
+    if (!profiler) {
+        return;
+    }
     if (profiler->Records(&scheduler)) {
         const u64 idx_inst =
             u64(Regs().num_indices) * u64(std::max<u32>(1u, Regs().num_instances.NumInstances()));
-        profiler->NoteDraw(vs.pgm_hash, ps ? ps->pgm_hash : 0, state.width, state.height,
+        profiler->NoteDraw(vs.pgm_hash, ps_hash, state.width, state.height,
                            state.num_color_attachments, idx_inst);
     }
-    if (!scheduler.WillBeginRendering(state)) {
+    if (!will_begin) {
         return;
     }
     std::array<u64, Gcn::NUM_COLOR_BUFFERS + 6> parts{};

@@ -1164,7 +1164,7 @@ std::pair<const Buffer*, u64> Manager::TryResolveReadClamped(VAddr addr,
             std::memory_order_relaxed);
     };
     const auto note_miss = [addr]() noexcept {
-        if (!IsTransientCpuRingAddress(addr)) {
+        if (IsNativeOwnedAddress(addr)) {
             BbStats::native_buf_misses.store(
                 BbStats::native_buf_misses.load(std::memory_order_relaxed) + 1ULL,
                 std::memory_order_relaxed);
@@ -1572,7 +1572,7 @@ void Manager::StageNativeCpuCopyBatch(std::span<const NativeCopyRegion> regions,
         return true;
     };
 
-    constexpr u64 kMaxStageBufferBytes = 512ULL << 10;
+    constexpr u64 kMaxStageBufferBytes = 4ULL << 20;
     for (u32 idx = 0; idx < regions.size(); ++idx) {
         const auto& reg = regions[idx];
         if (reg.byte_size == 0 || reg.byte_size > kMaxStageBufferBytes || reg.dst_va >= kMaxGuestVa) {

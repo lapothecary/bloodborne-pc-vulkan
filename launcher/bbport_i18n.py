@@ -432,10 +432,13 @@ EN = {
     "FXAA — субпиксельное, TAA — нативное темпоральное, DLAA 4 / 3 — нативное DLSS в 100% разрешении (Трансформер / CNN)":
         "FXAA: subpixel AA; TAA: native temporal AA; DLAA 4 / 3: native 100% DLSS (Transformer / CNN)",
     "FXAA (Субпиксельное сглаживание)": "FXAA (Subpixel AA)",
+    "SMAA 1x (Морфологическое сглаживание)": "SMAA 1x (Morphological AA)",
+    "SMAA T2x (Морфологическое + темпоральное 2x)": "SMAA T2x (Morphological + Temporal 2x)",
     "TAA (Темпоральное сглаживание)": "TAA (Temporal AA)",
     "DLAA (Нативное DLSS 100%)": "DLAA (DLSS Native 100%)",
     "DLAA 4 (Нативное DLSS 100%)": "DLAA 4 (DLSS Native 100%)",
     "DLAA 3 (CNN Быстрый 100%)": "DLAA 3 (CNN Fast 100%)",
+    "Медленный шаг (удержание)": "Slow Walk (Hold)",
     "Выкл.": "Off",
     "Сглаживание TAA активно в разрешении вывода": "TAA anti-aliasing active at output resolution",
     "Отражения SSR (меняются в игре на лету)": "SSR reflections (switches live in-game)",

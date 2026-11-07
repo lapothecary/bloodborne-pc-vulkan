@@ -117,6 +117,10 @@
 #include "bbgpu/shaders/ps_3c2b7974_frag.h"
 #include "bbgpu/shaders/ps_474f0123_frag.h"
 #include "bbgpu/shaders/ps_483f5dc1_frag.h"
+#include "bbgpu/shaders/ps_50287a64_frag.h"
+#include "bbgpu/shaders/ps_52738b8a_frag.h"
+#include "bbgpu/shaders/ps_dbb222eb_frag.h"
+#include "bbgpu/shaders/ps_9e3394c8_frag.h"
 
 namespace Shader::Backend::SPIRV {
 
@@ -178,7 +182,7 @@ struct NativeShaderCandidate {
     const char* label;
 };
 
-constexpr std::array<NativeShaderCandidate, 107> kNativeRegistry{{
+constexpr std::array<NativeShaderCandidate, 111> kNativeRegistry{{
     {0x000000000f61fd27ull, PS_0F61FD27_VSM_BLUR_FRAG, "ps_0f61fd27_vsm_blur"},
     {0x000000001ae03d75ull, PS_1AE03D75_VSM_MOMENT_CLDIST_FRAG, "ps_1ae03d75_vsm_moment_cldist"},
     {0x000000001ae03d75ull, PS_1AE03D75_VSM_MOMENT_NOCLIP_FRAG, "ps_1ae03d75_vsm_moment_noclip"},
@@ -286,6 +290,10 @@ constexpr std::array<NativeShaderCandidate, 107> kNativeRegistry{{
     {0x000000003c2b7974ull, PS_3C2B7974_FRAG, "ps_3c2b7974_yebis_tap3"},
     {0x00000000474f0123ull, PS_474F0123_FRAG, "ps_474f0123_yebis_tap4"},
     {0x00000000483f5dc1ull, PS_483F5DC1_FRAG, "ps_483f5dc1_yebis_tap5"},
+    {0x0000000050287a64ull, PS_50287A64_FRAG, "ps_50287a64_gbuf6_foliage"},
+    {0x0000000052738b8aull, PS_52738B8A_FRAG, "ps_52738b8a_gbuf6_foliage2"},
+    {0x00000000dbb222ebull, PS_DBB222EB_FRAG, "ps_dbb222eb_gbuf6_foliage_lm"},
+    {0x000000009e3394c8ull, PS_9E3394C8_FRAG, "ps_9e3394c8_gbuf6_foliage"},
 }};
 
 struct DescSlot {
@@ -582,7 +590,7 @@ u32 NativeShadersMinIdx() noexcept {
 }
 
 u32 NativeShadersMaxIdx() noexcept {
-    static const u32 max_idx = ParseEnvU32("BB_NATIVE_SHADER_MAX", 106u);
+    static const u32 max_idx = ParseEnvU32("BB_NATIVE_SHADER_MAX", 110u);
     return max_idx;
 }
 

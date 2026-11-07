@@ -36,14 +36,14 @@ layout(set = 0, binding = 8) uniform sampler fs_samp3;
 void main() {
     uint b0 = bitfieldExtract(push_data.buf_offsets0.x, 0, 8) >> 2;
 
-    vec3 t0 = texture(sampler2D(fs_img0, fs_samp0), fs_in_attr2.xy).rgb;
-    vec4 t1 = textureLod(sampler2D(fs_img1, fs_samp1), fs_in_attr0.xy, 0.0);
-    vec3 t2 = textureLod(sampler2D(fs_img2, fs_samp2), fs_in_attr1.xy, 0.0).rgb;
-    float t3 = textureLod(sampler2D(fs_img3, fs_samp3), fs_in_attr3.xy, 0.0).r;
+    vec3 tex0 = texture(sampler2D(fs_img0, fs_samp0), fs_in_attr2.xy).rgb;
+    vec4 tex1 = textureLod(sampler2D(fs_img1, fs_samp1), fs_in_attr0.xy, 0.0);
+    vec3 tex2 = textureLod(sampler2D(fs_img2, fs_samp2), fs_in_attr1.xy, 0.0).rgb;
+    float tex3 = textureLod(sampler2D(fs_img3, fs_samp3), fs_in_attr3.xy, 0.0).r;
 
-    vec3 c0 = t0.bgr;
-    vec3 c1 = t1.bgr;
-    vec3 c2 = t2.bgr;
+    vec3 c0 = tex0.bgr;
+    vec3 c1 = tex1.bgr;
+    vec3 c2 = tex2.bgr;
 
     float c752 = uintBitsToFloat(ssbo_1.data[b0 + 752]);
     float c753 = uintBitsToFloat(ssbo_1.data[b0 + 753]);
@@ -101,13 +101,13 @@ void main() {
     float dither_scale = uintBitsToFloat(ssbo_1.data[b0 + 809]);
     float dither_bias = uintBitsToFloat(ssbo_1.data[b0 + 810]);
 
-    vec3 gamma_out = exp2(log2(graded) * inv_gamma) + (t3 * dither_scale) + dither_bias;
+    vec3 gamma_out = exp2(log2(graded) * inv_gamma) + (tex3 * dither_scale) + dither_bias;
 
     vec4 aw = vec4(uintBitsToFloat(ssbo_1.data[b0 + 620]),
                    uintBitsToFloat(ssbo_1.data[b0 + 621]),
                    uintBitsToFloat(ssbo_1.data[b0 + 622]),
                    uintBitsToFloat(ssbo_1.data[b0 + 623]));
-    float out_a = clamp(t1.r * aw.x + (t1.g * aw.y + (t1.b * aw.z + t1.a * aw.w)), 0.0, 1.0);
+    float out_a = clamp(tex1.r * aw.x + (tex1.g * aw.y + (tex1.b * aw.z + tex1.a * aw.w)), 0.0, 1.0);
 
     frag_color0 = vec4(gamma_out.zyx, out_a);
 }

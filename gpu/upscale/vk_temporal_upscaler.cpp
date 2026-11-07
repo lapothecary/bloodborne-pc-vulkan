@@ -31,6 +31,7 @@
 #include "vulkan/shader_module.h"
 #include "upscale/vk_camera_motion.h"
 #include "upscale/vk_frame_generation.h"
+#include "upscale/vk_smaa.h"
 #include "render/vk_frame_capture.h"
 #include "vulkan/instance.h"
 #include "render/runtime.h"
@@ -402,7 +403,7 @@ bool TemporalUpscaler::OnFrameStart() {
         if (settings.upscaler.load() == BbSettings::UpscalerOff) {
             const int aa = settings.aa_mode.load();
             if (aa == BbSettings::AaDlaaCnn) return 6;
-            if (aa == BbSettings::AaDlaa) return (p >= 10 && p <= 13) ? p : 11;
+            if (aa == BbSettings::AaDlaa) return 11;
         }
         return p;
     }();
@@ -494,6 +495,7 @@ bool TemporalUpscaler::OnFrameStart() {
     ui_phase = false;
     ui_read_barrier = false;
     done_this_frame = false;
+    smaa_done = false;
     ldr_target = {};
     scene_color = {};
     snapshot_taken = false;
@@ -944,7 +946,7 @@ void TemporalUpscaler::RecordTaa(vk::CommandBuffer cmdbuf, vk::ImageView color,
 void TemporalUpscaler::ExtraSharpen(vk::Image target, bool ldr, u32 w, u32 h) {
     const auto& settings = BbSettings::Get();
     const float extra = std::clamp(settings.sharpness.load(), 0.0f, 2.0f) - 1.0f;
-    if (!settings.sharpen || extra <= 0.0f) {
+    if (!settings.sharpen || extra <= 0.0f || UseDlss()) {
         return;
     }
     const auto device = instance.GetDevice();
@@ -1223,6 +1225,7 @@ bool TemporalUpscaler::RecordReactive(vk::ImageView color_view) {
 }
 
 void TemporalUpscaler::Run() {
+    GpuProfiler::HudMarkPass(&scheduler, BbStats::GpuCat_AntiAliasing);
     if (auto* profiler = GpuProfiler::Get()) {
         const char* label = BbSettings::EffectiveUpscaler() == BbSettings::UpscalerTaa
             ? "upscaler Run (TAA)" : "upscaler Run (FSR)";
@@ -1555,9 +1558,102 @@ void TemporalUpscaler::OnColorTarget(VideoCore::ImageId color) {
     }
 }
 
+bool TemporalUpscaler::SmaaWanted() const {
+    const int aa = BbSettings::Get().aa_mode.load(std::memory_order_relaxed);
+    return (aa == BbSettings::AaSmaa || aa == BbSettings::AaSmaaT2x) &&
+           !Active() && camera_motion.Ready();
+}
+
+vk::Image TemporalUpscaler::RunSmaa(VideoCore::ImageId color_id, bool proxy) {
+    auto& color = texture_cache.GetImage(color_id);
+    // Gamma-space RGBA8 (luma edges want it so), sampled through its own UNORM format.
+    if (color.info.pixel_format != vk::Format::eR8G8B8A8Unorm ||
+        !(color.usage_flags & vk::ImageUsageFlagBits::eSampled)) {
+        return {};
+    }
+    if (!smaa) {
+        smaa = std::make_unique<Smaa>(instance, scheduler);
+    }
+    const bool temporal =
+        BbSettings::Get().aa_mode.load(std::memory_order_relaxed) == BbSettings::AaSmaaT2x &&
+        bool(camera_motion.Depth());
+    scheduler.EndRendering();
+    GpuProfiler::HudMarkPass(&scheduler, BbStats::GpuCat_AntiAliasing);
+    vk::ImageView view;
+    vk::ImageLayout layout = vk::ImageLayout::eGeneral;
+    u32 w = color.info.size.width, h = color.info.size.height;
+    vk::ImageView depth_view{};
+    if (proxy) {
+        VideoCore::ImageViewInfo info;
+        info.format = color.info.pixel_format;
+        const auto target = scene_targets.Read(color_id, info);
+        view = target.view;
+        layout = target.layout;
+        w = scene_targets.Size().width;
+        h = scene_targets.Size().height;
+        if (temporal) {
+            auto& depth = texture_cache.GetImage(camera_motion.Depth());
+            VideoCore::ImageViewInfo di;
+            di.format = depth.info.pixel_format;
+            depth_view = scene_targets.Read(camera_motion.Depth(), di).view;
+        }
+    } else {
+        view = CachedView(color, vk::Format::eR8G8B8A8Unorm, vk::ImageAspectFlagBits::eColor);
+        runtime.Transit(&color, vk::ImageLayout::eGeneral,
+                        vk::PipelineStageFlagBits2::eComputeShader,
+                        vk::AccessFlagBits2::eShaderRead);
+        if (temporal) {
+            auto& depth = texture_cache.GetImage(camera_motion.Depth());
+            depth_view = CachedView(depth, depth.info.pixel_format, vk::ImageAspectFlagBits::eDepth);
+            runtime.Transit(&depth, vk::ImageLayout::eGeneral,
+                            vk::PipelineStageFlagBits2::eComputeShader,
+                            vk::AccessFlagBits2::eShaderRead);
+        }
+        runtime.FlushBarriers();
+    }
+    if (temporal) {
+        if (!smaa->PrepareMotion(w, h)) {
+            return {};
+        }
+        camera_motion.RecordMotion(depth_view, smaa->MotionView(), w, h);
+    }
+    const bool frame_reset = reset;
+    if (smaa->Record(view, layout, w, h, temporal, frame_reset)) {
+        if (temporal) {
+            reset = false;
+            dispatched_last_frame = true;
+        }
+        return smaa->Output();
+    }
+    return {};
+}
+
 void TemporalUpscaler::OnDraw(u64 vs_hash, VideoCore::ImageId color,
                               VideoCore::ImageId depth, bool native_viewport) {
-    if (!Scaled() && vs_hash == ui_trigger_vs) done_this_frame = true;
+    if (!Scaled() && vs_hash == ui_trigger_vs) {
+        if (!smaa_done && ldr_target && (!color || color == ldr_target) && SmaaWanted()) {
+            if (const vk::Image smoothed = RunSmaa(ldr_target)) {
+                auto& image = texture_cache.GetImage(ldr_target);
+                runtime.Transit(&image, vk::ImageLayout::eTransferDstOptimal,
+                                vk::PipelineStageFlagBits2::eCopy,
+                                vk::AccessFlagBits2::eTransferWrite);
+                runtime.FlushBarriers();
+                const vk::ImageCopy region{
+                    .srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+                    .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+                    .extent = {image.info.size.width, image.info.size.height, 1},
+                };
+                scheduler.Record([smoothed, target = image.GetImage(),
+                                  region](vk::CommandBuffer cmd) {
+                    cmd.copyImage(smoothed, vk::ImageLayout::eGeneral, target,
+                                  vk::ImageLayout::eTransferDstOptimal, region);
+                });
+            }
+            GpuProfiler::HudMarkPass(&scheduler, BbStats::GpuCat_UiPresent);
+        }
+        smaa_done = true;
+        done_this_frame = true;
+    }
     // bbport (issue #67, patch by bmy): a UI draw without a color target (a Scaleform mask, color
     // writes off) writes the stencil the UI's next draws test, so it must go into the UI's
     // output-size depth like them. Left in the guest depth, the mask was lost when the next UI
@@ -1760,8 +1856,19 @@ void TemporalUpscaler::RunUiOnly(VideoCore::ImageId color_id, VideoCore::ImageId
     vk::Image source = color.GetImage();
     auto source_layout = vk::ImageLayout::eTransferSrcOptimal;
     u32 source_width = color.info.size.width, source_height = color.info.size.height;
-    if (camera_motion.Depth() && scene_targets.Reduced() &&
-        scene_targets.EligibleScene(color)) {
+    const bool proxy_scene = camera_motion.Depth() && scene_targets.Reduced() &&
+                             scene_targets.EligibleScene(color);
+    const vk::Image smoothed =
+        color_id == ldr_target && SmaaWanted() ? RunSmaa(color_id, proxy_scene) : vk::Image{};
+    GpuProfiler::HudMarkPass(&scheduler, BbStats::GpuCat_UiPresent);
+    if (smoothed) {
+        source = smoothed;
+        source_layout = vk::ImageLayout::eGeneral;
+        if (proxy_scene) {
+            source_width = scene_targets.Size().width;
+            source_height = scene_targets.Size().height;
+        }
+    } else if (proxy_scene) {
         VideoCore::ImageViewInfo view;
         view.format = color.info.pixel_format;
         const auto proxy = scene_targets.Read(color_id, view,
@@ -1896,6 +2003,7 @@ void TemporalUpscaler::EnsureLiveInputResources(u32 w, u32 h, vk::Format color_f
 }
 
 void TemporalUpscaler::RunScaled() {
+    GpuProfiler::HudMarkPass(&scheduler, BbStats::GpuCat_AntiAliasing);
     if (auto* profiler = GpuProfiler::Get()) {
         const char* label = BbSettings::EffectiveUpscaler() == BbSettings::UpscalerTaa
             ? "upscaler RunScaled (TAA)" : "upscaler RunScaled (FSR)";
@@ -2459,6 +2567,10 @@ bool TemporalUpscaler::RedirectDepth(VideoCore::ImageId depth, Target& target) {
     return true;
 }
 
+bool TemporalUpscaler::IsUiColorAddress(VAddr address) const {
+    return ui_color && texture_cache.GetImage(ui_color).info.guest_address == address;
+}
+
 bool TemporalUpscaler::RedirectSampled(VideoCore::ImageId image,
                                        const VideoCore::ImageViewInfo& info, vk::ImageView& view,
                                        vk::ImageLayout& layout) {
@@ -2670,7 +2782,7 @@ bool TemporalUpscaler::RecordDlss(vk::CommandBuffer cmdbuf, const Dlss::Resource
         if (s_dlss.upscaler.load() == BbSettings::UpscalerOff) {
             const int aa = s_dlss.aa_mode.load();
             if (aa == BbSettings::AaDlaaCnn) return 6;
-            if (aa == BbSettings::AaDlaa) return (p >= 10 && p <= 13) ? p : 11;
+            if (aa == BbSettings::AaDlaa) return 11;
         }
         return p;
     }();
@@ -2699,7 +2811,7 @@ bool TemporalUpscaler::RecordDlss(vk::CommandBuffer cmdbuf, const Dlss::Resource
             .jitter_y = sign * jitter[1],
             .reset = reset,
             .frame_ms = frame_ms,
-            .sharpness = settings.sharpen ? std::min(settings.sharpness.load(), 1.0f) : 0.0f,
+            .sharpness = 0.0f,
         });
     }
     if (!ok) {

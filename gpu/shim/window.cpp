@@ -72,6 +72,18 @@ extern "C" void bbgpu_add_pad_filter(BbGpuPadFilter filter) {
 }
 
 extern "C" void bbgpu_filter_pad(uint32_t* buttons, const uint8_t* sticks) {
+    // Fallback video skip if the host pad sample did not already stop an active video.
+    if (buttons && bbgpu_video_active()) {
+        static bool was_down = false;
+        const bool* k = SDL_WasInit(SDL_INIT_VIDEO) ? SDL_GetKeyboardState(nullptr) : nullptr;
+        const bool down = (k && (k[SDL_SCANCODE_RETURN] || k[SDL_SCANCODE_KP_ENTER] ||
+                                 k[SDL_SCANCODE_ESCAPE])) ||
+                          ((*buttons & 0x8u) != 0);
+        if (down && !was_down && bbgpu_video_skip()) {
+            *buttons = (*buttons & ~(0x2000u | 0x4000u)) | 0x8u;
+        }
+        was_down = down;
+    }
     for (const auto& slot : pad_filters) {
         if (const BbGpuPadFilter filter = slot.load(std::memory_order_acquire)) {
             filter(buttons, sticks);

@@ -699,6 +699,10 @@ void GXGnmCommandContext_EndQuery(void* context, void* unused, void* queryObj) {
     auto* ctxBase = static_cast<std::uint8_t*>(context);
     void* gfxCtx = ctxBase + 0x10;
     auto* queryView = static_cast<std::uint8_t*>(CGDescriptorViewGnm_Identity(queryObj));
+    if (!queryView) {
+        CGGfxContextGnm_FlushPendingStagingUploads(gfxCtx);
+        return;
+    }
 
     std::uint32_t viewCategory = *reinterpret_cast<const std::uint32_t*>(queryView + 0x00);
     std::uint32_t queryType = *reinterpret_cast<const std::uint32_t*>(queryView + 0x04);
@@ -818,6 +822,10 @@ void GXGnmCommandContext_BeginQuery(void* context, void* unused, void* queryObj)
     auto* ctxBase = static_cast<std::uint8_t*>(context);
     void* gfxCtx = ctxBase + 0x10;
     auto* queryView = static_cast<std::uint8_t*>(CGDescriptorViewGnm_Identity(queryObj));
+    if (!queryView) {
+        CGGfxContextGnm_FlushPendingStagingUploads(gfxCtx);
+        return;
+    }
 
     std::uint32_t viewCategory = *reinterpret_cast<const std::uint32_t*>(queryView + 0x00);
     std::uint32_t queryType = *reinterpret_cast<const std::uint32_t*>(queryView + 0x04);

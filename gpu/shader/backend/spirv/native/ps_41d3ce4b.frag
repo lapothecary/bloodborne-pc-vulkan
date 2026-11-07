@@ -1,13 +1,7 @@
 #version 460
 #extension GL_EXT_samplerless_texture_functions : require
-// Native 2-MRT PS 0x41d3ce4b
 
-layout(location = 0) in vec4 fs_in_attr0_p;
-layout(location = 1) in vec4 fs_in_attr1_p;
-
-layout(location = 0) out vec4 frag_color0;
-layout(location = 1) out vec4 frag_color1;
-
+// Auxiliary data block
 layout(push_constant) uniform AuxData {
     float xoffset;
     float yoffset;
@@ -24,183 +18,49 @@ layout(push_constant) uniform AuxData {
     uint scene_size;
 } push_data;
 
+// VFX / Fog Vertex-Colored 2-MRT —ps_41d3ce4b
+layout(location = 0) in vec4 fs_in_attr0_p;
+layout(location = 1) in vec4 fs_in_attr1_p;
+
+layout(location = 0) out vec4 frag_color0;
+layout(location = 1) out vec4 frag_color1;
+
 layout(set = 0, binding = 0, std430) readonly buffer ssbo_1_buf { uint data[]; } ssbo_1;
 layout(set = 0, binding = 1, std430) readonly buffer ssbo_2_buf { uint data[]; } ssbo_2;
 
-
-float safe_rsq(float x) {
-    return (x > 0.0) ? inversesqrt(max(x, 1.17549435e-38)) : 0.0;
-}
+float s1f(uint i) { return uintBitsToFloat(ssbo_1.data[i]); }
+float s2f(uint i) { return uintBitsToFloat(ssbo_2.data[i]); }
 
 void main() {
-    const uvec4 bo0 = push_data.buf_offsets0;
-    const vec4 in_attr0 = fs_in_attr0_p;
-    const vec4 in_attr1 = fs_in_attr1_p;
-    uint t70 = bo0.x;
-    uint buf0_off = bitfieldExtract(t70, int(0u), int(8u));
-    uint buf0_dword_off = buf0_off >> 2u;
-    uint buf1_off = bitfieldExtract(t70, int(8u), int(8u));
-    uint buf1_dword_off = buf1_off >> 2u;
-    uint t83 = uint(36u) + uint(buf0_dword_off);
-    uint t85 = ssbo_1.data[t83];
-    uint t87 = uint(37u) + uint(buf0_dword_off);
-    uint t89 = ssbo_1.data[t87];
-    uint t91 = uint(38u) + uint(buf0_dword_off);
-    uint t93 = ssbo_1.data[t91];
-    uint t95 = uint(39u) + uint(buf0_dword_off);
-    uint t97 = ssbo_1.data[t95];
-    uint t99 = uint(47u) + uint(buf0_dword_off);
-    uint t101 = ssbo_1.data[t99];
-    uint t103 = uint(43u) + uint(buf0_dword_off);
-    uint t105 = ssbo_1.data[t103];
-    uint t107 = uint(51u) + uint(buf0_dword_off);
-    uint t109 = ssbo_1.data[t107];
-    uint t110 = uint(8u) + uint(buf1_dword_off);
-    uint t112 = ssbo_2.data[t110];
-    uint t114 = uint(9u) + uint(buf1_dword_off);
-    uint t116 = ssbo_2.data[t114];
-    uint t118 = uint(10u) + uint(buf1_dword_off);
-    uint t120 = ssbo_2.data[t118];
-    float t139 = in_attr0.y;
-    float t145 = in_attr0.x;
-    float t152 = uintBitsToFloat(uint(t89));
-    float t153 = t152 * t139;
-    uint t161 = uint(4u) + uint(buf1_dword_off);
-    uint t163 = ssbo_2.data[t161];
-    uint t165 = uint(5u) + uint(buf1_dword_off);
-    uint t167 = ssbo_2.data[t165];
-    uint t169 = uint(6u) + uint(buf1_dword_off);
-    uint t171 = ssbo_2.data[t169];
-    uint t173 = uint(7u) + uint(buf1_dword_off);
-    uint t175 = ssbo_2.data[t173];
-    float t181 = in_attr0.z;
-    float t182 = uintBitsToFloat(uint(t85));
-    float t183 = t182 * t145;
-    float t184 = uintBitsToFloat(uint(t101));
-    float t185 = t184 * t153;
-    float t197 = in_attr1.z;
-    uint t199 = uint(12u) + uint(buf1_dword_off);
-    uint t201 = ssbo_2.data[t199];
-    uint t203 = uint(13u) + uint(buf1_dword_off);
-    uint t205 = ssbo_2.data[t203];
-    uint t207 = uint(14u) + uint(buf1_dword_off);
-    uint t209 = ssbo_2.data[t207];
-    uint t211 = uint(15u) + uint(buf1_dword_off);
-    uint t213 = ssbo_2.data[t211];
-    float t214 = uintBitsToFloat(uint(t93));
-    float t215 = t214 * t181;
-    float t216 = uintBitsToFloat(uint(t105));
-    float t217 = t216 * t183;
-    float t223 = in_attr1.x;
-    float t226 = t197 * t197;
-    float t228 = 0.586610019 * t185;
-    float t229 = uintBitsToFloat(uint(t109));
-    float t230 = t229 * t215;
-    float t233 = t223 * t223;
-    float t234 = t233 + t226;
-    float t235 = uintBitsToFloat(uint(t120));
-    float t237 = t217 * 0.298909992;
-    float t238 = t237 + t228;
-    uint t240 = uint(16u) + uint(buf1_dword_off);
-    uint t242 = ssbo_2.data[t240];
-    uint t244 = uint(17u) + uint(buf1_dword_off);
-    uint t246 = ssbo_2.data[t244];
-    uint t248 = uint(18u) + uint(buf1_dword_off);
-    uint t250 = ssbo_2.data[t248];
-    uint t252 = uint(19u) + uint(buf1_dword_off);
-    uint t254 = ssbo_2.data[t252];
-    float t255 = sqrt(t234);
-    float t256 = uintBitsToFloat(uint(t116));
-    float t259 = t230 * 0.114480004;
-    float t260 = t259 + t238;
-    float t403 = t255 - t256;
-    float t269 = t235 * t403;
-    float t271 = -1.0 + t260;
-    float t277 = in_attr1.y;
-    float t278 = -t269;
-    float t279 = exp2(t278);
-    float t280 = uintBitsToFloat(uint(t175));
-    float t281 = t280 * t271;
-    float t283 = t281 + 1.0;
-    uint t285 = uint(88u) + uint(buf0_dword_off);
-    uint t287 = ssbo_1.data[t285];
-    uint t289 = uint(89u) + uint(buf0_dword_off);
-    uint t291 = ssbo_1.data[t289];
-    uint t293 = uint(90u) + uint(buf0_dword_off);
-    uint t295 = ssbo_1.data[t293];
-    uint t297 = uint(91u) + uint(buf0_dword_off);
-    uint t299 = ssbo_1.data[t297];
-    float t300 = uintBitsToFloat(uint(t213));
-    float t301 = t300 - t277;
-    float t302 = uintBitsToFloat(uint(t209));
-    float t303 = -t279;
-    float t304 = uintBitsToFloat(uint(t112));
-    float t305 = t304 * t303;
-    float t306 = uintBitsToFloat(uint(t163));
-    float t307 = t306 * t283;
-    float t308 = uintBitsToFloat(uint(t167));
-    float t309 = t308 * t283;
-    float t310 = uintBitsToFloat(uint(t171));
-    float t311 = t310 * t283;
-    float t313 = uintBitsToFloat(uint(t205));
-    float t315 = t304 + t305;
-    float t316 = clamp(t315, 0.0, 1.0);
-    float t317 = -t183;
-    float t318 = t317 * t216;
-    float t319 = t318 + t307;
-    float t320 = -t153;
-    float t321 = t320 * t184;
-    float t322 = t321 + t309;
-    float t323 = -t215;
-    float t324 = t323 * t229;
-    float t325 = t324 + t311;
-    float t404 = t301 - t313;
-    float t333 = t302 * t404;
-    float t334 = clamp(t333, 0.0, 1.0);
-    float t335 = uintBitsToFloat(uint(t254));
-    float t336 = t335 * t271;
-    float t337 = t336 + 1.0;
-    float t338 = t316 * t319;
-    float t339 = t338 + t217;
-    float t340 = t316 * t322;
-    float t341 = t340 + t185;
-    float t342 = t316 * t325;
-    float t343 = t342 + t230;
-    float t349 = in_attr0.w;
-    float t350 = uintBitsToFloat(uint(t201));
-    float t351 = t350 * t334;
-    float t352 = clamp(t351, 0.0, 1.0);
-    float t353 = uintBitsToFloat(uint(t242));
-    float t355 = t353 * t337;
-    float t356 = t355 - t339;
-    float t357 = uintBitsToFloat(uint(t246));
-    float t359 = t357 * t337;
-    float t360 = t359 - t341;
-    float t361 = uintBitsToFloat(uint(t250));
-    float t363 = t361 * t337;
-    float t364 = t363 - t343;
-    float t365 = uintBitsToFloat(uint(t97));
-    float t366 = t365 * t349;
-    float t367 = clamp(t366, 0.0, 1.0);
-    float t368 = t352 * t356;
-    float t369 = t368 + t339;
-    float t370 = clamp(t369, 0.0, 1.0);
-    float t371 = t352 * t360;
-    float t372 = t371 + t341;
-    float t373 = clamp(t372, 0.0, 1.0);
-    float t374 = t352 * t364;
-    float t375 = t374 + t343;
-    float t376 = clamp(t375, 0.0, 1.0);
-    float t377 = uintBitsToFloat(uint(t287));
-    float t378 = t377 * t370;
-    float t379 = uintBitsToFloat(uint(t291));
-    float t380 = t379 * t373;
-    float t381 = uintBitsToFloat(uint(t295));
-    float t382 = t381 * t376;
-    float t383 = uintBitsToFloat(uint(t299));
-    float t384 = t383 * t367;
-    vec4 t401 = vec4(t378, t380, t382, t384);
-    frag_color1 = t401;
-    vec4 t402 = vec4(t370, t373, t376, t367);
-    frag_color0 = t402;
+    uint u0 = push_data.buf_offsets0.x;
+    uint d0 = bitfieldExtract(u0, 0, 8) >> 2u;
+    uint d1 = bitfieldExtract(u0, 8, 8) >> 2u;
+
+    vec3 base_rgb = vec3(
+        s1f(d0 + 36u) * fs_in_attr0_p.x,
+        s1f(d0 + 37u) * fs_in_attr0_p.y,
+        s1f(d0 + 38u) * fs_in_attr0_p.z
+    );
+    vec3 col_scale = vec3(s1f(d0 + 43u), s1f(d0 + 47u), s1f(d0 + 51u));
+    vec3 lit_rgb = col_scale * base_rgb;
+
+    float luma_bias = -1.0 + (lit_rgb.z * 0.114480004 + (lit_rgb.x * 0.298909992 + 0.586610019 * lit_rgb.y));
+    float rad_mod = s2f(d1 + 7u) * luma_bias + 1.0;
+    float hgt_mod = s2f(d1 + 19u) * luma_bias + 1.0;
+
+    float dist_xz = sqrt(fs_in_attr1_p.x * fs_in_attr1_p.x + fs_in_attr1_p.z * fs_in_attr1_p.z);
+    float fog_rad = clamp(s2f(d1 + 8u) + s2f(d1 + 8u) * (-exp2(-(s2f(d1 + 10u) * (dist_xz - s2f(d1 + 9u))))), 0.0, 1.0);
+
+    vec3 rad_col = vec3(s2f(d1 + 4u), s2f(d1 + 5u), s2f(d1 + 6u)) * rad_mod;
+    vec3 after_rad = fog_rad * (-base_rgb * col_scale + rad_col) + lit_rgb;
+
+    float fog_hgt = clamp(s2f(d1 + 12u) * clamp(s2f(d1 + 14u) * ((s2f(d1 + 15u) - fs_in_attr1_p.y) - s2f(d1 + 13u)), 0.0, 1.0), 0.0, 1.0);
+    vec3 hgt_col = vec3(s2f(d1 + 16u), s2f(d1 + 17u), s2f(d1 + 18u)) * hgt_mod;
+    vec3 final_rgb = clamp(fog_hgt * (hgt_col - after_rad) + after_rad, 0.0, 1.0);
+    float final_a = clamp(s1f(d0 + 39u) * fs_in_attr0_p.w, 0.0, 1.0);
+
+    vec4 out0 = vec4(final_rgb, final_a);
+    vec4 mrt1_scale = vec4(s1f(d0 + 88u), s1f(d0 + 89u), s1f(d0 + 90u), s1f(d0 + 91u));
+    frag_color1 = mrt1_scale * out0;
+    frag_color0 = out0;
 }

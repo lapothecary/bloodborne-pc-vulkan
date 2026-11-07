@@ -18,7 +18,9 @@
 #include "common/types.h"
 #include "bbport_frame_rate.h"
 #include "bbport_guest_code.h"
+#include "bbport_toggles.h"
 
+#include <ctime>
 #include <sys/mman.h>
 #ifdef __linux__
 #include <sys/prctl.h>
@@ -64,8 +66,10 @@ struct alignas(64) Live {
     float step_up = 0.1f;             ///< +0.1 per 30 FPS frame
     float decay08 = 0.8f;             ///< 0.8 per 30 FPS frame
     float cloth = 1.0f;               ///< cloth constraints' stiffness
+    float model_turn = 0.0f;          ///< the model preview's turn per 30 FPS frame (radians per stick unit)
 };
 Live* live = nullptr;
+float model_turn_base = 0.0f;         ///< the game's own model_turn (its constant, read at start)
 int base_rate = 0;               /// the launched mode's rate (0 = truly uncapped)
 std::atomic<int> live_limit{0};
 
@@ -83,6 +87,27 @@ void PS4_SYSV_ABI FrameStep(u64 pacer) {
     const float measured = *reinterpret_cast<const float*>(pacer + 0x264);
     const float min_dt = std::max(live->shortest, MinSimDt);
     float dt = std::clamp(std::isfinite(measured) ? measured : Frame30, min_dt, Frame30);
+    {
+        struct timespec ts_cpu{};
+        if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts_cpu) == 0) {
+            const u64 cur_cpu_ns = u64(ts_cpu.tv_sec) * 1'000'000'000ull + u64(ts_cpu.tv_nsec);
+            static thread_local u64 prev_cpu_ns = 0;
+            if (prev_cpu_ns != 0 && cur_cpu_ns > prev_cpu_ns) {
+                u64 delta_ns = cur_cpu_ns - prev_cpu_ns;
+                if (delta_ns < 500'000'000ull) {
+                    // Subtract the 200 us precision-spin margin when the frame pacer actively capped this frame.
+                    if (live->shortest > 0.0f && std::isfinite(measured) &&
+                        measured <= live->shortest * 1.05f) {
+                        const u64 spin_ns = 200'000ull;
+                        delta_ns = delta_ns > spin_ns ? (delta_ns - spin_ns) : (delta_ns / 2);
+                    }
+                    BbStats::main_cpu_busy_ns.fetch_add(delta_ns, std::memory_order_relaxed);
+                    BbStats::main_cpu_frames.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+            prev_cpu_ns = cur_cpu_ns;
+        }
+    }
     // BB_FRAME_DT_SMOOTH=a (diagnostics, 0 < a < 1): the step follows the measured frame time by
     // that fraction a frame, so frame-to-frame jitter of the measurement does not reach the
     // simulation (time stays right on average).
@@ -106,15 +131,52 @@ void PS4_SYSV_ABI FrameStep(u64 pacer) {
     live->step_down = -0.1f * frames;
     live->step_up = 0.1f * frames;
     live->decay08 = static_cast<float>(std::pow(0.8, frames_d));
-    // Cloth is stiffer the more often it is solved: the game's 1.0 at 30 FPS, 0.5 from 60 FPS up
-    // (the value the community's 60 FPS patches settled on). It is the upper bound the cloth
-    // setups clamp their Stiffness, Rigid Factor and Allowed Compression to when they load.
-    // BB_CLOTH_STIFFNESS=value (diagnostics): that bound at any frame rate.
+    live->model_turn = model_turn_base * frames;
+    // The cloth setups' range checks of Stiffness, Rigid Factor and Allowed Compression (0x80d800
+    // only warns) and a few uses of 1.0 next to them: the game's 1.0. The cloth follows the frame
+    // rate by its constraints' stiffness factor instead (ClothStiffnessFactor).
+    // BB_CLOTH_STIFFNESS=value (diagnostics): another value there.
     static const float cloth_override = [] {
         const char* env = std::getenv("BB_CLOTH_STIFFNESS");
         return env && *env ? std::strtof(env, nullptr) : -1.0f;
     }();
-    live->cloth = cloth_override > 0.0f ? cloth_override : std::clamp(frames, 0.5f, 1.0f);
+    live->cloth = cloth_override > 0.0f ? cloth_override : 1.0f;
+}
+
+// ---- Cloth: the constraints' stiffness factor per substep ----
+/// The game's exponent of Havok's stiffness adaptation (0x48d7bbc: -1.725), read at start.
+float cloth_exponent = -1.725f;
+
+/// Havok's stiffness factor of a constraint set for one substep (0x1167a80, replaced): `mode` 2
+/// adapts the constraints' stiffness to how often they are solved, (substeps x a x b)^-1.725
+/// (a, b the instance's scales at +0x1d0/+0x1d4), for a set of type 8 the iteration's share
+/// instead and for types 5 and 10 only the last substep. The substeps are per frame: at 191 FPS
+/// the cloth is solved 6.4 times as often as at 30 FPS by the same factor, and stiffer by as much
+/// (it flutters). The factor here is the game's x frames (the frame's length in 30 FPS frames):
+/// the cloth is pulled as far per second as at 30 FPS, whether or not it adapts to its own
+/// substeps. At 30 FPS it is the game's.
+float PS4_SYSV_ABI ClothStiffnessFactor(const u8* set, int mode, int iteration, int substeps, float a,
+                                        float b) {
+    const std::uint32_t type = *reinterpret_cast<const std::uint32_t*>(set + 0x18);
+    const bool adapts = mode == 2 && !(substeps == 1 && a == 1.0f && b == 1.0f);
+    if (adapts && type == 8) {
+        return float(iteration + 1) / float(substeps);
+    }
+    if (adapts && (type == 5 || type == 10)) {
+        return substeps - 1 == iteration ? 1.0f : 0.0f;
+    }
+    float game = 1.0f;
+    if (adapts) {
+        const float x = float(substeps) * a * b;
+        if (x != 1.0f && x > 0.0f) {
+            game = std::exp2f(cloth_exponent * std::log2f(x));
+        }
+    }
+    if (type == 5 || type == 8 || type == 10) {
+        return game;
+    }
+    const float frames = live->dt * 30.0f;
+    return game * frames;
 }
 
 // ---- Redirected constants: instruction (its RIP-relative operand), the constant, the value ----
@@ -179,6 +241,9 @@ constexpr Redirect Redirects[] = {
     {0x809d62, 0x47b98b8, LIVE(cloth)},
     {0x80a4c9, 0x47b98b8, LIVE(cloth)},
     {0x80a876, 0x47b98b8, LIVE(cloth)},
+    // The model preview (0x1db2780: the character creator, the stick turns the model; xmm0/xmm1 the
+    // stick): yaw and pitch += stick x the constant, per frame. 7x as fast at 200 FPS.
+    {0x1db27b0, 0x4928dfc, LIVE(model_turn)},
 };
 #undef LIVE
 
@@ -324,6 +389,18 @@ int HookRunSpeed() {
     return Detour(site, expected, 8, e) ? 1 : 0;
 }
 
+/// Havok's stiffness factor (0x1167a80: `push rbp; mov rbp, rsp; push r15`) by
+/// ClothStiffnessFactor (its arguments as they are, a tail call).
+bool HookClothStiffness() {
+    constexpr u64 site = 0x1167a80;
+    constexpr u8 code[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57};
+    std::memcpy(&cloth_exponent, reinterpret_cast<const void*>(image_base + 0x48d7bbc), sizeof(float));
+    if (!(cloth_exponent < 0.0f && cloth_exponent > -4.0f)) return false;
+    Emitter e;
+    e.JmpAbs(reinterpret_cast<u64>(&ClothStiffnessFactor));
+    return Detour(site, code, sizeof(code), e);
+}
+
 /// A mapping within +-2 GiB of the image (below it), for rel32 jumps and RIP-relative operands.
 u8* MapNear(int prot) {
     for (u64 k = 1; k <= 64; ++k) {
@@ -355,6 +432,8 @@ void PatchImage(unsigned char* image, std::uint64_t) {
         return;
     }
     live = new (data) Live{};
+    std::memcpy(&model_turn_base, image + 0x4928dfc, sizeof(model_turn_base));
+    live->model_turn = model_turn_base;
     // The mode's rate and BB_FPS_LIMIT (the launcher's frame rate limit): the game's pacer waits for
     // it itself, before the frame's simulation (lower latency than holding finished frames back at
     // the present). When uncapped (rate == 0), live->shortest is 0.0f (truly unlimited).
@@ -377,6 +456,7 @@ void PatchImage(unsigned char* image, std::uint64_t) {
     unlocked = true;
     int steps = HookFixedStep(0x17f9b71, -0x48) + HookFixedStep(0x1572a7d, -0x30);
     const int run = HookRunSpeed();
+    const bool cloth = HookClothStiffness();
     int redirected = 0;
     for (const Redirect& r : Redirects) {
         if (RedirectOperand(r)) {
@@ -399,13 +479,16 @@ void PatchImage(unsigned char* image, std::uint64_t) {
         }
     }
     mprotect(stub_page, StubPageSize, PROT_READ | PROT_EXEC);
+    std::printf("Frame rate: the model preview turns %.5f rad per stick unit per 30 FPS frame\n",
+                model_turn_base);
     std::printf("Frame rate: free (hooks, no patches): the game steps by each frame's time "
                 "(pacer=%s, sim=1/%d..1/30 s); %d fixed steps, %d of %zu per-frame values follow the frame's "
-                "time, pacer usleep spin=%d/3, the run's wall check %s\n",
+                "time, pacer usleep spin=%d/3, the run's wall check %s, the cloth's stiffness %s\n",
                 live->shortest > 0.0f ? "capped" : "truly uncapped (0.0 ms)", MaxRate,
                 steps, redirected, std::size(Redirects), spin_redirected,
                 run == 1 ? "by speed" : run == 2 ? "by speed (a Sprint Fix patch did it already)"
-                                                 : "unchanged (not found)");
+                                                 : "unchanged (not found)",
+                cloth ? "by solves per second" : "per frame (not found)");
 }
 
 bool CleanPacerEnabled() noexcept {

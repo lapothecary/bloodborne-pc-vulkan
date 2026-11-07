@@ -73,7 +73,7 @@
 #include "games/game_profile.h"
 #include "thd/thd.h"
 
-#include "bbnet/bbnet.h"
+#include "bbnet.h"
 
 namespace {
 /// The runtime's side (bbnet_init).

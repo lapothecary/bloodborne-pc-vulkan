@@ -44,6 +44,10 @@ constexpr KeyActionDef kKeyDefs[KeyActionCount] = {
      "Hold to Sprint; press Dodge while sprinting to Jump",
      "Удерживайте для бега; нажмите Уклонение на бегу для прыжка",
      "Left Shift"},
+    {"key.walk", "Slow Walk (Stealth)", "Медленный шаг (стелс)",
+     "Hold to walk slowly (40% stick) for silent stealth backstabs",
+     "Удерживайте для тихого медленного шага (40% стика) со спины",
+     "Left Alt"},
     {"key.triangle", "Heal / Blood Vial", "Лечение (Пузырёк)",
      "Use Blood Vial to restore HP (Triangle)",
      "Использовать Пузырёк крови для лечения (Треугольник)",
@@ -744,7 +748,7 @@ const char* UpscalerName(int upscaler) {
 }
 
 const char* AaModeName(int aa) {
-    static constexpr const char* names[AaCount] = {"off", "fxaa", "taa", "dlaa", "dlaa3"};
+    static constexpr const char* names[AaCount] = {"off", "fxaa", "taa", "dlaa", "dlaa3", "smaa", "smaa_t2x"};
     return names[std::clamp(aa, 0, AaCount - 1)];
 }
 

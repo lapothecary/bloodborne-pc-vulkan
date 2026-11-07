@@ -12,6 +12,7 @@
 
 #include "bbport_game_menu.h"
 #include "bbport_overlay.h"
+#include "bbport_settings.h"
 #include "bbport_timeline.h"
 #include "bbport_toggles.h"
 #include "core/emulator_settings.h"
@@ -22,6 +23,7 @@
 #include "upscale/vk_temporal_upscaler.h"
 #include "render/rasterizer.h"
 #include "render/shader_hle.h"
+#include "render/vk_gpu_profiler.h"
 #include "vulkan/platform.h"
 
 namespace Vulkan {
@@ -301,6 +303,12 @@ Frame* Presenter::PrepareFrame(const BbVideoOut::BufferAttributeGroup& attribute
         .gamma = gamma.load(std::memory_order_relaxed),
         .hdr = hdr.load(std::memory_order_relaxed),
         .srgb_input = attribute.attrib.pixel_format == BbVideoOut::PixelFormat::A2R10G10B10Srgb,
+        // Sharpening without an upscaler, or with DLSS/DLAA (NGX DLSS 2.5.1+ removed internal sharpening).
+        .sharpen = (BbSettings::EffectiveUpscaler() == BbSettings::UpscalerOff ||
+                    BbSettings::EffectiveUpscaler() == BbSettings::UpscalerDlss) &&
+                           BbSettings::Get().sharpen
+                       ? std::clamp(BbSettings::Get().sharpness.load(), 0.0f, 2.0f)
+                       : 0.0f,
     };
     // Numbered here, in command order; marked where the commands are recorded.
     const u32 stream = draw_scheduler.CrumbStream();
@@ -309,6 +317,7 @@ Frame* Presenter::PrepareFrame(const BbVideoOut::BufferAttributeGroup& attribute
                           : 0;
     // The encode pass holds no state: frames of different submissions may be recorded on two
     // threads at once.
+    GpuProfiler::HudMarkPass(&draw_scheduler, BbStats::GpuCat_UiPresent);
     draw_scheduler.Record([this, frame, source, encode, stream, crumb](vk::CommandBuffer cmdbuf) {
         if (crumb) {
             Breadcrumbs::Mark(cmdbuf, stream, crumb, false);

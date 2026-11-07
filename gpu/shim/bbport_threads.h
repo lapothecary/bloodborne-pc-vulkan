@@ -21,7 +21,7 @@
 
 namespace BbThreads {
 
-/// Hardware threads available to the process.
+/// Hardware threads the OS lets this process run on (respects taskset / containers).
 inline unsigned Available() {
 #ifdef _WIN32
     return bb_win32_available_cpus();
@@ -29,7 +29,10 @@ inline unsigned Available() {
     cpu_set_t set;
     CPU_ZERO(&set);
     if (sched_getaffinity(0, sizeof(set), &set) == 0) {
-        return std::max(1, CPU_COUNT(&set));
+        const int n = CPU_COUNT(&set);
+        if (n > 0) {
+            return static_cast<unsigned>(n);
+        }
     }
     return std::max(1u, std::thread::hardware_concurrency());
 #endif
@@ -362,7 +365,9 @@ inline const TopologyMasks& GetTopology() {
             if (domains[game_dom].phys_cores >= 6 && result.best_main_cpu >= 0) {
                 CPU_ZERO(&result.game_main);
                 CPU_SET(result.best_main_cpu, &result.game_main);
-                // Isolate MOMainThread's physical core (and its SMT sibling) from workers!
+                // Isolate MOMainThread's physical core (and its SMT sibling) from workers,
+                // while keeping all remaining physical + SMT threads in game_workers (14 threads
+                // on 8-core CCD0) so 5 Havok + 1 GXRender + 5 GXWorker (11 threads) never wait in a runqueue.
                 for (int s = 0; s < 256; ++s) {
                     if (CPU_ISSET(s, &cpus[result.best_main_cpu].siblings)) {
                         CPU_CLR(s, &result.game_workers);
@@ -529,6 +534,8 @@ inline void ApplyProcessThreadTopology() {
         return std::strncmp(s, prefix, std::strlen(prefix)) == 0;
     };
 
+    const int main_pid = int(::getpid());
+
     while (struct dirent* ent = ::readdir(dir)) {
         if (ent->d_name[0] < '0' || ent->d_name[0] > '9') {
             continue;
@@ -555,9 +562,10 @@ inline void ApplyProcessThreadTopology() {
                 break;
             }
         }
-        // Wait until guest threads set their real pthread name (not the initial process name).
-        if (comm[0] == '\0' || std::strcmp(comm, "bb-probe") == 0 ||
-            std::strcmp(comm, "probe") == 0) {
+        const bool is_main_tid = (tid == main_pid);
+        // Wait until non-main guest threads set their real pthread name (not the initial process name).
+        if (!is_main_tid && (comm[0] == '\0' || std::strcmp(comm, "bb-probe") == 0 ||
+                             std::strcmp(comm, "probe") == 0)) {
             continue;
         }
 
@@ -575,7 +583,7 @@ inline void ApplyProcessThreadTopology() {
         const cpu_set_t* target_mask = nullptr;
         bool boost_prio = false;
 
-        if (std::strcmp(comm, "MOMainThread") == 0) {
+        if (is_main_tid || std::strcmp(comm, "MOMainThread") == 0) {
             target_mask = &topo.game_main;
             boost_prio = true;
         } else if (starts_with(comm, "HavokWorker") ||
@@ -589,6 +597,9 @@ inline void ApplyProcessThreadTopology() {
                    starts_with(comm, "CS Filtering") ||
                    starts_with(comm, "MO Update")) {
             target_mask = &topo.game_workers;
+            if (starts_with(comm, "HavokWorker") || starts_with(comm, "GXRenderThread")) {
+                boost_prio = true;
+            }
         } else if (std::strcmp(comm, "bb:GpuComm") == 0 ||
                    std::strcmp(comm, "bb:DrawRec") == 0 ||
                    starts_with(comm, "bb:VkRecorder") ||

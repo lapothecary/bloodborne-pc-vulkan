@@ -1,0 +1,150 @@
+// SPDX-FileCopyrightText: Copyright 2026 bbport contributors
+// SPDX-License-Identifier: GPL-2.0-or-later
+// bbport: SMAA 1x Ultra & SMAA T2x (Jimenez et al., third_party/smaa, MIT) on the game's finished
+// LDR scene, before the UI draws over it (upscale/vk_smaa.cpp).
+// PASS 0: luma edge detection (SMAA_PRESET_ULTRA: threshold 0.05)
+// PASS 1: blending weights (SMAA_PRESET_ULTRA: 32 ortho / 16 diag steps, subsampleIndices for T2x)
+// PASS 2: neighbourhood blending
+// PASS 3: SMAA T2x motion-vector temporal resolve with 5-tap velocity dilation & 3x3 YCoCg clamping
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(push_constant) uniform Constants {
+    vec4 metrics;   // 1 / width, 1 / height, width, height
+    vec4 subsample; // PASS 1: subsampleIndices (0 for 1x; (1,1,1,0)/(2,2,2,0) for T2x); PASS 3: x = reset
+};
+
+#if PASS < 3
+#define SMAA_GLSL_4
+#define SMAA_RT_METRICS metrics
+#define SMAA_PRESET_ULTRA
+#define SMAA_AREATEX_SELECT(sample) sample.rg
+#define SMAA_SEARCHTEX_SELECT(sample) sample.r
+#include "../../third_party/smaa/SMAA.hlsl"
+#endif
+
+#if PASS == 0
+layout(binding = 0) uniform sampler2D color_tex; // gamma-space colour (UNORM view)
+layout(binding = 1, rgba8) uniform writeonly image2D edges_img;
+#elif PASS == 1
+layout(binding = 0) uniform sampler2D edges_tex;
+layout(binding = 1, rgba8) uniform writeonly image2D weights_img;
+layout(binding = 2) uniform sampler2D area_tex;
+layout(binding = 3) uniform sampler2D search_tex; // point sampling
+#elif PASS == 2
+layout(binding = 0) uniform sampler2D color_tex;
+layout(binding = 1, rgba8) uniform writeonly image2D output_img;
+layout(binding = 2) uniform sampler2D weights_tex;
+#else
+layout(binding = 0) uniform sampler2D current_tex;
+layout(binding = 1, rgba8) uniform writeonly image2D resolve_img;
+layout(binding = 2) uniform sampler2D previous_tex;
+layout(binding = 3) uniform sampler2D motion_tex; // RG16F pixels (previous - current), point sampled
+
+vec3 toYCoCg(vec3 c) {
+    return vec3(dot(c, vec3(0.25, 0.5, 0.25)),
+                dot(c, vec3(0.5, 0.0, -0.5)),
+                dot(c, vec3(-0.25, 0.5, -0.25)));
+}
+
+vec3 fromYCoCg(vec3 y) {
+    return vec3(y.x + y.y - y.z, y.x + y.z, y.x - y.y - y.z);
+}
+
+vec3 clipToBox(vec3 history, vec3 lo, vec3 hi) {
+    vec3 center = 0.5 * (lo + hi);
+    vec3 extent = max(0.5 * (hi - lo), vec3(1e-5));
+    vec3 offset = history - center;
+    vec3 units = abs(offset / extent);
+    float m = max(units.x, max(units.y, units.z));
+    return m > 1.0 ? center + offset / m : history;
+}
+#endif
+
+void main() {
+    const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    const ivec2 size = ivec2(int(metrics.z), int(metrics.w));
+    if (pixel.x >= size.x || pixel.y >= size.y) {
+        return;
+    }
+    const vec2 texcoord = (vec2(pixel) + 0.5) * metrics.xy;
+#if PASS == 0
+    vec4 offset[3];
+    SMAAEdgeDetectionVS(texcoord, offset);
+    const vec2 edges = SMAALumaEdgeDetectionPS(texcoord, offset, color_tex);
+    imageStore(edges_img, pixel, vec4(edges, 0.0, 0.0));
+#elif PASS == 1
+    vec2 pixcoord;
+    vec4 offset[3];
+    SMAABlendingWeightCalculationVS(texcoord, pixcoord, offset);
+    const vec4 weights = SMAABlendingWeightCalculationPS(texcoord, pixcoord, offset, edges_tex,
+                                                         area_tex, search_tex, subsample);
+    imageStore(weights_img, pixel, weights);
+#elif PASS == 2
+    vec4 offset;
+    SMAANeighborhoodBlendingVS(texcoord, offset);
+    imageStore(output_img, pixel, SMAANeighborhoodBlendingPS(texcoord, offset, color_tex, weights_tex));
+#else
+    const vec3 current = texelFetch(current_tex, pixel, 0).rgb;
+    if (subsample.x > 0.5) {
+        imageStore(resolve_img, pixel, vec4(current, 1.0));
+        return;
+    }
+
+    // 5-tap cross velocity dilation: picks foreground motion on thin fences/foliage and
+    // measures local velocity divergence to attenuate disocclusions (CryEngine SMAA T2x).
+    const ivec2 offsets[5] = ivec2[5](ivec2(0, 0), ivec2(-1, 0), ivec2(1, 0), ivec2(0, -1), ivec2(0, 1));
+    const vec2 center_motion = texelFetch(motion_tex, pixel, 0).rg;
+    vec2 best_motion = center_motion;
+    float best_len2 = dot(center_motion, center_motion);
+    float max_vel_diff = 0.0;
+    for (int i = 1; i < 5; ++i) {
+        const ivec2 q = clamp(pixel + offsets[i], ivec2(0), size - 1);
+        const vec2 m = texelFetch(motion_tex, q, 0).rg;
+        const float len2 = dot(m, m);
+        if (len2 > best_len2) {
+            best_len2 = len2;
+            best_motion = m;
+        }
+        max_vel_diff = max(max_vel_diff, length(m - center_motion));
+    }
+
+    const vec2 prev_uv = texcoord + best_motion * metrics.xy;
+    if (any(isnan(best_motion)) || any(isinf(best_motion)) ||
+        any(lessThan(prev_uv, vec2(0.0))) || any(greaterThan(prev_uv, vec2(1.0)))) {
+        imageStore(resolve_img, pixel, vec4(current, 1.0));
+        return;
+    }
+
+    // 3x3 YCoCg variance neighborhood around the current SMAA 1x Ultra pixel.
+    vec3 m1 = vec3(0.0);
+    vec3 m2 = vec3(0.0);
+    vec3 y_min = vec3(1e9);
+    vec3 y_max = vec3(-1e9);
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            const ivec2 q = clamp(pixel + ivec2(dx, dy), ivec2(0), size - 1);
+            const vec3 y = toYCoCg(texelFetch(current_tex, q, 0).rgb);
+            m1 += y;
+            m2 += y * y;
+            y_min = min(y_min, y);
+            y_max = max(y_max, y);
+        }
+    }
+    const vec3 mean = m1 * (1.0 / 9.0);
+    const vec3 sigma = sqrt(max(m2 * (1.0 / 9.0) - mean * mean, vec3(0.0)));
+    const vec3 box_min = max(y_min, mean - 1.0 * sigma);
+    const vec3 box_max = min(y_max, mean + 1.0 * sigma);
+
+    const vec3 prev_rgb = textureLod(previous_tex, prev_uv, 0.0).rgb;
+    const vec3 prev_clipped = clamp(fromYCoCg(clipToBox(toYCoCg(prev_rgb), box_min, box_max)), 0.0, 1.0);
+
+    // True 2x temporal resolve (50% current SMAA Ultra + 50% reprojected previous SMAA Ultra),
+    // attenuated at silhouette velocity discontinuities for zero ghosting.
+    const float weight = 0.5 * clamp(1.0 - max_vel_diff * 0.25, 0.0, 1.0);
+    const vec3 resolved = mix(current, prev_clipped, weight);
+    imageStore(resolve_img, pixel, vec4(resolved, 1.0));
+#endif
+}

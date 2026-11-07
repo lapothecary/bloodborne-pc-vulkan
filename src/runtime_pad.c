@@ -293,12 +293,12 @@ enum {
     IN_CROSS, IN_CIRCLE, IN_SQUARE, IN_TRIANGLE, IN_L1, IN_R1, IN_L2, IN_R2, IN_L3, IN_R3,
     IN_OPTIONS, IN_TOUCHPAD, IN_TOUCHPAD_RIGHT, IN_UP, IN_DOWN, IN_LEFT, IN_RIGHT,
     IN_MOVE_UP, IN_MOVE_DOWN, IN_MOVE_LEFT, IN_MOVE_RIGHT, IN_LOOK_UP, IN_LOOK_DOWN, IN_LOOK_LEFT,
-    IN_LOOK_RIGHT, IN_SPRINT, IN_DODGE, IN_COUNT
+    IN_LOOK_RIGHT, IN_SPRINT, IN_DODGE, IN_WALK, IN_COUNT
 };
 static const char *const input_names[IN_COUNT]={
     "cross","circle","square","triangle","l1","r1","l2","r2","l3","r3","options","touchpad",
     "touchpad_right","up","down","left","right","move_up","move_down","move_left","move_right",
-    "look_up","look_down","look_left","look_right","sprint","dodge",
+    "look_up","look_down","look_left","look_right","sprint","dodge","walk",
 };
 static const uint32_t input_buttons[IN_COUNT]={
     BTN_CROSS,BTN_CIRCLE,BTN_SQUARE,BTN_TRIANGLE,BTN_L1,BTN_R1,BTN_L2,BTN_R2,BTN_L3,BTN_R3,
@@ -325,7 +325,8 @@ static void bind_defaults(void) {
     /* The header comment's layout. */
     enum { NONE=-1, SHIFT=SDL_SCANCODE_LSHIFT };
     static const struct { int input; int key; int mod; } keys[]={
-        {IN_DODGE,SDL_SCANCODE_SPACE,NONE}, {IN_SPRINT,SHIFT,NONE}, {IN_CROSS,SDL_SCANCODE_F,NONE},
+        {IN_DODGE,SDL_SCANCODE_SPACE,NONE}, {IN_SPRINT,SHIFT,NONE}, {IN_WALK,SDL_SCANCODE_LALT,NONE},
+        {IN_CROSS,SDL_SCANCODE_F,NONE},
         {IN_CROSS,SDL_SCANCODE_RETURN,NONE}, {IN_TRIANGLE,SDL_SCANCODE_Q,NONE},
         {IN_L1,SDL_SCANCODE_E,NONE}, {IN_SQUARE,SDL_SCANCODE_TAB,NONE}, {IN_SQUARE,SDL_SCANCODE_R,NONE},
         {IN_R3,SDL_SCANCODE_C,NONE}, {IN_L3,SDL_SCANCODE_LCTRL,NONE},
@@ -624,6 +625,18 @@ static int keyboard_circle(const bool *k, uint64_t now, int menu) {
 }
 
 
+/* A video playing (the opening movie, the endings): Enter or Escape, or the gamepad's Options, stops
+ * it at its press, and the game gets Options (how it skips). From the SrShadowy fork. */
+static void video_skip(PadData *d, const bool *k) {
+    static int was_down;
+    const int down=(k && (k[SDL_SCANCODE_RETURN] || k[SDL_SCANCODE_KP_ENTER] || k[SDL_SCANCODE_ESCAPE])) ||
+                   (d->buttons & BTN_OPTIONS);
+    if (down && !was_down && bbgpu_video_active() && bbgpu_video_skip()) {
+        d->buttons=(d->buttons & ~(uint32_t)(BTN_CIRCLE|BTN_CROSS))|BTN_OPTIONS;
+    }
+    was_down=down;
+}
+
 static void apply_keyboard(PadData *d, const bool *k) {
     key_watch_start();
     const int menu=bbgpu_pointer_wanted()!=0;
@@ -645,8 +658,15 @@ static void apply_keyboard(PadData *d, const bool *k) {
     /* A gamepad's stick is kept while no key moves it. */
     key_stick(&move_stick,d->timestamp,key_down(k,IN_MOVE_LEFT),key_down(k,IN_MOVE_RIGHT),
               key_down(k,IN_MOVE_UP),key_down(k,IN_MOVE_DOWN),&d->left_x,&d->left_y);
+    /* Walk (default Left Alt, held): the left stick at 40%, the game's walking pace, from the move
+     * keys or a gamepad's stick (FromSoftware's PC ports bind it the same way). */
+    if (key_down(k,IN_WALK)) {
+        d->left_x=(uint8_t)(128+((int)d->left_x-128)*2/5);
+        d->left_y=(uint8_t)(128+((int)d->left_y-128)*2/5);
+    }
     key_stick(&look_stick,d->timestamp,key_down(k,IN_LOOK_LEFT),key_down(k,IN_LOOK_RIGHT),
               key_down(k,IN_LOOK_UP),key_down(k,IN_LOOK_DOWN),&d->right_x,&d->right_y);
+    video_skip(d,k);
     memset((void *)key_latch,0,sizeof(key_latch));
 }
 
@@ -672,6 +692,7 @@ static uint8_t look_axis(float value, uint8_t stick, int deadzone) {
 #define MOUSE_RAD_PER_PIXEL 0.0015f
 #include <sys/mman.h>
 static void sync_mouse_auto_rotation_hold(int hold) {
+    if (!runtime_libc_base) return;
     static int held_state = -1;
     if (hold == held_state) return;
     static const struct { uintptr_t va; uint8_t game[9]; } sites[3] = {

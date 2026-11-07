@@ -120,6 +120,7 @@ static bool MultiCopy(Rasterizer& rasterizer, const VideoCore::Buffer* src,
     const u64 table_offset = stream.Copy(regions.data(), table_size, align);
 
     scheduler.EndRendering();
+    GpuProfiler::HudMarkPass(&scheduler, BbStats::GpuCat_ComputeCopies);
     if (auto* profiler = GpuProfiler::Get()) {
         profiler->Mark(0xC0B1ull, [] { return std::string{"copy shader HLE: barrier + dispatch"}; });
     }

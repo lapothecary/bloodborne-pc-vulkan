@@ -839,7 +839,17 @@ void Rasterizer::BindDepthAttachment(RenderState& state, bool reduced, TargetRed
         attachment.image_layout = target.layout;
     }
     image.usage.depth_target = true;
-    if (upscaler->Enabled()) {
+    // A pass without a colour attachment (a Scaleform mask: colour writes off) writes the stencil
+    // the next draws into the colour target still bound test: its depth goes where theirs does,
+    // into the UI's only with the UI's colour target. Redirected under another target (the HUD's
+    // own), the masks were lost to the draws they cut out (drawn into the guest depth): the HUD's
+    // item icon strip was drawn whole, a grid of item icons over the screen.
+    const bool depth_only = std::ranges::none_of(
+        std::span{state.color_attachments}.first(state.num_color_attachments),
+        [](const auto& color) { return bool(color.image_view); });
+    const auto& cb0 = regs.color_buffers[0];
+    const bool other_target = depth_only && cb0 && !upscaler->IsUiColorAddress(cb0.Address());
+    if (upscaler->Enabled() && !other_target) {
         TemporalUpscaler::Target depth_target;
         redirect.depth = upscaler->RedirectDepth(image_id, depth_target);
         if (redirect.depth) {

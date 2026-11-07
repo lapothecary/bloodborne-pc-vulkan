@@ -148,7 +148,7 @@ void Pipeline::CreateLayouts(vk::ShaderStageFlags push_stages, const char* kind,
         if (!stage) {
             continue;
         }
-        const auto stage_bit = SwStageBits[u32(stage->sw_stage)];
+        const auto stage_bit = is_compute ? SwStageBits[u32(stage->sw_stage)] : AllGraphicsStageBits;
         const auto add = [&](vk::DescriptorType type, u32 count) {
             bindings.push_back({
                 .binding = binding,

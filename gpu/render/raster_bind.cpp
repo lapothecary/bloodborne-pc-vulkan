@@ -1118,7 +1118,11 @@ void Rasterizer::ResolveIndexBuffer(u32 index_offset) {
     }
     bool is_direct_buf = false;
     u64 idx_size = size;
-    auto [buffer, offset] = direct_buffers.TryResolveReadClamped(address, idx_size);
+    const VideoCore::Buffer* buffer = nullptr;
+    u64 offset = 0;
+    if (!VideoCore::DirectBuffers::IsTransientCpuRingAddress(address)) {
+        std::tie(buffer, offset) = direct_buffers.TryResolveReadClamped(address, idx_size);
+    }
     if (buffer && idx_size >= size) {
         is_direct_buf = true;
     } else {

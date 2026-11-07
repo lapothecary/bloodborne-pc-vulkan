@@ -21,6 +21,7 @@
 #include "bbport_button_prompts.h"
 #include "bbport_frame_rate.h"
 #include "bbport_guest_hooks.h"
+#include "bbport_menu_engine.h"
 #include "bbport_settings.h"
 #include "games/bloodborne_menu_pointer.h"
 #include <SDL3/SDL.h>
@@ -935,29 +936,23 @@ int GetItemSliderValue(int item_idx) {
 }
 
 void SetMovieClipVisible(u8* mc, int visible) {
-    const u64 vtbl = *reinterpret_cast<u64*>(mc);
-    if (!vtbl) return;
-    auto fn = *reinterpret_cast<void (PS4_SYSV_ABI**)(void*, int)>(vtbl + 0x8);
-    if (fn) fn(mc, visible);
+    BbMenuEngine::SetVisible(mc, visible != 0);
 }
 
 void DestroyMovieClip(u8* mc) {
-    *reinterpret_cast<u64*>(mc) = image_base + MovieClipBaseVtable;
-    const u32 flags = *reinterpret_cast<u32*>(mc + 0x48);
-    if (flags & 0x40) {
-        void* mgr = *reinterpret_cast<void**>(mc + 0x40);
-        const u64 val = *reinterpret_cast<u64*>(mc + 0x50);
-        if (mgr) {
-            const u64 vtbl = *reinterpret_cast<u64*>(mgr);
-            auto rel = *reinterpret_cast<void (PS4_SYSV_ABI**)(void*, void*, u64)>(vtbl + 0x18);
-            rel(mgr, mc + 0x30, val);
-        }
-        *reinterpret_cast<u64*>(mc + 0x40) = 0;
-    }
-    *reinterpret_cast<u32*>(mc + 0x48) = 0;
+    BbMenuEngine::DestroyClip(mc, image_base);
 }
 
-void SyncPageSlotSliderWidget(u8* page, u8* row, int slot, int slider_val, bool is_focused) {
+void SetMovieClipFrameLabel(u8* mc, const char* label) {
+    BbMenuEngine::GotoAndStopLabel(mc, label);
+}
+
+void SetMovieClipWideText(u8* text_mc, const char16_t* str) {
+    BbMenuEngine::SetWideText(text_mc, str);
+}
+
+void SyncPageSlotSliderWidget(u8* page, u8* row, int slot, int slider_val, bool is_focused,
+                              const char16_t* combo_text = nullptr) {
     if (!row || !page) return;
     using GetSubFn = void (PS4_SYSV_ABI*)(void*, const void*, const char*, ...);
     auto get_sub = Game<GetSubFn>(GetSubMovieClip);
@@ -995,35 +990,30 @@ void SyncPageSlotSliderWidget(u8* page, u8* row, int slot, int slider_val, bool 
 
         alignas(16) u8 bar_mc[0x60] = {};
         get_sub(bar_mc, slider_mc, "Bar");
-        void* bar_inner = *reinterpret_cast<void**>(bar_mc + 0x18);
-        if (bar_inner) {
-            alignas(16) u8 gfval[0x30] = {};
-            auto get_val = **reinterpret_cast<void (PS4_SYSV_ABI***)(void*, void*)>(bar_inner);
-            get_val(gfval, bar_inner);
-            const u32 flags = *reinterpret_cast<u32*>(gfval + 0x20);
-            if (flags & 0x8f) {
-                void* mgr = *reinterpret_cast<void**>(gfval + 0x18);
-                const u64 obj = *reinterpret_cast<u64*>(gfval + 0x28);
-                if (mgr) {
-                    const u64 vtbl = *reinterpret_cast<u64*>(mgr);
-                    auto goto_and_stop =
-                        *reinterpret_cast<void (PS4_SYSV_ABI**)(void*, u64, u64, u32)>(vtbl + 0x158);
-                    goto_and_stop(mgr, obj, u64(1 + std::clamp(slider_val, 0, 10) * 10), 1);
-                }
-            }
-            const u32 flags_after = *reinterpret_cast<u32*>(gfval + 0x20);
-            if (flags_after & 0x40) {
-                void* mgr = *reinterpret_cast<void**>(gfval + 0x18);
-                const u64 obj = *reinterpret_cast<u64*>(gfval + 0x28);
-                if (mgr) {
-                    const u64 vtbl = *reinterpret_cast<u64*>(mgr);
-                    auto rel = *reinterpret_cast<void (PS4_SYSV_ABI**)(void*, void*, u64)>(vtbl + 0x18);
-                    rel(mgr, gfval + 0x08, obj);
-                }
-                *reinterpret_cast<u64*>(gfval + 0x18) = 0;
-            }
-        }
+        BbMenuEngine::GotoAndStopFrame(bar_mc, u64(1 + std::clamp(slider_val, 0, 10) * 10));
         DestroyMovieClip(bar_mc);
+    } else if (combo_text != nullptr) {
+        SetMovieClipVisible(row + 0x10, 0);
+        SetMovieClipVisible(slider_mc, 0);
+        SetMovieClipVisible(combo_mc, 1);
+
+        alignas(16) u8 item0_mc[0x60] = {};
+        get_sub(item0_mc, combo_mc, "Item_%d_%d", 0, 0);
+        SetMovieClipVisible(item0_mc, 1);
+
+        alignas(16) u8 text_mc[0x60] = {};
+        get_sub(text_mc, item0_mc, "Text_0");
+        SetMovieClipWideText(text_mc, combo_text);
+        DestroyMovieClip(text_mc);
+        DestroyMovieClip(item0_mc);
+
+        // In `optionsetting.gfx`, `Widgets/ComboBox` (Sprite 57) has `Cursor` (Sprite 56) as a
+        // direct child of `ComboBox`, containing both the golden glow (id=49) and the `<|` / `|>`
+        // arrows (id=55 at depths 4 and 6).
+        alignas(16) u8 cursor_mc[0x60] = {};
+        get_sub(cursor_mc, combo_mc, "Cursor");
+        SetMovieClipVisible(cursor_mc, is_focused ? 1 : 0);
+        DestroyMovieClip(cursor_mc);
     } else {
         SetMovieClipVisible(slider_mc, 0);
         SetMovieClipVisible(combo_mc, 0);
@@ -1037,7 +1027,10 @@ void SyncPageSlotSliderWidget(u8* page, u8* row, int slot, int slider_val, bool 
 
 void SyncSlotSliderWidget(u8* row, int slot, bool is_focused) {
     const int item_idx = std::clamp(controls_scroll + slot, 0, TotalControlsItems - 1);
-    SyncPageSlotSliderWidget(active_controls_page, row, slot, GetItemSliderValue(item_idx), is_focused);
+    const char16_t* combo_text =
+        (item_idx >= ItemCameraX) ? TextOf(ControlsSlotVal + u32(slot)) : nullptr;
+    SyncPageSlotSliderWidget(active_controls_page, row, slot, GetItemSliderValue(item_idx), is_focused,
+                             combo_text);
 }
 
 void PopulateSelectRowChoices(u8* row, int field_idx, const std::vector<u32>& choice_ids, int selected_idx) {
@@ -1226,6 +1219,8 @@ enum NativeAaMode : int {
     AaTaa = 2,
     AaDlaa = 3,
     AaDlaaCnn = 4,
+    AaSmaa = 5,
+    AaSmaaT2x = 6,
 };
 
 enum DisplayUpscalerChoice : int {
@@ -1312,7 +1307,10 @@ int GetDisplayItemSliderValue(int item_idx) {
 
 void SyncDisplaySlotSliderWidget(u8* row, int slot, bool is_focused) {
     const int item_idx = std::clamp(display_scroll + slot, 0, TotalDisplayItems - 1);
-    SyncPageSlotSliderWidget(active_display_page, row, slot, GetDisplayItemSliderValue(item_idx), is_focused);
+    const char16_t* combo_text =
+        (item_idx == 9) ? TextOf(DisplaySlotVal + u32(slot)) : nullptr;
+    SyncPageSlotSliderWidget(active_display_page, row, slot, GetDisplayItemSliderValue(item_idx), is_focused,
+                             combo_text);
 }
 
 std::vector<int> BuildFpsValuesList(int* out_cur_idx) {
@@ -1470,14 +1468,23 @@ void BuildDisplaySlotChoices(int slot, std::vector<u32>& out_choices, int& out_s
     }
 
     if (item_idx == 3) {
+        std::vector<int> modes = {AaOff, AaFxaa, AaSmaa, AaSmaaT2x, AaTaa};
         add_choice("Off", "Выкл");
         add_choice("FXAA", "FXAA");
+        add_choice("SMAA 1x", "SMAA 1x");
+        add_choice("SMAA T2x", "SMAA T2x");
         add_choice("TAA", "TAA");
         if (s.dlss_supported.load()) {
+            modes.push_back(AaDlaa);
+            modes.push_back(AaDlaaCnn);
             add_choice("DLAA 4 (Transformer)", "DLAA 4 (Трансформер)");
             add_choice("DLAA 3 (CNN Fast)", "DLAA 3 (CNN Быстрый)");
         }
-        out_selected_idx = std::clamp(disp_aa_mode, 0, int(out_choices.size()) - 1);
+        int sel = 0;
+        for (int i = 0; i < int(modes.size()); ++i) {
+            if (modes[i] == disp_aa_mode) sel = i;
+        }
+        out_selected_idx = sel;
         return;
     }
 
@@ -1587,12 +1594,16 @@ void RefreshDisplaySlotTexts(int slot) {
     if (item_idx == 3) {
         SetDynamic(name_id, "Anti-Aliasing", "Сглаживание");
         SetDynamic(help_id,
-                   "Anti-Aliasing mode when Upscaler is Off (Off / FXAA / TAA / DLAA 4 Transformer / DLAA 3 CNN Fast)",
-                   "Режим сглаживания (Выкл / FXAA / TAA / DLAA 4 Трансформер / DLAA 3 CNN Быстрый)");
+                   "Anti-Aliasing mode when Upscaler is Off (Off / FXAA / SMAA 1x / SMAA T2x / TAA / DLAA 4 / DLAA 3)",
+                   "Режим сглаживания (Выкл / FXAA / SMAA 1x / SMAA T2x / TAA / DLAA 4 Трансформер / DLAA 3 CNN)");
         if (disp_aa_mode == AaOff) {
             SetDynamic(val_id, "Off", "Выкл");
         } else if (disp_aa_mode == AaFxaa) {
             SetDynamic(val_id, "FXAA", "FXAA");
+        } else if (disp_aa_mode == AaSmaa) {
+            SetDynamic(val_id, "SMAA 1x", "SMAA 1x");
+        } else if (disp_aa_mode == AaSmaaT2x) {
+            SetDynamic(val_id, "SMAA T2x", "SMAA T2x");
         } else if (disp_aa_mode == AaTaa) {
             SetDynamic(val_id, "TAA", "TAA");
         } else if (disp_aa_mode == AaDlaaCnn) {
@@ -1792,7 +1803,7 @@ void ApplyDisplaySlotChoiceIndex(u8* row, int slot, int choice_idx) {
     }
 
     if (item_idx == 3) {
-        std::vector<int> modes = {AaOff, AaFxaa, AaTaa};
+        std::vector<int> modes = {AaOff, AaFxaa, AaSmaa, AaSmaaT2x, AaTaa};
         if (s.dlss_supported.load()) {
             modes.push_back(AaDlaa);
             modes.push_back(AaDlaaCnn);
@@ -2012,7 +2023,8 @@ void RefreshEffectsSlotTexts(int slot) {
 }
 
 void SyncEffectsSlotSliderWidget(u8* row, int slot, bool is_focused) {
-    SyncPageSlotSliderWidget(active_effects_page, row, slot, -1, is_focused);
+    SyncPageSlotSliderWidget(active_effects_page, row, slot, -1, is_focused,
+                             TextOf(EffectsSlotVal + u32(slot)));
 }
 
 void UpdateEffectsSlotRowDisplay(u8* row, int slot) {
@@ -2308,9 +2320,7 @@ void HandleScrollablePageNavigate(u8* page, u8* input, float frame_time, int slo
     } else if (new_sel != pre_sel) {
         wrapped_from_top = false;
     }
-    if (new_sel != pre_sel || new_sel != hover_sel) {
-        sync_sliders_fn(new_sel);
-    }
+    sync_sliders_fn(new_sel);
 }
 
 void SyncAllControlsSliders(int new_sel) {
@@ -2407,11 +2417,12 @@ u64 PS4_SYSV_ABI RowInputHook(u8* row, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, d
             return 0;
         }
         const int item_idx = std::clamp(display_scroll + slot, 0, TotalDisplayItems - 1);
+        const u8 in = u8(a1);
+        const bool is_focused = (slot == GetSelectedDisplayRow());
         if (item_idx == 6) {
             // Sharpness slider row: Left/Right step the slider.
-            const u8 in = u8(a1);
-            SyncDisplaySlotSliderWidget(row, slot, in != 0);
-            if (in != 0) {
+            SyncDisplaySlotSliderWidget(row, slot, is_focused);
+            if (is_focused && in != 0) {
                 const int step = HorizontalMenuStep(in);
                 if (step != 0) {
                     StepDisplaySlotSetting(row, slot, step < 0 ? -1 : 1, false);
@@ -2419,7 +2430,20 @@ u64 PS4_SYSV_ABI RowInputHook(u8* row, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, d
             }
             return 0;
         }
-        // Multi-choice Display row: supports both native pop-up dropdown (Confirm) and quick Left/Right step.
+        if (item_idx == 9) {
+            // 2-choice toggle row (UI & Icons Upscale): uses <| Off / On |> ComboBox arrows.
+            SyncDisplaySlotSliderWidget(row, slot, is_focused);
+            if (is_focused && in != 0) {
+                const int step = HorizontalMenuStep(in);
+                const bool confirm =
+                    (step == 0) && Game<bool (PS4_SYSV_ABI*)(const u8*)>(IsConfirmPressed)(&in);
+                if (step != 0 || confirm) {
+                    StepDisplaySlotSetting(row, slot, step != 0 ? step : 1, true);
+                }
+            }
+            return 0;
+        }
+        // Multi-choice Display row (3+ options): supports both native pop-up dropdown (Confirm) and quick Left/Right step.
         if (row[0x3c0] != 0) {
             const u64 res = row_input_original(row, a1, a2, a3, a4, a5, frame_time);
             if (row[0x3c0] == 0) {
@@ -2427,8 +2451,7 @@ u64 PS4_SYSV_ABI RowInputHook(u8* row, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, d
             }
             return res;
         }
-        const u8 in = u8(a1);
-        if (in != 0) {
+        if (is_focused && in != 0) {
             const int step = HorizontalMenuStep(in);
             if (step != 0) {
                 StepDisplaySlotSetting(row, slot, step, false);
@@ -2458,6 +2481,8 @@ u64 PS4_SYSV_ABI RowInputHook(u8* row, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, d
             return 0;
         }
         const int item_idx = std::clamp(controls_scroll + slot, 0, TotalControlsItems - 1);
+        const u8 in = u8(a1);
+        const bool is_focused = (slot == GetSelectedControlsRow());
         const int k = ItemKeyAction(item_idx);
         if (k >= 0) {
             const int active_k = capturing_action.load(std::memory_order_relaxed);
@@ -2465,41 +2490,36 @@ u64 PS4_SYSV_ABI RowInputHook(u8* row, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, d
                 StepKeyCapture(row, slot, k);
                 return 0;
             }
-            if (active_k < 0 && !InCaptureCooldown()) {
-                const u8 in = u8(a1);
-                const bool is_focused = (in != 0) || (slot == GetSelectedControlsRow());
-                if (is_focused) {
-                    bool right = (in != 0) && (HorizontalMenuStep(in) > 0);
-                    if (!right && SDL_WasInit(SDL_INIT_VIDEO)) {
-                        int num_keys = 0;
-                        const bool* keys = SDL_GetKeyboardState(&num_keys);
-                        if (keys && num_keys > SDL_SCANCODE_RIGHT && keys[SDL_SCANCODE_RIGHT]) {
-                            right = true;
-                        }
+            if (active_k < 0 && !InCaptureCooldown() && is_focused) {
+                bool right = (in != 0) && (HorizontalMenuStep(in) > 0);
+                if (!right && SDL_WasInit(SDL_INIT_VIDEO)) {
+                    int num_keys = 0;
+                    const bool* keys = SDL_GetKeyboardState(&num_keys);
+                    if (keys && num_keys > SDL_SCANCODE_RIGHT && keys[SDL_SCANCODE_RIGHT]) {
+                        right = true;
                     }
-                    const bool confirm =
-                        !right && (in != 0) && Game<bool (PS4_SYSV_ABI*)(const u8*)>(IsConfirmPressed)(&in);
-                    if (right || confirm) {
-                        PlayMenuClickSound();
-                        captured_tokens.clear();
-                        captured_wheel.store(0, std::memory_order_relaxed);
-                        last_capture_preview.clear();
-                        capture_phase = CapturePhase::WaitInitialRelease;
-                        last_capture_step_ms.store(NowSteadyMs(), std::memory_order_relaxed);
-                        capturing_slot = slot;
-                        capturing_alt = right;
-                        capturing_action.store(k, std::memory_order_relaxed);
-                        ShowCapturePrompt(row, slot, k, {});
-                    }
+                }
+                const bool confirm =
+                    !right && (in != 0) && Game<bool (PS4_SYSV_ABI*)(const u8*)>(IsConfirmPressed)(&in);
+                if (right || confirm) {
+                    PlayMenuClickSound();
+                    captured_tokens.clear();
+                    captured_wheel.store(0, std::memory_order_relaxed);
+                    last_capture_preview.clear();
+                    capture_phase = CapturePhase::WaitInitialRelease;
+                    last_capture_step_ms.store(NowSteadyMs(), std::memory_order_relaxed);
+                    capturing_slot = slot;
+                    capturing_alt = right;
+                    capturing_action.store(k, std::memory_order_relaxed);
+                    ShowCapturePrompt(row, slot, k, {});
                 }
             }
             return 0;
         }
         if (item_idx >= ItemMouseSpeed && item_idx <= ItemCameraSens) {
             // Slider row (Mouse Speed, Camera Sensitivity, Controller Vibration)
-            const u8 in = u8(a1);
-            SyncSlotSliderWidget(row, slot, in != 0);
-            if (in != 0 && capturing_action.load(std::memory_order_relaxed) < 0 && !InCaptureCooldown()) {
+            SyncSlotSliderWidget(row, slot, is_focused);
+            if (is_focused && in != 0 && capturing_action.load(std::memory_order_relaxed) < 0 && !InCaptureCooldown()) {
                 const int step = HorizontalMenuStep(in);
                 if (step != 0) {
                     StepSlotSetting(row, slot, step < 0 ? -1 : 1, false);
@@ -2507,23 +2527,17 @@ u64 PS4_SYSV_ABI RowInputHook(u8* row, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, d
             }
             return 0;
         }
-        // Camera & Target multi-choice row (ItemCameraX..ItemCameraAdjust): supports both pop-up dropdown and Left/Right step.
-        if (row[0x3c0] != 0) {
-            const u64 res = row_input_original(row, a1, a2, a3, a4, a5, frame_time);
-            if (row[0x3c0] == 0) {
-                ApplyControlsSlotChoiceIndex(row, slot, values[FirstSlot + slot]);
-            }
-            return res;
-        }
-        const u8 in = u8(a1);
-        if (in != 0 && capturing_action.load(std::memory_order_relaxed) < 0 && !InCaptureCooldown()) {
+        // Camera & Target 2-choice toggle row (ItemCameraX..ItemCameraAdjust): uses <| Normal / Inverted |> ComboBox arrows.
+        SyncSlotSliderWidget(row, slot, is_focused);
+        if (is_focused && in != 0 && capturing_action.load(std::memory_order_relaxed) < 0 && !InCaptureCooldown()) {
             const int step = HorizontalMenuStep(in);
-            if (step != 0) {
-                StepSlotSetting(row, slot, step, false);
-                return 0;
+            const bool confirm =
+                (step == 0) && Game<bool (PS4_SYSV_ABI*)(const u8*)>(IsConfirmPressed)(&in);
+            if (step != 0 || confirm) {
+                StepSlotSetting(row, slot, step != 0 ? step : 1, true);
             }
         }
-        return row_input_original(row, a1, a2, a3, a4, a5, frame_time);
+        return 0;
     }
     if (val_ptr >= &values[FirstEffectsSlot] &&
         val_ptr < &values[int(FirstEffectsSlot) + EffectsSlotCount]) {
@@ -2536,22 +2550,19 @@ u64 PS4_SYSV_ABI RowInputHook(u8* row, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, d
             RefreshEffectsPage();
             return 0;
         }
-        if (row[0x3c0] != 0) {
-            const u64 res = row_input_original(row, a1, a2, a3, a4, a5, frame_time);
-            if (row[0x3c0] == 0) {
-                ApplyEffectsSlotChoiceIndex(row, slot, values[FirstEffectsSlot + slot]);
-            }
-            return res;
-        }
+        // Effects 2-choice toggle row: uses <| Off / On |> ComboBox arrows.
         const u8 in = u8(a1);
-        if (in != 0) {
+        const bool is_focused = (slot == GetSelectedEffectsRow());
+        SyncEffectsSlotSliderWidget(row, slot, is_focused);
+        if (is_focused && in != 0) {
             const int step = HorizontalMenuStep(in);
-            if (step != 0) {
-                StepEffectsSlotSetting(row, slot, step);
-                return 0;
+            const bool confirm =
+                (step == 0) && Game<bool (PS4_SYSV_ABI*)(const u8*)>(IsConfirmPressed)(&in);
+            if (step != 0 || confirm) {
+                StepEffectsSlotSetting(row, slot, step != 0 ? step : 1);
             }
         }
-        return row_input_original(row, a1, a2, a3, a4, a5, frame_time);
+        return 0;
     }
     return row_input_original(row, a1, a2, a3, a4, a5, frame_time);
 }
@@ -2844,6 +2855,11 @@ void Poll() {
 
         if (disp_upscaler_choice == DispUpOff) {
             target_upscaler = BbSettings::UpscalerOff;
+            if (disp_aa_mode == AaDlaa) {
+                target_dlss_preset = 11;
+            } else if (disp_aa_mode == AaDlaaCnn) {
+                target_dlss_preset = 6;
+            }
         } else {
             switch (disp_upscaler_choice) {
             case DispUpDlss4:

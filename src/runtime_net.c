@@ -4,7 +4,7 @@
  * versions (runtime_services.c). Trophies, voice and the store/profile dialogs always stay here. */
 #define _GNU_SOURCE
 #include "runtime.h"
-#include "gpu/bbnet/bbnet.h"
+#include "gpu/bbnet20/bbnet.h"
 #include <dlfcn.h>
 #include <limits.h>
 #include <stdio.h>

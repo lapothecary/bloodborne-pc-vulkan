@@ -2340,6 +2340,9 @@ uint32_t GXGammaRampAndFlipPresenter_SetGammaRampTable(
     if (DLThread_GetCurrentThreadId() != *reinterpret_cast<uint64_t*>(cmdCtx + 0xB718)) {
         return 5;
     }
+    if (std::memcmp(self + 0x3B8, inGammaRgbTriplets, 0x300Cu) == 0) {
+        return 0;
+    }
 
     DLScratchScope scratchScope{};
     scratchScope.vptr      = reinterpret_cast<const void*>(GX_VMA(0x52b49f0ULL));

@@ -197,6 +197,24 @@ inline std::atomic<std::uint64_t> present_wait_ns{0};
 /// V7.3: Hardware GPU execution vs inter-submission idle gap nanoseconds (zero-RenderPass-break
 /// submission-boundary Vulkan timestamp queries, collected 7 frames behind without waiting).
 inline std::atomic<std::uint64_t> hw_gpu_busy_ns{0}, hw_gpu_gap_ns{0}, hw_gpu_frames{0};
+/// Per-category hardware GPU render-pass breakdown (10 semantic pass buckets, sum == hw_gpu_busy_ns).
+enum HudGpuCat : std::uint8_t {
+    GpuCat_Shadows = 0,        // 1. Shadow Maps (CSM / Spot / VSM)
+    GpuCat_GBuffer = 1,        // 2. G-Buffer (3D Scene & Foliage)
+    GpuCat_Ssao = 2,           // 3. SSAO (Ambient Occlusion & Bilateral Blur)
+    GpuCat_DeferredLight = 3,  // 4. Deferred PBR Lighting, Light Volumes & Sky/Fog
+    GpuCat_Ssr = 4,            // 5. Water / Reflections (SSR Raymarch & Mip Chain)
+    GpuCat_ForwardAlpha = 5,   // 6. Forward Alpha (Hair, Blood, Cloth, VFX)
+    GpuCat_ComputeCopies = 6,  // 7. Compute & Copies (Particles, HLE, Transfers)
+    GpuCat_PostFxYebis = 7,    // 8. Yebis 2 Post-FX (DoF, MotionBlur, Bloom, 3D LUT)
+    GpuCat_AntiAliasing = 8,   // 9. Anti-Aliasing & Upscaler (SMAA / TAA / FSR / DLSS)
+    GpuCat_UiPresent = 9,      // 10. Scaleform UI / HUD & Present (RCAS)
+    GpuCat_Count = 10,
+    GpuCat_Gap = 0xFF
+};
+inline std::array<std::atomic<std::uint64_t>, GpuCat_Count> hw_gpu_cat_ns{};
+/// Active CPU execution nanoseconds of the game's Main thread (CLOCK_THREAD_CPUTIME_ID, excluding FPS cap sleep).
+inline std::atomic<std::uint64_t> main_cpu_busy_ns{0}, main_cpu_frames{0};
 /// Frames shown (Presenter::PrepareFrame), and bytes the background pre-upload put into the arena.
 inline std::atomic<std::uint32_t> frame_number{0};
 inline std::atomic<std::uint64_t> preupload_bytes{0};

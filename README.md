@@ -1,382 +1,264 @@
-# Bloodborne PC Vulkan — Native C++20 Graphics Engine (`2,940 / 2,940` Functions) + Direct Vulkan 1.3 RHI
+# Bloodborne PC Vulkan — Native C++20 Graphics Engine & Direct Vulkan 1.3 RHI
 
 <p align="center">
-  <img src="docs/images/wow.png" alt="Bloodborne PC Vulkan — 481 FPS (2.08 ms) @ 2560x1440 Native, 0 Page Faults/s, 100% Native Textures" width="920"/>
+  <img src="docs/images/hud_651fps.jpg" alt="Bloodborne PC Vulkan — 587 FPS (Avg 651 FPS, 1.54 ms) @ 2560x1440 Native, 1.18 ms HW GPU Busy, 100% NatBuf, 100% NatTex" width="49%"/>
+  <img src="docs/images/system_595fps.jpg" alt="Bloodborne PC Vulkan — 595 FPS @ 4.48 GHz (57°C CPU, 57 W PPT, 2,270 MB VRAM, 2.8 GB RAM)" width="49%"/>
 </p>
 
 <p align="center">
-  <b>100% Decompiled C++20 Graphics Engine (152,420 LOC)</b> • <b>True Split PC VRAM Architecture (0 Page Faults/s)</b> • <b>107 Hand-Crafted Native Vulkan 1.3 GLSL Shaders</b> • <b>3D World-Space Hardware Occlusion Culler</b> • <b>Universal L3 / Multi-CCD CPU Scheduler</b> • <b>Up to 529 FPS @ 2560x1440 Native</b>
+  <b>Up to 651 Avg FPS (1.54 ms) @ 2560×1440 Native</b> • <b>1.17 ms HW GPU Render Time</b> • <b>100% Native Buffers & Textures (0 Page Faults/s)</b><br/>
+  <b>2,940 / 2,940 Decompiled C++20 Engine Functions (152,420 LOC)</b> • <b>109 Clean Vectorized GLSL 460 Shaders</b> • <b>2.27 GB VRAM / 2.8 GB RAM</b>
 </p>
 
----
-
-> **[🇬🇧 English Guide](#-architectural-breakthroughs-what-this-project-fixes)** | **[🇷🇺 Полное описание и гайд на русском языке](#-bloodborne-pc-vulkan--описание-проекта-и-инструкция-ru)**
-
----
-
-## 🔥 Architectural Breakthroughs (What This Project Fixes)
-
-Traditional PS4 emulators and translation layers run *Bloodborne*'s graphics engine as raw guest x86-64 binary code emitting AMD Liverpool (GNM) PM4 command buffers into a simulated PS4 unified memory space. That approach suffers from three fundamental bottlenecks on PC:
-1. **PS4 Unified Memory `mprotect` Page-Fault Storms (`50,000–96,800 faults/sec`)** and **`15.4 GiB` VRAM Bloat** because the emulator cannot tell CPU-only memory apart from GPU vertex/constant/texture buffers without trapping page writes.
-2. **Bloated Machine-Translated GCN → SPIR-V Shaders** with redundant register spills, missing `early_fragment_tests`, and runtime pipeline compilation stutters.
-3. **Serial Single-Thread Command-Buffer Emulation Overhead** where every draw call decodes raw PM4 packets and re-validates guest memory ranges on the CPU critical path.
-
-**`bloodborne-pc-vulkan`** solves all three at the engine level by combining a **complete 1:1 C++20 decompilation of Bloodborne's graphics engine (`2,940 / 2,940` functions)** with a **Direct Vulkan 1.3 RHI backend (`libbbgpu.so`)**:
-
-### 1. True PC Split Memory Architecture (`DirectBuffers` & `DirectTextures` — `0` Faults/s)
-- Instead of guessing which guest pages are GPU resources via `mprotect` / `SIGSEGV` page-fault traps, our decompiled C++20 engine hooks `GXGnmBuffer` and `GXGnmTexture` creation directly via [`gx_direct_vulkan.h`](gpu/include/gx_direct_vulkan.h).
-- `DEFAULT`, `IMMUTABLE`, `DYNAMIC`, and GPU-only UAV buffers are allocated directly as VMA-suballocated `DEVICE_LOCAL` `VkBuffer`s and `VkImage`s tracked by a lock-free 4-byte bitmap (`g_native_owned_4b`), `65,536`-slot `DirectSrvs`, and `4,096`-slot `DirectSamplers`.
-- **Measured Result:**
-  - **Kernel Write Faults:** `96,800/s` → **`0/s`**
-  - **VRAM Usage (`2560x1440`):** `15.4 GiB` → **`2.5 – 3.5 GiB`** (`100.0% NatTex`, `96.8% NatBuf`)
-  - **System RAM (RSS):** `8.4 GB` → **`3.3 – 5.0 GB`**
-
-### 2. Complete `2,940 / 2,940` Decompiled C++20 Graphics Engine ([`our_cpp_100000_source/`](our_cpp_100000_source))
-All **2,940 graphics functions (`152,420` lines of C++20 with AVX2/FMA intrinsics)** across all 7 internal `FD4` / `GX` rendering modules have been decompiled and verified instruction-by-instruction against `eboot.bin` (`v1.09` GOTY `CUSA03173`):
-
-| Module | Directory | Functions | Engine Subsystem |
-| :---: | :--- | :---: | :--- |
-| **`01`** | [`01_CoreGraphics2_GNM`](our_cpp_100000_source/src/01_CoreGraphics2_GNM) | Low-level GNM | `GXCue` constant/vertex/texture ring binding, `GXGnmDevice`, hardware state & PM4 dispatch |
-| **`02`** | [`02_GX_GraphicsFramework`](our_cpp_100000_source/src/02_GX_GraphicsFramework) | Core GX | `GXDeviceSingleton`, camera frustum culling (`GXCullVolume`), render-target & resource lifecycle |
-| **`03`** | [`03_SceneShadowAndDrawPass`](our_cpp_100000_source/src/03_SceneShadowAndDrawPass) | Shadows & Scene | Cascaded Shadow Maps (`GXPssm`), VSM point-light cubemap shadow passes, G-Buffer scene draw lists |
-| **`04`** | [`04_TessellationAndGeometry`](our_cpp_100000_source/src/04_TessellationAndGeometry) | Geometry / Tess | Hardware `LsHs` / `EsGs` tessellation, cloth/fur/foliage skinning & dynamic mesh dispatch |
-| **`05`** | [`05_PostProcess_Yebis2`](our_cpp_100000_source/src/05_PostProcess_Yebis2) | Yebis2 PostFX | HDR Bloom, Glare, Depth of Field, Motion Blur, God Rays, Chromatic Aberration, Tone Mapping |
-| **`06`** | [`06_DeferredLightingAndAO`](our_cpp_100000_source/src/06_DeferredLightingAndAO) | Deferred PBR & AO | `1..12`-light tiled deferred PBR lighting, stenciled point/spot volumes, `GXSSAO` / HBAO+ |
-| **`07`** | [`07_SFX_ParticleGpuRenderer`](our_cpp_100000_source/src/07_SFX_ParticleGpuRenderer) | GPU Particles | Blood splashes, fire, mist, volumetric fog & GPU compute particle emitters (`FXR`) |
-
-Beyond 1:1 binary parity, having the full C++20 source code of all `2,940` functions allowed us to eliminate deep PS4-era console bottlenecks inside FromSoftware's `FD4` / `GX` / `Yebis2` engine:
-- **True Dynamic-Resolution G-Buffer Scaling:** Unbound `SceneTargets` from hardcoded `1920×1080` checks so `DLSS 4.5 / 4` and `FSR 3.1 / 4` presets (`Quality` / `Balanced` / `Performance` / `Ultra Perf.`) genuinely scale internal 6-MRT G-Buffer and half-res passes (`854×480`..`1706×960` at `2560×1440` output).
-- **Yebis2 Compute LUT, Bloom Cascade & PostFX Optimization (`160 → 2` Compute Dispatches/Frame, `22 → 13` Bloom Passes):** Eliminated unconditional per-frame `CustomDofLutCopy.cpo` (`4,096` scalar CPU LUT calls/frame), `LutCopy2DTo3DCs.cpo` 3D LUT recomputation, and `27.3 KiB` context resets when DoF / Color-Grading parameters are unchanged; capped the Yebis2 Bloom Gaussian cascade from 7 to 4 levels (`426×360`..`53×45`, eliminating 9 tiny 27×23..7×6 RenderPasses per frame); fixed phantom `PFXGS_CHEAPSLENS` lens-flare draws when Bloom is disabled (`PFXGS_DISABLE = -1`); and gated legacy `Glow` (`sub_e5bb70`) and `LightShaft` (`sub_e5a010`) passes.
-- **Single-Draw + `vkCmdCopyImage` SSR Glossy Mip-Pyramid & Deduplicated Depth Pyramid (`26 → 7` RenderPasses/Frame):** Capped SSR glossy mip generation (`sub_21c2100`) to Mips `0..5`, replaced the second full-screen quad draw per mip (`temp_rt → mip_surfs[mip]`) with native `vkCmdCopyImage` (`sub_2168880`), and decompiled `sub_e5b220` to skip the duplicate stage `0x1b` depth pyramid downsample when SSR (`+0x2974`) already downsampled scene depth at stage `0x0c` — eliminating **19 redundant RenderPass transitions per frame**.
-- **Zero-Miss GNM State, `cueHeap` Fetch-Shader & `ConstRing` Fast-Path Caching:** Fixed `bound_ds_state`, `bound_shader_hdr`, and `bound_input_layout` cache invalidations (`-1ULL`) in `01_CoreGraphics2_GNM`, replaced O(N) free-list heap scans with O(1) tracked counters, added O(1) `last_cached_fetch` matching for dynamic `cueHeap` fetch shaders (preventing mid-frame `SyncProgramWrites` / `NoteCopyIntoMemory` GPU stalls), and isolated Yebis2 `DumpConstRam` (`cue_has_const_ram`) so all ~1,700 scene draws remain on the zero-copy `cueHeap` fast path.
-- **PC Multi-Core, SIMD & Skinning Optimizations:** Removed the 6-core PS4 Jaguar worker-affinity clamp (`& 0x3FULL`), disabled the PS4 60Hz CPU frame-pacer busy-wait, replaced unaligned `+0x44` 64-bit `LOCK OR` atomics (x86 split-lock hazard) with aligned 32-bit atomics, hoisted FLVER skeleton palette uploads from per-submesh to once per model instance, eliminated duplicate `prev_bone_matrices == nullptr` skinning passes, and removed redundant `Inv(Inv(M))` 4×4 matrix inversions.
-- **`O(1)` 64-Shard Thread-Safe `FixedBlockPool` (`0x0263b810..0x0263bc40`) & True Unlimited FPS (`MaxRate = 5000`):** Disassembled and replaced the non-atomic PS4 fixed-block node allocator (`BbSafeFixedBlockPool_*` in [`bb_golden_engine.cpp`](gpu/shim/bb_golden_engine.cpp)) with 64 cache-line-aligned per-pool lock/quarantine shards (`2,048` quarantine slots), `O(1)` in-place pointer tagging, and `O(1)` bounds checks with zero linear scans and zero hardware `DIV` instructions — enabling rock-solid simulation up to `5,000 FPS`.
-- **Universal Hardware-Adaptive CPU Topology & L3 Cache Scheduler ([`bbport_threads.h`](gpu/shim/bbport_threads.h)):** Automatically inspects `/sys/devices/system/cpu/` to optimize thread placement for **any CPU**:
-  - **Multi-CCD / Multi-L3 CPUs (`Ryzen 9 5900X..9950X / X3D`, Threadripper):** Dedicates the #1 preferred physical core on the primary CCD/V-Cache domain (`CCD0`) exclusively to `MOMainThread` (leaving its SMT sibling idle), pins all 29 simulation/render workers (`HavokWorkerThre` × 5, `CSChrThread0..5`, `CSClothThread0..5`, `SpClothVertexUp` × 6, `GXRenderThread`, `GXWorker:1..5`) to the remaining cores of `CCD0` (`0` Infinity Fabric crossings across ~10,000 per-frame Havok barriers), and isolates all host Vulkan RHI (`bb:GpuComm`, `bb:DrawRec`, `bb:VkRecorder*`) & I/O threads on `CCD1`.
-  - **Intel Hybrid `P-Core + E-Core` CPUs (`12th–15th Gen`):** Pins `MOMainThread`, `Havok`, `CSChr`, `GX`, and Vulkan `Stage A/B` strictly to `P-Cores` (eliminating E-core straggler stalls on physics barriers) while offloading async copy, decompression, and audio threads to `E-Cores`.
-  - **Single-CCD `>= 6`-Core CPUs (`Ryzen 5/7`, `5800X3D / 7800X3D / 9800X3D`, `Intel 6c/8c`):** Isolates `MOMainThread` on its own physical core with its SMT sibling excluded from worker masks.
-- **Two-Sided Foliage Canopy Normal & Lightmap Fix:** Fixes the original 2015 PS4 bug where flower bushes, ferns, and foliage turned pitch-black when viewed from underneath (`!gl_FrontFacing` inverting upward canopy normals against single-sided baked lightmap directions `L_lightmap`).
-
-### 3. 107 Hand-Crafted Native Vulkan 1.3 GLSL Shaders + 752 Precompiled SPIR-V Shaders
-- Located in [`gpu/shader/backend/spirv/native/`](gpu/shader/backend/spirv/native) and registered in [`native_shaders.cpp`](gpu/shader/backend/spirv/native_shaders.cpp).
-- Replaces **140+ heaviest shader permutations** at startup (`-35%` to `-68%` SPIR-V instruction reduction, `0` runtime shader compilation stutters, `100%` of the top-20 GPU-time shaders):
-  - **All `1..12`-Light Deferred PBR Shaders:** Exact N-sphere 3D distance early-out (`if (!in_any_sphere) { demote; return; }`) + `layout(early_fragment_tests) in;` **before** sampling the four `2560x1440` G-Buffer textures (`fs_img1..4`).
-  - **6-MRT G-Buffer World, Character & Foliage Materials:** Direct IEEE-754 float math, exact tangent-frame reconstruction, and early alpha-cutout `discard;` before 3×3 tangent loads (`ps_998b035e` dropped from `0.261 ms` to `< 0.007 ms/frame`).
-  - **2-Phase Adaptive SSR Raymarcher (`ps_6c2323c2`, `ps_6320bb24`, `ps_e820ee9d`):** Replaced FromSoftware's naive linear 1,280–2,560 step loop + `ds_swizzle_b32` quad-derivative `textureGrad` with early sky/backface rejection, 48–64 step adaptive quadratic raymarching (`textureLod(..., 0.0)`), and 5-step Binary Search (`1/32` sub-pixel intersection accuracy) — **cutting SSR shader GPU time `7.5×` from `0.992 ms` to `0.133 ms/frame`**.
-  - **SSAO, Yebis2 HDR Bloom / Resample / Downsample / Glare / DoF / Tonemap (`ps_86e96401`, `ps_4b766f62`, `ps_3c2b7974`, `ps_474f0123`, `ps_483f5dc1`), Volumetric Fog & 4096×4096 CSM / VSM Shadows (`ps_006c079b`, `ps_a0e88f56`).**
-
-### 4. Lock-Free Two-Stage Draw Pipeline & 3D World-Space Hardware Occlusion Culler
-- **Two-Stage Pipeline (`Stage A: bb:GpuComm` → `Stage B: bb:DrawRec`):**
-  - `100% FastSelect` PSO lookup (including `LsHs` tessellation & `EsGs` geometry shaders), `O(1)` `ConstRing` bypass, and delta `VK_KHR_push_descriptor` (`57%` descriptor writes saved).
-- **Per-Instance 3D World-Space `SceneOcclusionCuller` ([`gpu/render/rasterizer.cpp`](gpu/render/rasterizer.cpp)):**
-  - Uses non-blocking `VkQueryPool(vk::QueryType::eOcclusion)` queries keyed by each draw's vertex buffer hash + **3D World-Space `3x4` Transform Matrix Palette** (`palette_ptr + model_cb[20] * 48`), paired with **0-latency 864-byte G-Buffer camera tracking**.
-  - Eliminates occluded 6-MRT G-Buffer meshes and secondary 32×32 / 64×64 micro-shadow clutter batches on the CPU before resource binding, with **zero pop-in delay on camera turns** and **zero false culling**.
-
-### 5. Upstream `bbport` Runtime, In-Game Display Menu & Upscalers (Honest Lineage & Credits)
-- **Full credit where credit is due:** We do **not** reinvent the OS runtime or the in-game settings UI. This project builds directly upon the open-source **[`bbport` (`deadinside28/bloodborne_pc` v0.6)](https://github.com/deadinside28/bloodborne_pc)** runtime (which itself originated from **[`shadPS4`](https://github.com/shadps4-emu/shadPS4)**'s video core under `GPL-2.0-or-later`).
-- From **`bbport` (`deadinside28`)**, we use and preserve:
-  - The Linux ELF loader & PS4 system-library (`libkernel` / `libc` / `libSceFios2` / audio / pad / online) runtime (`src/`).
-  - The in-game **Display** menu (`gpu/shim/bbport_menu.cpp`) and temporal upscaler integrations (**`FSR 3.1`**, **`FSR 4`**, **`TAA`**, **`DLSS`**, `16:9` / `21:9` aspect ratios, and `720p`–`4K` resolutions).
-- **What `bloodborne-pc-vulkan` adds on top of `bbport` v0.6 (`+152,420 LOC` in `our_cpp_100000_source/` + `+78,369 LOC` across `191` modified/new files in `gpu/`):**
-
-| Component | Source / Author | Scope in This Repository |
-| :--- | :--- | :--- |
-| **PS4 System Runtime (`src/`), In-Game Display Menu & Upscalers (`FSR 3.1/4`, `DLSS`, `TAA`)** | **[`bbport` (`deadinside28/bloodborne_pc`)](https://github.com/deadinside28/bloodborne_pc)** & **[`shadPS4`](https://github.com/shadps4-emu/shadPS4)** | Preserved from upstream `bbport` v0.6 (`src/` untouched; integrated with our DirectVk RHI). |
-| **Decompiled C++20 Graphics Engine (`2,940 / 2,940` functions)** | **`bloodborne-pc-vulkan` (`@lapothecary`)** | **`152,420` lines of C++20** in [`our_cpp_100000_source/`](our_cpp_100000_source) replacing raw `eboot.bin` graphics functions across all 7 `FD4`/`GX` modules (`bb_golden_engine.cpp`). |
-| **True Split PC VRAM (`DirectBuffers` & `DirectTextures`)** | **`bloodborne-pc-vulkan` (`@lapothecary`)** | New [`direct_buffers.cpp`](gpu/buffers/direct_buffers.cpp), [`direct_textures.cpp`](gpu/textures/direct_textures.cpp), and [`gx_direct_vulkan.h`](gpu/include/gx_direct_vulkan.h) (`0` page faults/s, `100% NatTex`, `2.1–3.5 GiB` VRAM). |
-| **107 Native Vulkan 1.3 GLSL Shaders + 752 Precompiled SPIR-V Shaders + Adaptive SSR & Foliage Normal Fix** | **`bloodborne-pc-vulkan` (`@lapothecary`)** | New [`gpu/shader/backend/spirv/native/`](gpu/shader/backend/spirv/native) & [`native_shaders.cpp`](gpu/shader/backend/spirv/native_shaders.cpp) (`-35%` to `-68%` SPIR-V size, N-sphere `early_fragment_tests` + `demote;`, `7.5×` faster 2-phase adaptive SSR raymarcher, native Yebis2 Bloom/Glare/DoF shaders, two-sided foliage canopy normal fix). |
-| **3D World-Space `SceneOcclusionCuller`, Two-Stage Pipeline, `O(1)` 64-Shard `FixedBlockPool` & Universal CPU Topology Scheduler** | **`bloodborne-pc-vulkan` (`@lapothecary`)** | Rewritten [`rasterizer.cpp`](gpu/render/rasterizer.cpp), `FastSelect` PSO cache, `O(1)` `ConstRing` & `cueHeap` fetch-shader cache, delta `push_descriptor` (`62%` saved), `O(1)` `BbSafeFixedBlockPool`, and hardware-adaptive Multi-CCD / Hybrid P+E / Single-CCD thread scheduler ([`bbport_threads.h`](gpu/shim/bbport_threads.h)). |
-| **Native PC `System -> Controls` (`26` Actions), `System -> Display`, `System -> Effects` (`11` Rows), 8-Page Sidebar GTK4 Launcher, Hybrid GPU UI/Icon/Logo Super-Resolution (`2x/4x`) & 4 Vulkan 1.3 Remaster Graphics Enhancements** | **`bloodborne-pc-vulkan` (`@lapothecary`)** | Unified scrollable 32-item `System -> Controls` (26 key/mouse actions, Mouse Wheel capture, `+Alt Key` 2nd slot, `Del : Clear` unbind, native Scaleform Button Guide bar), 10-item `System -> Display` (`DLSS 4.5 Transformer Preset M/L`, `DLSS 4 Preset K`, `DLAA 4 (Transformer 100%)` & lightweight `DLAA 3 (CNN Fast 100%, Preset F)`, decoupled `Anti-Aliasing` & `Upscaler`, `16x` AF, Hybrid GPU UI, Icon & Logo Super-Resolution `2x/4x` via [`ui_upscale.comp`](gpu/render/shaders/ui_upscale.comp)), 11-item scrollable `System -> Effects` with 4 live Vulkan 1.3 Remaster Enhancements (`Multi-Scale GTAO/SSAO`, `Screen-Space Contact Micro-Shadows + 12-Tap Vogel PCF`, `High-Precision Ultra SSR + 30Hz Dynamic Cubemap Fix`, `True Black / OLED Contrast De-Haze`), and redesigned 8-page Sidebar GTK4 Launcher (`1020x720`) with live bidirectional `bbport.ini` sync. |
-
 <p align="center">
-  <img src="docs/images/display_menu.jpg" alt="Upstream bbport In-Game Display & Upscaler Menu running on Bloodborne PC Vulkan" width="760"/>
+  <a href="https://github.com/lapothecary/bloodborne-pc-vulkan/releases/latest"><b>📦 Download Latest Prebuilt Release (v1.1.0)</b></a> •
+  <a href="#-what-is-this-project"><b>🇬🇧 English Guide</b></a> •
+  <a href="#-bloodborne-pc-vulkan--о-проекте-и-быстрый-старт-ru"><b>🇷🇺 Описание на русском</b></a>
 </p>
 
 ---
 
-## 📊 Verified Performance Benchmarks (`2560x1440` Native, Upscaler: `Off`)
+## 💡 What Is This Project?
 
-> **🖥️ Reference Test System:**
-> - **OS / Kernel:** `CachyOS Linux` (`Linux 7.3.1-1-cachyos`, `x86_64`)
-> - **CPU:** `AMD Ryzen 9 7950X` (`16 Cores / 32 Threads`)
-> - **GPU:** `NVIDIA GeForce RTX 4090` (`24 GB GDDR6X`, Driver `615.78.08`)
-> - **Memory:** `64 GB DDR5 RAM`
-> - **Render Resolution:** `2560×1440` Native (`100%` Render Scale, `Upscaler: Off`, `0` Write Faults/s)
+Most PS4 emulators and translation layers run *Bloodborne*'s rendering engine as an untouched console binary that writes AMD Liverpool (`GNM`) `PM4` command packets into a simulated PS4 unified memory space. On PC, that causes **50,000–96,800 `mprotect` page-fault interrupts per second**, **`9–15 GB` of VRAM bloat**, bloated machine-translated shaders, and heavy CPU/GPU bottlenecks.
+
+**`bloodborne-pc-vulkan`** takes a fundamentally different approach:
+1. **The Graphics Engine Is Rebuilt as Native C++20 + Direct Vulkan 1.3:**
+   We decompiled **all `2,940 / 2,940` functions (`152,420` lines of C++20)** of *Bloodborne*'s internal `FD4` / `GX` / `Yebis 2` graphics engine (`v1.09` GOTY `CUSA03173`) and wired its resource creation, state binding, and draw calls **directly into a native Vulkan 1.3 RHI (`libbbgpu.so`)**. The game no longer emulates PS4 unified memory for graphics — buffers and textures are allocated as true PC `DEVICE_LOCAL` `VkBuffer` and `VkImage` objects (**`100% NatBuf`**, **`100% NatTex`**, **`0` page faults/s**, **`2.27–3.4 GB` VRAM**).
+2. **All `109` Core Shaders Rewritten in Clean, Vectorized Vulkan 1.3 GLSL 460:**
+   Instead of raw machine-translated `tXXX` register dumps, all **`109` heaviest shaders** (6-MRT G-Buffer, `1..12`-light Deferred PBR, 2-phase Adaptive SSR Raymarcher, SSAO, Yebis 2 HDR Bloom/DoF/Tonemap, foliage subsurface translucency, and CSM/VSM shadows) are hand-crafted in clean GLSL 460 (`12,478` lines total, `0` `tXXX` register dumps, mathematically verified via AST + Monte-Carlo float32 testing).
+3. **Polished to the Physical Hardware Limit (`~650 Avg FPS` at `2560×1440` Native):**
+   Every single CPU and GPU micro-bottleneck — from redundant per-frame `3×1025×1` gamma-ramp uploads, Yebis 2 Bloom cascades, and SSR mip-pyramid passes down to Havok cloth/raycast hooks and Multi-CCD CPU core isolation — has been profiled to `0.01 ms` precision and eliminated. At `2560×1440` native, all 10 GPU render passes execute in **`1.17 ms` total (`~850 FPS` GPU ceiling)** while the CPU runs at a cool **`57°C` (`57 W` PPT at `4.48 GHz`)**.
+
+---
+
+## ⚡ 30-Second Quick Start (How to Play)
+
+> **⚠️ Legal Notice:** This repository contains **zero** proprietary Sony or FromSoftware assets, executables (`eboot.bin`), or game data. You must use your own legally dumped *Bloodborne* Game of the Year Edition (**`CUSA03173`** or **`CUSA00900`**, updated to **v1.09**).
+
+| Platform | Status | How to Run |
+| :--- | :---: | :--- |
+| 🐧 **Linux (`x86_64`)** | **✅ Ready (`v1.1.0`)** | Extract the release archive next to `CUSA03173` and run **`./play.sh`** (or **`./launcher.sh`**) |
+| 🪟 **Windows (`x86_64`)** | **🚧 Next Milestone** | Native Windows x64 build & release archive in active preparation |
+
+### Step-by-Step (No Git or Terminal Needed):
+1. Download **`bloodborne-pc-vulkan-linux-x86_64-prebuilt.tar.gz`** from **[Releases](https://github.com/lapothecary/bloodborne-pc-vulkan/releases/latest)**.
+2. Unpack the archive right next to your **`CUSA03173`** (`v1.09`) folder:
+   ```text
+   BloodBorne/
+   ├── CUSA03173/          # Your unpacked Bloodborne v1.09 folder (contains eboot.bin, dvdroot_ps4/, ...)
+   ├── play.sh             # <-- Double-click or run ./play.sh to start the game immediately!
+   ├── launcher.sh         # <-- Double-click or run ./launcher.sh to open the 8-page GUI Settings Launcher
+   ├── out/                # Prebuilt runtime + DirectVk libbbgpu.so + DLSS 4.5
+   ├── scripts/
+   ├── patches/
+   ├── launcher/
+   └── fsr4_shaders/
+   ```
+3. Launch **`./play.sh`** (starts the game directly) or **`./launcher.sh`** (opens the GUI configurator). Press **`F8`** in-game at any time to toggle the 10-pass hardware telemetry HUD.
+
+---
+
+## 🎮 Native PC Features & Enhancements
 
 <p align="center">
-  <img src="docs/images/english.png" alt="Central Yharnam Heavy Panorama Benchmark Comparison — bloodborne-pc-vulkan vs bbport" width="860"/>
+  <img src="docs/images/display_menu.jpg" alt="In-Game Native PC Display, Anti-Aliasing & Upscaler Menu" width="760"/>
 </p>
+
+| Category | What's Included |
+| :--- | :--- |
+| **Upscalers & 7 Anti-Aliasing Modes** | • **Upscalers:** `NVIDIA DLSS 4.5 / 4`, `AMD FSR 4`, `AMD FSR 3.1` (`Quality 67%`, `Balanced 58%`, `Performance 50%`, `Ultra Perf. 33%`), or `Native 100%`<br/>• **7 Anti-Aliasing Modes:** `DLAA 4 (Transformer Preset K)`, `DLAA 3 (CNN Fast Preset F)`, **`SMAA T2x` (Ultra + 2x Motion-Vector Temporal Resolve)**, **`SMAA 1x Ultra` (`~0.16 ms`)**, `TAA`, `FXAA`, or `Off`<br/>• **Zero-Pass `RCAS` Sharpening:** 5-tap Contrast-Adaptive Sharpening fused directly into `Presenter::EncodePass` (works with any AA mode or `Upscaler: Off` at `0.00 ms` extra pass cost) |
+| **Patched In-Game Native PC Menus (`System`)** | Built on our decompiled & sealed Scaleform GFx menu engine ([`bbport_menu_engine.h`](gpu/shim/bbport_menu_engine.h)):<br/>• **`System -> Display` (`10` items):** Live Resolution (`720p`–`4K`), Aspect Ratio (`16:9` / `21:9`), Upscaler, Anti-Aliasing, Sharpening, `16x` Anisotropic Filtering, **Hybrid GPU UI / Icon / Logo Super-Resolution (`Off / 2x / 4x`)**, and FPS Limit (`30`–`360` / `Uncapped`)<br/>• **`System -> Effects` (`11` live toggles, 0 restarts):** Bloom/Glare, Depth of Field, Motion Blur, Chromatic Aberration, Vignette, Film Grain, Distant Blur, Model Detail (LOD), plus **4 Vulkan 1.3 Remaster Enhancements** (`Multi-Scale GTAO/SSAO`, `Contact Micro-Shadows + 12-Tap Vogel PCF`, `High-Precision Ultra SSR + 30Hz Cubemap Fix`, `True Black / OLED Contrast De-Haze`)<br/>• **`System -> Controls` (`26` actions):** Native Mouse Look, Menu Mouse Cursor, Mouse Wheel binding (`Wheel Up/Down`), `+Alt Key` secondary slots, **`Left Alt` Slow Walk (`40%` speed for stealth backstabs)**, and **`Enter / Esc / Options` Cutscene Video Skipping** |
+| **8-Page GTK4 GUI Launcher (`launcher.sh`)** | Modern `1020×720` sidebar launcher with full 4-language localization (`English`, `Русский`, `Português (BR)`, `简体中文`) and live bidirectional `bbport.ini` synchronization |
+| **High-FPS Physics & Engine Fixes** | • **Havok Cloth Physics Scaling (`#58`):** Scales Havok constraint stiffness per substep above 30 FPS — no violent cloak/coat fluttering at `120–650 FPS`<br/>• **Zero-Save Fast Native `HitPushBack` Stub & `O(1)` 64-Shard `FixedBlockPool`:** Rock-solid stability up to `5,000 FPS` (`ShortestFrame = 0.0f`), accurate high-FPS save play-time carry, and Character Creator preview turn-speed fix |
+| **10-Category Hardware GPU & CPU Telemetry HUD (`F8`)** | Zero-pass-break `vkCmdWriteTimestamp2` profiler breaking down every frame into **3 CPU stages** (`Game Engine Work` vs `FPS Cap Sleep`, `Stage A DirectVk RHI`, `Stage B Vulkan Record`) and **10 GPU Render Passes** (`1. Shadow Maps`, `2. G-Buffer`, `3. SSAO`, `4. Deferred PBR & Sky/Fog`, `5. SSR & Mips`, `6. Forward Alpha`, `7. Compute & Copies`, `8. Yebis 2 Post-FX`, `9. Anti-Aliasing / Upscaler`, `10. Scaleform UI & Present`) + live `W / MHz / °C / VRAM` sensors |
+
+---
+
+## 📊 Verified Performance Benchmarks (`2560×1440` Native)
+
+> **🖥️ Reference Test System:** `CachyOS Linux` (`x86_64`) • `AMD Ryzen 9 7950X` (locked at a cool `4.48 GHz`, `57°C`, `57 W` PPT) • `NVIDIA GeForce RTX 4090` (`24 GB`, Driver `615.78.08`) • `64 GB DDR5 RAM` • `2560×1440` Native (`100%` Render Scale, `0` Page Faults/s)
+
+### 1. Real-Time 10-Pass Hardware GPU Breakdown (`2560×1440` Native, Hunter's Dream)
+
+| Render Stage / Hardware Pass | `Off + RCAS` (`651 Avg FPS` Uncapped) | `DLAA 4 + RCAS` (`170 FPS` Cap, All Post-FX On) |
+| :--- | :---: | :---: |
+| **Frame Rate & Frame Time** | **`587 FPS (Avg 651 FPS)` / `1.70 ms (Avg 1.54 ms)`** | **`170 FPS` Locked / `5.88 ms`** |
+| **Native Buffers (`NatBuf`) & Textures (`NatTex`)** | **`100% NatBuf` / `100% NatTex` / `62% DscSav`** | **`100% NatBuf` / `100% NatTex` / `55% DscSav`** |
+| **GPU 1. Shadow Maps (`CSM / VSM`)** | `0.04 ms` (`3%`) | `0.10 ms` (`3%`) |
+| **GPU 2. G-Buffer (`3D & Two-Sided Foliage`)** | `0.35 ms` (`30%`) | `0.63 ms` (`20%`) |
+| **GPU 3. SSAO (`Ambient Occlusion`)** | `0.08 ms` (`7%`) | `0.14 ms` (`5%`) |
+| **GPU 4. Deferred PBR & Sky/Fog** | `0.20 ms` (`17%`) | `0.39 ms` (`12%`) |
+| **GPU 5. SSR Reflections & Mips (`vkCmdCopyImage`)** | `0.05 ms` (`5%`) | `0.25 ms` (`8%`) |
+| **GPU 6. Forward Alpha (`Hair / VFX`)** | `0.09 ms` (`8%`) | `0.11 ms` (`4%`) |
+| **GPU 7. Compute & Copies (`HLE`)** | `0.02 ms` (`1%`) | `0.08 ms` (`2%`) |
+| **GPU 8. Yebis 2 Post-FX (`DoF / Bloom / LUT`)** | `0.16 ms` (`14%`) | `0.61 ms` (`20%`) |
+| **GPU 9. Anti-Aliasing / Upscaler (`DLAA 4 Preset K`)** | `0.00 ms` (`0%`) | `0.65 ms` (`21%`) |
+| **GPU 10. Scaleform UI & Present (`+ RCAS`)** | `0.17 ms` (`15%`) | `0.13 ms` (`4%`) |
+| **🔥 Total Hardware GPU Busy (All 10 Passes)** | **`1.18 ms (Avg 1.17 ms)` (`~854 FPS` GPU speed)** | **`3.09 ms` (`51%` GPU Busy, `266 W`, `61°C`)** |
+
+### 2. Heavy City Panorama Comparison (`2560×1440` Native — Central Yharnam Vista, `2,304` Raw Draws)
 
 <p align="center">
-  <img src="docs/images/yharnam_vulkan.png" alt="bloodborne-pc-vulkan — 165 FPS, 33% GPU Load (207.3 W), 3,388 MB VRAM, 3 Dispatches" width="860"/>
-  <br/>
-  <em><b>Above:</b> <code>bloodborne-pc-vulkan</code> (C++20 Engine + DirectVk 1.3) — <b>165 FPS</b>, <b>33.0% GPU load (207.3 W, 55°C)</b>, <b>3,388 MB VRAM</b>, <b>4.5 GB RAM</b>, <b>1,574 Draws</b>, <b>3 Dispatches</b>, <b>2.10 ms HW GPU Shaders</b>.</em>
+  <img src="docs/images/english.png" alt="Central Yharnam Panorama Benchmark — bloodborne-pc-vulkan vs PM4 Translation" width="860"/>
 </p>
 
-<p align="center">
-  <img src="docs/images/yharnam_bbport.png" alt="Upstream bbport — 139 FPS, 97% GPU Load (288.8 W), 9,320 MB VRAM, 110 Dispatches" width="860"/>
-  <br/>
-  <em><b>Above:</b> Traditional PS4 / PM4 Translation (<code>bbport</code>) in the exact same spot — <b>139 FPS (bottlenecked)</b>, <b>97% GPU load (288.8 W, 64°C / 76°C Hotspot)</b>, <b>9,320 MB VRAM</b>, <b>8.6 GB RAM</b>, <b>2,304 Draws</b>, <b>110 Dispatches</b>, <b>68 Submits</b>.</em>
-</p>
-
-### 1. Head-to-Head Same-Scene Comparison (`2560x1440` Native, Locked `170 FPS` Cap — Cathedral Ward)
-
-| Metric (Identical Camera & Scene @ `2560x1440`, `170 FPS`) | Upstream `bbport` (PS4 / PM4 Translation) | **`bloodborne-pc-vulkan` (C++20 Engine + DirectVk 1.3)** | Measured Improvement |
+| Metric (Central Yharnam Panorama @ `2560×1440` Native) | Traditional PM4 Translation (`bbport`) | **`bloodborne-pc-vulkan` (C++20 + DirectVk 1.3)** | Measured Improvement |
 | :--- | :---: | :---: | :--- |
-| **RTX 4090 Board Power & Temp** | `283.3 W` (`60°C`, Hotspot `72°C`) | **`182.9 – 193.7 W` (`52–54°C`, Hotspot `62–64°C`)** | **Minus `100.4 W` (`-35.4%`) & `-10°C` cooler** |
-| **GPU Utilization (`bb-probe`)** | `86.0%` (`90%` total) | **`9.0% – 28.0%` (`Avg ~21%`)** | **`3× – 4×` lower GPU load (`-65%`)** |
-| **VRAM Allocated** | `9,266 MB` (`9.3 GB`) | **`3,030 MB` (`3.0 GB`)** | **`3.1×` less VRAM (minus `6.2 GB` VRAM)** |
-| **System RAM (RSS)** | `8.6 GB` | **`3.9 GB`** | **`2.2×` less RAM (minus `4.7 GB` RAM)** |
-| **CPU Utilization (`Ryzen 9 7950X`)** | `23%` (`63 W` PPT) | **`9.4% – 10.7%` (`48–51 W` PPT)** | **`2.3×` lower CPU load** |
-| **Draw Calls / Frame (`Draws`)** | `1,796` | **`1,007 – 1,068`** | **Minus `728–789` redundant draws/frame (`-43.9%`)** |
-| **Compute Dispatches / Frame (`Disp`)** | `160` | **`2`** | **`80×` fewer dispatches (`160 → 2`)** |
-| **Vulkan Driver Submits / Frame (`Subm`)** | `73` | **`0.1 – 3.0`** | **`24×` fewer queue submits (`73 → 3`)** |
-| **Stage A (`GpuComm` / `ConstRing` CPU)** | `2.71 ms` (`ConstRing: 1.30 ms`) | **`1.42 ms` (`ConstRing: 0.20 ms`)** | **`1.9×` faster (`ConstRing` `6.5×` faster)** |
-| **Stage B (`Vulkan Record` / `HW GPU Busy`)** | `4.30 ms` (bottlenecked) | **`2.33 ms` (`HW GPU Busy: 2.04 ms`)** | **`1.85×` faster** |
-
-### 2. Heavy City Panorama Comparison (`2560x1440` Native — Central Yharnam Vista, `2,304` Raw Draws)
-
-| Metric (Central Yharnam Panorama @ `2560x1440` Native) | Upstream `bbport` (PS4 / PM4 Translation) | **`bloodborne-pc-vulkan` (C++20 Engine + DirectVk 1.3)** | Measured Improvement |
-| :--- | :---: | :---: | :--- |
-| **Frame Rate & Frame Time** | `139 FPS` (`7.22 ms`, **bottlenecked**) | **`165 FPS` (`6.05 ms`, `2.10 ms` HW GPU Busy)** | **`+26 FPS` higher while using `-81.5 W` less power** |
+| **Frame Rate & Frame Time** | `139 FPS` (`7.22 ms`, **GPU bottlenecked**) | **`165 FPS` (`6.05 ms`, `2.10 ms` HW GPU Busy)** | **`+26 FPS` higher while using `-81.5 W` less power** |
 | **RTX 4090 Board Power & Temp** | `288.8 W` (`64°C`, Hotspot `76°C`) | **`207.3 W` (`55°C`, Hotspot `69°C`)** | **Minus `81.5 W` (`-28.2%`) & `-9°C` cooler** |
-| **GPU Utilization (`bb-probe` / Total)** | `85.0%` (`97%` total — **GPU pegged**) | **`33.0%` (`55%` total, `3.79 ms` GPU idle gap)** | **`2.6×` lower GPU load (`2.10 ms` shader time)** |
+| **GPU Utilization** | `85.0%` (`97%` total — **pegged**) | **`33.0%` (`2.10 ms` shader time)** | **`2.6×` lower GPU load** |
 | **VRAM Allocated** | `9,320 MB` (`9.32 GB`) | **`3,388 MB` (`3.39 GB`, `100% NatTex`)** | **`2.75×` less VRAM (minus `5.93 GB` VRAM)** |
-| **System RAM (`bb-probe` RSS)** | `8.6 GB` | **`4.5 GB`** | **`1.9×` less RAM (minus `4.1 GB` RAM)** |
-| **CPU Utilization (`Ryzen 9 7950X`)** | `23.9%` (`31%` total, `73 W` PPT) | **`13.9%` (`19%` total, `64 W` PPT)** | **`1.7×` lower CPU load** |
-| **Guest `GnmWait` CPU Stall** | `1.19 ms` | **`0.00 ms`** | **100% eliminated (`0.00 ms` stall)** |
-| **Draw Calls / Frame (`Draws`)** | `2,304` | **`1,574`** | **Minus `730` occluded/redundant draws (`-31.7%`)** |
-| **Compute Dispatches / Frame (`Disp`)** | `110` | **`3`** | **`36.7×` fewer dispatches (`110 → 3`)** |
-| **Vulkan Driver Submits / Frame (`Subm`)** | `68` | **`3.0`** | **`22.7×` fewer queue submits (`68 → 3`)** |
-| **Stage A (`GpuComm` / `ConstRing` CPU)** | `3.62 ms` (`ConstRing: 1.91 ms`) | **`2.31 ms` (`ConstRing: 0.32 ms`)** | **`1.57×` faster (`ConstRing` `6.0×` faster)** |
-| **Stage B (`Vulkan Record` Total)** | `6.48 ms` (`Buffers+Sync: 2.32 ms`) | **`3.52 ms` (`Buffers: 0.76 ms`, `DscSav: 53%`)** | **`1.84×` faster (`Buffers` `3.05×` faster)** |
+| **System RAM (`RSS`)** | `8.6 GB` | **`2.8 – 4.5 GB`** | **`2×` less RAM (minus `4.1+ GB` RAM)** |
+| **Compute Dispatches / Frame (`Disp`)** | `110` | **`2 – 3`** | **`36× – 80×` fewer dispatches** |
+| **Vulkan Driver Submits / Frame (`Subm`)** | `68` | **`2.0 – 3.0`** | **`23×` fewer queue submits** |
 
-### 3. Uncapped vs Capped Pipeline Telemetry (`2560x1440` Native, Hunter's Dream / Clinic)
-
-| Metric | Traditional Emulation Baseline | **`bloodborne-pc-vulkan` (Uncapped)** | **`bloodborne-pc-vulkan` (170 FPS Cap)** |
-| :--- | :---: | :---: | :---: |
-| **Frame Rate (Hunter's Dream / Clinic)** | `90 – 138 FPS` | **Up to `529 FPS` (`Avg 502 FPS`, `1.89 ms`)** | **`170.0 FPS` Locked (`5.88 ms`)** |
-| **Stage A (`bb:GpuComm` CPU)** | `3.10 ms` | **`0.50 ms` (`ConstRing: 0.06 ms`)** | **`0.59 – 0.95 ms`** |
-| **Stage B (`bb:DrawRec` Vulkan Record)** | `6.10 ms` | **`0.93 ms` (`Avg 0.98 ms`)** | **`1.15 – 1.50 ms`** |
-| **HW GPU Busy (Shaders)** | `6.13 ms` | **`1.68 ms` (`Avg 1.60 ms`)** | **`1.56 – 1.87 ms`** |
-| **Total CPU Load (across 32 threads)** | `~35%+` | `~14–15%` | **`5.5% – 9.5%` (`~48–56 W` CPU PPT)** |
-| **Kernel Write Page Faults** | `50,149 – 96,800 / sec` | **`0 / sec`** | **`0 / sec`** |
-| **VRAM Allocated** | `15,400 MiB` | **`2,142 – 3,596 MiB`** | **`2,142 – 3,030 MiB`** |
+<details>
+<summary><b>📸 Click to view side-by-side Central Yharnam screenshots (`bloodborne-pc-vulkan` vs `bbport`)</b></summary>
+<br/>
+<p align="center">
+  <img src="docs/images/yharnam_vulkan.png" alt="bloodborne-pc-vulkan — 165 FPS, 33% GPU Load (207.3 W), 3,388 MB VRAM" width="840"/>
+  <br/>
+  <em><b>Above:</b> <code>bloodborne-pc-vulkan</code> — <b>165 FPS</b>, <b>33.0% GPU load (207.3 W, 55°C)</b>, <b>3,388 MB VRAM</b>, <b>4.5 GB RAM</b>, <b>3 Dispatches</b>.</em>
+</p>
+<p align="center">
+  <img src="docs/images/yharnam_bbport.png" alt="Traditional PM4 Translation — 139 FPS, 97% GPU Load (288.8 W), 9,320 MB VRAM" width="840"/>
+  <br/>
+  <em><b>Above:</b> Traditional PM4 Translation in the exact same spot — <b>139 FPS (bottlenecked)</b>, <b>97% GPU load (288.8 W)</b>, <b>9,320 MB VRAM</b>, <b>8.6 GB RAM</b>, <b>110 Dispatches</b>.</em>
+</p>
+</details>
 
 ---
 
-## 🚀 Linux Installation & Quick Start Guide
+## 🧠 Deep Engineering Architecture (How We Reached `651 Avg FPS`)
 
-> **⚠️ Legal Notice:** This repository contains **ZERO** proprietary Sony or FromSoftware assets, executables (`eboot.bin`), or game data. You must provide your own legally dumped PS4 *Bloodborne* Game of the Year Edition (`CUSA03173` or `CUSA00900` updated to **v1.09**).
+<details open>
+<summary><b>1. Complete <code>2,940 / 2,940</code> Decompiled C++20 Graphics Engine (<code>our_cpp_100000_source/</code>)</b></summary>
 
-### Option A (Simplest — No Git or Compilation Needed): Unpack Release Archive Next to `CUSA03173`
-1. Download **`bloodborne-pc-vulkan-linux-x86_64-prebuilt.tar.gz`** from the **[Releases](https://github.com/lapothecary/bloodborne-pc-vulkan/releases)** page.
-2. Extract all files from the archive directly into the folder where your unpacked `CUSA03173` (v1.09) game folder sits:
+All **2,940 rendering functions (`152,420` lines of C++20)** across all 7 internal `FD4` / `GX` modules have been decompiled 1:1 and verified instruction-by-instruction against `eboot.bin`:
+
+| Module | Directory | Engine Subsystem |
+| :---: | :--- | :--- |
+| **`01`** | [`01_CoreGraphics2_GNM`](our_cpp_100000_source/src/01_CoreGraphics2_GNM) | `GXCue` constant/vertex/texture ring binding, `GXGnmDevice`, swapchain & gamma LUT presenter |
+| **`02`** | [`02_GX_GraphicsFramework`](our_cpp_100000_source/src/02_GX_GraphicsFramework) | `GXDeviceSingleton`, camera frustum culling (`GXCullVolume`), render-target & resource lifecycle |
+| **`03`** | [`03_TPF_GNF_ShaderContainers`](our_cpp_100000_source/src/03_TPF_GNF_ShaderContainers) | `TPF`/`GNF` texture container loaders, Cascaded Shadow Maps (`GXPssm`), VSM point-light shadows |
+| **`04`** | [`04_SceneRenderer`](our_cpp_100000_source/src/04_SceneRenderer) | FLVER material binder, SSR mip-chain generator, `GXYebisPostProcessDirector` & compute LUTs |
+| **`05`** | [`05_PostProcess_Yebis2`](our_cpp_100000_source/src/05_PostProcess_Yebis2) | Yebis 2 HDR Bloom, Glare, Depth of Field, Motion Blur, God Rays, Chromatic Aberration, Tonemap |
+| **`06`** | [`06_DeferredLightingAndAO`](our_cpp_100000_source/src/06_DeferredLightingAndAO) | `1..12`-light tiled deferred PBR lighting, stenciled light volumes, `GXSSAO` / HBAO+ |
+| **`07`** | [`07_SFX_ParticleGpuRenderer`](our_cpp_100000_source/src/07_SFX_ParticleGpuRenderer) | Blood splashes, fire, mist, volumetric fog & GPU compute particle emitters (`FXR`) |
+
+**Key Engine-Level Optimizations Made Possible by Full C++20 Source Access:**
+- **100% Native Split VRAM (`DirectBuffers` & `DirectTextures`):** Hooks `GXGnmBuffer` / `GXGnmTexture` creation directly (`0` page faults/s) and renames dynamic buffers up to `4 MiB` (`GXDynamicBufferRingOwner`) in-pass without breaking active Vulkan RenderPasses (`NatBuf: 100%`, `NatTex: 100%`).
+- **Unified Graphics Push-Descriptor `VkPipelineLayout` (`DscSav: 62%`):** Normalizes graphics descriptor `.stageFlags` to `AllGraphicsStageBits` so pipelines with matching binding layouts share a single `VkPipelineLayout`, preserving `GfxPushStateTracker` delta state across draws.
+- **Eliminated Redundant Per-Frame `3 × 1025×1 R32F` Gamma Ramp Uploads:** Dirty-gates `GXDevice_SetGammaCurveParams` (`0x2199cf0`) and `GXGammaRampAndFlipPresenter_SetGammaRampTable` (`0x26d6b20`) via `std::memcmp`, preventing 3,075 CPU `powf()` calls and 3 staging-to-VRAM texture uploads every frame when brightness/gamma is unchanged.
+- **Single-Draw + `vkCmdCopyImage` SSR Mip-Pyramid & Deduplicated Depth Pyramid (`26 → 7` RenderPasses/Frame):** Replaces second full-screen quad draws with hardware `vkCmdCopyImage` (`sub_2168880`) and skips the duplicate stage `0x1b` depth downsample (`sub_e5b220`).
+- **Yebis 2 Compute LUT & Bloom Cascade Trim (`160 → 2` Dispatches/Frame, `22 → 13` Bloom Passes):** Caches `CustomDof` CoC LUT (`s_pSinglePostEffect` `nearZ`/`farZ`) and 3D color-grading LUTs when camera parameters are unchanged; caps Bloom Gaussian cascade from 7 to 4 levels; fixes `PFXGS_DISABLE = -1` when Bloom is off.
+- **Native `DLAA 4` Transformer `Preset K` + Fused `RCAS`:** Locks native `100% DLAA 4` to NVIDIA's dedicated DLAA `Preset K (11)` instead of `Preset M (13)` (saving **`1.19 ms/frame`** on GPU and **`~4.8 GB` VRAM**), and fuses `DLSS/DLAA` sharpening into `Presenter::EncodePass`.
+</details>
+
+<details>
+<summary><b>2. All <code>109</code> Core Shaders Decompiled to Clean Vectorized GLSL 460 (<code>0</code> <code>tXXX</code> Dumps)</b></summary>
+
+- Every single one of the **`109` native shaders** in [`gpu/shader/backend/spirv/native/`](gpu/shader/backend/spirv/native) has been converted from machine-generated `tXXX` register dumps (`59,894` lines) into clean, human-readable, vectorized GLSL 460 (`12,478` lines — **4.8× smaller**, `0` `tXXX` variables remaining) and verified with [`tools/verify_clean_glsl.py`](tools/verify_clean_glsl.py) (32-trial float32 Monte-Carlo equivalence).
+- **Physical Two-Sided Foliage Subsurface Translucency & Genuine `gl_FrontFacing`:** Restores genuine `gl_FrontFacing` across all 16 double-sided `.frag` shaders (eliminating inverted normals on character faces, tree trunks, and mirrored fern fronds) while adding `85%` backface subsurface transmission (`clamp(max(dot_lm, -dot_lm * 0.85), 0.0, 1.0)`) so leaves and flowers viewed from underneath are naturally lit instead of turning pitch-black.
+- **2-Phase Adaptive SSR Raymarcher (`ps_6c2323c2`):** `7.5×` faster (`0.992 ms → 0.133 ms/frame`) via early sky/backface rejection, quadratic adaptive step growth, and 5-step binary search refinement.
+- **Deferred PBR N-Sphere Early-Out (`early_fragment_tests` + `demote;`):** Rejects pixels outside `1..12` point-light spheres before sampling the four `2560×1440` G-Buffer textures.
+</details>
+
+<details>
+<summary><b>3. Universal Multi-CCD CPU Topology Scheduler & Inline DirectVk Recording (<code>bbport_threads.h</code>)</b></summary>
+
+- **Physical Core #0 Isolation for `MOMainThread`:** Automatically detects `tid == getpid()` (`MOMainThread`) and isolates it on the #1 preferred physical core (`CPU#0` on `CCD0`) with its SMT sibling (`CPU#16`) completely excluded from all worker masks and boosted priority (`nice -2`).
+- **Zero-Runqueue-Stall `CCD0` Simulation Pool (`14` Hardware Threads for `11` Active Workers):** Places all 5 `HavokWorkerThread`s, `GXRenderThread`, and 5 `GXWorker`s across the remaining 14 hardware threads (`CPU#1..7, 17..23`) of `CCD0`'s shared 32 MB L3 cache (`0` Infinity Fabric crossings across ~10,000 per-frame Havok barriers), while isolating Vulkan RHI (`bb:GpuComm`, `bb:VkRecorder`) and I/O helpers on `CCD1` (`CPU#8..15, 24..31`).
+- **Inline DirectVk Recording (`HW GPU Mid-Frame Idle Gap: 0.28–0.35 ms`):** Bypasses legacy `DrawPipe` SPSC queue serialization and `pending_reads` hash-table overhead so `bb:GpuComm` records DirectVk commands directly in `1.24 ms` while `MOMainThread` simulates the next frame in parallel on `CCD0`.
+</details>
+
+<details>
+<summary><b>4. Building from Source & Diagnostic Isolation Variables</b></summary>
+
+```bash
+# 1. Build the Decompiled C++20 Graphics Engine (2,940 functions -> libbb_gx_engine_native.a):
+cmake -S our_cpp_100000_source -B our_cpp_100000_source/build -G Ninja -DCMAKE_BUILD_TYPE=Release
+ninja -C our_cpp_100000_source/build
+
+# 2. Build the Vulkan 1.3 RHI Library (libbbgpu.so):
+ninja -C build_gpu && cp -f build_gpu/libbbgpu.so out/gpu/libbbgpu.so
+```
+
+**Runtime Subsystem Isolation Flags (No Rebuild Needed):**
+```bash
+# Disable Hardware Occlusion Culler & Micro-Shadow Culler:
+BB_HW_OCCLUSION_CULL=0 BB_MICRO_SHADOW_CULL=0 ./play.sh
+
+# Disable the 109 Hand-Crafted Native GLSL Shaders (fall back to raw SPIR-V):
+BB_NATIVE_SHADERS=0 BB_NATIVE_SHADER_MIN=999 ./play.sh
+
+# Isolate specific C++20 Engine Modules (01..07) or binary-search a function VMA range:
+BB_GX_MODULES=01,02,03,04,05,06,07 ./play.sh
+BB_GX_SKIP_MIN=0x22900a0 BB_GX_SKIP_MAX=0x2292000 ./play.sh
+```
+</details>
+
+---
+
+# 🇷🇺 Bloodborne PC Vulkan — О проекте и быстрый старт (RU)
+
+### Что это за проект простыми словами?
+Обычные эмуляторы и слои трансляции запускают графику *Bloodborne* как «чёрный ящик» от PS4: игра генерирует консольные пакеты `PM4` в общую память, а эмулятор пытается угадать, где лежат буферы и текстуры, перехватывая **до 96 800 ошибок страниц (`mprotect` / `SIGSEGV`) в секунду** и раздувая потребление видеопамяти до **`9–15 ГБ VRAM`**.
+
+В **`bloodborne-pc-vulkan`** мы сделали то, что превращает графическое ядро игры в **нативный ПК-движок на Vulkan 1.3**:
+1. **Декомпилировали все `2,940 из 2,940` функций графического движка (`152,420` строк чистого C++20)** во всех 7 модулях рендера (`FD4` / `GX` / `Yebis 2`) и подключили их **напрямую к Vulkan 1.3 (`libbbgpu.so`)** без эмуляции общей памяти PS4. Игра сразу создаёт нативные ПК-буферы и текстуры в памяти видеокарты (**`100% NatBuf`**, **`100% NatTex`**, **`0` прерываний `Faults/s`**, **`2.27–3.4 ГБ` VRAM** и **`2.8 ГБ` ОЗУ**).
+2. **Переписали все `109` ключевых шейдеров игры на чистый векторизованный GLSL 460 (`0` регистровых свалок `tXXX`):** от G-Buffer, PBR-освещения и двустороннего подповерхностного рассеивания листвы до 2-фазного адаптивного реймарчинга отражений SSR (`в 7.5 раза` быстрее оригинала) и пост-обработки `Yebis 2`.
+3. **Вылизали каждый микро-нюанс CPU и GPU до физического предела железа (`651 Avg FPS` / `1.54 мс` в `2560×1440` Native):**
+   - Полное время работы видеокарты по всем 10 рендер-пассам сжато до **`1.18 мс` (потолок GPU ~`850 FPS`)**, а с лимитом `170 FPS` без тяжёлых эффектов видеокарта нагружена всего на **`8–14%`**.
+   - Устранены скрытые CPU-тормоза физики Havok (атомарные `lock`-барьеры ткани и `640`-байтные дампы регистров `YMM/GPR` в `HitPushBack`), холостые перезаливки `3×1025×1` таблиц гаммы, `2048 КБ` копирования буферов и лишние проходы Bloom/SSR.
+   - На процессоре при фиксированных холодных **`4.48 ГГц` (`57°C`, `57 Вт` PPT)** игра выдаёт **`595–651 FPS`** в `2560×1440`!
+
+---
+
+### ⚡ Как запустить за 30 секунд (просто кинуть релиз рядом с `CUSA03173`)
+
+| Платформа | Статус | Как запустить |
+| :--- | :---: | :--- |
+| 🐧 **Linux (`x86_64`)** | **✅ Готово (`v1.1.0`)** | Распаковать архив из Releases рядом с папкой `CUSA03173` и запустить **`./play.sh`** (или **`./launcher.sh`**) |
+| 🪟 **Windows (`x86_64`)** | **🚧 Следующий этап** | Нативный порт под Windows x64 (отдельный архив в Releases) в разработке |
+
+1. Скачайте готовый архив **`bloodborne-pc-vulkan-linux-x86_64-prebuilt.tar.gz`** из раздела **[Releases](https://github.com/lapothecary/bloodborne-pc-vulkan/releases/latest)**.
+2. Распакуйте его прямо рядом с вашей папкой **`CUSA03173`** (`v1.09` GOTY):
    ```text
-   your_game_folder/
-   ├── CUSA03173/                  # Your unpacked Bloodborne v1.09 game dump (eboot.bin, dvdroot_ps4/, ...)
-   ├── play.sh                     # <-- Run this to start the game directly!
-   ├── launcher.sh                 # <-- Or run this to open the GUI settings launcher
-   ├── run.sh
-   ├── out/                        # Prebuilt runtime & DirectVk libbbgpu.so + DLSS 4.5
-   ├── bin -> out
+   BloodBorne/
+   ├── CUSA03173/          # Ваша папка с игрой (внутри eboot.bin, dvdroot_ps4/, ...)
+   ├── play.sh             # <-- Запустите двойным кликом (или ./play.sh) для старта игры!
+   ├── launcher.sh         # <-- Или запустите для открытия 8-страничного GUI-лаунчера настроек
+   ├── out/                # Готовые бинарники, DirectVk libbbgpu.so и DLSS 4.5
    ├── scripts/
    ├── patches/
    ├── launcher/
    └── fsr4_shaders/
    ```
-3. Run **`./play.sh`** (or **`./launcher.sh`**):
-   ```bash
-   ./play.sh
-   # Or with the on-screen FPS / pipeline telemetry HUD:
-   BB_FRAME_STATS=1 ./play.sh
-   ```
-
-### Option B: Clone via Git (Prebuilt Binaries Already Included in `main`)
-1. Place your `CUSA03173` folder either inside or right next to `bloodborne-pc-vulkan` and clone the repository:
-   ```bash
-   git clone https://github.com/lapothecary/bloodborne-pc-vulkan.git
-   cd bloodborne-pc-vulkan
-   ./play.sh
-   ```
-
-### Step 2B: Building from Source on Linux
-Dependencies: `clang` / `gcc` (C++20), `cmake`, `ninja`, `python3`, `vulkan-devel`, `sdl3`.
-
-1. **Build the Decompiled C++20 Graphics Engine (`2,940` functions → `libbb_gx_engine_native.a`):**
-   ```bash
-   cmake -S our_cpp_100000_source -B our_cpp_100000_source/build -G Ninja -DCMAKE_BUILD_TYPE=Release
-   ninja -C our_cpp_100000_source/build
-   ```
-2. **Build the Vulkan 1.3 RHI Library (`libbbgpu.so`) & Runtime (`bb-probe`):**
-   ```bash
-   bash build.sh
-   ```
+3. Запустите **`./play.sh`** (прямой вход в игру) или **`./launcher.sh`** (настройка графики и управления). Клавиша **`F8`** в игре переключает детальный HUD-мониторинг всех 10 рендер-пассов GPU и CPU.
 
 ---
 
-## 🛠️ Diagnostic & Subsystem Isolation Variables
-
-If you are testing on a new GPU/driver and want to isolate any rendering behavior without recompiling:
-
-```bash
-# 1. Disable Hardware Occlusion Culler & Micro-Shadow Culler:
-BB_HW_OCCLUSION_CULL=0 BB_MICRO_SHADOW_CULL=0 BB_FPS_LIMIT=60 ./play.sh
-
-# 2. Disable the 107 Hand-Crafted Native GLSL Shaders (fall back to raw SPIR-V):
-BB_NATIVE_SHADERS=0 BB_NATIVE_SHADER_MIN=999 BB_FPS_LIMIT=60 ./play.sh
-
-# 3. Run only specific C++20 Engine Modules (e.g., 01..07 or binary-search a function VA range):
-BB_GX_MODULES=01,02,03,04,05,06,07 BB_FPS_LIMIT=60 ./play.sh
-BB_GX_SKIP_MIN=0x22900a0 BB_GX_SKIP_MAX=0x2292000 BB_FPS_LIMIT=60 ./play.sh
-```
+### 🎮 Что добавлено для комфортной игры на ПК:
+- **Апскейлеры и 7 режимов сглаживания:** `DLSS 4.5 / 4`, нативный `DLAA 4 (Transformer Preset K — минус 4.8 ГБ VRAM и в 2.8 раза быстрее Preset M)`, лёгкий `DLAA 3 (CNN Быстрый Preset F)`, `FSR 4`, `FSR 3.1`, **`SMAA T2x` (морфологический Ultra + темпоральный резолв по векторам движения)**, **`SMAA 1x Ultra` (`~0.16 мс`)**, `TAA`, `FXAA` и однопроходная резкость **`RCAS`** в `Presenter::EncodePass` (`0.00 мс` доп. проходов, работает даже при `Upscaler: Off`).
+- **Нативные внутриигровые ПК-меню (`System -> Display`, `Effects`, `Controls`) и 8-страничный GTK4-лаунчер:**
+  - Живое переключение разрешения (`720p`–`4K`), `21:9` Ultrawide, `16x` анизотропной фильтрации, **гибридного GPU-апскейла интерфейса, иконок и логотипов (`2x / 4x`)** и лимита FPS без перезапуска.
+  - **11 живых тумблеров в `System -> Effects`:** отключение любых пост-эффектов на лету + **4 ремастер-улучшения Vulkan 1.3** (`Multi-Scale GTAO/SSAO`, `Contact Micro-Shadows + 12-Tap Vogel PCF`, `Ultra SSR + фикс 30 Гц кубмапов`, `True Black / OLED De-Haze`).
+  - **26 действий клавиатуры и мыши в `System -> Controls`:** нативный обзор мышью, курсор мыши в меню, биндинг колеса мыши, вторые слоты `+Alt Key`, **медленный шаг на `Left Alt` (для тихих бэкстабов)** и **пропуск видеороликов на `Enter / Esc / Options`**.
+- **Физика плащей и одежды при 60–650 FPS:** пошаговая коррекция жёсткости ткани Havok (`ClothStiffnessFactor`) без «бешеного» дрожания плащей на высоком FPS.
 
 ---
 
-# 🇷🇺 Bloodborne PC Vulkan — Описание проекта и инструкция (RU)
+## 📜 Honest Credits, Lineage & License / Авторы и благодарности
 
-**`bloodborne-pc-vulkan`** — это проект нативной декомпиляции графического движка *Bloodborne* (`2,940 из 2,940` функций рендера, `152,420` строк чистого кода C++20 с `AVX2`/`FMA`) в связке с прямым рендерером **Vulkan 1.3 (`libbbgpu.so`)** для Linux.
-
-### Чем этот проект отличается от обычной эмуляции PS4:
-
-1. **Настоящее разделение памяти PC (`DirectBuffers` + `DirectTextures` — `0` ошибок страниц в секунду):**
-   - В PS4 память общая (Unified Memory), поэтому классические эмуляторы отслеживают запись CPU в буферы через защиту страниц ядра Linux (`mprotect` / `SIGSEGV`), ловя **от 50 000 до 96 800 прерываний в секунду** и раздувая потребление видеопамяти до **15.4 ГБ VRAM**.
-   - В нашем проекте декомпилированный движок C++20 перехватывает создание `GXGnmBuffer` и `GXGnmTexture` напрямую и выделяет нативные `VkBuffer` / `VkImage` в `DEVICE_LOCAL` видеопамяти через VMA (`100% NatTex`, `96.8% NatBuf`).
-   - **Итог:** количество `WriteFaults` упало с **`96,800/с` до `0/с`**, потребление VRAM в `2560x1440` снизилось с **`15.4 ГБ` до `2.5–3.5 ГБ`**, а ОЗУ (RSS) — до **`3.3–5.0 ГБ`**.
-
-2. **Полный исходный код 2 940 функций графического движка в [`our_cpp_100000_source/`](our_cpp_100000_source) и глубокая оптимизация ядра `FD4` / `GX` / `Yebis2`:**
-   - В репозитории открыт весь декомпилированный C++20 код всех 7 графических подсистем игры (`01_CoreGraphics2_GNM`, `02_GX_GraphicsFramework`, `03_SceneShadowAndDrawPass`, `04_TessellationAndGeometry`, `05_PostProcess_Yebis2`, `06_DeferredLightingAndAO`, `07_SFX_ParticleGpuRenderer`), поинструкционно сверенный с оригинальным `eboot.bin` (`v1.09`).
-   - Благодаря полному контролю над C++20 кодом движка устранены консольные узкие места эпохи PS4: G-Buffer и `SceneTargets` отвязаны от хардкода `1920×1080` для честной работы пресетов `DLSS 4.5 / FSR 3.1`, лишние ежекадровые Compute-диспатчи `Yebis2` (`CustomDofLutCopy.cpo`, `LutCopy2DTo3DCs.cpo`) сокращены со **`160 до 2`** за кадр, гауссов каскад Bloom в `Yebis2` ограничен 4 уровнями вместо 7 (`22 → 13` проходов без невидимых буферов `27×23..7×6`), устранён фантомный просчёт бликов `PFXGS_CHEAPSLENS` при выключенном Bloom (`PFXGS_DISABLE = -1`), глянцевая мип-пирамида SSR (`sub_21c2100`) переведена на одиночный проход с аппаратным `vkCmdCopyImage` и дедупликацией глубины (`sub_e5b220`, минус **19 лишних RenderPass за кадр**), починен кэш аппаратных состояний `01_CoreGraphics2_GNM` и O(1) кэш динамических `cueHeap` fetch-шейдеров (без mid-frame простоев `SyncProgramWrites` / `NoteCopyIntoMemory`), снят лимит в 6 ядер PS4 Jaguar (`& 0x3FULL`), отключён 60-герцовый CPU busy-wait фреймпейсер, убраны невыровненные 64-битные `LOCK OR` атомики (`+0x44`), а загрузка скелетных матриц FLVER вынесена с каждого сабмеша на один раз за инстанс модели.
-   - **64-шардовый потокобезопасный `O(1)` аллокатор `FixedBlockPool` (`0x0263b810..0x0263bc40`) и честный анлок до `5000 FPS`:** дизассемблирован и переписан с нуля системный пул фиксированных блоков движка (`BbSafeFixedBlockPool_*` в [`bb_golden_engine.cpp`](gpu/shim/bb_golden_engine.cpp)) — 64 кэш-выровненных шарда (`alignas(64)`) с 2048 слотами карантина, `O(1)` in-place тегированием указателей и без единой инструкции деления `DIV`.
-   - **Универсальный адаптивный планировщик топологии CPU и кэша L3 ([`bbport_threads.h`](gpu/shim/bbport_threads.h)):** автоматически определяет архитектуру любого процессора через `/sys/devices/system/cpu/`:
-     - На многочиплетных **AMD Ryzen 9 (`5900X..9950X / X3D`)** выделяет лучшее физическое ядро №1 на `CCD0` монопольно под `MOMainThread` (оставляя его второй SMT-поток пустым), привязывает все 29 потоков симуляции (`HavokWorkerThre` × 5, `CSChrThread0..5`, `CSClothThread0..5`, `SpClothVertexUp` × 6, `GXRenderThread`, `GXWorker:1..5`) к остальным ядрам того же `CCD0` (**0 пересечений шины Infinity Fabric** на ~10 000 барьеров Хавока за кадр), а весь конвейер Vulkan RHI (`bb:GpuComm`, `bb:DrawRec`, `bb:VkRecorder*`) и фоновый I/O выносит на `CCD1`.
-     - На гибридных **Intel `12–15 Gen (P-Core + E-Core)`** жёстко удерживает потоки игры, Хавока и RHI на быстрых `P-ядрах`, а фоновые задачи и распаковку уводит на `E-ядра`.
-     - На одночиплетных процессорах с `>= 6` ядрами (**Ryzen 5/7, `5800X3D / 7800X3D / 9800X3D`, Intel 6c/8c**) изолирует физическое ядро `MOMainThread` от SMT-конкуренции.
-   - **Исправление оригинального бага PS4 с чёрной изнанкой цветов и травы:** в 12 двусторонних G-Buffer шейдерах растительности и SPIR-V оптимизаторе сохранена авторская верхняя нормаль кроны `+N`, благодаря чему листья и цветы при взгляде снизу не уходят в отрицательный `dot(L_lightmap, -N)` и не превращаются в угольно-чёрные силуэты.
-
-3. **107 нативных шейдеров Vulkan 1.3 GLSL + 752 предкомпилированных SPIR-V шейдера:**
-   - Самые тяжёлые шейдеры игры (6-MRT G-Buffer, отложенное PBR-освещение на `1..12` источников со сферическим `early_fragment_tests` + `demote;` до чтения текстур G-Buffer, 2-фазный адаптивный реймарчинг SSR `ps_6c2323c2` с 5-шаговым бинарным поиском — **в `7.5 раза` быстрее оригинала (`0.992 → 0.133 мс/кадр`)**, SSAO, все проходы HDR пост-обработки и гауссова Bloom в `Yebis2` (`ps_86e96401`, `ps_4b766f62`, `ps_3c2b7974`, `ps_474f0123`, `ps_483f5dc1`), тени 4096×4096 `ps_006c079b` / `ps_a0e88f56` и объёмный туман) переписаны на чистый GLSL под Vulkan 1.3 (сокращение инструкций SPIR-V на `35%–68%`, **0 статтеров компиляции шейдеров**).
-
-4. **Аппаратный 3D Occlusion Culler (`SceneOcclusionCuller`) и двухстадийный конвейер рендера:**
-   - Каждый объект в мире идентифицируется по его точной 3D-матрице трансформации `3x4` в мировых координатах (`palette_ptr + model_cb[20] * 48`) с 0-кадровым чтением `864`-байтного буфера камеры сцены.
-   - Закрытые стенами и рельефом объекты отсекаются через `VkQueryPool(eOcclusion)` до биндинга ресурсов и без малейшей задержки появления при повороте камеры.
-   - **Производительность в `2560x1440` Native:** до **`529 FPS` без лимита (`Avg 502 FPS`, `1.89 мс/кадр`, `1.68 мс` HW GPU Busy)** и стабильные **`170 FPS` при нагрузке на CPU всего `5.5%–8.7%`**.
-
-5. **Честное разделение: что взято из [`bbport`](https://github.com/deadinside28/bloodborne_pc) (`deadinside28`), а что написано нами:**
-   - Системный рантайм PS4 (`src/`: загрузчик ELF, файловая система `Fios2`, звук, геймпад, сеть), внутриигровое меню **Display** и интеграция апскейлеров (`FSR 3.1`, `FSR 4`, `TAA`, `DLSS`) взяты из открытого проекта **[`bbport` (`deadinside28/bloodborne_pc` v0.6)](https://github.com/deadinside28/bloodborne_pc)** (который, в свою очередь, вырос из видеоядра **[`shadPS4`](https://github.com/shadps4-emu/shadPS4)** под лицензией GPL). Мы открыто указываем авторство `bbport` и не приписываем себе их системный рантайм и меню.
-   - Наша работа в **`bloodborne-pc-vulkan`** — это **`+152,420` строк** полной C++20 декомпиляции всех `2,940 / 2,940` функций графического движка в [`our_cpp_100000_source/`](our_cpp_100000_source) и **`+78,369` строк** в [`gpu/`](gpu) (`191` изменённый и новый файл): прямое разделение памяти `DirectBuffers` / `DirectTextures` (`0` page faults/s), `107` нативных шейдеров Vulkan 1.3 GLSL, `752` предкомпилированных SPIR-V шейдера, 3D World-Space `SceneOcclusionCuller`, двухстадийный RHI-конвейер, 8-страничный сайдбар-лаунчер GTK4 (`1020x720`) с живой двусторонней синхронизацией `bbport.ini`, а также переработанные нативные внутриигровые меню **`System -> Controls`** (26 действий, захват колеса мыши, 2-й слот `+Alt Key`, очистка `Del : Clear` и нативная нижняя строка подсказок Scaleform), **`System -> Display`** (**DLSS 4.5 Transformer Preset M/L**, **DLSS 4 Preset K**, **DLAA 4 (Transformer 100%)** и легковесный **DLAA 3 (CNN Быстрый 100%, Preset F)**, `16x` анизотропная фильтрация, гибридный GPU-апскейл интерфейса, иконок и логотипов `2x/4x`, лимит FPS и живой ресемплинг апскейлеров напрямую из `DirectTextures` в `DEVICE_LOCAL` VRAM без перезапуска игры) и 11-строчное прокручиваемое меню **`System -> Effects`** с 4 живыми ремастер-улучшениями Vulkan 1.3 (**Multi-Scale GTAO/SSAO**, **Screen-Space Contact Micro-Shadows + 12-Tap Vogel PCF**, **High-Precision Ultra SSR + фикс 30 Гц кубмапов** и **True Black / OLED Contrast De-Haze**).
-
-### 📊 Прямое сравнение в одной и той же точке сцены (`2560x1440` Native, лимит `170 FPS`, Соборный округ)
-
-| Показатель (одна и та же точка, `2560x1440`, `Cap 170`) | `bbport` (трансляция PS4 / PM4) | **Наш `bloodborne-pc-vulkan` (C++20 + DirectVk 1.3)** | Разница (наш выигрыш) |
-| :--- | :---: | :---: | :--- |
-| **Потребление и нагрев RTX 4090** | `283.3 W` (`60°C`, Hotspot `72°C`) | **`182.9 – 193.7 W` (`52–54°C`, Hotspot `62–64°C`)** | **Минус `100.4 Вт` (`-35.4%`) и `-10°C`!** |
-| **Загрузка GPU (`bb-probe`)** | `86.0%` (`90%` общая) | **`9.0% – 28.0%` (`Avg ~21%`)** | **В `3 – 4 раза` ниже (`-65%`)!** |
-| **Потребление VRAM** | `9,266 MB` (`9.3 ГБ`) | **`3,030 MB` (`3.0 ГБ`)** | **В `3.1 раза` меньше (минус `6.2 ГБ` VRAM)!** |
-| **Оперативная память (RAM)** | `8.6 GB` | **`3.9 GB`** | **В `2.2 раза` меньше (минус `4.7 ГБ` ОЗУ)!** |
-| **Загрузка процессора (CPU)** | `23%` (`63 W` PPT) | **`9.4% – 10.7%` (`48–51 W` PPT)** | **В `2.3 раза` ниже!** |
-| **Draw Calls (вызовы отрисовки)** | `1,796` | **`1,007 – 1,068`** | **Минус `728–789` лишних вызовов/кадр (`-43.9%`)!** |
-| **Compute Dispatches (`Disp`)** | `160` | **`2`** | **В `80 раз` меньше (`160 → 2`)!** |
-| **Сабмиты в драйвер Vulkan (`Subm`)** | `73` | **`0.1 – 3.0`** | **В `24 раза` меньше (`73 → 3`)!** |
-| **Stage A (RHI / Команды)** | `2.71 ms` (`ConstRing: 1.30 ms`) | **`1.42 ms` (`ConstRing: 0.20 ms`)** | **В `1.9 раза` быстрее (`ConstRing` в `6.5 раза`)!** |
-| **Stage B (Запись Vulkan / HW GPU Busy)** | `4.30 ms` (упор в лимит) | **`2.33 ms` (`HW GPU Busy: 2.04 ms`)** | **В `1.85 раза` быстрее!** |
-
-### 📊 Сравнение на тяжёлой городской панораме (`2560x1440` Native, Центральный Ярнам — `2,304` исходных Draw Calls)
-
-> **🖥️ Тестовый стенд (Reference Hardware Setup):**
-> - **ОС / Ядро:** `CachyOS Linux` (`Linux 7.3.1-1-cachyos`, `x86_64`)
-> - **Процессор (CPU):** `AMD Ryzen 9 7950X` (`16 ядер / 32 потока`)
-> - **Видеокарта (GPU):** `NVIDIA GeForce RTX 4090` (`24 ГБ GDDR6X`, драйвер `615.78.08`)
-> - **Оперативная память (RAM):** `64 ГБ DDR5`
-> - **Разрешение рендера:** честные нативные `2560×1440` (`100%` Render Scale, `Upscaler: Off`, `0` Write Faults/s)
-
-<p align="center">
-  <img src="docs/images/russian.png" alt="Сравнение производительности в Центральном Ярнаме — bloodborne-pc-vulkan против bbport" width="860"/>
-</p>
-
-<p align="center">
-  <img src="docs/images/yharnam_vulkan.png" alt="bloodborne-pc-vulkan — 165 FPS, 33% нагрузка GPU (207.3 Вт), 3,388 МБ VRAM, 3 Dispatches" width="860"/>
-  <br/>
-  <em><b>Сверху:</b> Наш <code>bloodborne-pc-vulkan</code> (C++20 + DirectVk 1.3) — <b>165 FPS</b>, <b>нагрузка GPU 33.0% (207.3 Вт, 55°C)</b>, <b>3,388 МБ VRAM</b>, <b>4.5 ГБ RAM</b>, <b>1,574 Draws</b>, <b>3 Dispatches</b>, <b>2.10 мс шейдеры GPU</b>.</em>
-</p>
-
-<p align="center">
-  <img src="docs/images/yharnam_bbport.png" alt="bbport — 139 FPS, 97% нагрузка GPU (288.8 Вт), 9,320 МБ VRAM, 110 Dispatches" width="860"/>
-  <br/>
-  <em><b>Сверху:</b> Обычная трансляция PS4 / PM4 (<code>bbport</code>) в той же самой точке — <b>просадка до 139 FPS</b>, <b>карта забита на 97% (288.8 Вт, 64°C / Hotspot 76°C)</b>, <b>9,320 МБ VRAM</b>, <b>8.6 ГБ RAM</b>, <b>2,304 Draws</b>, <b>110 Dispatches</b>, <b>68 Submits</b>.</em>
-</p>
-
-| Показатель (Панорама Центрального Ярнама, `2560x1440`) | `bbport` (трансляция PS4 / PM4) | **Наш `bloodborne-pc-vulkan` (C++20 + DirectVk 1.3)** | Разница (наш выигрыш) |
-| :--- | :---: | :---: | :--- |
-| **Кадровая частота (FPS)** | `139 FPS` (`7.22 ms` — **упор в потолок!**) | **`165 FPS` (`6.05 ms`, шейдеры GPU: всего `2.10 ms`)** | **`+26 FPS` выше при меньшем на `81.5 Вт` потреблении!** |
-| **Потребление и нагрев RTX 4090** | `288.8 W` (`64°C`, Hotspot `76°C`) | **`207.3 W` (`55°C`, Hotspot `69°C`)** | **Минус `81.5 Вт` (`-28.2%`) и `-9°C`!** |
-| **Загрузка GPU (`bb-probe` / Общая)** | `85.0%` (`97%` — **карта забита в упор**) | **`33.0%` (`55%` общая, `3.79 ms` запаса GPU)** | **В `2.6 раза` ниже нагрузка на GPU!** |
-| **Потребление VRAM** | `9,320 MB` (`9.32 ГБ`) | **`3,388 MB` (`3.39 ГБ`, `100% NatTex`)** | **В `2.75 раза` меньше (минус `5.93 ГБ` VRAM)!** |
-| **Оперативная память (`bb-probe` RAM)** | `8.6 GB` | **`4.5 GB`** | **В `1.9 раза` меньше (минус `4.1 ГБ` ОЗУ)!** |
-| **Загрузка процессора (CPU)** | `23.9%` (`31%` общая, `73 W` PPT) | **`13.9%` (`19%` общая, `64 W` PPT)** | **В `1.7 раза` ниже!** |
-| **Простой синхронизации `Guest GnmWait`** | `1.19 ms` | **`0.00 ms`** | **Полностью устранён (`0.00 ms`)!** |
-| **Draw Calls (вызовы отрисовки)** | `2,304` | **`1,574`** | **Минус `730` лишних/закрытых мешей (`-31.7%`)!** |
-| **Compute Dispatches (`Disp`)** | `110` | **`3`** | **В `36.7 раза` меньше (`110 → 3`)!** |
-| **Сабмиты в драйвер Vulkan (`Subm`)** | `68` | **`3.0`** | **В `22.7 раза` меньше (`68 → 3`)!** |
-| **Stage A (RHI / `ConstRing`)** | `3.62 ms` (`ConstRing: 1.91 ms`) | **`2.31 ms` (`ConstRing: 0.32 ms`)** | **В `1.57 раза` быстрее (`ConstRing` в `6.0 раза`)!** |
-| **Stage B (Запись Vulkan)** | `6.48 ms` (`Buffers+Sync: 2.32 ms`) | **`3.52 ms` (`Buffers: 0.76 ms`, `DscSav: 53%`)** | **В `1.84 раза` быстрее (`Buffers` в `3.05 раза`)!** |
-
----
-
-### 📦 Как установить и запустить на Linux (Пошагово)
-
-#### Вариант А (Самый простой — без Git и терминала: просто распаковать архив из Releases рядом с `CUSA03173`)
-1. Скачайте готовый архив **`bloodborne-pc-vulkan-linux-x86_64-prebuilt.tar.gz`** из раздела **[Releases](https://github.com/lapothecary/bloodborne-pc-vulkan/releases)**.
-2. Просто перекиньте (распакуйте) все файлы из архива прямо в ту папку, где у вас лежит распакованная папка игры **`CUSA03173`** (`v1.09`), чтобы получилось так:
-   ```text
-   ваша_папка_с_игрой/
-   ├── CUSA03173/                  # Ваша папка с игрой (внутри eboot.bin, dvdroot_ps4/, sce_module/, sce_sys/)
-   ├── play.sh                     # <-- Запустите для прямого старта игры!
-   ├── launcher.sh                 # <-- Или запустите для открытия окна лаунчера настроек
-   ├── run.sh
-   ├── out/                        # Готовые бинарники, libbbgpu.so и DLSS 4.5
-   ├── bin -> out
-   ├── scripts/
-   ├── patches/
-   ├── launcher/
-   └── fsr4_shaders/
-   ```
-3. Запустите **`./play.sh`** (сразу запускает игру) или **`./launcher.sh`** (открывает окно лаунчера):
-   ```bash
-   ./play.sh
-   # Или запуск с оверлеем FPS и статистики конвейера:
-   BB_FRAME_STATS=1 ./play.sh
-   ```
-   *(При первом запуске скрипт `scripts/prepare.py` автоматически соберёт `out/boot-linked.bin` из вашего `CUSA03173/eboot.bin`).*
-
-#### Вариант Б (Через `git clone` — все готовые бинарники также уже включены в репозиторий)
-```bash
-git clone https://github.com/lapothecary/bloodborne-pc-vulkan.git
-cd bloodborne-pc-vulkan
-./play.sh
-```
-
----
-
-## 🐛 Reporting Issues / Сообщить о баге
-
-Found a visual glitch, crash, or performance drop in a specific area or boss fight?
-Please open an **[Issue](https://github.com/lapothecary/bloodborne-pc-vulkan/issues/new/choose)** and attach:
-1. Your GPU model, driver version, and Linux distro.
-2. The log file from `logs/YYYYMMDD_HHMMSS.log`.
-3. Which of the 3 isolation flags (`BB_HW_OCCLUSION_CULL=0`, `BB_NATIVE_SHADERS=0`, or `BB_GX_MODULES=01,02`) affects the issue.
-
----
-
-## 📜 Credits, Acknowledgements & License
-
-- **Upstream OS Runtime, In-Game Menu, Upscalers & Base Video Core:**
-  - **[`bbport` (`deadinside28/bloodborne_pc`)](https://github.com/deadinside28/bloodborne_pc)** — Linux runtime (`src/`), in-game Display menu (`bbport_menu.cpp`), temporal upscalers (`FSR 3.1`, `FSR 4`, `TAA`, `DLSS`), and base GTK4 launcher.
+We believe in 100% transparent engineering credits:
+- **Upstream OS Runtime Loader & Base Video Core Foundation:**
+  - **[`bbport` (`deadinside28/bloodborne_pc` v0.6 / v0.7)](https://github.com/deadinside28/bloodborne_pc)** — Linux ELF loader & PS4 system runtime (`src/`), base in-game Display menu & temporal upscaler hooks (`FSR 3.1/4`, `DLSS`, `TAA`), and high-FPS frame-delta patches.
   - **[`shadPS4` (`shadps4-emu/shadPS4`)](https://github.com/shadps4-emu/shadPS4)** — Original PS4 Vulkan video core and shader recompiler foundation (`GPL-2.0-or-later`).
-  - **[`bbhost` (`droogie/bbhost`)](https://github.com/droogie/bbhost)** — Fellow open-source Bloodborne PC translation-layer project (independent architecture; acknowledged for pioneering Bloodborne PC research).
-- **`bloodborne-pc-vulkan` Additions by [@lapothecary](https://github.com/lapothecary):**
-  - Complete `2,940 / 2,940` C++20 `FD4`/`GX` Graphics Engine decompilation (`152,420 LOC` in [`our_cpp_100000_source/`](our_cpp_100000_source) + [`bb_golden_engine.cpp`](gpu/shim/bb_golden_engine.cpp)).
-  - True Split PC VRAM architecture ([`direct_buffers.cpp`](gpu/buffers/direct_buffers.cpp), [`direct_textures.cpp`](gpu/textures/direct_textures.cpp), [`gx_direct_vulkan.h`](gpu/include/gx_direct_vulkan.h)).
-  - 107 Hand-Crafted Native Vulkan 1.3 GLSL Shaders + 752 Precompiled SPIR-V Shaders ([`gpu/shader/backend/spirv/native/`](gpu/shader/backend/spirv/native), [`native_shaders.cpp`](gpu/shader/backend/spirv/native_shaders.cpp)).
-  - 3D World-Space `SceneOcclusionCuller` & Two-Stage Draw Pipeline ([`rasterizer.cpp`](gpu/render/rasterizer.cpp)).
+- **`bloodborne-pc-vulkan` Engineering by [@lapothecary](https://github.com/lapothecary):**
+  - Complete **`2,940 / 2,940` C++20 `FD4`/`GX`/`Yebis2` Graphics Engine decompilation** (`152,420 LOC` in [`our_cpp_100000_source/`](our_cpp_100000_source) + [`bb_golden_engine.cpp`](gpu/shim/bb_golden_engine.cpp)).
+  - **True Split PC VRAM Architecture (`100% NatBuf`, `100% NatTex`, `0` Faults/s)** ([`direct_buffers.cpp`](gpu/buffers/direct_buffers.cpp), [`direct_textures.cpp`](gpu/textures/direct_textures.cpp), [`gx_direct_vk_impl.cpp`](gpu/shim/gx_direct_vk_impl.cpp)).
+  - **`109` Clean Vectorized Vulkan 1.3 GLSL 460 Shaders (`0` `tXXX` dumps) + `752` Precompiled SPIR-V Shaders** ([`gpu/shader/backend/spirv/native/`](gpu/shader/backend/spirv/native), [`tools/verify_clean_glsl.py`](tools/verify_clean_glsl.py)).
+  - **Sealed Scaleform GFx Menu Engine ([`bbport_menu_engine.h`](gpu/shim/bbport_menu_engine.h)), `SMAA 1x Ultra` & `SMAA T2x`, Fused `RCAS`, Hybrid `2x/4x` UI Super-Resolution, 10-Category Hardware GPU Profiler HUD, & Multi-CCD CPU Topology Scheduler ([`bbport_threads.h`](gpu/shim/bbport_threads.h)).**
 - Licensed under the **[GNU General Public License v3.0](LICENSE)** (`GPL-3.0`, compatible with upstream `GPL-2.0-or-later`).

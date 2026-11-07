@@ -50,6 +50,9 @@ void bbgpu_add_event_filter(BbGpuEventFilter filter);
 typedef int (*BbGpuPointerQuery)(void);
 void bbgpu_add_pointer_query(BbGpuPointerQuery query);
 int bbgpu_pointer_wanted(void);
+/* A video (AvPlayer) playing now; bbgpu_video_skip stops it (1 when one was stopped). */
+int bbgpu_video_active(void);
+int bbgpu_video_skip(void);
 /* A module's changes to the pad state the game reads (runtime_pad.c, after the host's input and
  * the scripted one): the buttons (PS4 bits); the sticks (lx ly rx ry) as they are. Up to 4. */
 typedef void (*BbGpuPadFilter)(uint32_t *buttons, const uint8_t *sticks);

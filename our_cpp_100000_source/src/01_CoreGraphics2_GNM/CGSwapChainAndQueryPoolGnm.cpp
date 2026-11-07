@@ -351,7 +351,7 @@ int32_t CGSwapChainGnm_InitDisplayAndBackBuffers(
     float* lutR = lutBuf;
     float* lutG = lutBuf + 0x401;
     float* lutB = lutBuf + 0x802;
-    float* dstGamma = reinterpret_cast<float*>(self + 0x3c0);
+    float* dstGamma = reinterpret_cast<float*>(self + 0x3b8);
     constexpr float kInv1024 = 0.0009765625f;
     for (uint32_t i = 0; i < 0x401u; ++i) {
         float v = static_cast<float>(i) * kInv1024;

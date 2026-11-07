@@ -540,14 +540,18 @@ void Rasterizer::DirectCopyBuffers(std::span<const DirectCopyRegion> regions) {
             if (nat_dst) {
                 const VideoCore::Buffer* src_buf = nullptr;
                 u64 src_off = 0;
-                if (transient_buf && transient_idx >= 0) {
+                if ( transient_buf && transient_idx >= 0) {
                     const auto& slice = transient_slices[static_cast<size_t>(transient_idx)];
                     src_buf = transient_buf;
                     src_off = transient_base_off + slice.staging_rel_offset;
                 } else {
                     u64 src_sz = reg.byte_size;
-                    std::tie(src_buf, src_off) =
-                        direct_buffers.TryResolveReadClamped(reg.src_va, src_sz);
+                    if (reg.reserved != gx_direct_vk::kCopyFlagKnownCpuSource &&
+                        VideoCore::DirectBuffers::OverlapsNativeOwnedRange(reg.src_va,
+                                                                           reg.byte_size)) {
+                        std::tie(src_buf, src_off) =
+                            direct_buffers.TryResolveReadClamped(reg.src_va, src_sz);
+                    }
                     if (!src_buf || src_sz < reg.byte_size) {
                         std::tie(src_buf, src_off) =
                             buffer_cache.ObtainBuffer(reg.src_va, reg.byte_size, false);
@@ -655,7 +659,8 @@ void Rasterizer::DirectCopyBuffers(std::span<const DirectCopyRegion> regions) {
         texture_cache.InvalidateMemoryFromGPU(reg.dst_va, reg.byte_size);
         const VideoCore::Buffer* src_buf = nullptr;
         u64 src_off = 0;
-        if (n1_native_bufs) {
+        if (n1_native_bufs && reg.reserved != gx_direct_vk::kCopyFlagKnownCpuSource &&
+            VideoCore::DirectBuffers::OverlapsNativeOwnedRange(reg.src_va, reg.byte_size)) {
             u64 src_sz = reg.byte_size;
             std::tie(src_buf, src_off) = direct_buffers.TryResolveReadClamped(reg.src_va, src_sz);
             if (!src_buf || src_sz < reg.byte_size) {

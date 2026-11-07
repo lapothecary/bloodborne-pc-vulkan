@@ -184,6 +184,7 @@ void Scheduler::BeginRendering(const RenderState& state, u8 color_dont_care_mask
     resume_rendering = false;
     EndRendering();
     CarrySuspend(false);
+    GpuProfiler::HudOnBeginRendering(this);
     is_rendering = true;
     ++descriptor_state_epoch;
     render_state = state;

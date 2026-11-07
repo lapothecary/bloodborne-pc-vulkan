@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include <algorithm>
 #include <cctype>
+#include <mutex>
 #include <string_view>
 
+#include "bbgpu.h"
 #include "common/logging/log.h"
 #include "core/libraries/libs.h"
 #include "platform/avplayer/avplayer.h"
@@ -18,6 +20,8 @@ constexpr s32 ErrorOperationFailed = s32(0x806A0002);
 constexpr s32 ErrorNotSupported = s32(0x806A0004);
 
 using Handle = Player*;
+std::mutex active_mutex;
+Handle active_player = nullptr;
 
 /// From the file name's extension (a URI's query and fragment ignored).
 AvPlayerSourceType SourceTypeOf(std::string_view path) {
@@ -66,7 +70,10 @@ Handle PS4_SYSV_ABI sceAvPlayerInit(AvPlayerInitData* data) {
         LOG_ERROR(Lib_AvPlayer, "sceAvPlayerInit needs all four allocators");
         return nullptr;
     }
-    return new Player(*data);
+    auto* p = new Player(*data);
+    std::scoped_lock lock{active_mutex};
+    active_player = p;
+    return p;
 }
 
 s32 PS4_SYSV_ABI sceAvPlayerInitEx(const AvPlayerInitDataEx* data, Handle* player) {
@@ -81,6 +88,8 @@ s32 PS4_SYSV_ABI sceAvPlayerInitEx(const AvPlayerInitDataEx* data, Handle* playe
     init.num_output_video_framebuffers = data->num_output_video_framebuffers;
     init.auto_start = data->auto_start;
     *player = new Player(init);
+    std::scoped_lock lock{active_mutex};
+    active_player = *player;
     return BbErr::Ok;
 }
 
@@ -91,6 +100,12 @@ s32 PS4_SYSV_ABI sceAvPlayerPostInit(Handle player, AvPlayerPostInitData* data) 
 s32 PS4_SYSV_ABI sceAvPlayerClose(Handle player) {
     if (!player) {
         return ErrorInvalidParams;
+    }
+    {
+        std::scoped_lock lock{active_mutex};
+        if (active_player == player) {
+            active_player = nullptr;
+        }
     }
     delete player;
     return BbErr::Ok;
@@ -247,3 +262,17 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
 }
 
 } // namespace BbAvPlayer
+
+extern "C" int bbgpu_video_active(void) {
+    std::scoped_lock lock{BbAvPlayer::active_mutex};
+    return BbAvPlayer::active_player && BbAvPlayer::active_player->IsActive() ? 1 : 0;
+}
+
+extern "C" int bbgpu_video_skip(void) {
+    std::scoped_lock lock{BbAvPlayer::active_mutex};
+    if (!BbAvPlayer::active_player || !BbAvPlayer::active_player->IsActive()) {
+        return 0;
+    }
+    LOG_INFO(Lib_AvPlayer, "video skipped by the player");
+    return BbAvPlayer::active_player->Stop() ? 1 : 0;
+}

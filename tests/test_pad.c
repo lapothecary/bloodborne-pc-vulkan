@@ -10,6 +10,10 @@ int bbgpu_mouse_captured(void) { return 0; }
 void bbgpu_mouse_look_enable(int enabled) { (void)enabled; }
 void bbgpu_mouse_capture(void) {}
 int bbgpu_camera_look(float yaw, float pitch) { (void)yaw; (void)pitch; return 0; }
+int bbgpu_free_camera(void) { return 0; }
+int bbgpu_pointer_wanted(void) { return 0; }
+int bbgpu_video_active(void) { return 0; }
+int bbgpu_video_skip(void) { return 0; }
 void bbgpu_filter_pad(uint32_t *buttons, const uint8_t *sticks) { (void)buttons; (void)sticks; }
 void runtime_re_watch_tick(const void *pad_buffer, uint64_t reads) { (void)pad_buffer; (void)reads; }
 uintptr_t runtime_libc_base;
@@ -117,8 +121,9 @@ int main(void) {
     SDL_UpdateGamepads();
     assert(pad_read_state(1,&data)==0);
     assert(data.buttons==(BTN_CROSS|BTN_R2|BTN_R1) && data.r2==255);
-    assert(bindings[IN_CROSS].key_count==2 && bindings[IN_CROSS].keys[0]==SDL_SCANCODE_X &&
+    assert(bindings[IN_CROSS].key_count>=2 && bindings[IN_CROSS].keys[0]==SDL_SCANCODE_X &&
            bindings[IN_CROSS].keys[1]==SDL_SCANCODE_SPACE);
+    assert(bindings[IN_WALK].key_count==1 && bindings[IN_WALK].keys[0]==SDL_SCANCODE_LALT);
     SDL_CloseJoystick(joystick);
     if (gamepad) SDL_CloseGamepad(gamepad);
     gamepad=NULL;

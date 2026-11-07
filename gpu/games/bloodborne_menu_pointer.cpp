@@ -359,6 +359,12 @@ public:
         if (on("Widgets/Slider/Bar", 0.0f, &bounds)) {
             return x < bounds.CenterX() ? Left : Right;
         }
+        if (on("Widgets/ComboBox/LeftItem_0", 14.0f, &bounds)) {
+            return Left;
+        }
+        if (on("Widgets/ComboBox/RightItem_0", 14.0f, &bounds)) {
+            return Right;
+        }
         if (on("Widgets/ComboBox", 0.0f, &bounds)) {
             return x < bounds.CenterX() ? Left : Right;
         }

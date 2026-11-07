@@ -121,6 +121,8 @@ public:
     bool RedirectColor(VideoCore::ImageId color, const VideoCore::ImageViewInfo& view,
                        Target& target);
     bool RedirectDepth(VideoCore::ImageId depth, Target& target);
+    /// Whether `address` is the UI's colour target (the one RedirectColor redirects).
+    [[nodiscard]] bool IsUiColorAddress(VAddr address) const;
     /// A sampled image replaced by the upscaled frame (the display pass).
     bool RedirectSampled(VideoCore::ImageId image, const VideoCore::ImageViewInfo& info,
                          vk::ImageView& view, vk::ImageLayout& layout);
@@ -189,6 +191,11 @@ private:
     /// Available and switched on (menu setting, toggle 1 << 24).
     [[nodiscard]] bool Active() const;
     [[nodiscard]] bool ReactiveOn() const;
+    /// SMAA wanted on this frame's scene: aa_mode=smaa, no upscaler, a 3D scene.
+    [[nodiscard]] bool SmaaWanted() const;
+    /// Runs SMAA 1x on `color` (or its `scene_targets` proxy) and returns the smoothed image in
+    /// GENERAL layout (null if it could not run).
+    vk::Image RunSmaa(VideoCore::ImageId color, bool proxy = false);
     bool EnsureResources(u32 width, u32 height, u32 out_width, u32 out_height, bool hdr);
     void CreatePipelines();
     /// Records the reactive mask pass; false when there is no snapshot this frame.
@@ -288,6 +295,9 @@ private:
     bool resources_taa = false;
     std::unique_ptr<Fsr4Upscaler> fsr4;
     std::unique_ptr<class FrameGeneration> frame_generation;
+    /// aa_mode=smaa without an upscaler (RunSmaa); made on first use.
+    std::unique_ptr<class Smaa> smaa;
+    bool smaa_done = false; ///< this frame's SMAA ran at the game's own size (OnDraw)
     bool hudless_taken = false; ///< this frame's UI-less image went to frame generation
     /// Inputs of this frame's scaled run, for frame generation (CaptureFrameGenScene).
     void CaptureFrameGenScene(vk::Image depth_image, vk::Format depth_format, u32 w, u32 h, u32 ow,

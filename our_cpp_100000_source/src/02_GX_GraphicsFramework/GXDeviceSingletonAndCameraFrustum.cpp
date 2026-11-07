@@ -818,12 +818,16 @@ void GXDevice_SetDisplayConfigFlags100(uint8_t* pDevice, uint32_t flags) {
  */
 void GXDevice_SetGammaCurveParams(uint8_t* pDevice, const uint64_t* pGammaSource) {
     uint64_t w2 = pGammaSource[3];
-    *(uint64_t*)(pDevice + 0x3c8) = w2;
     uint64_t w0 = pGammaSource[1];
     uint64_t w1 = pGammaSource[2];
-    *(uint64_t*)(pDevice + 0x3c0) = w1;
-    *(uint64_t*)(pDevice + 0x3b8) = w0;
-    pDevice[0x3ab] = 1;
+    if (*(const uint64_t*)(pDevice + 0x3b8) != w0 ||
+        *(const uint64_t*)(pDevice + 0x3c0) != w1 ||
+        *(const uint64_t*)(pDevice + 0x3c8) != w2) {
+        *(uint64_t*)(pDevice + 0x3c8) = w2;
+        *(uint64_t*)(pDevice + 0x3c0) = w1;
+        *(uint64_t*)(pDevice + 0x3b8) = w0;
+        pDevice[0x3ab] = 1;
+    }
 }
 
 /**
@@ -3554,6 +3558,7 @@ void GXDevice_Construct(uint8_t* pDevice) {
     for (size_t offset = 0x3b8; offset <= 0x3cc; offset += 4) {
         *reinterpret_cast<uint32_t*>(pDevice + offset) = 0x400ccccdu;
     }
+    pDevice[0x3ab] = 1;
 
     GXDevice_InitEmbeddedHeapState(pDevice + 0x3d0);
     GXDevice_InitEmbeddedHeapState(pDevice + 0x4d8);
