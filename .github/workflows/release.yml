@@ -106,21 +106,31 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: Cache Windows GPU Build (build_win32_gpu)
+        uses: actions/cache@v4
+        with:
+          path: build_win32_gpu
+          key: win32-gpu-build-${{ hashFiles('gpu/CMakeLists.txt', 'gpu/shim/**', 'gpu/render/**', 'gpu/memory/**', 'gpu/shaders/**') }}
+          restore-keys: |
+            win32-gpu-build-
+
       - name: Build Windows x86_64 bb-probe.exe & bb-gpu-capabilities.exe
         run: |
           if [ ! -f our_cpp_100000_source/build_win32/libbb_gx_engine_native.a ]; then
             python3 tools/build_gx_win32_coff.py
           fi
-          if ! cmake -S gpu -B build_win32_gpu -G Ninja \
-            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-            -DBB_LTO=OFF -DBB_PGO=off -DBB_NET=OFF > cmake_win32.log 2>&1; then
+          if [ ! -f build_win32_gpu/build.ninja ]; then
+            if ! cmake -S gpu -B build_win32_gpu -G Ninja \
+              -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+              -DBB_LTO=OFF -DBB_PGO=off -DBB_NET=OFF > cmake_win32.log 2>&1; then
+              cat cmake_win32.log
+              grep -E "CMake Error|error:|not found|Could NOT" cmake_win32.log | head -n 15 | while IFS= read -r line; do
+                echo "::error::CMAKE: $line"
+              done
+              exit 1
+            fi
             cat cmake_win32.log
-            grep -E "CMake Error|error:|not found|Could NOT" cmake_win32.log | head -n 15 | while IFS= read -r line; do
-              echo "::error::CMAKE: $line"
-            done
-            exit 1
           fi
-          cat cmake_win32.log
           if ! ninja -C build_win32_gpu bb-probe > ninja_win32.log 2>&1; then
             tail -n 120 ninja_win32.log
             grep -E "error:|undefined symbol:|ld.lld: error:|FAILED:" ninja_win32.log | head -n 15 | while IFS= read -r line; do
@@ -131,61 +141,10 @@ jobs:
           clang -std=c11 -O2 -Wall -Wextra -I/clang64/include tools/gpu_capabilities.c \
             -L/clang64/lib -lvulkan-1 -lSDL3 -o build_win32_gpu/bb-gpu-capabilities.exe
 
-      - name: Build Windows WPF Launcher (Bloodborne.exe) & Runner (bbport-run.exe)
+      - name: Build Windows WPF Launcher, Freeze Runner & Package ZIP
         shell: pwsh
         run: |
-          $env:DOTNET_CLI_TELEMETRY_OPTOUT = "1"
-          $env:DOTNET_NOLOGO = "1"
-          dotnet publish launcher/windows -c Release -r win-x64 --self-contained true `
-            -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true `
-            -p:EnableCompressionInSingleFile=true -p:DebugType=none -o dist_win/wpf
-          python -m pip install --upgrade pip pyinstaller
-          $hidden = @(
-            "argparse","base64","bisect","collections","contextlib","glob","hashlib","json",
-            "math","re","shutil","struct","tempfile","zlib","io","runpy","xml.etree.ElementTree",
-            "ctypes.wintypes","socket","urllib.request","urllib.error","http.server",
-            "socketserver","secrets","uuid","traceback","datetime","threading"
-          ) | ForEach-Object { "--hidden-import", $_ }
-          python -m PyInstaller --noconfirm --clean --log-level WARN --console --name bbport-run `
-            --icon packaging/bbport.ico --distpath dist_win/pyi-dist --workpath dist_win/pyi-work `
-            --specpath dist_win/pyi-work --paths . --paths scripts --hidden-import run `
-            @hidden launcher/bbport_launcher_win.py
-
-      - name: Package bloodborne-pc-vulkan-windows-x86_64-prebuilt.zip
-        run: |
-          stage="dist_win/bloodborne-pc-vulkan-windows"
-          rm -rf "$stage"
-          mkdir -p "$stage/bin" "$stage/launcher" "$stage/scripts/bbsc_gameserver"
-          cp -r dist_win/pyi-dist/bbport-run/. "$stage/"
-          cp dist_win/wpf/Bloodborne.exe "$stage/"
-          cp play.bat run.py LICENSE "$stage/"
-          cp packaging/windows/README-Windows.txt "$stage/" 2>/dev/null || true
-          cp launcher/bloodborne.ico launcher/bloodborne.png "$stage/launcher/" 2>/dev/null || true
-          cp scripts/*.py "$stage/scripts/"
-          cp scripts/bbsc_gameserver/* "$stage/scripts/bbsc_gameserver/" 2>/dev/null || true
-          cp -r patches "$stage/"
-          [ -d fsr4_shaders ] && cp -r fsr4_shaders "$stage/"
-          llvm-strip --strip-debug -o "$stage/bin/bb-probe.exe" build_win32_gpu/bb-probe.exe
-          llvm-strip --strip-debug -o "$stage/bin/bb-gpu-capabilities.exe" build_win32_gpu/bb-gpu-capabilities.exe
-          queue=("$stage/bin/bb-probe.exe" "$stage/bin/bb-gpu-capabilities.exe")
-          declare -A seen
-          while ((${#queue[@]})); do
-            file="${queue[0]}"
-            queue=("${queue[@]:1}")
-            for dll in $(llvm-objdump -p "$file" | sed -n 's/^ *DLL Name: //p'); do
-              key="${dll,,}"
-              [[ -n "${seen[$key]:-}" ]] && continue
-              seen[$key]=1
-              found=$(find /clang64/bin -maxdepth 1 -iname "$dll" -print -quit)
-              if [[ -n "$found" ]]; then
-                cp "$found" "$stage/bin/"
-                queue+=("$found")
-              fi
-            done
-          done
-          rm -f "$stage/bin/vulkan-1.dll"
-          (cd dist_win && zip -qr ../bloodborne-pc-vulkan-windows-x86_64-prebuilt.zip bloodborne-pc-vulkan-windows)
-          sha256sum bloodborne-pc-vulkan-windows-x86_64-prebuilt.zip > bloodborne-pc-vulkan-windows-x86_64-prebuilt.zip.sha256
+          python tools/package_win32_release.py
 
       - name: Upload Windows x86_64 Asset to GitHub Release
         uses: softprops/action-gh-release@v2
