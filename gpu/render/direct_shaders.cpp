@@ -263,9 +263,10 @@ void InitializeManifestLibrary() noexcept {
         g_manifest_spv_verified.store(spv_ok, std::memory_order_release);
         g_manifest_raw_verified.store(raw_ok, std::memory_order_release);
 
+        const std::string root_str = have_root ? g_shaders_root.string() : "<embedded-manifest-only>";
         std::printf("[bb_vulkan] V4.1 Direct Shader Manifest: indexed %u/%u core shaders in O(1) "
                     "(archive=%s, verified %u .spv + %u raw Shdr containers)\n",
-                    count, count, have_root ? g_shaders_root.c_str() : "<embedded-manifest-only>",
+                    count, count, root_str.c_str(),
                     spv_ok, raw_ok);
         std::fflush(stdout);
     });
