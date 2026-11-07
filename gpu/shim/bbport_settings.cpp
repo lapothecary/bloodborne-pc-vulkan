@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -724,7 +725,11 @@ void Save() {
     FILE* file = std::fopen(temporary.c_str(), "w");
     bool ok = file && std::fwrite(out.data(), 1, out.size(), file) == out.size();
     ok = file && std::fclose(file) == 0 && ok;
-    if (!ok || std::rename(temporary.c_str(), Path()) != 0) {
+    std::error_code ec;
+    if (ok) {
+        std::filesystem::rename(temporary, Path(), ec);
+    }
+    if (!ok || ec) {
         std::printf("Settings: cannot write %s\n", Path());
     } else if (runtime_pad_reload_bindings) {
         runtime_pad_reload_bindings();

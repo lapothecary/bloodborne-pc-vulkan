@@ -27,35 +27,24 @@ jobs:
             fsr4_shaders
           sha256sum bloodborne-pc-vulkan-linux-x86_64-prebuilt.tar.gz > bloodborne-pc-vulkan-linux-x86_64-prebuilt.tar.gz.sha256
 
-      - name: Create GitHub Release
+      - name: Create or Update GitHub Release (Linux x86_64)
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name }}
-          name: "Bloodborne PC Vulkan ${{ github.ref_name }} (Linux x86_64 Prebuilt — Up to 651 Avg FPS, 2,940 C++20 Engine + 109 Clean GLSL Shaders)"
+          tag_name: ${{ github.ref_name || 'v1.1.0' }}
+          name: "Bloodborne PC Vulkan ${{ github.ref_name || 'v1.1.0' }} (Linux & Windows x86_64 Prebuilt — Up to 651 Avg FPS, 2,940 C++20 Engine + 109 Clean GLSL Shaders)"
           body: |
-            ## Bloodborne PC Vulkan ${{ github.ref_name }} — Linux `x86_64` Prebuilt Release
+            ## Bloodborne PC Vulkan ${{ github.ref_name || 'v1.1.0' }} — Linux & Windows `x86_64` Prebuilt Release
 
             ### ⚡ 30-Second Quick Start (Just Unpack Next to `CUSA03173` & Play)
-            1. Download **`bloodborne-pc-vulkan-linux-x86_64-prebuilt.tar.gz`** below.
-            2. Extract all files directly into the folder where your unpacked **`CUSA03173`** (`v1.09` GOTY) folder sits:
-               ```text
-               BloodBorne/
-               ├── CUSA03173/       # Your unpacked Bloodborne v1.09 folder (eboot.bin, dvdroot_ps4/, ...)
-               ├── play.sh          # <-- Double-click or run ./play.sh to start the game directly!
-               ├── launcher.sh      # <-- Or run ./launcher.sh to open the 8-page GUI Settings Launcher
-               ├── run.sh
-               ├── out/
-               ├── bin -> out
-               ├── scripts/
-               ├── patches/
-               ├── launcher/
-               └── fsr4_shaders/
-               ```
-            3. Run **`./play.sh`** (or **`./launcher.sh`**). Press **`F8`** in-game to toggle the 10-pass hardware GPU/CPU telemetry HUD.
+            - **Linux (`x86_64`)**: Download **`bloodborne-pc-vulkan-linux-x86_64-prebuilt.tar.gz`**, extract next to your **`CUSA03173`** (`v1.09` GOTY) folder, and run **`./play.sh`** (or **`./launcher.sh`**).
+            - **Windows 10/11 (`x86_64`)**: Download **`bloodborne-pc-vulkan-windows-x86_64-prebuilt.zip`**, extract next to your **`CUSA03173`** (`v1.09` GOTY) folder, and double-click **`play.bat`** (or **`Bloodborne.exe`** for the GUI Launcher).
+            - Press **`F8`** in-game to toggle the 10-pass hardware GPU/CPU telemetry HUD.
 
             ---
 
-            ### 🔥 What's New in `${{ github.ref_name }}`:
+            ### 🔥 What's New in `${{ github.ref_name || 'v1.1.0' }}`:
+            - **Native Windows 10/11 `x86_64` Port (`bb-probe.exe` + `Bloodborne.exe` WPF Launcher + `play.bat`)**:
+              - All `2,940 / 2,940` decompiled C++20 engine functions (`102,597` LOC) compiled into a zero-relocation Windows `COFF64` library (`libbb_gx_engine_native.a`) with explicit `sysv_abi` ↔ Win64 `ms_abi` bridge and Windows TEB `gs:[0x1480 + 8*slot]` guest TLS.
             - **Up to `651 Avg FPS (1.54 ms)` & `1.17 ms` Total Hardware GPU Render Time at `2560×1440` Native**:
               - **`100% NatBuf` & `100% NatTex` (`0` Page Faults/s)**: `4 MiB` in-pass dynamic buffer renaming (`GXDynamicBufferRingOwner`), unified graphics push-descriptor `VkPipelineLayout` (`DscSav: 62%`), and dirty-gated `3×1025×1 R32F` gamma LUT uploads.
               - **Physical-Core #0 `MOMainThread` Isolation + Zero-Runqueue-Stall `CCD0` Worker Pool (`bbport_threads.h`)**: Reaches `595–651 FPS` at `2560×1440` with CPU running at a cool **`4.48 GHz` (`57°C`, `57 W` PPT)** and **`2.27 GB` VRAM / `2.8 GB` RAM**.
@@ -70,3 +59,147 @@ jobs:
           files: |
             bloodborne-pc-vulkan-linux-x86_64-prebuilt.tar.gz
             bloodborne-pc-vulkan-linux-x86_64-prebuilt.tar.gz.sha256
+
+  release-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup MSYS2 CLANG64
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: CLANG64
+          update: true
+          install: >-
+            git
+            zip
+            mingw-w64-clang-x86_64-clang
+            mingw-w64-clang-x86_64-lld
+            mingw-w64-clang-x86_64-cmake
+            mingw-w64-clang-x86_64-ninja
+            mingw-w64-clang-x86_64-pkgconf
+            mingw-w64-clang-x86_64-glslang
+            mingw-w64-clang-x86_64-spirv-tools
+            mingw-w64-clang-x86_64-vulkan-headers
+            mingw-w64-clang-x86_64-vulkan-loader
+            mingw-w64-clang-x86_64-vulkan-memory-allocator
+            mingw-w64-clang-x86_64-sdl3
+            mingw-w64-clang-x86_64-ffmpeg
+            mingw-w64-clang-x86_64-fmt
+            mingw-w64-clang-x86_64-boost
+            mingw-w64-clang-x86_64-robin-map
+            mingw-w64-clang-x86_64-xxhash
+            mingw-w64-clang-x86_64-miniz
+            mingw-w64-clang-x86_64-zydis
+            mingw-w64-clang-x86_64-python
+
+      - name: Setup .NET 9 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0.x'
+
+      - name: Setup Windows Python 3.12 for PyInstaller
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Fetch third-party submodules & apply FSR-Vulkan patches
+        run: |
+          if [ ! -f gpu/third_party/fsr-vulkan/CMakeLists.txt ]; then
+            rm -rf gpu/third_party/fsr-vulkan
+            git clone https://github.com/FireBurn/FSR-Vulkan.git gpu/third_party/fsr-vulkan
+            git -C gpu/third_party/fsr-vulkan checkout c64f093404125e960813f95f1996c14780f0dd69
+            for p in gpu/patches/fsr-vulkan/*.patch; do
+              git -C gpu/third_party/fsr-vulkan apply "$PWD/$p"
+            done
+          fi
+          if [ ! -f gpu/third_party/imgui/imgui.h ]; then
+            rm -rf gpu/third_party/imgui
+            git clone https://github.com/ocornut/imgui.git gpu/third_party/imgui
+            git -C gpu/third_party/imgui checkout f1cc2ae15e53a861a874c3034aae6798fde194ab
+          fi
+          if [ ! -d third_party/LibAtrac9/C/src ]; then
+            rm -rf third_party/LibAtrac9
+            git clone https://github.com/Thealexbarney/LibAtrac9.git third_party/LibAtrac9
+            git -C third_party/LibAtrac9 checkout efca2e3af35562a09a9bb6deed90e45b4b824dc4
+          fi
+
+      - name: Build Windows x86_64 bb-probe.exe & bb-gpu-capabilities.exe
+        run: |
+          if [ ! -f our_cpp_100000_source/build_win32/libbb_gx_engine_native.a ]; then
+            python3 tools/build_gx_win32_coff.py
+          fi
+          cmake -S gpu -B build_win32_gpu -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DBB_LTO=OFF -DBB_PGO=off -DBB_NET=OFF
+          ninja -C build_win32_gpu bb-probe
+          clang -std=c11 -O2 -Wall -Wextra -I/clang64/include tools/gpu_capabilities.c \
+            -L/clang64/lib -lvulkan-1 -lSDL3 -o build_win32_gpu/bb-gpu-capabilities.exe
+
+      - name: Build Windows WPF Launcher (Bloodborne.exe) & Runner (bbport-run.exe)
+        shell: pwsh
+        run: |
+          $env:DOTNET_CLI_TELEMETRY_OPTOUT = "1"
+          $env:DOTNET_NOLOGO = "1"
+          dotnet publish launcher/windows -c Release -r win-x64 --self-contained true `
+            -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true `
+            -p:EnableCompressionInSingleFile=true -p:DebugType=none -o dist_win/wpf
+          python -m pip install --upgrade pip pyinstaller
+          $hidden = @(
+            "argparse","base64","bisect","collections","contextlib","glob","hashlib","json",
+            "math","re","shutil","struct","tempfile","zlib","io","runpy","xml.etree.ElementTree",
+            "ctypes.wintypes","socket","urllib.request","urllib.error","http.server",
+            "socketserver","secrets","uuid","traceback","datetime","threading"
+          ) | ForEach-Object { "--hidden-import", $_ }
+          python -m PyInstaller --noconfirm --clean --log-level WARN --console --name bbport-run `
+            --icon packaging/bbport.ico --distpath dist_win/pyi-dist --workpath dist_win/pyi-work `
+            --specpath dist_win/pyi-work --paths . --paths scripts --hidden-import run `
+            @hidden launcher/bbport_launcher_win.py
+
+      - name: Package bloodborne-pc-vulkan-windows-x86_64-prebuilt.zip
+        run: |
+          stage="dist_win/bloodborne-pc-vulkan-windows"
+          rm -rf "$stage"
+          mkdir -p "$stage/bin" "$stage/launcher" "$stage/scripts/bbsc_gameserver"
+          cp -r dist_win/pyi-dist/bbport-run/. "$stage/"
+          cp dist_win/wpf/Bloodborne.exe "$stage/"
+          cp play.bat run.py LICENSE "$stage/"
+          cp packaging/windows/README-Windows.txt "$stage/" 2>/dev/null || true
+          cp launcher/bloodborne.ico launcher/bloodborne.png "$stage/launcher/" 2>/dev/null || true
+          cp scripts/*.py "$stage/scripts/"
+          cp scripts/bbsc_gameserver/* "$stage/scripts/bbsc_gameserver/" 2>/dev/null || true
+          cp -r patches "$stage/"
+          [ -d fsr4_shaders ] && cp -r fsr4_shaders "$stage/"
+          llvm-strip --strip-debug -o "$stage/bin/bb-probe.exe" build_win32_gpu/bb-probe.exe
+          llvm-strip --strip-debug -o "$stage/bin/bb-gpu-capabilities.exe" build_win32_gpu/bb-gpu-capabilities.exe
+          queue=("$stage/bin/bb-probe.exe" "$stage/bin/bb-gpu-capabilities.exe")
+          declare -A seen
+          while ((${#queue[@]})); do
+            file="${queue[0]}"
+            queue=("${queue[@]:1}")
+            for dll in $(llvm-objdump -p "$file" | sed -n 's/^ *DLL Name: //p'); do
+              key="${dll,,}"
+              [[ -n "${seen[$key]:-}" ]] && continue
+              seen[$key]=1
+              found=$(find /clang64/bin -maxdepth 1 -iname "$dll" -print -quit)
+              if [[ -n "$found" ]]; then
+                cp "$found" "$stage/bin/"
+                queue+=("$found")
+              fi
+            done
+          done
+          rm -f "$stage/bin/vulkan-1.dll"
+          (cd dist_win && zip -qr ../bloodborne-pc-vulkan-windows-x86_64-prebuilt.zip bloodborne-pc-vulkan-windows)
+          sha256sum bloodborne-pc-vulkan-windows-x86_64-prebuilt.zip > bloodborne-pc-vulkan-windows-x86_64-prebuilt.zip.sha256
+
+      - name: Upload Windows x86_64 Asset to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name || 'v1.1.0' }}
+          files: |
+            bloodborne-pc-vulkan-windows-x86_64-prebuilt.zip
+            bloodborne-pc-vulkan-windows-x86_64-prebuilt.zip.sha256

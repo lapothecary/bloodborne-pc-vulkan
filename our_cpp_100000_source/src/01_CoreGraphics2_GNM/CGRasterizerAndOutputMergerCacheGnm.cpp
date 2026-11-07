@@ -17,7 +17,7 @@
 namespace Bloodborne::CoreGraphics2::Gnm {
 
 extern "C" {
-extern uintptr_t g_eboot_live_slide;
+__attribute__((visibility("hidden"))) extern uintptr_t g_eboot_live_slide;
 
 #define DEFINE_EBOOT_TRAMPOLINE(sym_name, vma_hex, ret_type, ...) \
     __attribute__((weak, naked, used, visibility("hidden"))) ret_type sym_name(__VA_ARGS__) { \

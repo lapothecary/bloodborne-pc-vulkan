@@ -2157,7 +2157,7 @@ void Manager::ProcessEvents(Core::MemoryManager* memory) {
 
 extern "C" {
 
-void bb_direct_vk_note_fresh_gpu_range(const void* gpu_addr, uint64_t byte_size) noexcept {
+void PS4_SYSV_ABI bb_direct_vk_note_fresh_gpu_range(const void* gpu_addr, uint64_t byte_size) noexcept {
     if (!gpu_addr || byte_size == 0) {
         return;
     }
@@ -2192,7 +2192,7 @@ void bb_direct_vk_note_fresh_gpu_range(const void* gpu_addr, uint64_t byte_size)
     Vulkan::DirectShaders::InvalidateRange(addr, byte_size);
 }
 
-void bb_direct_vk_prepare_buffer_write(const void* gpu_addr, uint64_t byte_size) noexcept {
+void PS4_SYSV_ABI bb_direct_vk_prepare_buffer_write(const void* gpu_addr, uint64_t byte_size) noexcept {
     if (!gpu_addr || byte_size == 0) {
         return;
     }
@@ -2206,17 +2206,17 @@ void bb_direct_vk_prepare_buffer_write(const void* gpu_addr, uint64_t byte_size)
     }
 }
 
-void bb_direct_vk_note_asset_buffer_write(const void* gpu_addr, uint64_t byte_size) noexcept {
+void PS4_SYSV_ABI bb_direct_vk_note_asset_buffer_write(const void* gpu_addr, uint64_t byte_size) noexcept {
     if (!gpu_addr || byte_size == 0) {
         return;
     }
     runtime_memory_note_write(reinterpret_cast<uintptr_t>(gpu_addr), byte_size);
 }
 
-void bb_direct_vk_note_exact_buffer_alloc(const void* gpu_addr,
-                                          uint32_t raw_byte_size,
-                                          uint32_t alloc_byte_size,
-                                          uint32_t is_native_owned) noexcept {
+void PS4_SYSV_ABI bb_direct_vk_note_exact_buffer_alloc(const void* gpu_addr,
+                                                       uint32_t raw_byte_size,
+                                                       uint32_t alloc_byte_size,
+                                                       uint32_t is_native_owned) noexcept {
     if (!gpu_addr || raw_byte_size == 0) {
         return;
     }
@@ -2231,11 +2231,11 @@ void bb_direct_vk_note_exact_buffer_alloc(const void* gpu_addr,
                                                     is_native_owned != 0u);
 }
 
-void bb_direct_vk_register_immutable_buffer(uint32_t resource_id,
-                                            const void* gpu_addr,
-                                            uint32_t raw_byte_size,
-                                            uint32_t alloc_byte_size,
-                                            uint32_t bind_flags) noexcept {
+void PS4_SYSV_ABI bb_direct_vk_register_immutable_buffer(uint32_t resource_id,
+                                                         const void* gpu_addr,
+                                                         uint32_t raw_byte_size,
+                                                         uint32_t alloc_byte_size,
+                                                         uint32_t bind_flags) noexcept {
     if (!gpu_addr || raw_byte_size == 0) {
         return;
     }
@@ -2260,13 +2260,13 @@ void bb_direct_vk_register_immutable_buffer(uint32_t resource_id,
     VideoCore::DirectBuffers::PushEvent(ev);
 }
 
-void bb_direct_vk_register_native_buffer(uint32_t resource_id,
-                                         const void* gpu_addr,
-                                         uint32_t raw_byte_size,
-                                         uint32_t alloc_byte_size,
-                                         uint32_t bind_flags,
-                                         uint32_t usage_type,
-                                         uint32_t has_initial_data) noexcept {
+void PS4_SYSV_ABI bb_direct_vk_register_native_buffer(uint32_t resource_id,
+                                                      const void* gpu_addr,
+                                                      uint32_t raw_byte_size,
+                                                      uint32_t alloc_byte_size,
+                                                      uint32_t bind_flags,
+                                                      uint32_t usage_type,
+                                                      uint32_t has_initial_data) noexcept {
     if (!gpu_addr || raw_byte_size == 0) {
         return;
     }
@@ -2293,7 +2293,7 @@ void bb_direct_vk_register_native_buffer(uint32_t resource_id,
     VideoCore::DirectBuffers::PushEvent(ev);
 }
 
-void bb_direct_vk_retire_buffer_range(const void* gpu_addr, uint64_t byte_size) noexcept {
+void PS4_SYSV_ABI bb_direct_vk_retire_buffer_range(const void* gpu_addr, uint64_t byte_size) noexcept {
     if (!gpu_addr || byte_size == 0) {
         return;
     }
@@ -2329,7 +2329,7 @@ void bb_direct_vk_retire_buffer_range(const void* gpu_addr, uint64_t byte_size) 
     VideoCore::DirectBuffers::PushEvent(ev);
 }
 
-void bb_direct_vk_register_transient_cue_heap(const void* gpu_addr, uint64_t byte_size) noexcept {
+void PS4_SYSV_ABI bb_direct_vk_register_transient_cue_heap(const void* gpu_addr, uint64_t byte_size) noexcept {
     if (!gpu_addr || byte_size == 0) {
         return;
     }
@@ -2337,7 +2337,7 @@ void bb_direct_vk_register_transient_cue_heap(const void* gpu_addr, uint64_t byt
                                                        byte_size);
 }
 
-void bb_direct_vk_register_transient_cpu_ring(const void* gpu_addr, uint64_t byte_size) noexcept {
+void PS4_SYSV_ABI bb_direct_vk_register_transient_cpu_ring(const void* gpu_addr, uint64_t byte_size) noexcept {
     if (!gpu_addr || byte_size == 0) {
         return;
     }

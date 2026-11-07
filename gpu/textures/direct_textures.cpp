@@ -256,12 +256,12 @@ u16 UnpackAndCleanSrv(Gcn::Image& tsharp, u8& out_gen8) noexcept {
 
 } // namespace VideoCore::DirectTextures
 
-extern "C" void bb_direct_vk_retire_buffer_range(const void* gpu_addr, uint64_t byte_size) noexcept;
-extern "C" void bb_direct_vk_retire_shader_range(const void* gpu_addr, uint64_t byte_size) noexcept;
+extern "C" void PS4_SYSV_ABI bb_direct_vk_retire_buffer_range(const void* gpu_addr, uint64_t byte_size) noexcept;
+extern "C" void PS4_SYSV_ABI bb_direct_vk_retire_shader_range(const void* gpu_addr, uint64_t byte_size) noexcept;
 
 extern "C" {
 
-void bb_direct_vk_prepare_texture_write(const void* gpu_addr, uint64_t byte_size) noexcept {
+void PS4_SYSV_ABI bb_direct_vk_prepare_texture_write(const void* gpu_addr, uint64_t byte_size) noexcept {
     if (!gpu_addr || byte_size == 0) {
         return;
     }
@@ -273,7 +273,7 @@ void bb_direct_vk_prepare_texture_write(const void* gpu_addr, uint64_t byte_size
     }
 }
 
-void bb_direct_vk_unwatch_texture_range(const void* gpu_addr, uint64_t byte_size) noexcept {
+void PS4_SYSV_ABI bb_direct_vk_unwatch_texture_range(const void* gpu_addr, uint64_t byte_size) noexcept {
     if (!gpu_addr || byte_size == 0) {
         return;
     }
@@ -285,7 +285,7 @@ void bb_direct_vk_unwatch_texture_range(const void* gpu_addr, uint64_t byte_size
     }
 }
 
-void bb_direct_vk_retire_gpu_range(const void* gpu_addr, uint64_t byte_size) noexcept {
+void PS4_SYSV_ABI bb_direct_vk_retire_gpu_range(const void* gpu_addr, uint64_t byte_size) noexcept {
     if (!gpu_addr || byte_size == 0) {
         return;
     }
@@ -308,11 +308,11 @@ void bb_direct_vk_retire_gpu_range(const void* gpu_addr, uint64_t byte_size) noe
     bb_direct_vk_retire_shader_range(gpu_addr, byte_size);
 }
 
-void bb_direct_vk_register_asset_texture(uint32_t resource_id,
-                                         const void* tsharp_8dw,
-                                         uint32_t raw_byte_size,
-                                         uint32_t alloc_byte_size,
-                                         uint32_t is_immutable) noexcept {
+void PS4_SYSV_ABI bb_direct_vk_register_asset_texture(uint32_t resource_id,
+                                                      const void* tsharp_8dw,
+                                                      uint32_t raw_byte_size,
+                                                      uint32_t alloc_byte_size,
+                                                      uint32_t is_immutable) noexcept {
     if (!tsharp_8dw || raw_byte_size == 0) {
         return;
     }
@@ -327,13 +327,13 @@ void bb_direct_vk_register_asset_texture(uint32_t resource_id,
     VideoCore::DirectTextures::PushEvent(ev);
 }
 
-void bb_direct_vk_register_native_sampler(void* ssharp_4dw) noexcept {
+void PS4_SYSV_ABI bb_direct_vk_register_native_sampler(void* ssharp_4dw) noexcept {
     (void)VideoCore::DirectTextures::RegisterNativeSampler(ssharp_4dw);
 }
 
-void bb_direct_vk_register_native_srv(void* tsharp_8dw,
-                                      uint32_t resource_id,
-                                      uint32_t is_immutable) noexcept {
+void PS4_SYSV_ABI bb_direct_vk_register_native_srv(void* tsharp_8dw,
+                                                   uint32_t resource_id,
+                                                   uint32_t is_immutable) noexcept {
     (void)VideoCore::DirectTextures::RegisterNativeSrv(tsharp_8dw, resource_id, is_immutable != 0u);
 }
 

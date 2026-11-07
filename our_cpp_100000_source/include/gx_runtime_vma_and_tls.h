@@ -14,8 +14,21 @@
 #include <cstddef>
 #include <cstdint>
 
+#if defined(_WIN32) || defined(GX_TARGET_WINDOWS_MINGW)
+#define GX_SYSV_ABI __attribute__((sysv_abi))
+#else
+#define GX_SYSV_ABI
+#endif
+
+#if defined(GX_STANDALONE_TEST)
+#define GX_HOST_IMPORT __attribute__((weak)) GX_SYSV_ABI
+#else
+#define GX_HOST_IMPORT __attribute__((visibility("hidden"))) GX_SYSV_ABI
+#endif
+
 extern "C" {
 __attribute__((visibility("hidden"))) extern uintptr_t g_eboot_live_slide;
+__attribute__((visibility("hidden"))) extern uint32_t  g_win32_guest_tls_teb_offset;
 __attribute__((visibility("hidden"))) extern uint8_t   g_gx_offline_scratch[0x10000];
 __attribute__((visibility("hidden"))) extern uint8_t   g_gx_offline_tls_area[0x4000];
 #if !defined(GX_HOST_PROVIDES_CYG_PROFILE)
@@ -44,7 +57,12 @@ __attribute__((no_instrument_function)) static inline uintptr_t gx_resolve_vma(u
 
 __attribute__((no_instrument_function)) static inline uintptr_t gx_guest_tls_base() noexcept {
     if (__builtin_expect(g_eboot_live_slide != 0ULL, 1)) {
-#if defined(__x86_64__) && !defined(_WIN32)
+#if defined(_WIN32) || defined(GX_TARGET_WINDOWS_MINGW)
+        uintptr_t tcb = 0;
+        const uintptr_t teb_off = static_cast<uintptr_t>(g_win32_guest_tls_teb_offset);
+        __asm__ volatile("movq %%gs:(%1), %0" : "=r"(tcb) : "r"(teb_off));
+        return tcb ? tcb : reinterpret_cast<uintptr_t>(g_gx_offline_tls_area + 0x2000);
+#elif defined(__x86_64__)
         uintptr_t tcb = 0;
         // In bb_vulkan / bbport (g_eboot_live_slide >= 0x10000000ULL, e.g. 0x800000000ULL),
         // ARCH_SET_GS points GS directly at the guest TCB (where gs:[0x0] == tcb_self).
@@ -60,10 +78,6 @@ __attribute__((no_instrument_function)) static inline uintptr_t gx_guest_tls_bas
         }
         __asm__ volatile("movq %%fs:0, %0" : "=r"(tcb));
         return tcb;
-#elif defined(_WIN32)
-        uintptr_t tcb = 0;
-        __asm__ volatile("movq %%gs:0x1480, %0" : "=r"(tcb));
-        return tcb ? tcb : reinterpret_cast<uintptr_t>(g_gx_offline_tls_area + 0x2000);
 #endif
     }
     return reinterpret_cast<uintptr_t>(g_gx_offline_tls_area + 0x2000);

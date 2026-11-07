@@ -29,12 +29,16 @@ set(BB_GX_COMMON_FLAGS
     -fdata-sections
     -fno-strict-aliasing
     -fno-stack-protector
+    -fno-threadsafe-statics
+    -fno-exceptions
+    -fno-asynchronous-unwind-tables
     -ffp-contract=off
     -mno-red-zone
     -Wall
     -Wextra
     -Wno-unused-parameter
     -Wno-unused-function
+    -Wno-address
     -include ${CMAKE_CURRENT_SOURCE_DIR}/include/gx_runtime_vma_and_tls.h
 )
 
@@ -134,6 +138,7 @@ target_compile_options(bb_gx_engine_native PRIVATE ${BB_GX_COMMON_FLAGS})
 # ----------------------------------------------------------------------------
 add_executable(gx_native_workspace_runner tests/gx_native_workspace_runner.cpp)
 target_include_directories(gx_native_workspace_runner PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_definitions(gx_native_workspace_runner PRIVATE GX_STANDALONE_TEST=1)
 target_compile_options(gx_native_workspace_runner PRIVATE ${BB_GX_COMMON_FLAGS})
 target_link_libraries(gx_native_workspace_runner PRIVATE bb_gx_engine_native)
 
@@ -162,6 +167,7 @@ if(UNIX AND EXISTS "${BBHOST_ROOT}/src/core/elf.cpp")
     )
     target_compile_definitions(gx_live_combat_test PRIVATE
         BBHOST_SOURCE_DIR="${BBHOST_ROOT}"
+        GX_STANDALONE_TEST=1
     )
     target_compile_options(gx_live_combat_test PRIVATE ${BB_GX_COMMON_FLAGS})
     target_link_libraries(gx_live_combat_test PRIVATE bb_gx_engine_native m pthread dl)

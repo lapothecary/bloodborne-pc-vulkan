@@ -1457,8 +1457,8 @@ int32_t sub_bb2800(void* /*this_ctx*/, float val) {
     return 0;
 }
 
-extern "C" __attribute__((weak)) void BbGoldenEngine_OnYebisCameraMatrix(uint32_t kind, const float* mtx16);
-extern "C" __attribute__((weak)) void BbGoldenEngine_OnYebisCameraParams(float near_z, float far_z, float fov_y);
+extern "C" GX_HOST_IMPORT void BbGoldenEngine_OnYebisCameraMatrix(uint32_t kind, const float* mtx16);
+extern "C" GX_HOST_IMPORT void BbGoldenEngine_OnYebisCameraParams(float near_z, float far_z, float fov_y);
 
 uint64_t sub_bd90f0(void* pPostEffect, uint64_t a2, uint32_t a3, uint64_t a4, uint64_t a5, uint64_t a6, float f0, float f1, float f2, float f3, float f4, float f5, float f6, float f7);
 uint64_t sub_bb27f0(void* /*this_ctx*/, uint64_t a2, uint32_t a3, uint64_t a4, uint64_t a5, uint64_t a6, float f0, float f1, float f2, float f3, float f4, float f5, float f6, float f7) {

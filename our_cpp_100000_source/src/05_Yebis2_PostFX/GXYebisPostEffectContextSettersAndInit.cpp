@@ -1,9 +1,7 @@
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <immintrin.h>
-#include <mutex>
-#include <pthread.h>
-#include <vector>
 
 #include "gx_direct_vulkan.h"
 
@@ -928,7 +926,7 @@ void* sub_bb6350(
     return pfOutMatrix;
 }
 
-extern "C" __attribute__((weak)) void BbGoldenEngine_OnYebisJitter(float jx, float jy);
+extern "C" GX_HOST_IMPORT void BbGoldenEngine_OnYebisJitter(float jx, float jy);
 
 // 0xbb6310 | 58 B | PPFX::GetJitteredSubpixel
 void sub_bb6310(uint32_t iSample, void* afOutOffset) {
@@ -1143,25 +1141,46 @@ struct PendingYebisUnreg {
 };
 
 struct YebisRegistrySync {
-    std::mutex mtx;
+    std::atomic_flag lock = ATOMIC_FLAG_INIT;
     bool scene_active = false;
-    pthread_t owner_thread{};
-    std::vector<PendingYebisUnreg> pending;
+    uintptr_t owner_tcb = 0;
+    static constexpr uint32_t kMaxPending = 512;
+    PendingYebisUnreg pending[kMaxPending]{};
+    uint32_t pending_count = 0;
+
+    void Acquire() noexcept {
+        while (lock.test_and_set(std::memory_order_acquire)) {
+            _mm_pause();
+        }
+    }
+
+    void Release() noexcept {
+        lock.clear(std::memory_order_release);
+    }
 
     bool IsInBeginEnd() const noexcept {
         const void* post_fx = g_pSinglePostEffect();
         return post_fx != nullptr && *static_cast<const uint8_t*>(post_fx) != 0u;
     }
 
-    void DrainLocked() {
-        if (pending.empty() || IsInBeginEnd()) {
+    void PushLocked(bool is_rt, void* ctx, void* resource) noexcept {
+        if (pending_count < kMaxPending) {
+            pending[pending_count++] = {is_rt, ctx, resource};
+        }
+    }
+
+    void DrainLocked() noexcept {
+        if (pending_count == 0 || IsInBeginEnd()) {
             return;
         }
-        std::vector<PendingYebisUnreg> batch;
-        batch.swap(pending);
-        for (const auto& item : batch) {
+        PendingYebisUnreg batch[kMaxPending];
+        const uint32_t count = pending_count;
+        std::memcpy(batch, pending, count * sizeof(PendingYebisUnreg));
+        pending_count = 0;
+        for (uint32_t i = 0; i < count; ++i) {
+            const auto& item = batch[i];
             if (IsInBeginEnd()) {
-                pending.push_back(item);
+                PushLocked(item.is_rt, item.ctx, item.resource);
                 continue;
             }
             if (item.is_rt) {
@@ -1173,36 +1192,39 @@ struct YebisRegistrySync {
     }
 };
 
+struct YebisSpinGuard {
+    YebisRegistrySync& sync;
+    explicit YebisSpinGuard(YebisRegistrySync& s) noexcept : sync(s) { sync.Acquire(); }
+    ~YebisSpinGuard() noexcept { sync.Release(); }
+};
+
 YebisRegistrySync g_yebis_reg_sync;
 
 } // namespace
 
 extern "C" void bb_direct_vk_yebis_scene_enter() noexcept {
-    std::scoped_lock lk{g_yebis_reg_sync.mtx};
+    YebisSpinGuard lk{g_yebis_reg_sync};
     g_yebis_reg_sync.scene_active = true;
-    g_yebis_reg_sync.owner_thread = pthread_self();
+    g_yebis_reg_sync.owner_tcb = gx_guest_tls_base();
 }
 
 extern "C" void bb_direct_vk_yebis_scene_leave() noexcept {
-    std::scoped_lock lk{g_yebis_reg_sync.mtx};
+    YebisSpinGuard lk{g_yebis_reg_sync};
     g_yebis_reg_sync.DrainLocked();
     g_yebis_reg_sync.scene_active = false;
-    g_yebis_reg_sync.owner_thread = pthread_t{};
+    g_yebis_reg_sync.owner_tcb = 0;
 }
 
 int32_t sub_bb5f10(void* this_ctx, void* pGnmTexture) {
     if (!gx_direct_vk::EnabledV5Sub(gx_direct_vk::kV5Sub_AsyncFramePipeline)) {
         return sub_bb5f10_impl(this_ctx, pGnmTexture);
     }
-    std::scoped_lock lk{g_yebis_reg_sync.mtx};
+    YebisSpinGuard lk{g_yebis_reg_sync};
     const bool other_thread_in_scene =
         g_yebis_reg_sync.scene_active &&
-        !pthread_equal(pthread_self(), g_yebis_reg_sync.owner_thread);
+        (gx_guest_tls_base() != g_yebis_reg_sync.owner_tcb);
     if (other_thread_in_scene || g_yebis_reg_sync.IsInBeginEnd()) {
-        if (g_yebis_reg_sync.pending.capacity() < 256) {
-            g_yebis_reg_sync.pending.reserve(256);
-        }
-        g_yebis_reg_sync.pending.push_back({false, this_ctx, pGnmTexture});
+        g_yebis_reg_sync.PushLocked(false, this_ctx, pGnmTexture);
         return 0;
     }
     g_yebis_reg_sync.DrainLocked();
@@ -1214,15 +1236,12 @@ int32_t sub_bb5e40(void* this_ctx, void* pGnmRenderTarget) {
     if (!gx_direct_vk::EnabledV5Sub(gx_direct_vk::kV5Sub_AsyncFramePipeline)) {
         return sub_bb5e40_impl(this_ctx, pGnmRenderTarget);
     }
-    std::scoped_lock lk{g_yebis_reg_sync.mtx};
+    YebisSpinGuard lk{g_yebis_reg_sync};
     const bool other_thread_in_scene =
         g_yebis_reg_sync.scene_active &&
-        !pthread_equal(pthread_self(), g_yebis_reg_sync.owner_thread);
+        (gx_guest_tls_base() != g_yebis_reg_sync.owner_tcb);
     if (other_thread_in_scene || g_yebis_reg_sync.IsInBeginEnd()) {
-        if (g_yebis_reg_sync.pending.capacity() < 256) {
-            g_yebis_reg_sync.pending.reserve(256);
-        }
-        g_yebis_reg_sync.pending.push_back({true, this_ctx, pGnmRenderTarget});
+        g_yebis_reg_sync.PushLocked(true, this_ctx, pGnmRenderTarget);
         return 0;
     }
     g_yebis_reg_sync.DrainLocked();
@@ -1262,7 +1281,7 @@ int32_t sub_bb5c90(
     sub_10883f0(pGnmTexture, gnmFormat);
     void* regPair[3] = {nullptr, nullptr, nullptr};
     {
-        std::scoped_lock lk{g_yebis_reg_sync.mtx};
+        YebisSpinGuard lk{g_yebis_reg_sync};
         hr = sub_2610430(self + 0x18, pGnmTexture, regPair);
     }
     sub_10883f0(pGnmTexture, oldFmt);
@@ -1310,7 +1329,7 @@ int32_t sub_bb5ae0(
     sub_10883f0(pGnmTexture, gnmFormat);
     void* regPair[3] = {nullptr, nullptr, nullptr};
     {
-        std::scoped_lock lk{g_yebis_reg_sync.mtx};
+        YebisSpinGuard lk{g_yebis_reg_sync};
         hr = sub_2610430(self + 0x18, pGnmTexture, regPair);
     }
     sub_10883f0(pGnmTexture, oldFmt);
@@ -1358,7 +1377,7 @@ int32_t sub_bb5930(
     sub_10883f0(pGnmTexture, gnmFormat);
     void* regPair[3] = {nullptr, nullptr, nullptr};
     {
-        std::scoped_lock lk{g_yebis_reg_sync.mtx};
+        YebisSpinGuard lk{g_yebis_reg_sync};
         hr = sub_2610430(self + 0x18, pGnmTexture, regPair);
     }
     sub_10883f0(pGnmTexture, oldFmt);
@@ -1405,7 +1424,7 @@ int32_t sub_bb5790(
     sub_10883f0(pGnmTexture, gnmFormat);
     void* regPair[3] = {nullptr, nullptr, nullptr};
     {
-        std::scoped_lock lk{g_yebis_reg_sync.mtx};
+        YebisSpinGuard lk{g_yebis_reg_sync};
         hr = sub_2610430(self + 0x18, pGnmTexture, regPair);
     }
     sub_10883f0(pGnmTexture, oldFmt);
@@ -1451,7 +1470,7 @@ int32_t sub_bb5600(
     sub_10883f0(pGnmTexture, gnmFormat);
     void* regPair[3] = {nullptr, nullptr, nullptr};
     {
-        std::scoped_lock lk{g_yebis_reg_sync.mtx};
+        YebisSpinGuard lk{g_yebis_reg_sync};
         hr = sub_2610430(self + 0x18, pGnmTexture, regPair);
     }
     sub_10883f0(pGnmTexture, oldFmt);
@@ -1502,7 +1521,7 @@ int32_t sub_bb5430(
     sub_10883f0(pGnmTexture, gnmFormat);
     void* regPair[3] = {nullptr, nullptr, nullptr};
     {
-        std::scoped_lock lk{g_yebis_reg_sync.mtx};
+        YebisSpinGuard lk{g_yebis_reg_sync};
         hr = sub_2610430(self + 0x18, pGnmTexture, regPair);
     }
     sub_10883f0(pGnmTexture, oldFmt);
@@ -1558,7 +1577,7 @@ int32_t sub_bb5290(
     sub_1086540(pGnmRenderTarget, gnmFormat);
     void* regPair[3] = {nullptr, nullptr, nullptr};
     {
-        std::scoped_lock lk{g_yebis_reg_sync.mtx};
+        YebisSpinGuard lk{g_yebis_reg_sync};
         hr = sub_26105f0(self + 0x18, pGnmRenderTarget, regPair);
     }
     sub_1086540(pGnmRenderTarget, oldFmt);
@@ -1618,7 +1637,7 @@ int32_t sub_bb5080(
     void* regPair[3] = {nullptr, nullptr, nullptr};
     int32_t hr = 0;
     {
-        std::scoped_lock lk{g_yebis_reg_sync.mtx};
+        YebisSpinGuard lk{g_yebis_reg_sync};
         hr = sub_2610430(self + 0x18, pGnmTexture, regPair);
     }
     sub_10883f0(pGnmTexture, oldFmt);
@@ -1678,7 +1697,7 @@ int32_t sub_bb4f60(
     void* regPair[3] = {nullptr, nullptr, nullptr};
     int32_t hr = 0;
     {
-        std::scoped_lock lk{g_yebis_reg_sync.mtx};
+        YebisSpinGuard lk{g_yebis_reg_sync};
         hr = sub_2610430(self + 0x18, pGnmTexture, regPair);
     }
     sub_10883f0(pGnmTexture, oldFmt);
@@ -1915,9 +1934,14 @@ uint64_t sub_bb4a90(void* /*this_ctx*/, uint64_t a2, uint64_t a3, uint64_t a4, u
 // 0xbb48d0 | 436 B | IPfxContext_Gnm::~IPfxContext_Gnm
 void sub_bb48d0(void* this_ctx) {
     {
-        std::scoped_lock lk{g_yebis_reg_sync.mtx};
-        std::erase_if(g_yebis_reg_sync.pending,
-                      [this_ctx](const PendingYebisUnreg& e) { return e.ctx == this_ctx; });
+        YebisSpinGuard lk{g_yebis_reg_sync};
+        uint32_t dst = 0;
+        for (uint32_t i = 0; i < g_yebis_reg_sync.pending_count; ++i) {
+            if (g_yebis_reg_sync.pending[i].ctx != this_ctx) {
+                g_yebis_reg_sync.pending[dst++] = g_yebis_reg_sync.pending[i];
+            }
+        }
+        g_yebis_reg_sync.pending_count = dst;
     }
     uint8_t* self = reinterpret_cast<uint8_t*>(this_ctx);
     *reinterpret_cast<uint64_t*>(self + 0x00) = GX_VMA(0x52b3580ULL);

@@ -915,24 +915,11 @@ void GXGnmCommandContext_BeginQuery(void* context, void* unused, void* queryObj)
 // [VMA: 0x2169eb0 | Size: 1 B]
 void GXGnmCommandContext_UnmapSubresourceNoOp() {}
 
-extern "C" __attribute__((weak)) void BbGoldenEngine_NotifyGpuSurfaceWrite(void* dst, std::uint64_t size) {
-    (void)dst;
-    (void)size;
-}
-extern "C" __attribute__((weak)) void BbGoldenEngine_OnDrawCall(
-    std::uint32_t count, std::uint32_t instanceCount, bool isIndexed, bool isIndirect) {
-    (void)count;
-    (void)instanceCount;
-    (void)isIndexed;
-    (void)isIndirect;
-}
-extern "C" __attribute__((weak)) void BbGoldenEngine_OnDispatchCall(
-    std::uint32_t groupX, std::uint32_t groupY, std::uint32_t groupZ, bool isIndirect) {
-    (void)groupX;
-    (void)groupY;
-    (void)groupZ;
-    (void)isIndirect;
-}
+extern "C" GX_HOST_IMPORT void BbGoldenEngine_NotifyGpuSurfaceWrite(void* dst, std::uint64_t size);
+extern "C" GX_HOST_IMPORT void BbGoldenEngine_OnDrawCall(
+    std::uint32_t count, std::uint32_t instanceCount, bool isIndexed, bool isIndirect);
+extern "C" GX_HOST_IMPORT void BbGoldenEngine_OnDispatchCall(
+    std::uint32_t groupX, std::uint32_t groupY, std::uint32_t groupZ, bool isIndirect);
 
 // [VMA: 0x2169c30 | Size: 639 B]
 std::uint32_t GXGnmCommandContext_MapSubresource(

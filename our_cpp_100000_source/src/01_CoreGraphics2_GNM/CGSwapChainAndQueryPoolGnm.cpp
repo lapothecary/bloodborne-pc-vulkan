@@ -676,7 +676,7 @@ int32_t CGDeviceGnm_WrapResourceHandle(uint64_t** out_obj, void* device_wrapper,
     return 9;
 }
 
-extern "C" uintptr_t g_eboot_live_slide;
+extern "C" __attribute__((visibility("hidden"))) uintptr_t g_eboot_live_slide;
 
 // VMA: 0x26d4330 (8 B)
 uint64_t* CGGlobalRing_GetFencePtr() {

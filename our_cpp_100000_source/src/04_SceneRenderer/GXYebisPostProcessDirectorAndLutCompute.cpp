@@ -65,10 +65,10 @@ void sub_21f2e70(void* feedBackBlurBank, void* ui);                             
 void sub_21ea4c0(void* colorGradingBank, void* ui);                              // 0x21ea4c0
 
 // Yebis2 Director Action Callbacks (defined in lower SceneRenderer range)
-void sub_21d4230(void* director, int arg);                                       // 0x21d4230 (InitParam callback)
-void sub_21d4240(void* director, int arg);                                       // 0x21d4240 (Save callback)
-void sub_21d44f0(void* director, int arg);                                       // 0x21d44f0 (Load callback)
-void sub_21d4210(void* director);                                                // 0x21d4210 (FeedBackBlur Enable callback)
+__attribute__((visibility("hidden"))) void sub_21d4230(void* director, int arg);                                       // 0x21d4230 (InitParam callback)
+__attribute__((visibility("hidden"))) void sub_21d4240(void* director, int arg);                                       // 0x21d4240 (Save callback)
+__attribute__((visibility("hidden"))) void sub_21d44f0(void* director, int arg);                                       // 0x21d44f0 (Load callback)
+__attribute__((visibility("hidden"))) void sub_21d4210(void* director);                                                // 0x21d4210 (FeedBackBlur Enable callback)
 void sub_21d2dd0(void* director);                                                // 0x21d2dd0 (Reinitialize Yebis context)
 void sub_21b4b00(void* jobQueue, void* fnCallback, void* arg0, void* arg1, uint32_t flags); // 0x21b4b00
 

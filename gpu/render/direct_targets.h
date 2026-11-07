@@ -42,18 +42,18 @@ u32 LookupDepthTargetUid(const u32* gnm_dt_13dw) noexcept;
 } // namespace Vulkan::DirectTargets
 
 extern "C" {
-uint32_t bb_direct_vk_register_color_target(const void* gnm_rt_11dw,
-                                            const void* parent_tsharp_8dw,
-                                            uint32_t mip_level,
-                                            uint32_t first_slice,
-                                            uint32_t slice_count) noexcept;
+uint32_t PS4_SYSV_ABI bb_direct_vk_register_color_target(const void* gnm_rt_11dw,
+                                                         const void* parent_tsharp_8dw,
+                                                         uint32_t mip_level,
+                                                         uint32_t first_slice,
+                                                         uint32_t slice_count) noexcept;
 
-uint32_t bb_direct_vk_register_depth_target(const void* gnm_dt_13dw,
-                                            const void* parent_tsharp_8dw,
-                                            uint32_t mip_level,
-                                            uint32_t first_slice,
-                                            uint32_t slice_count) noexcept;
+uint32_t PS4_SYSV_ABI bb_direct_vk_register_depth_target(const void* gnm_dt_13dw,
+                                                         const void* parent_tsharp_8dw,
+                                                         uint32_t mip_level,
+                                                         uint32_t first_slice,
+                                                         uint32_t slice_count) noexcept;
 
-uint32_t bb_direct_vk_lookup_color_target_uid(const void* gnm_rt_11dw) noexcept;
-uint32_t bb_direct_vk_lookup_depth_target_uid(const void* gnm_dt_13dw) noexcept;
+uint32_t PS4_SYSV_ABI bb_direct_vk_lookup_color_target_uid(const void* gnm_rt_11dw) noexcept;
+uint32_t PS4_SYSV_ABI bb_direct_vk_lookup_depth_target_uid(const void* gnm_dt_13dw) noexcept;
 }

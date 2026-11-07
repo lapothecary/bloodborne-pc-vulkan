@@ -75,7 +75,7 @@ static_assert(sizeof(CGContextStateShadowGnm) == 0x23d0, "CGContextStateShadowGn
 // ============================================================================
 
 extern "C" {
-extern uintptr_t g_eboot_live_slide;
+__attribute__((visibility("hidden"))) extern uintptr_t g_eboot_live_slide;
 
 #define DEFINE_SHADOW_BRIDGE(fn_name, hex_vma) \
     __attribute__((weak, naked, used, visibility("hidden"))) void fn_name() { \

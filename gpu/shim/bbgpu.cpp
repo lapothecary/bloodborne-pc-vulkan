@@ -480,3 +480,74 @@ extern "C" int bbgpu_text_input_poll(char* out, uint64_t size) {
     }
     return state;
 }
+
+extern "C" unsigned long long bbgpu_world_us(void) {
+    return static_cast<unsigned long long>(runtime_process_time_us());
+}
+
+extern "C" void bbgpu_trophy_setup(const char* sce_sys_host_dir, const char* user_dir) {
+    (void)sce_sys_host_dir;
+    (void)user_dir;
+}
+
+extern "C" int bbgpu_trophy_unlock(int id) {
+    (void)id;
+    return -1;
+}
+
+extern "C" int bbgpu_rebuild_shader_caches(void) {
+    return 0;
+}
+
+extern "C" int bbgpu_rebuild_shader_cache(const char* dir) {
+    (void)dir;
+    return 0;
+}
+
+extern "C" int bbgpu_predict_shaders_test(const char* cache_dir, const char* pack,
+                                          const char* game_dir, const char* out_dir, int jobs) {
+    (void)cache_dir; (void)pack; (void)game_dir; (void)out_dir; (void)jobs;
+    return 0;
+}
+
+extern "C" int bbgpu_merge_shader_metas(const char* cache_dir, const char* pack,
+                                        const char* game_dir, const char* meta_dir,
+                                        const char* out_pack, const char* work_dir, int jobs) {
+    (void)cache_dir; (void)pack; (void)game_dir; (void)meta_dir;
+    (void)out_pack; (void)work_dir; (void)jobs;
+    return 0;
+}
+
+extern "C" int bbgpu_meta_reconstruct_test(const char* cache_dir, const char* pack,
+                                           const char* game_dir) {
+    (void)cache_dir; (void)pack; (void)game_dir;
+    return 0;
+}
+
+extern "C" int bbgpu_merge_shader_packs(const char* cache_dir, const char* pack_a,
+                                        const char* pack_b, const char* game_dir,
+                                        const char* out_pack, const char* work_dir, int jobs) {
+    (void)cache_dir; (void)pack_a; (void)pack_b; (void)game_dir;
+    (void)out_pack; (void)work_dir; (void)jobs;
+    return 0;
+}
+
+extern "C" int bbgpu_export_shader_recipes(const char* cache_dir, const char* game_dir,
+                                           const char* out_path) {
+    (void)cache_dir; (void)game_dir; (void)out_path;
+    return 0;
+}
+
+extern "C" int bbgpu_import_shader_recipes(const char* cache_dir, const char* pack,
+                                           const char* game_dir, unsigned long long motion_params,
+                                           unsigned long long motion_positions) {
+    (void)cache_dir; (void)pack; (void)game_dir; (void)motion_params; (void)motion_positions;
+    return 0;
+}
+
+extern "C" int bbgpu_gpu_touched(std::uint64_t va) {
+    (void)va;
+    return 0;
+}
+
+extern "C" void bbgpu_straddle_report() {}

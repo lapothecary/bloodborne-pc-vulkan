@@ -874,18 +874,16 @@ void sub_22ae500(
         return;
     }
 
-    // Throttle dynamic 6-face environment cubemap updates to 30 Hz (1 face per 33.3 ms, matching PS4 30 FPS)
+    // Throttle dynamic 6-face environment cubemap updates to ~30 Hz (1 face per ~33.3 ms, ~130M TSC ticks)
     // after the initial 6 faces have been rendered at least once.
     {
         static uint32_t s_totalFacesRendered = 0;
-        static uint64_t s_lastFaceTimeNs = 0;
-        struct timespec ts{};
-        clock_gettime(CLOCK_MONOTONIC, &ts);
-        uint64_t nowNs = static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL + static_cast<uint64_t>(ts.tv_nsec);
-        if (s_totalFacesRendered >= 6u && (nowNs - s_lastFaceTimeNs) < 33000000ULL) {
+        static uint64_t s_lastFaceTsc = 0;
+        const uint64_t nowTsc = __builtin_ia32_rdtsc();
+        if (s_totalFacesRendered >= 6u && (nowTsc - s_lastFaceTsc) < 130000000ULL) {
             return;
         }
-        s_lastFaceTimeNs = nowNs;
+        s_lastFaceTsc = nowTsc;
         if (s_totalFacesRendered < 6u) {
             ++s_totalFacesRendered;
         }

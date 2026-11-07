@@ -4,96 +4,98 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "gx_runtime_vma_and_tls.h"
+
 extern "C" {
-__attribute__((weak)) uint32_t bb_direct_vk_register_color_target(
+GX_HOST_IMPORT uint32_t bb_direct_vk_register_color_target(
     const void* gnm_rt_11dw,
     const void* parent_tsharp_8dw,
     uint32_t mip_level,
     uint32_t first_slice,
     uint32_t slice_count) noexcept;
 
-__attribute__((weak)) uint32_t bb_direct_vk_register_depth_target(
+GX_HOST_IMPORT uint32_t bb_direct_vk_register_depth_target(
     const void* gnm_dt_13dw,
     const void* parent_tsharp_8dw,
     uint32_t mip_level,
     uint32_t first_slice,
     uint32_t slice_count) noexcept;
 
-__attribute__((weak)) uint32_t bb_direct_vk_lookup_color_target_uid(const void* gnm_rt_11dw) noexcept;
-__attribute__((weak)) uint32_t bb_direct_vk_lookup_depth_target_uid(const void* gnm_dt_13dw) noexcept;
+GX_HOST_IMPORT uint32_t bb_direct_vk_lookup_color_target_uid(const void* gnm_rt_11dw) noexcept;
+GX_HOST_IMPORT uint32_t bb_direct_vk_lookup_depth_target_uid(const void* gnm_dt_13dw) noexcept;
 
-__attribute__((weak)) void bb_direct_vk_prepare_texture_write(const void* gpu_addr,
-                                                              uint64_t byte_size) noexcept;
-__attribute__((weak)) void bb_direct_vk_unwatch_texture_range(const void* gpu_addr,
-                                                              uint64_t byte_size) noexcept;
-__attribute__((weak)) void bb_direct_vk_retire_gpu_range(const void* gpu_addr,
-                                                         uint64_t byte_size) noexcept;
-__attribute__((weak)) void bb_direct_vk_register_asset_texture(uint32_t resource_id,
-                                                               const void* tsharp_8dw,
-                                                               uint32_t raw_byte_size,
-                                                               uint32_t alloc_byte_size,
-                                                               uint32_t is_immutable) noexcept;
+GX_HOST_IMPORT void bb_direct_vk_prepare_texture_write(const void* gpu_addr,
+                                                       uint64_t byte_size) noexcept;
+GX_HOST_IMPORT void bb_direct_vk_unwatch_texture_range(const void* gpu_addr,
+                                                       uint64_t byte_size) noexcept;
+GX_HOST_IMPORT void bb_direct_vk_retire_gpu_range(const void* gpu_addr,
+                                                  uint64_t byte_size) noexcept;
+GX_HOST_IMPORT void bb_direct_vk_register_asset_texture(uint32_t resource_id,
+                                                        const void* tsharp_8dw,
+                                                        uint32_t raw_byte_size,
+                                                        uint32_t alloc_byte_size,
+                                                        uint32_t is_immutable) noexcept;
 
 // V3.3: Direct DEVICE_LOCAL VkBuffer lifecycle, zero-fault allocator/loader notifications
-__attribute__((weak)) void bb_direct_vk_note_fresh_gpu_range(const void* gpu_addr,
-                                                             uint64_t byte_size) noexcept;
-__attribute__((weak)) void bb_direct_vk_prepare_buffer_write(const void* gpu_addr,
-                                                             uint64_t byte_size) noexcept;
-__attribute__((weak)) void bb_direct_vk_note_asset_buffer_write(const void* gpu_addr,
-                                                                uint64_t byte_size) noexcept;
-__attribute__((weak)) void bb_direct_vk_register_immutable_buffer(uint32_t resource_id,
-                                                                  const void* gpu_addr,
-                                                                  uint32_t raw_byte_size,
-                                                                  uint32_t alloc_byte_size,
-                                                                  uint32_t bind_flags) noexcept;
-__attribute__((weak)) void bb_direct_vk_register_native_buffer(uint32_t resource_id,
-                                                               const void* gpu_addr,
-                                                               uint32_t raw_byte_size,
-                                                               uint32_t alloc_byte_size,
-                                                               uint32_t bind_flags,
-                                                               uint32_t usage_type,
-                                                               uint32_t has_initial_data) noexcept;
-__attribute__((weak)) void bb_direct_vk_note_exact_buffer_alloc(const void* gpu_addr,
-                                                                uint32_t raw_byte_size,
-                                                                uint32_t alloc_byte_size,
-                                                                uint32_t is_native_owned) noexcept;
-__attribute__((weak)) void bb_direct_vk_retire_buffer_range(const void* gpu_addr,
-                                                            uint64_t byte_size) noexcept;
+GX_HOST_IMPORT void bb_direct_vk_note_fresh_gpu_range(const void* gpu_addr,
+                                                      uint64_t byte_size) noexcept;
+GX_HOST_IMPORT void bb_direct_vk_prepare_buffer_write(const void* gpu_addr,
+                                                      uint64_t byte_size) noexcept;
+GX_HOST_IMPORT void bb_direct_vk_note_asset_buffer_write(const void* gpu_addr,
+                                                         uint64_t byte_size) noexcept;
+GX_HOST_IMPORT void bb_direct_vk_register_immutable_buffer(uint32_t resource_id,
+                                                           const void* gpu_addr,
+                                                           uint32_t raw_byte_size,
+                                                           uint32_t alloc_byte_size,
+                                                           uint32_t bind_flags) noexcept;
+GX_HOST_IMPORT void bb_direct_vk_register_native_buffer(uint32_t resource_id,
+                                                        const void* gpu_addr,
+                                                        uint32_t raw_byte_size,
+                                                        uint32_t alloc_byte_size,
+                                                        uint32_t bind_flags,
+                                                        uint32_t usage_type,
+                                                        uint32_t has_initial_data) noexcept;
+GX_HOST_IMPORT void bb_direct_vk_note_exact_buffer_alloc(const void* gpu_addr,
+                                                         uint32_t raw_byte_size,
+                                                         uint32_t alloc_byte_size,
+                                                         uint32_t is_native_owned) noexcept;
+GX_HOST_IMPORT void bb_direct_vk_retire_buffer_range(const void* gpu_addr,
+                                                     uint64_t byte_size) noexcept;
 
 // V4.1: Direct 752-shader SPIR-V manifest & lock-free guest shader binary registry
-__attribute__((weak)) void bb_direct_vk_register_shader_binary(const void* gpu_ucode_addr,
-                                                               uint32_t ucode_alloc_bytes,
-                                                               const void* shdr_container,
-                                                               uint32_t container_bytes,
-                                                               uint32_t shader_type) noexcept;
-__attribute__((weak)) void bb_direct_vk_retire_shader_range(const void* gpu_addr,
-                                                            uint64_t byte_size) noexcept;
+GX_HOST_IMPORT void bb_direct_vk_register_shader_binary(const void* gpu_ucode_addr,
+                                                        uint32_t ucode_alloc_bytes,
+                                                        const void* shdr_container,
+                                                        uint32_t container_bytes,
+                                                        uint32_t shader_type) noexcept;
+GX_HOST_IMPORT void bb_direct_vk_retire_shader_range(const void* gpu_addr,
+                                                     uint64_t byte_size) noexcept;
 
 // V5.1: Native C++20 PC PostFX, Resolution, Heap & Hardware Fix Controls
-__attribute__((weak)) int bb_direct_vk_is_effect_enabled(uint32_t effect_index) noexcept;
-__attribute__((weak)) uint32_t bb_direct_vk_gx_command_heap_bytes() noexcept;
-__attribute__((weak)) int bb_direct_vk_intel_tonemap_fix() noexcept;
-__attribute__((weak)) int bb_direct_vk_light_grid_override(uint32_t* out_w, uint32_t* out_h) noexcept;
-__attribute__((weak)) void bb_direct_vk_note_gpu_allocator(const void* alloc,
-                                                           uint64_t live_ranges,
-                                                           uint64_t live_bytes) noexcept;
+GX_HOST_IMPORT int bb_direct_vk_is_effect_enabled(uint32_t effect_index) noexcept;
+GX_HOST_IMPORT uint32_t bb_direct_vk_gx_command_heap_bytes() noexcept;
+GX_HOST_IMPORT int bb_direct_vk_intel_tonemap_fix() noexcept;
+GX_HOST_IMPORT int bb_direct_vk_light_grid_override(uint32_t* out_w, uint32_t* out_h) noexcept;
+GX_HOST_IMPORT void bb_direct_vk_note_gpu_allocator(const void* alloc,
+                                                    uint64_t live_ranges,
+                                                    uint64_t live_bytes) noexcept;
 
 // V5.2a: Async Full-Frame Pipeline & Thread-Safe Yebis2 Deferred Texture/RT Unregister
-__attribute__((weak)) void bb_direct_vk_yebis_scene_enter() noexcept;
-__attribute__((weak)) void bb_direct_vk_yebis_scene_leave() noexcept;
-__attribute__((weak)) void bb_direct_vk_note_release_check(uint32_t hr) noexcept;
+GX_HOST_IMPORT void bb_direct_vk_yebis_scene_enter() noexcept;
+GX_HOST_IMPORT void bb_direct_vk_yebis_scene_leave() noexcept;
+GX_HOST_IMPORT void bb_direct_vk_note_release_check(uint32_t hr) noexcept;
 
 // V6.1 / N2.5: Zero-fault transient GX cueHeap & DCB/CCB/Yebis command ring registration
-__attribute__((weak)) void bb_direct_vk_register_transient_cue_heap(const void* gpu_addr,
-                                                                    uint64_t byte_size) noexcept;
-__attribute__((weak)) void bb_direct_vk_register_transient_cpu_ring(const void* gpu_addr,
-                                                                    uint64_t byte_size) noexcept;
+GX_HOST_IMPORT void bb_direct_vk_register_transient_cue_heap(const void* gpu_addr,
+                                                             uint64_t byte_size) noexcept;
+GX_HOST_IMPORT void bb_direct_vk_register_transient_cpu_ring(const void* gpu_addr,
+                                                             uint64_t byte_size) noexcept;
 
 // N2.1: Direct Native VkSampler & VkImageView (SRV/UAV) descriptor registration
-__attribute__((weak)) void bb_direct_vk_register_native_sampler(void* ssharp_4dw) noexcept;
-__attribute__((weak)) void bb_direct_vk_register_native_srv(void* tsharp_8dw,
-                                                            uint32_t resource_id,
-                                                            uint32_t is_immutable) noexcept;
+GX_HOST_IMPORT void bb_direct_vk_register_native_sampler(void* ssharp_4dw) noexcept;
+GX_HOST_IMPORT void bb_direct_vk_register_native_srv(void* tsharp_8dw,
+                                                     uint32_t resource_id,
+                                                     uint32_t is_immutable) noexcept;
 }
 
 namespace gx_direct_vk {

@@ -732,7 +732,7 @@ static void GXParamBankManager_OpenParamEditListDialogImpl_DE(
 
 // Declare Group C HashTable helpers defined in GXYebisToneMapAndSettingParamBanks.cpp
 extern "C" {
-    void GXParamBankManagerC_OpenParamEditListDialog(void* self);
+    __attribute__((visibility("hidden"))) void GXParamBankManagerC_OpenParamEditListDialog(void* self);
     ParamBucketIter* DLHashTable_EraseNode_InnerC(
         ParamBucketIter* outIter, ParamInnerHashTable* table, ParamHashNode* targetNode);
     ParamBucketIter* DLHashTable_EraseNode_OuterC(

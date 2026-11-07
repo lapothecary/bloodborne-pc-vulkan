@@ -2028,6 +2028,7 @@ static const GXEbootExternalImportEntry kGXEbootExternalImports[kGXEbootExternal
 // ============================================================================
 extern "C" {
 __attribute__((weak, used, visibility("hidden"))) uintptr_t g_eboot_live_slide = 0;
+__attribute__((weak, used, visibility("hidden"))) uint32_t g_win32_guest_tls_teb_offset = 0x1480u;
 __attribute__((weak, used, visibility("hidden"))) alignas(64) uint8_t g_gx_offline_scratch[0x10000] = {0};
 __attribute__((weak, used, visibility("hidden"))) alignas(64) uint8_t g_gx_offline_tls_area[0x4000] = {0};
 __attribute__((weak, naked, used, visibility("hidden"))) void gx_ext_fn_0() __asm__("AnsiString_Length");
@@ -23970,5 +23971,41 @@ __attribute__((weak, naked, used, visibility("hidden"))) void gx_ext_fn_1985() {
         "retq\n\t"
     );
 }
+#if !defined(GX_HOST_PROVIDES_DIRECT_VK)
+__attribute__((weak, visibility("hidden"))) uint32_t bb_direct_vk_register_color_target(const void*, const void*, uint32_t, uint32_t, uint32_t) noexcept { return 0; }
+__attribute__((weak, visibility("hidden"))) uint32_t bb_direct_vk_register_depth_target(const void*, const void*, uint32_t, uint32_t, uint32_t) noexcept { return 0; }
+__attribute__((weak, visibility("hidden"))) uint32_t bb_direct_vk_lookup_color_target_uid(const void*) noexcept { return 0; }
+__attribute__((weak, visibility("hidden"))) uint32_t bb_direct_vk_lookup_depth_target_uid(const void*) noexcept { return 0; }
+__attribute__((weak, visibility("hidden"))) void bb_direct_vk_prepare_texture_write(const void*, uint64_t) noexcept {}
+__attribute__((weak, visibility("hidden"))) void bb_direct_vk_unwatch_texture_range(const void*, uint64_t) noexcept {}
+__attribute__((weak, visibility("hidden"))) void bb_direct_vk_retire_gpu_range(const void*, uint64_t) noexcept {}
+__attribute__((weak, visibility("hidden"))) void bb_direct_vk_register_asset_texture(uint32_t, const void*, uint32_t, uint32_t, uint32_t) noexcept {}
+__attribute__((weak, visibility("hidden"))) void bb_direct_vk_note_fresh_gpu_range(const void*, uint64_t) noexcept {}
+__attribute__((weak, visibility("hidden"))) void bb_direct_vk_prepare_buffer_write(const void*, uint64_t) noexcept {}
+__attribute__((weak, visibility("hidden"))) void bb_direct_vk_note_asset_buffer_write(const void*, uint64_t) noexcept {}
+__attribute__((weak, visibility("hidden"))) void bb_direct_vk_register_immutable_buffer(uint32_t, const void*, uint32_t, uint32_t, uint32_t) noexcept {}
+__attribute__((weak, visibility("hidden"))) void bb_direct_vk_register_native_buffer(uint32_t, const void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t) noexcept {}
+__attribute__((weak, visibility("hidden"))) void bb_direct_vk_note_exact_buffer_alloc(const void*, uint32_t, uint32_t, uint32_t) noexcept {}
+__attribute__((weak, visibility("hidden"))) void bb_direct_vk_retire_buffer_range(const void*, uint64_t) noexcept {}
+__attribute__((weak, visibility("hidden"))) void bb_direct_vk_register_shader_binary(const void*, uint32_t, const void*, uint32_t, uint32_t) noexcept {}
+__attribute__((weak, visibility("hidden"))) void bb_direct_vk_retire_shader_range(const void*, uint64_t) noexcept {}
+__attribute__((weak, visibility("hidden"))) int bb_direct_vk_is_effect_enabled(uint32_t) noexcept { return 1; }
+__attribute__((weak, visibility("hidden"))) uint32_t bb_direct_vk_gx_command_heap_bytes() noexcept { return 0; }
+__attribute__((weak, visibility("hidden"))) int bb_direct_vk_intel_tonemap_fix() noexcept { return 0; }
+__attribute__((weak, visibility("hidden"))) int bb_direct_vk_light_grid_override(uint32_t*, uint32_t*) noexcept { return 0; }
+__attribute__((weak, visibility("hidden"))) void bb_direct_vk_note_gpu_allocator(const void*, uint64_t, uint64_t) noexcept {}
+__attribute__((weak, visibility("hidden"))) void bb_direct_vk_note_release_check(uint32_t) noexcept {}
+__attribute__((weak, visibility("hidden"))) void bb_direct_vk_register_transient_cue_heap(const void*, uint64_t) noexcept {}
+__attribute__((weak, visibility("hidden"))) void bb_direct_vk_register_transient_cpu_ring(const void*, uint64_t) noexcept {}
+__attribute__((weak, visibility("hidden"))) void bb_direct_vk_register_native_sampler(void*) noexcept {}
+__attribute__((weak, visibility("hidden"))) void bb_direct_vk_register_native_srv(void*, uint32_t, uint32_t) noexcept {}
+__attribute__((weak, visibility("hidden"))) void BbGoldenEngine_OnYebisJitter(float, float) {}
+__attribute__((weak, visibility("hidden"))) void BbGoldenEngine_OnYebisCameraMatrix(uint32_t, const float*) {}
+__attribute__((weak, visibility("hidden"))) void BbGoldenEngine_OnYebisCameraParams(float, float, float) {}
+__attribute__((weak, visibility("hidden"))) void BbGoldenEngine_NotifyGpuSurfaceWrite(void*, uint64_t) {}
+__attribute__((weak, visibility("hidden"))) void BbGoldenEngine_OnDrawCall(uint32_t, uint32_t, bool, bool) {}
+__attribute__((weak, visibility("hidden"))) void BbGoldenEngine_OnDispatchCall(uint32_t, uint32_t, uint32_t, bool) {}
+__attribute__((weak, visibility("hidden"))) void BbGoldenEngine_UpgradeResourceCache(void**, uint32_t*) {}
+#endif
 } // extern "C"
 #endif // GX_DISABLE_WEAK_EXTERNAL_IMPORTS

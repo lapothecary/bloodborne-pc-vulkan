@@ -19,6 +19,9 @@
 #include "core/emulator_settings.h"
 #include "sdl_window.h"
 #include "upscale/vk_dlss.h"
+#ifdef _WIN32
+#include "platform/win32/nvidia_profile.h"
+#endif
 
 namespace Vulkan {
 
@@ -126,6 +129,10 @@ std::vector<const char*> Extensions(Frontend::WindowSystemType window_type,
 vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool enable_validation,
                                   bool enable_crash_diagnostic) {
     LOG_INFO(Render_Vulkan, "Creating vulkan instance");
+#ifdef _WIN32
+    // Before the driver loads (it reads its profile then): NVIDIA cards kept low clocks.
+    BbNvidiaProfile::Apply();
+#endif
     static vk::detail::DynamicLoader loader;
     VULKAN_HPP_DEFAULT_DISPATCHER.init(
         loader.getProcAddress<PFN_vkGetInstanceProcAddr>("vkGetInstanceProcAddr"));

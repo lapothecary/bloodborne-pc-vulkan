@@ -1975,10 +1975,14 @@ uint32_t sub_2292dc0(const void* pSelf, const void* pVolume) {
     struct CachedFrustumEdges {
         alignas(16) uint8_t planes[0x60];
         alignas(16) __m128  edges[36];
+        uintptr_t           owner_tcb;
         bool                valid;
     };
-    static thread_local CachedFrustumEdges s_edgeCache{};
-    if (!s_edgeCache.valid || std::memcmp(s_edgeCache.planes, planesBase, 0x60) != 0) {
+    static CachedFrustumEdges s_edgeCaches[64]{};
+    const uintptr_t cur_tcb = gx_guest_tls_base();
+    CachedFrustumEdges& s_edgeCache = s_edgeCaches[((cur_tcb >> 12) ^ (cur_tcb >> 20)) & 63u];
+    if (!s_edgeCache.valid || s_edgeCache.owner_tcb != cur_tcb ||
+        std::memcmp(s_edgeCache.planes, planesBase, 0x60) != 0) {
         std::memcpy(s_edgeCache.planes, planesBase, 0x60);
         sub_2668a30(planesBase, s_edgeCache.edges);
 
@@ -1991,6 +1995,7 @@ uint32_t sub_2292dc0(const void* pSelf, const void* pVolume) {
             s_edgeCache.edges[i + 1] = _mm_and_ps(_mm_mul_ps(signFlipXY, s_edgeCache.edges[i + 1]), maskXYZ);
             s_edgeCache.edges[i + 2] = _mm_and_ps(_mm_mul_ps(signFlipXY, s_edgeCache.edges[i + 2]), maskXYZ);
         }
+        s_edgeCache.owner_tcb = cur_tcb;
         s_edgeCache.valid = true;
     }
 

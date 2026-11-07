@@ -10,10 +10,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <dirent.h>
 #include <mutex>
 #include <thread>
 #ifndef _WIN32
+#include <dirent.h>
 #include <sched.h>
 #include <sys/resource.h>
 #include <unistd.h>

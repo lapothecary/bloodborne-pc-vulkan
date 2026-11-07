@@ -14,6 +14,10 @@
 
 #define GX_HOST_PROVIDES_CYG_PROFILE 1
 #define GX_HOST_PROVIDES_CGMEMORY_MEMCPY 1
+#define GX_HOST_PROVIDES_DIRECT_VK 1
+#if defined(_WIN32)
+#define GX_DISABLE_WEAK_EXTERNAL_IMPORTS 1
+#endif
 #include "../../our_cpp_100000_source/include/gx_runtime_vma_and_tls.h"
 #include "../../our_cpp_100000_source/include/gx_eboot_external_imports.h"
 #include "../../our_cpp_100000_source/include/gx_decomp_registry.h"
@@ -21,6 +25,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cpuid.h>
 #include <cstddef>
 #include <cstdint>
@@ -42,15 +47,47 @@ BbGoldenEngine::CameraBridgeState g_camera_bridge{};
 } // namespace
 
 extern "C" {
-std::uint32_t GXShaderLibrary_GetTotalShaderCount() noexcept;
+std::uint32_t GX_SYSV_ABI GXShaderLibrary_GetTotalShaderCount() noexcept;
+#if defined(_WIN32)
+int bb_guest_tls_slot(void) noexcept;
+#endif
 
-__attribute__((no_instrument_function)) void __cyg_profile_func_enter(void*, void*) noexcept {}
-__attribute__((no_instrument_function)) void __cyg_profile_func_exit(void*, void*) noexcept {}
+__attribute__((no_instrument_function)) void GX_SYSV_ABI __cyg_profile_func_enter(void*, void*) noexcept {}
+__attribute__((no_instrument_function)) void GX_SYSV_ABI __cyg_profile_func_exit(void*, void*) noexcept {}
+
+// System V AMD64 ABI C/math runtime bridges for our_cpp_100000_source on Windows (and Linux)
+void* GX_SYSV_ABI __gx_sysv_memcpy(void* dst, const void* src, std::size_t n) noexcept {
+    return std::memcpy(dst, src, n);
+}
+void* GX_SYSV_ABI __gx_sysv_memmove(void* dst, const void* src, std::size_t n) noexcept {
+    return std::memmove(dst, src, n);
+}
+void* GX_SYSV_ABI __gx_sysv_memset(void* dst, int c, std::size_t n) noexcept {
+    return std::memset(dst, c, n);
+}
+int GX_SYSV_ABI __gx_sysv_memcmp(const void* s1, const void* s2, std::size_t n) noexcept {
+    return std::memcmp(s1, s2, n);
+}
+int GX_SYSV_ABI __gx_sysv_strcmp(const char* s1, const char* s2) noexcept {
+    return std::strcmp(s1, s2);
+}
+char* GX_SYSV_ABI __gx_sysv_getenv(const char* name) noexcept {
+    return std::getenv(name);
+}
+std::uint64_t GX_SYSV_ABI __gx_sysv_strtoul(const char* nptr, char** endptr, int base) noexcept {
+    return static_cast<std::uint64_t>(std::strtoull(nptr, endptr, base));
+}
+float GX_SYSV_ABI __gx_sysv_cosf(float x) noexcept { return std::cos(x); }
+float GX_SYSV_ABI __gx_sysv_sinf(float x) noexcept { return std::sin(x); }
+float GX_SYSV_ABI __gx_sysv_tanf(float x) noexcept { return std::tan(x); }
+float GX_SYSV_ABI __gx_sysv_exp2f(float x) noexcept { return std::exp2(x); }
+float GX_SYSV_ABI __gx_sysv_log2f(float x) noexcept { return std::log2(x); }
+float GX_SYSV_ABI __gx_sysv_powf(float x, float y) noexcept { return std::pow(x, y); }
 
 void runtime_memory_note_write(std::uint64_t address, std::uint64_t size);
 int runtime_extra_direct_map(std::uint64_t size, std::uint64_t alignment, void** out);
 
-void BbGoldenEngine_OnYebisCameraMatrix(std::uint32_t kind, const float* mtx16) {
+void GX_SYSV_ABI BbGoldenEngine_OnYebisCameraMatrix(std::uint32_t kind, const float* mtx16) {
     if (!mtx16) return;
     switch (kind) {
     case 0u:
@@ -74,20 +111,20 @@ void BbGoldenEngine_OnYebisCameraMatrix(std::uint32_t kind, const float* mtx16) 
     g_camera_bridge.update_epoch = g_cpp_camera_updates.fetch_add(1, std::memory_order_relaxed) + 1;
 }
 
-void BbGoldenEngine_OnYebisCameraParams(float near_z, float far_z, float fov_y) {
+void GX_SYSV_ABI BbGoldenEngine_OnYebisCameraParams(float near_z, float far_z, float fov_y) {
     g_camera_bridge.near_z = near_z;
     g_camera_bridge.far_z = far_z;
     g_camera_bridge.fov_y = fov_y;
     g_camera_bridge.has_params = true;
 }
 
-void BbGoldenEngine_OnYebisJitter(float jx, float jy) {
+void GX_SYSV_ABI BbGoldenEngine_OnYebisJitter(float jx, float jy) {
     g_camera_bridge.jitter[0] = jx;
     g_camera_bridge.jitter[1] = jy;
 }
 
 // Strong override for CGMemoryGnm_Memcpy (0x262cf10): pre/post notifies Vulkan memory tracker for zero-fault GPU uploads
-void* CGMemoryGnm_Memcpy(void* dst, const void* src, std::size_t size) {
+void* GX_SYSV_ABI CGMemoryGnm_Memcpy(void* dst, const void* src, std::size_t size) {
     if (!dst || !src || size == 0) {
         return dst;
     }
@@ -101,7 +138,7 @@ void* CGMemoryGnm_Memcpy(void* dst, const void* src, std::size_t size) {
 }
 
 // Direct C++20 -> Vulkan surface write notification for one-time CPU texture tiling (GXGnmTexture1D/2D/3D_CreateAndInitialize)
-void BbGoldenEngine_NotifyGpuSurfaceWrite(void* dst, std::uint64_t size) {
+void GX_SYSV_ABI BbGoldenEngine_NotifyGpuSurfaceWrite(void* dst, std::uint64_t size) {
     if (!dst || size == 0) {
         return;
     }
@@ -111,18 +148,18 @@ void BbGoldenEngine_NotifyGpuSurfaceWrite(void* dst, std::uint64_t size) {
 }
 
 // Direct C++20 -> Vulkan fast-path Draw & Dispatch hooks (used by GXGnmCommandContext_Draw* / Dispatch*)
-void BbGoldenEngine_OnDrawCall(
+void GX_SYSV_ABI BbGoldenEngine_OnDrawCall(
     std::uint32_t /*count*/, std::uint32_t /*instanceCount*/, bool /*isIndexed*/, bool /*isIndirect*/) {
     g_cpp_draws.fetch_add(1, std::memory_order_relaxed);
 }
 
-void BbGoldenEngine_OnDispatchCall(
+void GX_SYSV_ABI BbGoldenEngine_OnDispatchCall(
     std::uint32_t /*groupX*/, std::uint32_t /*groupY*/, std::uint32_t /*groupZ*/, bool /*isIndirect*/) {
     g_cpp_dispatches.fetch_add(1, std::memory_order_relaxed);
 }
 
 // Native C++ replacement for bbport_guest_hooks.cpp ResourceCacheBacking (0x216b21d inside 0x216b0f0)
-void BbGoldenEngine_UpgradeResourceCache(void** io_cueHeap, std::uint32_t* io_cueHeapByteSize) {
+void GX_SYSV_ABI BbGoldenEngine_UpgradeResourceCache(void** io_cueHeap, std::uint32_t* io_cueHeapByteSize) {
     if (!io_cueHeap || !*io_cueHeap || !io_cueHeapByteSize) {
         return;
     }
@@ -154,14 +191,14 @@ void BbGoldenEngine_UpgradeResourceCache(void** io_cueHeap, std::uint32_t* io_cu
 // ============================================================================
 // Module V5.1: Native C++20 PC PostFX, Resolution/LightGrid & Heap Controls
 // ============================================================================
-int bb_direct_vk_is_effect_enabled(std::uint32_t effect_index) noexcept {
+int GX_SYSV_ABI bb_direct_vk_is_effect_enabled(std::uint32_t effect_index) noexcept {
     if (effect_index < static_cast<std::uint32_t>(BbSettings::EffectCount)) {
         return BbSettings::Get().effects[effect_index].load(std::memory_order_relaxed) ? 1 : 0;
     }
     return 1;
 }
 
-std::uint32_t bb_direct_vk_gx_command_heap_bytes() noexcept {
+std::uint32_t GX_SYSV_ABI bb_direct_vk_gx_command_heap_bytes() noexcept {
     static const std::uint32_t kHeapBytes = []() noexcept -> std::uint32_t {
         if (const char* env_kb = std::getenv("BB_GX_COMMAND_HEAP_KB"); env_kb && env_kb[0] != '\0') {
             const long kb = std::strtol(env_kb, nullptr, 0);
@@ -177,7 +214,7 @@ std::uint32_t bb_direct_vk_gx_command_heap_bytes() noexcept {
     return kHeapBytes;
 }
 
-int bb_direct_vk_intel_tonemap_fix() noexcept {
+int GX_SYSV_ABI bb_direct_vk_intel_tonemap_fix() noexcept {
     static const int kFix = []() noexcept -> int {
         if (const char* env = std::getenv("BB_INTEL_TONEMAP_FIX"); env && env[0] != '\0') {
             if (env[0] == '1') return 1;
@@ -195,7 +232,7 @@ int bb_direct_vk_intel_tonemap_fix() noexcept {
     return kFix;
 }
 
-int bb_direct_vk_light_grid_override(std::uint32_t* out_w, std::uint32_t* out_h) noexcept {
+int GX_SYSV_ABI bb_direct_vk_light_grid_override(std::uint32_t* out_w, std::uint32_t* out_h) noexcept {
     struct GridOverride {
         int active;
         std::uint32_t w;
@@ -231,7 +268,7 @@ int bb_direct_vk_light_grid_override(std::uint32_t* out_w, std::uint32_t* out_h)
     return 1;
 }
 
-void bb_direct_vk_note_gpu_allocator(
+void GX_SYSV_ABI bb_direct_vk_note_gpu_allocator(
     const void* alloc, std::uint64_t live_ranges, std::uint64_t live_bytes) noexcept {
     if (!BbStats::enabled || !alloc) {
         return;
@@ -248,7 +285,7 @@ void bb_direct_vk_note_gpu_allocator(
     }
 }
 
-void bb_direct_vk_note_release_check(std::uint32_t hr) noexcept {
+void GX_SYSV_ABI bb_direct_vk_note_release_check(std::uint32_t hr) noexcept {
     static const bool kHeapSitesOn = [] {
         const char* env = std::getenv("BB_HEAP_SITES");
         return env && env[0] == '1';
@@ -305,8 +342,8 @@ struct FixedPoolSpinLock {
     std::uint32_t depth{0};
 
     static std::uint64_t Self() noexcept {
-        static thread_local std::uint8_t tag = 0;
-        return reinterpret_cast<std::uint64_t>(&tag);
+        const std::uintptr_t tcb = gx_guest_tls_base();
+        return tcb ? static_cast<std::uint64_t>(tcb) : 1ULL;
     }
     void lock() noexcept {
         const std::uint64_t me = Self();
@@ -432,13 +469,13 @@ void FixedBlockPool_CommitFreeLocked(FixedBlockPool* pool, void* node) noexcept 
         void* const alloc = pool->allocator;
         if (alloc) {
             auto* const vtable = *reinterpret_cast<void***>(alloc);
-            using FreeFn = void (*)(void*, void*);
+            using FreeFn = void (GX_SYSV_ABI *)(void*, void*);
             reinterpret_cast<FreeFn>(vtable[0x70 / 8])(alloc, reinterpret_cast<void*>(page_base));
         }
     }
 }
 
-void* BbSafeFixedBlockPool_AllocateNode(void* pool_raw) {
+void* GX_SYSV_ABI BbSafeFixedBlockPool_AllocateNode(void* pool_raw) {
     if (!pool_raw) {
         return nullptr;
     }
@@ -509,7 +546,7 @@ void* BbSafeFixedBlockPool_AllocateNode(void* pool_raw) {
         const std::uint64_t align = 0ULL - pool->page_mask;
         const std::uint64_t alloc_size = hdr_off + 0x20ULL;
         auto* const vtable = *reinterpret_cast<void***>(alloc);
-        using AllocAlignedFn = void* (*)(void*, std::uint64_t, std::uint64_t);
+        using AllocAlignedFn = void* (GX_SYSV_ABI *)(void*, std::uint64_t, std::uint64_t);
         auto* const page_base = static_cast<std::uint8_t*>(
             reinterpret_cast<AllocAlignedFn>(vtable[0x58 / 8])(alloc, alloc_size, align));
         if (!page_base) {
@@ -533,7 +570,7 @@ void* BbSafeFixedBlockPool_AllocateNode(void* pool_raw) {
     }
 }
 
-void BbSafeFixedBlockPool_FreeNode(void* pool_raw, void* node) {
+void GX_SYSV_ABI BbSafeFixedBlockPool_FreeNode(void* pool_raw, void* node) {
     if (!pool_raw || !node) {
         return;
     }
@@ -573,7 +610,7 @@ void BbSafeFixedBlockPool_FreeNode(void* pool_raw, void* node) {
     }
 }
 
-void BbSafeFixedBlockPool_Finalize(void* pool_raw) {
+void GX_SYSV_ABI BbSafeFixedBlockPool_Finalize(void* pool_raw) {
     if (!pool_raw) {
         return;
     }
@@ -591,7 +628,7 @@ void BbSafeFixedBlockPool_Finalize(void* pool_raw) {
 
     void* const alloc = pool->allocator;
     const std::uint64_t hdr_off = pool->header_offset;
-    using FreeFn = void (*)(void*, void*);
+    using FreeFn = void (GX_SYSV_ABI *)(void*, void*);
     FreeFn free_fn = nullptr;
     if (alloc) {
         auto* const vtable = *reinterpret_cast<void***>(alloc);
@@ -629,7 +666,7 @@ void BbSafeFixedBlockPool_Finalize(void* pool_raw) {
     full_sentinel->prev = full_sentinel;
 }
 
-std::uint64_t BbSafeFixedBlockPool_GetFreeBytes(void* pool_raw) {
+std::uint64_t GX_SYSV_ABI BbSafeFixedBlockPool_GetFreeBytes(void* pool_raw) {
     if (!pool_raw) {
         return 0;
     }
@@ -658,7 +695,9 @@ std::uint64_t BbSafeFixedBlockPool_GetFreeBytes(void* pool_raw) {
 
 namespace GXGraphicsFramework {
 // Strong override for GXGraphicsFramework::CGMemoryGnm_FastCopyGpuMemory (0x261a1b0)
-void CGMemoryGnm_FastCopyGpuMemory(void* dst, const void* src, std::uint32_t size) {
+void GX_SYSV_ABI CGMemoryGnm_FastCopyGpuMemory(void* dst, const void* src, std::uint32_t size)
+    __asm__("_ZN19GXGraphicsFramework29CGMemoryGnm_FastCopyGpuMemoryEPvPKvj");
+void GX_SYSV_ABI CGMemoryGnm_FastCopyGpuMemory(void* dst, const void* src, std::uint32_t size) {
     if (!dst || !src || size == 0) {
         return;
     }
@@ -837,6 +876,9 @@ bool ShouldInstallEntry(const GXDecompiledFunctionEntry& e, u64 size,
 
 void PatchImage(unsigned char* image, u64 size) {
     g_eboot_live_slide = reinterpret_cast<uintptr_t>(image);
+#if defined(_WIN32)
+    g_win32_guest_tls_teb_offset = 0x1480u + 8u * static_cast<std::uint32_t>(bb_guest_tls_slot());
+#endif
 
     const char* env_mods = std::getenv("BB_GX_MODULES");
     if (!env_mods) {

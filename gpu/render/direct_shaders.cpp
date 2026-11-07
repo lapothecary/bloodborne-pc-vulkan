@@ -16,8 +16,8 @@
 #include "gcn/regs_shader.h"
 
 extern "C" {
-std::uint32_t GXShaderLibrary_GetTotalShaderCount() noexcept;
-const GXShaderManifestEntry* GXShaderLibrary_GetEntryByIndex(std::uint32_t index) noexcept;
+std::uint32_t PS4_SYSV_ABI GXShaderLibrary_GetTotalShaderCount() noexcept;
+const GXShaderManifestEntry* PS4_SYSV_ABI GXShaderLibrary_GetEntryByIndex(std::uint32_t index) noexcept;
 }
 
 namespace Vulkan::DirectShaders {
@@ -558,10 +558,10 @@ Telemetry ReadTelemetry() noexcept {
 
 extern "C" {
 
-void bb_direct_vk_register_shader_binary(const void* gpu_ucode_addr, uint32_t ucode_alloc_bytes,
-                                         const void* /*shdr_container*/,
-                                         uint32_t /*container_bytes*/,
-                                         uint32_t shader_type) noexcept {
+void PS4_SYSV_ABI bb_direct_vk_register_shader_binary(const void* gpu_ucode_addr, uint32_t ucode_alloc_bytes,
+                                                      const void* /*shdr_container*/,
+                                                      uint32_t /*container_bytes*/,
+                                                      uint32_t shader_type) noexcept {
     if (!gpu_ucode_addr) {
         return;
     }
@@ -655,7 +655,7 @@ void bb_direct_vk_register_shader_binary(const void* gpu_ucode_addr, uint32_t uc
     }
 }
 
-void bb_direct_vk_retire_shader_range(const void* gpu_addr, uint64_t byte_size) noexcept {
+void PS4_SYSV_ABI bb_direct_vk_retire_shader_range(const void* gpu_addr, uint64_t byte_size) noexcept {
     if (!gpu_addr || byte_size == 0) {
         return;
     }

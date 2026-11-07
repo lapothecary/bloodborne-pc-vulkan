@@ -1219,10 +1219,7 @@ extern "C" void GXGnmTexture3D_ReleaseMemory(GXGnmTextureHardwareObject* hwTex) 
     }
 }
 
-extern "C" __attribute__((weak)) void BbGoldenEngine_NotifyGpuSurfaceWrite(void* dst, uint64_t size) {
-    (void)dst;
-    (void)size;
-}
+extern "C" GX_HOST_IMPORT void BbGoldenEngine_NotifyGpuSurfaceWrite(void* dst, uint64_t size);
 
 // [VMA: 0x21723a0 - 0x217276b] (972 bytes)
 // Allocates and initializes a 3D Gnm Texture, optionally uploading initial mip subresources via DMA or CPU surface tiling.
@@ -4965,10 +4962,7 @@ extern int32_t GXMutex_InitializeOSMutex(void* mutexHandle); // 0x2083fe0
 extern uint32_t GXGnmCommandContext_InitializeWithRings(void* cmdCtx, uint32_t flags, GXGnmGraphicsContext* gfxCtx, GXMemoryAllocator* sysAlloc, GXMemoryAllocator* garlicAlloc); // 0x2168080
 extern uint32_t CGContextGnm_InitializeGlobalHardwareTables(GXGnmGraphicsContext* gfxCtx, GXMemoryAllocator* sysAlloc, GXMemoryAllocator* garlicAlloc); // 0x26b2030
 extern uint32_t CGComputeGnm_InitializeGlobalDispatcher(GXMemoryAllocator* sysAlloc); // 0x26b9c00
-extern "C" __attribute__((weak)) void BbGoldenEngine_UpgradeResourceCache(void** ioHeap, uint32_t* ioSize) {
-    (void)ioHeap;
-    (void)ioSize;
-}
+extern "C" GX_HOST_IMPORT void BbGoldenEngine_UpgradeResourceCache(void** ioHeap, uint32_t* ioSize);
 
 // [VMA: 0x216b0f0 - 0x216b8f8] (size: 2056 bytes)
 // Translates: sub_216b0f0

@@ -3,6 +3,7 @@
 /bin
 /build_gpu/
 /our_cpp_100000_source/build/
+/our_cpp_100000_source/build_win32/obj/
 /pgo/
 /dist/
 __pycache__/

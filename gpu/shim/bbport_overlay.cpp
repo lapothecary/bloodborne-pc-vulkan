@@ -13,9 +13,7 @@
 #include <string>
 #include <string_view>
 #include <vector>
-#ifndef _WIN32
 #include <dlfcn.h>
-#endif
 
 #include <SDL3/SDL.h>
 #include "bbport_guest_hooks.h"
@@ -1308,7 +1306,12 @@ void PollGpuHwSensors(HudBreakdown& h) noexcept {
 
     if (!probed) {
         probed = true;
-        if (void* lib = dlopen("libnvidia-ml.so.1", RTLD_LAZY | RTLD_LOCAL)) {
+#ifdef _WIN32
+        constexpr const char* kNvmlLibName = "nvml.dll";
+#else
+        constexpr const char* kNvmlLibName = "libnvidia-ml.so.1";
+#endif
+        if (void* lib = dlopen(kNvmlLibName, RTLD_LAZY | RTLD_LOCAL)) {
             auto fn_init = reinterpret_cast<FnInit>(dlsym(lib, "nvmlInit_v2"));
             if (!fn_init) {
                 fn_init = reinterpret_cast<FnInit>(dlsym(lib, "nvmlInit"));

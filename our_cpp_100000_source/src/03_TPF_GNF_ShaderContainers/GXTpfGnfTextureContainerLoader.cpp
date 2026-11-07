@@ -387,7 +387,7 @@ uint32_t       GXTpfEntryV1_GetMipSliceByteSize(const GXTpfEntryStrategy* self, 
 const uint8_t* GXTpfEntryV1_GetSubresourcePayloadPointer(const GXTpfEntryStrategy* self, const GXTpfTextureSourceView* view, uint32_t mipIndex, uint32_t sliceIndex); // 0x26dac70
 void           GXTpfEntryV1_ExtractExtraMetadataNoOp(const GXTpfEntryStrategy* self, const GXTpfTextureSourceView* view, GXTpfExtraMetadataOut* outMeta); // 0x26daca0
 
-bool           GXTpfEntry_ReturnTrue(const GXTpfEntryStrategy* self, const GXTpfTextureSourceView* view);                           // 0x26dacb0
+__attribute__((visibility("hidden"))) bool GXTpfEntry_ReturnTrue(const GXTpfEntryStrategy* self, const GXTpfTextureSourceView* view);                           // 0x26dacb0
 uint32_t       GXTpfEntryV2_GetDataOffset(const GXTpfEntryStrategy* self, const GXTpfTextureSourceView* view);                      // 0x26dacc0
 uint32_t       GXTpfEntryV2_GetDataSize(const GXTpfEntryStrategy* self, const GXTpfTextureSourceView* view);                        // 0x26dacd0
 uint32_t       GXTpfEntryV2_GetTextureType(const GXTpfEntryStrategy* self, const GXTpfTextureSourceView* view);                     // 0x26dace0
