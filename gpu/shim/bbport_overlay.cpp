@@ -52,7 +52,6 @@ extern "C" const unsigned char bb_font_ttf[];
 extern "C" const unsigned char bb_font_ttf_end[];
 
 extern "C" void runtime_restart(void); // bb-probe (probe.c)
-extern "C" __attribute__((weak)) void runtime_toypad_lights(uint32_t out[3]); // runtime_toypad.c
 
 namespace BbOverlay {
 
@@ -295,9 +294,6 @@ void ToyPadSection() {
     auto figures = ReadToyPad(path);
     bool changed = false;
     u32 lights[3] = {};
-    if (runtime_toypad_lights) {
-        runtime_toypad_lights(lights);
-    }
     static unsigned pick_id = 1; // the figure to put on
     ImGui::SeparatorText(BbSettings::MenuText("Toy Pad", "Toy Pad (фигурки)"));
     // Choosing a figure: characters, then vehicles and gadgets (ids from 1000).

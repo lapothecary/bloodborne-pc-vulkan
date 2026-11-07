@@ -14,7 +14,11 @@
 #include <utility>
 #include <vector>
 
+#ifdef _WIN32
+extern "C" void runtime_pad_reload_bindings(void);
+#else
 extern "C" __attribute__((weak)) void runtime_pad_reload_bindings(void);
+#endif
 
 namespace BbSettings {
 

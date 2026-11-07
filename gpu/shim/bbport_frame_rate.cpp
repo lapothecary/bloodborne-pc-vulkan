@@ -88,6 +88,7 @@ void PS4_SYSV_ABI FrameStep(u64 pacer) {
     const float min_dt = std::max(live->shortest, MinSimDt);
     float dt = std::clamp(std::isfinite(measured) ? measured : Frame30, min_dt, Frame30);
     {
+#ifdef CLOCK_THREAD_CPUTIME_ID
         struct timespec ts_cpu{};
         if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts_cpu) == 0) {
             const u64 cur_cpu_ns = u64(ts_cpu.tv_sec) * 1'000'000'000ull + u64(ts_cpu.tv_nsec);
@@ -107,6 +108,7 @@ void PS4_SYSV_ABI FrameStep(u64 pacer) {
             }
             prev_cpu_ns = cur_cpu_ns;
         }
+#endif
     }
     // BB_FRAME_DT_SMOOTH=a (diagnostics, 0 < a < 1): the step follows the measured frame time by
     // that fraction a frame, so frame-to-frame jitter of the measurement does not reach the
