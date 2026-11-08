@@ -73,6 +73,8 @@ jobs:
         uses: msys2/setup-msys2@v2
         with:
           msystem: CLANG64
+          release: false
+          cache: false
           update: true
           install: >-
             git
