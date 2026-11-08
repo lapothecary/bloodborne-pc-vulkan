@@ -2770,6 +2770,7 @@ u8 ClassifyHudRenderPass(u64 vs_hash, u64 ps_hash, u32 width, u32 height, u32 nu
                          bool has_depth, bool in_ui_phase) noexcept {
     // 10. UI (Scaleform) & Present (final gamma/LUT1D display blit or UI phase)
     if (in_ui_phase || vs_hash == 0x34e8a281ull || ps_hash == 0x38d65b32ull ||
+        ps_hash == 0xbabda34dull || ps_hash == 0xcfa96da9ull || ps_hash == 0x4baeaa00ull ||
         UiComposition::MovieShader(vs_hash)) {
         return BbStats::GpuCat_UiPresent;
     }
@@ -2803,7 +2804,8 @@ u8 ClassifyHudRenderPass(u64 vs_hash, u64 ps_hash, u32 width, u32 height, u32 nu
     // 4. Deferred PBR Lighting, Light Volumes & Sky/Atmospheric Fog / Godrays
     if (num_mrts == 2 || ps_hash == 0xd92266b9ull || ps_hash == 0xdda49e89ull ||
         ps_hash == 0x32e47788ull || ps_hash == 0x765450dfull || ps_hash == 0xe55e45ebull ||
-        vs_hash == 0x637500e0ull || ps_hash == 0xa291c498ull) {
+        vs_hash == 0x637500e0ull || ps_hash == 0xa291c498ull || vs_hash == 0x8747a367ull ||
+        ps_hash == 0x8650418full) {
         return BbStats::GpuCat_DeferredLight;
     }
     // 6. Forward Alpha (Hair, Blood, Cloth, Mist, Half-Res Soft Particles — 1 MRT + depth)

@@ -389,9 +389,16 @@ void GpuProfiler::Print(bool to_file) {
         const char* e = std::getenv("BB_VERBOSE_STATS");
         return e && e[0] == '1';
     }();
-    FILE* f = std::fopen("/tmp/bb_gpu_profile.txt", "w");
-    std::printf("GPU profile: %.2f ms/frame over %llu frames, %zu labels (details in /tmp/bb_gpu_profile.txt)\n",
-                sum / frames, static_cast<unsigned long long>(frames), sorted.size());
+#ifdef _WIN32
+    constexpr const char* kProfilePath = "logs/bb_gpu_profile.txt";
+    constexpr const char* kSessionProfilePath = "logs/bb_gpu_profile_session.txt";
+#else
+    constexpr const char* kProfilePath = "/tmp/bb_gpu_profile.txt";
+    constexpr const char* kSessionProfilePath = "/tmp/bb_gpu_profile_session.txt";
+#endif
+    FILE* f = std::fopen(kProfilePath, "w");
+    std::printf("GPU profile: %.2f ms/frame over %llu frames, %zu labels (details in %s)\n",
+                sum / frames, static_cast<unsigned long long>(frames), sorted.size(), kProfilePath);
     if (f) {
         std::fprintf(f, "GPU profile: %.2f ms/frame over %llu frames, %zu labels\n", sum / frames,
                      static_cast<unsigned long long>(frames), sorted.size());
@@ -495,7 +502,7 @@ void GpuProfiler::Print(bool to_file) {
             dst.vtx_instances += st.vtx_instances;
         }
     }
-    if (FILE* sf = std::fopen("/tmp/bb_gpu_profile_session.txt", "w")) {
+    if (FILE* sf = std::fopen(kSessionProfilePath, "w")) {
         std::vector<std::pair<u64, Total>> sess_sorted(s_session_totals.begin(), s_session_totals.end());
         std::ranges::sort(sess_sorted, [](const auto& a, const auto& b) { return a.second.ms > b.second.ms; });
         double sess_sum = 0.0;

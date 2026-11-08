@@ -1614,7 +1614,7 @@ void UpdateHudBreakdown(HudBreakdown& h) {
         const float raw_main_cpu_ms = float(double(safe_delta(cur_main_cpu_ns, last_main_cpu_ns)) *
                                             1e-6 / double(d_main_cpu_frames));
         h.game_cpu_work_ms = std::clamp(raw_main_cpu_ms, 0.02f, std::max(0.02f, h.idle_a_ms));
-        h.fps_cap_sleep_ms = std::max(0.0f, h.idle_a_ms - h.game_cpu_work_ms);
+        h.fps_cap_sleep_ms = std::max(0.0f, h.idle_a_ms - h.game_cpu_work_ms - h.gnm_wait_ms);
     } else {
         h.game_cpu_work_ms = h.idle_a_ms;
         h.fps_cap_sleep_ms = 0.0f;

@@ -647,9 +647,9 @@ inline void ApplyProcessThreadTopology() {
     ::closedir(dir);
 }
 #else
-inline void PinToGpuDomain() {}
-inline void PinToHelperDomain() {}
-inline void ApplyProcessThreadTopology() {}
+inline void PinToGpuDomain() { bb_win32_pin_gpu_domain(); }
+inline void PinToHelperDomain() { bb_win32_pin_helper_domain(); }
+inline void ApplyProcessThreadTopology() { bb_win32_apply_thread_topology(); }
 #endif
 
 } // namespace BbThreads

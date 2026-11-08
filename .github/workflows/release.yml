@@ -117,7 +117,7 @@ jobs:
           fi
           if [ -f build_win32_gpu/build.ninja ]; then
             find build_win32_gpu -type f \( -name "*.obj" -o -name "*.a" -o -name "*.spv" -o -name "*.h" \) -exec touch {} +
-            rm -f build_win32_gpu/CMakeFiles/bbgpu.dir/shim/*.obj build_win32_gpu/CMakeFiles/bbgpu.dir/platform/win32/*.obj build_win32_gpu/bb-probe.exe
+            rm -f build_win32_gpu/CMakeFiles/bbgpu.dir/shim/*.obj build_win32_gpu/CMakeFiles/bbgpu.dir/platform/win32/*.obj build_win32_gpu/CMakeFiles/bbgpu.dir/render/rasterizer.cpp.obj build_win32_gpu/CMakeFiles/bbgpu.dir/render/vk_gpu_profiler.cpp.obj build_win32_gpu/bb-probe.exe
           else
             if ! cmake -S gpu -B build_win32_gpu -G Ninja \
               -DCMAKE_BUILD_TYPE=RelWithDebInfo \

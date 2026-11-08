@@ -2314,7 +2314,7 @@ void sub_21d5f80(void* self, void* renderCmdCtx, void* filterParam) {
         }
 
         const int32_t rawBloomLevels = *reinterpret_cast<const int32_t*>(param + 0x0e4);
-        const int32_t bloomLevels = (rawBloomLevels <= 0 || rawBloomLevels > 4) ? 4 : rawBloomLevels;
+        const int32_t bloomLevels = (rawBloomLevels <= 0 || rawBloomLevels > 3) ? 3 : rawBloomLevels;
         sub_bb40e0(ppfxCtx, bloomLevels);
         sub_bb3c10(ppfxCtx, *reinterpret_cast<const float*>(param + 0x0e8));
         sub_bb4130(ppfxCtx, *reinterpret_cast<const float*>(param + 0x0ec));
@@ -2478,9 +2478,11 @@ void sub_21d5f80(void* self, void* renderCmdCtx, void* filterParam) {
             sub_bb3340(ppfxCtx, -1, focusDist);
         }
 
-        sub_bb3f80(ppfxCtx, *reinterpret_cast<const float*>(param + 0x1d8));
+        const float rawDofScale = *reinterpret_cast<const float*>(param + 0x1d8);
+        const float dofScale = (rawDofScale <= 0.0f || rawDofScale > 0.5f) ? 0.5f : rawDofScale;
+        sub_bb3f80(ppfxCtx, dofScale);
         sub_bb34a0(ppfxCtx,
-                   *reinterpret_cast<const int32_t*>(param + 0x1cc),
+                   0,
                    *reinterpret_cast<const float*>(param + 0x1c4),
                    *reinterpret_cast<const float*>(param + 0x1c8) * fDeg2Rad);
 
@@ -2495,9 +2497,11 @@ void sub_21d5f80(void* self, void* renderCmdCtx, void* filterParam) {
             }
             const float sensorHeightM = ccdDiagM / std::sqrt(aspect * aspect + f1);
 
-            sub_bb3fd0(ppfxCtx,
-                       *reinterpret_cast<const int32_t*>(param + 0x1d0),
-                       *reinterpret_cast<const int32_t*>(param + 0x1d4));
+            const int32_t rawDofLv0 = *reinterpret_cast<const int32_t*>(param + 0x1d0);
+            const int32_t rawDofLv1 = *reinterpret_cast<const int32_t*>(param + 0x1d4);
+            const int32_t dofLv0 = (rawDofLv0 <= 0 || rawDofLv0 > 1) ? 1 : rawDofLv0;
+            const int32_t dofLv1 = (rawDofLv1 <= 0 || rawDofLv1 > 1) ? 1 : rawDofLv1;
+            sub_bb3fd0(ppfxCtx, dofLv0, dofLv1);
             sub_bb2970(ppfxCtx,
                        0,
                        focusDist,
@@ -2528,8 +2532,20 @@ void sub_21d5f80(void* self, void* renderCmdCtx, void* filterParam) {
         }
 
         // 0x21d7d23..0x21d7fb8: Motion Blur & Velocity Buffer
+        const __m128 camAbsMask = _mm_set1_ps(fNeg0);
+        const __m128 camDiff01  = _mm_max_ps(_mm_andnot_ps(camAbsMask, _mm_sub_ps(curRow0, prevRow0)),
+                                             _mm_andnot_ps(camAbsMask, _mm_sub_ps(curRow1, prevRow1)));
+        const __m128 camDiff23  = _mm_max_ps(_mm_andnot_ps(camAbsMask, _mm_sub_ps(curRow2, prevRow2)),
+                                             _mm_andnot_ps(camAbsMask, _mm_sub_ps(curRow3, prevRow3)));
+        const __m128 camDiffMax = _mm_max_ps(camDiff01, camDiff23);
+        alignas(16) float camDiffArr[4];
+        _mm_store_ps(camDiffArr, camDiffMax);
+        const float maxCamDelta = std::max(std::max(camDiffArr[0], camDiffArr[1]),
+                                           std::max(camDiffArr[2], camDiffArr[3]));
+        const bool camMoved  = (maxCamDelta > f0_0001) || (velWrap != nullptr);
         const bool mbAllowed = gx_direct_vk::IsEffectEnabled(gx_direct_vk::kEffectMotionBlur) &&
-                               (*reinterpret_cast<const int32_t*>(param + 0x1dc) != 0);
+                               (*reinterpret_cast<const int32_t*>(param + 0x1dc) != 0) &&
+                               camMoved;
         sub_bb3870(ppfxCtx, (velWrap != nullptr && mbAllowed) ? 1u : 0u);
         sub_bb38b0(ppfxCtx, mbAllowed ? param[0x204] : 0u);
         const int32_t mbType = ((resetFlags & 2u) != 0u)
@@ -2574,9 +2590,13 @@ void sub_21d5f80(void* self, void* renderCmdCtx, void* filterParam) {
             }
         }
 
+        const int32_t rawMbSamp0 = *reinterpret_cast<const int32_t*>(param + 0x1ec);
+        const int32_t rawMbSamp1 = *reinterpret_cast<const int32_t*>(param + 0x1f0);
+        const int32_t mbSamp0 = (rawMbSamp0 > 4) ? 4 : rawMbSamp0;
+        const int32_t mbSamp1 = (rawMbSamp1 > 4) ? 4 : rawMbSamp1;
         sub_bb38f0(ppfxCtx,
-                   *reinterpret_cast<const int32_t*>(param + 0x1ec),
-                   *reinterpret_cast<const int32_t*>(param + 0x1f0),
+                   mbSamp0,
+                   mbSamp1,
                    *reinterpret_cast<const float*>(param + 0x1e4),
                    *reinterpret_cast<const float*>(param + 0x1e8),
                    *reinterpret_cast<const float*>(param + 0x1f4));

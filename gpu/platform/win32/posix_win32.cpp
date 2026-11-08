@@ -384,6 +384,246 @@ void SampleThread(HANDLE thread, std::string name) {
         }
     }
 }
+
+struct Win32TopologyMasks {
+    DWORD_PTR game_main = 0;
+    DWORD_PTR game_workers = 0;
+    DWORD_PTR gpu = 0;
+    DWORD_PTR helper = 0;
+};
+
+const Win32TopologyMasks& GetWin32Topology() {
+    static const Win32TopologyMasks topo = [] {
+        Win32TopologyMasks res{};
+        const char* env_ccd = bb_env("BB_GPU_CCD");
+        const char* env_topo = bb_env("BB_THREAD_TOPOLOGY");
+        if ((env_ccd && (env_ccd[0] == 'o' || env_ccd[0] == '-')) ||
+            (env_topo && (env_topo[0] == '0' || env_topo[0] == 'o' || env_topo[0] == '-'))) {
+            return res;
+        }
+
+        DWORD_PTR proc_mask = 0, sys_mask = 0;
+        if (!GetProcessAffinityMask(GetCurrentProcess(), &proc_mask, &sys_mask) ||
+            __builtin_popcountll(proc_mask) <= 2) {
+            return res;
+        }
+
+        struct PhysCore {
+            DWORD_PTR mask = 0;
+            DWORD_PTR primary = 0;
+            DWORD_PTR smt = 0;
+            int eff_class = 0;
+            int domain = 0;
+        };
+        std::vector<PhysCore> cores;
+
+        DWORD len = 0;
+        GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &len);
+        if (len > 0) {
+            std::vector<uint8_t> buf(len);
+            if (GetLogicalProcessorInformationEx(
+                    RelationProcessorCore,
+                    reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buf.data()), &len)) {
+                uint8_t* ptr = buf.data();
+                uint8_t* end = ptr + len;
+                while (ptr < end) {
+                    auto* info = reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(ptr);
+                    if (info->Relationship == RelationProcessorCore &&
+                        info->Processor.GroupCount >= 1 &&
+                        info->Processor.GroupMask[0].Group == 0) {
+                        const DWORD_PTR m = info->Processor.GroupMask[0].Mask & proc_mask;
+                        if (m != 0) {
+                            const DWORD_PTR prim = m & (~m + 1);
+                            cores.push_back(PhysCore{m, prim, m & ~prim,
+                                                     int(info->Processor.EfficiencyClass), 0});
+                        }
+                    }
+                    ptr += info->Size;
+                }
+            }
+        }
+        if (cores.size() < 4) {
+            return res;
+        }
+
+        struct L3Domain {
+            DWORD_PTR mask = 0;
+            DWORD size_bytes = 0;
+            int max_eff = 0;
+            int phys_count = 0;
+        };
+        std::vector<L3Domain> domains;
+        DWORD cache_len = 0;
+        GetLogicalProcessorInformationEx(RelationCache, nullptr, &cache_len);
+        if (cache_len > 0) {
+            std::vector<uint8_t> buf(cache_len);
+            if (GetLogicalProcessorInformationEx(
+                    RelationCache,
+                    reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buf.data()),
+                    &cache_len)) {
+                uint8_t* ptr = buf.data();
+                uint8_t* end = ptr + cache_len;
+                while (ptr < end) {
+                    auto* info = reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(ptr);
+                    if (info->Relationship == RelationCache && info->Cache.Level == 3 &&
+                        info->Cache.GroupMask.Group == 0) {
+                        const DWORD_PTR m = info->Cache.GroupMask.Mask & proc_mask;
+                        if (m != 0) {
+                            bool found = false;
+                            for (auto& d : domains) {
+                                if (d.mask == m) {
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            if (!found) {
+                                domains.push_back(L3Domain{m, info->Cache.CacheSize, 0, 0});
+                            }
+                        }
+                    }
+                    ptr += info->Size;
+                }
+            }
+        }
+
+        if (domains.empty()) {
+            domains.push_back(L3Domain{proc_mask, 0, 0, int(cores.size())});
+        }
+        for (auto& c : cores) {
+            for (size_t di = 0; di < domains.size(); ++di) {
+                if ((domains[di].mask & c.mask) != 0) {
+                    c.domain = int(di);
+                    domains[di].max_eff = std::max(domains[di].max_eff, c.eff_class);
+                    domains[di].phys_count++;
+                    break;
+                }
+            }
+        }
+
+        // Sort domains by (max_eff DESC, size_bytes DESC, phys_count DESC) so CCD0 / V-Cache / P-cores come first
+        std::vector<int> dom_order(domains.size());
+        for (size_t i = 0; i < domains.size(); ++i) {
+            dom_order[i] = int(i);
+        }
+        std::sort(dom_order.begin(), dom_order.end(), [&](int a, int b) {
+            if (domains[a].max_eff != domains[b].max_eff)
+                return domains[a].max_eff > domains[b].max_eff;
+            if (domains[a].size_bytes != domains[b].size_bytes)
+                return domains[a].size_bytes > domains[b].size_bytes;
+            return domains[a].phys_count > domains[b].phys_count;
+        });
+
+        const int dom0 = dom_order[0];
+        if (domains.size() >= 2 && domains[dom0].phys_count >= 6) {
+            // Dual-CCD / Hybrid (e.g. Ryzen 9 5900X / 5950X / 7950X / 9950X or Intel P+E):
+            // CCD0: Core 0 primary -> MOMainThread; Cores 1..N-1 primary -> Game Workers;
+            // CCD1+: GPU recording & submission + background helpers.
+            bool first = true;
+            DWORD_PTR dom0_smt = 0;
+            for (const auto& c : cores) {
+                if (c.domain == dom0) {
+                    if (first) {
+                        res.game_main = c.primary;
+                        first = false;
+                    } else {
+                        res.game_workers |= c.primary;
+                        dom0_smt |= c.smt;
+                    }
+                } else {
+                    res.gpu |= c.mask;
+                    res.helper |= (c.smt != 0 ? c.smt : c.mask);
+                }
+            }
+            if (res.helper == 0) {
+                res.helper = (dom0_smt != 0) ? dom0_smt : res.gpu;
+            }
+        } else {
+            // Single-CCD (e.g. 6c/8c Ryzen 5/7, X3D, Intel):
+            // Core 0 primary -> MOMainThread; ~65% cores -> Game Workers; remaining cores -> GPU.
+            const size_t n = cores.size();
+            const size_t split = std::max<size_t>(2, (n * 2) / 3);
+            res.game_main = cores[0].primary;
+            DWORD_PTR all_smt = 0;
+            for (size_t i = 1; i < n; ++i) {
+                all_smt |= cores[i].smt;
+                if (i < split) {
+                    res.game_workers |= (n >= 8 ? cores[i].primary : cores[i].mask);
+                } else {
+                    res.gpu |= cores[i].mask;
+                }
+            }
+            res.helper = (all_smt != 0) ? all_smt : res.gpu;
+        }
+
+        std::printf("GPU: Win32 thread topology: %zu physical cores across %zu L3 domains "
+                    "(main=%#llx, workers=%#llx, gpu=%#llx, helper=%#llx)\n",
+                    cores.size(), domains.size(),
+                    static_cast<unsigned long long>(res.game_main),
+                    static_cast<unsigned long long>(res.game_workers),
+                    static_cast<unsigned long long>(res.gpu),
+                    static_cast<unsigned long long>(res.helper));
+        std::fflush(stdout);
+        return res;
+    }();
+    return topo;
+}
+
+void ApplyWin32ThreadTopologyByName(const char* name) {
+    if (!name || !*name) {
+        return;
+    }
+    const auto& topo = GetWin32Topology();
+    if (topo.game_main == 0) {
+        return;
+    }
+    const auto starts_with = [](const char* s, const char* p) {
+        return std::strncmp(s, p, std::strlen(p)) == 0;
+    };
+    DWORD_PTR mask = 0;
+    bool boost = false;
+    if (std::strcmp(name, "MOMainThread") == 0) {
+        mask = topo.game_main;
+        boost = true;
+    } else if (starts_with(name, "HavokWorker") ||
+               starts_with(name, "GXRenderThread") ||
+               starts_with(name, "MorphemeWorker") ||
+               starts_with(name, "EzTaskRunner") ||
+               starts_with(name, "FD4TaskRunner")) {
+        mask = topo.game_workers;
+        if (starts_with(name, "HavokWorker") || starts_with(name, "GXRenderThread")) {
+            boost = true;
+        }
+    } else if (std::strcmp(name, "bb:GpuComm") == 0 ||
+               std::strcmp(name, "bb:DrawRec") == 0 ||
+               starts_with(name, "bb:VkRecorder") ||
+               std::strcmp(name, "bb:Present") == 0) {
+        mask = topo.gpu;
+        boost = true;
+    } else if (starts_with(name, "bb:") ||
+               starts_with(name, "bb-probe:") ||
+               starts_with(name, "EzWorkPool") ||
+               starts_with(name, "Core.Res.") ||
+               starts_with(name, "FMOD") ||
+               starts_with(name, "FSBank") ||
+               starts_with(name, "SLSession") ||
+               starts_with(name, "SL ") ||
+               starts_with(name, "CSTrophy") ||
+               starts_with(name, "CSMenu") ||
+               starts_with(name, "SaveData") ||
+               starts_with(name, "FrpgNet") ||
+               starts_with(name, "SystemService") ||
+               starts_with(name, "ImeEvent") ||
+               starts_with(name, "FaceGen") ||
+               starts_with(name, "KatanaMain")) {
+        mask = topo.helper;
+    }
+    if (mask != 0) {
+        SetThreadAffinityMask(GetCurrentThread(), mask);
+        if (boost) {
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+        }
+    }
+}
 } // namespace
 void bb_win32_set_thread_name(const char* name) {
     wchar_t wide[64];
@@ -392,6 +632,7 @@ void bb_win32_set_thread_name(const char* name) {
         wide[63] = 0;
         SetThreadDescription(GetCurrentThread(), wide);
     }
+    ApplyWin32ThreadTopologyByName(name);
     static const char* sampled = bb_env("BB_SAMPLE_THREAD");
     if (sampled && *sampled && std::strcmp(sampled, name) == 0) {
         HANDLE self = nullptr;
@@ -509,6 +750,24 @@ void bb_win32_background_thread(void) {
 void bb_win32_critical_thread(int level) {
     SetThreadPriority(GetCurrentThread(),
                       level >= 2 ? THREAD_PRIORITY_HIGHEST : THREAD_PRIORITY_ABOVE_NORMAL);
+}
+
+void bb_win32_pin_gpu_domain(void) {
+    const auto& topo = GetWin32Topology();
+    if (topo.gpu != 0) {
+        SetThreadAffinityMask(GetCurrentThread(), topo.gpu);
+    }
+}
+
+void bb_win32_pin_helper_domain(void) {
+    const auto& topo = GetWin32Topology();
+    if (topo.helper != 0) {
+        SetThreadAffinityMask(GetCurrentThread(), topo.helper);
+    }
+}
+
+void bb_win32_apply_thread_topology(void) {
+    (void)GetWin32Topology();
 }
 
 int backtrace(void** buffer, int size) {
