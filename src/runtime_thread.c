@@ -44,6 +44,7 @@ typedef struct GuestThread {
     ThreadAttr attr;
     char name[32];
     int detached, finished, joined, host_owned;
+    volatile int started;
     jmp_buf exit_jump;
     struct GuestThread *next;
     unsigned char *stack_memory; /* the low stack it runs on (Windows: switched to at its start) */
@@ -261,6 +262,7 @@ static void set_host_name(const char *name) {
 }
 static void run_guest(void *p) {
     GuestThread *t=p;
+    __atomic_store_n(&t->started,1,__ATOMIC_RELEASE);
     if (!setjmp(t->exit_jump)) t->result=t->entry(t->argument);
 }
 void runtime_re_watch_thread(void);
@@ -310,6 +312,15 @@ static int32_t create(GuestThread **out,ThreadAttr **attr_slot,GuestEntry entry,
     pthread_attr_destroy(&host);
     if (e) { fprintf(stderr,"STOP: host pthread_create failed: %d\n",e); exit(21); }
     if (t->detached) pthread_detach(t->host);
+    /* Wait until the host thread has finished OS/DLL startup (DLL_THREAD_ATTACH on Windows),
+     * attached its guest TCB/TLS, and switched to its guest stack in run_guest(). Without this,
+     * at 1000+ FPS on Windows the parent thread can resume and even destroy a short-lived
+     * DLThread (e.g. Mv_AudioPlayThread) before the new OS thread enters DLThread::ThreadEntry. */
+    for (int spin=0;!__atomic_load_n(&t->started,__ATOMIC_ACQUIRE) && spin<50000;++spin) {
+        if (spin<100) sched_yield();
+        else usleep(10);
+    }
+    sched_yield();
     pthread_mutex_lock(&lock); ++created; pthread_mutex_unlock(&lock);
     printf("Runtime: guest thread '%s' created (stack=%llu, prio=%d)\n",t->name,(unsigned long long)stack,t->attr.prio);
     return 0;

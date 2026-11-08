@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include <chrono>
 #include <cstring>
+#include <thread>
 
 #include "common/logging/log.h"
 #include "common/thread.h"
@@ -179,9 +180,19 @@ void Player::Handle(const Event& event) {
             std::unique_lock lock{source_mutex};
             found = source && source->FindStreams();
         }
+        // In MoviePlayer::StartMovie (eboot 0x28fe15f..0x28fe24c), sceAvPlayerAddSource is
+        // called BEFORE Mv_AudioPlayThread is created (0x28fe219) and resumed (0x28fe23a).
+        // MoviePlayer::OnStateReady (0x28ff6a0) requires Mv_AudioPlayThread to have entered
+        // MvAudioPlayRunnable::Run (0x2900423, state1 == 2) before StateReady is processed;
+        // otherwise OnStateReady aborts with movie_state = 3 and immediately destroys the
+        // DLThread while the OS thread is still starting. Give StartMovie and Mv_AudioPlayThread
+        // 20 ms on this background controller thread to complete initialization first.
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
         if (found) {
-            SetState(State::Ready);
-            Announce(State::Ready);
+            if (state == State::AddingSource) {
+                SetState(State::Ready);
+                Announce(State::Ready);
+            }
         } else {
             OnWarning(ErrorNotSupported);
             SetState(State::Error);
