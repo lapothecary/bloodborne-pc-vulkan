@@ -57,7 +57,7 @@ std::array<ArgsNote, ArgSlots> args_notes{};
 
 void Init(const Instance& instance) {
     const char* env = std::getenv("BB_BREADCRUMBS");
-    if (env && env[0] == '0') {
+    if (!env || env[0] != '1') {
         return;
     }
     if (!instance.IsBufferMarkerSupported()) {

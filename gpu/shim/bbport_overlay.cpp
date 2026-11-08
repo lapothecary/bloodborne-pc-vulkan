@@ -1608,15 +1608,19 @@ void UpdateHudBreakdown(HudBreakdown& h) {
     }
 
     h.idle_a_ms = ns_to_ms(safe_delta(cur_idle_ns, last_idle_ns));
-    h.gnm_wait_ms = ns_to_ms(safe_delta(cur_gnm_wait_ns, last_gnm_wait_ns));
+    const float raw_gnm_wait_ms = ns_to_ms(safe_delta(cur_gnm_wait_ns, last_gnm_wait_ns));
     const std::uint64_t d_main_cpu_frames = safe_delta(cur_main_cpu_frames, last_main_cpu_frames);
     if (d_main_cpu_frames > 0) {
         const float raw_main_cpu_ms = float(double(safe_delta(cur_main_cpu_ns, last_main_cpu_ns)) *
                                             1e-6 / double(d_main_cpu_frames));
         h.game_cpu_work_ms = std::clamp(raw_main_cpu_ms, 0.02f, std::max(0.02f, h.idle_a_ms));
-        h.fps_cap_sleep_ms = std::max(0.0f, h.idle_a_ms - h.game_cpu_work_ms - h.gnm_wait_ms);
+        const float max_non_cpu_ms = std::max(0.0f, h.frame_ms - h.game_cpu_work_ms);
+        h.gnm_wait_ms = std::min(raw_gnm_wait_ms, max_non_cpu_ms);
+        h.fps_cap_sleep_ms = std::clamp(h.idle_a_ms - h.game_cpu_work_ms - h.gnm_wait_ms,
+                                        0.0f, std::max(0.0f, max_non_cpu_ms - h.gnm_wait_ms));
     } else {
         h.game_cpu_work_ms = h.idle_a_ms;
+        h.gnm_wait_ms = std::min(raw_gnm_wait_ms, h.frame_ms);
         h.fps_cap_sleep_ms = 0.0f;
     }
 
@@ -2152,10 +2156,11 @@ void FpsCounter() {
             ImGui::TextColored(col, "%4.0f%%", gpu_share);
         };
 
-        // Compact 4-row CPU section (active work cleanly separated from FPS cap sleep)
+        // Compact 4-row CPU section (active work cleanly separated from FPS cap sleep / Gnm sync)
         row_cpu("CPU 1. Game Engine (Work)",
                 h.game_cpu_work_ms, h.avg_game_cpu_work_ms, h.bottleneck_kind == 1);
-        row_cpu("  FPS Cap Sleep + GnmSync",
+        row_cpu(h.fps_cap_active > 0 ? "  FPS Cap Sleep + GnmSync"
+                                     : "  Gnm Frame Sync (GPU Wait)",
                 h.fps_cap_sleep_ms + h.gnm_wait_ms, h.avg_fps_cap_sleep_ms + h.avg_gnm_wait_ms,
                 h.bottleneck_kind == 4, true);
         row_cpu("CPU 2. Stage A (DirectVk RHI)",

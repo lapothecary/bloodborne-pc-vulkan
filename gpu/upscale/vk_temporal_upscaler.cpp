@@ -1849,6 +1849,9 @@ void TemporalUpscaler::RunUiOnly(VideoCore::ImageId color_id, VideoCore::ImageId
     const auto& color = texture_cache.GetImage(color_id);
     const auto depth_format = depth_id ? texture_cache.GetImage(depth_id).info.pixel_format
                                       : vk::Format::eD32SfloatS8Uint;
+    const bool smaa_active = color_id == ldr_target && SmaaWanted();
+    GpuProfiler::HudMarkPass(&scheduler,
+                             smaa_active ? BbStats::GpuCat_AntiAliasing : BbStats::GpuCat_UiPresent);
     EnsureUiResources(target_width, target_height, color.info.pixel_format, depth_format);
     PrepareUiDepth(depth_id);
     // Copy only the background already drawn. The subsequent menu/HUD/text draws execute
@@ -1858,9 +1861,10 @@ void TemporalUpscaler::RunUiOnly(VideoCore::ImageId color_id, VideoCore::ImageId
     u32 source_width = color.info.size.width, source_height = color.info.size.height;
     const bool proxy_scene = camera_motion.Depth() && scene_targets.Reduced() &&
                              scene_targets.EligibleScene(color);
-    const vk::Image smoothed =
-        color_id == ldr_target && SmaaWanted() ? RunSmaa(color_id, proxy_scene) : vk::Image{};
-    GpuProfiler::HudMarkPass(&scheduler, BbStats::GpuCat_UiPresent);
+    const vk::Image smoothed = smaa_active ? RunSmaa(color_id, proxy_scene) : vk::Image{};
+    if (smaa_active) {
+        GpuProfiler::HudMarkPass(&scheduler, BbStats::GpuCat_UiPresent);
+    }
     if (smoothed) {
         source = smoothed;
         source_layout = vk::ImageLayout::eGeneral;

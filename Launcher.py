@@ -1914,6 +1914,8 @@ class AdwLauncherWindow:
         env["BB_HW_OCCLUSION_CULL"] = "1" if self.settings.get("hw_occlusion_cull", True) else "0"
         env["BB_MICRO_SHADOW_CULL"] = "1" if self.settings.get("hw_occlusion_cull", True) else "0"
         env["BB_NATIVE_SHADERS"] = "1" if self.settings.get("native_shaders", True) else "0"
+        env.setdefault("BB_READBACKS", "0")
+        env.setdefault("BB_BREADCRUMBS", "0")
         env["BB_PC_MODEL"] = "0"
         env["BB_GX_MODULES"] = "all"
 

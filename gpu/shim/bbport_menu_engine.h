@@ -186,7 +186,8 @@ inline constexpr std::size_t kRowEntryStride   = 0x090; // {Text name[0x40], Tex
 inline void SetVisible(u8* mc, bool visible) {
     if (!mc) return;
     const u64 vtbl = *reinterpret_cast<u64*>(mc);
-    if (!vtbl) return;
+    void* const inner = *reinterpret_cast<void**>(mc + 0x18);
+    if (!vtbl || !inner) return;
     auto fn = *reinterpret_cast<void (PS4_SYSV_ABI**)(void*, int)>(vtbl + 0x08);
     if (fn) fn(mc, visible ? 1 : 0);
 }

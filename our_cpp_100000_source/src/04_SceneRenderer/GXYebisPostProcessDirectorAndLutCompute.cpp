@@ -2542,15 +2542,16 @@ void sub_21d5f80(void* self, void* renderCmdCtx, void* filterParam) {
         _mm_store_ps(camDiffArr, camDiffMax);
         const float maxCamDelta = std::max(std::max(camDiffArr[0], camDiffArr[1]),
                                            std::max(camDiffArr[2], camDiffArr[3]));
-        const bool camMoved  = (maxCamDelta > f0_0001) || (velWrap != nullptr);
+        const int32_t mbType = ((resetFlags & 2u) != 0u)
+                                   ? 1
+                                   : *reinterpret_cast<const int32_t*>(param + 0x1e0);
+        const bool hasObjVel = (mbType == 2) && (velWrap != nullptr);
+        const bool camMoved  = (maxCamDelta > f0_0001) || hasObjVel;
         const bool mbAllowed = gx_direct_vk::IsEffectEnabled(gx_direct_vk::kEffectMotionBlur) &&
                                (*reinterpret_cast<const int32_t*>(param + 0x1dc) != 0) &&
                                camMoved;
         sub_bb3870(ppfxCtx, (velWrap != nullptr && mbAllowed) ? 1u : 0u);
         sub_bb38b0(ppfxCtx, mbAllowed ? param[0x204] : 0u);
-        const int32_t mbType = ((resetFlags & 2u) != 0u)
-                                   ? 1
-                                   : *reinterpret_cast<const int32_t*>(param + 0x1e0);
         sub_bb3890(ppfxCtx, mbType);
         sub_bb38e0(ppfxCtx,
                    *reinterpret_cast<const float*>(param + 0x2ac),

@@ -930,8 +930,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
                                 return;
                             }
                             const u32 probe_mask = culler.camera_moving ? 1u : 3u;
-                            if (!e.probe_in_flight && !Breadcrumbs::Enabled() &&
-                                !DynCheck::Enabled() &&
+                            if (!e.probe_in_flight && !DynCheck::Enabled() &&
                                 (e.zero_streak > 0 ||
                                  ((culler.cur_frame + u32(e_idx)) & probe_mask) == 0u)) {
                                 occ_probe_entry_idx = static_cast<s32>(e_idx);

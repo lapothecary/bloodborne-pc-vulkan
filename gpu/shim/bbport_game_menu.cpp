@@ -726,6 +726,46 @@ u8* effects_slot_rows[EffectsSlotCount] = {};
 int effects_scroll = 0;
 bool effects_wrapped_from_top = false;
 
+void ClearActiveCustomPages() {
+    active_controls_page = nullptr;
+    active_display_page = nullptr;
+    active_effects_page = nullptr;
+    in_controls_page.store(false, std::memory_order_relaxed);
+    BbPrompts::SetControlsGuideActive(false);
+    for (int i = 0; i < ControlsSlotCount; ++i) {
+        slot_rows[i] = nullptr;
+    }
+    for (int i = 0; i < DisplaySlotCount; ++i) {
+        display_slot_rows[i] = nullptr;
+    }
+    for (int i = 0; i < EffectsSlotCount; ++i) {
+        effects_slot_rows[i] = nullptr;
+    }
+}
+
+bool ValidateActivePageRows(u8* page, int slot_count, const int* first_val_ptr, u8** rows) {
+    if (!page) {
+        return false;
+    }
+    u8* const rows_begin = *reinterpret_cast<u8**>(page + 0xe58);
+    u8* const rows_end = *reinterpret_cast<u8**>(page + 0xe60);
+    if (!rows_begin || !rows_end || (rows_end - rows_begin) < slot_count * 0x90) {
+        return false;
+    }
+    for (int slot = 0; slot < slot_count; ++slot) {
+        u8* const widget = *reinterpret_cast<u8**>(rows_begin + slot * 0x90 + 0x80);
+        if (!widget) {
+            return false;
+        }
+        const int* const val_ptr = *reinterpret_cast<const int* const*>(widget + RowValue);
+        if (val_ptr != (first_val_ptr + slot)) {
+            return false;
+        }
+        rows[slot] = widget;
+    }
+    return true;
+}
+
 int GetSelectedPageRow(u8* page) {
     if (!page) return 0;
     int sel = *reinterpret_cast<int*>(page + 0xae8);
@@ -1111,24 +1151,18 @@ void RefreshControlsPage() {
     for (int slot = 0; slot < ControlsSlotCount; ++slot) {
         RefreshSlotTexts(slot);
     }
-    if (active_controls_page) {
-        u8* const rows_begin = *reinterpret_cast<u8**>(active_controls_page + 0xe58);
-        u8* const rows_end = *reinterpret_cast<u8**>(active_controls_page + 0xe60);
-        if (rows_begin && rows_end && rows_end - rows_begin >= ControlsSlotCount * 0x90) {
-            for (int slot = 0; slot < ControlsSlotCount; ++slot) {
-                u8* const entry = rows_begin + slot * 0x90;
-                *reinterpret_cast<const char16_t**>(entry + 0x00) = TextOf(ControlsSlotName + u32(slot));
-                *reinterpret_cast<const char16_t**>(entry + 0x40) = TextOf(ControlsSlotHelp + u32(slot));
-                u8* const widget = *reinterpret_cast<u8**>(entry + 0x80);
-                if (widget) {
-                    slot_rows[slot] = widget;
-                }
-            }
-        }
-        Game<void (PS4_SYSV_ABI*)(void*)>(ListDraw)(active_controls_page + 0xa70);
-        Game<void (PS4_SYSV_ABI*)(void*)>(UpdatePageHelpBar)(active_controls_page);
-        Game<void (PS4_SYSV_ABI*)(void*)>(UpdatePageButtonGuide)(active_controls_page);
+    if (!ValidateActivePageRows(active_controls_page, ControlsSlotCount, &values[FirstSlot], slot_rows)) {
+        return;
     }
+    u8* const rows_begin = *reinterpret_cast<u8**>(active_controls_page + 0xe58);
+    for (int slot = 0; slot < ControlsSlotCount; ++slot) {
+        u8* const entry = rows_begin + slot * 0x90;
+        *reinterpret_cast<const char16_t**>(entry + 0x00) = TextOf(ControlsSlotName + u32(slot));
+        *reinterpret_cast<const char16_t**>(entry + 0x40) = TextOf(ControlsSlotHelp + u32(slot));
+    }
+    Game<void (PS4_SYSV_ABI*)(void*)>(ListDraw)(active_controls_page + 0xa70);
+    Game<void (PS4_SYSV_ABI*)(void*)>(UpdatePageHelpBar)(active_controls_page);
+    Game<void (PS4_SYSV_ABI*)(void*)>(UpdatePageButtonGuide)(active_controls_page);
     for (int slot = 0; slot < ControlsSlotCount; ++slot) {
         UpdateSlotRowDisplay(slot_rows[slot], slot);
     }
@@ -1714,45 +1748,36 @@ void RefreshDisplayPage() {
     for (int slot = 0; slot < DisplaySlotCount; ++slot) {
         RefreshDisplaySlotTexts(slot);
     }
-    if (active_display_page) {
-        u8* const rows_begin = *reinterpret_cast<u8**>(active_display_page + 0xe58);
-        u8* const rows_end = *reinterpret_cast<u8**>(active_display_page + 0xe60);
-        if (rows_begin && rows_end && rows_end - rows_begin >= DisplaySlotCount * 0x90) {
-            for (int slot = 0; slot < DisplaySlotCount; ++slot) {
-                u8* const entry = rows_begin + slot * 0x90;
-                *reinterpret_cast<const char16_t**>(entry + 0x00) = TextOf(DisplaySlotName + u32(slot));
-                *reinterpret_cast<const char16_t**>(entry + 0x40) = TextOf(DisplaySlotHelp + u32(slot));
-                u8* const widget = *reinterpret_cast<u8**>(entry + 0x80);
-                if (widget) {
-                    display_slot_rows[slot] = widget;
-                }
-            }
-        }
-        Game<void (PS4_SYSV_ABI*)(void*)>(ListDraw)(active_display_page + 0xa70);
-        Game<void (PS4_SYSV_ABI*)(void*)>(UpdatePageHelpBar)(active_display_page);
+    if (!ValidateActivePageRows(active_display_page, DisplaySlotCount, &values[FirstDisplaySlot],
+                                display_slot_rows)) {
+        return;
     }
+    u8* const rows_begin = *reinterpret_cast<u8**>(active_display_page + 0xe58);
+    for (int slot = 0; slot < DisplaySlotCount; ++slot) {
+        u8* const entry = rows_begin + slot * 0x90;
+        *reinterpret_cast<const char16_t**>(entry + 0x00) = TextOf(DisplaySlotName + u32(slot));
+        *reinterpret_cast<const char16_t**>(entry + 0x40) = TextOf(DisplaySlotHelp + u32(slot));
+    }
+    Game<void (PS4_SYSV_ABI*)(void*)>(ListDraw)(active_display_page + 0xa70);
+    Game<void (PS4_SYSV_ABI*)(void*)>(UpdatePageHelpBar)(active_display_page);
     for (int slot = 0; slot < DisplaySlotCount; ++slot) {
         UpdateDisplaySlotRowDisplay(display_slot_rows[slot], slot);
     }
 }
 
 void InitDisplayPage(void* page) {
+    ClearActiveCustomPages();
     active_display_page = static_cast<u8*>(page);
     display_scroll = 0;
     display_wrapped_from_top = false;
-    for (int slot = 0; slot < DisplaySlotCount; ++slot) {
-        display_slot_rows[slot] = nullptr;
-    }
     LoadValues();
     for (int slot = 0; slot < DisplaySlotCount; ++slot) {
         RefreshDisplaySlotTexts(slot);
     }
     AddRows(page, pages[0].rows);
-    u8* const rows_begin = *reinterpret_cast<u8**>(active_display_page + 0xe58);
-    u8* const rows_end = *reinterpret_cast<u8**>(active_display_page + 0xe60);
-    if (rows_begin && rows_end && rows_end - rows_begin >= DisplaySlotCount * 0x90) {
+    if (ValidateActivePageRows(active_display_page, DisplaySlotCount, &values[FirstDisplaySlot],
+                               display_slot_rows)) {
         for (int slot = 0; slot < DisplaySlotCount; ++slot) {
-            display_slot_rows[slot] = *reinterpret_cast<u8**>(rows_begin + slot * 0x90 + 0x80);
             UpdateDisplaySlotRowDisplay(display_slot_rows[slot], slot);
         }
     }
@@ -2041,45 +2066,36 @@ void RefreshEffectsPage() {
     for (int slot = 0; slot < EffectsSlotCount; ++slot) {
         RefreshEffectsSlotTexts(slot);
     }
-    if (active_effects_page) {
-        u8* const rows_begin = *reinterpret_cast<u8**>(active_effects_page + 0xe58);
-        u8* const rows_end = *reinterpret_cast<u8**>(active_effects_page + 0xe60);
-        if (rows_begin && rows_end && rows_end - rows_begin >= EffectsSlotCount * 0x90) {
-            for (int slot = 0; slot < EffectsSlotCount; ++slot) {
-                u8* const entry = rows_begin + slot * 0x90;
-                *reinterpret_cast<const char16_t**>(entry + 0x00) = TextOf(EffectsSlotName + u32(slot));
-                *reinterpret_cast<const char16_t**>(entry + 0x40) = TextOf(EffectsSlotHelp + u32(slot));
-                u8* const widget = *reinterpret_cast<u8**>(entry + 0x80);
-                if (widget) {
-                    effects_slot_rows[slot] = widget;
-                }
-            }
-        }
-        Game<void (PS4_SYSV_ABI*)(void*)>(ListDraw)(active_effects_page + 0xa70);
-        Game<void (PS4_SYSV_ABI*)(void*)>(UpdatePageHelpBar)(active_effects_page);
+    if (!ValidateActivePageRows(active_effects_page, EffectsSlotCount, &values[FirstEffectsSlot],
+                                effects_slot_rows)) {
+        return;
     }
+    u8* const rows_begin = *reinterpret_cast<u8**>(active_effects_page + 0xe58);
+    for (int slot = 0; slot < EffectsSlotCount; ++slot) {
+        u8* const entry = rows_begin + slot * 0x90;
+        *reinterpret_cast<const char16_t**>(entry + 0x00) = TextOf(EffectsSlotName + u32(slot));
+        *reinterpret_cast<const char16_t**>(entry + 0x40) = TextOf(EffectsSlotHelp + u32(slot));
+    }
+    Game<void (PS4_SYSV_ABI*)(void*)>(ListDraw)(active_effects_page + 0xa70);
+    Game<void (PS4_SYSV_ABI*)(void*)>(UpdatePageHelpBar)(active_effects_page);
     for (int slot = 0; slot < EffectsSlotCount; ++slot) {
         UpdateEffectsSlotRowDisplay(effects_slot_rows[slot], slot);
     }
 }
 
 void InitEffectsPage(void* page) {
+    ClearActiveCustomPages();
     active_effects_page = static_cast<u8*>(page);
     effects_scroll = 0;
     effects_wrapped_from_top = false;
-    for (int slot = 0; slot < EffectsSlotCount; ++slot) {
-        effects_slot_rows[slot] = nullptr;
-    }
     LoadValues();
     for (int slot = 0; slot < EffectsSlotCount; ++slot) {
         RefreshEffectsSlotTexts(slot);
     }
     AddRows(page, pages[1].rows);
-    u8* const rows_begin = *reinterpret_cast<u8**>(active_effects_page + 0xe58);
-    u8* const rows_end = *reinterpret_cast<u8**>(active_effects_page + 0xe60);
-    if (rows_begin && rows_end && rows_end - rows_begin >= EffectsSlotCount * 0x90) {
+    if (ValidateActivePageRows(active_effects_page, EffectsSlotCount, &values[FirstEffectsSlot],
+                               effects_slot_rows)) {
         for (int slot = 0; slot < EffectsSlotCount; ++slot) {
-            effects_slot_rows[slot] = *reinterpret_cast<u8**>(rows_begin + slot * 0x90 + 0x80);
             UpdateEffectsSlotRowDisplay(effects_slot_rows[slot], slot);
         }
     }
@@ -2224,6 +2240,7 @@ using ControlsContentFn = void (PS4_SYSV_ABI*)(void*, u8*);
 ControlsContentFn controls_content_original = nullptr;
 
 void PS4_SYSV_ABI ControlsContentHook(void* page, u8* game_settings) {
+    ClearActiveCustomPages();
     active_controls_page = static_cast<u8*>(page);
     in_controls_page.store(true, std::memory_order_relaxed);
     BbPrompts::SetControlsGuideActive(true);
@@ -2231,19 +2248,13 @@ void PS4_SYSV_ABI ControlsContentHook(void* page, u8* game_settings) {
     controls_scroll = 0;
     controls_wrapped_from_top = false;
     capture_cooldown_ms.store(NowSteadyMs() + 250, std::memory_order_relaxed);
-    for (int slot = 0; slot < ControlsSlotCount; ++slot) {
-        slot_rows[slot] = nullptr;
-    }
     LoadValues();
     for (int slot = 0; slot < ControlsSlotCount; ++slot) {
         RefreshSlotTexts(slot);
     }
     AddRows(page, controls_rows);
-    u8* const rows_begin = *reinterpret_cast<u8**>(active_controls_page + 0xe58);
-    u8* const rows_end = *reinterpret_cast<u8**>(active_controls_page + 0xe60);
-    if (rows_begin && rows_end && rows_end - rows_begin >= ControlsSlotCount * 0x90) {
+    if (ValidateActivePageRows(active_controls_page, ControlsSlotCount, &values[FirstSlot], slot_rows)) {
         for (int slot = 0; slot < ControlsSlotCount; ++slot) {
-            slot_rows[slot] = *reinterpret_cast<u8**>(rows_begin + slot * 0x90 + 0x80);
             UpdateSlotRowDisplay(slot_rows[slot], slot);
         }
     }
@@ -2262,11 +2273,14 @@ bool AnySlotPopupOpen(u8* const* rows, int slot_count) {
 }
 
 void HandleScrollablePageNavigate(u8* page, u8* input, float frame_time, int slot_count, int max_scroll,
-                                  int& scroll, bool& wrapped_from_top, u8* const* rows,
+                                  int& scroll, bool& wrapped_from_top, const int* first_val_ptr, u8** rows,
                                   void (*refresh_fn)(), void (*sync_sliders_fn)(int)) {
     const bool popup_was_open = AnySlotPopupOpen(rows, slot_count);
     const int pre_sel = GetSelectedPageRow(page);
     options_page_navigate_original(page, input, frame_time);
+    if (!ValidateActivePageRows(page, slot_count, first_val_ptr, rows)) {
+        return;
+    }
     if (popup_was_open || AnySlotPopupOpen(rows, slot_count)) {
         return;
     }
@@ -2323,53 +2337,85 @@ void HandleScrollablePageNavigate(u8* page, u8* input, float frame_time, int slo
 }
 
 void SyncAllControlsSliders(int new_sel) {
+    if (!ValidateActivePageRows(active_controls_page, ControlsSlotCount, &values[FirstSlot], slot_rows)) {
+        return;
+    }
     for (int slot = 0; slot < ControlsSlotCount; ++slot) {
         SyncSlotSliderWidget(slot_rows[slot], slot, slot == new_sel);
     }
 }
 
 void SyncAllDisplaySliders(int new_sel) {
+    if (!ValidateActivePageRows(active_display_page, DisplaySlotCount, &values[FirstDisplaySlot],
+                                display_slot_rows)) {
+        return;
+    }
     for (int slot = 0; slot < DisplaySlotCount; ++slot) {
         SyncDisplaySlotSliderWidget(display_slot_rows[slot], slot, slot == new_sel);
     }
 }
 
 void SyncAllEffectsSliders(int new_sel) {
+    if (!ValidateActivePageRows(active_effects_page, EffectsSlotCount, &values[FirstEffectsSlot],
+                                effects_slot_rows)) {
+        return;
+    }
     for (int slot = 0; slot < EffectsSlotCount; ++slot) {
         SyncEffectsSlotSliderWidget(effects_slot_rows[slot], slot, slot == new_sel);
     }
 }
 
 void PS4_SYSV_ABI OptionsPageNavigateHook(u8* page, u8* input, float frame_time) {
-    in_controls_page.store(page == active_controls_page, std::memory_order_relaxed);
     if (page == active_controls_page) {
-        const int sel = GetSelectedControlsRow();
-        const int item_idx = std::clamp(controls_scroll + std::max(0, sel), 0, TotalControlsItems - 1);
-        BbPrompts::SetControlsGuideActive(sel >= 0 && sel < ControlsSlotCount && ItemKeyAction(item_idx) >= 0);
-        if (capturing_action.load(std::memory_order_relaxed) >= 0 || InCaptureCooldown()) {
+        if (!ValidateActivePageRows(page, ControlsSlotCount, &values[FirstSlot], slot_rows)) {
+            active_controls_page = nullptr;
+            in_controls_page.store(false, std::memory_order_relaxed);
+            BbPrompts::SetControlsGuideActive(false);
+            for (int i = 0; i < ControlsSlotCount; ++i) slot_rows[i] = nullptr;
+        } else {
+            in_controls_page.store(true, std::memory_order_relaxed);
+            const int sel = GetSelectedControlsRow();
+            const int item_idx = std::clamp(controls_scroll + std::max(0, sel), 0, TotalControlsItems - 1);
+            BbPrompts::SetControlsGuideActive(sel >= 0 && sel < ControlsSlotCount && ItemKeyAction(item_idx) >= 0);
+            if (capturing_action.load(std::memory_order_relaxed) >= 0 || InCaptureCooldown()) {
+                return;
+            }
+            HandleScrollablePageNavigate(page, input, frame_time, ControlsSlotCount, MaxControlsScroll,
+                                         controls_scroll, controls_wrapped_from_top, &values[FirstSlot],
+                                         slot_rows, &RefreshControlsPage, &SyncAllControlsSliders);
+            if (ValidateActivePageRows(page, ControlsSlotCount, &values[FirstSlot], slot_rows)) {
+                const int new_sel = GetSelectedControlsRow();
+                const int new_idx = std::clamp(controls_scroll + std::max(0, new_sel), 0, TotalControlsItems - 1);
+                BbPrompts::SetControlsGuideActive(new_sel >= 0 && new_sel < ControlsSlotCount &&
+                                                  ItemKeyAction(new_idx) >= 0);
+                Game<void (PS4_SYSV_ABI*)(void*)>(UpdatePageButtonGuide)(page);
+            }
             return;
         }
-        HandleScrollablePageNavigate(page, input, frame_time, ControlsSlotCount, MaxControlsScroll,
-                                     controls_scroll, controls_wrapped_from_top, slot_rows,
-                                     &RefreshControlsPage, &SyncAllControlsSliders);
-        const int new_sel = GetSelectedControlsRow();
-        const int new_idx = std::clamp(controls_scroll + std::max(0, new_sel), 0, TotalControlsItems - 1);
-        BbPrompts::SetControlsGuideActive(new_sel >= 0 && new_sel < ControlsSlotCount && ItemKeyAction(new_idx) >= 0);
-        Game<void (PS4_SYSV_ABI*)(void*)>(UpdatePageButtonGuide)(page);
-        return;
     }
+    in_controls_page.store(false, std::memory_order_relaxed);
     BbPrompts::SetControlsGuideActive(false);
     if (page == active_display_page) {
-        HandleScrollablePageNavigate(page, input, frame_time, DisplaySlotCount, MaxDisplayScroll,
-                                     display_scroll, display_wrapped_from_top, display_slot_rows,
-                                     &RefreshDisplayPage, &SyncAllDisplaySliders);
-        return;
+        if (!ValidateActivePageRows(page, DisplaySlotCount, &values[FirstDisplaySlot], display_slot_rows)) {
+            active_display_page = nullptr;
+            for (int i = 0; i < DisplaySlotCount; ++i) display_slot_rows[i] = nullptr;
+        } else {
+            HandleScrollablePageNavigate(page, input, frame_time, DisplaySlotCount, MaxDisplayScroll,
+                                         display_scroll, display_wrapped_from_top, &values[FirstDisplaySlot],
+                                         display_slot_rows, &RefreshDisplayPage, &SyncAllDisplaySliders);
+            return;
+        }
     }
     if (page == active_effects_page) {
-        HandleScrollablePageNavigate(page, input, frame_time, EffectsSlotCount, MaxEffectsScroll,
-                                     effects_scroll, effects_wrapped_from_top, effects_slot_rows,
-                                     &RefreshEffectsPage, &SyncAllEffectsSliders);
-        return;
+        if (!ValidateActivePageRows(page, EffectsSlotCount, &values[FirstEffectsSlot], effects_slot_rows)) {
+            active_effects_page = nullptr;
+            for (int i = 0; i < EffectsSlotCount; ++i) effects_slot_rows[i] = nullptr;
+        } else {
+            HandleScrollablePageNavigate(page, input, frame_time, EffectsSlotCount, MaxEffectsScroll,
+                                         effects_scroll, effects_wrapped_from_top, &values[FirstEffectsSlot],
+                                         effects_slot_rows, &RefreshEffectsPage, &SyncAllEffectsSliders);
+            return;
+        }
     }
     options_page_navigate_original(page, input, frame_time);
 }

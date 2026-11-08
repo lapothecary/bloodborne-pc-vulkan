@@ -450,7 +450,8 @@ void OnFlipStats() {
         window_draws = all_draws;
         window_gpu_us = gpu_us;
         static u64 win_idle_ns = 0, win_sync_rec_ns = 0, win_host_copy_ns = 0,
-                   win_copy_thr_ns = 0, win_tick_wait_ns = 0;
+                   win_copy_thr_ns = 0, win_tick_wait_ns = 0,
+                   win_gnm_waits = 0, win_gnm_wait_ns = 0;
         const auto win_delta = [](const std::atomic<u64>& cnt, u64& last) -> u64 {
             const u64 cur = cnt.load(std::memory_order_relaxed);
             const u64 d = cur >= last ? cur - last : cur;
@@ -539,8 +540,8 @@ void OnFlipStats() {
                         BbStats::submit_done_calls.exchange(0) / double(frames),
                         BbStats::submits_allowed_queries.exchange(0) / double(frames),
                         BbStats::submits_refused.exchange(0) / double(frames),
-                        BbStats::gnm_frame_waits.exchange(0) / double(frames),
-                        BbStats::gnm_frame_wait_ns.exchange(0) / (1e6 * double(frames)),
+                        win_delta(BbStats::gnm_frame_waits, win_gnm_waits) / double(frames),
+                        win_delta(BbStats::gnm_frame_wait_ns, win_gnm_wait_ns) / (1e6 * double(frames)),
                         BbStats::asc_submits.exchange(0) / double(frames));
             std::printf("EOP fences: %llu decoded, %llu labels written, %lld pending; %.1f labels/frame "
                         "written by the GPU\n",
@@ -552,8 +553,8 @@ void OnFlipStats() {
             BbStats::submit_done_calls.exchange(0);
             BbStats::submits_allowed_queries.exchange(0);
             BbStats::submits_refused.exchange(0);
-            BbStats::gnm_frame_waits.exchange(0);
-            BbStats::gnm_frame_wait_ns.exchange(0);
+            win_delta(BbStats::gnm_frame_waits, win_gnm_waits);
+            win_delta(BbStats::gnm_frame_wait_ns, win_gnm_wait_ns);
             BbStats::asc_submits.exchange(0);
             BbStats::gpu_labels.exchange(0);
         }

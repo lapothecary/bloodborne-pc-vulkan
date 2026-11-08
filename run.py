@@ -537,6 +537,8 @@ def run(extra_args=(), env=None, on_line=None):
         setdefault(env, 'BB_HW_OCCLUSION_CULL', '1')
         setdefault(env, 'BB_MICRO_SHADOW_CULL', '1')
         setdefault(env, 'BB_NATIVE_SHADERS', '1')
+        setdefault(env, 'BB_READBACKS', '0')
+        setdefault(env, 'BB_BREADCRUMBS', '0')
         setdefault(env, 'BB_COPY_GPU_BUFFERS', '1')
         setdefault(env, 'BB_GPU_WRITE_TWINS', '1')
         setdefault(env, 'BB_GPU_WRITE_TWINS_MAX', '65536')

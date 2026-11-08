@@ -23,9 +23,8 @@ public:
     u32 GetInternalScreenWidth() { static const auto value = u32(Number("BB_INTERNAL_WIDTH", 1920)); return value; }
     u32 GetInternalScreenHeight() { static const auto value = u32(Number("BB_INTERNAL_HEIGHT", 1080)); return value; }
     std::string GetPresentMode() { const char* v = std::getenv("BB_PRESENT_MODE"); return v ? v : "Mailbox"; }
-    // bbport: Relaxed by default: without readbacks FaceGen reads stale GPU-written vertices
-    // (vertex explosions); in Hunter's Nightmare it costs no measurable frame rate.
-    u32 GetReadbacksMode() { static const auto value = u32(Number("BB_READBACKS", GpuReadbacksMode::Relaxed)); return value; }
+    // bbport: Disabled by default (GPU write twins handle FaceGen without synchronous GPU readbacks).
+    u32 GetReadbacksMode() { static const auto value = u32(Number("BB_READBACKS", GpuReadbacksMode::Disabled)); return value; }
     // bbport: uncapped presets (run.sh: BB_VBLANK_HZ=1000; 0 means 480): vblank runs at
     // 1000 Hz, and a finished frame is presented as soon as it arrives (IsUncappedVblank), not on
     // the next vblank tick (at the display rate frames alternated 10/20 ms at 100 Hz: judder; at
