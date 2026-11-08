@@ -331,6 +331,12 @@ def run(extra_args=(), env=None, on_line=None):
                '--settings', env['BB_CONFIG'], '--game-dir', game, '--render-res', env.get('BB_RENDER_RES', ''),
                '--output-res', env.get('BB_OUTPUT_RES', ''), '--patches-dir', env.get('BB_PATCHES_DIR', data / 'patches'),
                '--patches-config', env.get('BB_PATCHES_CONFIG', data / 'patches.json'), '--large-heaps', large_heaps)
+        setdefault(env, 'BB_PC_MODEL', '0')
+        setdefault(env, 'BB_GUEST_IN_PLACE', env['BB_PC_MODEL'])
+        setdefault(env, 'BB_GX_MODULES', 'all')
+        setdefault(env, 'BB_HW_OCCLUSION_CULL', '1')
+        setdefault(env, 'BB_MICRO_SHADOW_CULL', '1')
+        setdefault(env, 'BB_NATIVE_SHADERS', '1')
         setdefault(env, 'BB_COPY_GPU_BUFFERS', '1')
         setdefault(env, 'BB_GPU_WRITE_TWINS', '1')
         setdefault(env, 'BB_GPU_WRITE_TWINS_MAX', '65536')

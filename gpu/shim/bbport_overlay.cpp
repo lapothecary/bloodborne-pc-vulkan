@@ -1273,7 +1273,6 @@ struct HudBreakdown {
 };
 
 void PollGpuHwSensors(HudBreakdown& h) noexcept {
-#ifndef _WIN32
     struct NvmlUtil {
         unsigned int gpu;
         unsigned int memory;
@@ -1303,11 +1302,14 @@ void PollGpuHwSensors(HudBreakdown& h) noexcept {
     if (!probed) {
         probed = true;
 #ifdef _WIN32
-        constexpr const char* kNvmlLibName = "nvml.dll";
+        void* lib = dlopen("nvml.dll", RTLD_LAZY | RTLD_LOCAL);
+        if (!lib) {
+            lib = dlopen("C:\\Program Files\\NVIDIA Corporation\\NVSMI\\nvml.dll", RTLD_LAZY | RTLD_LOCAL);
+        }
 #else
-        constexpr const char* kNvmlLibName = "libnvidia-ml.so.1";
+        void* lib = dlopen("libnvidia-ml.so.1", RTLD_LAZY | RTLD_LOCAL);
 #endif
-        if (void* lib = dlopen(kNvmlLibName, RTLD_LAZY | RTLD_LOCAL)) {
+        if (lib) {
             auto fn_init = reinterpret_cast<FnInit>(dlsym(lib, "nvmlInit_v2"));
             if (!fn_init) {
                 fn_init = reinterpret_cast<FnInit>(dlsym(lib, "nvmlInit"));
@@ -1354,6 +1356,7 @@ void PollGpuHwSensors(HudBreakdown& h) noexcept {
         return;
     }
 
+#ifndef _WIN32
     // Fallback for AMD / Intel / Steam Deck via Linux DRM sysfs:
     auto read_sysfs_u64 = [](const char* path, std::uint64_t& out) -> bool {
         FILE* f = std::fopen(path, "r");
@@ -1934,58 +1937,73 @@ void UpdateHudBreakdown(HudBreakdown& h) {
 
     if (std::chrono::duration<double>(now - last_file_dump).count() >= 1.0) {
         last_file_dump = now;
+        const auto& s = BbSettings::Get();
+        const auto out = BbSettings::CurrentOutput();
+        const auto shd = Vulkan::DirectShaders::ReadTelemetry();
+        char hud_buf[2048];
+        std::snprintf(hud_buf, sizeof(hud_buf),
+                      "FPS: %.1f (%.2f ms/f) | Avg15s: %.1f FPS (%.2f ms/f, Jit %.2f ms) | Scene: %dx%d -> %dx%d | Upscaler: %s (%s)%s\n"
+                      "GPU HW: %.1f W | %d MHz | %d C | DrvBusy %d%% | VRAM %.2f/%.2f GB\n"
+                      "Counts/f: Draws %.0f (Avg %.0f) | Disp %.0f (Avg %.0f) | Subm %.1f (Avg %.1f) | PipeDrains %.1f | Faults/s %.1f | NativeVkBuf %.1f%% | NativeVkTex %.1f%% | DescSaved %.1f%% | DontCare %llu/%llu\n"
+                      "DirectShaders: reg %llu | manifest %llu/%u | stageA_hits %llu | worker_hits %llu\n"
+                      "CPU 1. Game Engine: Work %.2f ms (Avg %.2f) | FpsCapSleep %.2f ms (Avg %.2f) | GnmWait %.2f ms (Avg %.2f)\n"
+                      "CPU 2. Stage A (GpuComm): Total %.2f ms (Avg %.2f) | PM4+FastPSO %.2f ms (Avg %.2f) | ConstRing %.2f ms (Avg %.2f) | WaitDrainB %.2f ms\n"
+                      "CPU 3. Stage B (DrawRec): Total %.2f ms (Avg %.2f) | Buffers %.2f ms | Tex+Desc %.2f ms | State+Draw+Disp %.2f ms | Tasks %.2f ms | Packet+Regs %.2f ms\n"
+                      "GPU Render Passes: TotalBusy %.2f ms (Avg %.2f) | Gap %.2f ms (Avg %.2f) | PresentSync %.2f ms (Avg %.2f)\n"
+                      "  1.Shadows %.2f ms | 2.GBuf %.2f ms | 3.SSAO %.2f ms | 4.DefPBR %.2f ms | 5.SSR %.2f ms | 6.FwdAlpha %.2f ms | 7.CompCopy %.2f ms | 8.Yebis2 %.2f ms | 9.AA/Up %.2f ms | 10.UI/Pres %.2f ms\n"
+                      "BOTTLENECK: %s (Now %.2f ms / Avg %.2f ms)\n",
+                      h.fps, h.frame_ms, h.avg_fps, h.avg_frame_ms, h.avg_jitter_ms,
+                      s.active_render_width.load(), s.active_render_height.load(),
+                      out.width, out.height,
+                      BbSettings::UpscalerName(s.upscaler),
+                      BbSettings::PresetName(BbSettings::RenderPreset()),
+                      BbSettings::ResolutionNeedsRestart() ? " [NEEDS RESTART]" : "",
+                      h.gpu_power_w, h.gpu_clock_mhz, h.gpu_temp_c, h.gpu_drv_util_pct, h.vram_used_gb, h.vram_total_gb,
+                      h.draws_pf, h.avg_draws_pf, h.dispatches_pf, h.avg_dispatches_pf,
+                      h.submits_pf, h.avg_submits_pf, h.drains_pf,
+                      h.faults_ps, h.native_buf_pct, h.native_tex_pct,
+                      h.desc_saved_pct,
+                      static_cast<unsigned long long>(BbStats::dont_care_passes.load(std::memory_order_relaxed)),
+                      static_cast<unsigned long long>(BbStats::total_render_passes.load(std::memory_order_relaxed)),
+                      static_cast<unsigned long long>(shd.registered_binaries),
+                      static_cast<unsigned long long>(shd.manifest_binaries_bound),
+                      shd.manifest_total,
+                      static_cast<unsigned long long>(shd.stage_a_direct_hits),
+                      static_cast<unsigned long long>(shd.worker_direct_hits),
+                      h.game_cpu_work_ms, h.avg_game_cpu_work_ms, h.fps_cap_sleep_ms, h.avg_fps_cap_sleep_ms, h.gnm_wait_ms, h.avg_gnm_wait_ms,
+                      h.a_total_ms, h.avg_a_total_ms, h.a_pm4_pipe_ms, h.avg_a_pm4_pipe_ms,
+                      h.a_ring_ms, h.avg_a_ring_ms, h.a_drain_ms,
+                      h.b_total_ms, h.avg_b_total_ms, h.b_buffers_ms,
+                      h.b_tex_desc_ms, h.b_state_pass_ms,
+                      h.b_tasks_ms, h.b_packet_misc_ms,
+                      h.hw_gpu_busy_ms, h.avg_hw_gpu_busy_ms, h.hw_gpu_gap_ms, h.avg_hw_gpu_gap_ms,
+                      gpu_wait_now_ms, h.avg_gpu_wait_ms,
+                      h.hw_gpu_cat_ms[0], h.hw_gpu_cat_ms[1], h.hw_gpu_cat_ms[2], h.hw_gpu_cat_ms[3], h.hw_gpu_cat_ms[4],
+                      h.hw_gpu_cat_ms[5], h.hw_gpu_cat_ms[6], h.hw_gpu_cat_ms[7], h.hw_gpu_cat_ms[8], h.hw_gpu_cat_ms[9],
+                      h.bottleneck_en, h.bottleneck_ms, h.avg_bottleneck_ms);
+#ifndef _WIN32
         if (FILE* f = std::fopen("/tmp/bb_frame_hud.txt", "w")) {
-            const auto& s = BbSettings::Get();
-            const auto out = BbSettings::CurrentOutput();
-            const auto shd = Vulkan::DirectShaders::ReadTelemetry();
-            std::fprintf(f,
-                         "FPS: %.1f (%.2f ms/f) | Avg15s: %.1f FPS (%.2f ms/f, Jit %.2f ms) | Scene: %dx%d -> %dx%d | Upscaler: %s (%s)%s\n"
-                         "GPU HW: %.1f W | %d MHz | %d C | DrvBusy %d%% | VRAM %.2f/%.2f GB\n"
-                         "Counts/f: Draws %.0f (Avg %.0f) | Disp %.0f (Avg %.0f) | Subm %.1f (Avg %.1f) | PipeDrains %.1f | Faults/s %.1f | NativeVkBuf %.1f%% | NativeVkTex %.1f%% | DescSaved %.1f%% | DontCare %llu/%llu\n"
-                         "DirectShaders: reg %llu | manifest %llu/%u | stageA_hits %llu | worker_hits %llu\n"
-                         "CPU 1. Game Engine: Work %.2f ms (Avg %.2f) | FpsCapSleep %.2f ms (Avg %.2f) | GnmWait %.2f ms (Avg %.2f)\n"
-                         "CPU 2. Stage A (GpuComm): Total %.2f ms (Avg %.2f) | PM4+FastPSO %.2f ms (Avg %.2f) | ConstRing %.2f ms (Avg %.2f) | WaitDrainB %.2f ms\n"
-                         "CPU 3. Stage B (DrawRec): Total %.2f ms (Avg %.2f) | Buffers %.2f ms | Tex+Desc %.2f ms | State+Draw+Disp %.2f ms | Tasks %.2f ms | Packet+Regs %.2f ms\n"
-                         "GPU Render Passes: TotalBusy %.2f ms (Avg %.2f) | Gap %.2f ms (Avg %.2f) | PresentSync %.2f ms (Avg %.2f)\n"
-                         "  1.Shadows %.2f ms | 2.GBuf %.2f ms | 3.SSAO %.2f ms | 4.DefPBR %.2f ms | 5.SSR %.2f ms | 6.FwdAlpha %.2f ms | 7.CompCopy %.2f ms | 8.Yebis2 %.2f ms | 9.AA/Up %.2f ms | 10.UI/Pres %.2f ms\n"
-                         "BOTTLENECK: %s (Now %.2f ms / Avg %.2f ms)\n",
-                         h.fps, h.frame_ms, h.avg_fps, h.avg_frame_ms, h.avg_jitter_ms,
-                         s.active_render_width.load(), s.active_render_height.load(),
-                         out.width, out.height,
-                         BbSettings::UpscalerName(s.upscaler),
-                         BbSettings::PresetName(BbSettings::RenderPreset()),
-                         BbSettings::ResolutionNeedsRestart() ? " [NEEDS RESTART]" : "",
-                         h.gpu_power_w, h.gpu_clock_mhz, h.gpu_temp_c, h.gpu_drv_util_pct, h.vram_used_gb, h.vram_total_gb,
-                         h.draws_pf, h.avg_draws_pf, h.dispatches_pf, h.avg_dispatches_pf,
-                         h.submits_pf, h.avg_submits_pf, h.drains_pf,
-                         h.faults_ps, h.native_buf_pct, h.native_tex_pct,
-                         h.desc_saved_pct,
-                         static_cast<unsigned long long>(BbStats::dont_care_passes.load(std::memory_order_relaxed)),
-                         static_cast<unsigned long long>(BbStats::total_render_passes.load(std::memory_order_relaxed)),
-                         static_cast<unsigned long long>(shd.registered_binaries),
-                         static_cast<unsigned long long>(shd.manifest_binaries_bound),
-                         shd.manifest_total,
-                         static_cast<unsigned long long>(shd.stage_a_direct_hits),
-                         static_cast<unsigned long long>(shd.worker_direct_hits),
-                         h.game_cpu_work_ms, h.avg_game_cpu_work_ms, h.fps_cap_sleep_ms, h.avg_fps_cap_sleep_ms, h.gnm_wait_ms, h.avg_gnm_wait_ms,
-                         h.a_total_ms, h.avg_a_total_ms, h.a_pm4_pipe_ms, h.avg_a_pm4_pipe_ms,
-                         h.a_ring_ms, h.avg_a_ring_ms, h.a_drain_ms,
-                         h.b_total_ms, h.avg_b_total_ms, h.b_buffers_ms,
-                         h.b_tex_desc_ms, h.b_state_pass_ms,
-                         h.b_tasks_ms, h.b_packet_misc_ms,
-                         h.hw_gpu_busy_ms, h.avg_hw_gpu_busy_ms, h.hw_gpu_gap_ms, h.avg_hw_gpu_gap_ms,
-                         gpu_wait_now_ms, h.avg_gpu_wait_ms,
-                         h.hw_gpu_cat_ms[0], h.hw_gpu_cat_ms[1], h.hw_gpu_cat_ms[2], h.hw_gpu_cat_ms[3], h.hw_gpu_cat_ms[4],
-                         h.hw_gpu_cat_ms[5], h.hw_gpu_cat_ms[6], h.hw_gpu_cat_ms[7], h.hw_gpu_cat_ms[8], h.hw_gpu_cat_ms[9],
-                         h.bottleneck_en, h.bottleneck_ms, h.avg_bottleneck_ms);
+            std::fputs(hud_buf, f);
             std::fclose(f);
+        }
+#endif
+        if (FILE* f = std::fopen("logs/bb_frame_hud.txt", "w")) {
+            std::fputs(hud_buf, f);
+            std::fclose(f);
+        }
+        static Clock::time_point last_log_print = now;
+        if (std::chrono::duration<double>(now - last_log_print).count() >= 5.0 && h.draws_pf >= 10.0f) {
+            last_log_print = now;
+            std::printf("\n[HUD Telemetry]\n%s", hud_buf);
+            std::fflush(stdout);
         }
     }
 }
 
+static HudBreakdown g_hud{};
+
 void FpsCounter() {
-    static HudBreakdown h{};
-    UpdateHudBreakdown(h);
+    const HudBreakdown& h = g_hud;
 
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
     const float pad = 12.0f * base_scale;
@@ -2389,6 +2407,13 @@ bool HandleEvent(const SDL_Event& event) {
             SetOpen(event.key.key == SDLK_INSERT ? !is_open : false);
             return true;
         }
+        if (down && !event.key.repeat &&
+            (event.key.key == SDLK_F8 || event.key.key == SDLK_F10)) {
+            auto& s = BbSettings::Get();
+            s.show_fps = !s.show_fps.load();
+            BbSettings::Save();
+            return true;
+        }
         if (!is_open) {
             return false;
         }
@@ -2511,6 +2536,7 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
         present_ms_sq_sum_accum += double(ms) * double(ms);
         ++present_ms_count_accum;
     }
+    UpdateHudBreakdown(g_hud);
     // BB_FPS_PRINT=1: the present rate every 5 s on stdout, without the cost of BB_FRAME_STATS
     // (its timers are in the draw path): to measure as players run the game.
     static const bool fps_print = [] {

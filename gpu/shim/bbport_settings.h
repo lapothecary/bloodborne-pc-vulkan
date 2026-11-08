@@ -141,8 +141,8 @@ struct Values {
     /// Chosen in the menu (or already in bbport.ini): only then is it saved, so the language
     /// the menu merely started with keeps following the launcher's (#134).
     std::atomic<bool> menu_language_chosen{false};
-    std::atomic<int> upscaler{UpscalerFsr3};
-    std::atomic<int> aa_mode{AaFxaa};
+    std::atomic<int> upscaler{UpscalerOff};
+    std::atomic<int> aa_mode{AaSmaaT2x};
     std::atomic<bool> aa_mode_chosen{false};
     std::atomic<int> preset{NativeAA};
     std::atomic<bool> sharpen{true};
@@ -154,7 +154,7 @@ struct Values {
     std::atomic<float> reactive_threshold{0.2f};
     std::atomic<float> reactive_max{0.9f};
     std::atomic<int> debug_view{DebugNone};
-    std::atomic<bool> show_fps{false};
+    std::atomic<bool> show_fps{true};
     /// The settings menu's position (fraction of the screen), -1 until it is moved.
     std::atomic<float> menu_x{-1.0f}, menu_y{-1.0f};
     // FSR 4 checks (menu): the provider's auto exposure, the jitter sign it is given.

@@ -96,11 +96,6 @@ jobs:
             mingw-w64-clang-x86_64-zydis
             mingw-w64-clang-x86_64-python
 
-      - name: Setup .NET 9 SDK
-        uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: '9.0.x'
-
       - name: Setup Windows Python 3.12 for PyInstaller
         uses: actions/setup-python@v5
         with:
@@ -122,7 +117,7 @@ jobs:
           fi
           if [ -f build_win32_gpu/build.ninja ]; then
             find build_win32_gpu -type f \( -name "*.obj" -o -name "*.a" -o -name "*.spv" -o -name "*.h" \) -exec touch {} +
-            rm -f build_win32_gpu/CMakeFiles/bbgpu.dir/shim/bb_golden_engine.cpp.obj build_win32_gpu/bb-probe.exe
+            rm -f build_win32_gpu/CMakeFiles/bbgpu.dir/shim/*.obj build_win32_gpu/bb-probe.exe
           else
             if ! cmake -S gpu -B build_win32_gpu -G Ninja \
               -DCMAKE_BUILD_TYPE=RelWithDebInfo \
@@ -147,7 +142,7 @@ jobs:
               -L/clang64/lib -lvulkan-1 -lSDL3 -o build_win32_gpu/bb-gpu-capabilities.exe
           fi
 
-      - name: Build Windows WPF Launcher, Freeze Runner & Package ZIP
+      - name: Build Unified Python Launcher, DLSS 4.5 Bridge & Package ZIP
         shell: pwsh
         run: |
           python tools/package_win32_release.py

@@ -97,28 +97,7 @@ def main() -> None:
     root = Path(__file__).resolve().parent.parent
     os.chdir(root)
 
-    # 1. Build Windows WPF Launcher (Bloodborne.exe)
-    os.environ["DOTNET_CLI_TELEMETRY_OPTOUT"] = "1"
-    os.environ["DOTNET_NOLOGO"] = "1"
-    wpf_out = root / "dist_win" / "wpf"
-    if wpf_out.exists():
-        shutil.rmtree(wpf_out)
-    run_checked([
-        "dotnet", "publish", "launcher/windows",
-        "-c", "Release", "-r", "win-x64", "--self-contained", "true",
-        "-p:PublishSingleFile=true",
-        "-p:IncludeNativeLibrariesForSelfExtract=true",
-        "-p:EnableCompressionInSingleFile=true",
-        "-p:DebugType=none",
-        "-o", str(wpf_out),
-    ], "DOTNET_WPF")
-
-    bloodborne_exe = wpf_out / "Bloodborne.exe"
-    if not bloodborne_exe.is_file():
-        emit_error(f"Bloodborne.exe was not generated in {wpf_out}")
-        sys.exit(1)
-
-    # 2. Build PyInstaller runner (bbport-run.exe)
+    # 1. Freeze Unified Python Launcher (Bloodborne.exe + bbport-run.exe) via PyInstaller
     run_checked([sys.executable, "-m", "pip", "install", "--upgrade", "pip", "pyinstaller", "pillow"], "PIP_PYINSTALLER")
 
     hidden_modules = [
@@ -126,6 +105,7 @@ def main() -> None:
         "math", "re", "shutil", "struct", "tempfile", "zlib", "io", "runpy", "xml.etree.ElementTree",
         "ctypes.wintypes", "socket", "urllib.request", "urllib.error", "http.server",
         "socketserver", "secrets", "uuid", "traceback", "datetime", "threading",
+        "tkinter", "tkinter.ttk", "tkinter.filedialog", "tkinter.messagebox",
     ]
     pyi_dist = root / "dist_win" / "pyi-dist"
     pyi_work = root / "dist_win" / "pyi-work"
@@ -135,8 +115,8 @@ def main() -> None:
 
     pyi_cmd = [
         sys.executable, "-m", "PyInstaller",
-        "--noconfirm", "--clean", "--log-level", "WARN", "--console",
-        "--name", "bbport-run",
+        "--noconfirm", "--clean", "--log-level", "WARN", "--windowed",
+        "--name", "Bloodborne",
         "--icon", str(root / "packaging" / "bbport.ico"),
         "--distpath", str(pyi_dist),
         "--workpath", str(pyi_work),
@@ -150,12 +130,12 @@ def main() -> None:
     pyi_cmd.append(str(root / "launcher" / "bbport_launcher_win.py"))
     run_checked(pyi_cmd, "PYINSTALLER")
 
-    bbport_run_dir = pyi_dist / "bbport-run"
-    if not (bbport_run_dir / "bbport-run.exe").is_file():
-        emit_error(f"bbport-run.exe was not generated in {bbport_run_dir}")
+    bbport_run_dir = pyi_dist / "Bloodborne"
+    if not (bbport_run_dir / "Bloodborne.exe").is_file():
+        emit_error(f"Bloodborne.exe was not generated in {bbport_run_dir}")
         sys.exit(1)
 
-    # 3. Assemble staging directory
+    # 2. Assemble staging directory
     stage = root / "dist_win" / "bloodborne-pc-vulkan-windows"
     if stage.exists():
         shutil.rmtree(stage)
@@ -164,7 +144,7 @@ def main() -> None:
     (stage / "scripts" / "bbsc_gameserver").mkdir(parents=True, exist_ok=True)
 
     shutil.copytree(bbport_run_dir, stage, dirs_exist_ok=True)
-    shutil.copy2(bloodborne_exe, stage / "Bloodborne.exe")
+    shutil.copy2(stage / "Bloodborne.exe", stage / "bbport-run.exe")
     for fname in ("play.bat", "run.py", "LICENSE"):
         src = root / fname
         if src.is_file():
@@ -249,6 +229,37 @@ def main() -> None:
     if len(copied_dlls) < 8 or not (stage / "bin" / "SDL3.dll").is_file() or not (stage / "bin" / "libc++.dll").is_file():
         emit_error(f"Failed to bundle required MSYS2 DLLs (only {len(copied_dlls)} found in {clang64_bin})")
         sys.exit(1)
+
+    # 4.5 Build NVIDIA DLSS 4.5 / DLAA 4 Bridge (bbport_dlss.dll) + Bundle nvngx_dlss.dll
+    dlss_sdk_dir = root / "dist_win" / "dlss_sdk"
+    dlss_build_dir = root / "dist_win" / "dlss_bridge"
+    if not (dlss_sdk_dir / "include" / "nvsdk_ngx_vk.h").is_file():
+        if dlss_sdk_dir.exists():
+            shutil.rmtree(dlss_sdk_dir)
+        run_checked(["git", "clone", "--depth", "1", "https://github.com/NVIDIA/DLSS.git", str(dlss_sdk_dir)], "GIT_DLSS_SDK")
+    if dlss_build_dir.exists():
+        shutil.rmtree(dlss_build_dir)
+    vulkan_inc = clang64_bin.parent / "include"
+    run_checked([
+        "cmake", "-S", str(root / "gpu" / "dlss_bridge"), "-B", str(dlss_build_dir),
+        "-A", "x64",
+        f"-DDLSS_SDK_ROOT={dlss_sdk_dir.as_posix()}",
+        f"-DVULKAN_INCLUDE={vulkan_inc.as_posix()}",
+    ], "CMAKE_DLSS_BRIDGE")
+    run_checked(["cmake", "--build", str(dlss_build_dir), "--config", "Release"], "BUILD_DLSS_BRIDGE")
+    built_bridge = dlss_build_dir / "Release" / "bbport_dlss.dll"
+    if not built_bridge.is_file():
+        built_bridge = dlss_build_dir / "bbport_dlss.dll"
+    ngx_dll = dlss_sdk_dir / "lib" / "Windows_x86_64" / "rel" / "nvngx_dlss.dll"
+    if not built_bridge.is_file() or not ngx_dll.is_file():
+        emit_error(f"Missing DLSS files: bridge={built_bridge.is_file()}, nvngx_dlss={ngx_dll.is_file()}")
+        sys.exit(1)
+    shutil.copy2(built_bridge, stage / "bin" / "bbport_dlss.dll")
+    shutil.copy2(ngx_dll, stage / "bin" / "nvngx_dlss.dll")
+    dlss_lic = dlss_sdk_dir / "LICENSE.txt"
+    if dlss_lic.is_file():
+        shutil.copy2(dlss_lic, stage / "NVIDIA-DLSS-LICENSE.txt")
+    print("=== Bundled NVIDIA DLSS 4.5 / DLAA 4 Bridge: bin/bbport_dlss.dll + bin/nvngx_dlss.dll ===", flush=True)
 
     # 5. Create zip archive + sha256
     zip_path = root / "bloodborne-pc-vulkan-windows-x86_64-prebuilt.zip"

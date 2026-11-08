@@ -255,6 +255,7 @@ DEFAULTS = {
 
 # bbport.ini keys the launcher edits; the rest of the file is kept.
 INI_DEFAULTS = {
+    "aa_mode": "smaa_t2x",
     "upscaler": "off",
     "preset": "0",
     "dlss_preset": "11",
@@ -862,7 +863,7 @@ class LauncherWindow(Adw.ApplicationWindow):
         raw_up = self.ini.get("upscaler", "off")
         raw_preset = int(self.ini.get("preset", "0") or 0)
         raw_aa = self.ini.get("aa_mode", "")
-        if raw_aa in ("off", "fxaa", "taa", "dlaa", "dlaa3"):
+        if raw_aa in ("off", "fxaa", "smaa", "smaa_t2x", "taa", "dlaa", "dlaa3"):
             init_aa = raw_aa
         elif raw_up == "taa":
             init_aa = "taa"
@@ -1548,7 +1549,7 @@ class LauncherWindow(Adw.ApplicationWindow):
             except ValueError:
                 raw_preset = 0
             raw_aa = self.ini.get("aa_mode", "")
-            if raw_aa in ("off", "fxaa", "taa", "dlaa", "dlaa3"):
+            if raw_aa in ("off", "fxaa", "smaa", "smaa_t2x", "taa", "dlaa", "dlaa3"):
                 init_aa = raw_aa
             elif raw_up == "taa":
                 init_aa = "taa"

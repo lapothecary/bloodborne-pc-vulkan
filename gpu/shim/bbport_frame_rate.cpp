@@ -24,6 +24,13 @@
 #include <sys/mman.h>
 #ifdef __linux__
 #include <sys/prctl.h>
+#elif defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <x86intrin.h>
+#include <chrono>
 #endif
 #include <unistd.h>
 #include <algorithm>
@@ -88,10 +95,31 @@ void PS4_SYSV_ABI FrameStep(u64 pacer) {
     const float min_dt = std::max(live->shortest, MinSimDt);
     float dt = std::clamp(std::isfinite(measured) ? measured : Frame30, min_dt, Frame30);
     {
-#ifdef CLOCK_THREAD_CPUTIME_ID
+        u64 cur_cpu_ns = 0;
+        bool have_cpu_ns = false;
+#if defined(_WIN32)
+        ULONG64 thread_cycles = 0;
+        if (QueryThreadCycleTime(GetCurrentThread(), &thread_cycles)) {
+            static const u64 base_tsc = __rdtsc();
+            static const auto base_time = std::chrono::steady_clock::now();
+            const u64 dtsc = __rdtsc() - base_tsc;
+            const u64 dns = u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    std::chrono::steady_clock::now() - base_time)
+                                    .count());
+            const double ns_per_cyc = (dtsc > 100'000ull && dns > 100'000ull)
+                                          ? (double(dns) / double(dtsc))
+                                          : (1.0 / 3.6);
+            cur_cpu_ns = u64(double(thread_cycles) * ns_per_cyc);
+            have_cpu_ns = true;
+        }
+#elif defined(CLOCK_THREAD_CPUTIME_ID)
         struct timespec ts_cpu{};
         if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts_cpu) == 0) {
-            const u64 cur_cpu_ns = u64(ts_cpu.tv_sec) * 1'000'000'000ull + u64(ts_cpu.tv_nsec);
+            cur_cpu_ns = u64(ts_cpu.tv_sec) * 1'000'000'000ull + u64(ts_cpu.tv_nsec);
+            have_cpu_ns = true;
+        }
+#endif
+        if (have_cpu_ns) {
             static thread_local u64 prev_cpu_ns = 0;
             if (prev_cpu_ns != 0 && cur_cpu_ns > prev_cpu_ns) {
                 u64 delta_ns = cur_cpu_ns - prev_cpu_ns;
@@ -108,7 +136,6 @@ void PS4_SYSV_ABI FrameStep(u64 pacer) {
             }
             prev_cpu_ns = cur_cpu_ns;
         }
-#endif
     }
     // BB_FRAME_DT_SMOOTH=a (diagnostics, 0 < a < 1): the step follows the measured frame time by
     // that fraction a frame, so frame-to-frame jitter of the measurement does not reach the
