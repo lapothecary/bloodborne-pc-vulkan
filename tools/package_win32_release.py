@@ -239,7 +239,14 @@ def main() -> None:
         run_checked(["git", "clone", "--depth", "1", "https://github.com/NVIDIA/DLSS.git", str(dlss_sdk_dir)], "GIT_DLSS_SDK")
     if dlss_build_dir.exists():
         shutil.rmtree(dlss_build_dir)
-    vulkan_inc = clang64_bin.parent / "include"
+    vulkan_inc = root / "dist_win" / "vk_headers_inc"
+    if vulkan_inc.exists():
+        shutil.rmtree(vulkan_inc)
+    vulkan_inc.mkdir(parents=True, exist_ok=True)
+    for vk_sub in ("vulkan", "vk_video"):
+        src_vk = clang64_bin.parent / "include" / vk_sub
+        if src_vk.is_dir():
+            shutil.copytree(src_vk, vulkan_inc / vk_sub)
     run_checked([
         "cmake", "-S", str(root / "gpu" / "dlss_bridge"), "-B", str(dlss_build_dir),
         "-A", "x64",
