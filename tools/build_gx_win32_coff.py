@@ -319,16 +319,18 @@ def main() -> int:
     for sym in needed_ext:
         vma = func_map.get(sym) or data_map.get(sym)
         if vma is not None:
+            is_ptr_getter = (sym == "GXGlobalDevice_GetInstance" or sym in data_map or vma >= 0x4000000)
+            tail_insns = ["\tmovq\t(%r11), %rax", "\tretq"] if is_ptr_getter else ["\tjmpq\t*%r11"]
             tramp_lines.extend(
                 [
                     f"\t.globl\t{sym}",
-                    "\t.p2align\t4",
+                    "\t.p2align\t4, 0x90",
                     f"{sym}:",
                     "\tmovq\tg_eboot_live_slide(%rip), %r11",
                     "\ttestq\t%r11, %r11",
                     "\tjz\t1f",
                     f"\taddq\t$0x{vma:x}, %r11",
-                    "\tjmpq\t*%r11",
+                    *tail_insns,
                     "1:",
                     "\txorl\t%eax, %eax",
                     "\tretq",
