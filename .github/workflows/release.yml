@@ -120,7 +120,10 @@ jobs:
           if [ ! -f our_cpp_100000_source/build_win32/libbb_gx_engine_native.a ]; then
             python3 tools/build_gx_win32_coff.py
           fi
-          if [ ! -f build_win32_gpu/build.ninja ]; then
+          if [ -f build_win32_gpu/build.ninja ]; then
+            find build_win32_gpu -type f \( -name "*.obj" -o -name "*.a" -o -name "*.spv" -o -name "*.h" \) -exec touch {} +
+            rm -f build_win32_gpu/CMakeFiles/bbgpu.dir/shim/bb_golden_engine.cpp.obj build_win32_gpu/bb-probe.exe
+          else
             if ! cmake -S gpu -B build_win32_gpu -G Ninja \
               -DCMAKE_BUILD_TYPE=RelWithDebInfo \
               -DBB_LTO=OFF -DBB_PGO=off -DBB_NET=OFF > cmake_win32.log 2>&1; then

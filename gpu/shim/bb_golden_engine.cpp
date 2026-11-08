@@ -912,7 +912,7 @@ void PatchImage(unsigned char* image, u64 size) {
     for (std::size_t i = 0; i < kGXDecompiledFunctionCount; ++i) {
         const GXDecompiledFunctionEntry& e = kGXDecompiledFunctions[i];
         if (!ShouldInstallEntry(e, size, skip_min, skip_max, env_mods)) {
-            if (e.vma < size && RedirectSkippedHostFnToGuest(e.func_ptr, image + e.vma, page)) {
+            if (e.size >= 5 && e.vma < size && RedirectSkippedHostFnToGuest(e.func_ptr, image + e.vma, page)) {
                 ++redirected;
             }
             continue;

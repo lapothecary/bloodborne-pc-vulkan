@@ -124,6 +124,14 @@ def convert_elf_asm_to_coff(asm_text: str, drop_weak_defs: set[str]) -> str:
         if m_glbl and m_glbl.group(1) in drop_weak_defs:
             continue
 
+        if s.startswith((".prefalign\t", ".prefalign ")):
+            out.append("\t.p2align\t4, 0x90")
+            continue
+        if s.startswith(".Lfunc_end"):
+            out.append("\t.p2align\t4, 0x90")
+            out.append(line)
+            continue
+
         if s.startswith((".section\t.rodata", ".section .rodata", ".section\t.data.rel.ro", ".section .data.rel.ro")):
             out.append('\t.section\t.rdata,"dr"')
             continue
