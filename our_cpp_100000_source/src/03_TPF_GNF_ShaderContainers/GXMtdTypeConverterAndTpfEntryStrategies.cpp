@@ -169,6 +169,13 @@ struct GXTpfExtraMetadataOut {
     uint32_t extValue0C;         // +0x0C
 } __attribute__((packed));
 
+struct alignas(16) GXMappedSubresource {
+    void*    pData;              // +0x00
+    uint32_t rowPitch;           // +0x08
+    uint32_t depthPitch;         // +0x0C
+};
+static_assert(sizeof(GXMappedSubresource) == 0x10, "GXMappedSubresource must be 16 bytes");
+
 } // namespace GX
 } // namespace FromSoftware
 
@@ -184,7 +191,8 @@ void        GXGnmBuffer_ExtractDescriptorFromHardware(const void* hwBuf,
 uint32_t    GXGnmCommandContext_GetContextSlotId(const void* cmdCtx);              // 0x216a7c0
 uint32_t    GXGnmBuffer_ValidateMapMode(void* bufObj, uint32_t mapMode, uint32_t ctxSlotId); // 0x2165150
 uint32_t    GXGnmCommandContext_MapBuffer(void* cmdCtx, void* cmdCtxRingBase, void* bufObj,
-                                          uint32_t subresource, uint32_t mapMode, void** outMappedPtr); // 0x2169c30
+                                          uint32_t subresource, uint32_t mapMode,
+                                          FromSoftware::GX::GXMappedSubresource* outMapped); // 0x2169c30
 void        GXGnmCommandContext_UnmapBuffer(void* cmdCtx, void* cmdCtxRingBase,
                                             void* bufObj, uint32_t subresource);   // 0x2169eb0
 uint32_t    GXGnmDevice_CreateBuffer(void* gxDevice,
@@ -583,7 +591,7 @@ uint32_t GXDynamicBufferRingCursor_AllocateAndMapSlice(
     uint32_t alignMask = align - 1u;
     uint32_t alignedSize = (requestedBytes + alignMask) & ~alignMask;
 
-    void* baseMappedPtr = nullptr;
+    GXMappedSubresource mapped{};
 
     if (self->nextFreeOffset + requestedBytes <= self->totalByteSize) {
         // Try MAP_WRITE_NO_OVERWRITE (3) or check if MAP_WRITE_DISCARD (4) is required first
@@ -591,11 +599,11 @@ uint32_t GXDynamicBufferRingCursor_AllocateAndMapSlice(
         uint32_t status = GXGnmBuffer_ValidateMapMode(self->bufferObj, 4, slotId);
         if (status == 0) {
             status = GXGnmCommandContext_MapBuffer(
-                cmdCtx, cmdCtx + 0xB730, self->bufferObj, 0, 4, &baseMappedPtr);
+                cmdCtx, cmdCtx + 0xB730, self->bufferObj, 0, 4, &mapped);
             if (status == 0) {
                 self->lastMappedOffset = self->nextFreeOffset;
                 self->nextFreeOffset  += alignedSize;
-                *outMappedCpuPtr = static_cast<uint8_t*>(baseMappedPtr) + self->lastMappedOffset;
+                *outMappedCpuPtr = static_cast<uint8_t*>(mapped.pData) + self->lastMappedOffset;
                 return 0;
             }
         }
@@ -610,15 +618,15 @@ uint32_t GXDynamicBufferRingCursor_AllocateAndMapSlice(
         return 9;
     }
     if (GXGnmCommandContext_MapBuffer(
-            cmdCtx, cmdCtx + 0xB730, self->bufferObj, 0, 3, &baseMappedPtr) != 0) {
+            cmdCtx, cmdCtx + 0xB730, self->bufferObj, 0, 3, &mapped) != 0) {
         return 9;
     }
 
-    uintptr_t rawAddr = reinterpret_cast<uintptr_t>(baseMappedPtr);
+    uintptr_t rawAddr = reinterpret_cast<uintptr_t>(mapped.pData);
     uint32_t padBytes = static_cast<uint32_t>(((rawAddr + alignMask) & ~static_cast<uintptr_t>(alignMask)) - rawAddr);
     self->lastMappedOffset = padBytes;
     self->nextFreeOffset   = padBytes + alignedSize;
-    *outMappedCpuPtr       = static_cast<uint8_t*>(baseMappedPtr) + self->lastMappedOffset;
+    *outMappedCpuPtr       = static_cast<uint8_t*>(mapped.pData) + self->lastMappedOffset;
     return 0;
 }
 
