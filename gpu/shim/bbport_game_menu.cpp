@@ -250,10 +250,9 @@ enum class GameLanguage { Unknown, English, Russian };
 std::atomic<GameLanguage> game_language{GameLanguage::Unknown};
 
 bool RussianTexts() {
-    const GameLanguage game = game_language.load();
-    return game == GameLanguage::Unknown
-               ? BbSettings::Get().menu_language == BbSettings::MenuLanguage::Russian
-               : game == GameLanguage::Russian;
+    const char* menu_lang = std::getenv("BB_MENU_LANGUAGE");
+    return menu_lang && (menu_lang[0] == 'r' || menu_lang[0] == 'R') &&
+           (menu_lang[1] == 'u' || menu_lang[1] == 'U');
 }
 
 // Texts that change while the game runs (the chosen aspect ratio's resolutions, "Auto (21:9)",
@@ -2729,6 +2728,11 @@ bool Detour(unsigned char* image, u64 va, const u8* prologue, std::size_t length
         return false;
     }
     const std::int32_t to32 = std::int32_t(to);
+    const u64 page = u64(sysconf(_SC_PAGESIZE));
+    const u64 patch_start = reinterpret_cast<u64>(site) & ~(page - 1);
+    mprotect(reinterpret_cast<void*>(patch_start),
+             reinterpret_cast<u64>(site) + length - patch_start,
+             PROT_READ | PROT_WRITE | PROT_EXEC);
     site[0] = 0xe9;
     std::memcpy(site + 1, &to32, 4);
     for (std::size_t i = 5; i < length; ++i) {
@@ -2742,9 +2746,10 @@ bool Detour(unsigned char* image, u64 va, const u8* prologue, std::size_t length
 /// A mapping within +-2 GiB of the image, for rel32 jumps both ways.
 u8* MapNear(unsigned char* image, u64 image_size, std::size_t size) {
     const u64 base = reinterpret_cast<u64>(image);
+    const u64 above_base = (base + image_size + 0xFFFFull) & ~0xFFFFull;
     for (u64 k = 1; k <= 64; ++k) {
-        for (const u64 hint : {base - k * (24ull << 20), base + image_size + k * (24ull << 20)}) {
-            void* p = mmap(reinterpret_cast<void*>(hint), size, PROT_READ | PROT_WRITE,
+        for (const u64 hint : {base - k * (24ull << 20), above_base + k * (24ull << 20)}) {
+            void* p = mmap(reinterpret_cast<void*>(hint & ~0xFFFFull), size, PROT_READ | PROT_WRITE,
                            MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
             if (p != MAP_FAILED) {
                 return static_cast<u8*>(p);

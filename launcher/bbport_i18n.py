@@ -1145,17 +1145,6 @@ ZH_CN = {
 
 
 def system_language():
-    for key in ("LC_ALL", "LC_MESSAGES", "LANG", "LANGUAGE"):
-        value = os.environ.get(key, "")
-        if value:
-            locale = value.lower().replace("-", "_")
-            if locale.startswith("ru"):
-                return "ru"
-            if locale.startswith("pt_br"):
-                return "pt_BR"
-            if locale.startswith("zh"):
-                return "zh_CN"
-            return "en"
     return "en"
 
 

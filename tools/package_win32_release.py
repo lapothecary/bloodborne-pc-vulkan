@@ -127,7 +127,7 @@ def main() -> None:
     ]
     for mod in hidden_modules:
         pyi_cmd.extend(["--hidden-import", mod])
-    pyi_cmd.append(str(root / "launcher" / "bbport_launcher_win.py"))
+    pyi_cmd.append(str(root / "run.py"))
     run_checked(pyi_cmd, "PYINSTALLER")
 
     bbport_run_dir = pyi_dist / "Bloodborne"
@@ -144,11 +144,13 @@ def main() -> None:
     (stage / "scripts" / "bbsc_gameserver").mkdir(parents=True, exist_ok=True)
 
     shutil.copytree(bbport_run_dir, stage, dirs_exist_ok=True)
+    shutil.copy2(stage / "Bloodborne.exe", stage / "Launcher.exe")
     shutil.copy2(stage / "Bloodborne.exe", stage / "bbport-run.exe")
-    for fname in ("play.bat", "run.py", "LICENSE"):
+    for fname in ("Launcher.py", "play.bat", "run.py", "LICENSE"):
         src = root / fname
         if src.is_file():
             shutil.copy2(src, stage / fname)
+    shutil.copy2(root / "Launcher.py", stage / "launcher" / "bbport_launcher_win.py")
     readme_win = root / "packaging" / "windows" / "README-Windows.txt"
     if readme_win.is_file():
         shutil.copy2(readme_win, stage / "README-Windows.txt")

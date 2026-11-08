@@ -44,9 +44,9 @@ struct Area {
 std::vector<Area> areas;
 
 std::uintptr_t MapNear(std::uintptr_t code) {
-    const long page = sysconf(_SC_PAGESIZE);
+    const long page = std::max<long>(sysconf(_SC_PAGESIZE), 65536L);
     // Below the code first (the port maps the game's image at 0x800000000 with room under it),
-    // then above, in 64 MiB steps.
+    // then above, in 64 MiB steps (aligned to 64 KiB for Windows VirtualAlloc granularity).
     for (std::int64_t step = 1; step * (64ll << 20) < JumpReach; ++step) {
         for (const std::int64_t sign : {-1ll, 1ll}) {
             const std::int64_t at = std::int64_t(code) + sign * step * (64ll << 20);

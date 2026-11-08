@@ -1842,64 +1842,56 @@ void UpdateHudBreakdown(HudBreakdown& h) {
             h.hw_gpu_busy_ms >= stage_a_work_ms) {
             h.bottleneck_ms = h.hw_gpu_busy_ms;
             h.avg_bottleneck_ms = h.avg_hw_gpu_busy_ms;
-            h.bottleneck_ru = "Лимит FPS (макс. нагрузка: GPU Shaders)";
             h.bottleneck_en = "FPS Cap Active (Max: GPU Shaders)";
         } else if (game_cpu_bound_ms >= stage_b_work_ms && game_cpu_bound_ms >= stage_a_work_ms) {
             h.bottleneck_ms = game_cpu_bound_ms;
             h.avg_bottleneck_ms = h.avg_game_cpu_work_ms;
-            h.bottleneck_ru = "Лимит FPS (макс. нагрузка: Game CPU)";
             h.bottleneck_en = "FPS Cap Active (Max: Game CPU)";
         } else if (stage_b_work_ms >= stage_a_work_ms) {
             h.bottleneck_ms = stage_b_work_ms;
             h.avg_bottleneck_ms = h.avg_b_total_ms;
-            h.bottleneck_ru = "Лимит FPS (макс. нагрузка: Stage B)";
             h.bottleneck_en = "FPS Cap Active (Max: Stage B)";
         } else {
             h.bottleneck_ms = stage_a_work_ms;
             h.avg_bottleneck_ms = avg_stage_a_work_ms;
-            h.bottleneck_ru = "Лимит FPS (макс. нагрузка: Stage A)";
             h.bottleneck_en = "FPS Cap Active (Max: Stage A)";
         }
+        h.bottleneck_ru = h.bottleneck_en;
     } else {
         if (h.gnm_wait_ms >= 1.50f && h.b_busy_pct < 78.0f && h.gpu_present_ms < 0.50f) {
             h.bottleneck_kind = 4;
             h.bottleneck_ms = h.gnm_wait_ms;
             h.avg_bottleneck_ms = h.avg_gnm_wait_ms;
-            h.bottleneck_ru = "Ожидание GPU кадра (Guest GnmWait)";
             h.bottleneck_en = "CPU<->GPU Frame Sync (Guest GnmWait)";
         } else if (h.hw_gpu_busy_ms >= game_cpu_bound_ms && h.hw_gpu_busy_ms >= stage_b_work_ms &&
                    h.hw_gpu_busy_ms >= stage_a_work_ms) {
             h.bottleneck_kind = 0;
             h.bottleneck_ms = h.hw_gpu_busy_ms;
             h.avg_bottleneck_ms = h.avg_hw_gpu_busy_ms;
-            h.bottleneck_ru = "Видеокарта (HW GPU Render Passes)";
             h.bottleneck_en = "GPU Bound (HW Render Passes)";
         } else if ((h.b_busy_pct >= 90.0f || stage_b_work_ms >= serial_a_chain_ms) &&
                    stage_b_work_ms >= gpu_sync_ms) {
             h.bottleneck_kind = 3;
             h.bottleneck_ms = stage_b_work_ms;
             h.avg_bottleneck_ms = h.avg_b_total_ms;
-            h.bottleneck_ru = "CPU Stage B (Запись команд Vulkan)";
             h.bottleneck_en = "CPU Stage B (Vulkan Cmd Record)";
         } else if (game_cpu_bound_ms >= stage_a_work_ms && game_cpu_bound_ms >= gpu_sync_ms) {
             h.bottleneck_kind = 1;
             h.bottleneck_ms = game_cpu_bound_ms;
             h.avg_bottleneck_ms = std::max(0.0f, h.avg_game_cpu_work_ms - h.avg_a_drain_ms);
-            h.bottleneck_ru = "Потоки движка игры (Game CPU Work)";
             h.bottleneck_en = "Game Engine CPU (Havok / AI / Logic)";
         } else if (stage_a_work_ms >= gpu_sync_ms) {
             h.bottleneck_kind = 2;
             h.bottleneck_ms = stage_a_work_ms;
             h.avg_bottleneck_ms = avg_stage_a_work_ms;
-            h.bottleneck_ru = "CPU Stage A (DirectVk RHI + FastPSO)";
             h.bottleneck_en = "CPU Stage A (DirectVk RHI + FastPSO)";
         } else {
             h.bottleneck_kind = 0;
             h.bottleneck_ms = gpu_sync_ms;
             h.avg_bottleneck_ms = h.avg_gpu_wait_ms;
-            h.bottleneck_ru = "Видеокарта (GPU Present / Sync)";
             h.bottleneck_en = "GPU Execution (Present / Sync)";
         }
+        h.bottleneck_ru = h.bottleneck_en;
     }
 
     last_time = now;
@@ -2056,13 +2048,11 @@ void FpsCounter() {
     if (h.has_avg) {
         ImGui::TextColored(
             ImVec4(0.95f, 0.92f, 0.78f, 1.0f),
-            BbSettings::MenuText("%.0f FPS (Avg %.0f)  %.2f ms (Avg %.2f)  [%s]",
-                                 "%.0f FPS (Avg %.0f)  %.2f мс (Avg %.2f)  [%s]"),
+            "%.0f FPS (Avg %.0f)  %.2f ms (Avg %.2f)  [%s]",
             now_fps, h.avg_fps, now_ms, h.avg_frame_ms, upscaler_str);
     } else {
         ImGui::TextColored(ImVec4(0.95f, 0.92f, 0.78f, 1.0f),
-                           BbSettings::MenuText("%.0f FPS  %.2f ms  [%s]",
-                                                "%.0f FPS  %.2f мс  [%s]"),
+                           "%.0f FPS  %.2f ms  [%s]",
                            now_fps, now_ms, upscaler_str);
     }
     const float gpu_busy_pct =
@@ -2073,9 +2063,7 @@ void FpsCounter() {
                                                        : ImVec4(0.62f, 0.92f, 0.75f, 1.0f);
         ImGui::TextColored(
             gpu_col,
-            BbSettings::MenuText(
-                "GPU: %.0f W | %.0f%% Busy (Drv %d%%) | %d MHz | %d C | VRAM: %.2f GB",
-                "GPU: %.0f Вт | %.0f%% Занят (Дрв %d%%) | %d МГц | %d C | VRAM: %.2f ГБ"),
+            "GPU: %.0f W | %.0f%% Busy (Drv %d%%) | %d MHz | %d C | VRAM: %.2f GB",
             h.gpu_power_w, gpu_busy_pct, h.gpu_drv_util_pct, h.gpu_clock_mhz, h.gpu_temp_c,
             h.vram_used_gb);
     }
@@ -2087,16 +2075,11 @@ void FpsCounter() {
         std::snprintf(cap_buf, sizeof(cap_buf), "Uncapped");
     }
     ImGui::TextDisabled(
-        BbSettings::MenuText("Scene: %dx%d -> %dx%d | %s | Jit: %.2f ms (Avg %.2f)%s",
-                             "Сцена: %dx%d -> %dx%d | %s | Джиттер: %.2f мс (Avg %.2f)%s"),
+        "Scene: %dx%d -> %dx%d | %s | Jit: %.2f ms (Avg %.2f)%s",
         rw, rh, out.width, out.height, cap_buf, h.jitter_ms, h.avg_jitter_ms,
-        BbSettings::ResolutionNeedsRestart()
-            ? BbSettings::MenuText(" (restart!)", " (перезапуск!)")
-            : "");
+        BbSettings::ResolutionNeedsRestart() ? " (restart!)" : "");
     ImGui::TextDisabled(
-        BbSettings::MenuText(
-            "Draws: %.0f (%.0f) | Disp: %.0f (%.0f) | Subm: %.1f | B busy: %.0f%% (%.0f%%)",
-            "Draws: %.0f (%.0f) | Disp: %.0f (%.0f) | Subm: %.1f | B занят: %.0f%% (%.0f%%)"),
+        "Draws: %.0f (%.0f) | Disp: %.0f (%.0f) | Subm: %.1f | B busy: %.0f%% (%.0f%%)",
         h.draws_pf, h.avg_draws_pf, h.dispatches_pf, h.avg_dispatches_pf, h.submits_pf,
         h.b_busy_pct, h.avg_b_busy_pct);
     const ImVec4 health_col = (h.faults_ps < 10.0f && h.eop_pf < 5.0f)
@@ -2104,9 +2087,7 @@ void FpsCounter() {
                                   : ImVec4(1.0f, 0.72f, 0.38f, 1.0f);
     ImGui::TextColored(
         health_col,
-        BbSettings::MenuText(
-            "Faults: %.0f/s (%.0f) | NatBuf: %.0f%% (%.0f%%) | NatTex: %.0f%% | DscSav: %.0f%% (%.0f%%)",
-            "Фолты: %.0f/с (%.0f) | NatBuf: %.0f%% (%.0f%%) | NatTex: %.0f%% | DscSav: %.0f%% (%.0f%%)"),
+        "Faults: %.0f/s (%.0f) | NatBuf: %.0f%% (%.0f%%) | NatTex: %.0f%% | DscSav: %.0f%% (%.0f%%)",
         h.faults_ps, h.avg_faults_ps, h.native_buf_pct, h.avg_native_buf_pct, h.native_tex_pct,
         h.desc_saved_pct, h.avg_desc_saved_pct);
 
@@ -2115,16 +2096,15 @@ void FpsCounter() {
                           ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_NoPadOuterX)) {
         ImGui::TableNextRow();
         ImGui::TableSetColumnIndex(0);
-        ImGui::TextDisabled("%s", BbSettings::MenuText("CPU & GPU Render Pass Breakdown",
-                                                       "Раскладка CPU и рендер-пассов GPU"));
+        ImGui::TextDisabled("CPU & GPU Render Pass Breakdown");
         ImGui::TableSetColumnIndex(1);
-        ImGui::TextDisabled("%s", BbSettings::MenuText("   Now", "Сейчас"));
+        ImGui::TextDisabled("   Now");
         ImGui::TableSetColumnIndex(2);
-        ImGui::TextDisabled("%s", BbSettings::MenuText("Avg 15s", "Avg 15с"));
+        ImGui::TextDisabled("Avg 15s");
         ImGui::TableSetColumnIndex(3);
-        ImGui::TextDisabled("%s", BbSettings::MenuText(" Share", " Доля"));
+        ImGui::TextDisabled(" Share");
 
-        const auto row_cpu = [&](const char* label_en, const char* label_ru, float ms, float avg_ms,
+        const auto row_cpu = [&](const char* label_en, float ms, float avg_ms,
                                  bool highlight = false, bool is_sleep = false) {
             ImGui::TableNextRow();
             ImGui::TableSetColumnIndex(0);
@@ -2133,9 +2113,9 @@ void FpsCounter() {
                              : ms >= 1.50f   ? ImVec4(1.0f, 0.60f, 0.45f, 1.0f)
                              : ms >= 0.75f   ? ImVec4(0.95f, 0.92f, 0.75f, 1.0f)
                                              : ImVec4(0.75f, 0.78f, 0.82f, 1.0f);
-            ImGui::TextColored(col, "%s", BbSettings::MenuText(label_en, label_ru));
+            ImGui::TextColored(col, "%s", label_en);
             ImGui::TableSetColumnIndex(1);
-            ImGui::TextColored(col, BbSettings::MenuText("%5.2f ms", "%5.2f мс"), ms);
+            ImGui::TextColored(col, "%5.2f ms", ms);
             ImGui::TableSetColumnIndex(2);
             if (h.has_avg) {
                 ImGui::TextDisabled("%5.2f", avg_ms);
@@ -2147,7 +2127,7 @@ void FpsCounter() {
             ImGui::TextDisabled("%4.0f%%", f_pct);
         };
 
-        const auto row_gpu = [&](const char* label_en, const char* label_ru, float ms, float avg_ms,
+        const auto row_gpu = [&](const char* label_en, float ms, float avg_ms,
                                  bool highlight = false) {
             ImGui::TableNextRow();
             ImGui::TableSetColumnIndex(0);
@@ -2155,9 +2135,9 @@ void FpsCounter() {
                              : ms >= 0.80f   ? ImVec4(1.0f, 0.60f, 0.45f, 1.0f)
                              : ms >= 0.35f   ? ImVec4(0.95f, 0.92f, 0.75f, 1.0f)
                                              : ImVec4(0.75f, 0.82f, 0.86f, 1.0f);
-            ImGui::TextColored(col, "%s", BbSettings::MenuText(label_en, label_ru));
+            ImGui::TextColored(col, "%s", label_en);
             ImGui::TableSetColumnIndex(1);
-            ImGui::TextColored(col, BbSettings::MenuText("%5.2f ms", "%5.2f мс"), ms);
+            ImGui::TextColored(col, "%5.2f ms", ms);
             ImGui::TableSetColumnIndex(2);
             if (h.has_avg) {
                 ImGui::TextDisabled("%5.2f", avg_ms);
@@ -2173,43 +2153,39 @@ void FpsCounter() {
         };
 
         // Compact 4-row CPU section (active work cleanly separated from FPS cap sleep)
-        row_cpu("CPU 1. Game Engine (Work)", "CPU 1. Движок игры (Работа)",
+        row_cpu("CPU 1. Game Engine (Work)",
                 h.game_cpu_work_ms, h.avg_game_cpu_work_ms, h.bottleneck_kind == 1);
-        row_cpu("  FPS Cap Sleep + GnmSync", "  Сон лимита FPS + GnmSync",
+        row_cpu("  FPS Cap Sleep + GnmSync",
                 h.fps_cap_sleep_ms + h.gnm_wait_ms, h.avg_fps_cap_sleep_ms + h.avg_gnm_wait_ms,
                 h.bottleneck_kind == 4, true);
-        row_cpu("CPU 2. Stage A (DirectVk RHI)", "CPU 2. Stage A (DirectVk RHI)",
+        row_cpu("CPU 2. Stage A (DirectVk RHI)",
                 h.a_total_ms, h.avg_a_total_ms, h.bottleneck_kind == 2);
-        row_cpu("CPU 3. Stage B (Vulkan Record)", "CPU 3. Stage B (Запись Vulkan)",
+        row_cpu("CPU 3. Stage B (Vulkan Record)",
                 h.b_total_ms, h.avg_b_total_ms, h.bottleneck_kind == 3);
 
         // Full 10-pass Hardware GPU Render Pass Breakdown
-        struct PassDesc {
-            const char* en;
-            const char* ru;
-        };
-        static constexpr std::array<PassDesc, BbStats::GpuCat_Count> kPassLabels = {{
-            {"GPU 1. Shadow Maps (CSM/VSM)",   "GPU 1. Карты теней (CSM/VSM)"},
-            {"GPU 2. G-Buffer (3D & Foliage)", "GPU 2. G-Buffer (3D сцена и листва)"},
-            {"GPU 3. SSAO (Ambient Occlusion)","GPU 3. Затенение SSAO"},
-            {"GPU 4. Deferred PBR & Sky/Fog",  "GPU 4. Свет PBR, небо и туман"},
-            {"GPU 5. SSR Reflections & Mips",  "GPU 5. Отражения SSR и мипы"},
-            {"GPU 6. Forward Alpha (Hair/VFX)","GPU 6. Прозрачность (волосы/VFX)"},
-            {"GPU 7. Compute & Copies (HLE)",  "GPU 7. Compute и копии (частицы)"},
-            {"GPU 8. Yebis 2 Post-FX (DoF/LUT)","GPU 8. Пост-эффекты Yebis 2"},
-            {"GPU 9. Anti-Aliasing / Upscaler","GPU 9. Сглаживание / Апскейлер"},
-            {"GPU 10. Scaleform UI & Present", "GPU 10. Интерфейс UI и вывод"},
+        static constexpr std::array<const char*, BbStats::GpuCat_Count> kPassLabels = {{
+            "GPU 1. Shadow Maps (CSM/VSM)",
+            "GPU 2. G-Buffer (3D & Foliage)",
+            "GPU 3. SSAO (Ambient Occlusion)",
+            "GPU 4. Deferred PBR & Sky/Fog",
+            "GPU 5. SSR Reflections & Mips",
+            "GPU 6. Forward Alpha (Hair/VFX)",
+            "GPU 7. Compute & Copies (HLE)",
+            "GPU 8. Yebis 2 Post-FX (DoF/LUT)",
+            "GPU 9. Anti-Aliasing / Upscaler",
+            "GPU 10. Scaleform UI & Present",
         }};
         for (std::size_t c = 0; c < BbStats::GpuCat_Count; ++c) {
-            row_gpu(kPassLabels[c].en, kPassLabels[c].ru, h.hw_gpu_cat_ms[c],
+            row_gpu(kPassLabels[c], h.hw_gpu_cat_ms[c],
                     h.avg_hw_gpu_cat_ms[c],
                     c == h.top_gpu_cat && h.hw_gpu_cat_ms[c] >= 0.25f);
         }
 
         // Total Hardware GPU Busy + Mid-Frame Gap
-        row_cpu("HW GPU Total Busy (All Passes)", "ИТОГО: Чистая работа GPU",
+        row_cpu("HW GPU Total Busy (All Passes)",
                 h.hw_gpu_busy_ms, h.avg_hw_gpu_busy_ms, h.bottleneck_kind == 0);
-        row_cpu("  HW GPU Mid-Frame Idle Gap", "  Паузы GPU между сабмитами",
+        row_cpu("  HW GPU Mid-Frame Idle Gap",
                 h.hw_gpu_gap_ms, h.avg_hw_gpu_gap_ms, false, true);
 
         ImGui::EndTable();
@@ -2219,8 +2195,8 @@ void FpsCounter() {
                                                     : ImVec4(1.0f, 0.78f, 0.28f, 1.0f);
     ImGui::TextColored(
         limit_col,
-        BbSettings::MenuText("LIMIT: %s (%.2f ms | Avg %.2f)", "ЛИМИТ: %s (%.2f мс | Avg %.2f)"),
-        BbSettings::MenuText(h.bottleneck_en, h.bottleneck_ru), h.bottleneck_ms,
+        "LIMIT: %s (%.2f ms | Avg %.2f)",
+        h.bottleneck_en, h.bottleneck_ms,
         h.avg_bottleneck_ms);
     ImGui::End();
 }

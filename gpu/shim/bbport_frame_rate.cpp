@@ -430,19 +430,21 @@ bool HookClothStiffness() {
     return Detour(site, code, sizeof(code), e);
 }
 
-/// A mapping within +-2 GiB of the image (below it), for rel32 jumps and RIP-relative operands.
-u8* MapNear(int prot) {
+/// A mapping within +-2 GiB of the image (below or above it), for rel32 jumps and RIP-relative operands.
+u8* MapNear(int prot, u64 image_size) {
+    const u64 above_base = (image_base + image_size + 0xFFFFull) & ~0xFFFFull;
     for (u64 k = 1; k <= 64; ++k) {
-        const u64 hint = image_base - k * (8ull << 20);
-        void* p = mmap(reinterpret_cast<void*>(hint), StubPageSize, prot,
-                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
-        if (p != MAP_FAILED) return static_cast<u8*>(p);
+        for (const u64 hint : {image_base - k * (8ull << 20), above_base + k * (8ull << 20)}) {
+            void* p = mmap(reinterpret_cast<void*>(hint & ~0xFFFFull), StubPageSize, prot,
+                           MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+            if (p != MAP_FAILED) return static_cast<u8*>(p);
+        }
     }
     return nullptr;
 }
 } // namespace
 
-void PatchImage(unsigned char* image, std::uint64_t) {
+void PatchImage(unsigned char* image, std::uint64_t image_size) {
     // BB_FPS (run.sh, the launcher's frame rate): uncap (default), 60 or 90 (the same, at most that
     // many frames a second), 30 (the game's own). BB_FRAME_HOOKS=0: the community's frame rate
     // patches instead (scripts/patches.py; comparisons).
@@ -454,8 +456,8 @@ void PatchImage(unsigned char* image, std::uint64_t) {
         return;
     }
     image_base = reinterpret_cast<u64>(image);
-    u8* data = MapNear(PROT_READ | PROT_WRITE);
-    stub_page = MapNear(PROT_READ | PROT_WRITE | PROT_EXEC);
+    u8* data = MapNear(PROT_READ | PROT_WRITE, image_size);
+    stub_page = MapNear(PROT_READ | PROT_WRITE | PROT_EXEC, image_size);
     if (!data || !stub_page) {
         std::printf("Frame rate: no memory next to the game's code: 30 FPS\n");
         return;

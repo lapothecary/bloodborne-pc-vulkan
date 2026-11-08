@@ -345,7 +345,7 @@ std::string FormatKeyBinding(const std::string& raw, bool russian) {
         out += chord_out;
     }
     if (out.empty()) {
-        return russian ? "Нет" : "None";
+        return "None";
     }
     return out;
 }
@@ -477,8 +477,8 @@ Values& Get() {
     return values;
 }
 
-const char* MenuText(const char* english, const char* russian) {
-    return Get().menu_language == MenuLanguage::Russian ? russian : english;
+const char* MenuText(const char* english, const char*) {
+    return english;
 }
 
 void Load() {
@@ -486,15 +486,7 @@ void Load() {
     for (int e = 0; e < EffectCount; ++e) {
         v.effects[e] = Effects[e].default_on;
     }
-    // Default menu language follows BB_MENU_LANGUAGE or BB_LANGUAGE (8 = Russian; English by default).
-    {
-        const char* menu_lang = std::getenv("BB_MENU_LANGUAGE");
-        const char* game_lang = std::getenv("BB_LANGUAGE");
-        const bool is_ru = (menu_lang && (menu_lang[0] == 'r' || menu_lang[0] == 'R') &&
-                            (menu_lang[1] == 'u' || menu_lang[1] == 'U')) ||
-                           ((!menu_lang || !*menu_lang) && game_lang && std::atoi(game_lang) == 8);
-        v.menu_language = is_ru ? MenuLanguage::Russian : MenuLanguage::English;
-    }
+    v.menu_language = MenuLanguage::English;
     if (FILE* file = std::fopen(Path(), "r")) {
         char line[256];
         while (std::fgets(line, sizeof(line), file)) {

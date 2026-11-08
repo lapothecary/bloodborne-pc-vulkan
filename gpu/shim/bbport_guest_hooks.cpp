@@ -99,14 +99,17 @@ u8* stub_page = nullptr;
 std::size_t stub_used = 0;
 constexpr std::size_t StubPageSize = 65536;
 
-/// A page within +-2 GiB of the image (below its base: the image grows upwards).
+/// A page within +-2 GiB of the image (below or above its base).
 u8* MapStubPage() {
+    const u64 above_base = ImageBase + 0x6000000ull;
     for (u64 k = 1; k <= 64; ++k) {
-        const u64 hint = ImageBase - k * (16ull << 20);
-        void* p = mmap(reinterpret_cast<void*>(hint), StubPageSize, PROT_READ | PROT_WRITE | PROT_EXEC,
-                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
-        if (p != MAP_FAILED) {
-            return static_cast<u8*>(p);
+        for (const u64 hint : {ImageBase - k * (16ull << 20), above_base + k * (16ull << 20)}) {
+            void* p = mmap(reinterpret_cast<void*>(hint & ~0xFFFFull), StubPageSize,
+                           PROT_READ | PROT_WRITE | PROT_EXEC,
+                           MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+            if (p != MAP_FAILED) {
+                return static_cast<u8*>(p);
+            }
         }
     }
     return nullptr;

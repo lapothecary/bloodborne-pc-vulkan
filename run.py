@@ -183,6 +183,200 @@ def large_scene_memory(env, scene):
         setdefault(env, 'BB_DMEM_MB', '9152')
 
 
+def _discover_game_dir(base_dir):
+    candidates = [
+        base_dir / 'CUSA03173',
+        base_dir / 'game',
+        base_dir.parent / 'CUSA03173',
+        base_dir.parent / 'game',
+        base_dir.parent / 'Bloodborne' / 'CUSA03173',
+        base_dir.parent / 'Bloodborne' / 'game',
+    ]
+    for c in candidates:
+        if (c / 'eboot.bin').is_file():
+            return str(c.resolve())
+    for parent in (base_dir, base_dir.parent):
+        try:
+            for sub in parent.iterdir():
+                if sub.is_dir():
+                    if (sub / 'eboot.bin').is_file():
+                        return str(sub.resolve())
+                    for sub2 in ('CUSA03173', 'game', 'dvdroot_ps4'):
+                        p2 = sub / sub2
+                        if (p2 / 'eboot.bin').is_file():
+                            return str(p2.resolve())
+        except OSError:
+            pass
+    return ''
+
+
+def _load_saved_launcher_and_ini(env, data):
+    """Loads saved settings from launcher-win.json and bbport.ini so running Bloodborne.exe
+    directly applies all settings saved by Launcher.py or changed live in-game."""
+    import json
+    ini_path = Path(env.get('BB_CONFIG') or data / 'bbport.ini')
+    ini = {}
+    ini_lines = []
+    if ini_path.is_file():
+        try:
+            ini_lines = ini_path.read_text(encoding='utf-8', errors='replace').splitlines()
+            for line in ini_lines:
+                if '=' in line and not line.lstrip().startswith('#'):
+                    k, v = line.split('=', 1)
+                    ini[k.strip()] = v.strip()
+        except OSError:
+            pass
+    else:
+        default_ini = (
+            "# bbport settings (in-game menu: Insert / L3+R3)\n"
+            "aa_mode=smaa_t2x\n"
+            "upscaler=off\n"
+            "preset=0\n"
+            "dlss_preset=11\n"
+            "anisotropic=16\n"
+            "ui_upscale=1\n"
+            "fps_limit=0\n"
+            "sharpen=1\n"
+            "sharpness=0.50\n"
+            "object_motion=0\n"
+            "show_fps=1\n"
+            "aspect_ratio=auto\n"
+            "output_res=auto\n"
+            "model_lod=0\n"
+            "live_resolution=0\n"
+            "effect_game_aa=0\n"
+            "mouse_look=1\n"
+            "mouse_sensitivity=1.00\n"
+            "mouse_invert_y=0\n"
+            "skip_intro=1\n"
+            "skip_network_choice=1\n"
+        )
+        with contextlib.suppress(OSError):
+            ini_path.write_text(default_ini, encoding='utf-8')
+            for line in default_ini.splitlines():
+                if '=' in line and not line.startswith('#'):
+                    k, v = line.split('=', 1)
+                    ini[k.strip()] = v.strip()
+
+    s = {}
+    json_candidates = [
+        data / 'launcher-win.json',
+        Path(os.environ.get('XDG_CONFIG_HOME', Path.home() / '.config')) / 'bb_vulkan-launcher' / 'settings.json',
+    ]
+    if os.environ.get('APPDATA'):
+        json_candidates.append(Path(os.environ['APPDATA']) / 'bbport-launcher' / 'settings.json')
+    for jf in json_candidates:
+        if jf.is_file():
+            with contextlib.suppress(OSError, ValueError):
+                s = json.loads(jf.read_text(encoding='utf-8'))
+                break
+
+    # In-game menu writes directly to bbport.ini; let bbport.ini override launcher json for shared keys
+    game_dir = env.get('BB_GAME_DIR') or ini.get('game_dir') or s.get('game_dir') or ''
+    if not game_dir or not (Path(game_dir) / 'eboot.bin').is_file():
+        discovered = _discover_game_dir(PACKAGE_DIR)
+        if discovered:
+            game_dir = discovered
+    if game_dir:
+        setdefault(env, 'BB_GAME_DIR', str(game_dir))
+    if s.get('user_dir'):
+        setdefault(env, 'BB_USER_DIR', str(s['user_dir']))
+    if s.get('mods_dir'):
+        setdefault(env, 'BB_MODS_DIR', str(s['mods_dir']))
+    setdefault(env, 'BB_MODS_CONFIG', str(data / 'mods.json'))
+    setdefault(env, 'BB_MODS_ENABLED', '0' if s.get('mods_enabled') is False else '1')
+    if s.get('patches_dir'):
+        setdefault(env, 'BB_PATCHES_DIR', str(s['patches_dir']))
+    setdefault(env, 'BB_PATCHES_CONFIG', str(data / 'patches.json'))
+
+    lang = ini.get('language') or str(s.get('language', '1'))
+    setdefault(env, 'BB_LANGUAGE', lang)
+    setdefault(env, 'BB_MENU_LANGUAGE', 'en')
+
+    fullscreen = ini.get('fullscreen')
+    if fullscreen is None:
+        fullscreen = '1' if s.get('fullscreen') else '0'
+    setdefault(env, 'BB_FULLSCREEN', fullscreen)
+
+    present_mode = ini.get('present_mode') or s.get('present_mode') or 'Mailbox'
+    setdefault(env, 'BB_PRESENT_MODE', present_mode)
+
+    if s.get('gamepad'):
+        setdefault(env, 'BB_GAMEPAD', str(s['gamepad']))
+    if s.get('display'):
+        setdefault(env, 'BB_DISPLAY', str(s['display']))
+
+    skip_net = ini.get('skip_network_choice')
+    if skip_net is None:
+        skip_net = '0' if s.get('skip_network_choice') is False else '1'
+    setdefault(env, 'BB_SKIP_NETWORK_CHOICE', skip_net)
+
+    if s.get('hdr'):
+        setdefault(env, 'BB_HDR', '1')
+
+    fps_limit = ini.get('fps_limit')
+    if fps_limit is None:
+        fps_limit = str(s.get('fps_limit', 0) or 0)
+    setdefault(env, 'BB_FPS', 'uncap')
+    setdefault(env, 'BB_FPS_LIMIT', str(fps_limit))
+
+    if s.get('draw_pipe'):
+        setdefault(env, 'BB_DRAW_PIPE', str(s['draw_pipe']))
+    setdefault(env, 'BB_HW_OCCLUSION_CULL', '0' if s.get('hw_occlusion_cull') is False else '1')
+    setdefault(env, 'BB_MICRO_SHADOW_CULL', '0' if s.get('hw_occlusion_cull') is False else '1')
+    setdefault(env, 'BB_NATIVE_SHADERS', '0' if s.get('native_shaders') is False else '1')
+    if s.get('save_log'):
+        setdefault(env, 'BB_SAVE_LOG', '1')
+    if s.get('gpu_profile'):
+        setdefault(env, 'BB_GPU_PROFILE', '1')
+    if s.get('vk_validation'):
+        setdefault(env, 'BB_VK_VALIDATION', '1')
+    for item in str(s.get('extra_env', '')).split():
+        if '=' in item:
+            k, v = item.split('=', 1)
+            setdefault(env, k, v)
+
+
+def _prompt_game_dir_once(data, ini_path):
+    """If Bloodborne.exe is launched directly and eboot.bin cannot be found, ask once via a native folder dialog."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog, messagebox
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showinfo(
+            "Bloodborne PC Vulkan",
+            "Please select your Bloodborne game folder (the folder containing eboot.bin, e.g. CUSA03173 or game)."
+        )
+        chosen = filedialog.askdirectory(title="Select Bloodborne folder (containing eboot.bin)")
+        root.destroy()
+        if not chosen:
+            return ''
+        p = Path(chosen)
+        for cand in (p, p / 'CUSA03173', p / 'game', p / 'dvdroot_ps4'):
+            if (cand / 'eboot.bin').is_file():
+                resolved = str(cand.resolve())
+                # Save into launcher-win.json and bbport.ini so future launches remember it
+                import json
+                jf = data / 'launcher-win.json'
+                s = {}
+                if jf.is_file():
+                    with contextlib.suppress(OSError, ValueError):
+                        s = json.loads(jf.read_text(encoding='utf-8'))
+                s['game_dir'] = resolved
+                with contextlib.suppress(OSError):
+                    jf.write_text(json.dumps(s, indent=2), encoding='utf-8')
+                with contextlib.suppress(OSError):
+                    txt = ini_path.read_text(encoding='utf-8') if ini_path.is_file() else ''
+                    lines = [ln for ln in txt.splitlines() if not ln.strip().startswith('game_dir=')]
+                    lines.append(f'game_dir={resolved}')
+                    ini_path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+                return resolved
+    except Exception:
+        pass
+    return ''
+
+
 def run(extra_args=(), env=None, on_line=None):
     """Prepares and runs the game; the exit code. on_line(text) gets every line of output."""
     global _log_file
@@ -201,6 +395,7 @@ def run(extra_args=(), env=None, on_line=None):
     out = data / 'out'
     out.mkdir(parents=True, exist_ok=True)
     setdefault(env, 'BB_CONFIG', str(data / 'bbport.ini'))
+    _load_saved_launcher_and_ini(env, data)
     user = Path(env.get('BB_USER_DIR') or data / 'user')
     setdefault(env, 'BB_GPU_USER_DIR', str(user))
     # Every run is logged on Windows (an issue report needs it): logs/<time>.log.
@@ -237,7 +432,12 @@ def run(extra_args=(), env=None, on_line=None):
     try:
         game = Path(env.get('BB_GAME_DIR') or PACKAGE_DIR.parent / 'CUSA03173')
         if not (game / 'eboot.bin').is_file():
-            log(f'No eboot.bin in {game} (choose the game folder in the launcher).')
+            chosen = _prompt_game_dir_once(data, Path(env['BB_CONFIG']))
+            if chosen:
+                env['BB_GAME_DIR'] = chosen
+                game = Path(chosen)
+        if not (game / 'eboot.bin').is_file():
+            log(f'No eboot.bin in {game} (choose the game folder in Launcher.py).')
             return 1
         original_game = game  # the game's own files (shader recipes read program code there)
         os.environ.update(env)  # the scripts read BB_* from the environment
@@ -381,4 +581,12 @@ def run(extra_args=(), env=None, on_line=None):
 NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 
 if __name__ == '__main__':
+    if len(sys.argv) >= 3 and sys.argv[1] == '--run-script':
+        target_script = sys.argv[2]
+        sys.argv = sys.argv[2:]
+        runpy.run_path(target_script, run_name='__main__')
+        sys.exit(0)
+    if Path(sys.executable).stem.lower().startswith('launcher') or '--launcher' in sys.argv[1:]:
+        runpy.run_path(str(PACKAGE_DIR / 'Launcher.py'), run_name='__main__')
+        sys.exit(0)
     sys.exit(run(sys.argv[1:]))

@@ -321,11 +321,15 @@ void* mmap(void* address, size_t size, int prot, int flags, int fd, off_t offset
         if (prot != (PROT_READ | PROT_WRITE)) VirtualProtect(view, size, PageProtection(prot), &old);
         return view;
     }
-    void* p = VirtualAlloc(address, size, prot == PROT_NONE && (flags & MAP_NORESERVE)
-                                              ? MEM_RESERVE
-                                              : MEM_RESERVE | MEM_COMMIT,
+    void* alloc_addr = address;
+    if ((flags & MAP_FIXED_NOREPLACE) && !(flags & MAP_FIXED) && alloc_addr) {
+        alloc_addr = reinterpret_cast<void*>(start & ~uintptr_t(0xFFFF));
+    }
+    void* p = VirtualAlloc(alloc_addr, size, prot == PROT_NONE && (flags & MAP_NORESERVE)
+                                             ? MEM_RESERVE
+                                             : MEM_RESERVE | MEM_COMMIT,
                            PageProtection(prot));
-    if (!p || (fixed && p != address)) {
+    if (!p || (fixed && p != alloc_addr)) {
         if (p) VirtualFree(p, 0, MEM_RELEASE);
         errno = fixed ? EEXIST : ENOMEM;
         return MAP_FAILED;
