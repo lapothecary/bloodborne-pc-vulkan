@@ -522,6 +522,12 @@ BBNET_EXPORT void bbnet_image_ready(uint64_t base, uint64_t size) {
     // while the game runs (session teardown, the host's lamp): its code pages stay writable
     // (shadPS4 maps them so; the port maps them read and execute).
     unsigned writable = 0;
+#ifdef _WIN32
+    if (size >= 0x50da000ULL) {
+        writable += mprotect(reinterpret_cast<void*>(base), 0x50da000ULL,
+                             PROT_READ | PROT_WRITE | PROT_EXEC) == 0;
+    }
+#else
     if (FILE* maps = std::fopen("/proc/self/maps", "r")) {
         char line[512];
         while (std::fgets(line, sizeof(line), maps)) {
@@ -540,6 +546,7 @@ BBNET_EXPORT void bbnet_image_ready(uint64_t base, uint64_t size) {
         }
         std::fclose(maps);
     }
+#endif
     std::printf("BBSC: seamless co-op hooks for the image at %#llx (%u code mappings writable)\n",
                 static_cast<unsigned long long>(base), writable);
     if (const char* probe = std::getenv("BB_BBSC_PROBE")) {

@@ -281,8 +281,11 @@ constexpr std::array<HotFlag, 6> hot_flags = {{
 /// one that makes the new code reachable).
 void WriteHotCode(u64 address, const u8* bytes, std::size_t size, bool data) {
     if (data) {
-        // A constant: its page keeps the protection it has (read-only data) after the write.
-        int prot = PROT_READ;
+        // A constant: its page keeps the protection it has (read-only data, or read+exec when inside
+        // Segment 0 [ImageBase, ImageBase + 0x50da000) of boot.bin / boot-linked.bin) after the write.
+        int prot = (address >= ImageBase && address < ImageBase + 0x50da000ULL)
+                       ? Core::GuestCodeProtection()
+                       : PROT_READ;
         if (FILE* maps = std::fopen("/proc/self/maps", "r")) {
             char line[512];
             while (std::fgets(line, sizeof(line), maps)) {
@@ -418,7 +421,7 @@ void ApplyHotEffects(bool force, u64 fresh = 0) {
         static float applied_step_scale = -1.0f;
         if (force || applied_step_scale != target_step_scale) {
             applied_step_scale = target_step_scale;
-            WriteHotCode(ImageBase + 0x00632f8,
+            WriteHotCode(ImageBase + 0x0063318,
                          reinterpret_cast<const u8*>(&target_step_scale), sizeof(float), true);
         }
         if (runtime_memory_is_mapped(ImageBase + 0x5540dd8, 8)) {
@@ -519,13 +522,13 @@ bool InstallHotEffects() {
         static constexpr std::array<u8, 4> ssr_const_step = {0x00, 0x00, 0x80, 0x3f}; // 1.0f
         static constexpr std::array<u8, 1> ssr_movaps_xmm0 = {0xd8};
         static constexpr std::array<u8, 4> ssr_step_scale_val = {0x00, 0x00, 0x00, 0x40}; // 2.0f
-        static constexpr std::array<u8, 4> ssr_step_scale_rel = {0x13, 0x99, 0x1b, 0xff};
+        static constexpr std::array<u8, 4> ssr_step_scale_rel = {0x33, 0x99, 0x1b, 0xff}; // -> 0x0063318
         WriteHotCode(ImageBase + 0x22c3d2f, ssr_alloc_nop.data(), ssr_alloc_nop.size(), false);
         WriteHotCode(ImageBase + 0x22c428d, ssr_fullres_nop.data(), ssr_fullres_nop.size(), false);
         WriteHotCode(ImageBase + 0x4929c8c, ssr_const_min.data(), ssr_const_min.size(), true);
         WriteHotCode(ImageBase + 0x4929c90, ssr_const_step.data(), ssr_const_step.size(), true);
         WriteHotCode(ImageBase + 0x22b8d83, ssr_movaps_xmm0.data(), ssr_movaps_xmm0.size(), false);
-        WriteHotCode(ImageBase + 0x00632f8, ssr_step_scale_val.data(), ssr_step_scale_val.size(), true);
+        WriteHotCode(ImageBase + 0x0063318, ssr_step_scale_val.data(), ssr_step_scale_val.size(), true);
         WriteHotCode(ImageBase + 0x0ea99e1, ssr_step_scale_rel.data(), ssr_step_scale_rel.size(), false);
     }
     for (auto& code : hot_code) {
