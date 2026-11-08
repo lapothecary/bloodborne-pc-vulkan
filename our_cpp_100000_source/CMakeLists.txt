@@ -22,7 +22,8 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(BB_GX_COMMON_FLAGS
     -O3
     -DNDEBUG
-    -march=znver4
+    -march=x86-64-v3
+    -mtune=znver4
     -fno-omit-frame-pointer
     -fshort-wchar
     -ffunction-sections
