@@ -560,8 +560,12 @@ bool Source::ToFrame(Track& track, bool is_video, const AVFrame& decoded) {
         }
         const u32 pitch = Common::AlignUp<u32>(u32(decoded.width), 64);
         const u32 height = Common::AlignUp<u32>(u32(decoded.height), 16);
+        // Invalidate and disarm GPU texture-cache write traps BEFORE host memcpy into recycled
+        // video buffers (on Windows, host threads writing to PAGE_READONLY trapped guest pages
+        // would fault without clearing the trap first), and invalidate again after writing.
+        Core::Memory::Instance()->InvalidateMemory(reinterpret_cast<VAddr>(buffer->Data()),
+                                                   u64(pitch) * height * 3 / 2);
         CopyNv12(buffer->Data(), buffer->Size(), *nv12, pitch, height);
-        // The GPU side may have this memory cached as a texture.
         Core::Memory::Instance()->InvalidateMemory(reinterpret_cast<VAddr>(buffer->Data()),
                                                    u64(pitch) * height * 3 / 2);
         auto& details = info.details.video;

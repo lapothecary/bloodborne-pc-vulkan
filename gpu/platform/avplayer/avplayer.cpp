@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include <algorithm>
 #include <cctype>
+#include <cstddef>
 #include <mutex>
 #include <string_view>
 
@@ -50,6 +51,92 @@ bool HasAllocators(const AvPlayerMemAllocator& allocator) {
            allocator.deallocate_texture;
 }
 
+// Sealed C++20 layout of Bloodborne's MoviePlayer AvPlayer allocator hierarchy
+// (eboot.bin 0x28fd9f0, 0x28fde00, 0x2900e70, 0x2901150, 0x2901560, 0x2902670, 0x2902a80).
+// On PS4, MoviePlayer sets remap_flag (+0x44 of AvPlayerDirectRemapAllocator) and
+// batch_fallback_flag (+0xe9 of AvPlayerDualAllocator) to remap general CPU heap allocations
+// (0x1007400000, prot=0x03) a second time with GPU protection (prot=0x33) via
+// sceKernelMapDirectMemory / sceKernelBatchMap. Under private_import (BB_PRIVATE_GUEST_MEMORY=1),
+// each physical region has a single virtual mapping, and host FFmpeg software decoding only
+// accesses general buffers on the CPU (while video textures come from tex_alloc in Garlic GPU
+// memory which already has prot=0x33). Clearing remap_flag and batch_fallback_flag causes
+// 0x2902a80 (at 0x2902ace: cmpb $0x0, 0x44(%r15); je 0x2902b86) to return the heap allocation
+// directly without secondary virtual aliasing.
+struct BbMovieDirectRemapAllocator {
+    void* meta_alloc;
+    void* heap_alloc;
+    u8 vector_storage[0x2f];
+    u8 vector_init;
+    u32 required_prot;
+    u8 remap_flag;
+    u8 pad[0x1b];
+};
+static_assert(offsetof(BbMovieDirectRemapAllocator, vector_init) == 0x3f);
+static_assert(offsetof(BbMovieDirectRemapAllocator, required_prot) == 0x40);
+static_assert(offsetof(BbMovieDirectRemapAllocator, remap_flag) == 0x44);
+static_assert(sizeof(BbMovieDirectRemapAllocator) == 0x60);
+
+struct BbMovieDualAllocator {
+    void* meta_alloc;
+    void* heap_alloc;
+    u8 batch_remap[0x60];
+    BbMovieDirectRemapAllocator direct_remap;
+    u8 tracking_vector[0x17];
+    u8 vector_init;
+    u8 remap_flag_copy;
+    u8 batch_fallback_flag;
+    u8 pad0[6];
+    u64 page_size;
+    u64 block_size;
+    u8 initialized;
+    u8 pad1[7];
+};
+static_assert(offsetof(BbMovieDualAllocator, direct_remap) == 0x70);
+static_assert(offsetof(BbMovieDualAllocator, vector_init) == 0xe7);
+static_assert(offsetof(BbMovieDualAllocator, remap_flag_copy) == 0xe8);
+static_assert(offsetof(BbMovieDualAllocator, batch_fallback_flag) == 0xe9);
+static_assert(offsetof(BbMovieDualAllocator, page_size) == 0xf0);
+static_assert(offsetof(BbMovieDualAllocator, block_size) == 0xf8);
+static_assert(offsetof(BbMovieDualAllocator, initialized) == 0x100);
+static_assert(sizeof(BbMovieDualAllocator) == 0x108);
+
+struct BbMovieGeneralAllocatorAdapter {
+    const void* vtable;
+    BbMovieDualAllocator* dual_alloc;
+};
+static_assert(sizeof(BbMovieGeneralAllocatorAdapter) == 0x10);
+
+struct BbMovieMemoryReplacementContext {
+    void* heap_alloc;
+    BbMovieGeneralAllocatorAdapter* general_alloc;
+    void* tex_alloc;
+};
+static_assert(sizeof(BbMovieMemoryReplacementContext) == 0x18);
+
+void DisableGuestDirectRemap(const AvPlayerMemAllocator& allocator) {
+    if (!allocator.object_ptr) {
+        return;
+    }
+    auto* base = static_cast<u8*>(allocator.object_ptr);
+    auto* ctx = reinterpret_cast<BbMovieMemoryReplacementContext*>(base);
+    auto* expected_general = reinterpret_cast<BbMovieGeneralAllocatorAdapter*>(base + 0x250);
+    auto* expected_dual = reinterpret_cast<BbMovieDualAllocator*>(base + 0x148);
+    if (ctx->general_alloc != expected_general || expected_general->dual_alloc != expected_dual) {
+        return;
+    }
+    if (expected_dual->heap_alloc != ctx->heap_alloc || expected_dual->initialized != 1 ||
+        expected_dual->direct_remap.required_prot != 0x33) {
+        return;
+    }
+    if (expected_dual->direct_remap.remap_flag != 0 || expected_dual->batch_fallback_flag != 0) {
+        expected_dual->direct_remap.remap_flag = 0;
+        expected_dual->remap_flag_copy = 0;
+        expected_dual->batch_fallback_flag = 0;
+        LOG_INFO(Lib_AvPlayer,
+                 "MoviePlayer direct-remap disabled for private_import compatibility");
+    }
+}
+
 s32 Result(bool ok) {
     return ok ? BbErr::Ok : ErrorOperationFailed;
 }
@@ -70,6 +157,7 @@ Handle PS4_SYSV_ABI sceAvPlayerInit(AvPlayerInitData* data) {
         LOG_ERROR(Lib_AvPlayer, "sceAvPlayerInit needs all four allocators");
         return nullptr;
     }
+    DisableGuestDirectRemap(data->memory_replacement);
     auto* p = new Player(*data);
     std::scoped_lock lock{active_mutex};
     active_player = p;
@@ -80,6 +168,7 @@ s32 PS4_SYSV_ABI sceAvPlayerInitEx(const AvPlayerInitDataEx* data, Handle* playe
     if (!data || !player || !HasAllocators(data->memory_replacement)) {
         return ErrorInvalidParams;
     }
+    DisableGuestDirectRemap(data->memory_replacement);
     AvPlayerInitData init{};
     init.memory_replacement = data->memory_replacement;
     init.file_replacement = data->file_replacement;
