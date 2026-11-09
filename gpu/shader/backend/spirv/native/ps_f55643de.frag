@@ -107,7 +107,7 @@ void main() {
     if (enhanced_shadows && d < 0.9999) {
         const float ign = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
         const float base_ang = ign * 6.28318530718;
-        const float rad_step = max(abs(da), abs(db)) * 1.35;
+        const float rad_step = length(vec2(da, db));
         if (rad_step > 0.0) {
             float vogel_sum = pcf_avg * 4.0;
             for (uint i = 0u; i < 8u; ++i) {
@@ -120,39 +120,45 @@ void main() {
             pcf_avg = vogel_sum * (1.0 / 12.0);
         }
 
-        // Screen-space depth-raymarched contact micro-shadows along the exact directional light vector
-        // L_screen = cross(sm0.xyz, sm1.xyz) where delta_sx == 0, delta_sy == 0, and delta_sz < 0.
-        if (cascade <= 1u && pcf_avg > 0.01) {
-            vec3 l_ray = cross(sm0.xyz, sm1.xyz);
-            float l_dz = dot(l_ray, sm2.xyz);
+        // Perspective- and cascade-atlas-invariant screen-space contact micro-shadows:
+        // Quotient-rule gradients of (u = sx/sw, v = sy/sw, dref = sz/sw) cancel out both
+        // perspective w (sm3) and per-cascade shadow-atlas quadrant offsets, eliminating
+        // any seam at cascade split boundaries while preserving stone/cobblestone micro-shadows.
+        const float contact_fade = 1.0 - smoothstep(10.0, 22.0, dist);
+        if (contact_fade > 0.001 && pcf_avg > 0.01) {
+            const float u_sh = sx * inv_sw;
+            const float v_sh = sy * inv_sw;
+            const vec3 gu = sm0.xyz - u_sh * sm3.xyz;
+            const vec3 gv = sm1.xyz - v_sh * sm3.xyz;
+            const vec3 gz = sm2.xyz - dref * sm3.xyz;
+            vec3 l_ray = cross(gu, gv);
+            float l_dz = dot(l_ray, gz);
             if (l_dz > 0.0) {
                 l_ray = -l_ray;
                 l_dz = -l_dz;
             }
-            // Convert NDC step (in_x, in_y) to UV step (in_x * 0.5, -in_y * 0.5).
             vec2 uv_dir = vec2(l_ray.x * 0.5, -l_ray.y * 0.5);
             float uv_len = length(uv_dir);
             if (uv_len > 1e-6 && abs(l_dz) > 1e-7) {
-                // March ~16 pixels across 8 steps (2.0 px/step at 1080p) with IGN phase jitter.
-                const float max_uv_dist = 0.012;
+                const float max_uv_dist = 0.010;
                 const float scale = (max_uv_dist / 8.0) / uv_len;
                 const vec2 step_uv = uv_dir * scale;
                 const float step_d = l_ray.z * scale;
-                // Depth thickness proportional to per-step depth change and view distance.
-                const float thickness = max(abs(step_d) * 3.5, 0.00035 / max(abs(vz), 1.0));
-                float contact_vis = 1.0;
+                const float base_bias = abs(step_d) * 1.35 + 0.000025;
+                const float thickness = max(abs(step_d) * 3.0, 0.00030 / max(dist, 1.0));
+                float contact_occ = 0.0;
                 for (uint s = 1u; s <= 8u; ++s) {
                     float t = float(s) - 0.65 + ign * 0.65;
                     vec2 sample_uv = fs_in_attr1.xy + step_uv * t;
                     float ray_d = d + step_d * t;
                     float scene_d = textureLod(sampler2D(fs_img0, fs_samp0), sample_uv, 0.0).r;
                     float diff = ray_d - scene_d;
-                    if (diff > 0.000015 && diff < thickness) {
+                    if (diff > base_bias * t && diff < thickness) {
                         float w = 1.0 - (float(s - 1u) * 0.11);
-                        contact_vis = min(contact_vis, 1.0 - 0.78 * w);
+                        contact_occ = max(contact_occ, 0.72 * w);
                     }
                 }
-                pcf_avg *= contact_vis;
+                pcf_avg *= (1.0 - contact_occ * contact_fade);
             }
         }
     }

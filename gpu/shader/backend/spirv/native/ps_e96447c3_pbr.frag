@@ -64,7 +64,11 @@ float eval_cube_vsm(uint base, vec3 pos_v) {
     float lit = (sm.x >= dist_n) ? 1.0 : 0.0;
     float var = max(0.00100000005 / far_d, (-sm.x) * sm.x + sm.y);
     float diff_d = dist_n - sm.x;
-    return s2f(base + 19u) * (-1.0 + max(lit, var / (diff_d * diff_d + var))) + 1.0;
+    float p_max = max(lit, var / (diff_d * diff_d + var));
+    if (((push_data.buf_offsets2.y >> 24u) & 0x02u) != 0u) {
+        p_max = smoothstep(0.18, 1.0, p_max);
+    }
+    return s2f(base + 19u) * (-1.0 + p_max) + 1.0;
 }
 
 void main() {

@@ -172,6 +172,14 @@ void main() {
         spec_acc += (bl3 * (sh3 * (S3 * (0.125 * sp_e3 + 0.25)))) * ((-fr3 * spec_sq) + (spec_sq + fr3));
     }
 
+    if (((push_data.buf_offsets2.y >> 24u) & 0x01u) != 0u) {
+        // Lagarde / Frostbite Specular Micro-Occlusion for directional sun/moon lighting
+        float raw_ao = clamp(tex_sh.z, 0.0, 1.0);
+        float ndotv = clamp(dot(V, N), 0.0, 1.0);
+        float spec_ao = clamp(pow(ndotv + raw_ao, exp2(-16.0 * (1.0 - tex_mat.x) - 1.0)) - 1.0 + raw_ao, 0.0, 1.0);
+        spec_acc *= mix(1.0, spec_ao / max(raw_ao, 1e-4), 0.80);
+    }
+
     frag_color1 = vec4(spec_acc, 1.0);
     frag_color0 = vec4(diff_acc, 1.0);
 }

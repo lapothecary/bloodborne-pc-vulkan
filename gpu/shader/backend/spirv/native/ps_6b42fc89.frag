@@ -170,11 +170,13 @@ void main() {
     const float sh0_scale = (-s2f(17u + buf1_dword_off)) * (1.0 / (s2f(16u + buf1_dword_off) - 1.0));
     const float sh0_dist = sh0_max * (1.0 / sh0_scale);
 
+    const bool enh_vsm = ((push_data.buf_offsets2.y >> 24u) & 0x02u) != 0u;
     const vec2 vsm0 = texture(sampler2DArray(fs_img5, fs_samp1), cube_array_uv(sh0_vec)).xy;
     const float vsm0_cmp = (vsm0.x >= sh0_dist) ? 1.0 : 0.0;
     const float vsm0_var = max(0.00100000005 / sh0_scale, (-vsm0.x) * vsm0.x + vsm0.y);
     const float vsm0_diff = sh0_dist - vsm0.x;
-    const float vsm0_p = max(vsm0_cmp, vsm0_var / (vsm0_diff * vsm0_diff + vsm0_var));
+    const float vsm0_raw = max(vsm0_cmp, vsm0_var / (vsm0_diff * vsm0_diff + vsm0_var));
+    const float vsm0_p = enh_vsm ? smoothstep(0.18, 1.0, vsm0_raw) : vsm0_raw;
     const float sh0 = s2f(19u + buf1_dword_off) * (vsm0_p - 1.0) + 1.0;
 
     const float sp0_k = s2f(7u + buf1_dword_off);
@@ -211,7 +213,8 @@ void main() {
     const float vsm1_cmp = (vsm1.x >= sh1_dist) ? 1.0 : 0.0;
     const float vsm1_var = max(0.00100000005 / sh1_scale, (-vsm1.x) * vsm1.x + vsm1.y);
     const float vsm1_diff = sh1_dist - vsm1.x;
-    const float vsm1_p = max(vsm1_cmp, vsm1_var / (vsm1_diff * vsm1_diff + vsm1_var));
+    const float vsm1_raw = max(vsm1_cmp, vsm1_var / (vsm1_diff * vsm1_diff + vsm1_var));
+    const float vsm1_p = enh_vsm ? smoothstep(0.18, 1.0, vsm1_raw) : vsm1_raw;
     const float sh1 = s2f(43u + buf1_dword_off) * (vsm1_p - 1.0) + 1.0;
 
     const float sp1_k = s2f(31u + buf1_dword_off);
@@ -248,7 +251,8 @@ void main() {
     const float vsm2_cmp = (vsm2.x >= sh2_dist) ? 1.0 : 0.0;
     const float vsm2_var = max(0.00100000005 / sh2_scale, (-vsm2.x) * vsm2.x + vsm2.y);
     const float vsm2_diff = sh2_dist - vsm2.x;
-    const float vsm2_p = max(vsm2_cmp, vsm2_var / (vsm2_diff * vsm2_diff + vsm2_var));
+    const float vsm2_raw = max(vsm2_cmp, vsm2_var / (vsm2_diff * vsm2_diff + vsm2_var));
+    const float vsm2_p = enh_vsm ? smoothstep(0.18, 1.0, vsm2_raw) : vsm2_raw;
     const float sh2 = s2f(67u + buf1_dword_off) * (vsm2_p - 1.0) + 1.0;
 
     const float sp2_k = s2f(55u + buf1_dword_off);

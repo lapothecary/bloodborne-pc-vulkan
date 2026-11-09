@@ -823,11 +823,13 @@ namespace {
 /// Whether a G-buffer vertex shader gets the motion attachment (its bone palette buffers):
 /// shared by the full selection (RefreshGraphicsKey) and the fast select.
 bool VsSelectsMotion(const Shader::Info& vs) {
+    const u32* const vs_flat = vs.FlatUserData().data();
+    const VAddr vs_base = vs.ProgramBase();
     for (const auto& resource : vs.buffers) {
         if (resource.IsSpecial()) {
             continue;
         }
-        const auto buffer = resource.GetSharp(vs);
+        const auto buffer = resource.GetSharpDirect(vs_flat, vs_base);
         if (buffer.Valid() && buffer.GetStride() == 16 &&
             Motion::ClassifyBuffer(buffer.GetSize()) != Motion::BufferRole::Other) {
             return true;
@@ -1621,11 +1623,13 @@ bool PipelineCache::AsyncSkippable(const PipelineSelection& selection, bool indi
     if (last_frame_draws < 300) {
         return false;
     }
-    // A full-screen pass (one triangle or quad: lighting, fog, post-processing) waits for its
-    // pipeline: going without one for a frame left whole frames grey. So does an indirect draw
-    // (its size unknown here). What may go without is geometry, which shows a frame later.
+    // A full-screen pass (one triangle or quad without depth testing: lighting, fog, post-processing)
+    // waits for its pipeline: going without one for a frame left whole frames grey. So does an
+    // indirect draw (its size unknown here). 3D depth-tested geometry (including 6-index blood decals
+    // and hit sparks) may compile asynchronously without stalling the frame.
     constexpr u32 FullScreenIndices = 12;
-    if (indirect || selection.regs->num_indices <= FullScreenIndices) {
+    if (indirect || (!selection.regs->depth_control.depth_enable &&
+                     selection.regs->num_indices <= FullScreenIndices)) {
         return false;
     }
     // A pass drawn every frame: its render target drawn to in each of the last 8 frames (the

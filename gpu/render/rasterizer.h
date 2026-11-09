@@ -653,6 +653,7 @@ private:
         u64 exact_gen = 0;
         u32 frame_number = ~0u;
         bool has_transient_cue = false;
+        bool resolved_direct_valid = false;
         const GraphicsPipeline* pipeline = nullptr;
         u32 step_rate_0 = 0;
         u32 step_rate_1 = 0;
@@ -665,6 +666,9 @@ private:
         std::array<std::pair<VAddr, VAddr>, 16> ranges{};
         std::array<u64, 16> range_min_spans{};
         std::array<u8, 16> range_indices{};
+        std::array<const VideoCore::Buffer*, 16> range_direct_buffers{};
+        std::array<vk::Buffer, 16> host_buffers{};
+        std::array<vk::DeviceSize, 16> host_offsets{};
     };
     u64 stage_b_vertex_memo_clock = 0;
     std::unique_ptr<std::array<StageBVertexMemoEntry, StageBVertexMemoEntry::TableSize>>

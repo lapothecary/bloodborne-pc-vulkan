@@ -153,8 +153,8 @@ public:
     /// N1.1 / N1.2 (~2 ns fast path): resolves a read-only [addr, addr + inout_size) binding
     /// inside a live native VkBuffer (or its active zero-break stream_buffer version), clamping
     /// oversized/0xFFFFFFFF V# sizes to the exact end of that GXGnmBuffer.
-    [[nodiscard]] std::pair<const Buffer*, u64> TryResolveReadClamped(VAddr addr,
-                                                                      u64& inout_size) noexcept;
+    [[nodiscard]] std::pair<const Buffer*, u64> TryResolveReadClamped(
+        VAddr addr, u64& inout_size, bool* out_static_immutable = nullptr) noexcept;
     [[nodiscard]] std::pair<const Buffer*, u64> TryResolveRead(VAddr addr, u64 size) noexcept {
         return TryResolveReadClamped(addr, size);
     }

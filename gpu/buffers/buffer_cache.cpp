@@ -1331,12 +1331,13 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
         // `NO_OVERWRITE` sub-draws at `device_addr = blk_base + vb_offset` in O(1) without
         // re-copying 3..4 MiB per draw or overflowing `stream_buffer`.
         auto& tls_cue_memo = TlsCueMemo();
+        u64 precomputed_small_stamp = 0;
         if (size <= STREAM_THRESHOLD) {
+            precomputed_small_stamp = DirectBuffers::ComputeTransientCueStamp(device_addr, size);
             const auto& fast_memo = tls_cue_memo[CueMemoSlotIdx(device_addr, size)];
             if (fast_memo.addr == device_addr && fast_memo.size == size &&
                 fast_memo.tick == cur_tick && fast_memo.inv_gen == cur_inv &&
-                fast_memo.cue_stamp != 0 &&
-                fast_memo.cue_stamp == DirectBuffers::ComputeTransientCueStamp(device_addr, size)) {
+                fast_memo.cue_stamp != 0 && fast_memo.cue_stamp == precomputed_small_stamp) {
                 TraceBinding(device_addr, size, false, 3);
                 return {&stream_buffer, fast_memo.offset};
             }
@@ -1361,10 +1362,14 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
         const VAddr upload_addr = promote_big_blk ? blk_base : device_addr;
         const u32 upload_size = promote_big_blk ? blk_size : size;
         const u64 sub_off = device_addr - upload_addr;
-        const u64 cur_stamp = DirectBuffers::ComputeTransientCueStamp(upload_addr, upload_size);
+        const u64 cur_stamp =
+            (!promote_big_blk && size <= STREAM_THRESHOLD)
+                ? precomputed_small_stamp
+                : DirectBuffers::ComputeTransientCueStamp(upload_addr, upload_size);
         auto& memo = tls_cue_memo[CueMemoSlotIdx(upload_addr, upload_size)];
-        if (memo.addr == upload_addr && memo.size == upload_size && memo.tick == cur_tick &&
-            memo.inv_gen == cur_inv && memo.cue_stamp != 0 && memo.cue_stamp == cur_stamp) {
+        if ((promote_big_blk || size > STREAM_THRESHOLD) && memo.addr == upload_addr &&
+            memo.size == upload_size && memo.tick == cur_tick && memo.inv_gen == cur_inv &&
+            memo.cue_stamp != 0 && memo.cue_stamp == cur_stamp) {
             TraceBinding(device_addr, size, false, 3);
             return {&stream_buffer, memo.offset + sub_off};
         }

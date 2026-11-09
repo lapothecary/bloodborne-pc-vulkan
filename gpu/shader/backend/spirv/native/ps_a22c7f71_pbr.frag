@@ -78,6 +78,9 @@ mat2x3 eval_vsm_point_light(uint base, vec3 L_vec, float d2, vec4 sm, vec3 pos, 
     float sh_dist = max(abs(sv.z), max(abs(sv.x), abs(sv.y))) / sh_range;
     float var = max(0.00100000005 / sh_range, (-sm.x * sm.x) + sm.y);
     float p_max = max((sm.x >= sh_dist) ? 1.0 : 0.0, var / ((sh_dist - sm.x) * (sh_dist - sm.x) + var));
+    if (((push_data.buf_offsets2.y >> 24u) & 0x02u) != 0u) {
+        p_max = smoothstep(0.18, 1.0, p_max);
+    }
     float sh_factor = s2f(base + 19u) * (p_max - 1.0) + 1.0;
 
     float spec_pow = max(1.0, (s2f(base + 7u) * exp_13) / (exp_13 * 0.0100021362 + s2f(base + 7u)));

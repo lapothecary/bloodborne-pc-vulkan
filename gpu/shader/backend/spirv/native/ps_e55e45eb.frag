@@ -37,6 +37,11 @@ void main() {
 
     vec2 uv = fs_in_attr0.xy;
     vec2 step_uv = (uv - light_pos) * (density / float(num_samples));
+    if (((push_data.buf_offsets2.y >> 24u) & 0x0Au) != 0u) {
+        // Sub-step Jimenez Interleaved Gradient Noise phase jitter to eliminate radial step banding
+        float ign = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
+        uv = clamp(uv - step_uv * (ign - 0.5), vec2(0.0), vec2(1.0));
+    }
 
     float cur_decay = 1.0;
     vec4 acc = vec4(0.0);

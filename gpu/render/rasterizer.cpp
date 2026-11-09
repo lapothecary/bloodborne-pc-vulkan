@@ -138,7 +138,12 @@ struct SceneOcclusionCuller {
                             }
                             if (e.zero_streak >= 3 && !fast_camera_turn) {
                                 const u32 stagger = static_cast<u32>(idx & 1u);
-                                const u32 skip_len = camera_moving ? 1u : (2u + stagger);
+                                const u32 skip_len =
+                                    camera_moving
+                                        ? (e.zero_streak >= 6 ? (2u + stagger) : (1u + stagger))
+                                        : (e.zero_streak >= 8   ? (6u + static_cast<u32>(idx & 3u))
+                                           : e.zero_streak >= 5 ? (4u + stagger)
+                                                                : (2u + stagger));
                                 e.skip_until_frame = cur_frame + skip_len;
                             }
                         } else {
@@ -180,14 +185,16 @@ struct SceneOcclusionCuller {
             const float dy = pos[1] - prev_cam_pos[1];
             const float dz = pos[2] - prev_cam_pos[2];
             const float dist_sq = dx * dx + dy * dy + dz * dz;
-            if (cos_ang < 0.9997f || dist_sq > 0.0025f) {
+            if (cos_ang < 0.9990f || dist_sq > 0.0100f) {
                 fast_camera_turn = true;
                 camera_moving = true;
                 for (auto& e : entries) {
                     e.skip_until_frame = 0;
-                    e.zero_streak = 0;
+                    if (e.zero_streak > 2) {
+                        e.zero_streak = 2;
+                    }
                 }
-            } else if (cos_ang < 0.99998f || dist_sq > 0.0001f) {
+            } else if (cos_ang < 0.99995f || dist_sq > 0.0002f) {
                 camera_moving = true;
             }
         }
@@ -769,7 +776,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
             }
         }
 
-        // 2. Hardware Temporal Occlusion Culling for All 6-MRT Opaque G-Buffer World Batches
+        // 2. Hardware Temporal Occlusion Culling for All 6-MRT G-Buffer World & Cutout Batches
         //    Note: 2D screen-space deferred light tiles (vs 0x8747a367) are culled per-pixel on the
         //    GPU via early_fragment_tests + 3D sphere demote in the fragment shaders (0-frame
         //    latency, 100% artifact-free), NOT by skipping 2D tile draws on the CPU.
@@ -778,8 +785,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
         const bool is_gbuf_cull_cand =
             is_indexed && mrt_mask == 0x3f && begin_memo.state.num_color_attachments == 6 &&
             !regs.blend_control[0].enable && regs.depth_control.depth_enable &&
-            regs.depth_control.depth_write_enable && num_indices >= 96 &&
-            (!ps_stage || !ps_stage->has_discard);
+            regs.depth_control.depth_write_enable && num_indices >= 36;
         if (culler.enabled && culler.pool && begin_memo.valid &&
             !regs.depth_render_control.depth_clear_enable &&
             !regs.depth_render_control.stencil_clear_enable &&
@@ -788,24 +794,23 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
             if (gbuf_ord == 1) {
                 culler.CollectRetiredSlices(instance.GetDevice(), scheduler);
             }
+            VAddr cue_base = 0;
+            VAddr cue_end = 0;
+            VideoCore::DirectBuffers::GetTransientCueHeapBounds(cue_base, cue_end);
             bool has_transient_vb = false;
             u64 vtx_buf_hash = 0;
             if (used_prepared && used_prepared->vertex.valid) {
                 vtx_buf_hash = used_prepared->vertex.buffers_hash;
                 for (u32 i = 0; i < used_prepared->vertex.count; ++i) {
                     const VAddr vb_addr = used_prepared->vertex.buffers[i].base_address;
-                    const u64 vb_sz = used_prepared->vertex.buffers[i].GetSize();
-                    if (vb_addr != 0 &&
-                        VideoCore::DirectBuffers::IsTransientCueHeap(vb_addr, vb_sz)) {
+                    if (vb_addr >= cue_base && vb_addr < cue_end) {
                         has_transient_vb = true;
                         break;
                     }
                 }
             } else if (!packet_vsharps.empty()) {
                 for (const auto& vb : packet_vsharps) {
-                    if (vb.base_address != 0 &&
-                        VideoCore::DirectBuffers::IsTransientCueHeap(vb.base_address,
-                                                                     vb.GetSize())) {
+                    if (vb.base_address >= cue_base && vb.base_address < cue_end) {
                         has_transient_vb = true;
                         break;
                     }
@@ -814,9 +819,13 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
                 }
             }
 
+            const bool is_inst_gbuf_vs =
+                (vs_hash == 0x6a833138ull || vs_hash == 0xecbef4c7ull);
             bool is_skeleton = false;
             bool has_model_cb = false;
             u32 model_base_matrix_idx = 0;
+            const u8* inst_cb_ptr = nullptr;
+            u32 inst_cb_size = 0;
             const u8* palette_ptr = nullptr;
             u32 palette_size = 0;
             if (!has_transient_vb) {
@@ -831,6 +840,8 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
                         }
                     }
                 }
+                const u32* const vs_flat = vs_stage.FlatUserData().data();
+                const VAddr vs_pgm_base = vs_stage.ProgramBase();
                 for (u32 b_idx = 0; b_idx < vs_stage.buffers.size(); ++b_idx) {
                     const auto& res = vs_stage.buffers[b_idx];
                     if (res.IsSpecial()) {
@@ -838,26 +849,34 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
                     }
                     u32 cb_size = 0;
                     const u8* cb_ptr = nullptr;
-                    if (const auto* ring = FindRingBinding(vs_stage, b_idx)) {
-                        cb_size = ring->size;
-                        if (ring->address != 0 &&
-                            !buffer_cache.IsConstRamRange(ring->address, cb_size) &&
-                            memory->ClampRangeSize(ring->address, cb_size) == cb_size) {
-                            cb_ptr = reinterpret_cast<const u8*>(ring->address);
-                        } else {
-                            cb_ptr = (ring->ring == 0)
-                                         ? constant_ring->Data(ring->offset)
-                                         : worker_rings[ring->ring - 1]->Data(ring->offset);
+                    if (num_ring_stages != 0) {
+                        if (const auto* ring = FindRingBinding(vs_stage, b_idx)) {
+                            cb_size = ring->size;
+                            if (ring->address != 0 &&
+                                ((ring->address >= cue_base &&
+                                  ring->address + cb_size <= cue_end) ||
+                                 (!buffer_cache.IsConstRamRange(ring->address, cb_size) &&
+                                  memory->ClampRangeSize(ring->address, cb_size) == cb_size))) {
+                                cb_ptr = reinterpret_cast<const u8*>(ring->address);
+                            } else {
+                                cb_ptr = (ring->ring == 0)
+                                             ? constant_ring->Data(ring->offset)
+                                             : worker_rings[ring->ring - 1]->Data(ring->offset);
+                            }
                         }
-                    } else {
+                    }
+                    if (!cb_ptr) {
                         const Gcn::Buffer sharp =
-                            prep_vs ? prep_vs->buffer_sharps[b_idx] : res.GetSharp(vs_stage);
+                            prep_vs ? prep_vs->buffer_sharps[b_idx]
+                                    : res.GetSharpDirect(vs_flat, vs_pgm_base);
                         if (!sharp.Valid() || sharp.GetStride() != 16) {
                             continue;
                         }
                         cb_size = sharp.GetSize();
                         if (sharp.base_address != 0 &&
-                            memory->ClampRangeSize(sharp.base_address, cb_size) == cb_size) {
+                            ((sharp.base_address >= cue_base &&
+                              sharp.base_address + cb_size <= cue_end) ||
+                             memory->ClampRangeSize(sharp.base_address, cb_size) == cb_size)) {
                             cb_ptr = reinterpret_cast<const u8*>(sharp.base_address);
                         }
                     }
@@ -866,20 +885,31 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
                             culler.UpdateCameraFromSceneConstants(
                                 reinterpret_cast<const float*>(cb_ptr));
                         }
-                    } else if (cb_size >= 640 && cb_size <= 16384) {
-                        is_skeleton = true;
-                        break;
-                    } else if (cb_size == 416) {
+                    } else if (cb_size == 416 && !is_inst_gbuf_vs) {
                         if (cb_ptr) {
                             std::memcpy(&model_base_matrix_idx, cb_ptr + 80, sizeof(u32));
                             has_model_cb = true;
                         }
-                    } else if (cb_size >= 48 && cb_size < 640 && (cb_size % 48) == 0) {
+                    } else if (is_inst_gbuf_vs && cb_size >= 208 && cb_size <= 32768 &&
+                               (cb_size % 208) == 0) {
+                        if (cb_ptr && !inst_cb_ptr) {
+                            inst_cb_ptr = cb_ptr;
+                            inst_cb_size = cb_size;
+                            std::memcpy(&model_base_matrix_idx, cb_ptr + 80, sizeof(u32));
+                            has_model_cb = true;
+                        }
+                    } else if (cb_size >= 48 && cb_size <= 16384 && (cb_size % 48) == 0) {
                         if (cb_ptr && !palette_ptr) {
                             palette_ptr = cb_ptr;
                             palette_size = cb_size;
                         }
                     }
+                }
+                if (!has_model_cb && palette_size >= 640) {
+                    is_skeleton = true;
+                } else if (has_model_cb && !is_inst_gbuf_vs && model_base_matrix_idx == 0 &&
+                           palette_size >= 640) {
+                    is_skeleton = true;
                 }
             }
 
@@ -890,10 +920,15 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
                      u64(model_base_matrix_idx) * 48ull + 48ull <= u64(palette_size))
                         ? (model_base_matrix_idx * 48u)
                         : 0u;
-                const u32 hash_bytes = std::min<u32>(palette_size - mat_byte_off, 192u);
-                const u64 world_palette_hash = XXH3_64bits_withSeed(
+                const u32 hash_bytes =
+                    std::min<u32>(palette_size - mat_byte_off, is_inst_gbuf_vs ? 384u : 192u);
+                u64 world_palette_hash = XXH3_64bits_withSeed(
                     palette_ptr + mat_byte_off, hash_bytes,
                     (u64(model_base_matrix_idx) * 0x9E3779B97F4A7C15ull) ^ u64(palette_size));
+                if (inst_cb_ptr && inst_cb_size > 0) {
+                    world_palette_hash ^= XXH3_64bits_withSeed(
+                        inst_cb_ptr, std::min<u32>(inst_cb_size, 1040u), 0xD6E8FEB86659FD93ull);
+                }
 
                 const u32 index_size =
                     regs.index_buffer_type.index_type == Gcn::IndexType::Index16 ? 2u : 4u;

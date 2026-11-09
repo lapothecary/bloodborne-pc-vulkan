@@ -653,6 +653,32 @@ void Rasterizer::ResolveVertexBuffers(const GraphicsPipeline* pipeline,
                 cand.last_use = ++stage_b_vertex_memo_clock;
                 attributes.assign(cand.attributes.begin(), cand.attributes.begin() + cnt);
                 bindings.assign(cand.bindings.begin(), cand.bindings.begin() + cnt);
+                static const bool trace_shader = std::getenv("BB_TRACE_SHADER") != nullptr;
+                if (cand.resolved_direct_valid && !cand.has_transient_cue && StageBFastBind() &&
+                    !VideoCore::BufferCache::LayerPagedActive() && !InPlaceReads::Enabled() &&
+                    !HasPendingHleCopies() && !trace_shader) [[likely]] {
+                    bool uav_dirty = false;
+                    for (u32 r = 0; r < cand.num_ranges; ++r) {
+                        if (!cand.range_direct_buffers[r] ||
+                            cand.range_direct_buffers[r]->uav_written) [[unlikely]] {
+                            uav_dirty = true;
+                            break;
+                        }
+                    }
+                    if (!uav_dirty) [[likely]] {
+                        v.host_buffers.assign(cand.host_buffers.begin(),
+                                              cand.host_buffers.begin() + cnt);
+                        v.host_offsets.assign(cand.host_offsets.begin(),
+                                              cand.host_offsets.begin() + cnt);
+                        v.num_buffers = cnt;
+                        if (motion_draw) {
+                            motion_geometry = cand.buffers_hash;
+                        }
+                        BbStats::native_buf_hits.fetch_add(cand.num_ranges,
+                                                           std::memory_order_relaxed);
+                        return;
+                    }
+                }
                 guest_buffers.assign(cand.vsharps.begin(), cand.vsharps.begin() + cnt);
                 memo_hit_slot = &cand;
                 break;
@@ -665,11 +691,16 @@ void Rasterizer::ResolveVertexBuffers(const GraphicsPipeline* pipeline,
                 auto& w0 = (*stage_b_vertex_memo)[set_base];
                 auto& w1 = (*stage_b_vertex_memo)[set_base + 1];
                 auto& slot = (w0.key == 0 || w0.last_use <= w1.last_use) ? w0 : w1;
+                VAddr cue_base = 0;
+                VAddr cue_end = 0;
+                VideoCore::DirectBuffers::GetTransientCueHeapBounds(cue_base, cue_end);
                 bool any_cue = false;
                 for (u32 i = 0; i < cnt; ++i) {
-                    if (packet_vsharps[i].base_address != 0 &&
-                        VideoCore::DirectBuffers::IsTransientCueHeap(
-                            packet_vsharps[i].base_address, packet_vsharps[i].GetSize())) {
+                    const VAddr b_addr = packet_vsharps[i].base_address;
+                    if (b_addr != 0 &&
+                        ((b_addr >= cue_base && b_addr < cue_end) ||
+                         VideoCore::DirectBuffers::IsTransientCueHeap(
+                             b_addr, packet_vsharps[i].GetSize()))) {
                         any_cue = true;
                         break;
                     }
@@ -680,6 +711,7 @@ void Rasterizer::ResolveVertexBuffers(const GraphicsPipeline* pipeline,
                 slot.exact_gen = cur_exact_gen;
                 slot.frame_number = cur_frame;
                 slot.has_transient_cue = any_cue;
+                slot.resolved_direct_valid = false;
                 slot.pipeline = pipeline;
                 slot.step_rate_0 = step0;
                 slot.step_rate_1 = step1;
@@ -940,6 +972,10 @@ void Rasterizer::ResolveVertexBuffers(const GraphicsPipeline* pipeline,
         return std::min<u64>(cur_size, Common::AlignUp<u64>(needed, 64ULL));
     };
 
+    const bool dynamic_input = instance.IsVertexInputDynamicState();
+    bool all_ranges_clean_direct =
+        (memo_fill_slot && !memo_fill_slot->has_transient_cue && dynamic_input &&
+         ranges.size() <= 16);
     for (u32 r_idx = 0; r_idx < ranges.size(); ++r_idx) {
         auto& range = ranges[r_idx];
         u64 min_stream_span = 1;
@@ -959,18 +995,24 @@ void Rasterizer::ResolveVertexBuffers(const GraphicsPipeline* pipeline,
         const u64 raw_range_size = range.end - range.begin;
         u64 size = raw_range_size;
         bool is_direct_buf = false;
+        bool is_static_immutable = false;
         const bool is_transient_ring =
-            VideoCore::DirectBuffers::IsTransientCpuRingAddress(range.begin);
+            (memo_hit_slot && !memo_hit_slot->has_transient_cue) ||
+                    (memo_fill_slot && !memo_fill_slot->has_transient_cue)
+                ? VideoCore::DirectBuffers::IsTransientAuxCpuRing(range.begin, 1ULL)
+                : VideoCore::DirectBuffers::IsTransientCpuRingAddress(range.begin);
         if (!HasPendingHleCopies()) {
             u64 direct_size = raw_range_size;
             if (!is_transient_ring) {
                 std::tie(range.buffer, range.offset) =
-                    direct_buffers.TryResolveReadClamped(range.begin, direct_size);
+                    direct_buffers.TryResolveReadClamped(range.begin, direct_size,
+                                                         &is_static_immutable);
             }
             if (range.buffer && direct_size >= min_stream_span) {
                 size = direct_size;
                 is_direct_buf = true;
             } else {
+                is_static_immutable = false;
                 range.buffer = nullptr;
                 range.offset = 0;
                 size = VideoCore::DirectBuffers::ClampNativeGpuReadSize(
@@ -988,17 +1030,27 @@ void Rasterizer::ResolveVertexBuffers(const GraphicsPipeline* pipeline,
             u64 direct_size = size;
             if (!is_transient_ring) {
                 std::tie(range.buffer, range.offset) =
-                    direct_buffers.TryResolveReadClamped(range.begin, direct_size);
+                    direct_buffers.TryResolveReadClamped(range.begin, direct_size,
+                                                         &is_static_immutable);
             }
             if (range.buffer && direct_size >= min_stream_span) {
                 size = direct_size;
                 is_direct_buf = true;
             } else {
+                is_static_immutable = false;
                 range.buffer = nullptr;
                 range.offset = 0;
                 size = clamp_transient_draw_vb_size(range.begin, range.end, min_stream_span, size);
                 std::tie(range.buffer, range.offset) =
                     buffer_cache.ObtainBuffer(range.begin, size, false);
+            }
+        }
+        if (all_ranges_clean_direct) {
+            if (is_direct_buf && is_static_immutable && range.buffer &&
+                range.buffer != &buffer_cache.GetStreamBuffer() && !range.buffer->uav_written) {
+                memo_fill_slot->range_direct_buffers[r_idx] = range.buffer;
+            } else {
+                all_ranges_clean_direct = false;
             }
         }
         if (!is_direct_buf && InPlaceReads::Enabled()) {
@@ -1055,7 +1107,6 @@ void Rasterizer::ResolveVertexBuffers(const GraphicsPipeline* pipeline,
     }
 
     // Each stream at its offset in its range's buffer (null for streams without memory).
-    const bool dynamic_input = instance.IsVertexInputDynamicState();
     u32 stream_with_memory = 0;
     for (const auto& buffer : guest_buffers) {
         u64 host_size = 0;
@@ -1091,6 +1142,11 @@ void Rasterizer::ResolveVertexBuffers(const GraphicsPipeline* pipeline,
         }
     }
     v.num_buffers = static_cast<u32>(guest_buffers.size());
+    if (all_ranges_clean_direct && v.num_buffers == memo_fill_slot->count && v.num_buffers <= 16) {
+        std::copy_n(v.host_buffers.begin(), v.num_buffers, memo_fill_slot->host_buffers.begin());
+        std::copy_n(v.host_offsets.begin(), v.num_buffers, memo_fill_slot->host_offsets.begin());
+        memo_fill_slot->resolved_direct_valid = true;
+    }
 }
 
 void Rasterizer::BindIndexBuffer(u32 index_offset) {
@@ -1146,15 +1202,18 @@ void Rasterizer::ResolveIndexBuffer(u32 index_offset) {
         }
     }
     bool is_direct_buf = false;
+    bool is_static_immutable = false;
     u64 idx_size = size;
     const VideoCore::Buffer* buffer = nullptr;
     u64 offset = 0;
     if (!VideoCore::DirectBuffers::IsTransientCpuRingAddress(address)) {
-        std::tie(buffer, offset) = direct_buffers.TryResolveReadClamped(address, idx_size);
+        std::tie(buffer, offset) =
+            direct_buffers.TryResolveReadClamped(address, idx_size, &is_static_immutable);
     }
     if (buffer && idx_size >= size) {
         is_direct_buf = true;
     } else {
+        is_static_immutable = false;
         buffer = nullptr;
         offset = 0;
         std::tie(buffer, offset) = buffer_cache.ObtainBuffer(address, size, false);
@@ -1169,7 +1228,7 @@ void Rasterizer::ResolveIndexBuffer(u32 index_offset) {
         (is_direct_buf && buffer->uav_written)) {
         needs_barrier |= runtime.IsBufferAccessed(buffer, offset, size);
         bound_buffers.emplace_back(buffer, offset, size, false);
-    } else if (is_direct_buf) {
+    } else if (is_direct_buf && is_static_immutable) {
         auto& d = GetVtxIdxDedup();
         d.sched = &scheduler;
         d.ib_resolve_epoch = scheduler.DescriptorStateEpoch();
@@ -1434,14 +1493,25 @@ void Rasterizer::BindGuestBuffer(const Shader::BufferResource& desc, const Gcn::
     }
     static const bool n1_native_bufs =
         gx_direct_vk::EnabledNativeVk(gx_direct_vk::kN1_NativeBuffers);
+    VAddr cue_base = 0;
+    VAddr cue_end = 0;
+    VideoCore::DirectBuffers::GetTransientCueHeapBounds(cue_base, cue_end);
+    const bool in_cue = (address >= cue_base && address < cue_end);
     const bool can_try_direct_read =
-        !desc.is_written && !VideoCore::DirectBuffers::IsTransientCpuRingAddress(address) &&
+        !desc.is_written && !in_cue &&
+        !VideoCore::DirectBuffers::IsTransientAuxCpuRing(address, 1ULL) &&
         (!desc.is_formatted || (n1_native_bufs && !texture_cache.IsMeta(address)));
     bool is_direct_buf = false;
     const VideoCore::Buffer* buffer = nullptr;
     u64 offset = 0;
     u64 size = vsharp.GetSize();
-    if (can_try_direct_read && !HasPendingHleCopies()) {
+    if (in_cue && !desc.is_written && !desc.is_formatted && !HasPendingHleCopies()) [[likely]] {
+        const u64 raw_sz = vsharp.GetSize();
+        const u64 clamped_mem_size =
+            (address + raw_sz <= cue_end) ? raw_sz : memory->ClampRangeSize(address, raw_sz);
+        size = VideoCore::DirectBuffers::ClampTransientCueReadSize(address, clamped_mem_size);
+        std::tie(buffer, offset) = buffer_cache.ObtainBuffer(address, size, false, false);
+    } else if (can_try_direct_read && !HasPendingHleCopies()) {
         std::tie(buffer, offset) = direct_buffers.TryResolveReadClamped(address, size);
         is_direct_buf = (buffer != nullptr);
         if (!buffer) {

@@ -38,8 +38,8 @@ Most PS4 emulators and translation layers run *Bloodborne*'s rendering engine as
 
 | Platform | Status | How to Run |
 | :--- | :---: | :--- |
-| 🐧 **Linux (`x86_64`)** | **✅ Ready (`v1.1.0`)** | Extract the release archive next to `CUSA03173` and run **`./play.sh`** (or **`./launcher.sh`**) |
-| 🪟 **Windows (`x86_64`)** | **🚧 Next Milestone** | Native Windows x64 build & release archive in active preparation |
+| 🐧 **Linux (`x86_64`)** | **✅ Ready (`v1.1.0`)** | Extract `bloodborne-pc-vulkan-linux-x86_64-prebuilt.tar.gz` next to `CUSA03173` and run **`./play.sh`** (or **`./launcher.sh`**) |
+| 🪟 **Windows 10/11 (`x86_64`)** | **✅ Ready (`v1.1.0`)** | Extract `bloodborne-pc-vulkan-windows-x86_64-prebuilt.zip` next to `CUSA03173` and double-click **`Bloodborne.exe`** (or **`Launcher.exe`**) |
 
 ### Step-by-Step (No Git or Terminal Needed):
 1. Download **`bloodborne-pc-vulkan-linux-x86_64-prebuilt.tar.gz`** from **[Releases](https://github.com/lapothecary/bloodborne-pc-vulkan/releases/latest)**.
@@ -220,8 +220,8 @@ BB_GX_SKIP_MIN=0x22900a0 BB_GX_SKIP_MAX=0x2292000 ./play.sh
 
 | Платформа | Статус | Как запустить |
 | :--- | :---: | :--- |
-| 🐧 **Linux (`x86_64`)** | **✅ Готово (`v1.1.0`)** | Распаковать архив из Releases рядом с папкой `CUSA03173` и запустить **`./play.sh`** (или **`./launcher.sh`**) |
-| 🪟 **Windows (`x86_64`)** | **🚧 Следующий этап** | Нативный порт под Windows x64 (отдельный архив в Releases) в разработке |
+| 🐧 **Linux (`x86_64`)** | **✅ Готово (`v1.1.0`)** | Распаковать `bloodborne-pc-vulkan-linux-x86_64-prebuilt.tar.gz` рядом с `CUSA03173` и запустить **`./play.sh`** (или **`./launcher.sh`**) |
+| 🪟 **Windows 10/11 (`x86_64`)** | **✅ Готово (`v1.1.0`)** | Распаковать `bloodborne-pc-vulkan-windows-x86_64-prebuilt.zip` рядом с `CUSA03173` и запустить двойным кликом **`Bloodborne.exe`** (или **`Launcher.exe`**) |
 
 1. Скачайте готовый архив **`bloodborne-pc-vulkan-linux-x86_64-prebuilt.tar.gz`** из раздела **[Releases](https://github.com/lapothecary/bloodborne-pc-vulkan/releases/latest)**.
 2. Распакуйте его прямо рядом с вашей папкой **`CUSA03173`** (`v1.09` GOTY):

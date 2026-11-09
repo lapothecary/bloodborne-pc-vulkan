@@ -1153,8 +1153,11 @@ void Manager::OnGpuWrite(VAddr addr, u64 size) noexcept {
     RetireOverlapping(addr, size, /*clear_global_owned=*/true);
 }
 
-std::pair<const Buffer*, u64> Manager::TryResolveReadClamped(VAddr addr,
-                                                             u64& inout_size) noexcept {
+std::pair<const Buffer*, u64> Manager::TryResolveReadClamped(
+    VAddr addr, u64& inout_size, bool* out_static_immutable) noexcept {
+    if (out_static_immutable) {
+        *out_static_immutable = false;
+    }
     if (inout_size == 0 || addr >= kMaxGuestVa) {
         return {nullptr, 0};
     }
@@ -1190,6 +1193,12 @@ std::pair<const Buffer*, u64> Manager::TryResolveReadClamped(VAddr addr,
                     ? e.stream_override_buf
                     : (e.needs_zero_init && zero_buffer ? zero_buffer.get() : e.buffer.get());
             const u64 active_off = e.stream_override_buf ? e.stream_override_off : 0ULL;
+            if (out_static_immutable) {
+                *out_static_immutable =
+                    (e.usage_type == 1u && !e.stream_override_buf && !e.needs_zero_init &&
+                     !e.dirty_writeback && !e.noted_ext_gpu_mod && !e.gpu_written_without_shadow &&
+                     !e.zero_known);
+            }
             note_hit();
             return {active_buf, active_off + sub_off};
         }
@@ -1349,7 +1358,10 @@ std::pair<const Buffer*, u64> Manager::TryResolveWrite(VAddr addr, u64 size, boo
             Vulkan::DirectShaders::InvalidateRange(base, hit_entry->alloc_size);
         }
         const Buffer* dst_buf = hit_entry->buffer.get();
-        hit_entry->gpu_written_without_shadow = true;
+        if (!hit_entry->gpu_written_without_shadow) {
+            hit_entry->gpu_written_without_shadow = true;
+            ++erase_generation;
+        }
         hit_entry->has_cpu_shadow = false;
         hit_entry->zero_known = false;
         hit_entry->cpu_shadow.reset();
@@ -1562,6 +1574,7 @@ void Manager::StageNativeCpuCopyBatch(std::span<const NativeCopyRegion> regions,
             }
             if (!e.noted_ext_gpu_mod) {
                 e.noted_ext_gpu_mod = true;
+                ++erase_generation;
                 buf_cache.NoteExternalGpuModified(s.base_va, e.alloc_size);
                 Vulkan::DirectShaders::InvalidateRange(s.base_va, e.alloc_size);
             }

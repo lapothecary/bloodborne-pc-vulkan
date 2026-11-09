@@ -45,17 +45,18 @@ jobs:
             ### 🔥 What's New in `${{ github.ref_name || 'v1.1.0' }}`:
             - **Native Windows 10/11 `x86_64` Port (`Bloodborne.exe` + `Launcher.py` / `Launcher.exe` + `bb-probe.exe`)**:
               - All `2,940 / 2,940` decompiled C++20 engine functions (`102,597` LOC) compiled into a zero-relocation Windows `COFF64` library (`libbb_gx_engine_native.a`) with explicit `sysv_abi` ↔ Win64 `ms_abi` bridge and Windows TEB `gs:[0x1480 + 8*slot]` guest TLS.
-            - **Up to `651 Avg FPS (1.54 ms)` & `1.17 ms` Total Hardware GPU Render Time at `2560×1440` Native**:
-              - **`100% NatBuf` & `100% NatTex` (`0` Page Faults/s)**: `4 MiB` in-pass dynamic buffer renaming (`GXDynamicBufferRingOwner`), unified graphics push-descriptor `VkPipelineLayout` (`DscSav: 62%`), and dirty-gated `3×1025×1 R32F` gamma LUT uploads.
-              - **Physical-Core #0 `MOMainThread` Isolation + Zero-Runqueue-Stall `CCD0` Worker Pool (`bbport_threads.h`)**: Reaches `595–651 FPS` at `2560×1440` with CPU running at a cool **`4.48 GHz` (`57°C`, `57 W` PPT)** and **`2.27 GB` VRAM / `2.8 GB` RAM**.
-              - **All `109` Core Shaders Rewritten in Clean, Vectorized Vulkan 1.3 GLSL 460 (`0` `tXXX` register dumps)**: 4.8× smaller shader codebase (`12,478` lines), mathematically verified via `tools/verify_clean_glsl.py`, with genuine `gl_FrontFacing` and physical two-sided foliage subsurface translucency (`85%` backface transmission).
-            - **7 Anti-Aliasing Modes, Upscalers & Zero-Pass `RCAS` Sharpening**:
-              - Native **`DLAA 4 (Transformer Preset K)`** (saves `1.19 ms/frame` and `~4.8 GB` VRAM vs `Preset M`), **`DLAA 3 (CNN Fast Preset F)`**, **`SMAA T2x` (Morphological Ultra + 2x Motion-Vector Temporal Resolve)**, **`SMAA 1x Ultra` (`~0.16 ms`)**, `TAA`, `FXAA`, plus `DLSS 4.5 / 4`, `FSR 4`, and `FSR 3.1`.
-              - **Fused Zero-Pass `RCAS` Contrast-Adaptive Sharpening** inside `Presenter::EncodePass` (works with any AA mode or `Upscaler: Off` with zero extra passes).
-            - **High-FPS Physics, Controls & 10-Category Hardware GPU Profiler HUD**:
-              - **Havok Cloth Physics Stiffness Scaling above 30 FPS (`#58`)** + zero-save inline `HitPushBack` fast-path stub + high-FPS save play-time carry + HUD item-icon stencil mask fix.
-              - **Cutscene Video Skipping (`Enter / Esc / Options`)** & **Slow-Walk Key (`Left Alt`, `40%` speed for stealth backstabs)**.
-              - **10-Category Hardware GPU Render-Pass Breakdown (`F8` HUD)**: Real-time `vkCmdWriteTimestamp2` timing for `Shadow Maps`, `G-Buffer`, `SSAO`, `Deferred PBR`, `SSR`, `Forward Alpha`, `Compute/HLE`, `Yebis 2 Post-FX`, `AA/Upscaler`, and `Scaleform UI & Present`, plus active `CPU Work` vs `FPS Cap Sleep` and live `W / MHz / °C / VRAM` sensors.
+            - **Up to `666 Avg FPS (1.50 ms)` & `51.7%` Hardware Occlusion Culling at `2560×1440` Native**:
+              - **Expanded `SceneOcclusionCuller` & Direct-Inline `Stage A` (`2a..2d`) Memoization**: Covers instanced G-Buffer world shaders (`vs_6a833138`, `vs_ecbef4c7`), static building palettes, and 6-MRT cutout/foliage draws (skipping up to **`51.7%` / `415 draws/frame`** of occluded geometry in heavy multi-room portals), paired with `O(1)` static `DirectBuffers` vertex memoization (`ResolveVertexBuffers` `1.63 -> 0.91 ms`) and `cueHeap` constant-buffer fast paths (`3.0–3.2 µs/draw`).
+              - **`100% NatBuf` & `100% NatTex` (`0` Page Faults/s)**: `4 MiB` in-pass dynamic buffer renaming (`GXDynamicBufferRingOwner`), unified graphics push-descriptor `VkPipelineLayout` (`DscSav: 62%`), single-view private guest memory (`MAP_PRIVATE` / `VirtualAlloc2` `MEM_PRIVATE`), and dirty-gated `3×1025×1 R32F` gamma LUT uploads.
+              - **Physical-Core #0 `MOMainThread` Isolation + Multi-CCD Worker Pool (`bbport_threads.h` / `posix_win32.cpp`)**: Reaches `154–170 FPS` in the heaviest multi-shadow indoor portals and `600–666+ FPS` in lighter areas at `2560×1440`.
+              - **All `111` Core Shaders (`109` Unique Files) Rewritten in Clean, Vectorized Vulkan 1.3 GLSL 460 (`0` `tXXX` register dumps)**: Mathematically verified via `tools/verify_clean_glsl.py`, with genuine `gl_FrontFacing`, physical two-sided foliage subsurface translucency (`85%` backface transmission), exact quotient-rule CSM contact-shadow gradient in `ps_f55643de.frag` (fixing the Cascade 0/1 road seam), Lagarde `Specular AO`, Jimenez IGN volumetric godray dithering, and VSM Chebyshev light-bleeding suppression.
+            - **7 Anti-Aliasing Modes, Upscalers, 3-State Window Mode & Zero-Pass `RCAS` Sharpening**:
+              - Native **`DLAA 4 (Transformer Preset K)`**, **`DLAA 3 (CNN Fast Preset F)`**, **`SMAA T2x` (Morphological Ultra + 2x Motion-Vector Temporal Resolve)**, **`SMAA 1x Ultra` (`~0.16 ms`)**, `TAA`, `FXAA`, plus `DLSS 4.5 / 4`, `FSR 4`, and `FSR 3.1`.
+              - **3-State Window Mode (`Fullscreen` / `Borderless Windowed` / `Windowed` + `Alt+Enter`)** & **Fused Zero-Pass `RCAS` Contrast-Adaptive Sharpening** inside `Presenter::EncodePass`.
+            - **High-FPS Foliage/Cloth Physics, Controls & 21-Subpass X-Ray GPU/CPU Profiler HUD (`F8` / `F9`)**:
+              - **Frame-Rate-Independent FLVER Foliage & Flower Sway (`HookFoliageSway` at `0x2313870`)** + **Havok Cloth Physics Stiffness Scaling above 30 FPS (`#58`)** + high-FPS `Mv_AudioPlayThread` startup handshake + save play-time carry + HUD item-icon stencil mask fix.
+              - **Automatic Split Base + Update Folder Support (`CUSAxxxxx` + `CUSAxxxxx-patch`)**, **Cutscene Video Skipping (`Enter / Esc / Options`)**, & **Slow-Walk Key (`Left Alt`, `40%` speed)**.
+              - **10-Category / 21-Subpass Hardware GPU & CPU X-Ray Breakdown (`F8` / `F9` HUD)**: Real-time `vkCmdWriteTimestamp2` timing for `Shadow Maps`, `G-Buffer`, `SSAO`, `Deferred PBR`, `SSR`, `Forward Alpha`, `Compute/HLE`, `Yebis 2 Post-FX`, `AA/Upscaler`, and `Scaleform UI & Present`, plus `CPU 2a..2e` Stage A breakdown and live `W / MHz / °C / VRAM` sensors.
           files: |
             bloodborne-pc-vulkan-linux-x86_64-prebuilt.tar.gz
             bloodborne-pc-vulkan-linux-x86_64-prebuilt.tar.gz.sha256
@@ -107,7 +108,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: build_win32_gpu
-          key: win32-gpu-build-${{ hashFiles('gpu/CMakeLists.txt', 'gpu/shim/**', 'gpu/platform/**', 'gpu/render/**', 'gpu/memory/**', 'gpu/shaders/**') }}
+          key: win32-gpu-build-${{ hashFiles('gpu/CMakeLists.txt', 'gpu/shim/**', 'gpu/platform/**', 'gpu/render/**', 'gpu/buffers/**', 'gpu/cp/**', 'gpu/shader/backend/spirv/**') }}
           restore-keys: |
             win32-gpu-build-
 
@@ -120,7 +121,8 @@ jobs:
           fi
           if [ -f build_win32_gpu/build.ninja ]; then
             find build_win32_gpu -type f \( -name "*.obj" -o -name "*.a" -o -name "*.spv" -o -name "*.h" \) -exec touch {} +
-            rm -f build_win32_gpu/CMakeFiles/bbgpu.dir/shim/*.obj build_win32_gpu/CMakeFiles/bbgpu.dir/platform/win32/*.obj build_win32_gpu/CMakeFiles/bbgpu.dir/platform/avplayer/player.cpp.obj build_win32_gpu/CMakeFiles/bbgpu.dir/platform/videoout/frame_stats.cpp.obj build_win32_gpu/CMakeFiles/bbgpu.dir/render/rasterizer.cpp.obj build_win32_gpu/CMakeFiles/bbgpu.dir/render/vk_breadcrumbs.cpp.obj build_win32_gpu/CMakeFiles/bbgpu.dir/render/vk_gpu_profiler.cpp.obj build_win32_gpu/CMakeFiles/bbgpu.dir/upscale/vk_temporal_upscaler.cpp.obj build_win32_gpu/CMakeFiles/bb-probe.dir/*.obj build_win32_gpu/CMakeFiles/bb-probe.dir/*/*.obj build_win32_gpu/bb-probe.exe build_win32_gpu/libbbgpu.dll
+            rm -f build_win32_gpu/include/bbgpu/shaders/ps_0ef50047_pbr_frag.h build_win32_gpu/include/bbgpu/shaders/ps_3fe9e964_frag.h build_win32_gpu/include/bbgpu/shaders/ps_6b42fc89_frag.h build_win32_gpu/include/bbgpu/shaders/ps_a22c7f71_pbr_frag.h build_win32_gpu/include/bbgpu/shaders/ps_d92266b9_pbr_frag.h build_win32_gpu/include/bbgpu/shaders/ps_e55e45eb_frag.h build_win32_gpu/include/bbgpu/shaders/ps_e96447c3_pbr_frag.h build_win32_gpu/include/bbgpu/shaders/ps_f55643de_frag.h
+            rm -f build_win32_gpu/CMakeFiles/bbgpu.dir/shim/*.obj build_win32_gpu/CMakeFiles/bbgpu.dir/platform/win32/*.obj build_win32_gpu/CMakeFiles/bbgpu.dir/platform/avplayer/player.cpp.obj build_win32_gpu/CMakeFiles/bbgpu.dir/platform/videoout/frame_stats.cpp.obj build_win32_gpu/CMakeFiles/bbgpu.dir/buffers/*.obj build_win32_gpu/CMakeFiles/bbgpu.dir/render/*.obj build_win32_gpu/CMakeFiles/bbgpu.dir/cp/*.obj build_win32_gpu/CMakeFiles/bbgpu.dir/shader/backend/spirv/native_shaders.cpp.obj build_win32_gpu/CMakeFiles/bbgpu.dir/upscale/vk_temporal_upscaler.cpp.obj build_win32_gpu/CMakeFiles/bb-probe.dir/*.obj build_win32_gpu/CMakeFiles/bb-probe.dir/*/*.obj build_win32_gpu/bb-probe.exe build_win32_gpu/libbbgpu.dll
           else
             if ! cmake -S gpu -B build_win32_gpu -G Ninja \
               -DCMAKE_BUILD_TYPE=RelWithDebInfo \

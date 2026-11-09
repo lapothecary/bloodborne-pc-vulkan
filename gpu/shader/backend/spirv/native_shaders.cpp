@@ -594,9 +594,21 @@ u32 NativeShadersMaxIdx() noexcept {
     return max_idx;
 }
 
+u32 NativeShadersSkipMinIdx() noexcept {
+    static const u32 skip_min = ParseEnvU32("BB_NATIVE_SHADER_SKIP_MIN", 0xFFFFFFFFu);
+    return skip_min;
+}
+
+u32 NativeShadersSkipMaxIdx() noexcept {
+    static const u32 skip_max = ParseEnvU32("BB_NATIVE_SHADER_SKIP_MAX", 0xFFFFFFFFu);
+    return skip_max;
+}
+
 bool NativeShadersCustomRange() noexcept {
     return NativeShadersMinIdx() != 0u ||
-           NativeShadersMaxIdx() + 1u < static_cast<u32>(kNativeRegistry.size());
+           NativeShadersMaxIdx() + 1u < static_cast<u32>(kNativeRegistry.size()) ||
+           NativeShadersSkipMinIdx() != 0xFFFFFFFFu ||
+           NativeShadersSkipMaxIdx() != 0xFFFFFFFFu;
 }
 
 bool TryReplaceWithNativeShader(u64 pgm_hash, const std::vector<u32>& ref_spv,
@@ -611,10 +623,20 @@ bool TryReplaceWithNativeShader(u64 pgm_hash, const std::vector<u32>& ref_spv,
     if (min_i >= max_i) {
         return false;
     }
+    const u32 skip_min = NativeShadersSkipMinIdx();
+    const u32 skip_max = NativeShadersSkipMaxIdx();
+    const auto is_skipped = [skip_min, skip_max](size_t idx) noexcept -> bool {
+        if (skip_min == 0xFFFFFFFFu && skip_max == 0xFFFFFFFFu) {
+            return false;
+        }
+        const u32 lo = (skip_min == 0xFFFFFFFFu) ? 0u : skip_min;
+        const u32 hi = (skip_max == 0xFFFFFFFFu) ? lo : skip_max;
+        return static_cast<u32>(idx) >= lo && static_cast<u32>(idx) <= hi;
+    };
 
     bool any_hash_match = false;
     for (size_t idx = min_i; idx < max_i; ++idx) {
-        if (kNativeRegistry[idx].pgm_hash == pgm_hash) {
+        if (!is_skipped(idx) && kNativeRegistry[idx].pgm_hash == pgm_hash) {
             any_hash_match = true;
             break;
         }
@@ -632,6 +654,9 @@ bool TryReplaceWithNativeShader(u64 pgm_hash, const std::vector<u32>& ref_spv,
     }
 
     for (size_t idx = min_i; idx < max_i; ++idx) {
+        if (is_skipped(idx)) {
+            continue;
+        }
         const auto& entry = kNativeRegistry[idx];
         if (entry.pgm_hash != pgm_hash) {
             continue;

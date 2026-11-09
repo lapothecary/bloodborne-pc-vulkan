@@ -90,7 +90,14 @@ void main() {
     vec3 spec_sq = tex_spec.xyz * tex_spec.xyz;
     float gloss_sq = tex_gloss.x * tex_gloss.x;
     vec3 spec_fresnel = spec_sq + ((-spec_sq * fresnel + fresnel) * gloss_sq);
-    vec3 spec_out = ao_factor * (tex_ssr.w * (spec_fresnel * tex_ssr.xyz - tex_env.xyz) + tex_env.xyz);
+    vec3 spec_ao_factor = ao_factor;
+    if (((push_data.buf_offsets2.y >> 24u) & 0x01u) != 0u) {
+        // Lagarde / Frostbite Specular Micro-Occlusion: suppresses glowing grazing specular inside crevices
+        float raw_ao = clamp(tex_ao.x * tex_ao.y, 0.0, 1.0);
+        float spec_ao = clamp(pow(NdotV + raw_ao, exp2(-16.0 * (1.0 - tex_gloss.x) - 1.0)) - 1.0 + raw_ao, 0.0, 1.0);
+        spec_ao_factor *= mix(1.0, spec_ao / max(raw_ao, 1e-4), 0.85);
+    }
+    vec3 spec_out = spec_ao_factor * (tex_ssr.w * (spec_fresnel * tex_ssr.xyz - tex_env.xyz) + tex_env.xyz);
 
     frag_color1 = vec4(spec_out, 1.0);
     frag_color0 = vec4(tex_diff.xyz * ao_factor, 1.0);

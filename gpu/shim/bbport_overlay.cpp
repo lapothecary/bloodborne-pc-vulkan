@@ -1953,7 +1953,8 @@ void UpdateHudBreakdown(HudBreakdown& h) {
         }
         h.bottleneck_ru = h.bottleneck_en;
     } else {
-        if (h.gnm_wait_ms >= 1.50f && h.b_busy_pct < 78.0f && h.gpu_present_ms < 0.50f) {
+        if (h.gnm_wait_ms >= 1.50f && stage_a_work_ms < h.frame_ms * 0.78f &&
+            h.b_busy_pct < 78.0f && h.gpu_present_ms < 0.50f) {
             h.bottleneck_kind = 4;
             h.bottleneck_ms = h.gnm_wait_ms;
             h.avg_bottleneck_ms = h.avg_gnm_wait_ms;

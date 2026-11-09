@@ -46,7 +46,7 @@ std::string OptBinaryName(u64 pgm_hash, size_t perm_idx) {
     const char* prefix = "opt1";
     if (hw_interp) {
         if (fast_fp) {
-            prefix = native_sh ? "opt26" : "opt6_nonat";
+            prefix = native_sh ? "opt29" : "opt6_nonat";
         } else {
             prefix = "opt3_strict";
         }
@@ -65,7 +65,7 @@ const char* DriverCacheBlobName() noexcept {
     const bool native_sh = Shader::Backend::SPIRV::NativeShadersEnabled();
     if (hw_interp) {
         if (fast_fp) {
-            return native_sh ? "vk_driver_cache_opt26" : "vk_driver_cache_opt6_nonat";
+            return native_sh ? "vk_driver_cache_opt29" : "vk_driver_cache_opt6_nonat";
         }
         return "vk_driver_cache_opt3_strict";
     }
@@ -146,7 +146,7 @@ void SaveShaderBinary(std::vector<u32>&& spv, u64 pgm_hash, size_t perm_idx) {
 }
 
 void SaveOptShaderBinary(std::vector<u32>&& spv, u64 pgm_hash, size_t perm_idx) {
-    if (!Store().IsOpened()) {
+    if (!Store().IsOpened() || Shader::Backend::SPIRV::NativeShadersCustomRange()) {
         return;
     }
     Store().Save(BbCache::BlobType::ShaderBinary, OptBinaryName(pgm_hash, perm_idx),
