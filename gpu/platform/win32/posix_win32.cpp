@@ -392,6 +392,8 @@ struct Win32TopologyMasks {
     DWORD_PTR helper = 0;
 };
 
+const DWORD g_main_thread_id = GetCurrentThreadId();
+
 const Win32TopologyMasks& GetWin32Topology() {
     static const Win32TopologyMasks topo = [] {
         Win32TopologyMasks res{};
@@ -416,6 +418,8 @@ const Win32TopologyMasks& GetWin32Topology() {
             int domain = 0;
         };
         std::vector<PhysCore> cores;
+        int min_eff = 9999;
+        int max_eff = 0;
 
         DWORD len = 0;
         GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &len);
@@ -434,15 +438,18 @@ const Win32TopologyMasks& GetWin32Topology() {
                         const DWORD_PTR m = info->Processor.GroupMask[0].Mask & proc_mask;
                         if (m != 0) {
                             const DWORD_PTR prim = m & (~m + 1);
-                            cores.push_back(PhysCore{m, prim, m & ~prim,
-                                                     int(info->Processor.EfficiencyClass), 0});
+                            const int eff = int(info->Processor.EfficiencyClass);
+                            min_eff = std::min(min_eff, eff);
+                            max_eff = std::max(max_eff, eff);
+                            cores.push_back(PhysCore{m, prim, m & ~prim, eff, 0});
                         }
                     }
                     ptr += info->Size;
                 }
             }
         }
-        if (cores.size() < 4) {
+        if (cores.size() < 6) {
+            // Compact CPU (< 6 physical cores, e.g. 4c/8t): keep all cores shared and rely on priorities.
             return res;
         }
 
@@ -500,59 +507,114 @@ const Win32TopologyMasks& GetWin32Topology() {
             }
         }
 
-        // Sort domains by (max_eff DESC, size_bytes DESC, phys_count DESC) so CCD0 / V-Cache / P-cores come first
+        // Sort domains by (size_bytes DESC, max_eff DESC, phys_count DESC) so 3D V-Cache / CCD0 / P-cores come first.
         std::vector<int> dom_order(domains.size());
         for (size_t i = 0; i < domains.size(); ++i) {
             dom_order[i] = int(i);
         }
         std::sort(dom_order.begin(), dom_order.end(), [&](int a, int b) {
-            if (domains[a].max_eff != domains[b].max_eff)
-                return domains[a].max_eff > domains[b].max_eff;
             if (domains[a].size_bytes != domains[b].size_bytes)
                 return domains[a].size_bytes > domains[b].size_bytes;
+            if (domains[a].max_eff != domains[b].max_eff)
+                return domains[a].max_eff > domains[b].max_eff;
             return domains[a].phys_count > domains[b].phys_count;
         });
 
-        const int dom0 = dom_order[0];
-        if (domains.size() >= 2 && domains[dom0].phys_count >= 6) {
-            // Dual-CCD / Hybrid (e.g. Ryzen 9 5900X / 5950X / 7950X / 9950X or Intel P+E):
-            // CCD0: Core 0 primary -> MOMainThread; Cores 1..N-1 primary -> Game Workers;
-            // CCD1+: GPU recording & submission + background helpers.
-            bool first = true;
-            DWORD_PTR dom0_smt = 0;
-            for (const auto& c : cores) {
-                if (c.domain == dom0) {
-                    if (first) {
-                        res.game_main = c.primary;
-                        first = false;
-                    } else {
-                        res.game_workers |= c.primary;
-                        dom0_smt |= c.smt;
-                    }
-                } else {
-                    res.gpu |= c.mask;
-                    res.helper |= (c.smt != 0 ? c.smt : c.mask);
+        int game_dom = dom_order[0];
+        if (domains.size() >= 2) {
+            // CASE 1: Multi-CCD / Multi-L3-Domain CPU (e.g. Ryzen 9 5900X/5950X/7900X/7950X/7950X3D/9950X/9950X3D).
+            // - Primary L3 domain (CCD0 / 3D V-Cache):
+            //   * Main game thread (`main`) gets Core 0 primary (with its SMT sibling left idle).
+            //   * All remaining physical + SMT threads in CCD0 (`c.mask`, 14 threads on 8-core CCD0)
+            //     run Havok, CSChr, CSCloth, SpCloth, FD4Job, GXRenderThread, and GXWorker* inside
+            //     the exact same L3 cache with zero Infinity Fabric crossings.
+            // - Secondary L3 domain(s) (CCD1+): Host Vulkan RHI (`bb:GpuComm`, `bb:VkRecorder*`,
+            //   `bb:Present`) + background streaming/decompression/audio helpers (`EzWorkPool*`,
+            //   `Core.Res.*`, `FMOD*`).
+            int gpu_dom = -1;
+            if (env_ccd && env_ccd[0] >= '0' && env_ccd[0] <= '9') {
+                gpu_dom = std::clamp(std::atoi(env_ccd), 0, int(domains.size()) - 1);
+                if (gpu_dom == game_dom) {
+                    game_dom = (gpu_dom == dom_order[0]) ? dom_order[1] : dom_order[0];
                 }
+            }
+
+            size_t best_idx = size_t(-1);
+            for (size_t i = 0; i < cores.size(); ++i) {
+                if (cores[i].domain == game_dom &&
+                    (best_idx == size_t(-1) || cores[i].eff_class > cores[best_idx].eff_class)) {
+                    best_idx = i;
+                }
+            }
+            for (size_t i = 0; i < cores.size(); ++i) {
+                const auto& c = cores[i];
+                if (c.domain == game_dom) {
+                    if (domains[game_dom].phys_count >= 6 && i == best_idx) {
+                        res.game_main = c.primary; // c.smt intentionally left idle
+                    } else {
+                        res.game_workers |= c.mask;
+                    }
+                } else if (gpu_dom < 0 || c.domain == gpu_dom) {
+                    res.gpu |= c.mask;
+                    res.helper |= c.mask;
+                }
+            }
+            if (res.game_main == 0) {
+                res.game_main = domains[game_dom].mask;
+                res.game_workers = domains[game_dom].mask;
+            }
+            if (res.gpu == 0) {
+                res.gpu = res.game_workers;
             }
             if (res.helper == 0) {
-                res.helper = (dom0_smt != 0) ? dom0_smt : res.gpu;
+                res.helper = res.gpu;
             }
         } else {
-            // Single-CCD (e.g. 6c/8c Ryzen 5/7, X3D, Intel):
-            // Core 0 primary -> MOMainThread; ~65% cores -> Game Workers; remaining cores -> GPU.
-            const size_t n = cores.size();
-            const size_t split = std::max<size_t>(2, (n * 2) / 3);
-            res.game_main = cores[0].primary;
-            DWORD_PTR all_smt = 0;
-            for (size_t i = 1; i < n; ++i) {
-                all_smt |= cores[i].smt;
-                if (i < split) {
-                    res.game_workers |= (n >= 8 ? cores[i].primary : cores[i].mask);
-                } else {
-                    res.gpu |= cores[i].mask;
+            // Single L3 domain: check Intel Hybrid P+E (`max_eff > min_eff`) vs Homogeneous (`>= 6` cores).
+            DWORD_PTR p_mask = 0, e_mask = 0;
+            size_t p_phys = 0;
+            size_t best_p = size_t(-1);
+            if (max_eff > min_eff) {
+                for (size_t i = 0; i < cores.size(); ++i) {
+                    if (cores[i].eff_class == max_eff) {
+                        p_mask |= cores[i].mask;
+                        if (best_p == size_t(-1)) {
+                            best_p = i;
+                        }
+                        ++p_phys;
+                    } else {
+                        e_mask |= cores[i].mask;
+                    }
                 }
             }
-            res.helper = (all_smt != 0) ? all_smt : res.gpu;
+
+            if (p_phys >= 4 && e_mask != 0) {
+                // CASE 2: Single-L3 Hybrid P-Core + E-Core (Intel 12th-15th Gen).
+                // Main + Game Workers + Vulkan RHI stay strictly on P-cores; Helpers/IO/Audio run on E-cores.
+                if (p_phys >= 6 && best_p != size_t(-1)) {
+                    res.game_main = cores[best_p].primary; // SMT sibling left idle
+                    for (size_t i = 0; i < cores.size(); ++i) {
+                        if (cores[i].eff_class == max_eff && i != best_p) {
+                            res.game_workers |= cores[i].mask;
+                        }
+                    }
+                } else {
+                    res.game_main = p_mask;
+                    res.game_workers = p_mask;
+                }
+                res.gpu = res.game_workers;
+                res.helper = e_mask;
+            } else {
+                // CASE 3: Single-L3 Homogeneous CPU with >= 6 Physical Cores
+                // (e.g. Ryzen 5 5600X/7600X, Ryzen 7 5800X3D/7800X3D/9800X3D, Intel 6c/8c).
+                // Core 0 primary -> Main game thread (SMT sibling idle); all remaining cores -> Workers & GPU.
+                res.game_main = cores[0].primary;
+                for (size_t i = 1; i < cores.size(); ++i) {
+                    res.game_workers |= cores[i].mask;
+                }
+                res.gpu = res.game_workers;
+                res.helper = res.game_workers;
+            }
         }
 
         std::printf("GPU: Win32 thread topology: %zu physical cores across %zu L3 domains "
@@ -581,11 +643,18 @@ void ApplyWin32ThreadTopologyByName(const char* name) {
     };
     DWORD_PTR mask = 0;
     bool boost = false;
-    if (std::strcmp(name, "MOMainThread") == 0) {
+    if (std::strcmp(name, "main") == 0) {
         mask = topo.game_main;
         boost = true;
     } else if (starts_with(name, "HavokWorker") ||
+               starts_with(name, "CSChrThread") ||
+               starts_with(name, "CSClothThread") ||
+               starts_with(name, "SpClothVertex") ||
+               starts_with(name, "FD4JobWorker") ||
                starts_with(name, "GXRenderThread") ||
+               starts_with(name, "GXWorker") ||
+               starts_with(name, "Battle Worker") ||
+               starts_with(name, "CS Filtering") ||
                starts_with(name, "MorphemeWorker") ||
                starts_with(name, "EzTaskRunner") ||
                starts_with(name, "FD4TaskRunner")) {
@@ -601,6 +670,14 @@ void ApplyWin32ThreadTopologyByName(const char* name) {
         boost = true;
     } else if (starts_with(name, "bb:") ||
                starts_with(name, "bb-probe:") ||
+               std::strcmp(name, "MOMainThread") == 0 ||
+               starts_with(name, "MO Update") ||
+               starts_with(name, "Mv_") ||
+               starts_with(name, "CSChrBackInit") ||
+               starts_with(name, "NexusRevolution") ||
+               starts_with(name, "FrpgSaveLoad") ||
+               starts_with(name, "DLUserPreferenc") ||
+               starts_with(name, "Core.Logging") ||
                starts_with(name, "EzWorkPool") ||
                starts_with(name, "Core.Res.") ||
                starts_with(name, "FMOD") ||
@@ -767,7 +844,19 @@ void bb_win32_pin_helper_domain(void) {
 }
 
 void bb_win32_apply_thread_topology(void) {
-    (void)GetWin32Topology();
+    const auto& topo = GetWin32Topology();
+    if (topo.game_main == 0) {
+        return;
+    }
+    static std::atomic<bool> main_pinned{false};
+    if (!main_pinned.exchange(true, std::memory_order_relaxed)) {
+        if (HANDLE h = OpenThread(THREAD_SET_INFORMATION | THREAD_QUERY_INFORMATION, FALSE,
+                                  g_main_thread_id)) {
+            SetThreadAffinityMask(h, topo.game_main);
+            SetThreadPriority(h, THREAD_PRIORITY_ABOVE_NORMAL);
+            CloseHandle(h);
+        }
+    }
 }
 
 int backtrace(void** buffer, int size) {

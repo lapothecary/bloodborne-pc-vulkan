@@ -36,6 +36,13 @@ constexpr NvStatus Ok = 0, SettingNotFound = -160, ProfileNotFound = -163,
                    ExecutableNotFound = -166;
 constexpr std::uint32_t PreferredPstateId = 0x1057EB71;
 constexpr std::uint32_t PreferMax = 1;
+// OGL_CPL_PREFER_DXPRESENT_ID ("Vulkan/OpenGL present method"):
+// 1 = OGL_CPL_PREFER_DXPRESENT_PREFER_ENABLED ("Prefer layered on DXGI Swapchain"), which enables
+// DirectFlip / Independent Flip / G-Sync in Borderless & Fullscreen, eliminates legacy WDDM blit
+// (`dwm.exe` 60%+ GPU composition overhead & 3.8 ms PresentSync), and reports accurate GPU 3D
+// utilization on `bb-probe.exe` in Windows Task Manager.
+constexpr std::uint32_t PreferDxPresentId = 0x20D690F8;
+constexpr std::uint32_t PreferDxPresentEnabled = 1;
 constexpr int StringMax = 2048;
 using UnicodeString = std::uint16_t[StringMax];
 
@@ -135,7 +142,9 @@ struct Api {
 } // namespace
 
 void Apply() {
-    if (bb_env_off("BB_NV_POWER")) {
+    const bool want_power = !bb_env_off("BB_NV_POWER");
+    const bool want_dxgi = !bb_env_off("BB_NV_DXGI_SWAPCHAIN");
+    if (!want_power && !want_dxgi) {
         return;
     }
     Api api{};
@@ -199,38 +208,58 @@ void Apply() {
     }
 
     auto setting = std::make_unique<Setting>();
-    std::memset(setting.get(), 0, sizeof(Setting));
-    setting->version = Version<Setting>(1);
-    status = api.get_setting(session, profile, PreferredPstateId, setting.get());
-    const bool user_set = status == Ok && setting->location == 0 && !setting->is_current_predefined;
-    if (status == Ok && setting->current.u32 == PreferMax) {
-        std::printf("NVIDIA profile: power management already prefers maximum performance\n");
-        return done(nullptr, 0);
+    bool changed = false;
+
+    const auto apply_dword = [&](std::uint32_t id, std::uint32_t target, std::uint32_t fallback_was,
+                                 const char* label, const char* target_desc, const char* env_name) {
+        std::memset(setting.get(), 0, sizeof(Setting));
+        setting->version = Version<Setting>(1);
+        NvStatus st = api.get_setting(session, profile, id, setting.get());
+        const bool user_set = st == Ok && setting->location == 0 && !setting->is_current_predefined;
+        if (st == Ok && setting->current.u32 == target) {
+            std::printf("NVIDIA profile: %s already %s\n", label, target_desc);
+            return;
+        }
+        if (user_set) {
+            std::printf("NVIDIA profile: %s mode %u chosen by the user for %ls, kept\n", label,
+                        setting->current.u32, exe);
+            return;
+        }
+        if (st != Ok && st != SettingNotFound) {
+            std::printf("NVIDIA profile: could not read %s (NVAPI status %d)\n", label, st);
+            return;
+        }
+        const std::uint32_t was = st == Ok ? setting->current.u32 : fallback_was;
+        std::memset(setting.get(), 0, sizeof(Setting));
+        setting->version = Version<Setting>(1);
+        setting->id = id;
+        setting->type = 0;
+        setting->current.u32 = target;
+        st = api.set_setting(session, profile, setting.get());
+        if (st != Ok) {
+            std::printf("NVIDIA profile: could not set %s (NVAPI status %d)\n", label, st);
+            return;
+        }
+        changed = true;
+        std::printf("NVIDIA profile: %s for %ls: mode %u -> %s (%s=0: leave it)\n", label, exe, was,
+                    target_desc, env_name);
+    };
+
+    if (want_power) {
+        apply_dword(PreferredPstateId, PreferMax, 5u, "power management",
+                    "prefer maximum performance", "BB_NV_POWER");
     }
-    if (user_set) {
-        std::printf("NVIDIA profile: power management mode %u chosen by the user for %ls, kept\n",
-                    setting->current.u32, exe);
-        return done(nullptr, 0);
+    if (want_dxgi) {
+        apply_dword(PreferDxPresentId, PreferDxPresentEnabled, 2u, "Vulkan/OpenGL present method",
+                    "prefer layered on DXGI Swapchain", "BB_NV_DXGI_SWAPCHAIN");
     }
-    if (status != Ok && status != SettingNotFound) {
-        return done("could not read the power management mode", status);
-    }
-    const std::uint32_t was = status == Ok ? setting->current.u32 : 5;
-    std::memset(setting.get(), 0, sizeof(Setting));
-    setting->version = Version<Setting>(1);
-    setting->id = PreferredPstateId;
-    setting->type = 0;
-    setting->current.u32 = PreferMax;
-    status = api.set_setting(session, profile, setting.get());
-    if (status == Ok) {
+
+    if (changed) {
         status = api.save_settings(session);
+        if (status != Ok) {
+            return done("could not save driver profile settings", status);
+        }
     }
-    if (status != Ok) {
-        return done("could not set prefer maximum performance", status);
-    }
-    std::printf("NVIDIA profile: power management for %ls: mode %u -> prefer maximum performance "
-                "(BB_NV_POWER=0: leave it)\n",
-                exe, was);
     done(nullptr, 0);
 }
 

@@ -215,9 +215,12 @@ void Set(Values& v, const std::string& key, const std::string& value) {
         v.live_resolution = value == "auto" ? -1 : std::clamp(i, 0, 1);
     } else if (key == "output_res") {
         int w = 0, h = 0;
-        if (std::sscanf(value.c_str(), "%dx%d", &w, &h) == 2 && w >= 320 && h >= 200 && w <= 16384 &&
-            h <= 16384) {
+        if (value == "auto") {
+            v.output_res_auto = true;
+        } else if (std::sscanf(value.c_str(), "%dx%d", &w, &h) == 2 && w >= 320 && h >= 200 && w <= 16384 &&
+                   h <= 16384) {
             v.output_res = PackSize({w, h});
+            v.output_res_auto = false;
         }
     } else if (key == "aspect_ratio") {
         v.aspect = AspectAuto;
@@ -483,7 +486,19 @@ void SetMonitor(int width, int height) {
     if (width <= 0 || height <= 0 || m == Monitor()) return;
     monitor.store(PackSize(m), std::memory_order_relaxed);
     auto& v = Get();
-    // Auto follows the monitor: its output is kept (and saved: run.sh's startup patch reads it).
+    if (v.output_res_auto.load(std::memory_order_relaxed)) {
+        const OutputSize target =
+            (FixedRenderSession() && v.startup_output.width > 0 && v.startup_output.height > 0)
+                ? v.startup_output
+                : m;
+        if (v.output_res.load() != PackSize(target)) {
+            std::printf("Output: %dx%d for the monitor (output_res=auto)\n", target.width,
+                        target.height);
+            v.output_res = PackSize(target);
+        }
+        return;
+    }
+    // Auto aspect ratio follows the monitor's aspect group.
     const OutputSize fitted = CurrentOutput();
     if (v.aspect == AspectAuto && PackSize(fitted) != v.output_res.load()) {
         std::printf("Output: %s for the monitor (%dx%d, aspect ratio auto)\n", SizeText(fitted).c_str(),
@@ -595,6 +610,15 @@ void Load() {
         const char* output = std::getenv("BB_OUTPUT_RES");
         if (output && std::sscanf(output, "%dx%d", &w, &h) == 2) v.startup_output = {w, h};
     }
+    if (v.output_res_auto.load()) {
+        int mw = 0, mh = 0;
+        const char* mon = std::getenv("BB_OUTPUT_RES");
+        if (!mon || !mon[0]) mon = std::getenv("BB_MONITOR_SIZE");
+        if (mon && std::sscanf(mon, "%dx%d", &mw, &mh) == 2 && mw >= 320 && mh >= 200 &&
+            mw <= 16384 && mh <= 16384) {
+            v.output_res = PackSize({mw, mh});
+        }
+    }
     v.startup_live_resolution = v.live_resolution;
 }
 
@@ -696,7 +720,7 @@ void Save() {
     }
     put("model_lod", std::to_string(v.model_lod.load()));
     put("aspect_ratio", AspectKey(v.aspect));
-    put("output_res", SizeText(CurrentOutput()));
+    put("output_res", v.output_res_auto.load() ? std::string("auto") : SizeText(CurrentOutput()));
     put("window_mode", WindowModeName(v.window_mode.load()));
     put("fullscreen", v.window_mode.load() == WindowModeWindowed ? "0" : "1");
     // Read by run.sh at start.

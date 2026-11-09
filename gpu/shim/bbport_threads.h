@@ -583,7 +583,7 @@ inline void ApplyProcessThreadTopology() {
         const cpu_set_t* target_mask = nullptr;
         bool boost_prio = false;
 
-        if (is_main_tid || std::strcmp(comm, "MOMainThread") == 0) {
+        if (is_main_tid) {
             target_mask = &topo.game_main;
             boost_prio = true;
         } else if (starts_with(comm, "HavokWorker") ||
@@ -594,8 +594,7 @@ inline void ApplyProcessThreadTopology() {
                    starts_with(comm, "GXRenderThread") ||
                    starts_with(comm, "GXWorker") ||
                    starts_with(comm, "Battle Worker") ||
-                   starts_with(comm, "CS Filtering") ||
-                   starts_with(comm, "MO Update")) {
+                   starts_with(comm, "CS Filtering")) {
             target_mask = &topo.game_workers;
             if (starts_with(comm, "HavokWorker") || starts_with(comm, "GXRenderThread")) {
                 boost_prio = true;
@@ -607,6 +606,14 @@ inline void ApplyProcessThreadTopology() {
             target_mask = &topo.gpu;
         } else if (starts_with(comm, "bb:") ||
                    starts_with(comm, "bb-probe:") ||
+                   std::strcmp(comm, "MOMainThread") == 0 ||
+                   starts_with(comm, "MO Update") ||
+                   starts_with(comm, "Mv_") ||
+                   starts_with(comm, "CSChrBackInit") ||
+                   starts_with(comm, "NexusRevolution") ||
+                   starts_with(comm, "FrpgSaveLoad") ||
+                   starts_with(comm, "DLUserPreferenc") ||
+                   starts_with(comm, "Core.Logging") ||
                    starts_with(comm, "EzWorkPool") ||
                    starts_with(comm, "Core.Res.") ||
                    starts_with(comm, "FMOD") ||

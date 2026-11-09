@@ -170,6 +170,8 @@ struct Values {
     std::atomic<bool> window_mode_chosen{false};
     /// The chosen output resolution (PackSize; CurrentOutput fits it to the aspect ratio).
     std::atomic<std::uint32_t> output_res{PackSize(OutputDefault)};
+    /// True while `output_res=auto` in bbport.ini (follows monitor / BB_OUTPUT_RES without false restart prompts).
+    std::atomic<bool> output_res_auto{true};
     /// Live resolution and preset changes (run.sh): 0 off by default (startup patch, fastest
     /// on the Steam Deck and older GPUs), -1 auto (strong discrete GPUs), 1 on. On restart.
     std::atomic<int> live_resolution{0};

@@ -2938,7 +2938,11 @@ void Poll() {
         NowSteadyMs() - display_heavy_dirty_ms.load(std::memory_order_relaxed) >= 100) {
         display_heavy_dirty.store(false, std::memory_order_release);
         const int aspect = std::clamp(disp_aspect, 0, BbSettings::AspectCount - 1);
-        s.output_res = BbSettings::PackSize(MenuOutput(aspect, disp_output_idx));
+        const auto chosen_out = BbSettings::PackSize(MenuOutput(aspect, disp_output_idx));
+        if (chosen_out != s.output_res.load()) {
+            s.output_res_auto = false;
+            s.output_res = chosen_out;
+        }
         s.aspect = aspect;
 
         int target_upscaler = BbSettings::UpscalerOff;

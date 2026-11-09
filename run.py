@@ -412,14 +412,15 @@ def run(extra_args=(), env=None, on_line=None):
     _log_file = open(logs / f'{stamp}.log', 'w', encoding='utf-8', errors='replace')
     if env.get('BB_SAVE_LOG') == '1':
         env['BB_FRAME_STATS'] = '1'
-        setdefault(env, 'BB_FRAME_LOG', str(logs / f'{stamp}.frames.csv'))
+        if env.get('BB_CSV_LOG') == '1':
+            setdefault(env, 'BB_FRAME_LOG', str(logs / f'{stamp}.frames.csv'))
     elif sys.platform == 'win32':
-        # Windows test builds: the 10 s summaries, a per-frame CSV and slow image creations
-        # (20 ms and more) are always logged; the hot paths only read the clock every 1024
-        # draws. BB_FRAME_STATS=off (or BB_SAVE_LOG=0) leaves them out.
+        # Windows builds: log lightweight 10 s summaries and slow image creations (20 ms+);
+        # heavy per-frame .frames.csv is opt-in via BB_CSV_LOG=1 (matching run.sh).
         if env.get('BB_FRAME_STATS') != 'off' and env.get('BB_SAVE_LOG') != '0':
             setdefault(env, 'BB_FRAME_STATS', '1')
-            setdefault(env, 'BB_FRAME_LOG', str(logs / f'{stamp}.frames.csv'))
+            if env.get('BB_CSV_LOG') == '1':
+                setdefault(env, 'BB_FRAME_LOG', str(logs / f'{stamp}.frames.csv'))
             setdefault(env, 'BB_SLOW_BIND_LOG', '20000')
         elif env.get('BB_FRAME_STATS') == 'off':
             del env['BB_FRAME_STATS']
@@ -501,18 +502,25 @@ def run(extra_args=(), env=None, on_line=None):
             printed = script('patches.py', '--print-scaled', '--settings', env['BB_CONFIG']).split()
             if len(printed) == 2:
                 scaled_render, scaled_output = printed
-        live = '0'
-        # 1080p output: the live path always ran there; over the startup patch (BB_LIVE_HYBRID) a
-        # preset below Native AA gets the game's targets at its size.
-        if not scaled_output and not env.get('BB_RENDER_RES') and env.get('BB_LIVE_HYBRID', '1') == '1':
+        # Match run.sh + play.sh: respect `live_resolution` from bbport.ini (default 0 = native
+        # startup patch with zero RunUiOnly proxy overhead) instead of forcing BB_LIVE_HYBRID=1.
+        live = env.get('BB_LIVE_RES', '')
+        if not live:
+            live = ini.get('live_resolution', '0').strip()
+            if live == 'auto':
+                try:
+                    live = subprocess.run([str(caps), '--live-resolution'], stdout=subprocess.PIPE,
+                                          stderr=subprocess.DEVNULL, text=True, env=env,
+                                          creationflags=NO_WINDOW).stdout.strip() or '0'
+                except OSError:
+                    live = '0'
+        live = '1' if live == '1' else '0'
+        if live == '1' and not scaled_output and not env.get('BB_RENDER_RES') and env.get('BB_LIVE_HYBRID', '1') == '1':
             printed = script('patches.py', '--print-scaled', '--align', '8', '--settings', env['BB_CONFIG']).split()
             if len(printed) == 2:
                 scaled_render, scaled_output = printed
                 env['BB_LIVE_RES'] = '1'
-        if scaled_output:
-            # Always on (free over the startup patch); BB_LIVE_RES=0 (tests): the patch alone.
-            live = '1' if env.get('BB_LIVE_RES', '1') == '1' else '0'
-        hybrid = live == '1' and env.get('BB_LIVE_HYBRID', '1') == '1'
+        hybrid = live == '1' and bool(scaled_output) and env.get('BB_LIVE_HYBRID', '1') == '1'
         if hybrid:
             # Live preset changes over the startup patch (see run.sh), the scene a multiple of 8.
             scaled_render, scaled_output = script('patches.py', '--print-scaled', '--align', '8', '--settings',
@@ -521,12 +529,12 @@ def run(extra_args=(), env=None, on_line=None):
                        BB_LIVE_HYBRID='1')
             large_scene_memory(env, scaled_render)
             log(f'Output {scaled_output}: scene {scaled_render}, live preset changes over it')
-        elif live == '1':
+        elif live == '1' and scaled_output:
             log(f'Output {scaled_output}: live resolution changes (BB_LIVE_HYBRID=0: proxies only)')
         elif scaled_output:
             env.update(BB_RENDER_RES=scaled_render, BB_OUTPUT_RES=scaled_output, BB_AUTO_RENDER_RES='1')
             large_scene_memory(env, scaled_render)
-            log(f'Output {scaled_output}: scene {scaled_render}, direct memory {env.get("BB_DMEM_MB") or 5056} MiB')
+            log(f'Output {scaled_output}: scene {scaled_render}, direct memory {env.get("BB_DMEM_MB") or 9152} MiB')
         # Texture packs fill the game's graphics heaps (#240, see run.sh): the full larger heaps
         # and their direct memory. BB_LARGE_HEAPS=1/0 forces it.
         large_heaps = env.get('BB_LARGE_HEAPS', '')
@@ -547,14 +555,21 @@ def run(extra_args=(), env=None, on_line=None):
                '--settings', env['BB_CONFIG'], '--game-dir', game, '--render-res', env.get('BB_RENDER_RES', ''),
                '--output-res', env.get('BB_OUTPUT_RES', ''), '--patches-dir', env.get('BB_PATCHES_DIR', data / 'patches'),
                '--patches-config', env.get('BB_PATCHES_CONFIG', data / 'patches.json'), '--large-heaps', large_heaps)
+        setdefault(env, '__GL_SHADER_DISK_CACHE', '1')
+        setdefault(env, '__GL_SHADER_DISK_CACHE_SKIP_CLEANUP', '1')
+        setdefault(env, '__GL_SHADER_DISK_CACHE_SIZE', '10737418240')
         setdefault(env, 'BB_PC_MODEL', '0')
         setdefault(env, 'BB_GUEST_IN_PLACE', env['BB_PC_MODEL'])
+        setdefault(env, 'BB_PREUPLOAD', '2')
         setdefault(env, 'BB_GX_MODULES', 'all')
         setdefault(env, 'BB_HW_OCCLUSION_CULL', '1')
         setdefault(env, 'BB_MICRO_SHADOW_CULL', '1')
         setdefault(env, 'BB_NATIVE_SHADERS', '1')
         setdefault(env, 'BB_READBACKS', '0')
         setdefault(env, 'BB_BREADCRUMBS', '0')
+        setdefault(env, 'BB_INDIRECT_GUARD', '0')
+        setdefault(env, 'BB_OBJECT_MOTION', '0')
+        setdefault(env, 'BB_LIVE_RES', live)
         setdefault(env, 'BB_COPY_GPU_BUFFERS', '1')
         setdefault(env, 'BB_GPU_WRITE_TWINS', '1')
         setdefault(env, 'BB_GPU_WRITE_TWINS_MAX', '65536')

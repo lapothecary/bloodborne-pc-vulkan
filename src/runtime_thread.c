@@ -142,6 +142,9 @@ void runtime_re_watch_now(uint64_t address);
 void runtime_thread_attach_main(void) {
     GuestThread *t=runtime_thread_current();
     snprintf(t->name,sizeof(t->name),"main");
+#ifdef _WIN32
+    bb_win32_set_thread_name("main");
+#endif
     /* BB_TLS_WATCH=<offset from the thread pointer> (reverse engineering): who writes that static
      * TLS variable of the main thread (reported when the game faults). */
     const char *watch=bb_env("BB_TLS_WATCH");

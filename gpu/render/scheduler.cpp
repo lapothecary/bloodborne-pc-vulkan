@@ -91,15 +91,14 @@ void Scheduler::ProducerScope::Leave() noexcept {
 
 namespace {
 
-/// Vulkan recording threads: BB_VK_RECORD_THREADS, else 2 from 8 hardware threads and 3
-/// from 12. One thread records ~75% of a core at 200 FPS (4 cores / 8 threads); the segments
-/// let the stream use more than one.
+/// Vulkan recording threads: BB_VK_RECORD_THREADS, default 1. A single unified recording
+/// stream preserves `GfxPushStateTracker` push-descriptor delta deduplication across the whole
+/// frame (`DscSav: 54-62%` vs `28%` when fragmented across 48 KiB multi-thread segments).
 u32 RecordingThreadCount() {
     if (const char* env = std::getenv("BB_VK_RECORD_THREADS")) {
         return std::clamp(std::atoi(env), 1, 8);
     }
-    const unsigned available = BbThreads::Available();
-    return available >= 12 ? 3 : available >= 8 ? 2 : 1;
+    return 1;
 }
 
 vk::CommandBuffer BeginCommandBuffer(CommandPool& pool) {
@@ -817,7 +816,7 @@ void Scheduler::RecorderThread(std::stop_token stoken, u32 index) {
                 if (const char* env = std::getenv("BB_RECORDER_SPIN_US")) {
                     return std::max(0, std::atoi(env));
                 }
-                return BbThreads::Available() >= 12 ? 20 : 10;
+                return 10;
             }());
             const auto spin_until = std::chrono::steady_clock::now() + spin_time;
             for (u32 spins = 1; worker.queued.load(std::memory_order_acquire) == 0 &&

@@ -95,9 +95,10 @@ bool Rasterizer::DrawPipeWanted() {
     if (env && env[0]) {
         return env[0] == '1';
     }
-    // Stage B spins while draws flow. Measured ahead with 16 threads (+19%) and with 4 cores /
-    // 8 threads (taskset, Steam Deck-like: +18%).
-    return BbThreads::Available() >= 8;
+    // Direct-Inline Stage A (`BB_DRAW_PIPE=0`) is faster on both Linux and Windows with our
+    // `pso_sig_epoch`, `StageBVertexMemo`, `cueHeap`, and `BeginMemo` fast paths, eliminating
+    // ~4.9 ms of SPSC queue / cross-thread Stage B serialization overhead (`BB_DRAW_PIPE=1` opts in).
+    return false;
 }
 
 bool Rasterizer::UseDrawPipe() const {

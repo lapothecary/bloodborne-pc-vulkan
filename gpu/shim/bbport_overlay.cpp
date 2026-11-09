@@ -710,6 +710,9 @@ void Menu() {
     if (ImGui::BeginCombo(BbSettings::MenuText("Resolution", "Разрешение"), size_label(current).c_str())) {
         for (const auto& o : BbSettings::Outputs(s.aspect)) {
             if (ImGui::Selectable(size_label(o).c_str(), o == current)) {
+                if (o != current) {
+                    s.output_res_auto = false;
+                }
                 Store(s.output_res, BbSettings::PackSize(o), true);
             }
         }

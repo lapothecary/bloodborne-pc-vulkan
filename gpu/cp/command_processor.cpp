@@ -771,7 +771,10 @@ void CommandProcessor::WaitForWork(std::stop_token stop) {
             const char* env = std::getenv("BB_HONEST_IDLE_US");
             return env ? std::strtoll(env, nullptr, 10) : 200ll;
         }());
-        static const bool spin_wait = BbThreads::Available() >= 12;
+        static const bool spin_wait = [] {
+            const char* env = std::getenv("BB_GPU_SPIN_US");
+            return env && std::atoi(env) > 0;
+        }();
         bool got_work = has_work();
         if (!got_work && idle_wait.count() > 0) {
             if (spin_wait) {
@@ -803,14 +806,12 @@ void CommandProcessor::WaitForWork(std::stop_token stop) {
         }
     }
     BbTimeline::Note(BbTimeline::DecoderIdleBegin);
-    // A frame comes in ~20 submissions: waking from the condition variable for each took tens of
-    // microseconds. Spin first, with cores to spare (BB_GPU_SPIN_US, default 200 with 12+
-    // hardware threads, else 0).
+    // Avoid empty PAUSE busy-spin waste by default (`BB_GPU_SPIN_US` opts in).
     static const auto spin_time = std::chrono::microseconds([] {
         if (const char* env = std::getenv("BB_GPU_SPIN_US")) {
             return std::max(0, std::atoi(env));
         }
-        return BbThreads::Available() >= 12 ? 200 : 0;
+        return 0;
     }());
     if (spin_time.count() > 0) {
         const auto spin_until = std::chrono::steady_clock::now() + spin_time;
