@@ -148,7 +148,8 @@ class GameCheckError(Exception):
 
 
 def prepare(game, out):
-    source = (game / 'eboot.bin').read_bytes()
+    base_dir, patch_dir = game_check.resolve_patch_pair(game)
+    source = game_check.game_file(game, 'eboot.bin').read_bytes()
     elf, header, ph, segments, missing = parse_self(source)
     loads = [p for p in ph if p['type'] in (1, 0x61000010)]
     def mapped(addr, size=8):
@@ -164,6 +165,14 @@ def prepare(game, out):
     # bbport: only the supported executable runs (game_check.py); others fail in the game's code.
     if found := game_check.problem(game, hashlib.sha256(image).hexdigest()):
         raise GameCheckError(game_check.explain(*found))
+    libc_path = game_check.game_file(game, 'sce_module/libc.prx')
+    if not libc_path.is_file():
+        try:
+            info = sfo(game_check.game_file(game, 'sce_sys/param.sfo').read_bytes())
+        except (OSError, ValueError, IndexError):
+            info = {}
+        raise GameCheckError(game_check.explain('missing_base', info.get('TITLE_ID', 'CUSA03173'),
+                                                info.get('APP_VER', '?')))
     dp = next(p for p in ph if p['type'] == 2)
     dyn = []
     for pos in range(dp['offset'], dp['offset'] + dp['filesz'], 16):
@@ -233,7 +242,7 @@ def prepare(game, out):
                   'sceKernelGetDirectMemorySize', 'sceKernelAllocateDirectMemory',
                   'sceKernelMapDirectMemory', 'sceKernelReleaseDirectMemory', 'sceKernelMunmap')
     known = {nid(name): name for name in candidates}
-    libc_evidence = inspect_libc(game / 'sce_module/libc.prx')
+    libc_evidence = inspect_libc(libc_path)
     out.mkdir(parents=True, exist_ok=True)
     # A deliberately small format, consumed by probe.c; no host struct packing.
     with (out / 'boot.bin').open('wb') as f:
@@ -253,18 +262,19 @@ def prepare(game, out):
     (out / 'entry.bin').write_bytes(image[:1024])
     resources = collections.Counter()
     total_bytes = 0
-    for path in (game / 'dvdroot_ps4').rglob('*'):
+    for path in (base_dir / 'dvdroot_ps4').rglob('*'):
         if path.is_file():
-            resources[path.relative_to(game / 'dvdroot_ps4').parts[0]] += 1
+            resources[path.relative_to(base_dir / 'dvdroot_ps4').parts[0]] += 1
             total_bytes += path.stat().st_size
+    sce_mod_dir = game_check.game_file(game, 'sce_module')
     report = dict(source_sha256=hashlib.sha256(source).hexdigest(), source_bytes=len(source),
-                  sfo=sfo((game / 'sce_sys/param.sfo').read_bytes()), entry=hex(header[4]),
+                  sfo=sfo(game_check.game_file(game, 'sce_sys/param.sfo').read_bytes()), entry=hex(header[4]),
                   image_bytes=size, program_headers=ph, self_segments=segments,
                   unavailable_metadata_headers=missing, needed=[string(v) for t, v in dyn if t == 1],
                   relocation_counts=dict(counts), import_count=len(names), imports=names,
                   import_name_hints={name: known[name.split('#')[0]] for name in names if name.split('#')[0] in known},
                   libc_evidence=libc_evidence,
-                  bundled_modules=sorted(p.name for p in (game / 'sce_module').iterdir()),
+                  bundled_modules=sorted(p.name for p in sce_mod_dir.iterdir()) if sce_mod_dir.is_dir() else [],
                   resources=dict(resources), resource_bytes=total_bytes,
                   status='Prepared only; execution and Vulkan are tested separately.')
     (out / 'analysis.json').write_text(json.dumps(report, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')

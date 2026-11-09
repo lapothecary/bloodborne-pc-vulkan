@@ -199,13 +199,7 @@ int bb_section_create(unsigned long long size) {
         errno = ENOMEM;
         return -1;
     }
-    section.whole = static_cast<unsigned char*>(MapViewOfFile3(
-        section.handle, GetCurrentProcess(), nullptr, 0, size, 0, PAGE_READWRITE, nullptr, 0));
-    if (!section.whole) {
-        CloseHandle(section.handle);
-        errno = ENOMEM;
-        return -1;
-    }
+    section.whole = nullptr;
     const int fd = next_section++;
     sections.emplace(fd, section);
     return fd;
@@ -262,6 +256,14 @@ int bb_section_discard(int fd, unsigned long long offset, unsigned long long len
         errno = EINVAL;
         return -1;
     }
+    if (!it->second.whole) {
+        it->second.whole = static_cast<unsigned char*>(MapViewOfFile3(
+            it->second.handle, GetCurrentProcess(), nullptr, 0, it->second.size, 0, PAGE_READWRITE, nullptr, 0));
+        if (!it->second.whole) {
+            errno = ENOMEM;
+            return -1;
+        }
+    }
     bb_discard(it->second.whole + offset, size_t(length));
     return 0;
 }
@@ -273,6 +275,14 @@ int fallocate(int fd, int mode, off_t offset, off_t length) {
     if (it == sections.end() || uint64_t(offset) + uint64_t(length) > it->second.size) {
         errno = EINVAL;
         return -1;
+    }
+    if (!it->second.whole) {
+        it->second.whole = static_cast<unsigned char*>(MapViewOfFile3(
+            it->second.handle, GetCurrentProcess(), nullptr, 0, it->second.size, 0, PAGE_READWRITE, nullptr, 0));
+        if (!it->second.whole) {
+            errno = ENOMEM;
+            return -1;
+        }
     }
     std::memset(it->second.whole + offset, 0, size_t(length));
     return 0;

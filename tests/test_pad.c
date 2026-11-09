@@ -14,6 +14,8 @@ int bbgpu_free_camera(void) { return 0; }
 int bbgpu_pointer_wanted(void) { return 0; }
 int bbgpu_video_active(void) { return 0; }
 int bbgpu_video_skip(void) { return 0; }
+unsigned long long bbgpu_world_us(void) { return now_us(); }
+int runtime_memory_low_info(uintptr_t va, int *prot, uintptr_t *end) { (void)va; (void)prot; (void)end; return 0; }
 void bbgpu_filter_pad(uint32_t *buttons, const uint8_t *sticks) { (void)buttons; (void)sticks; }
 void runtime_re_watch_tick(const void *pad_buffer, uint64_t reads) { (void)pad_buffer; (void)reads; }
 uintptr_t runtime_libc_base;
@@ -133,6 +135,17 @@ int main(void) {
     unlink(config);
     /* Mouse: names, the look stick's speed-to-deflection at two frame rates, the wheel's presses. */
     assert(key_from_name("Mouse Left")==MOUSE_KEY+SDL_BUTTON_LEFT && key_from_name("wheel down")==MOUSE_WHEEL_DOWN);
+    assert(key_from_name("Enter")==SDL_SCANCODE_RETURN && key_from_name("KP_Enter")==SDL_SCANCODE_KP_ENTER);
+    {
+        bool keys[SDL_SCANCODE_COUNT]={0};
+        keys[SDL_SCANCODE_RETURN]=true;
+        keys[SDL_SCANCODE_UP]=true;
+        keys[SDL_SCANCODE_DOWN]=true;
+        keys[SDL_SCANCODE_LEFT]=true;
+        keys[SDL_SCANCODE_RIGHT]=true;
+        assert(key_down(keys,IN_CROSS) && key_down(keys,IN_UP) && key_down(keys,IN_DOWN) &&
+               key_down(keys,IN_LEFT) && key_down(keys,IN_RIGHT));
+    }
     for (int rate=60;rate<=240;rate*=4) {
         PadData m; memset(&m,0,sizeof m);
         look_x=look_y=0; look_last_us=1;

@@ -319,6 +319,10 @@ struct PipelineCache::FastSelect {
         const u32* last_fetch_code = nullptr;
         const CachedFetch* last_cached_fetch = nullptr;
         bool rt_verified = false;
+        u64 last_flat_hash = 0;
+        u32 last_flat_words = 0;
+        std::array<u32, 4> last_ud_head{};
+        Shader::Backend::Bindings last_start{};
         Shader::RuntimeInfo runtime_info{};
     };
     static constexpr u32 MaxStages = 4; ///< VS (2), EsGs (3), or LsHs tessellation (4: PS+HS+VS+LS)
@@ -345,6 +349,15 @@ struct PipelineCache::FastSelect {
     std::array<std::pair<const u32*, const CachedFetch*>, 64> fetch_mru{};
     u64 use_clock = 0;
 
+    u64 last_sig_epoch = 0;
+    DrawIndirectParams last_params{};
+    VAddr last_positions_addr = 0;
+    bool last_obj_motion = false;
+    int last_upscaler = -1;
+    size_t last_set_base = 0;
+    u32 last_matching_ways_mask = 0;
+    Entry* last_first_match = nullptr;
+
     std::array<Stage, MaxStages> pending{};
     u32 num_pending = 0;
     bool pending_ok = true;
@@ -368,6 +381,9 @@ void PipelineCache::InvalidateFastSelect() {
         fast->fetch_map.clear();
         fast->fetch_mru.fill({});
         fast->use_clock = 0;
+        fast->last_sig_epoch = 0;
+        fast->last_first_match = nullptr;
+        fast->last_matching_ways_mask = 0;
         fast->last_vsharps_pipeline = nullptr;
         fast->last_vsharps.clear();
     }
@@ -977,12 +993,15 @@ void PipelineCache::NoteFastProgram(Program* program, HwStage hw_stage, SwStage 
 void PipelineCache::CommitFastSelect(const GraphicsPipeline* pipeline,
                                      const DrawIndirectParams& params) {
     auto& f = *fast;
+    f.last_sig_epoch = 0;
+    f.last_first_match = nullptr;
+    f.last_matching_ways_mask = 0;
     const auto& regs = liverpool->regs;
     if (!pipeline || !f.pending_ok || f.num_pending == 0) {
         ++f.not_eligible;
         return;
     }
-    std::array<u32, FastSelect::MaxSigWords> sig{};
+    std::array<u32, FastSelect::MaxSigWords> sig;
     const u32 sig_len =
         BuildFastSelectSig(regs, params, instance.IsVertexInputDynamicState(),
                            instance.IsTessellationSupported(), sig);
@@ -1051,33 +1070,56 @@ const GraphicsPipeline* PipelineCache::TryFastSelect(const DrawIndirectParams& p
     auto& f = *fast;
     f.last_vsharps_pipeline = nullptr;
     const auto& regs = liverpool->regs;
-    std::array<u32, FastSelect::MaxSigWords> sig{};
-    const u32 sig_len =
-        BuildFastSelectSig(regs, params, instance.IsVertexInputDynamicState(),
-                           instance.IsTessellationSupported(), sig);
-    if (sig_len == 0) {
-        ++f.not_eligible;
-        return nullptr;
-    }
-    const u64 sig_key = XXH3_64bits(sig.data(), sig_len * sizeof(u32)) | 1ULL;
-    const size_t set_base =
-        ((sig_key >> 1) & (FastSelect::NumSets - 1)) * FastSelect::NumWays;
+    const u64 cur_sig_epoch = liverpool->pso_sig_epoch;
+    const VAddr cur_pos_addr = Shader::MotionVectors::positions_address;
+    const bool cur_obj_motion = BbSettings::Get().object_motion.load(std::memory_order_relaxed);
+    const int cur_upscaler = BbSettings::EffectiveUpscaler();
 
+    size_t set_base = 0;
     FastSelect::Entry* first_match = nullptr;
     u32 matching_ways_mask = 0;
-    for (u32 w = 0; w < FastSelect::NumWays; ++w) {
-        auto& cand = f.entries[set_base + w];
-        if (cand.key == sig_key && cand.sig_words == sig_len &&
-            std::memcmp(cand.sig.data(), sig.data(), sig_len * sizeof(u32)) == 0) {
-            if (!first_match) {
-                first_match = &cand;
-            }
-            matching_ways_mask |= (1u << w);
+
+    if (f.last_sig_epoch == cur_sig_epoch && f.last_first_match != nullptr &&
+        f.last_positions_addr == cur_pos_addr && f.last_obj_motion == cur_obj_motion &&
+        f.last_upscaler == cur_upscaler &&
+        std::memcmp(&f.last_params, &params, sizeof(params)) == 0) {
+        set_base = f.last_set_base;
+        first_match = f.last_first_match;
+        matching_ways_mask = f.last_matching_ways_mask;
+    } else {
+        std::array<u32, FastSelect::MaxSigWords> sig;
+        const u32 sig_len =
+            BuildFastSelectSig(regs, params, instance.IsVertexInputDynamicState(),
+                               instance.IsTessellationSupported(), sig);
+        if (sig_len == 0) {
+            ++f.not_eligible;
+            return nullptr;
         }
-    }
-    if (!first_match) {
-        ++f.miss_regs;
-        return nullptr;
+        const u64 sig_key = XXH3_64bits(sig.data(), sig_len * sizeof(u32)) | 1ULL;
+        set_base = ((sig_key >> 1) & (FastSelect::NumSets - 1)) * FastSelect::NumWays;
+
+        for (u32 w = 0; w < FastSelect::NumWays; ++w) {
+            auto& cand = f.entries[set_base + w];
+            if (cand.key == sig_key && cand.sig_words == sig_len &&
+                std::memcmp(cand.sig.data(), sig.data(), sig_len * sizeof(u32)) == 0) {
+                if (!first_match) {
+                    first_match = &cand;
+                }
+                matching_ways_mask |= (1u << w);
+            }
+        }
+        if (!first_match) {
+            ++f.miss_regs;
+            return nullptr;
+        }
+        f.last_sig_epoch = cur_sig_epoch;
+        f.last_params = params;
+        f.last_positions_addr = cur_pos_addr;
+        f.last_obj_motion = cur_obj_motion;
+        f.last_upscaler = cur_upscaler;
+        f.last_set_base = set_base;
+        f.last_first_match = first_match;
+        f.last_matching_ways_mask = matching_ways_mask;
     }
 
     const u64 cur_epoch = DirectShaders::InvalidationEpoch();
@@ -1124,8 +1166,9 @@ const GraphicsPipeline* PipelineCache::TryFastSelect(const DrawIndirectParams& p
         }
         auto& mru = f.fetch_mru[(reinterpret_cast<uintptr_t>(code) >> 4) & 63];
         if (!BbToggle::Disabled(BbToggle::FetchShaderCache) && mru.first == code && mru.second &&
-            std::memcmp(code, mru.second->words.data(),
-                        mru.second->words.size() * sizeof(u32)) == 0) {
+            (epoch_valid ||
+             std::memcmp(code, mru.second->words.data(),
+                         mru.second->words.size() * sizeof(u32)) == 0)) {
             if (st_slot) {
                 st_slot->last_fetch_code = code;
                 st_slot->last_cached_fetch = mru.second;
@@ -1134,8 +1177,9 @@ const GraphicsPipeline* PipelineCache::TryFastSelect(const DrawIndirectParams& p
         }
         if (const auto it = f.fetch_map.find(code);
             !BbToggle::Disabled(BbToggle::FetchShaderCache) && it != f.fetch_map.end() &&
-            std::memcmp(code, it->second.words.data(),
-                        it->second.words.size() * sizeof(u32)) == 0) {
+            (epoch_valid ||
+             std::memcmp(code, it->second.words.data(),
+                         it->second.words.size() * sizeof(u32)) == 0)) {
             mru = {code, &it->second};
             if (st_slot) {
                 st_slot->last_fetch_code = code;
@@ -1274,7 +1318,7 @@ const GraphicsPipeline* PipelineCache::TryFastSelect(const DrawIndirectParams& p
         bool filled_vsharps = false;
         const Shader::Info* tcs_info = nullptr;
         for (u32 i = 0; i < way.num_stages; ++i) {
-            const auto& st = way.stages[i];
+            auto& st = way.stages[i];
             const auto& modules = st.program->modules;
             auto& info = st.program->info;
             if (st.sw_stage == SwStage::TessellationControl) {
@@ -1290,12 +1334,46 @@ const GraphicsPipeline* PipelineCache::TryFastSelect(const DrawIndirectParams& p
             }
             const bool want_vsharps =
                 (st.sw_stage == SwStage::Vertex && info.has_fetch_shader && way_fetch[i] != nullptr);
-            if (st.perm_idx >= modules.size() ||
-                !modules[st.perm_idx].spec.MatchesInPlace(
+            if (st.perm_idx >= modules.size()) {
+                spec_ok = false;
+                break;
+            }
+            const bool can_memo_flat =
+                !want_vsharps && !info.has_fetch_shader && st.hw_stage != HwStage::Local &&
+                st.sw_stage != SwStage::TessellationControl;
+            u64 flat_hash = 0;
+            u32 flat_words = 0;
+            bool head_same = false;
+            const auto start_binding = binding;
+            if (can_memo_flat) {
+                flat_words = static_cast<u32>(info.flattened_ud_buf.size());
+                const u32* flat_ptr = info.flattened_ud_buf.data();
+                if (flat_words >= 4u && flat_words == st.last_flat_words &&
+                    start_binding == st.last_start && flat_ptr[0] == st.last_ud_head[0] &&
+                    flat_ptr[1] == st.last_ud_head[1] && flat_ptr[2] == st.last_ud_head[2] &&
+                    flat_ptr[3] == st.last_ud_head[3]) {
+                    head_same = true;
+                    flat_hash = XXH3_64bits(flat_ptr, flat_words * sizeof(u32)) | 1ULL;
+                    if (flat_hash == st.last_flat_hash) {
+                        info.AddBindings(binding);
+                        continue;
+                    }
+                }
+            }
+            if (!modules[st.perm_idx].spec.MatchesInPlace(
                     info, st.runtime_info, profile, binding, way_fetch[i], st.rt_verified,
                     want_vsharps ? &f.last_vsharps : nullptr)) {
                 spec_ok = false;
                 break;
+            }
+            if (can_memo_flat && flat_words >= 4u) {
+                const u32* flat_ptr = info.flattened_ud_buf.data();
+                st.last_ud_head = {flat_ptr[0], flat_ptr[1], flat_ptr[2], flat_ptr[3]};
+                st.last_flat_words = flat_words;
+                st.last_start = start_binding;
+                st.last_flat_hash = head_same
+                                        ? flat_hash
+                                        : (XXH3_64bits(flat_ptr, flat_words * sizeof(u32)) | 1ULL);
             }
             if (want_vsharps) {
                 filled_vsharps = true;

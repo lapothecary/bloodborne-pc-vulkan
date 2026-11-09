@@ -19,6 +19,7 @@ inline bool IsFsr4(int upscaler) {
     return upscaler == UpscalerFsr4 || upscaler == UpscalerFsr411;
 }
 enum Preset : int { NativeAA = 0, Quality, Balanced, Performance, UltraPerformance, PresetCount };
+enum WindowMode : int { WindowModeFullscreen = 0, WindowModeBorderless = 1, WindowModeWindowed = 2, WindowModeCount };
 enum DebugView : int { DebugNone = 0, DebugReactive = 1, DebugMotion = 2, DebugViewCount };
 enum class MenuLanguage { English, Russian };
 
@@ -165,6 +166,8 @@ struct Values {
     std::atomic<bool> effects[EffectCount]{};
     std::atomic<int> model_lod{0}; ///< -2 highest .. 2 lowest, 0 the game's
     std::atomic<int> aspect{AspectAuto};
+    std::atomic<int> window_mode{WindowModeFullscreen};
+    std::atomic<bool> window_mode_chosen{false};
     /// The chosen output resolution (PackSize; CurrentOutput fits it to the aspect ratio).
     std::atomic<std::uint32_t> output_res{PackSize(OutputDefault)};
     /// Live resolution and preset changes (run.sh): 0 off by default (startup patch, fastest
@@ -237,5 +240,6 @@ float PresetScale(int preset);
 const char* PresetName(int preset);
 const char* UpscalerName(int upscaler);
 const char* AaModeName(int aa);
+const char* WindowModeName(int mode);
 
 } // namespace BbSettings

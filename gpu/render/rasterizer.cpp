@@ -557,6 +557,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const PreparedDraw* pre
     }
     if (!pipelined || !FilterDrawPasses()) {
         DrainDrawPipe(DrawPipe::ReasonDraw);
+        BB_SECTION(Task);
         FrameCapture::Poll();
         scheduler.PopPendingOperations();
         if (!FilterDraw()) {
@@ -584,7 +585,11 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const PreparedDraw* pre
         PostDraw(pipeline, used_prepared, is_indexed, index_offset);
         return;
     }
+    const auto* fast_vs = pipeline_cache.PeekFastVsharps(pipeline);
+    packet_vsharps = fast_vs ? std::span<const Gcn::Buffer>{fast_vs->data(), fast_vs->size()}
+                             : std::span<const Gcn::Buffer>{};
     DrawRecord(pipeline, used_prepared, is_indexed, index_offset);
+    packet_vsharps = {};
 }
 
 /// The guest memory a draw reads, in its breadcrumb: a GPU stuck in the draw is reported with it
@@ -1029,7 +1034,8 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
         }
     }
     draw_inputs.pipeline = nullptr;
-    if (HasPendingHleCopies() && scheduler.WillBeginRendering(state)) {
+    const bool will_begin_pass = !last_begin_memo_hit && scheduler.WillBeginRendering(state);
+    if (HasPendingHleCopies() && will_begin_pass) {
         FlushPendingHleCopies(*this);
     }
     ++tls_draws_in_frame;
@@ -1040,13 +1046,13 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
         return 1150u;
     }();
     if (!HonestLabels() && mid_flush_draws != 0 && !tls_mid_frame_flushed &&
-        tls_draws_in_frame >= mid_flush_draws && scheduler.WillBeginRendering(state)) {
+        tls_draws_in_frame >= mid_flush_draws && will_begin_pass) {
         tls_mid_frame_flushed = true;
         GetSceneCuller().SealCurrentSlice(scheduler.CurrentTick());
         SubmitInfo info{};
         scheduler.Flush(info);
     }
-    if (needs_barrier || (scheduler.WillBeginRendering(state) && runtime.HasPendingBarriers())) {
+    if (needs_barrier || (will_begin_pass && runtime.HasPendingBarriers())) {
         runtime.FlushBarriers();
     }
     EmitVertexBuffers();
@@ -2076,9 +2082,10 @@ void Rasterizer::BeginDraw(const GraphicsPipeline* pipeline, const RenderState& 
         const char* env = std::getenv("BB_DYNAMIC_STATE_ALWAYS");
         return env && env[0] == '1';
     }();
+    const bool will_begin = !last_begin_memo_hit && scheduler.WillBeginRendering(state);
     if (dynamic_always) {
         scheduler.GetDynamicState().Invalidate();
-    } else if (scheduler.WillBeginRendering(state)) {
+    } else if (will_begin) {
         scheduler.GetDynamicState().InvalidateViewports();
     }
     UpdateDynamicState(pipeline, is_indexed);
@@ -2095,7 +2102,7 @@ void Rasterizer::BeginDraw(const GraphicsPipeline* pipeline, const RenderState& 
         const auto& rvp = Regs().viewports[0];
         std::printf("Display watch regs: vp0 %g %g %g %g vte %#x jitter %g,%g new pass %d\n", rvp.xscale,
                     rvp.xoffset, rvp.yscale, rvp.yoffset, std::bit_cast<u32>(Regs().viewport_control),
-                    draw_jitter[0], draw_jitter[1], int(scheduler.WillBeginRendering(state)));
+                    draw_jitter[0], draw_jitter[1], int(will_begin));
         const auto& ds = scheduler.GetDynamicState();
         const auto& vps = ds.CurrentViewports();
         const auto& scs = ds.CurrentScissors();
@@ -2114,16 +2121,20 @@ void Rasterizer::BeginDraw(const GraphicsPipeline* pipeline, const RenderState& 
                     int(Regs().IsClipDisabled()), push_data.xscale, push_data.xoffset,
                     push_data.yscale, push_data.yoffset);
     }
-    MarkPass(pipeline, state);
+    MarkPass(pipeline, state, will_begin);
     if (occlusion) {
         occlusion->SetPassScale(target_scale[0] * target_scale[1]); // samples at the game's size
     }
-    const u8 color_dont_care_mask =
-        (allow_dont_care && scheduler.WillBeginRendering(state))
-            ? ComputeFullscreenOverwriteMask(pipeline, state, draw_prepared, is_indexed,
-                                             index_offset)
-            : 0;
-    scheduler.BeginRendering(state, color_dont_care_mask);
+    if (will_begin) {
+        const u8 color_dont_care_mask =
+            allow_dont_care ? ComputeFullscreenOverwriteMask(pipeline, state, draw_prepared,
+                                                             is_indexed, index_offset)
+                            : 0;
+        scheduler.BeginRendering(state, color_dont_care_mask);
+        if (begin_memo.valid) {
+            begin_memo.cmd_epoch = scheduler.DescriptorStateEpoch();
+        }
+    }
     // Push constants after the pass begins: beginning it may record the occlusion results' compute
     // dispatch (OcclusionQueries::Suspend), and the driver keeps one set of push constants for
     // compute and graphics. Its 8 bytes over xoffset/yoffset drew single frames shifted by half the
@@ -2465,8 +2476,8 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
     // After the resource binding: its transfers (image uploads, downloads) mark themselves.
     const auto mark = [&] {
         GpuProfiler::HudMarkPass(&scheduler, cs.pgm_hash == 0x9a9cf8a9ull
-                                                 ? BbStats::GpuCat_PostFxYebis
-                                                 : BbStats::GpuCat_ComputeCopies);
+                                                 ? BbStats::GpuSub_Post_BloomGlare
+                                                 : BbStats::GpuSub_Comp_ParticlesCs);
         if (auto* profiler = GpuProfiler::Get()) {
             profiler->Mark(cs.pgm_hash ^ 0xD15Aull, [&] {
                 return fmt::format("dispatch cs {:016x} ({}x{}x{} groups)", cs.pgm_hash,
@@ -2644,7 +2655,7 @@ void Rasterizer::DispatchIndirectRecord(const ComputePipeline* pipeline, VAddr a
         runtime.FlushBarriers(false);
     }
     const auto& cs_crumb = pipeline->GetStage(Shader::SwStage::Compute);
-    GpuProfiler::HudMarkPass(&scheduler, BbStats::GpuCat_ComputeCopies);
+    GpuProfiler::HudMarkPass(&scheduler, BbStats::GpuSub_Comp_ParticlesCs);
     if (auto* profiler = GpuProfiler::Get()) {
         profiler->Mark(cs_crumb.pgm_hash ^ 0xD15B0000ull, [&] {
             return fmt::format("dispatch indirect cs {:016x}", cs_crumb.pgm_hash);
@@ -2765,73 +2776,128 @@ void Rasterizer::OnSubmit() {
 
 namespace {
 
-u8 ClassifyHudRenderPass(u64 vs_hash, u64 ps_hash, u32 width, u32 height, u32 num_mrts,
-                         bool has_depth, bool in_ui_phase) noexcept {
+u8 ClassifyHudRenderSubPass(u64 vs_hash, u64 ps_hash, u32 width, u32 height, u32 num_mrts,
+                            bool has_depth, bool in_ui_phase) noexcept {
     // 10. UI (Scaleform) & Present (final gamma/LUT1D display blit or UI phase)
-    if (in_ui_phase || vs_hash == 0x34e8a281ull || ps_hash == 0x38d65b32ull ||
+    if (ps_hash == 0x38d65b32ull) {
+        return BbStats::GpuSub_Ui_RcasPresent;
+    }
+    if (in_ui_phase || vs_hash == 0x34e8a281ull ||
         ps_hash == 0xbabda34dull || ps_hash == 0xcfa96da9ull || ps_hash == 0x4baeaa00ull ||
         UiComposition::MovieShader(vs_hash)) {
-        return BbStats::GpuCat_UiPresent;
+        return BbStats::GpuSub_Ui_ScaleformHud;
     }
     // 9. Anti-Aliasing (in-game DLAA / FXAA / FXAA3 / FXAA3HQ passes)
     if (ps_hash == 0xda1faca9ull || ps_hash == 0x894de4ceull || ps_hash == 0x309a6f67ull ||
         ps_hash == 0x6c5edb96ull) {
-        return BbStats::GpuCat_AntiAliasing;
+        return BbStats::GpuSub_Aa_Upscaler;
     }
     // 2. G-Buffer (5/6/7-MRT deferred geometry & foliage)
     if (num_mrts >= 4) {
-        return BbStats::GpuCat_GBuffer;
+        if (ps_hash == 0x1c3953c6ull || ps_hash == 0x998b035eull || ps_hash == 0xca7226ecull ||
+            ps_hash == 0xe21e283aull || ps_hash == 0x2140da2bull || ps_hash == 0xa89e01e9ull ||
+            ps_hash == 0x70bb42afull || ps_hash == 0xdbeccd9cull || ps_hash == 0x2390c887ull ||
+            ps_hash == 0xb9bb200eull) {
+            return BbStats::GpuSub_GBuf_FoliageAndCloth;
+        }
+        return BbStats::GpuSub_GBuf_WorldAndChr;
     }
     // 5. Water / Reflections (SSR raymarching, Hi-Z depth downsample, mip blur & IBL combine)
-    if (ps_hash == 0x6c2323c2ull || ps_hash == 0x6320bb24ull || ps_hash == 0xe820ee9dull ||
-        ps_hash == 0x3fe9e964ull || ps_hash == 0x01ae5388ull) {
-        return BbStats::GpuCat_Ssr;
+    if (ps_hash == 0x6c2323c2ull) {
+        return BbStats::GpuSub_Ssr_Raymarch;
+    }
+    if (ps_hash == 0x6320bb24ull || ps_hash == 0xe820ee9dull || ps_hash == 0x01ae5388ull) {
+        return BbStats::GpuSub_Ssr_HiZAndMips;
     }
     // 3. SSAO (Ambient Occlusion generation & bilateral depth-aware blur)
-    if (ps_hash == 0xcbbca5dcull || ps_hash == 0x11ffdfb5ull || ps_hash == 0x83da8467ull ||
-        ps_hash == 0xabf92450ull || ps_hash == 0xc45c51cbull) {
-        return BbStats::GpuCat_Ssao;
+    if (ps_hash == 0xcbbca5dcull || ps_hash == 0x83da8467ull || ps_hash == 0x7b1a6a02ull ||
+        ps_hash == 0xb6b33378ull || ps_hash == 0x63bf8617ull || ps_hash == 0xca2d8d0aull) {
+        return BbStats::GpuSub_Ssao_GenReproj;
+    }
+    if (ps_hash == 0xc45c51cbull || ps_hash == 0x5196090eull || ps_hash == 0xa707b215ull ||
+        ps_hash == 0x114b2257ull || ps_hash == 0x7efecca6ull || ps_hash == 0xb5f8c858ull) {
+        return BbStats::GpuSub_Ssao_BilateralBlur;
     }
     // 1. Shadow Maps (4096x4096 CSM/spot shadow atlas, depth-only passes, VSM moments/blur, CSM PCF)
-    if ((width == 4096 && height == 4096) || (num_mrts == 0 && has_depth) ||
-        vs_hash == 0x167daba6ull || ps_hash == 0x1ae03d75ull || ps_hash == 0x0f61fd27ull ||
-        ps_hash == 0xf55643deull || ps_hash == 0x006c079bull || ps_hash == 0xa0e88f56ull ||
-        ps_hash == 0x4fd8db00ull || ps_hash == 0x9837d1c8ull || ps_hash == 0x92852ef3ull ||
-        ps_hash == 0x7cde8e5full || ps_hash == 0xa2108f5eull) {
-        return BbStats::GpuCat_Shadows;
+    if ((width == 4096 && height == 4096) ||
+        (num_mrts == 0 && has_depth && ps_hash != 0x4fd8db00ull) ||
+        ps_hash == 0x006c079bull || ps_hash == 0xa0e88f56ull || ps_hash == 0xa2108f5eull) {
+        return BbStats::GpuSub_Shadow_CascadeAtlas;
+    }
+    if (vs_hash == 0x167daba6ull || ps_hash == 0x1ae03d75ull || ps_hash == 0x0f61fd27ull ||
+        ps_hash == 0xf55643deull || ps_hash == 0x11ffdfb5ull || ps_hash == 0x4fd8db00ull ||
+        ps_hash == 0x9837d1c8ull || ps_hash == 0x92852ef3ull || ps_hash == 0x7cde8e5full ||
+        ps_hash == 0x12483d6dull) {
+        return BbStats::GpuSub_Shadow_VsmAndPcf;
     }
     // 4. Deferred PBR Lighting, Light Volumes & Sky/Atmospheric Fog / Godrays
-    if (num_mrts == 2 || ps_hash == 0xd92266b9ull || ps_hash == 0xdda49e89ull ||
-        ps_hash == 0x32e47788ull || ps_hash == 0x765450dfull || ps_hash == 0xe55e45ebull ||
-        vs_hash == 0x637500e0ull || ps_hash == 0xa291c498ull || vs_hash == 0x8747a367ull ||
-        ps_hash == 0x8650418full) {
-        return BbStats::GpuCat_DeferredLight;
+    if (ps_hash == 0x765450dfull || ps_hash == 0xdda49e89ull || ps_hash == 0x32e47788ull ||
+        ps_hash == 0xe55e45ebull || vs_hash == 0x637500e0ull || ps_hash == 0xa291c498ull) {
+        return BbStats::GpuSub_Def_SkyFogShafts;
+    }
+    if (num_mrts == 2 || ps_hash == 0xd92266b9ull || ps_hash == 0x3fe9e964ull ||
+        vs_hash == 0x8747a367ull || ps_hash == 0x8650418full) {
+        return BbStats::GpuSub_Def_DirectLocalPbr;
     }
     // 6. Forward Alpha (Hair, Blood, Cloth, Mist, Half-Res Soft Particles — 1 MRT + depth)
     if (has_depth) {
-        return BbStats::GpuCat_ForwardAlpha;
+        if (ps_hash == 0x71c96598ull || ps_hash == 0x5e224cb6ull || ps_hash == 0x9eb30215ull ||
+            ps_hash == 0x2eacb983ull) {
+            return BbStats::GpuSub_Fwd_SoftParticles;
+        }
+        return BbStats::GpuSub_Fwd_HairClothAlpha;
     }
-    // 8. Yebis 2 Post-FX (DoF, Motion Blur, Bloom Pyramid, 3D LUT, Tonemap — 1 MRT without depth)
-    return BbStats::GpuCat_PostFxYebis;
+    // 8. Yebis 2 Post-FX & GXPostEffect (1 MRT without depth):
+    // 8a. Depth of Field (CoC & Bokeh Gather)
+    if (ps_hash == 0xa2c4f30aull || ps_hash == 0xd3c8bb21ull || ps_hash == 0x111fce32ull ||
+        ps_hash == 0x9e1cb278ull || ps_hash == 0xc902266full || ps_hash == 0x981046d7ull ||
+        ps_hash == 0xa9c2becaull || ps_hash == 0xed1e60eeull || ps_hash == 0xf3621495ull ||
+        ps_hash == 0xb095e72full || ps_hash == 0x04ef5f2full || ps_hash == 0xf0fa51feull ||
+        ps_hash == 0xd61c51ceull || ps_hash == 0xebbf4c04ull || ps_hash == 0x164cdf00ull ||
+        ps_hash == 0x5850880cull || ps_hash == 0x7f677cb7ull || ps_hash == 0xcfbd6ad9ull ||
+        ps_hash == 0x2ef21350ull || ps_hash == 0x52e4f791ull || ps_hash == 0x8248f5aaull ||
+        ps_hash == 0x2c3eebe3ull) {
+        return BbStats::GpuSub_Post_DoF;
+    }
+    // 8b. Motion Blur (Camera/Object Velocity & Bilateral Blur)
+    if (ps_hash == 0xe0305cefull || ps_hash == 0x347ef3f4ull || ps_hash == 0x4b766f62ull ||
+        ps_hash == 0x86e96401ull || ps_hash == 0x107109bcull || ps_hash == 0xabf92450ull ||
+        ps_hash == 0x52b0abfdull || ps_hash == 0xdfff41caull || ps_hash == 0x514b4e45ull ||
+        ps_hash == 0x1534534aull || ps_hash == 0x7df9e24aull || ps_hash == 0xc6ea8d61ull ||
+        ps_hash == 0xb84726b7ull || ps_hash == 0x23cf4ed2ull || ps_hash == 0x94059df9ull ||
+        ps_hash == 0xe4009b2bull || ps_hash == 0xb72bb396ull || ps_hash == 0x8adcefe7ull) {
+        return BbStats::GpuSub_Post_MotionBlur;
+    }
+    // 8c. Bloom, Emissive Glow & Glare Starburst Pyramid
+    if (ps_hash == 0x57f3b8c2ull || ps_hash == 0x8c08444cull || ps_hash == 0xf7229091ull ||
+        ps_hash == 0x3c2b7974ull || ps_hash == 0x483f5dc1ull || ps_hash == 0x474f0123ull ||
+        ps_hash == 0x265a6d2dull || ps_hash == 0xe80526ccull || ps_hash == 0x88414cd6ull ||
+        ps_hash == 0xff902740ull || ps_hash == 0x2f82498dull || ps_hash == 0x44a2ed89ull ||
+        ps_hash == 0x714ff44eull || ps_hash == 0x825dd04bull || ps_hash == 0x1c3cbd98ull ||
+        ps_hash == 0xe93a1097ull || ps_hash == 0xa61e325dull ||
+        (width == 1568 && height == 588)) {
+        return BbStats::GpuSub_Post_BloomGlare;
+    }
+    // 8d. HDR -> LDR Tonemap, 3D Color Grading LUT & Pre-Tonemap Clamp
+    return BbStats::GpuSub_Post_TonemapLut;
 }
 
 } // namespace
 
-void Rasterizer::MarkPass(const GraphicsPipeline* pipeline, const RenderState& state) {
-    const bool will_begin = scheduler.WillBeginRendering(state);
+void Rasterizer::MarkPass(const GraphicsPipeline* pipeline, const RenderState& state,
+                          bool will_begin) {
     auto* profiler = GpuProfiler::Get();
-    if (!will_begin && !profiler) {
-        return;
-    }
     const auto& vs = pipeline->GetStage(Shader::SwStage::Vertex);
     const auto* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
     const u64 ps_hash = ps ? ps->pgm_hash : 0;
+    const u8 subcat = ClassifyHudRenderSubPass(
+        vs.pgm_hash, ps_hash, state.width, state.height, state.num_color_attachments,
+        state.depth_stencil_attachment.has_depth,
+        ui_pass_started || (upscaler && upscaler->InUiPhase()));
     if (will_begin) {
-        const u8 cat = ClassifyHudRenderPass(
-            vs.pgm_hash, ps_hash, state.width, state.height, state.num_color_attachments,
-            state.depth_stencil_attachment.has_depth,
-            ui_pass_started || (upscaler && upscaler->InUiPhase()));
-        GpuProfiler::HudSetNextPassCat(&scheduler, cat);
+        GpuProfiler::HudSetNextPassCat(&scheduler, subcat);
+    } else {
+        GpuProfiler::HudOnSubPassChange(&scheduler, subcat);
     }
     if (!profiler) {
         return;

@@ -795,6 +795,25 @@ void Rasterizer::ResolveVertexBuffers(const GraphicsPipeline* pipeline,
             memo_fill_slot->num_ranges = static_cast<u32>(ranges.size());
             for (u32 i = 0; i < memo_fill_slot->num_ranges; ++i) {
                 memo_fill_slot->ranges[i] = {ranges[i].begin, ranges[i].end};
+                u64 min_span = 1;
+                for (const auto& b : guest_buffers) {
+                    if (b.base_address >= ranges[i].begin && b.base_address < ranges[i].end) {
+                        min_span = std::max<u64>(
+                            min_span, (b.base_address - ranges[i].begin) +
+                                          std::max<u64>(1, b.GetStride()));
+                    }
+                }
+                memo_fill_slot->range_min_spans[i] = min_span;
+            }
+            u32 swm = 0;
+            for (const auto& buffer : guest_buffers) {
+                if (buffer.base_address != 0 && buffer.GetSize() > 0) {
+                    const auto it = std::ranges::find_if(ranges, [&](const Range& r) {
+                        return buffer.base_address >= r.begin && buffer.base_address < r.end;
+                    });
+                    memo_fill_slot->range_indices[swm++] =
+                        (it != ranges.end()) ? static_cast<u8>(it - ranges.begin()) : 0u;
+                }
             }
         }
     }
@@ -921,13 +940,20 @@ void Rasterizer::ResolveVertexBuffers(const GraphicsPipeline* pipeline,
         return std::min<u64>(cur_size, Common::AlignUp<u64>(needed, 64ULL));
     };
 
-    for (auto& range : ranges) {
+    for (u32 r_idx = 0; r_idx < ranges.size(); ++r_idx) {
+        auto& range = ranges[r_idx];
         u64 min_stream_span = 1;
-        for (const auto& b : guest_buffers) {
-            if (b.base_address >= range.begin && b.base_address < range.end) {
-                min_stream_span =
-                    std::max<u64>(min_stream_span,
-                                  (b.base_address - range.begin) + std::max<u64>(1, b.GetStride()));
+        if (memo_hit_slot && r_idx < memo_hit_slot->num_ranges) {
+            min_stream_span = memo_hit_slot->range_min_spans[r_idx];
+        } else if (memo_fill_slot && r_idx < memo_fill_slot->num_ranges) {
+            min_stream_span = memo_fill_slot->range_min_spans[r_idx];
+        } else {
+            for (const auto& b : guest_buffers) {
+                if (b.base_address >= range.begin && b.base_address < range.end) {
+                    min_stream_span =
+                        std::max<u64>(min_stream_span,
+                                      (b.base_address - range.begin) + std::max<u64>(1, b.GetStride()));
+                }
             }
         }
         const u64 raw_range_size = range.end - range.begin;
@@ -1039,10 +1065,13 @@ void Rasterizer::ResolveVertexBuffers(const GraphicsPipeline* pipeline,
         }
         if (buffer.base_address != 0 && buffer.GetSize() > 0) {
             const auto range =
-                ready ? ranges.begin() + ready->range_index[stream_with_memory++]
-                      : std::ranges::find_if(ranges, [&](const Range& r) {
-                            return buffer.base_address >= r.begin && buffer.base_address < r.end;
-                        });
+                ready           ? ranges.begin() + ready->range_index[stream_with_memory++]
+                : memo_hit_slot ? ranges.begin() + memo_hit_slot->range_indices[stream_with_memory++]
+                : memo_fill_slot
+                    ? ranges.begin() + memo_fill_slot->range_indices[stream_with_memory++]
+                    : std::ranges::find_if(ranges, [&](const Range& r) {
+                          return buffer.base_address >= r.begin && buffer.base_address < r.end;
+                      });
             ASSERT(range != ranges.end());
             const u64 host_off = range->offset + buffer.base_address - range->begin;
             v.host_buffers.push_back(range->buffer->Handle());

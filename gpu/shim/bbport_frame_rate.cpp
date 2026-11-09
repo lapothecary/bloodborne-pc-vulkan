@@ -74,6 +74,7 @@ struct alignas(64) Live {
     float decay08 = 0.8f;             ///< 0.8 per 30 FPS frame
     float cloth = 1.0f;               ///< cloth constraints' stiffness
     float model_turn = 0.0f;          ///< the model preview's turn per 30 FPS frame (radians per stick unit)
+    float dt_half = Frame30 * 0.5f;   ///< 1/60 s at 30 FPS (0.5 * dt), used by foliage wave timers (0x2313870)
 };
 Live* live = nullptr;
 float model_turn_base = 0.0f;         ///< the game's own model_turn (its constant, read at start)
@@ -161,6 +162,7 @@ void PS4_SYSV_ABI FrameStep(u64 pacer) {
     live->step_up = 0.1f * frames;
     live->decay08 = static_cast<float>(std::pow(0.8, frames_d));
     live->model_turn = model_turn_base * frames;
+    live->dt_half = dt * 0.5f;
     // The cloth setups' range checks of Stiffness, Rigid Factor and Allowed Compression (0x80d800
     // only warns) and a few uses of 1.0 next to them: the game's 1.0. The cloth follows the frame
     // rate by its constraints' stiffness factor instead (ClothStiffnessFactor).
@@ -236,8 +238,9 @@ constexpr Redirect Redirects[] = {
     {0x1f77d4a, 0x4929170, LIVE(dt)},  // an update by one frame (0 after a reset)
     {0x227784b, 0x4929b80, LIVE(dt)},  // timers advanced by one frame (0xebbda0)
     {0x2277892, 0x4929b80, LIVE(dt)},
-    {0x2313dad, 0x4929e70, LIVE(dt)},  // a simulation step: 1/60 in the game's 60 Hz mode,
-    {0x2313db7, 0x4929e74, LIVE(dt)},  // 1/30 otherwise
+    {0x2313d8d, 0x4929e70, LIVE(dt_half)}, // foliage wave/timer step: 1/60 at 30 FPS (0.5 * dt),
+    {0x2313dad, 0x4929e70, LIVE(dt_half)},
+    {0x2313db7, 0x4929e74, LIVE(dt)},      // 1/30 otherwise
     {0x2315d71, 0x4929e74, LIVE(dt)},
     // Body parts the physics moves (0x1515ec0, each part every frame): their timers advanced by the
     // step they are given (0x180df90 at +0xf0, 0x1811650 at +0xd0), 1/30 s; not in the patches.
@@ -430,6 +433,42 @@ bool HookClothStiffness() {
     return Detour(site, code, sizeof(code), e);
 }
 
+/// Foliage wind/interaction sway in 0x2313870:
+/// - At 0x23149ea (`vmovdqa xmm14, [rbp - 0x170]`), `xmm14` multiplies the already-integrated
+///   wind phase `[rbp - 0x190]` (`[rdi + 0x1b4]`, advanced by `live->dt` in 0x29552d0) and sway
+///   vector (`0x2314a66: vmulps xmm12, xmm4, xmm2`, `0x2314ae7: vmulss xmm9, xmm14, xmm1`).
+///   On native PS4 (30 FPS, `[SprjFlipper + 0x10] == 1`), `xmm14` is the constant `0x4929e70`
+///   (`1/60f = 0.01666667f`). Keeping `xmm14` fixed at `0x4929e70` prevents:
+///   (a) 2x speed/amplitude exaggeration at 30 FPS when `live->dt = 1/30f`,
+///   (b) amplitude/speed shrinkage to `60 / FPS` (~16% at 360 FPS), and
+///   (c) frame-to-frame phase jumps ("хоррор-рывки") from `live->dt * accumulated_time` jitter.
+/// - At 0x2314b35..0x2314b43, `xmm10` (the per-frame timer step added to `[r14 + 0x610/0x620]`
+///   at 0x2314bdb, 0x231581a, 0x2315aa5) loads `[rbp - 0x170]` (`live->dt_half = 0.5f * dt`).
+bool HookFoliageSway() {
+    constexpr u64 site_amp = 0x23149ea;
+    constexpr u8 code_amp[] = {0xc5, 0x79, 0x6f, 0xb5, 0x90, 0xfe, 0xff, 0xff};
+    Emitter e_amp;
+    e_amp.Bytes({0x48, 0xb8}); // movabs rax, image_base + 0x4929e70 (rax is overwritten at 0x2314aef)
+    e_amp.U64(image_base + 0x4929e70);
+    e_amp.Bytes({0xc5, 0x7a, 0x10, 0x30}); // vmovss xmm14, [rax] (1/60f = 0.01666667f)
+    e_amp.JmpAbs(image_base + site_amp + sizeof(code_amp));
+
+    constexpr u64 site_step = 0x2314b35;
+    constexpr u8 code_step[] = {
+        0x44, 0x8b, 0x85, 0x48, 0xfe, 0xff, 0xff, // mov r8d, [rbp - 0x1b8]
+        0x75, 0x05,                               // jne +5
+        0xc4, 0x41, 0x79, 0x6f, 0xd6,             // vmovdqa xmm10, xmm14
+    };
+    Emitter e_step;
+    e_step.Bytes({0x44, 0x8b, 0x85, 0x48, 0xfe, 0xff, 0xff});       // mov r8d, [rbp - 0x1b8]
+    e_step.Bytes({0x75, 0x08});                                     // jne +8 (preserve pause check)
+    e_step.Bytes({0xc5, 0x79, 0x6f, 0x95, 0x90, 0xfe, 0xff, 0xff}); // vmovdqa xmm10, [rbp - 0x170]
+    e_step.JmpAbs(image_base + site_step + sizeof(code_step));
+
+    return Detour(site_amp, code_amp, sizeof(code_amp), e_amp) &&
+           Detour(site_step, code_step, sizeof(code_step), e_step);
+}
+
 /// A mapping within +-2 GiB of the image (below or above it), for rel32 jumps and RIP-relative operands.
 u8* MapNear(int prot, u64 image_size) {
     const u64 above_base = (image_base + image_size + 0xFFFFull) & ~0xFFFFull;
@@ -486,6 +525,7 @@ void PatchImage(unsigned char* image, std::uint64_t image_size) {
     }
     unlocked = true;
     int steps = HookFixedStep(0x17f9b71, -0x48) + HookFixedStep(0x1572a7d, -0x30);
+    const bool foliage = HookFoliageSway();
     const int run = HookRunSpeed();
     const bool cloth = HookClothStiffness();
     int redirected = 0;
@@ -514,9 +554,11 @@ void PatchImage(unsigned char* image, std::uint64_t image_size) {
                 model_turn_base);
     std::printf("Frame rate: free (hooks, no patches): the game steps by each frame's time "
                 "(pacer=%s, sim=1/%d..1/30 s); %d fixed steps, %d of %zu per-frame values follow the frame's "
-                "time, pacer usleep spin=%d/3, the run's wall check %s, the cloth's stiffness %s\n",
+                "time, foliage sway=%s, pacer usleep spin=%d/3, the run's wall check %s, "
+                "the cloth's stiffness %s\n",
                 live->shortest > 0.0f ? "capped" : "truly uncapped (0.0 ms)", MaxRate,
-                steps, redirected, std::size(Redirects), spin_redirected,
+                steps, redirected, std::size(Redirects),
+                foliage ? "fixed-amplitude + dt-phase" : "unchanged", spin_redirected,
                 run == 1 ? "by speed" : run == 2 ? "by speed (a Sprint Fix patch did it already)"
                                                  : "unchanged (not found)",
                 cloth ? "by solves per second" : "per frame (not found)");

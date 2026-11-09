@@ -346,6 +346,10 @@ struct StageSpecialization {
         const bool buffers_match_size = (buffers.size() == cur_info.buffers.size());
         const bool images_match_size = (images.size() == cur_info.images.size());
         const bool samplers_match_size = (samplers.size() == cur_info.samplers.size());
+        if (!bitset.none() && (!(start == cur_start) || !buffers_match_size || !images_match_size ||
+                               !samplers_match_size)) {
+            return false;
+        }
 
         for (size_t i = 0; i < cur_info.buffers.size(); ++i) {
             const auto& desc = cur_info.buffers[i];
@@ -357,10 +361,21 @@ struct StageSpecialization {
             if (!buffers_match_size || !(start == cur_start)) {
                 return false;
             }
+            const u32 stride = sharp.GetStride();
+            const bool is_paged =
+                profile.paged_buffers &&
+                IsPagedBuffer(true, sharp, cur_info.pgm_hash, profile.buffer_copy_shader_hash);
+            if (!desc.is_formatted && !sharp.swizzle_enable) [[likely]] {
+                const auto& ref = buffers[i];
+                if (ref.stride != stride || ref.paged != is_paged || ref.is_formatted ||
+                    ref.swizzle_enable) {
+                    return false;
+                }
+                continue;
+            }
             BufferSpecialization bspec{};
-            bspec.stride = sharp.GetStride();
-            bspec.paged = IsPagedBuffer(profile.paged_buffers, sharp, cur_info.pgm_hash,
-                                        profile.buffer_copy_shader_hash);
+            bspec.stride = stride;
+            bspec.paged = is_paged;
             bspec.is_formatted = desc.is_formatted;
             bspec.swizzle_enable = sharp.swizzle_enable;
             if (bspec.is_formatted) {

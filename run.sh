@@ -83,7 +83,7 @@ game=$("$PYTHON" scripts/mods.py "$game" --out "$out" \
     --mods-dir "${BB_MODS_DIR:-$data/mods}" --config "${BB_MODS_CONFIG:-$data/mods.json}" \
     --enabled "${BB_MODS_ENABLED:-1}")
 # A private merged view lasts for this launch, including restarts. Cleanup only our own view.
-if [[ $game != "$(realpath "$original_game")" ]]; then
+if [[ $game != "$(realpath "$original_game")" && $(basename -- "$game") == mod-game-* ]]; then
     mod_game=$game
     trap '"$PYTHON" -c '\''import shutil,sys; shutil.rmtree(sys.argv[1])'\'' "$mod_game"' EXIT
 fi

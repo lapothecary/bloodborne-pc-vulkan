@@ -171,6 +171,7 @@ REMASTER_ENHANCEMENTS = [
 ]
 MODEL_LOD = [("Как в игре", "0"), ("Максимальная (-2)", "-2"), ("Ниже (1)", "1"),
              ("Минимальная (2)", "2")]
+WINDOW_MODES = [("Полный экран", "fullscreen"), ("Окно без рамки", "borderless"), ("В окне", "windowed")]
 FPS_PRESET_CHOICES = [
     ("Без лимита (Анлимит)", 0), ("30 FPS (PS4)", 30), ("60 FPS", 60), ("90 FPS", 90),
     ("120 FPS", 120), ("144 FPS", 144), ("165 FPS", 165), ("170 FPS", 170),
@@ -212,7 +213,8 @@ DEFAULTS = {
     "mods_enabled": True,
     "patches_dir": "",
     "language": "1",
-    "fullscreen": False,
+    "window_mode": "fullscreen",
+    "fullscreen": True,
     "hdr": False,
     "present_mode": "Mailbox",
     "gamepad": "",
@@ -266,6 +268,7 @@ INI_DEFAULTS = {
     "sharpness": "0.50",
     "object_motion": "0",
     "show_fps": "1",
+    "window_mode": "fullscreen",
     "output_res": "1920x1080",
     "model_lod": "0",
     "live_resolution": "0",
@@ -421,7 +424,9 @@ def game_environment(s):
     env["BB_LANGUAGE"] = s["language"]
     # The in-game menu speaks the launcher's language until one is chosen in it (menu_language).
     env["BB_MENU_LANGUAGE"] = language()
-    env["BB_FULLSCREEN"] = "1" if s["fullscreen"] else "0"
+    wm = s.get("window_mode") or ("fullscreen" if s.get("fullscreen", True) else "windowed")
+    env["BB_WINDOW_MODE"] = wm
+    env["BB_FULLSCREEN"] = "0" if wm == "windowed" else "1"
     env["BB_PRESENT_MODE"] = s["present_mode"]
     if s.get("gamepad"):
         env["BB_GAMEPAD"] = s["gamepad"]
@@ -798,9 +803,17 @@ class LauncherWindow(Adw.ApplicationWindow):
                                 lambda *_: self.fill_outputs(parse_size(combo_value(self.output_row))))
         self.display_row.connect("notify::selected", lambda *_: self.on_display_changed())
 
-        self.fullscreen_row = Adw.SwitchRow(title=tr("Полноэкранный режим"),
-                                            active=self.settings["fullscreen"])
-        screen.add(self.fullscreen_row)
+        init_wm = self.ini.get("window_mode")
+        if init_wm not in ("fullscreen", "borderless", "windowed"):
+            init_wm = "windowed" if self.ini.get("fullscreen") == "0" else (
+                self.settings.get("window_mode")
+                or ("fullscreen" if self.settings.get("fullscreen", True) else "windowed")
+            )
+        self.window_mode_row = combo_row(
+            tr("Режим экрана"),
+            tr("Полный экран, окно без рамки или оконный режим (переключается в игре на лету, Alt+Enter)"),
+            WINDOW_MODES, init_wm)
+        screen.add(self.window_mode_row)
         self.hdr_row = Adw.SwitchRow(title=tr("Разрешить HDR"), active=self.settings["hdr"])
         screen.add(self.hdr_row)
         page.add(screen)
@@ -1266,11 +1279,13 @@ class LauncherWindow(Adw.ApplicationWindow):
     def game_problem(self, path):
         """game_check.problem for the folder, kept until its eboot.bin or param.sfo changes (the
         image hash reads ~90 MB)."""
+        base_dir, patch_dir = game_check.resolve_patch_pair(path)
+        active_dir = patch_dir or base_dir
         try:
-            key = (str(path),) + tuple(
-                (f.stat().st_size, f.stat().st_mtime_ns) for f in (path / "eboot.bin", path / "sce_sys/param.sfo"))
+            key = (str(base_dir), str(patch_dir)) + tuple(
+                (f.stat().st_size, f.stat().st_mtime_ns) for f in (active_dir / "eboot.bin", active_dir / "sce_sys/param.sfo"))
         except OSError:
-            key = (str(path),)
+            key = (str(base_dir), str(patch_dir))
         if getattr(self, "_game_problem_key", None) != key:
             self._game_problem_key = key
             self._game_problem = game_check.problem(path)
@@ -1433,7 +1448,9 @@ class LauncherWindow(Adw.ApplicationWindow):
         s["gpu"] = combo_value(self.gpu_row)
         s["skip_network_choice"] = self.skip_network_row.get_active()
         s["language"] = combo_value(self.language_row)
-        s["fullscreen"] = self.fullscreen_row.get_active()
+        wm_val = combo_value(self.window_mode_row)
+        s["window_mode"] = wm_val
+        s["fullscreen"] = wm_val != "windowed"
         s["present_mode"] = combo_value(self.present_row)
         s["hdr"] = self.hdr_row.get_active()
         s["fps_mode"] = "uncap"
@@ -1478,7 +1495,8 @@ class LauncherWindow(Adw.ApplicationWindow):
             "ui_upscale": "1" if self.ui_upscale_row.get_active() else "0",
             "fps_limit": str(int(self.limit_row.get_value())),
             "language": str(combo_value(self.language_row)),
-            "fullscreen": "1" if self.fullscreen_row.get_active() else "0",
+            "window_mode": wm_val,
+            "fullscreen": "0" if wm_val == "windowed" else "1",
             "present_mode": str(combo_value(self.present_row)),
             "skip_network_choice": "1" if self.skip_network_row.get_active() else "0",
             "sharpen": "1" if self.sharpen_row.get_active() else "0",
@@ -1516,8 +1534,12 @@ class LauncherWindow(Adw.ApplicationWindow):
             s = self.settings
             if "language" in self.ini:
                 s["language"] = self.ini["language"]
-            if "fullscreen" in self.ini:
+            if "window_mode" in self.ini and self.ini["window_mode"] in ("fullscreen", "borderless", "windowed"):
+                s["window_mode"] = self.ini["window_mode"]
+                s["fullscreen"] = s["window_mode"] != "windowed"
+            elif "fullscreen" in self.ini:
                 s["fullscreen"] = self.ini["fullscreen"] == "1"
+                s["window_mode"] = "fullscreen" if s["fullscreen"] else "windowed"
             if "present_mode" in self.ini:
                 s["present_mode"] = self.ini["present_mode"]
             if "skip_network_choice" in self.ini:
@@ -1538,7 +1560,7 @@ class LauncherWindow(Adw.ApplicationWindow):
             aspect = self.ini.get("aspect_ratio", "auto")
             self.fill_aspects(aspect if aspect in ASPECTS else "auto")
             self.fill_outputs(parse_size(self.ini.get("output_res", "1920x1080")))
-            self.fullscreen_row.set_active(bool(s["fullscreen"]))
+            select_combo(self.window_mode_row, s.get("window_mode", "fullscreen"))
             select_combo(self.present_row, s["present_mode"])
             select_combo(self.language_row, s["language"])
             self.skip_network_row.set_active(bool(s.get("skip_network_choice", True)))

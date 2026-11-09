@@ -15,6 +15,8 @@
 
 extern "C" void runtime_memory_set_guest_chunk_allocator(int (*alloc)(uint64_t phys,
                                                                       uint64_t size));
+extern "C" void runtime_memory_set_guest_chunk_private(int (*import)(uint64_t phys, uint64_t size,
+                                                                     void* pointer));
 extern "C" void runtime_memory_set_guest_chunk_whole(int whole);
 extern "C" void* runtime_memory_backing_pointer(uint64_t phys);
 
@@ -265,6 +267,49 @@ bool ImportHost(void* pointer, u64 size, vk::Buffer& buffer, vk::DeviceMemory& m
     buffer = created;
     memory = allocated;
     return true;
+}
+
+/// The runtime's chunk importer in private host import mode: imports the single private guest view
+/// directly (no memfd or pagefile section alias). If the driver declines an import, returns 0 so
+/// the chunk stays in private memory and uses standard staging uploads.
+int ImportPrivate(u64 phys, u64 size, void* pointer) {
+    {
+        std::scoped_lock lk{mutex};
+        if (chunk_count == MaxChunks) {
+            return 0;
+        }
+    }
+    if (!pointer || reinterpret_cast<std::uintptr_t>(pointer) % import_alignment != 0 ||
+        size % import_alignment != 0) {
+        return 0;
+    }
+    vk::Buffer buffer;
+    vk::DeviceMemory memory;
+    vk::Result error{};
+    if (!ImportHost(pointer, size, buffer, memory, error)) {
+        static std::atomic<int> failures{0};
+        if (failures.fetch_add(1) < 4) {
+            std::fprintf(stderr, "Guest memory: importing private chunk %#llx failed (%s); using staging copies\n",
+                         (unsigned long long)phys, vk::to_string(error).c_str());
+        }
+        return 0;
+    }
+    {
+        std::scoped_lock lk{mutex};
+        std::size_t i = chunk_count++;
+        for (; i > 0 && chunks[i - 1]->phys > phys; --i) {
+            chunks[i] = chunks[i - 1];
+        }
+        static std::uint32_t next_index = 0;
+        chunks[i] = new Chunk{phys, size, buffer, memory, next_index++};
+        RegisterChunk(chunks[i]);
+    }
+    const u64 total = chunk_bytes.fetch_add(size) + size;
+    std::printf("Guest memory: direct memory %#llx+%llu MiB imported by the GPU (private host memory), "
+                "%llu MiB so far\n",
+                (unsigned long long)phys, (unsigned long long)(size >> 20),
+                (unsigned long long)(total >> 20));
+    return 0;
 }
 
 /// The runtime's chunk allocator in host import mode: CHUNK_IMPORTED (-3, the chunk stays in the
@@ -738,14 +783,30 @@ void Install(const Vulkan::Instance& instance) {
     // BB_GUEST_IN_PLACE (the GPU uses this memory in place) needs it too.
     const char* env = std::getenv("BB_GUEST_GPU_MEMORY");
     const char* in_place = std::getenv("BB_GUEST_IN_PLACE");
+    const char* priv = std::getenv("BB_PRIVATE_GUEST_MEMORY");
+    const bool use_private = !(priv && priv[0] == '0');
     if (!(env && env[0] == '1') && !(in_place && in_place[0] == '1' && PcModelGpu(instance))) {
+        if (use_private) {
+            runtime_memory_set_guest_chunk_private([](uint64_t, uint64_t, void*) -> int { return 0; });
+            std::printf("Guest memory: single-view private memory (no memfd/section alias)\n");
+        }
         return;
     }
     if (!Usable(instance)) {
-        std::printf("Guest memory: direct memory stays in the memfd\n");
+        if (use_private) {
+            runtime_memory_set_guest_chunk_private([](uint64_t, uint64_t, void*) -> int { return 0; });
+            std::printf("Guest memory: single-view private memory (no memfd/section alias)\n");
+        } else {
+            std::printf("Guest memory: direct memory stays in the memfd\n");
+        }
         return;
     }
     const bool host = mode == Mode::HostImport;
+    if (host && use_private) {
+        runtime_memory_set_guest_chunk_private(&ImportPrivate);
+        std::printf("Guest memory: single-view private memory imported by the GPU (BB_GUEST_GPU_MEMORY=1)\n");
+        return;
+    }
     // One chunk per direct allocation where the dma-buf maps at offset 0 only, and with the
     // layer's memory module (a mapping then lies whole in one chunk buffer).
     runtime_memory_set_guest_chunk_whole(LayerMemory() || (!host && whole_only) ? 1 : 0);

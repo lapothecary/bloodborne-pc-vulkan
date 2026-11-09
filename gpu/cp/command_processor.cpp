@@ -81,12 +81,35 @@ u64 CommandProcessor::HashRegisterPacket(u64 checksum, const u32* words, u32 cou
     return checksum;
 }
 
-void CommandProcessor::ApplyGraphicsRegisterPacket(Regs& regs, const u32* packet, u64& checksum,
-                                                   RegDirty* dirty, bool compute_checksum) {
+bool CommandProcessor::ApplyGraphicsRegisterPacket(Regs& regs, const u32* packet, u64& checksum,
+                                                   RegDirty* dirty, bool compute_checksum,
+                                                   u64* pso_sig_epoch, u64* dyn_reg_epoch) {
     const u32 header = packet[0];
     const u32 body_words = BodyWords(header);
     const u32* body = packet + 1;
     const bool track_all = dirty && dirty->track_all_blocks;
+    bool handled_completely = false;
+    const auto bump_pso_and_dyn = [&]() noexcept {
+        if (pso_sig_epoch) {
+            ++(*pso_sig_epoch);
+        }
+        if (dyn_reg_epoch) {
+            ++(*dyn_reg_epoch);
+        }
+    };
+    const auto context_span_affects_pso_sig = [](u32 ctx_off, u32 count) constexpr noexcept -> bool {
+        if (count == 0u) {
+            return false;
+        }
+        const u32 end = ctx_off + count - 1u;
+        const auto overlaps = [&](u32 lo, u32 hi) constexpr noexcept {
+            return ctx_off <= hi && end >= lo;
+        };
+        return overlaps(0x003u, 0x003u) || overlaps(0x010u, 0x017u) || overlaps(0x08Eu, 0x08Fu) ||
+               overlaps(0x191u, 0x1C5u) || overlaps(0x1E0u, 0x1E7u) || overlaps(0x202u, 0x207u) ||
+               overlaps(0x286u, 0x2A9u) || overlaps(0x2ABu, 0x2DEu) || overlaps(0x2E4u, 0x2EAu) ||
+               overlaps(0x2F8u, 0x2F8u) || overlaps(0x318u, 0x38Fu);
+    };
     const auto mark = [&](u32 index, u32 count) {
         if (dirty) {
             dirty->Mark(index, count);
@@ -118,25 +141,67 @@ void CommandProcessor::ApplyGraphicsRegisterPacket(Regs& regs, const u32* packet
             dirty->Clear();
             dirty->reset = true;
         }
+        bump_pso_and_dyn();
         break;
     case Op::SetConfigReg:
         set(Bank::Config);
+        bump_pso_and_dyn();
+        handled_completely = true;
         break;
-    case Op::SetContextReg:
-        set(Bank::Context);
-        break;
-    case Op::SetShReg:
-        // The compute program goes to the queue's compute state, not the file.
-        if (InComputeRange(body[0] & 0xFFFF)) {
-            return;
+    case Op::SetContextReg: {
+        const u32 ctx_off = body[0] & 0xFFFFu;
+        const u32 count = body_words - 1u;
+        const u32 dst_reg = Bank::Context + ctx_off;
+        const u32* src = body + 1u;
+        bool any_changed = false;
+        for (u32 i = 0; i < count; ++i) {
+            if (regs.reg_array[dst_reg + i] != src[i]) {
+                regs.reg_array[dst_reg + i] = src[i];
+                any_changed = true;
+            }
         }
-        set(Bank::Sh);
+        mark(dst_reg, count);
+        if (any_changed) {
+            if (dyn_reg_epoch) {
+                ++(*dyn_reg_epoch);
+            }
+            if (pso_sig_epoch && context_span_affects_pso_sig(ctx_off, count)) {
+                ++(*pso_sig_epoch);
+            }
+        }
         break;
+    }
+    case Op::SetShReg: {
+        // The compute program goes to the queue's compute state, not the file.
+        const u32 sh_off = body[0] & 0xFFFFu;
+        if (InComputeRange(sh_off)) {
+            return false;
+        }
+        const u32 count = body_words - 1u;
+        const u32 dst_reg = Bank::Sh + sh_off;
+        const u32* src = body + 1u;
+        bool any_changed = false;
+        for (u32 i = 0; i < count; ++i) {
+            if (regs.reg_array[dst_reg + i] != src[i]) {
+                regs.reg_array[dst_reg + i] = src[i];
+                any_changed = true;
+            }
+        }
+        mark_sh(dst_reg, count);
+        if (any_changed && pso_sig_epoch && (sh_off & 0x3Fu) < 0x0Cu) {
+            ++(*pso_sig_epoch);
+        }
+        handled_completely = true;
+        break;
+    }
     case Op::SetUconfigReg:
         set(Bank::Uconfig);
+        bump_pso_and_dyn();
+        handled_completely = true;
         break;
     case Op::IndexType:
         write(Reg::VgtDmaIndexType, body[0]);
+        handled_completely = true;
         break;
     case Op::DrawIndex2:
         // max size, base low, base high, index count, draw initiator
@@ -158,31 +223,39 @@ void CommandProcessor::ApplyGraphicsRegisterPacket(Regs& regs, const u32* packet
         break;
     case Op::NumInstances:
         write(Reg::VgtNumInstances, body[0]);
+        handled_completely = true;
         break;
     case Op::IndexBase:
         write(Reg::VgtDmaBase, body[0]);
         write(Reg::VgtDmaBaseHi, (regs.reg_array[Reg::VgtDmaBaseHi] & ~0xFFu) | (body[1] & 0xFF));
+        handled_completely = true;
         break;
     case Op::IndexBufferSize:
         write(Reg::VgtNumIndices, body[0]);
+        handled_completely = true;
         break;
     case Op::EventWrite:
         // A streamout flush: the offsets are updated at once (no streamout here).
         if ((body[0] & 0x3F) != EventWrite::SoVgtStreamoutFlush) {
-            return;
+            return false;
         }
         write(Reg::CpStrmoutCntl, regs.reg_array[Reg::CpStrmoutCntl] | 1);
+        bump_pso_and_dyn();
         break;
     case Op::Nop: {
         if (body_words < 2 || body[0] != NopPayload::DirectVulkan) {
-            return;
+            return false;
         }
         const auto vk_op = DirectVk::Op(body[1] & 0xFFFFu);
         if (vk_op == DirectVk::Op::SetIndexState && body_words == 6u) {
             DirectVk::SetIndexStateArgs a{};
             std::memcpy(&a, body + 2u, sizeof(a));
             if (a.index_and_flags & 0x100u) {
-                write(Reg::VgtPrimitiveType, a.prim_type & 0x3Fu);
+                const u32 new_prim = a.prim_type & 0x3Fu;
+                if (regs.reg_array[Reg::VgtPrimitiveType] != new_prim) {
+                    bump_pso_and_dyn();
+                }
+                write(Reg::VgtPrimitiveType, new_prim);
             }
             if (a.index_and_flags & 0x200u) {
                 write(Reg::VgtDmaBase, u32(a.ib_va) & ~1u);
@@ -192,6 +265,7 @@ void CommandProcessor::ApplyGraphicsRegisterPacket(Regs& regs, const u32* packet
             if (a.index_and_flags & 0x400u) {
                 write(Reg::VgtDmaIndexType, a.index_and_flags & 0xFFu);
             }
+            handled_completely = true;
             break;
         }
         if (vk_op == DirectVk::Op::DrawIndexed && body_words == 6u) {
@@ -220,7 +294,11 @@ void CommandProcessor::ApplyGraphicsRegisterPacket(Regs& regs, const u32* packet
             DirectVk::DrawIndexAddrArgs a{};
             std::memcpy(&a, body + 2u, sizeof(a));
             if (a.prim_and_size & 0x100u) {
-                write(Reg::VgtPrimitiveType, a.prim_and_size & 0x3Fu);
+                const u32 new_prim = a.prim_and_size & 0x3Fu;
+                if (regs.reg_array[Reg::VgtPrimitiveType] != new_prim) {
+                    bump_pso_and_dyn();
+                }
+                write(Reg::VgtPrimitiveType, new_prim);
             }
             if (a.prim_and_size & 0x200u) {
                 write(Reg::VgtDmaIndexType, (a.prim_and_size >> 16) & 0xFFu);
@@ -245,12 +323,12 @@ void CommandProcessor::ApplyGraphicsRegisterPacket(Regs& regs, const u32* packet
         if (vk_op == DirectVk::Op::SetStageUserData && body_words >= 3u) {
             const u32 sh_offset = body[2] & 0xFFFFu;
             if (InComputeRange(sh_offset)) {
-                return;
+                return false;
             }
             u32 mask = body[2] >> 16;
             const u32 count = body_words - 3u;
             if (static_cast<u32>(std::popcount(mask)) != count) {
-                return;
+                return false;
             }
             if ((mask & (mask + 1u)) == 0u) [[likely]] {
                 std::memcpy(&regs.reg_array[Bank::Sh + sh_offset], body + 3u, count * sizeof(u32));
@@ -264,30 +342,57 @@ void CommandProcessor::ApplyGraphicsRegisterPacket(Regs& regs, const u32* packet
                 }
                 mark_sh(Bank::Sh + sh_offset, 16u);
             }
+            if (pso_sig_epoch && (sh_offset & 0x3Fu) < 0x0Cu) [[unlikely]] {
+                ++(*pso_sig_epoch);
+            }
+            handled_completely = true;
             break;
         }
         if (vk_op == DirectVk::Op::SetContextRegsPacked && body_words >= 4u) {
             const u32 num_spans = body[1] >> 16;
             u32 idx = 2u;
+            bool any_changed = false;
+            bool pso_changed = false;
             for (u32 s = 0u; s < num_spans; ++s) {
                 if (idx >= body_words) {
-                    return;
+                    return false;
                 }
                 const u32 span_hdr = body[idx++];
                 const u32 ctx_off = span_hdr & 0xFFFFu;
                 const u32 count = span_hdr >> 16;
                 if (count == 0u || idx + count > body_words ||
                     Bank::Context + ctx_off + count > std::size(regs.reg_array)) {
-                    return;
+                    return false;
                 }
                 const u32 dst_reg = Bank::Context + ctx_off;
-                std::memcpy(&regs.reg_array[dst_reg], &body[idx], count * sizeof(u32));
+                bool span_changed = false;
+                for (u32 i = 0; i < count; ++i) {
+                    if (regs.reg_array[dst_reg + i] != body[idx + i]) {
+                        regs.reg_array[dst_reg + i] = body[idx + i];
+                        span_changed = true;
+                    }
+                }
+                if (span_changed) {
+                    any_changed = true;
+                    if (!pso_changed && context_span_affects_pso_sig(ctx_off, count)) {
+                        pso_changed = true;
+                    }
+                }
                 mark(dst_reg, count);
                 idx += count;
             }
             if (idx != body_words) {
-                return;
+                return false;
             }
+            if (any_changed) {
+                if (dyn_reg_epoch) {
+                    ++(*dyn_reg_epoch);
+                }
+                if (pso_changed && pso_sig_epoch) {
+                    ++(*pso_sig_epoch);
+                }
+            }
+            handled_completely = true;
             break;
         }
         if (vk_op == DirectVk::Op::SetRenderTarget) {
@@ -297,13 +402,15 @@ void CommandProcessor::ApplyGraphicsRegisterPacket(Regs& regs, const u32* packet
                 const u32 dst_reg = Bank::Context + 0x318u + slot * 0x0Fu;
                 std::memcpy(&regs.reg_array[dst_reg], body + 2u, 11u * sizeof(u32));
                 mark(dst_reg, 11u);
+                bump_pso_and_dyn();
                 break;
             }
             if (!valid && body_words == 2u) {
                 write(Bank::Context + 0x31Cu + slot * 0x0Fu, 0u);
+                bump_pso_and_dyn();
                 break;
             }
-            return;
+            return false;
         }
         if (vk_op == DirectVk::Op::SetDepthRenderTarget) {
             const bool valid = ((body[1] >> 16) & 1u) != 0u;
@@ -315,20 +422,30 @@ void CommandProcessor::ApplyGraphicsRegisterPacket(Regs& regs, const u32* packet
                 write(Bank::Context + 0x002u, dt[8]);
                 write(Bank::Context + 0x005u, dt[9]);
                 write(Bank::Context + 0x2AFu, dt[10]);
+                bump_pso_and_dyn();
                 break;
             }
             if (!valid && body_words == 2u) {
                 write(Bank::Context + 0x010u, 0u);
                 write(Bank::Context + 0x011u, 0u);
+                bump_pso_and_dyn();
                 break;
             }
-            return;
+            return false;
         }
         if (vk_op == DirectVk::Op::BindVsShader && body_words == 9u) {
             const bool only_sh = ((body[1] >> 18) & 1u) != 0u;
-            std::memcpy(&regs.reg_array[Bank::Sh + 0x48u], body + 2u, 4u * sizeof(u32));
+            const u32* vs = body + 2u;
+            bool changed = (regs.reg_array[Bank::Sh + 0x48u] != vs[0]) ||
+                           (regs.reg_array[Bank::Sh + 0x49u] != vs[1]) ||
+                           (regs.reg_array[Bank::Sh + 0x4Au] != vs[2]) ||
+                           (regs.reg_array[Bank::Sh + 0x4Bu] != vs[3]);
+            std::memcpy(&regs.reg_array[Bank::Sh + 0x48u], vs, 4u * sizeof(u32));
             mark_sh(Bank::Sh + 0x48u, 4u);
             if (!only_sh) {
+                changed |= (regs.reg_array[Bank::Context + 0x1B1u] != body[6]) ||
+                           (regs.reg_array[Bank::Context + 0x1C3u] != body[7]) ||
+                           (regs.reg_array[Bank::Context + 0x207u] != body[8]);
                 regs.reg_array[Bank::Context + 0x1B1u] = body[6];
                 regs.reg_array[Bank::Context + 0x1C3u] = body[7];
                 regs.reg_array[Bank::Context + 0x207u] = body[8];
@@ -343,6 +460,10 @@ void CommandProcessor::ApplyGraphicsRegisterPacket(Regs& regs, const u32* packet
                     }
                 }
             }
+            if (changed && pso_sig_epoch) {
+                ++(*pso_sig_epoch);
+            }
+            handled_completely = true;
             break;
         }
         if (vk_op == DirectVk::Op::BindPsShader) {
@@ -351,9 +472,21 @@ void CommandProcessor::ApplyGraphicsRegisterPacket(Regs& regs, const u32* packet
             const bool only_sh = ((body[1] >> 18) & 1u) != 0u;
             if (valid && body_words == 14u) {
                 const u32* ps = body + 2u;
+                bool changed = (regs.reg_array[Bank::Sh + 0x08u] != ps[0]) ||
+                               (regs.reg_array[Bank::Sh + 0x09u] != ps[1]) ||
+                               (regs.reg_array[Bank::Sh + 0x0Au] != ps[2]) ||
+                               (regs.reg_array[Bank::Sh + 0x0Bu] != ps[3]);
                 std::memcpy(&regs.reg_array[Bank::Sh + 0x08u], ps, 4u * sizeof(u32));
                 mark_sh(Bank::Sh + 0x08u, 4u);
                 if (!only_sh) {
+                    changed |= (regs.reg_array[Bank::Context + 0x1C4u] != ps[4]) ||
+                               (regs.reg_array[Bank::Context + 0x1C5u] != ps[5]) ||
+                               (regs.reg_array[Bank::Context + 0x1B3u] != ps[6]) ||
+                               (regs.reg_array[Bank::Context + 0x1B4u] != ps[7]) ||
+                               (regs.reg_array[Bank::Context + 0x1B6u] != ps[8]) ||
+                               (regs.reg_array[Bank::Context + 0x1B8u] != ps[9]) ||
+                               (regs.reg_array[Bank::Context + 0x203u] != ps[10]) ||
+                               (regs.reg_array[Bank::Context + 0x08Fu] != ps[11]);
                     regs.reg_array[Bank::Context + 0x1C4u] = ps[4];
                     regs.reg_array[Bank::Context + 0x1C5u] = ps[5];
                     regs.reg_array[Bank::Context + 0x1B3u] = ps[6];
@@ -377,6 +510,10 @@ void CommandProcessor::ApplyGraphicsRegisterPacket(Regs& regs, const u32* packet
                         }
                     }
                 }
+                if (changed && pso_sig_epoch) {
+                    ++(*pso_sig_epoch);
+                }
+                handled_completely = true;
                 break;
             }
             if (!valid && body_words == 2u) {
@@ -389,13 +526,19 @@ void CommandProcessor::ApplyGraphicsRegisterPacket(Regs& regs, const u32* packet
                 if (sdk350) {
                     write(Bank::Context + 0x08Fu, 0xFu);
                 }
+                if (pso_sig_epoch) {
+                    ++(*pso_sig_epoch);
+                }
+                handled_completely = true;
                 break;
             }
-            return;
+            return false;
         }
         if (vk_op == DirectVk::Op::BindEsShader && body_words == 6u) {
             std::memcpy(&regs.reg_array[Bank::Sh + 0xC8u], body + 2u, 4u * sizeof(u32));
             mark_sh(Bank::Sh + 0xC8u, 4u);
+            bump_pso_and_dyn();
+            handled_completely = true;
             break;
         }
         if (vk_op == DirectVk::Op::BindGsShader && body_words == 9u) {
@@ -407,6 +550,8 @@ void CommandProcessor::ApplyGraphicsRegisterPacket(Regs& regs, const u32* packet
                 write(Bank::Context + 0x29Bu, body[7]);
                 write(Bank::Context + 0x2E4u, body[8]);
             }
+            bump_pso_and_dyn();
+            handled_completely = true;
             break;
         }
         if (vk_op == DirectVk::Op::BindHsShader && body_words == 10u) {
@@ -419,29 +564,35 @@ void CommandProcessor::ApplyGraphicsRegisterPacket(Regs& regs, const u32* packet
                 write(Bank::Context + 0x2DBu, body[6]);
                 write(Bank::Context + 0x2D6u, body[9]);
             }
+            bump_pso_and_dyn();
+            handled_completely = true;
             break;
         }
         if (vk_op == DirectVk::Op::BindLsShader && body_words == 6u) {
             std::memcpy(&regs.reg_array[Bank::Sh + 0x148u], body + 2u, 4u * sizeof(u32));
             mark_sh(Bank::Sh + 0x148u, 4u);
+            bump_pso_and_dyn();
+            handled_completely = true;
             break;
         }
         if (vk_op == DirectVk::Op::SetVgtControl && body_words == 2u) {
             const u32 prim_group_sz_minus_1 = (body[1] >> 16) & 0xFFu;
             const u32 partial_vs_wave_mode = (body[1] >> 24) & 1u;
             write(Bank::Context + 0x2AAu, (partial_vs_wave_mode << 16) | prim_group_sz_minus_1);
+            handled_completely = true;
             break;
         }
         if (vk_op == DirectVk::Op::InitDefaultHardwareState && body_words == 2u) {
             const u32 gen = (body[1] >> 16) & 0xFFu;
             if (gen > 5u) {
-                return;
+                return false;
             }
             regs.SetDefaults();
             if (dirty) {
                 dirty->Clear();
                 dirty->reset = true;
             }
+            bump_pso_and_dyn();
             if (gen == 4u) {
                 write(Reg::VgtNumInstances, 1u);
                 write(Bank::Context + 0x102u, 0u);
@@ -515,16 +666,24 @@ void CommandProcessor::ApplyGraphicsRegisterPacket(Regs& regs, const u32* packet
             if (gen == 3u || gen == 5u) {
                 write(Bank::Context + 0x2AAu, 0xFFu);
             }
+            if (pso_sig_epoch) {
+                ++(*pso_sig_epoch);
+            }
+            if (dyn_reg_epoch) {
+                ++(*dyn_reg_epoch);
+            }
+            handled_completely = true;
             break;
         }
-        return;
+        return false;
     }
     default:
-        return;
+        return false;
     }
     if (compute_checksum) {
         checksum = HashRegisterPacket(checksum, packet, body_words + 1);
     }
+    return handled_completely;
 }
 
 // ---- Thread ----------------------------------------------------------------------------------
@@ -888,7 +1047,10 @@ void CommandProcessor::Run(std::stop_token stop) {
                 SignalDecodedFrames(); // BB_SUBMIT_LOCK=frame: a frame's last submission decoded
             }
         }
-        AfterBatch();
+        {
+            BB_SECTION(ADecode);
+            AfterBatch();
+        }
     }
 }
 
@@ -899,31 +1061,6 @@ void CommandProcessor::AfterBatch() {
         rasterizer && rasterizer->PipeOrder() &&
         !BbToggle::Disabled(BbToggle::PipelinedTasks);
     const bool was_submit_done = submit_done.exchange(false, std::memory_order_acq_rel);
-    if (was_submit_done) {
-        if (pipe_signals || pipe_order) {
-            // BB_PIPE_SIGNALS: the frame's cache work runs on the recording thread after the
-            // frame (this thread decodes the next one meanwhile).
-            static constexpr u8 none = 0;
-            rasterizer->RunInOrder(
-                [](Vulkan::Rasterizer& r, const u8*) {
-                    r.OnSubmit();
-                    if (r.HasPendingWork()) {
-                        r.Flush();
-                    }
-                    // BB_EXP_FINISH_FRAMES=1 (experiment): the GPU finishes each frame before the next.
-                    static const bool finish = std::getenv("BB_EXP_FINISH_FRAMES") != nullptr;
-                    if (finish) {
-                        r.Finish();
-                    }
-                },
-                &none, 0, BbToggle::PipelinedTasks, false);
-        } else if (rasterizer) {
-            rasterizer->OnSubmit();
-            if (rasterizer->HasPendingWork()) {
-                rasterizer->Flush();
-            }
-        }
-    }
 
     // The guest takes GPU idle (sceGnmSubmitDone) as its work being done and frees the objects
     // that hold its fence labels: they must be written before, by the draw recording thread and
@@ -932,6 +1069,26 @@ void CommandProcessor::AfterBatch() {
         rasterizer->DrainDrawPipe(DrawPipe::ReasonSubmissionEnd);
         rasterizer->WaitDeferredSignals();
     }
+
+    if (was_submit_done && (pipe_signals || pipe_order)) {
+        // BB_PIPE_SIGNALS: the frame's cache work runs on the recording thread after the
+        // frame (this thread decodes the next one meanwhile).
+        static constexpr u8 none = 0;
+        rasterizer->RunInOrder(
+            [](Vulkan::Rasterizer& r, const u8*) {
+                r.OnSubmit();
+                if (r.HasPendingWork()) {
+                    r.Flush();
+                }
+                // BB_EXP_FINISH_FRAMES=1 (experiment): the GPU finishes each frame before the next.
+                static const bool finish = std::getenv("BB_EXP_FINISH_FRAMES") != nullptr;
+                if (finish) {
+                    r.Finish();
+                }
+            },
+            &none, 0, BbToggle::PipelinedTasks, false);
+    }
+
     // GPU idle only if nothing was submitted meanwhile: the drain and the deferred fences take
     // milliseconds, and a submission plus sceGnmSubmitDone in that time would release the lock for
     // work not even decoded (late fences in the guest's heap, command buffers reused as garbage).
@@ -966,8 +1123,23 @@ void CommandProcessor::AfterBatch() {
             return;
         }
         rasterizer->SignalAfterGpu([this, generation] { SignalGpuIdle(generation); });
+        if (was_submit_done && !pipe_order) {
+            rasterizer->OnSubmit();
+            if (rasterizer->HasPendingWork()) {
+                rasterizer->Flush();
+            } else {
+                rasterizer->SubmitForSignals();
+            }
+        }
         rasterizer->WaitPendingFrame();
         return;
+    }
+
+    if (was_submit_done && rasterizer && !pipe_signals && !pipe_order) {
+        rasterizer->OnSubmit();
+        if (rasterizer->HasPendingWork()) {
+            rasterizer->Flush();
+        }
     }
     if (pipe_order) {
         u64 generation;

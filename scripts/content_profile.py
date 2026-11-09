@@ -6,10 +6,11 @@ import json
 import struct
 from pathlib import Path
 from prepare import sfo
+import game_check
 
 
 def prepare(game, out, sku='full'):
-    values=sfo((game/'sce_sys/param.sfo').read_bytes())
+    values=sfo(game_check.game_file(game, 'sce_sys/param.sfo').read_bytes())
     params=[values.get(f'USER_DEFINED_PARAM_{i}',0) for i in range(1,5)]
     if any(type(v) is not int or not 0<=v<=0xffffffff for v in params):
         raise ValueError('invalid user-defined parameter')

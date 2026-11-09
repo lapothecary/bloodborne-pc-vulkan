@@ -3,6 +3,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -158,3 +159,29 @@ class ModTests(unittest.TestCase):
         self.assertEqual(mounted['content'], 'mod')
         self.assertFalse(Path(mounted['path']).exists())
         self.assertEqual((self.assets/'a.dcx').read_bytes(), b'original')
+
+    def test_split_base_and_patch_folders_work_from_either_direction(self):
+        # Simulate shadPS4 split dump: CUSA03173 (base 1.00, has libc.prx) + CUSA03173-patch (1.09 update, no libc.prx)
+        (self.game / 'sce_module').mkdir(parents=True, exist_ok=True)
+        (self.game / 'sce_module/libc.prx').write_bytes(b'base libc')
+        (self.game / 'sce_sys').mkdir(parents=True, exist_ok=True)
+        (self.game / 'sce_sys/param.sfo').write_bytes(b'base sfo')
+        patch = self.root / 'CUSA03173-patch'
+        (patch / 'sce_sys').mkdir(parents=True)
+        (patch / 'sce_sys/param.sfo').write_bytes(b'patch 1.09 sfo')
+        (patch / 'eboot.bin').write_bytes(b'patch 1.09 eboot')
+        (patch / 'dvdroot_ps4/chr').mkdir(parents=True)
+        (patch / 'dvdroot_ps4/chr/a.dcx').write_bytes(b'patched chr a')
+        (patch / 'dvdroot_ps4/map/m34_00_00_00').mkdir(parents=True)
+        (patch / 'dvdroot_ps4/map/m34_00_00_00/dlc.dcx').write_bytes(b'old hunters dlc')
+
+        for selected_input in (self.game, patch, self.root):
+            with self.subTest(selected=selected_input.name):
+                result = mods.build_overlay(selected_input, self.root / 'out', [])
+                self.assertEqual((result / 'eboot.bin').read_bytes(), b'patch 1.09 eboot')
+                self.assertEqual((result / 'sce_sys/param.sfo').read_bytes(), b'patch 1.09 sfo')
+                self.assertEqual((result / 'sce_module/libc.prx').read_bytes(), b'base libc')
+                self.assertEqual((result / 'dvdroot_ps4/chr/a.dcx').read_bytes(), b'patched chr a')
+                self.assertEqual((result / 'dvdroot_ps4/chr/b.dcx').read_bytes(), b'untouched')
+                self.assertEqual((result / 'dvdroot_ps4/map/m34_00_00_00/dlc.dcx').read_bytes(), b'old hunters dlc')
+                shutil.rmtree(result)

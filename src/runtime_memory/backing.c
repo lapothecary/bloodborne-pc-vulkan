@@ -24,6 +24,13 @@ static void advise_huge(void *p, uint64_t n) {
 /* Direct memory occupies [0,POOL_SIZE) of the memfd, flexible memory [POOL_SIZE,+FLEX_SPAN). */
 static int pool(void) {
     if (pool_fd>=0) return 0;
+    if (private_import) {
+        chunk_fds=malloc((POOL_SIZE/CHUNK+1)*sizeof(int));
+        if (!chunk_fds) return -1;
+        for (uint64_t c=0;c<=POOL_SIZE/CHUNK;++c) chunk_fds[c]=-1;
+        pool_fd=0;
+        return 0;
+    }
 #ifdef _WIN32
     /* A pagefile-backed section (gpu/platform/win32/posix_memory.cpp). */
     pool_fd=bb_section_create(POOL_SIZE+FLEX_SPAN);
@@ -234,6 +241,7 @@ static void *map_private(uintptr_t address, uint64_t size, int prot, uint64_t ph
         void *p=mmap((void *)address,size,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED,-1,0);
 #endif
         if (p==MAP_FAILED) return MAP_FAILED;
+        advise_huge(p,size);
         /* A heap growing on demand: only its first part for the GPU now (runtime_memory_commit). */
         /* Memory the GPU never uses (the game profile): none. */
         const uint64_t imported = deferred_end>deferred_phys && phys<deferred_phys &&
@@ -254,10 +262,21 @@ static void *map_private(uintptr_t address, uint64_t size, int prot, uint64_t ph
 }
 /* mmap of direct or flexible memory at phys, split where it crosses chunks. */
 static void *map_phys(uintptr_t address, uint64_t size, int prot, uint64_t phys) {
+    if (private_import) {
+        if (chunk_fds && phys<POOL_SIZE) return map_private(address,size,prot,phys);
+#ifdef _WIN32
+        void *p=bb_private_at((void *)address,size);
+        if (p==MAP_FAILED || mprotect(p,size,prot)) return MAP_FAILED;
+#else
+        void *p=mmap((void *)address,size,prot,MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED,-1,0);
+        if (p==MAP_FAILED) return MAP_FAILED;
+        advise_huge(p,size);
+#endif
+        return p;
+    }
 #ifdef _WIN32
     zero_now(phys,size);
 #endif
-    if (private_import && chunk_fds && phys<POOL_SIZE) return map_private(address,size,prot,phys);
     if (!chunk_fds || phys>=POOL_SIZE)
         return mmap((void *)address,size,prot,MAP_SHARED|MAP_FIXED,pool_fd,(off_t)phys);
     ensure_chunks(phys,size);
@@ -300,6 +319,7 @@ static void *map_phys(uintptr_t address, uint64_t size, int prot, uint64_t phys)
 }
 /* Released memfd memory: punched out, or cleared where the GPU pinned its pages. */
 static void punch_or_clear(uint64_t phys, uint64_t size) {
+    if (!backing_base) return;
     for (uint64_t done=0;done<size;) {
         const uint64_t at=phys+done, g=at/PIN_GRANULE;
         uint64_t n=(g+1)*PIN_GRANULE-at;
@@ -322,6 +342,27 @@ static void punch_or_clear(uint64_t phys, uint64_t size) {
 }
 /* Returns released physical memory to zero: hole punching in the memfd, a clear in a chunk. */
 static void zero_phys(uint64_t phys, uint64_t size) {
+    if (private_import) {
+        for (size_t i=0;i<region_count;) {
+            const Region r=regions[i];
+            const uint64_t a=r.phys>phys ? r.phys : phys;
+            const uint64_t b=r.phys+r.size<phys+size ? r.phys+r.size : phys+size;
+            if (a<b && r.fd==CHUNK_PRIVATE) {
+#ifdef _WIN32
+                bb_discard((void *)(r.va+(a-r.phys)),b-a);
+#else
+                madvise((void *)(r.va+(a-r.phys)),b-a,MADV_DONTNEED);
+#endif
+                if (a==r.phys && b==r.phys+r.size) {
+                    for (size_t j=i;j+1<region_count;++j) regions[j]=regions[j+1];
+                    --region_count;
+                    continue;
+                }
+            }
+            ++i;
+        }
+        return;
+    }
     for (uint64_t done=0;done<size;) {
         const uint64_t at=phys+done;
         if (!chunk_fds || at>=POOL_SIZE) {

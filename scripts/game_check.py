@@ -35,12 +35,137 @@ SUPPORTED_IMAGE = '071df19c8880086d97182dbc057bc8cb37badaca57d9112683836b24a0444
 LANCE_60FPS_IMAGE = 'bbc91f4dff6bc3118b039464289e39878a8fdfc802a07fab9d5fe84d935a676f'
 # The game loads these first; a broken extraction damages most files, these among them.
 CHECKED_FOLDER = 'dvdroot_ps4/shader'
+PATCH_SUFFIXES = ('-patch', '_patch', '.patch', '-update', '_update', '.update', '-patch0109', '-1.09')
+
+
+def _unwrap_game_root(folder):
+    """Unwrap a single wrapper directory (app0, a retail TITLE_ID, or game) if eboot.bin is inside it."""
+    folder = Path(folder)
+    try:
+        if not folder.is_dir():
+            return folder
+        if (folder / 'eboot.bin').is_file() or (folder / 'sce_sys/param.sfo').is_file():
+            return folder
+        entries = [e for e in folder.iterdir() if e.is_dir() and not e.name.startswith('.')]
+        for sub in ('app0', *SUPPORTED_TITLES, 'game'):
+            for entry in entries:
+                if entry.name.casefold() == sub.casefold():
+                    if (entry / 'eboot.bin').is_file() or (entry / 'sce_sys/param.sfo').is_file():
+                        return entry
+        if len(entries) == 1 and ((entries[0] / 'eboot.bin').is_file() or (entries[0] / 'sce_sys/param.sfo').is_file()):
+            return entries[0]
+    except OSError:
+        pass
+    return folder
+
+
+def _sfo_info(folder):
+    from prepare import sfo
+    try:
+        return sfo((Path(folder) / 'sce_sys/param.sfo').read_bytes())
+    except (OSError, ValueError, IndexError):
+        return {}
+
+
+def _has_libc(folder):
+    return (Path(folder) / 'sce_module/libc.prx').is_file()
+
+
+def _strip_patch_suffix(name):
+    lower = name.casefold()
+    for suffix in PATCH_SUFFIXES:
+        if lower.endswith(suffix) and len(name) > len(suffix):
+            return name[:-len(suffix)]
+    return None
+
+
+def resolve_patch_pair(game):
+    """Return `(base_dir, patch_dir)` for a game directory.
+
+    Supports shadPS4-style split folders (`CUSA03173` + `CUSA03173-patch`) whether the user selects
+    the base folder (`CUSA03173`), the update folder (`CUSA03173-patch`), or their parent folder.
+    If the game is already in a single folder (or no companion folder exists), returns `(folder, None)`.
+    """
+    raw = Path(game)
+    folder = _unwrap_game_root(raw)
+    info = _sfo_info(folder)
+    title = info.get('TITLE_ID', '')
+    version = info.get('APP_VER', '')
+    has_libc = _has_libc(folder)
+    outer = raw if raw != folder and _strip_patch_suffix(raw.name) else folder
+    base_stem = _strip_patch_suffix(outer.name)
+    search_parents = []
+    for p in (outer.parent, folder.parent, raw):
+        try:
+            if p.is_dir() and p not in search_parents:
+                search_parents.append(p)
+        except OSError:
+            pass
+
+    # Case 1: User selected the patch folder (missing sce_module/libc.prx, or named *-patch / *-update).
+    if not has_libc or base_stem is not None:
+        wanted_names = [n.casefold() for n in (base_stem, title) if n]
+        for parent in search_parents:
+            try:
+                entries = list(parent.iterdir())
+            except OSError:
+                continue
+            for entry in entries:
+                if not entry.is_dir() or entry == outer or entry == folder:
+                    continue
+                cand = _unwrap_game_root(entry)
+                if cand == folder or not _has_libc(cand):
+                    continue
+                if entry.name.casefold() in wanted_names or (title and _sfo_info(cand).get('TITLE_ID') == title):
+                    return cand, folder
+            for entry in entries:
+                if not entry.is_dir() or entry == outer or entry == folder:
+                    continue
+                cand = _unwrap_game_root(entry)
+                if cand != folder and _has_libc(cand) and _sfo_info(cand).get('TITLE_ID') in SUPPORTED_TITLES:
+                    return cand, folder
+
+    # Case 2: User selected the base folder (e.g. CUSA03173 v01.00); look for a sibling *-patch folder.
+    patch_names = {
+        f'{name.casefold()}{suf}'
+        for name in (outer.name, folder.name, title) if name
+        for suf in PATCH_SUFFIXES
+    }
+    for parent in search_parents:
+        try:
+            entries = list(parent.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            if not entry.is_dir() or entry == outer or entry == folder:
+                continue
+            cand = _unwrap_game_root(entry)
+            if cand == folder or not (cand / 'eboot.bin').is_file():
+                continue
+            cand_info = _sfo_info(cand)
+            is_named_patch = entry.name.casefold() in patch_names or _strip_patch_suffix(entry.name) is not None
+            same_title = not title or not cand_info.get('TITLE_ID') or cand_info.get('TITLE_ID') == title
+            if is_named_patch and same_title:
+                if cand_info.get('APP_VER') == SUPPORTED_VERSION or version != SUPPORTED_VERSION:
+                    return folder, cand
+
+    return folder, None
+
+
+def game_file(game, relative):
+    """Path to `relative` in the patch folder if present there, else in the base game folder."""
+    base, patch = resolve_patch_pair(game)
+    if patch is not None:
+        cand = patch / relative
+        if cand.exists():
+            return cand
+    return base / relative
 
 
 def image_sha256(game):
     """The SHA-256 of eboot.bin's loaded image (its loadable segments at their addresses)."""
     from prepare import parse_self, span  # same directory
-    elf, header, ph, _segments, _missing = parse_self((Path(game) / 'eboot.bin').read_bytes())
+    elf, header, ph, _segments, _missing = parse_self(game_file(game, 'eboot.bin').read_bytes())
     loads = [p for p in ph if p['type'] in (1, 0x61000010)]
     image = bytearray(max(p['vaddr'] + p['memsz'] for p in loads))
     for p in loads:
@@ -63,8 +188,12 @@ def dcx_broken(path):
 
 def broken_files(game, folder=CHECKED_FOLDER):
     """The .dcx files under the game's folder that do not unpack (paths relative to the game)."""
-    root = Path(game)
-    return [str(f.relative_to(root)) for f in sorted((root / folder).rglob('*.dcx')) if dcx_broken(f)]
+    base, patch = resolve_patch_pair(game)
+    seen = {}
+    for root in (base, patch) if patch else (base,):
+        for f in sorted((root / folder).rglob('*.dcx')):
+            seen[str(f.relative_to(root))] = f
+    return [rel for rel, f in sorted(seen.items()) if dcx_broken(f)]
 
 
 # Texture packs (#240): upscaled map textures, baked into the game folder or merged from the mods
@@ -188,7 +317,7 @@ def problem(game, image_hash=None):
         return None
     from prepare import sfo
     try:
-        info = sfo((Path(game) / 'sce_sys/param.sfo').read_bytes())
+        info = sfo(game_file(game, 'sce_sys/param.sfo').read_bytes())
     except (OSError, ValueError, IndexError):
         info = {}
     title, version = info.get('TITLE_ID', '?'), info.get('APP_VER', '?')
@@ -211,9 +340,9 @@ def explain(kind, title, version):
     """What is wrong and what to do, for the log (English)."""
     found = f'Found {title} version {version} (sce_sys/param.sfo).'
     return {
-        'missing_update': f'{found} bbport needs the 1.09 update merged into the game folder: copy '
-                          'everything from the dumped 1.09 update (e.g. CUSA03173-patch) into the '
-                          'game folder, replacing files (eboot.bin and sce_sys too).',
+        'missing_update': f'{found} bbport needs the 1.09 update: place the dumped 1.09 update '
+                          f'folder (e.g. {title}-patch) next to the game folder, or copy its '
+                          'files into the game folder.',
         'wrong_eboot': f'{found} param.sfo is from 1.09 but eboot.bin is not: copy eboot.bin from '
                        'the dumped 1.09 update into the game folder, replacing the old one.',
         'patched_eboot': f'{found} This eboot.bin has the 60 fps patch by Lance McDonald applied '
@@ -229,6 +358,9 @@ def explain(kind, title, version):
                          'tool left parts of compressed sectors stale (LibOrbisPkg PkgTool on '
                          '.NET 6 or newer, issue #81): extract the game and the 1.09 update again '
                          'with a fixed tool. scripts/game_check.py GAME_DIR checks every file.',
+        'missing_base': f'{found} This folder is only the 1.09 update patch (sce_module/libc.prx is '
+                        f'missing): place the base game folder (e.g. {title}) next to this patch '
+                        'folder, or select the base game folder.',
     }[kind]
 
 

@@ -197,7 +197,7 @@ static unsigned char *backing_at(uint64_t phys) {
         const Region *r=region_at(phys,&next);
         if (r && r->fd==CHUNK_PRIVATE) return (unsigned char *)(r->va+(phys-r->phys));
     }
-    return backing_base+phys;
+    return backing_base ? backing_base+phys : NULL;
 }
 /* A chunk the GPU library already made for [phys,+size) (runtime_memory_commit: its import takes
  * ~170 ms on NVIDIA, which the write lock must not span: every GPU query of the memory map waited

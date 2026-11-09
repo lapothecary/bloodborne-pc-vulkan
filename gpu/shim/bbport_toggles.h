@@ -212,7 +212,81 @@ enum HudGpuCat : std::uint8_t {
     GpuCat_Count = 10,
     GpuCat_Gap = 0xFF
 };
+/// Fine-grained X-Ray GPU sub-pass breakdown (21 buckets, sum per group == parent GpuCat).
+enum HudGpuSubCat : std::uint8_t {
+    // 1. Shadow Maps (GpuCat_Shadows)
+    GpuSub_Shadow_CascadeAtlas = 0, // 1a. 4096x4096 CSM & Spot Depth
+    GpuSub_Shadow_VsmAndPcf = 1,    // 1b. VSM Blur & Screen-Space PCF
+    // 2. G-Buffer (GpuCat_GBuffer)
+    GpuSub_GBuf_WorldAndChr = 2,    // 2a. World & Character 6-MRT PBR
+    GpuSub_GBuf_FoliageAndCloth = 3,// 2b. Foliage & Two-Sided Cutout
+    // 3. SSAO (GpuCat_Ssao)
+    GpuSub_Ssao_GenReproj = 4,      // 3a. SSAO Raw Gen & Reproject
+    GpuSub_Ssao_BilateralBlur = 5,  // 3b. SSAO Bilateral Upscale/Blur
+    // 4. Deferred PBR & Sky/Fog (GpuCat_DeferredLight)
+    GpuSub_Def_DirectLocalPbr = 6,  // 4a. Sun/IBL & Local Point Lights
+    GpuSub_Def_SkyFogShafts = 7,    // 4b. Sky Dome, Fog & Light Shafts
+    // 5. SSR Reflections & Mips (GpuCat_Ssr)
+    GpuSub_Ssr_Raymarch = 8,        // 5a. Half-Res SSR Raymarching
+    GpuSub_Ssr_HiZAndMips = 9,      // 5b. Hi-Z Depth & Glossy Mip Blur
+    // 6. Forward Alpha (GpuCat_ForwardAlpha)
+    GpuSub_Fwd_HairClothAlpha = 10, // 6a. Hair, Blood, Cloth & Water
+    GpuSub_Fwd_SoftParticles = 11,  // 6b. Soft Particles & Flipbook VFX
+    // 7. Compute & Copies (GpuCat_ComputeCopies)
+    GpuSub_Comp_ParticlesCs = 12,   // 7a. GPU Particle Sim & Compute
+    GpuSub_Comp_CopiesAndHle = 13,  // 7b. Buffer/Image Copies & HLE
+    // 8. Yebis 2 Post-FX (GpuCat_PostFxYebis)
+    GpuSub_Post_DoF = 14,           // 8a. Depth of Field (CoC & Bokeh)
+    GpuSub_Post_MotionBlur = 15,    // 8b. Motion Blur (Velocity & Blur)
+    GpuSub_Post_BloomGlare = 16,    // 8c. Bloom, Emissive Glow & Glare
+    GpuSub_Post_TonemapLut = 17,    // 8d. HDR->LDR Tonemap & 3D LUT
+    // 9. Anti-Aliasing & Upscaler (GpuCat_AntiAliasing)
+    GpuSub_Aa_Upscaler = 18,        // 9a. Anti-Aliasing / Upscaler Pass
+    // 10. Scaleform UI & Present (GpuCat_UiPresent)
+    GpuSub_Ui_ScaleformHud = 19,    // 10a. Scaleform Game HUD & Menus
+    GpuSub_Ui_RcasPresent = 20,     // 10b. RCAS Sharpen, Overlay & Flip
+    GpuSub_Count = 21,
+    GpuSub_Gap = 0xFF
+};
+constexpr std::uint8_t ParentGpuCat(std::uint8_t subcat) noexcept {
+    switch (subcat) {
+    case GpuSub_Shadow_CascadeAtlas:
+    case GpuSub_Shadow_VsmAndPcf:
+        return GpuCat_Shadows;
+    case GpuSub_GBuf_WorldAndChr:
+    case GpuSub_GBuf_FoliageAndCloth:
+        return GpuCat_GBuffer;
+    case GpuSub_Ssao_GenReproj:
+    case GpuSub_Ssao_BilateralBlur:
+        return GpuCat_Ssao;
+    case GpuSub_Def_DirectLocalPbr:
+    case GpuSub_Def_SkyFogShafts:
+        return GpuCat_DeferredLight;
+    case GpuSub_Ssr_Raymarch:
+    case GpuSub_Ssr_HiZAndMips:
+        return GpuCat_Ssr;
+    case GpuSub_Fwd_HairClothAlpha:
+    case GpuSub_Fwd_SoftParticles:
+        return GpuCat_ForwardAlpha;
+    case GpuSub_Comp_ParticlesCs:
+    case GpuSub_Comp_CopiesAndHle:
+        return GpuCat_ComputeCopies;
+    case GpuSub_Post_DoF:
+    case GpuSub_Post_MotionBlur:
+    case GpuSub_Post_BloomGlare:
+    case GpuSub_Post_TonemapLut:
+        return GpuCat_PostFxYebis;
+    case GpuSub_Aa_Upscaler:
+        return GpuCat_AntiAliasing;
+    case GpuSub_Ui_ScaleformHud:
+    case GpuSub_Ui_RcasPresent:
+        return GpuCat_UiPresent;
+    default:
+        return GpuCat_Gap;
+    }
+}
 inline std::array<std::atomic<std::uint64_t>, GpuCat_Count> hw_gpu_cat_ns{};
+inline std::array<std::atomic<std::uint64_t>, GpuSub_Count> hw_gpu_subcat_ns{};
 /// Active CPU execution nanoseconds of the game's Main thread (CLOCK_THREAD_CPUTIME_ID, excluding FPS cap sleep).
 inline std::atomic<std::uint64_t> main_cpu_busy_ns{0}, main_cpu_frames{0};
 /// Frames shown (Presenter::PrepareFrame), and bytes the background pre-upload put into the arena.

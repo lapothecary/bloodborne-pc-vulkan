@@ -1277,6 +1277,7 @@ bool Rasterizer::RunInOrder(OrderedTask task, const void* data, u32 size, u64 to
                             bool reads_guest_memory) {
     if (!UseDrawPipe() || BbToggle::Disabled(toggle)) {
         DrainDrawPipe(DrawPipe::ReasonRasterizer);
+        BB_SECTION(Task);
         task(*this, static_cast<const u8*>(data));
         return false;
     }

@@ -61,6 +61,7 @@ std::mutex imgui_mutex; // the ImGui context: window thread (input) and present 
 bool initialized = false;
 std::atomic<bool> menu_open{false};
 std::atomic<bool> reset_hud_avg{false};
+std::atomic<bool> show_xray_details{true};
 bool l3_down = false, r3_down = false;
 bool dirty = false; // settings changed while open: saved on close
 int rebinding_action = -1; // >= 0 while waiting for a key/mouse press to rebind KeyAction
@@ -714,6 +715,17 @@ void Menu() {
         }
         ImGui::EndCombo();
     }
+    {
+        const char* wm_labels[] = {
+            BbSettings::MenuText("Fullscreen", "Полный экран"),
+            BbSettings::MenuText("Borderless Windowed", "Окно без рамки"),
+            BbSettings::MenuText("Windowed", "В окне")};
+        int wm = std::clamp(s.window_mode.load(), 0, BbSettings::WindowModeCount - 1);
+        if (ImGui::Combo(BbSettings::MenuText("Window mode", "Режим экрана"), &wm, wm_labels, 3)) {
+            s.window_mode_chosen = true;
+            Store(s.window_mode, wm, true);
+        }
+    }
     Hint(BbSettings::MenuText(
         "The output frame, UI, and 3D G-Buffer resolution update on the next frame boundary "
         "(full Yebis2 post-FX buffer reallocation applies on restart). Another aspect ratio "
@@ -1097,6 +1109,11 @@ struct HudSampleSlot {
     double a_pm4_pipe_ms = 0.0;
     double a_ring_ms = 0.0;
     double a_drain_ms = 0.0;
+    double a_decode_pso_ms = 0.0;
+    double a_buf_ring_ms = 0.0;
+    double a_tex_desc_ms = 0.0;
+    double a_state_draw_ms = 0.0;
+    double a_submit_sync_ms = 0.0;
     double b_total_ms = 0.0;
     double b_buffers_ms = 0.0;
     double b_tex_desc_ms = 0.0;
@@ -1107,6 +1124,7 @@ struct HudSampleSlot {
     double hw_gpu_busy_ms = 0.0;
     double hw_gpu_gap_ms = 0.0;
     std::array<double, BbStats::GpuCat_Count> hw_gpu_cat_ms{};
+    std::array<double, BbStats::GpuSub_Count> hw_gpu_subcat_ms{};
     std::uint64_t hw_gpu_frames = 0;
 };
 
@@ -1147,6 +1165,11 @@ struct HudSlidingWindow {
             sub_f64(sum.a_pm4_pipe_ms, old.a_pm4_pipe_ms);
             sub_f64(sum.a_ring_ms, old.a_ring_ms);
             sub_f64(sum.a_drain_ms, old.a_drain_ms);
+            sub_f64(sum.a_decode_pso_ms, old.a_decode_pso_ms);
+            sub_f64(sum.a_buf_ring_ms, old.a_buf_ring_ms);
+            sub_f64(sum.a_tex_desc_ms, old.a_tex_desc_ms);
+            sub_f64(sum.a_state_draw_ms, old.a_state_draw_ms);
+            sub_f64(sum.a_submit_sync_ms, old.a_submit_sync_ms);
             sub_f64(sum.b_total_ms, old.b_total_ms);
             sub_f64(sum.b_buffers_ms, old.b_buffers_ms);
             sub_f64(sum.b_tex_desc_ms, old.b_tex_desc_ms);
@@ -1158,6 +1181,9 @@ struct HudSlidingWindow {
             sub_f64(sum.hw_gpu_gap_ms, old.hw_gpu_gap_ms);
             for (std::size_t c = 0; c < BbStats::GpuCat_Count; ++c) {
                 sub_f64(sum.hw_gpu_cat_ms[c], old.hw_gpu_cat_ms[c]);
+            }
+            for (std::size_t sc = 0; sc < BbStats::GpuSub_Count; ++sc) {
+                sub_f64(sum.hw_gpu_subcat_ms[sc], old.hw_gpu_subcat_ms[sc]);
             }
             sub_u64(sum.hw_gpu_frames, old.hw_gpu_frames);
         } else {
@@ -1187,6 +1213,11 @@ struct HudSlidingWindow {
         sum.a_pm4_pipe_ms += s.a_pm4_pipe_ms;
         sum.a_ring_ms += s.a_ring_ms;
         sum.a_drain_ms += s.a_drain_ms;
+        sum.a_decode_pso_ms += s.a_decode_pso_ms;
+        sum.a_buf_ring_ms += s.a_buf_ring_ms;
+        sum.a_tex_desc_ms += s.a_tex_desc_ms;
+        sum.a_state_draw_ms += s.a_state_draw_ms;
+        sum.a_submit_sync_ms += s.a_submit_sync_ms;
         sum.b_total_ms += s.b_total_ms;
         sum.b_buffers_ms += s.b_buffers_ms;
         sum.b_tex_desc_ms += s.b_tex_desc_ms;
@@ -1198,6 +1229,9 @@ struct HudSlidingWindow {
         sum.hw_gpu_gap_ms += s.hw_gpu_gap_ms;
         for (std::size_t c = 0; c < BbStats::GpuCat_Count; ++c) {
             sum.hw_gpu_cat_ms[c] += s.hw_gpu_cat_ms[c];
+        }
+        for (std::size_t sc = 0; sc < BbStats::GpuSub_Count; ++sc) {
+            sum.hw_gpu_subcat_ms[sc] += s.hw_gpu_subcat_ms[sc];
         }
         sum.hw_gpu_frames += s.hw_gpu_frames;
     }
@@ -1235,12 +1269,17 @@ struct HudBreakdown {
     float gnm_wait_ms = 0.0f, avg_gnm_wait_ms = 0.0f;
     float game_cpu_work_ms = 0.0f, avg_game_cpu_work_ms = 0.0f;
     float fps_cap_sleep_ms = 0.0f, avg_fps_cap_sleep_ms = 0.0f;
-    // Stage 2: Stage A (bb:GpuComm)
+    // Stage 2: Stage A (bb:GpuComm / DirectVk RHI)
     float a_total_ms = 0.0f, avg_a_total_ms = 0.0f;
     float a_pm4_pipe_ms = 0.0f, avg_a_pm4_pipe_ms = 0.0f;
     float a_ring_ms = 0.0f, avg_a_ring_ms = 0.0f;
     float a_drain_ms = 0.0f, avg_a_drain_ms = 0.0f;
     float a_flush_ms = 0.0f;
+    float a_decode_pso_ms = 0.0f, avg_a_decode_pso_ms = 0.0f;
+    float a_buf_ring_ms = 0.0f, avg_a_buf_ring_ms = 0.0f;
+    float a_tex_desc_ms = 0.0f, avg_a_tex_desc_ms = 0.0f;
+    float a_state_draw_ms = 0.0f, avg_a_state_draw_ms = 0.0f;
+    float a_submit_sync_ms = 0.0f, avg_a_submit_sync_ms = 0.0f;
     // Stage 3: Stage B (bb:DrawRec)
     float b_total_ms = 0.0f, avg_b_total_ms = 0.0f;
     float b_buffers_ms = 0.0f, avg_b_buffers_ms = 0.0f;
@@ -1252,7 +1291,7 @@ struct HudBreakdown {
     float b_tasks_ms = 0.0f, avg_b_tasks_ms = 0.0f;
     float b_packet_misc_ms = 0.0f, avg_b_packet_misc_ms = 0.0f;
     float b_flush_ms = 0.0f;
-    // Stage 4: GPU / Sync Wait + Hardware GPU Busy/Gap + 10 Render-Pass Categories
+    // Stage 4: GPU / Sync Wait + Hardware GPU Busy/Gap + 10 Render-Pass Categories + 21 Sub-Categories
     float gpu_present_ms = 0.0f;
     float sync_rec_ms = 0.0f;
     float host_copy_ms = 0.0f;
@@ -1262,6 +1301,8 @@ struct HudBreakdown {
     float hw_gpu_gap_ms = 0.0f, avg_hw_gpu_gap_ms = 0.0f;
     std::array<float, BbStats::GpuCat_Count> hw_gpu_cat_ms{};
     std::array<float, BbStats::GpuCat_Count> avg_hw_gpu_cat_ms{};
+    std::array<float, BbStats::GpuSub_Count> hw_gpu_subcat_ms{};
+    std::array<float, BbStats::GpuSub_Count> avg_hw_gpu_subcat_ms{};
     std::size_t top_gpu_cat = 0;
     // Bottleneck summary
     const char* bottleneck_ru = "Ожидание данных...";
@@ -1431,6 +1472,7 @@ void UpdateHudBreakdown(HudBreakdown& h) {
     static std::uint64_t last_desc_saved = 0, last_desc_total = 0;
     static std::uint64_t last_hw_busy_ns = 0, last_hw_gap_ns = 0, last_hw_frames = 0;
     static std::array<std::uint64_t, BbStats::GpuCat_Count> last_hw_cat_ns{};
+    static std::array<std::uint64_t, BbStats::GpuSub_Count> last_hw_subcat_ns{};
     static std::array<std::uint64_t, BbSections::Count> last_ca{}, last_cb{};
 
     const auto now = Clock::now();
@@ -1470,6 +1512,9 @@ void UpdateHudBreakdown(HudBreakdown& h) {
         last_hw_frames = BbStats::hw_gpu_frames.load(std::memory_order_relaxed);
         for (std::size_t c = 0; c < BbStats::GpuCat_Count; ++c) {
             last_hw_cat_ns[c] = BbStats::hw_gpu_cat_ns[c].load(std::memory_order_relaxed);
+        }
+        for (std::size_t sc = 0; sc < BbStats::GpuSub_Count; ++sc) {
+            last_hw_subcat_ns[sc] = BbStats::hw_gpu_subcat_ns[sc].load(std::memory_order_relaxed);
         }
         for (std::size_t i = 0; i < BbSections::Count; ++i) {
             last_ca[i] = BbSections::cycles_a[i].load(std::memory_order_relaxed);
@@ -1541,6 +1586,10 @@ void UpdateHudBreakdown(HudBreakdown& h) {
     for (std::size_t c = 0; c < BbStats::GpuCat_Count; ++c) {
         cur_hw_cat_ns[c] = BbStats::hw_gpu_cat_ns[c].load(std::memory_order_relaxed);
     }
+    std::array<std::uint64_t, BbStats::GpuSub_Count> cur_hw_subcat_ns{};
+    for (std::size_t sc = 0; sc < BbStats::GpuSub_Count; ++sc) {
+        cur_hw_subcat_ns[sc] = BbStats::hw_gpu_subcat_ns[sc].load(std::memory_order_relaxed);
+    }
 
     const auto safe_delta = [](std::uint64_t cur, std::uint64_t last) -> std::uint64_t {
         return cur >= last ? (cur - last) : cur;
@@ -1604,6 +1653,10 @@ void UpdateHudBreakdown(HudBreakdown& h) {
                 top_c = c;
             }
         }
+        for (std::size_t sc = 0; sc < BbStats::GpuSub_Count; ++sc) {
+            h.hw_gpu_subcat_ms[sc] = float(
+                double(safe_delta(cur_hw_subcat_ns[sc], last_hw_subcat_ns[sc])) * 1e-6 * inv_hw_f);
+        }
         h.top_gpu_cat = top_c;
     }
 
@@ -1635,6 +1688,21 @@ void UpdateHudBreakdown(HudBreakdown& h) {
     const float raw_sync_rec_ms = ns_to_ms(safe_delta(cur_sync_rec_ns, last_sync_rec_ns));
     h.sync_rec_ms = std::max(0.0f, raw_sync_rec_ms - h.gpu_present_ms);
     h.host_copy_ms = ns_to_ms(safe_delta(cur_host_copy_ns, last_host_copy_ns));
+
+    // Stage A granular X-Ray breakdown (covers both Direct Inline mode and Pipelined mode):
+    const float a_buf_only_ms = cyc_to_ms(dca[BbSections::BindBuffers] +
+                                          dca[BbSections::ResolveVertexBuffers] +
+                                          dca[BbSections::ResolveIndexBuffer]);
+    h.a_buf_ring_ms = a_buf_only_ms + h.a_ring_ms;
+    h.a_tex_desc_ms = cyc_to_ms(dca[BbSections::BindTextures] + dca[BbSections::PipelineBind]);
+    const float a_draw_disp_total_ms =
+        cyc_to_ms(dca[BbSections::DrawRecord] + dca[BbSections::DispatchRecord]);
+    h.a_state_draw_ms = std::max(
+        0.0f, a_draw_disp_total_ms - (a_buf_only_ms + h.a_tex_desc_ms));
+    const float a_tasks_ms = std::max(0.0f, cyc_to_ms(dca[BbSections::Task]) - h.gpu_present_ms);
+    h.a_submit_sync_ms = h.a_flush_ms + a_tasks_ms + h.a_drain_ms;
+    h.a_decode_pso_ms = std::max(0.0f, h.a_total_ms - (h.a_buf_ring_ms + h.a_tex_desc_ms +
+                                                       h.a_state_draw_ms + h.a_submit_sync_ms));
 
     const float raw_b_total_ms = cyc_to_ms(safe_delta(cur_pipe_busy_cyc, last_pipe_busy_cyc));
     h.b_total_ms = std::max(0.0f, raw_b_total_ms - h.gpu_present_ms);
@@ -1692,6 +1760,11 @@ void UpdateHudBreakdown(HudBreakdown& h) {
         s.a_pm4_pipe_ms = double(h.a_pm4_pipe_ms) * f_weight;
         s.a_ring_ms = double(h.a_ring_ms) * f_weight;
         s.a_drain_ms = double(h.a_drain_ms) * f_weight;
+        s.a_decode_pso_ms = double(h.a_decode_pso_ms) * f_weight;
+        s.a_buf_ring_ms = double(h.a_buf_ring_ms) * f_weight;
+        s.a_tex_desc_ms = double(h.a_tex_desc_ms) * f_weight;
+        s.a_state_draw_ms = double(h.a_state_draw_ms) * f_weight;
+        s.a_submit_sync_ms = double(h.a_submit_sync_ms) * f_weight;
         s.b_total_ms = double(h.b_total_ms) * f_weight;
         s.b_buffers_ms = double(h.b_buffers_ms) * f_weight;
         s.b_tex_desc_ms = double(h.b_tex_desc_ms) * f_weight;
@@ -1706,6 +1779,9 @@ void UpdateHudBreakdown(HudBreakdown& h) {
             s.hw_gpu_gap_ms = double(h.hw_gpu_gap_ms) * hw_weight;
             for (std::size_t c = 0; c < BbStats::GpuCat_Count; ++c) {
                 s.hw_gpu_cat_ms[c] = double(h.hw_gpu_cat_ms[c]) * hw_weight;
+            }
+            for (std::size_t sc = 0; sc < BbStats::GpuSub_Count; ++sc) {
+                s.hw_gpu_subcat_ms[sc] = double(h.hw_gpu_subcat_ms[sc]) * hw_weight;
             }
         }
         win.Push(s);
@@ -1752,6 +1828,11 @@ void UpdateHudBreakdown(HudBreakdown& h) {
         h.avg_a_ring_ms = float(win.sum.a_ring_ms * inv_af);
         h.avg_a_drain_ms = float(win.sum.a_drain_ms * inv_af);
         h.avg_a_total_ms = h.avg_a_pm4_pipe_ms + h.avg_a_ring_ms + h.avg_a_drain_ms;
+        h.avg_a_decode_pso_ms = float(win.sum.a_decode_pso_ms * inv_af);
+        h.avg_a_buf_ring_ms = float(win.sum.a_buf_ring_ms * inv_af);
+        h.avg_a_tex_desc_ms = float(win.sum.a_tex_desc_ms * inv_af);
+        h.avg_a_state_draw_ms = float(win.sum.a_state_draw_ms * inv_af);
+        h.avg_a_submit_sync_ms = float(win.sum.a_submit_sync_ms * inv_af);
         h.avg_b_total_ms = float(win.sum.b_total_ms * inv_af);
         h.avg_b_buffers_ms = float(win.sum.b_buffers_ms * inv_af);
         h.avg_b_tex_desc_ms = float(win.sum.b_tex_desc_ms * inv_af);
@@ -1770,10 +1851,14 @@ void UpdateHudBreakdown(HudBreakdown& h) {
             for (std::size_t c = 0; c < BbStats::GpuCat_Count; ++c) {
                 h.avg_hw_gpu_cat_ms[c] = float(win.sum.hw_gpu_cat_ms[c] * inv_hw);
             }
+            for (std::size_t sc = 0; sc < BbStats::GpuSub_Count; ++sc) {
+                h.avg_hw_gpu_subcat_ms[sc] = float(win.sum.hw_gpu_subcat_ms[sc] * inv_hw);
+            }
         } else {
             h.avg_hw_gpu_busy_ms = h.hw_gpu_busy_ms;
             h.avg_hw_gpu_gap_ms = h.hw_gpu_gap_ms;
             h.avg_hw_gpu_cat_ms = h.hw_gpu_cat_ms;
+            h.avg_hw_gpu_subcat_ms = h.hw_gpu_subcat_ms;
         }
     } else {
         h.has_avg = false;
@@ -1796,6 +1881,11 @@ void UpdateHudBreakdown(HudBreakdown& h) {
         h.avg_a_ring_ms = h.a_ring_ms;
         h.avg_a_drain_ms = h.a_drain_ms;
         h.avg_a_total_ms = h.a_total_ms;
+        h.avg_a_decode_pso_ms = h.a_decode_pso_ms;
+        h.avg_a_buf_ring_ms = h.a_buf_ring_ms;
+        h.avg_a_tex_desc_ms = h.a_tex_desc_ms;
+        h.avg_a_state_draw_ms = h.a_state_draw_ms;
+        h.avg_a_submit_sync_ms = h.a_submit_sync_ms;
         h.avg_b_total_ms = h.b_total_ms;
         h.avg_b_buffers_ms = h.b_buffers_ms;
         h.avg_b_tex_desc_ms = h.b_tex_desc_ms;
@@ -1807,6 +1897,7 @@ void UpdateHudBreakdown(HudBreakdown& h) {
         h.avg_hw_gpu_busy_ms = h.hw_gpu_busy_ms;
         h.avg_hw_gpu_gap_ms = h.hw_gpu_gap_ms;
         h.avg_hw_gpu_cat_ms = h.hw_gpu_cat_ms;
+        h.avg_hw_gpu_subcat_ms = h.hw_gpu_subcat_ms;
     }
 
     // Determine primary bottleneck across parallel stages (and detect active FPS limiter):
@@ -1929,6 +2020,7 @@ void UpdateHudBreakdown(HudBreakdown& h) {
         last_hw_gap_ns = cur_hw_gap_ns;
         last_hw_frames = cur_hw_frames;
         last_hw_cat_ns = cur_hw_cat_ns;
+        last_hw_subcat_ns = cur_hw_subcat_ns;
     }
 
     if (std::chrono::duration<double>(now - last_file_dump).count() >= 1.0) {
@@ -1936,47 +2028,60 @@ void UpdateHudBreakdown(HudBreakdown& h) {
         const auto& s = BbSettings::Get();
         const auto out = BbSettings::CurrentOutput();
         const auto shd = Vulkan::DirectShaders::ReadTelemetry();
-        char hud_buf[2048];
-        std::snprintf(hud_buf, sizeof(hud_buf),
-                      "FPS: %.1f (%.2f ms/f) | Avg15s: %.1f FPS (%.2f ms/f, Jit %.2f ms) | Scene: %dx%d -> %dx%d | Upscaler: %s (%s)%s\n"
-                      "GPU HW: %.1f W | %d MHz | %d C | DrvBusy %d%% | VRAM %.2f/%.2f GB\n"
-                      "Counts/f: Draws %.0f (Avg %.0f) | Disp %.0f (Avg %.0f) | Subm %.1f (Avg %.1f) | PipeDrains %.1f | Faults/s %.1f | NativeVkBuf %.1f%% | NativeVkTex %.1f%% | DescSaved %.1f%% | DontCare %llu/%llu\n"
-                      "DirectShaders: reg %llu | manifest %llu/%u | stageA_hits %llu | worker_hits %llu\n"
-                      "CPU 1. Game Engine: Work %.2f ms (Avg %.2f) | FpsCapSleep %.2f ms (Avg %.2f) | GnmWait %.2f ms (Avg %.2f)\n"
-                      "CPU 2. Stage A (GpuComm): Total %.2f ms (Avg %.2f) | PM4+FastPSO %.2f ms (Avg %.2f) | ConstRing %.2f ms (Avg %.2f) | WaitDrainB %.2f ms\n"
-                      "CPU 3. Stage B (DrawRec): Total %.2f ms (Avg %.2f) | Buffers %.2f ms | Tex+Desc %.2f ms | State+Draw+Disp %.2f ms | Tasks %.2f ms | Packet+Regs %.2f ms\n"
-                      "GPU Render Passes: TotalBusy %.2f ms (Avg %.2f) | Gap %.2f ms (Avg %.2f) | PresentSync %.2f ms (Avg %.2f)\n"
-                      "  1.Shadows %.2f ms | 2.GBuf %.2f ms | 3.SSAO %.2f ms | 4.DefPBR %.2f ms | 5.SSR %.2f ms | 6.FwdAlpha %.2f ms | 7.CompCopy %.2f ms | 8.Yebis2 %.2f ms | 9.AA/Up %.2f ms | 10.UI/Pres %.2f ms\n"
-                      "BOTTLENECK: %s (Now %.2f ms / Avg %.2f ms)\n",
-                      h.fps, h.frame_ms, h.avg_fps, h.avg_frame_ms, h.avg_jitter_ms,
-                      s.active_render_width.load(), s.active_render_height.load(),
-                      out.width, out.height,
-                      BbSettings::UpscalerName(s.upscaler),
-                      BbSettings::PresetName(BbSettings::RenderPreset()),
-                      BbSettings::ResolutionNeedsRestart() ? " [NEEDS RESTART]" : "",
-                      h.gpu_power_w, h.gpu_clock_mhz, h.gpu_temp_c, h.gpu_drv_util_pct, h.vram_used_gb, h.vram_total_gb,
-                      h.draws_pf, h.avg_draws_pf, h.dispatches_pf, h.avg_dispatches_pf,
-                      h.submits_pf, h.avg_submits_pf, h.drains_pf,
-                      h.faults_ps, h.native_buf_pct, h.native_tex_pct,
-                      h.desc_saved_pct,
-                      static_cast<unsigned long long>(BbStats::dont_care_passes.load(std::memory_order_relaxed)),
-                      static_cast<unsigned long long>(BbStats::total_render_passes.load(std::memory_order_relaxed)),
-                      static_cast<unsigned long long>(shd.registered_binaries),
-                      static_cast<unsigned long long>(shd.manifest_binaries_bound),
-                      shd.manifest_total,
-                      static_cast<unsigned long long>(shd.stage_a_direct_hits),
-                      static_cast<unsigned long long>(shd.worker_direct_hits),
-                      h.game_cpu_work_ms, h.avg_game_cpu_work_ms, h.fps_cap_sleep_ms, h.avg_fps_cap_sleep_ms, h.gnm_wait_ms, h.avg_gnm_wait_ms,
-                      h.a_total_ms, h.avg_a_total_ms, h.a_pm4_pipe_ms, h.avg_a_pm4_pipe_ms,
-                      h.a_ring_ms, h.avg_a_ring_ms, h.a_drain_ms,
-                      h.b_total_ms, h.avg_b_total_ms, h.b_buffers_ms,
-                      h.b_tex_desc_ms, h.b_state_pass_ms,
-                      h.b_tasks_ms, h.b_packet_misc_ms,
-                      h.hw_gpu_busy_ms, h.avg_hw_gpu_busy_ms, h.hw_gpu_gap_ms, h.avg_hw_gpu_gap_ms,
-                      gpu_wait_now_ms, h.avg_gpu_wait_ms,
-                      h.hw_gpu_cat_ms[0], h.hw_gpu_cat_ms[1], h.hw_gpu_cat_ms[2], h.hw_gpu_cat_ms[3], h.hw_gpu_cat_ms[4],
-                      h.hw_gpu_cat_ms[5], h.hw_gpu_cat_ms[6], h.hw_gpu_cat_ms[7], h.hw_gpu_cat_ms[8], h.hw_gpu_cat_ms[9],
-                      h.bottleneck_en, h.bottleneck_ms, h.avg_bottleneck_ms);
+        char hud_buf[4096];
+        std::snprintf(
+            hud_buf, sizeof(hud_buf),
+            "FPS: %.1f (%.2f ms/f) | Avg15s: %.1f FPS (%.2f ms/f, Jit %.2f ms) | Scene: %dx%d -> %dx%d | Upscaler: %s (%s)%s\n"
+            "GPU HW: %.1f W | %d MHz | %d C | DrvBusy %d%% | VRAM %.2f/%.2f GB\n"
+            "Counts/f: Draws %.0f (Avg %.0f) | Disp %.0f (Avg %.0f) | Subm %.1f (Avg %.1f) | PipeDrains %.1f | Faults/s %.1f | NativeVkBuf %.1f%% | NativeVkTex %.1f%% | DescSaved %.1f%% | DontCare %llu/%llu\n"
+            "DirectShaders: reg %llu | manifest %llu/%u | stageA_hits %llu | worker_hits %llu\n"
+            "CPU 1. Game Engine: Work %.2f ms (Avg %.2f) | FpsCapSleep %.2f ms (Avg %.2f) | GnmWait %.2f ms (Avg %.2f)\n"
+            "CPU 2. Stage A (DirectVk RHI): Total %.2f ms (Avg %.2f) -> [2a.PM4+FastPSO %.2f | 2b.Buf+Vtx+Ring %.2f | 2c.Tex+PushDesc %.2f | 2d.Pass+State+Draw %.2f | 2e.Submit+Sync %.2f]\n"
+            "CPU 3. Stage B (Vulkan Record): Total %.2f ms (Avg %.2f) -> [3a.Buffers %.2f | 3b.Tex+Desc %.2f | 3c.Pass+Draw+Disp %.2f | 3d.Tasks %.2f | 3e.Packet+Regs %.2f]\n"
+            "GPU Render Passes: TotalBusy %.2f ms (Avg %.2f) | Gap %.2f ms (Avg %.2f) | PresentSync %.2f ms (Avg %.2f)\n"
+            "  1.Shadow %.2f ms (1a.CSM/Spot %.2f | 1b.VSM/PCF %.2f) | 2.GBuf %.2f ms (2a.World/Chr %.2f | 2b.Foliage %.2f)\n"
+            "  3.SSAO %.2f ms (3a.RawGen %.2f | 3b.Blur/Up %.2f) | 4.DefPBR %.2f ms (4a.Sun/IBL/Local %.2f | 4b.Sky/Fog/Shafts %.2f)\n"
+            "  5.SSR %.2f ms (5a.Raymarch %.2f | 5b.HiZ/Mips %.2f) | 6.FwdAlpha %.2f ms (6a.Hair/Blood/Water %.2f | 6b.Particles/VFX %.2f)\n"
+            "  7.CompCopy %.2f ms (7a.ParticleCS %.2f | 7b.Copies/HLE %.2f) | 8.Yebis2 %.2f ms (8a.DoF %.2f | 8b.MotBlur %.2f | 8c.Bloom/Glow %.2f | 8d.Tonemap/LUT %.2f)\n"
+            "  9.AA/Upscale %.2f ms (9a.Upscaler %.2f) | 10.UI/Present %.2f ms (10a.ScaleformHUD %.2f | 10b.RCAS+Overlay+Flip %.2f)\n"
+            "BOTTLENECK: %s (Now %.2f ms / Avg %.2f ms)\n",
+            h.fps, h.frame_ms, h.avg_fps, h.avg_frame_ms, h.avg_jitter_ms,
+            s.active_render_width.load(), s.active_render_height.load(),
+            out.width, out.height,
+            BbSettings::UpscalerName(s.upscaler),
+            BbSettings::PresetName(BbSettings::RenderPreset()),
+            BbSettings::ResolutionNeedsRestart() ? " [NEEDS RESTART]" : "",
+            h.gpu_power_w, h.gpu_clock_mhz, h.gpu_temp_c, h.gpu_drv_util_pct, h.vram_used_gb, h.vram_total_gb,
+            h.draws_pf, h.avg_draws_pf, h.dispatches_pf, h.avg_dispatches_pf,
+            h.submits_pf, h.avg_submits_pf, h.drains_pf,
+            h.faults_ps, h.native_buf_pct, h.native_tex_pct,
+            h.desc_saved_pct,
+            static_cast<unsigned long long>(BbStats::dont_care_passes.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(BbStats::total_render_passes.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(shd.registered_binaries),
+            static_cast<unsigned long long>(shd.manifest_binaries_bound),
+            shd.manifest_total,
+            static_cast<unsigned long long>(shd.stage_a_direct_hits),
+            static_cast<unsigned long long>(shd.worker_direct_hits),
+            h.game_cpu_work_ms, h.avg_game_cpu_work_ms, h.fps_cap_sleep_ms, h.avg_fps_cap_sleep_ms, h.gnm_wait_ms, h.avg_gnm_wait_ms,
+            h.a_total_ms, h.avg_a_total_ms, h.a_decode_pso_ms, h.a_buf_ring_ms, h.a_tex_desc_ms, h.a_state_draw_ms, h.a_submit_sync_ms,
+            h.b_total_ms, h.avg_b_total_ms, h.b_buffers_ms,
+            h.b_tex_desc_ms, h.b_state_pass_ms,
+            h.b_tasks_ms, h.b_packet_misc_ms,
+            h.hw_gpu_busy_ms, h.avg_hw_gpu_busy_ms, h.hw_gpu_gap_ms, h.avg_hw_gpu_gap_ms,
+            gpu_wait_now_ms, h.avg_gpu_wait_ms,
+            h.hw_gpu_cat_ms[0], h.hw_gpu_subcat_ms[BbStats::GpuSub_Shadow_CascadeAtlas], h.hw_gpu_subcat_ms[BbStats::GpuSub_Shadow_VsmAndPcf],
+            h.hw_gpu_cat_ms[1], h.hw_gpu_subcat_ms[BbStats::GpuSub_GBuf_WorldAndChr], h.hw_gpu_subcat_ms[BbStats::GpuSub_GBuf_FoliageAndCloth],
+            h.hw_gpu_cat_ms[2], h.hw_gpu_subcat_ms[BbStats::GpuSub_Ssao_GenReproj], h.hw_gpu_subcat_ms[BbStats::GpuSub_Ssao_BilateralBlur],
+            h.hw_gpu_cat_ms[3], h.hw_gpu_subcat_ms[BbStats::GpuSub_Def_DirectLocalPbr], h.hw_gpu_subcat_ms[BbStats::GpuSub_Def_SkyFogShafts],
+            h.hw_gpu_cat_ms[4], h.hw_gpu_subcat_ms[BbStats::GpuSub_Ssr_Raymarch], h.hw_gpu_subcat_ms[BbStats::GpuSub_Ssr_HiZAndMips],
+            h.hw_gpu_cat_ms[5], h.hw_gpu_subcat_ms[BbStats::GpuSub_Fwd_HairClothAlpha], h.hw_gpu_subcat_ms[BbStats::GpuSub_Fwd_SoftParticles],
+            h.hw_gpu_cat_ms[6], h.hw_gpu_subcat_ms[BbStats::GpuSub_Comp_ParticlesCs], h.hw_gpu_subcat_ms[BbStats::GpuSub_Comp_CopiesAndHle],
+            h.hw_gpu_cat_ms[7], h.hw_gpu_subcat_ms[BbStats::GpuSub_Post_DoF], h.hw_gpu_subcat_ms[BbStats::GpuSub_Post_MotionBlur],
+            h.hw_gpu_subcat_ms[BbStats::GpuSub_Post_BloomGlare], h.hw_gpu_subcat_ms[BbStats::GpuSub_Post_TonemapLut],
+            h.hw_gpu_cat_ms[8], h.hw_gpu_subcat_ms[BbStats::GpuSub_Aa_Upscaler],
+            h.hw_gpu_cat_ms[9], h.hw_gpu_subcat_ms[BbStats::GpuSub_Ui_ScaleformHud], h.hw_gpu_subcat_ms[BbStats::GpuSub_Ui_RcasPresent],
+            h.bottleneck_en, h.bottleneck_ms, h.avg_bottleneck_ms);
 #ifndef _WIN32
         if (FILE* f = std::fopen("/tmp/bb_frame_hud.txt", "w")) {
             std::fputs(hud_buf, f);
@@ -2047,6 +2152,11 @@ void FpsCounter() {
         std::snprintf(upscaler_str, sizeof(upscaler_str), "%s", base_aa_str);
     }
 
+    const bool xray = show_xray_details.load(std::memory_order_relaxed);
+    if (xray) {
+        ImGui::SetWindowFontScale(0.82f);
+    }
+
     const float now_fps = frame_ms_avg > 0.0f ? 1000.0f / frame_ms_avg : h.fps;
     const float now_ms = frame_ms_avg > 0.0f ? frame_ms_avg : h.frame_ms;
     if (h.has_avg) {
@@ -2096,11 +2206,15 @@ void FpsCounter() {
         h.desc_saved_pct, h.avg_desc_saved_pct);
 
     ImGui::Separator();
+    if (xray) {
+        ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(4.0f * base_scale, 1.0f * base_scale));
+    }
     if (ImGui::BeginTable("##hud_breakdown", 4,
                           ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_NoPadOuterX)) {
         ImGui::TableNextRow();
         ImGui::TableSetColumnIndex(0);
-        ImGui::TextDisabled("CPU & GPU Render Pass Breakdown");
+        ImGui::TextDisabled(xray ? "CPU & GPU Breakdown [F9: X-Ray ON]"
+                                 : "CPU & GPU Breakdown [F9: X-Ray OFF]");
         ImGui::TableSetColumnIndex(1);
         ImGui::TextDisabled("   Now");
         ImGui::TableSetColumnIndex(2);
@@ -2117,6 +2231,26 @@ void FpsCounter() {
                              : ms >= 1.50f   ? ImVec4(1.0f, 0.60f, 0.45f, 1.0f)
                              : ms >= 0.75f   ? ImVec4(0.95f, 0.92f, 0.75f, 1.0f)
                                              : ImVec4(0.75f, 0.78f, 0.82f, 1.0f);
+            ImGui::TextColored(col, "%s", label_en);
+            ImGui::TableSetColumnIndex(1);
+            ImGui::TextColored(col, "%5.2f ms", ms);
+            ImGui::TableSetColumnIndex(2);
+            if (h.has_avg) {
+                ImGui::TextDisabled("%5.2f", avg_ms);
+            } else {
+                ImGui::TextDisabled("  -- ");
+            }
+            ImGui::TableSetColumnIndex(3);
+            const float f_pct = now_ms > 0.05f ? std::clamp(100.0f * ms / now_ms, 0.0f, 100.0f) : 0.0f;
+            ImGui::TextDisabled("%4.0f%%", f_pct);
+        };
+
+        const auto row_cpu_sub = [&](const char* label_en, float ms, float avg_ms) {
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0);
+            const ImVec4 col = ms < 0.005f ? ImVec4(0.45f, 0.49f, 0.53f, 1.0f)
+                             : ms >= 0.45f ? ImVec4(0.95f, 0.85f, 0.55f, 1.0f)
+                                           : ImVec4(0.62f, 0.72f, 0.80f, 1.0f);
             ImGui::TextColored(col, "%s", label_en);
             ImGui::TableSetColumnIndex(1);
             ImGui::TextColored(col, "%5.2f ms", ms);
@@ -2156,7 +2290,33 @@ void FpsCounter() {
             ImGui::TextColored(col, "%4.0f%%", gpu_share);
         };
 
-        // Compact 4-row CPU section (active work cleanly separated from FPS cap sleep / Gnm sync)
+        const auto row_gpu_sub = [&](const char* label_en, BbStats::HudGpuSubCat sc) {
+            const float ms = h.hw_gpu_subcat_ms[sc];
+            const float avg_ms = h.avg_hw_gpu_subcat_ms[sc];
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0);
+            const ImVec4 col = (ms < 0.005f && avg_ms < 0.005f)
+                                   ? ImVec4(0.45f, 0.49f, 0.53f, 1.0f)
+                             : ms >= 0.25f ? ImVec4(0.95f, 0.85f, 0.55f, 1.0f)
+                                           : ImVec4(0.62f, 0.74f, 0.82f, 1.0f);
+            ImGui::TextColored(col, "%s", label_en);
+            ImGui::TableSetColumnIndex(1);
+            ImGui::TextColored(col, "%5.2f ms", ms);
+            ImGui::TableSetColumnIndex(2);
+            if (h.has_avg) {
+                ImGui::TextDisabled("%5.2f", avg_ms);
+            } else {
+                ImGui::TextDisabled("  -- ");
+            }
+            ImGui::TableSetColumnIndex(3);
+            const float gpu_share =
+                h.hw_gpu_busy_ms > 0.01f
+                    ? std::clamp(100.0f * ms / h.hw_gpu_busy_ms, 0.0f, 100.0f)
+                    : 0.0f;
+            ImGui::TextDisabled("%4.0f%%", gpu_share);
+        };
+
+        // CPU section (active work cleanly separated from FPS cap sleep / Gnm sync + X-Ray sub-rows)
         row_cpu("CPU 1. Game Engine (Work)",
                 h.game_cpu_work_ms, h.avg_game_cpu_work_ms, h.bottleneck_kind == 1);
         row_cpu(h.fps_cap_active > 0 ? "  FPS Cap Sleep + GnmSync"
@@ -2165,10 +2325,24 @@ void FpsCounter() {
                 h.bottleneck_kind == 4, true);
         row_cpu("CPU 2. Stage A (DirectVk RHI)",
                 h.a_total_ms, h.avg_a_total_ms, h.bottleneck_kind == 2);
+        if (xray) {
+            row_cpu_sub("  2a. PM4 Decode & FastPSO", h.a_decode_pso_ms, h.avg_a_decode_pso_ms);
+            row_cpu_sub("  2b. Buffers, Vtx/Idx & Ring", h.a_buf_ring_ms, h.avg_a_buf_ring_ms);
+            row_cpu_sub("  2c. Textures & PushDesc", h.a_tex_desc_ms, h.avg_a_tex_desc_ms);
+            row_cpu_sub("  2d. RenderPass, State & Draws", h.a_state_draw_ms, h.avg_a_state_draw_ms);
+            row_cpu_sub("  2e. Queue Submit & Sync", h.a_submit_sync_ms, h.avg_a_submit_sync_ms);
+        }
         row_cpu("CPU 3. Stage B (Vulkan Record)",
                 h.b_total_ms, h.avg_b_total_ms, h.bottleneck_kind == 3);
+        if (xray && (h.b_total_ms >= 0.02f || h.avg_b_total_ms >= 0.02f)) {
+            row_cpu_sub("  3a. Buffers, Vtx/Idx & VRAM", h.b_buffers_ms, h.avg_b_buffers_ms);
+            row_cpu_sub("  3b. Textures & PushDesc", h.b_tex_desc_ms, h.avg_b_tex_desc_ms);
+            row_cpu_sub("  3c. RenderPass, State & Draws", h.b_state_pass_ms, h.avg_b_state_pass_ms);
+            row_cpu_sub("  3d. Async Tasks & Copies", h.b_tasks_ms, h.avg_b_tasks_ms);
+            row_cpu_sub("  3e. Pipe Packet & Regs", h.b_packet_misc_ms, h.avg_b_packet_misc_ms);
+        }
 
-        // Full 10-pass Hardware GPU Render Pass Breakdown
+        // Full 10-pass + 21-subpass Hardware GPU Render Pass Breakdown
         static constexpr std::array<const char*, BbStats::GpuCat_Count> kPassLabels = {{
             "GPU 1. Shadow Maps (CSM/VSM)",
             "GPU 2. G-Buffer (3D & Foliage)",
@@ -2185,6 +2359,53 @@ void FpsCounter() {
             row_gpu(kPassLabels[c], h.hw_gpu_cat_ms[c],
                     h.avg_hw_gpu_cat_ms[c],
                     c == h.top_gpu_cat && h.hw_gpu_cat_ms[c] >= 0.25f);
+            if (!xray) {
+                continue;
+            }
+            switch (c) {
+            case BbStats::GpuCat_Shadows:
+                row_gpu_sub("  1a. 4096x4096 CSM & Spot Depth", BbStats::GpuSub_Shadow_CascadeAtlas);
+                row_gpu_sub("  1b. VSM Blur & Screen-Space PCF", BbStats::GpuSub_Shadow_VsmAndPcf);
+                break;
+            case BbStats::GpuCat_GBuffer:
+                row_gpu_sub("  2a. World & Character (6-MRT)", BbStats::GpuSub_GBuf_WorldAndChr);
+                row_gpu_sub("  2b. Foliage & Cutout (2-Sided)", BbStats::GpuSub_GBuf_FoliageAndCloth);
+                break;
+            case BbStats::GpuCat_Ssao:
+                row_gpu_sub("  3a. SSAO Raw Gen & Reproject", BbStats::GpuSub_Ssao_GenReproj);
+                row_gpu_sub("  3b. SSAO Bilateral Upscale/Blur", BbStats::GpuSub_Ssao_BilateralBlur);
+                break;
+            case BbStats::GpuCat_DeferredLight:
+                row_gpu_sub("  4a. Sun/IBL & Local Point Lights", BbStats::GpuSub_Def_DirectLocalPbr);
+                row_gpu_sub("  4b. Sky Dome, Fog & Light Shafts", BbStats::GpuSub_Def_SkyFogShafts);
+                break;
+            case BbStats::GpuCat_Ssr:
+                row_gpu_sub("  5a. Half-Res SSR Raymarching", BbStats::GpuSub_Ssr_Raymarch);
+                row_gpu_sub("  5b. Hi-Z Depth & Glossy Mips", BbStats::GpuSub_Ssr_HiZAndMips);
+                break;
+            case BbStats::GpuCat_ForwardAlpha:
+                row_gpu_sub("  6a. Hair, Blood, Cloth & Water", BbStats::GpuSub_Fwd_HairClothAlpha);
+                row_gpu_sub("  6b. Soft Particles & Flipbook VFX", BbStats::GpuSub_Fwd_SoftParticles);
+                break;
+            case BbStats::GpuCat_ComputeCopies:
+                row_gpu_sub("  7a. GPU Particle Sim & Compute", BbStats::GpuSub_Comp_ParticlesCs);
+                row_gpu_sub("  7b. Buffer/Image Copies & HLE", BbStats::GpuSub_Comp_CopiesAndHle);
+                break;
+            case BbStats::GpuCat_PostFxYebis:
+                row_gpu_sub("  8a. Depth of Field (Bokeh/CoC)", BbStats::GpuSub_Post_DoF);
+                row_gpu_sub("  8b. Motion Blur (Vel & Blur)", BbStats::GpuSub_Post_MotionBlur);
+                row_gpu_sub("  8c. Bloom, Emissive Glow & Glare", BbStats::GpuSub_Post_BloomGlare);
+                row_gpu_sub("  8d. HDR->LDR Tonemap & 3D LUT", BbStats::GpuSub_Post_TonemapLut);
+                break;
+            case BbStats::GpuCat_AntiAliasing:
+                break;
+            case BbStats::GpuCat_UiPresent:
+                row_gpu_sub("  10a. Scaleform Game HUD & Menus", BbStats::GpuSub_Ui_ScaleformHud);
+                row_gpu_sub("  10b. RCAS Sharpen, Overlay & Flip", BbStats::GpuSub_Ui_RcasPresent);
+                break;
+            default:
+                break;
+            }
         }
 
         // Total Hardware GPU Busy + Mid-Frame Gap
@@ -2195,6 +2416,9 @@ void FpsCounter() {
 
         ImGui::EndTable();
     }
+    if (xray) {
+        ImGui::PopStyleVar();
+    }
     ImGui::Separator();
     const ImVec4 limit_col = h.bottleneck_kind == 5 ? ImVec4(0.55f, 0.90f, 0.68f, 1.0f)
                                                     : ImVec4(1.0f, 0.78f, 0.28f, 1.0f);
@@ -2203,6 +2427,9 @@ void FpsCounter() {
         "LIMIT: %s (%.2f ms | Avg %.2f)",
         h.bottleneck_en, h.bottleneck_ms,
         h.avg_bottleneck_ms);
+    if (xray) {
+        ImGui::SetWindowFontScale(1.0f);
+    }
     ImGui::End();
 }
 
@@ -2393,6 +2620,11 @@ bool HandleEvent(const SDL_Event& event) {
             auto& s = BbSettings::Get();
             s.show_fps = !s.show_fps.load();
             BbSettings::Save();
+            return true;
+        }
+        if (down && !event.key.repeat && event.key.key == SDLK_F9) {
+            show_xray_details.store(!show_xray_details.load(std::memory_order_relaxed),
+                                    std::memory_order_relaxed);
             return true;
         }
         if (!is_open) {

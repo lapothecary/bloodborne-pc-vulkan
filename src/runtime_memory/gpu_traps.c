@@ -253,6 +253,28 @@ static void private_store(unsigned char *dst, const unsigned char *src, uint64_t
         store_once(dst,src,n);
     }
 }
+static void private_load(unsigned char *dst, const unsigned char *src, uint64_t n) {
+    const uintptr_t a=(uintptr_t)src&~(uintptr_t)(PAGE-1), b=((uintptr_t)src+n+PAGE-1)&~(uintptr_t)(PAGE-1);
+    int trapped=0;
+    if (trap_reasons && b<=TRAP_LIMIT) {
+        for (uintptr_t p=a>>12; p<(b>>12) && !trapped; ++p)
+            trapped=(__atomic_load_n(&trap_reasons[p],__ATOMIC_RELAXED)&TRAP_NO_ACCESS)!=0;
+        if (trapped) {
+            trapped=0;
+            pthread_mutex_lock(&trap_mutex);
+            for (uintptr_t p=a>>12; p<(b>>12) && !trapped; ++p) trapped=(trap_reasons[p]&TRAP_NO_ACCESS)!=0;
+            if (!trapped) pthread_mutex_unlock(&trap_mutex);
+        }
+    }
+    if (trapped) {
+        trap_apply(a,b,0);
+        memcpy(dst,src,n);
+        for (uintptr_t p=a>>12; p<(b>>12); ++p) trap_apply(p<<12,(p+1)<<12,trap_level(trap_reasons[p]));
+        pthread_mutex_unlock(&trap_mutex);
+    } else {
+        memcpy(dst,src,n);
+    }
+}
 int runtime_memory_write_backing(uintptr_t address, const void *data, uint64_t size) {
     read_lock();
     int ok=1;
@@ -260,9 +282,12 @@ int runtime_memory_write_backing(uintptr_t address, const void *data, uint64_t s
         size_t i=vma_index(at);
         if (i==vma_count || vmas[i].start>at || vmas[i].kind==KIND_RESERVED) { ok=0; break; }
         uint64_t n=(vmas[i].end<end ? vmas[i].end : end)-at;
-        unsigned char *dst=backing_at(vmas[i].phys+(at-vmas[i].start));
-        if (private_import && dst==(unsigned char *)at) private_store(dst,(const unsigned char *)data+(at-address),n);
-        else store_once(dst,(const unsigned char *)data+(at-address),n);
+        if (private_import) {
+            private_store((unsigned char *)at,(const unsigned char *)data+(at-address),n);
+        } else {
+            unsigned char *dst=backing_at(vmas[i].phys+(at-vmas[i].start));
+            store_once(dst,(const unsigned char *)data+(at-address),n);
+        }
         at+=n;
     }
     read_unlock();
@@ -280,7 +305,8 @@ void runtime_memory_read_backing(uintptr_t address, void *data, uint64_t size) {
         uint64_t n;
         if (i<vma_count && vmas[i].start<=at && vmas[i].kind!=KIND_RESERVED) {
             n=(vmas[i].end<end ? vmas[i].end : end)-at;
-            memcpy(out+(at-address),backing_at(vmas[i].phys+(at-vmas[i].start)),n);
+            if (private_import) private_load(out+(at-address),(const unsigned char *)at,n);
+            else memcpy(out+(at-address),backing_at(vmas[i].phys+(at-vmas[i].start)),n);
         } else {
             const uintptr_t next=i==vma_count ? end : vmas[i].start>at ? vmas[i].start : vmas[i].end;
             n=(next<end ? next : end)-at;
@@ -344,16 +370,14 @@ int runtime_memory_region(uintptr_t address, uintptr_t *start, uintptr_t *end, i
 }
 /* GPU page tracking: restrict host access, never beyond the guest's own protection. */
 void runtime_memory_gpu_protect(uintptr_t address, uint64_t size, int read, int write) {
-    read_lock();
-    for (size_t i=vma_index(address); i<vma_count && vmas[i].start<address+size; ++i) {
-        if (vmas[i].kind==KIND_RESERVED) continue;
-        uintptr_t a=vmas[i].start>address ? vmas[i].start : address;
-        uintptr_t b=vmas[i].end<address+size ? vmas[i].end : address+size;
-        int guest=host_prot(vmas[i].prot);
-        int want=(read ? PROT_READ : 0)|(write ? PROT_WRITE|PROT_READ : 0)|(guest & PROT_EXEC);
-        mprotect((void *)a,b-a,guest & want);
+    if (!read) {
+        runtime_memory_trap(address,size,0x88u,1);
+    } else if (!write) {
+        runtime_memory_trap(address,size,0x80u,0);
+        runtime_memory_trap(address,size,0x08u,1);
+    } else {
+        runtime_memory_trap(address,size,0x88u,0);
     }
-    read_unlock();
 }
 /* Host view of a guest range, for the GPU backend: the range must be mapped. */
 int runtime_memory_is_mapped(uintptr_t address, uint64_t size) {

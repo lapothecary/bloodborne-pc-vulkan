@@ -135,6 +135,7 @@ bool GpuProfiler::TryCollectHudSlice(u32 s) {
             double busy_ns = 0.0;
             double gap_ns = 0.0;
             std::array<double, BbStats::GpuCat_Count> cat_ns{};
+            std::array<double, BbStats::GpuSub_Count> subcat_ns{};
             u64 cursor = stamps[0];
             if (hud_has_prev_end) {
                 if (stamps[0] > hud_prev_end_stamp) {
@@ -148,15 +149,19 @@ bool GpuProfiler::TryCollectHudSlice(u32 s) {
             }
             for (u32 i = 0; i + 1 < count; ++i) {
                 const u64 s1 = stamps[i + 1];
-                const u8 cat = hud_cats[s][i];
+                const u8 subcat = hud_cats[s][i];
                 if (s1 > cursor) {
                     const double dt_ns = double(s1 - cursor) * period_ns;
                     cursor = s1;
-                    if (cat == BbStats::GpuCat_Gap) {
+                    if (subcat == BbStats::GpuSub_Gap) {
                         gap_ns += dt_ns;
-                    } else if (cat < BbStats::GpuCat_Count) {
+                    } else if (subcat < BbStats::GpuSub_Count) {
                         busy_ns += dt_ns;
-                        cat_ns[cat] += dt_ns;
+                        subcat_ns[subcat] += dt_ns;
+                        const u8 cat = BbStats::ParentGpuCat(subcat);
+                        if (cat < BbStats::GpuCat_Count) {
+                            cat_ns[cat] += dt_ns;
+                        }
                     }
                 }
             }
@@ -168,6 +173,12 @@ bool GpuProfiler::TryCollectHudSlice(u32 s) {
                 if (cat_ns[c] > 0.0) {
                     BbStats::hw_gpu_cat_ns[c].fetch_add(static_cast<u64>(cat_ns[c]),
                                                         std::memory_order_relaxed);
+                }
+            }
+            for (u32 sc = 0; sc < BbStats::GpuSub_Count; ++sc) {
+                if (subcat_ns[sc] > 0.0) {
+                    BbStats::hw_gpu_subcat_ns[sc].fetch_add(static_cast<u64>(subcat_ns[sc]),
+                                                            std::memory_order_relaxed);
                 }
             }
             BbStats::hw_gpu_frames.fetch_add(1, std::memory_order_relaxed);
@@ -204,12 +215,12 @@ void GpuProfiler::HudBeginSubmission(const Scheduler* sched) {
     }
 }
 
-void GpuProfiler::HudSetNextPassCat(const Scheduler* sched, u8 cat) {
+void GpuProfiler::HudSetNextPassCat(const Scheduler* sched, u8 subcat) {
     auto* self = stored_ptr;
     if (!self || !self->hud_enabled || !self->Records(sched)) {
         return;
     }
-    self->hud_cur_cat = cat;
+    self->hud_cur_cat = subcat;
 }
 
 void GpuProfiler::HudOnBeginRendering(const Scheduler* sched) {
@@ -235,23 +246,47 @@ void GpuProfiler::HudOnBeginRendering(const Scheduler* sched) {
     }
 }
 
-void GpuProfiler::HudMarkPass(const Scheduler* sched, u8 cat) {
+void GpuProfiler::HudOnSubPassChange(const Scheduler* sched, u8 subcat) {
     auto* self = stored_ptr;
     if (!self || !self->hud_enabled || !self->Records(sched)) {
         return;
     }
-    self->hud_cur_cat = cat;
+    self->hud_cur_cat = subcat;
     if (!self->hud_subm_open || self->hud_slice_blocked) {
         return;
     }
-    if (cat == self->hud_last_marked_cat) {
+    if (subcat == self->hud_last_marked_cat) {
+        return;
+    }
+    // Reserve 64 slots for RenderPass/submission boundaries; record inline without breaking the pass.
+    if (self->hud_used[self->hud_slice] + 64 <= HudSliceQueries) {
+        const u32 idx = self->hud_used[self->hud_slice]++;
+        self->hud_cats[self->hud_slice][idx] = subcat;
+        self->hud_last_marked_cat = subcat;
+        const u32 query = self->hud_slice * HudSliceQueries + idx;
+        self->scheduler.Record([pool_h = *self->hud_pool, query](vk::CommandBuffer cmdbuf) {
+            cmdbuf.writeTimestamp2(vk::PipelineStageFlagBits2::eAllGraphics, pool_h, query);
+        });
+    }
+}
+
+void GpuProfiler::HudMarkPass(const Scheduler* sched, u8 subcat) {
+    auto* self = stored_ptr;
+    if (!self || !self->hud_enabled || !self->Records(sched)) {
+        return;
+    }
+    self->hud_cur_cat = subcat;
+    if (!self->hud_subm_open || self->hud_slice_blocked) {
+        return;
+    }
+    if (subcat == self->hud_last_marked_cat) {
         return;
     }
     if (self->hud_used[self->hud_slice] + 2 <= HudSliceQueries) {
         self->scheduler.EndRendering();
         const u32 idx = self->hud_used[self->hud_slice]++;
-        self->hud_cats[self->hud_slice][idx] = cat;
-        self->hud_last_marked_cat = cat;
+        self->hud_cats[self->hud_slice][idx] = subcat;
+        self->hud_last_marked_cat = subcat;
         const u32 query = self->hud_slice * HudSliceQueries + idx;
         self->scheduler.Record([pool_h = *self->hud_pool, query](vk::CommandBuffer cmdbuf) {
             cmdbuf.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, pool_h, query);
@@ -266,8 +301,8 @@ void GpuProfiler::HudEndSubmission(const Scheduler* sched, u64 tick, bool is_fra
     }
     if (self->hud_subm_open) {
         const u32 idx = self->hud_used[self->hud_slice]++;
-        self->hud_cats[self->hud_slice][idx] = BbStats::GpuCat_Gap;
-        self->hud_last_marked_cat = BbStats::GpuCat_Gap;
+        self->hud_cats[self->hud_slice][idx] = BbStats::GpuSub_Gap;
+        self->hud_last_marked_cat = BbStats::GpuSub_Gap;
         const u32 query = self->hud_slice * HudSliceQueries + idx;
         self->hud_subm_open = false;
         self->hud_last_tick[self->hud_slice] = tick;
@@ -278,7 +313,7 @@ void GpuProfiler::HudEndSubmission(const Scheduler* sched, u64 tick, bool is_fra
     if (!is_frame_end) {
         return;
     }
-    self->hud_cur_cat = BbStats::GpuCat_ComputeCopies;
+    self->hud_cur_cat = BbStats::GpuSub_Comp_CopiesAndHle;
     if (self->hud_used[self->hud_slice] >= 2) {
         self->hud_pending[self->hud_slice] = true;
         self->hud_slice = (self->hud_slice + 1) % HudSlices;

@@ -1331,6 +1331,16 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
         // `NO_OVERWRITE` sub-draws at `device_addr = blk_base + vb_offset` in O(1) without
         // re-copying 3..4 MiB per draw or overflowing `stream_buffer`.
         auto& tls_cue_memo = TlsCueMemo();
+        if (size <= STREAM_THRESHOLD) {
+            const auto& fast_memo = tls_cue_memo[CueMemoSlotIdx(device_addr, size)];
+            if (fast_memo.addr == device_addr && fast_memo.size == size &&
+                fast_memo.tick == cur_tick && fast_memo.inv_gen == cur_inv &&
+                fast_memo.cue_stamp != 0 &&
+                fast_memo.cue_stamp == DirectBuffers::ComputeTransientCueStamp(device_addr, size)) {
+                TraceBinding(device_addr, size, false, 3);
+                return {&stream_buffer, fast_memo.offset};
+            }
+        }
         VAddr blk_base = 0;
         u32 blk_size = 0;
         const bool has_big_blk =

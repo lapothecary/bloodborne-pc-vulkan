@@ -133,10 +133,13 @@ public:
 
     /// The register-writing packets' effect on `regs` (shared with the draw preparation workers,
     /// which replay the stream): the blocks written go to `dirty`, the packet into `checksum`
-    /// (equal checksums at a draw mean equal register files).
-    static void ApplyGraphicsRegisterPacket(Regs& regs, const u32* packet, u64& checksum,
+    /// (equal checksums at a draw mean equal register files). Returns true when the packet is a
+    /// pure register write that needs no further handling in CommandProcessor::Graphics.
+    static bool ApplyGraphicsRegisterPacket(Regs& regs, const u32* packet, u64& checksum,
                                             RegDirty* dirty = nullptr,
-                                            bool compute_checksum = true);
+                                            bool compute_checksum = true,
+                                            u64* pso_sig_epoch = nullptr,
+                                            u64* dyn_reg_epoch = nullptr);
     static u64 HashRegisterPacket(u64 checksum, const u32* words, u32 count);
 
     Regs regs{};
@@ -150,6 +153,10 @@ public:
     RegDirty pipe_dirty;
     /// Running checksum of graphics-register packets (ApplyGraphicsRegisterPacket).
     u64 gfx_reg_checksum{};
+    /// Monotonic epoch incremented when any register affecting BuildFastSelectSig changes.
+    u64 pso_sig_epoch = 1;
+    /// Monotonic epoch incremented when any context/uconfig register affecting DynamicState changes.
+    u64 dyn_reg_epoch = 1;
 
 private:
     struct Level {

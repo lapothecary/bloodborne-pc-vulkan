@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 import struct
 from prepare import parse_self, span, unpack
+import game_check
 
 
 def encode_id(value):
@@ -78,8 +79,8 @@ def module(path):
 
 
 def link(game, out):
-    main = module(game/'eboot.bin')
-    libc = module(game/'sce_module/libc.prx')
+    main = module(game_check.game_file(game, 'eboot.bin'))
+    libc = module(game_check.game_file(game, 'sce_module/libc.prx'))
     raw = (out/'boot.bin').read_bytes()
     magic, size, entry, ns, nr, ni, flags = unpack('<8s6Q', raw, 0)
     if magic != b'BBPROBE2':

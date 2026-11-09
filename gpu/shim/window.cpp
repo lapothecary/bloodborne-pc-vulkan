@@ -136,11 +136,15 @@ SDL_DisplayID ChooseDisplay() {
 }
 
 // The monitor the window is on, in pixels: the output's aspect ratio "Auto" follows it.
-void TellMonitor(SDL_Window* window) {
-    if (const SDL_DisplayMode* mode = SDL_GetDesktopDisplayMode(SDL_GetDisplayForWindow(window))) {
+void TellMonitorDisplay(SDL_DisplayID display) {
+    if (const SDL_DisplayMode* mode = SDL_GetDesktopDisplayMode(display)) {
         const float density = mode->pixel_density > 0.0f ? mode->pixel_density : 1.0f;
         BbSettings::SetMonitor(int(mode->w * density + 0.5f), int(mode->h * density + 0.5f));
     }
+}
+
+void TellMonitor(SDL_Window* window) {
+    TellMonitorDisplay(SDL_GetDisplayForWindow(window));
 }
 
 } // namespace
@@ -153,18 +157,30 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
     SDL_PropertiesID props = SDL_CreateProperties();
     SDL_SetStringProperty(props, SDL_PROP_WINDOW_CREATE_TITLE_STRING, title);
     const SDL_DisplayID display = ChooseDisplay();
+    TellMonitorDisplay(display);
+    const int init_mode = BbSettings::Get().window_mode.load(std::memory_order_relaxed);
+    SDL_SetHint(SDL_HINT_VIDEO_MINIMIZE_ON_FOCUS_LOSS,
+                init_mode == BbSettings::WindowModeFullscreen ? "1" : "0");
+    const BbSettings::OutputSize init_out = BbSettings::CurrentOutput();
+    const s32 init_w = init_out.width > 0 ? init_out.width : width_;
+    const s32 init_h = init_out.height > 0 ? init_out.height : height_;
     SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_X_NUMBER, SDL_WINDOWPOS_CENTERED_DISPLAY(display));
     SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_Y_NUMBER, SDL_WINDOWPOS_CENTERED_DISPLAY(display));
-    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_WIDTH_NUMBER, width_);
-    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_HEIGHT_NUMBER, height_);
+    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_WIDTH_NUMBER, init_w);
+    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_HEIGHT_NUMBER, init_h);
     SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_RESIZABLE_BOOLEAN, true);
+    SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_BORDERLESS_BOOLEAN,
+                           init_mode == BbSettings::WindowModeBorderless);
     SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_VULKAN_BOOLEAN, true);
-    const char* fullscreen = std::getenv("BB_FULLSCREEN");
-    SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_FULLSCREEN_BOOLEAN, fullscreen && fullscreen[0] == '1');
+    SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_FULLSCREEN_BOOLEAN,
+                           init_mode != BbSettings::WindowModeWindowed);
     base_title = title;
     window = SDL_CreateWindowWithProperties(props);
     SDL_DestroyProperties(props);
     ASSERT_MSG(window, "Failed to create window: {}", SDL_GetError());
+    applied_window_mode = init_mode;
+    applied_output_w = init_w;
+    applied_output_h = init_h;
     // The cursor over the game: the port's own (BB_CURSOR=0: the system's).
     if (SDL_Cursor* cursor = BbCursor::Create()) {
         SDL_SetCursor(cursor);
@@ -322,6 +338,18 @@ bool WindowSDL::PollEvents() {
             CaptureMouse(true);
             continue;
         }
+        // Alt+Enter: toggle between Fullscreen and Windowed.
+        if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat &&
+            (event.key.key == SDLK_RETURN || event.key.key == SDLK_KP_ENTER) &&
+            (event.key.mod & SDL_KMOD_ALT) != 0) {
+            auto& v = BbSettings::Get();
+            const int cur = v.window_mode.load(std::memory_order_relaxed);
+            v.window_mode = (cur == BbSettings::WindowModeWindowed)
+                                ? BbSettings::WindowModeFullscreen
+                                : BbSettings::WindowModeWindowed;
+            BbSettings::Save();
+            continue;
+        }
         // F3: the frame rate limit 30 on and off (the cinematic of Laurence hangs above 30 FPS).
         if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat && event.key.key == SDLK_F3) {
             BbFrameRate::SetLimit(BbFrameRate::Limit() == 30 ? 0 : 30);
@@ -342,6 +370,21 @@ bool WindowSDL::PollEvents() {
         }
         if (event.type == SDL_EVENT_WINDOW_FOCUS_LOST) {
             CaptureMouse(false);
+            if (mouse_grabbed) {
+                mouse_grabbed = false;
+                SDL_SetWindowMouseGrab(window, false);
+            }
+            if (applied_window_mode == BbSettings::WindowModeFullscreen &&
+                (SDL_GetWindowFlags(window) & SDL_WINDOW_MINIMIZED) == 0) {
+                SDL_MinimizeWindow(window);
+            }
+        }
+        if (event.type == SDL_EVENT_WINDOW_FOCUS_GAINED || event.type == SDL_EVENT_WINDOW_RESTORED) {
+            if (applied_window_mode != BbSettings::WindowModeWindowed &&
+                (SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN) == 0) {
+                SDL_SetWindowFullscreenMode(window, nullptr);
+                SDL_SetWindowFullscreen(window, true);
+            }
         }
         switch (event.type) {
         case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
@@ -366,6 +409,15 @@ bool WindowSDL::PollEvents() {
             break;
         default:
             break;
+        }
+    }
+    {
+        const int wanted_mode = BbSettings::Get().window_mode.load(std::memory_order_relaxed);
+        const BbSettings::OutputSize wanted_out = BbSettings::CurrentOutput();
+        if (wanted_mode != applied_window_mode ||
+            (wanted_mode == BbSettings::WindowModeWindowed &&
+             (wanted_out.width != applied_output_w || wanted_out.height != applied_output_h))) {
+            ApplyWindowMode(wanted_mode, wanted_out.width, wanted_out.height);
         }
     }
     // A request from the game's side (runtime_pad.c: the spray can taken): as a click would.
@@ -416,16 +468,65 @@ bool WindowSDL::PollEvents() {
     return is_open;
 }
 
+void WindowSDL::ApplyWindowMode(int mode, s32 target_w, s32 target_h) {
+    if (!window) {
+        return;
+    }
+    SDL_DisplayID display = SDL_GetDisplayForWindow(window);
+    if (!display) {
+        display = SDL_GetPrimaryDisplay();
+    }
+    const s32 win_w = target_w > 0 ? target_w : 1920;
+    const s32 win_h = target_h > 0 ? target_h : 1080;
+
+    SDL_SetHint(SDL_HINT_VIDEO_MINIMIZE_ON_FOCUS_LOSS,
+                mode == BbSettings::WindowModeFullscreen ? "1" : "0");
+
+    if (mode == BbSettings::WindowModeFullscreen || mode == BbSettings::WindowModeBorderless) {
+        // Both Fullscreen and Borderless Windowed ("Desktop-friendly Fullscreen") use SDL's
+        // fullscreen desktop surface so Wayland/X11/Windows cover the entire monitor without
+        // panels or titlebars; Fullscreen minimizes on Alt+Tab (focus loss), whereas Borderless
+        // Windowed stays un-minimized in the background so other windows appear right over it.
+        SDL_SetWindowFullscreenMode(window, nullptr);
+        SDL_SetWindowFullscreen(window, true);
+        SDL_SyncWindow(window);
+    } else {
+        if ((SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN) != 0) {
+            SDL_SetWindowFullscreen(window, false);
+            SDL_SyncWindow(window);
+        }
+        SDL_RestoreWindow(window);
+        SDL_SetWindowBordered(window, true);
+        SDL_SetWindowResizable(window, true);
+        SDL_SetWindowSize(window, win_w, win_h);
+        SDL_SetWindowPosition(window, SDL_WINDOWPOS_CENTERED_DISPLAY(display),
+                              SDL_WINDOWPOS_CENTERED_DISPLAY(display));
+        SDL_SyncWindow(window);
+    }
+    int w = 0, h = 0;
+    SDL_GetWindowSizeInPixels(window, &w, &h);
+    if (w > 0 && h > 0) {
+        width = w;
+        height = h;
+    }
+    applied_window_mode = mode;
+    applied_output_w = win_w;
+    applied_output_h = win_h;
+    std::printf("Window: mode=%s (%dx%d -> %dx%d px)\n",
+                BbSettings::WindowModeName(mode), int(win_w), int(win_h), w, h);
+}
+
 // Issue #3: the OS cursor over the game. Hidden in fullscreen, and in a window after 3 s without
 // moving the mouse; always shown while the settings menu or a game's pointer menu is open.
 void WindowSDL::UpdateCursor() {
-    const bool fullscreen = (SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN) != 0;
+    const bool fullscreen = (SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN) != 0 ||
+                            applied_window_mode == BbSettings::WindowModeBorderless;
     // In a game menu (pointer_shown) it also goes after 1.5 s without moving, so that the tail of a
     // closing menu does not leave it hanging over the game; any motion brings it back.
     const u64 idle = SDL_GetTicks() - last_mouse_motion_ms;
     const bool hide = !BbOverlay::MenuOpen() &&
                       (mouse_captured.load(std::memory_order_relaxed) ||
-                       (pointer_shown ? idle > 1500 : (fullscreen || idle > 3000)));
+                        (pointer_shown ? idle > 1500 : (fullscreen || idle > 3000)));
     if (hide != cursor_hidden) {
         cursor_hidden = hide;
         hide ? SDL_HideCursor() : SDL_ShowCursor();

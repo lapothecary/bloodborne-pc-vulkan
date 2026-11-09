@@ -327,7 +327,13 @@ CommandProcessor::Step CommandProcessor::Graphics(Work& work, Level& level, cons
     const bool retry = work.waiting_at == packet;
     if (!retry) {
         const bool need_checksum = rasterizer && rasterizer->GetDrawPreparation().Enabled();
-        ApplyGraphicsRegisterPacket(regs, packet, gfx_reg_checksum, &pipe_dirty, need_checksum);
+        const bool need_dirty = rasterizer && rasterizer->UseDrawPipe();
+        const bool handled_completely = ApplyGraphicsRegisterPacket(
+            regs, packet, gfx_reg_checksum, need_dirty ? &pipe_dirty : nullptr, need_checksum,
+            &pso_sig_epoch, &dyn_reg_epoch);
+        if (handled_completely) {
+            return Step::Next;
+        }
         // Not before earlier fences either: these may write guest memory.
         if (op != Op::Nop && rasterizer && !Pipelined(op) &&
             !(op == Op::DmaData && DmaData::From(body).DstLow() == 0x3022C)) [[unlikely]] {

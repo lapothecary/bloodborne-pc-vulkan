@@ -531,7 +531,20 @@ public partial class MainWindow : Window
                 dialog.InitialDirectory = value;
             if (dialog.ShowDialog(this) == true)
             {
-                store.Set(key, dialog.FolderName);
+                var chosen = dialog.FolderName;
+                if (key == "game_dir" && !File.Exists(Path.Combine(chosen, "eboot.bin")))
+                {
+                    foreach (var sub in new[] { "CUSA03173", "CUSA00900", "CUSA00207", "CUSA00208", "CUSA00299", "CUSA01363", "CUSA03179", "CUSA03014", "CUSA03023", "game", "app0" })
+                    {
+                        var cand = Path.Combine(chosen, sub);
+                        if (File.Exists(Path.Combine(cand, "eboot.bin")))
+                        {
+                            chosen = cand;
+                            break;
+                        }
+                    }
+                }
+                store.Set(key, chosen);
                 Show();
             }
         };

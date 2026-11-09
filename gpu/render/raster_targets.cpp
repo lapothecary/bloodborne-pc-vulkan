@@ -521,11 +521,15 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         texture_set_why = {};
         begin_memo_hits = begin_memo_misses = texture_set_hits = texture_set_misses = 0;
     }
+    last_begin_memo_hit = false;
     BeginSignature signature;
     if (memo_on) {
         signature = MakeBeginSignature(pipeline);
         const auto& regs = Regs();
-        bool usable = begin_memo.valid && scheduler.IsRenderingWith(begin_memo.state) &&
+        const u64 cur_cmd_epoch = scheduler.DescriptorStateEpoch();
+        bool usable = begin_memo.valid && scheduler.IsRendering() &&
+                      (begin_memo.cmd_epoch == cur_cmd_epoch ||
+                       scheduler.IsRenderingWith(begin_memo.state)) &&
                       !regs.depth_render_control.depth_clear_enable &&
                       !regs.depth_render_control.stencil_clear_enable &&
                       signature == begin_memo.signature;
@@ -542,6 +546,8 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         }
         if (usable) {
             ++begin_memo_hits;
+            begin_memo.cmd_epoch = cur_cmd_epoch;
+            last_begin_memo_hit = true;
             attachment_feedback_loop = false;
             push_data.scene_size = begin_memo.scene_size;
             target_scale = begin_memo.target_scale;

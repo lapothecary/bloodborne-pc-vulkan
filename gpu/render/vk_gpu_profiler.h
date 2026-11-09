@@ -62,9 +62,10 @@ public:
 
     /// V7.3: Zero-RenderPass-break submission-boundary & per-pass GPU meter for the HUD.
     static void HudBeginSubmission(const Scheduler* sched);
-    static void HudSetNextPassCat(const Scheduler* sched, u8 cat);
+    static void HudSetNextPassCat(const Scheduler* sched, u8 subcat);
     static void HudOnBeginRendering(const Scheduler* sched);
-    static void HudMarkPass(const Scheduler* sched, u8 cat);
+    static void HudOnSubPassChange(const Scheduler* sched, u8 subcat);
+    static void HudMarkPass(const Scheduler* sched, u8 subcat);
     static void HudEndSubmission(const Scheduler* sched, u64 tick, bool is_frame_end);
 
 private:
@@ -79,7 +80,7 @@ private:
     static constexpr u32 NumSlices = 4;
     static constexpr u32 SliceQueries = 4096;
     static constexpr u32 HudSlices = 8;
-    static constexpr u32 HudSliceQueries = 256;
+    static constexpr u32 HudSliceQueries = 512;
     static inline GpuProfiler* instance_ptr = nullptr;
     static inline GpuProfiler* stored_ptr = nullptr;
     bool permanent = false;
@@ -99,7 +100,7 @@ private:
     bool hud_subm_open = false;
     bool hud_slice_blocked = false;
     bool hud_has_prev_end = false;
-    u8 hud_cur_cat = 6; ///< BbStats::GpuCat_ComputeCopies
+    u8 hud_cur_cat = 13; ///< BbStats::GpuSub_Comp_CopiesAndHle
     u8 hud_last_marked_cat = 0xFF;
     u64 hud_prev_end_stamp = 0;
     std::array<u32, HudSlices> hud_used{};

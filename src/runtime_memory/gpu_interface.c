@@ -75,7 +75,7 @@ static int parse_experiment_cycle(void) {
 /* bbport: the GPU library provides direct memory chunks (see CHUNK). */
 void runtime_memory_set_guest_chunk_whole(int whole) { whole_chunks=whole; }
 /* bbport: the host address of direct memory phys in the backing view (host memory import). */
-void *runtime_memory_backing_pointer(uint64_t phys) { return backing_base ? backing_at(phys) : NULL; }
+void *runtime_memory_backing_pointer(uint64_t phys) { return (backing_base || private_import) ? backing_at(phys) : NULL; }
 /* bbport: lazy guest memory (see lazy_game). */
 void runtime_memory_set_guest_lazy(int lazy) { lazy_game=lazy; }
 /* bbport: the memfd of guest memory (lazy guest memory: udmabuf over it), -1 before it exists. */

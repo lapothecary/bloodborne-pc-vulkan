@@ -1225,7 +1225,7 @@ bool TemporalUpscaler::RecordReactive(vk::ImageView color_view) {
 }
 
 void TemporalUpscaler::Run() {
-    GpuProfiler::HudMarkPass(&scheduler, BbStats::GpuCat_AntiAliasing);
+    GpuProfiler::HudMarkPass(&scheduler, BbStats::GpuSub_Aa_Upscaler);
     if (auto* profiler = GpuProfiler::Get()) {
         const char* label = BbSettings::EffectiveUpscaler() == BbSettings::UpscalerTaa
             ? "upscaler Run (TAA)" : "upscaler Run (FSR)";
@@ -1578,7 +1578,7 @@ vk::Image TemporalUpscaler::RunSmaa(VideoCore::ImageId color_id, bool proxy) {
         BbSettings::Get().aa_mode.load(std::memory_order_relaxed) == BbSettings::AaSmaaT2x &&
         bool(camera_motion.Depth());
     scheduler.EndRendering();
-    GpuProfiler::HudMarkPass(&scheduler, BbStats::GpuCat_AntiAliasing);
+    GpuProfiler::HudMarkPass(&scheduler, BbStats::GpuSub_Aa_Upscaler);
     vk::ImageView view;
     vk::ImageLayout layout = vk::ImageLayout::eGeneral;
     u32 w = color.info.size.width, h = color.info.size.height;
@@ -1649,7 +1649,7 @@ void TemporalUpscaler::OnDraw(u64 vs_hash, VideoCore::ImageId color,
                                   vk::ImageLayout::eTransferDstOptimal, region);
                 });
             }
-            GpuProfiler::HudMarkPass(&scheduler, BbStats::GpuCat_UiPresent);
+            GpuProfiler::HudMarkPass(&scheduler, BbStats::GpuSub_Ui_ScaleformHud);
         }
         smaa_done = true;
         done_this_frame = true;
@@ -1851,7 +1851,7 @@ void TemporalUpscaler::RunUiOnly(VideoCore::ImageId color_id, VideoCore::ImageId
                                       : vk::Format::eD32SfloatS8Uint;
     const bool smaa_active = color_id == ldr_target && SmaaWanted();
     GpuProfiler::HudMarkPass(&scheduler,
-                             smaa_active ? BbStats::GpuCat_AntiAliasing : BbStats::GpuCat_UiPresent);
+                             smaa_active ? BbStats::GpuSub_Aa_Upscaler : BbStats::GpuSub_Ui_ScaleformHud);
     EnsureUiResources(target_width, target_height, color.info.pixel_format, depth_format);
     PrepareUiDepth(depth_id);
     // Copy only the background already drawn. The subsequent menu/HUD/text draws execute
@@ -1863,7 +1863,7 @@ void TemporalUpscaler::RunUiOnly(VideoCore::ImageId color_id, VideoCore::ImageId
                              scene_targets.EligibleScene(color);
     const vk::Image smoothed = smaa_active ? RunSmaa(color_id, proxy_scene) : vk::Image{};
     if (smaa_active) {
-        GpuProfiler::HudMarkPass(&scheduler, BbStats::GpuCat_UiPresent);
+        GpuProfiler::HudMarkPass(&scheduler, BbStats::GpuSub_Ui_ScaleformHud);
     }
     if (smoothed) {
         source = smoothed;
@@ -2007,7 +2007,7 @@ void TemporalUpscaler::EnsureLiveInputResources(u32 w, u32 h, vk::Format color_f
 }
 
 void TemporalUpscaler::RunScaled() {
-    GpuProfiler::HudMarkPass(&scheduler, BbStats::GpuCat_AntiAliasing);
+    GpuProfiler::HudMarkPass(&scheduler, BbStats::GpuSub_Aa_Upscaler);
     if (auto* profiler = GpuProfiler::Get()) {
         const char* label = BbSettings::EffectiveUpscaler() == BbSettings::UpscalerTaa
             ? "upscaler RunScaled (TAA)" : "upscaler RunScaled (FSR)";

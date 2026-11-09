@@ -224,6 +224,27 @@ void Set(Values& v, const std::string& key, const std::string& value) {
         for (int a = 0; a < AspectCount; ++a) {
             if (value == AspectKey(a)) v.aspect = a;
         }
+    } else if (key == "window_mode") {
+        if (value == "fullscreen" || value == "0") {
+            v.window_mode = WindowModeFullscreen;
+            v.window_mode_chosen = true;
+        } else if (value == "borderless" || value == "borderless_windowed" || value == "1") {
+            v.window_mode = WindowModeBorderless;
+            v.window_mode_chosen = true;
+        } else if (value == "windowed" || value == "2") {
+            v.window_mode = WindowModeWindowed;
+            v.window_mode_chosen = true;
+        }
+    } else if (key == "fullscreen") {
+        if (!v.window_mode_chosen.load()) {
+            if (value == "borderless" || value == "borderless_windowed" || value == "2") {
+                v.window_mode = WindowModeBorderless;
+            } else if (value == "0" || value == "false" || value == "off" || value == "windowed") {
+                v.window_mode = WindowModeWindowed;
+            } else if (value == "1" || value == "true" || value == "on" || value == "fullscreen") {
+                v.window_mode = WindowModeFullscreen;
+            }
+        }
     } else if (key == "mouse_look") {
         v.mouse_look = i != 0;
     } else if (key == "mouse_invert_y") {
@@ -260,7 +281,7 @@ void Set(Values& v, const std::string& key, const std::string& value) {
                 else if (trimmed == "Left Shift+Mouse Left, Mouse X1" || trimmed == "Left Shift+Mouse Left")
                     trimmed = "Left Shift+Mouse Left, Mouse 4";
                 else if (trimmed == "Tab, R") trimmed = "R, Tab";
-                else if (trimmed == "F, Return") trimmed = "F, Enter";
+                else if (trimmed == "F, Return" || (k == KeyInteractCross && trimmed == "F")) trimmed = "F, Enter";
                 else if (trimmed == "3, Up, Wheel Up" || trimmed == "Wheel Up, 3, Up") trimmed = "Wheel Up, 3";
                 else if (trimmed == "4, Down, Wheel Down" || trimmed == "Wheel Down, 4, Down") trimmed = "Wheel Down, 4";
                 else if (trimmed == "1, Left") trimmed = "1";
@@ -533,6 +554,21 @@ void Load() {
             Set(v, "fps_limit", env);
         }
     }
+    if (const char* env = std::getenv("BB_WINDOW_MODE")) {
+        if (env[0] != '\0') {
+            Set(v, "window_mode", env);
+        }
+    } else if (const char* env = std::getenv("BB_FULLSCREEN")) {
+        if (std::strcmp(env, "0") == 0 || std::strcmp(env, "false") == 0 || std::strcmp(env, "windowed") == 0) {
+            v.window_mode = WindowModeWindowed;
+        } else if (std::strcmp(env, "borderless") == 0 || std::strcmp(env, "borderless_windowed") == 0 ||
+                   std::strcmp(env, "2") == 0) {
+            v.window_mode = WindowModeBorderless;
+        } else if ((std::strcmp(env, "1") == 0 || std::strcmp(env, "true") == 0 || std::strcmp(env, "fullscreen") == 0) &&
+                   !v.window_mode_chosen.load()) {
+            v.window_mode = WindowModeFullscreen;
+        }
+    }
     if (!v.aa_mode_chosen.load()) {
         if (v.upscaler.load() == UpscalerTaa) {
             v.aa_mode = AaTaa;
@@ -661,6 +697,8 @@ void Save() {
     put("model_lod", std::to_string(v.model_lod.load()));
     put("aspect_ratio", AspectKey(v.aspect));
     put("output_res", SizeText(CurrentOutput()));
+    put("window_mode", WindowModeName(v.window_mode.load()));
+    put("fullscreen", v.window_mode.load() == WindowModeWindowed ? "0" : "1");
     // Read by run.sh at start.
     put("live_resolution", v.live_resolution < 0 ? "auto" : flag(v.live_resolution != 0));
     put("frame_generation", flag(v.frame_generation));
@@ -751,6 +789,11 @@ const char* UpscalerName(int upscaler) {
 const char* AaModeName(int aa) {
     static constexpr const char* names[AaCount] = {"off", "fxaa", "taa", "dlaa", "dlaa3", "smaa", "smaa_t2x"};
     return names[std::clamp(aa, 0, AaCount - 1)];
+}
+
+const char* WindowModeName(int mode) {
+    static constexpr const char* names[WindowModeCount] = {"fullscreen", "borderless", "windowed"};
+    return names[std::clamp(mode, 0, WindowModeCount - 1)];
 }
 
 } // namespace BbSettings

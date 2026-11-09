@@ -117,8 +117,25 @@ class GameCheckTests(unittest.TestCase):
 
     def test_every_problem_is_explained(self):
         for kind in ('missing_update', 'wrong_eboot', 'patched_eboot', 'other_title',
-                     'unreadable', 'damaged_files'):
+                     'unreadable', 'damaged_files', 'missing_base'):
             self.assertIn('CUSA', game_check.explain(kind, 'CUSA03173', '01.00'))
+
+    def test_split_base_and_patch_sibling_folders_pass_from_either_folder(self):
+        base = Path(self.tmp.name) / 'CUSA03173'
+        patch = Path(self.tmp.name) / 'CUSA03173-patch'
+        (base / 'sce_sys').mkdir(parents=True)
+        (base / 'sce_module').mkdir(parents=True)
+        (base / 'sce_module/libc.prx').write_bytes(b'libc')
+        (base / 'sce_sys/param.sfo').write_bytes(param_sfo({'APP_VER': '01.00', 'TITLE_ID': 'CUSA03173'}))
+        (base / 'eboot.bin').write_bytes(b'old 1.00 eboot')
+        (patch / 'sce_sys').mkdir(parents=True)
+        (patch / 'sce_sys/param.sfo').write_bytes(param_sfo({'APP_VER': '01.09', 'TITLE_ID': 'CUSA03173'}))
+        (patch / 'eboot.bin').write_bytes(fixture())
+        with mock.patch.object(game_check, 'SUPPORTED_IMAGE', game_check.image_sha256(patch)):
+            self.assertIsNone(game_check.problem(base))
+            self.assertIsNone(game_check.problem(patch))
+            self.assertEqual(game_check.resolve_patch_pair(base), (base, patch))
+            self.assertEqual(game_check.resolve_patch_pair(patch), (base, patch))
 
 
 if __name__ == '__main__':

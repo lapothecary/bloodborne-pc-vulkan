@@ -26,7 +26,7 @@ static const uint32_t input_buttons[IN_COUNT]={
     BTN_CROSS,BTN_CIRCLE,BTN_SQUARE,BTN_TRIANGLE,BTN_L1,BTN_R1,BTN_L2,BTN_R2,BTN_L3,BTN_R3,
     BTN_OPTIONS,BTN_TOUCHPAD,0,BTN_UP,BTN_DOWN,BTN_LEFT,BTN_RIGHT,
 };
-#define MAX_BIND 4
+#define MAX_BIND 6
 #include "../../gpu/shim/bb_env.h"
 /* Mouse buttons and the wheel in key.<input> lines ("Mouse Left", "Wheel Down", ...): codes past
  * SDL's scancodes. They count only while the window holds the mouse for looking (gpu/shim
@@ -99,8 +99,26 @@ static int pad_button_from_name(const char *name) {
 static int key_from_name(const char *name) {
     for (size_t i=0;i<sizeof(mouse_keys)/sizeof(*mouse_keys);++i)
         if (!SDL_strcasecmp(name,mouse_keys[i].name)) return mouse_keys[i].code;
+    if (!SDL_strcasecmp(name,"Enter")) return SDL_SCANCODE_RETURN;
+    if (!SDL_strcasecmp(name,"KP_Enter") || !SDL_strcasecmp(name,"Numpad Enter")) return SDL_SCANCODE_KP_ENTER;
     const SDL_Scancode s=SDL_GetScancodeFromName(name);
     return s==SDL_SCANCODE_UNKNOWN ? -1 : (int)s;
+}
+static int scancode_bound_anywhere(int scancode) {
+    for (int i=0;i<IN_COUNT;++i)
+        for (int j=0;j<bindings[i].key_count;++j)
+            if (bindings[i].keys[j]==scancode && bindings[i].mods[j]<0 && bindings[i].mods2[j]<0)
+                return 1;
+    return 0;
+}
+static void ensure_nav_key(int input, int scancode) {
+    if (scancode_bound_anywhere(scancode)) return;
+    Binding *b=&bindings[input];
+    if (b->key_count<MAX_BIND) {
+        b->mods[b->key_count]=-1;
+        b->mods2[b->key_count]=-1;
+        b->keys[b->key_count++]=scancode;
+    }
 }
 /* Mouse look (bbport.ini): mouse_look=0 leaves the mouse alone; mouse_sensitivity (default 1:
  * ~1000 pixels/s turn the camera at full speed), mouse_invert_y=1, mouse_invert_x=1. */
@@ -180,6 +198,16 @@ static void load_bindings(void) {
         }
     }
     fclose(f);
+    /* Keep Enter and the arrow keys active as fallback navigation/confirm keys when bbport.ini
+     * only lists gameplay keys (e.g. key.cross=F, key.left=1, key.right=2, key.up=Wheel Up, 3,
+     * key.down=Wheel Down, 4) and those keys were not bound to another action. Appended after the
+     * primary gameplay keys so HUD button prompts still show F / 1 / 2 / 3 / 4. */
+    ensure_nav_key(IN_CROSS,SDL_SCANCODE_RETURN);
+    ensure_nav_key(IN_CROSS,SDL_SCANCODE_KP_ENTER);
+    ensure_nav_key(IN_UP,SDL_SCANCODE_UP);
+    ensure_nav_key(IN_DOWN,SDL_SCANCODE_DOWN);
+    ensure_nav_key(IN_LEFT,SDL_SCANCODE_LEFT);
+    ensure_nav_key(IN_RIGHT,SDL_SCANCODE_RIGHT);
 }
 /* The mouse while the window holds it: buttons, and the wheel as short presses (one per notch,
  * each held and released for a few frames so the game sees it). */
@@ -360,6 +388,13 @@ static void apply_keyboard(PadData *d, const bool *k) {
     for (int i=IN_CROSS;i<=IN_RIGHT;++i) {
         if (i==IN_TOUCHPAD || i==IN_TOUCHPAD_RIGHT || !key_down(k,i)) continue;
         d->buttons |= (i==IN_OPTIONS && menu && !options_latched) ? BTN_CIRCLE : input_buttons[i];
+    }
+    if (menu) {
+        if (code_down(k,SDL_SCANCODE_UP)) d->buttons|=BTN_UP;
+        if (code_down(k,SDL_SCANCODE_DOWN)) d->buttons|=BTN_DOWN;
+        if (code_down(k,SDL_SCANCODE_LEFT)) d->buttons|=BTN_LEFT;
+        if (code_down(k,SDL_SCANCODE_RIGHT)) d->buttons|=BTN_RIGHT;
+        if (code_down(k,SDL_SCANCODE_RETURN) || code_down(k,SDL_SCANCODE_KP_ENTER)) d->buttons|=BTN_CROSS;
     }
     if (keyboard_circle(k,d->timestamp,menu)) d->buttons|=BTN_CIRCLE;
     if (key_down(k,IN_TOUCHPAD)) touch_click(d,0);

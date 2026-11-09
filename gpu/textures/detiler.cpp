@@ -244,7 +244,7 @@ std::pair<const Buffer*, u64> Detiler::TileImage(Image& image,
     }
     runtime.DownloadImage(&image, staging.buffer, buffer_copies);
     runtime.FlushBarriers();
-    Vulkan::GpuProfiler::HudMarkPass(&scheduler, BbStats::GpuCat_ComputeCopies);
+    Vulkan::GpuProfiler::HudMarkPass(&scheduler, BbStats::GpuSub_Comp_CopiesAndHle);
     // BB_GPU_PROFILE: the tiler's dispatch gets a mark of its own (without it its time went to
     // the pass or dispatch before: the light shafts' passes looked slow in #204, #210).
     auto* profiler = Vulkan::GpuProfiler::Get();

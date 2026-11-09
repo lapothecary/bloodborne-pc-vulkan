@@ -242,6 +242,8 @@ def _load_saved_launcher_and_ini(env, data):
             "show_fps=1\n"
             "aspect_ratio=auto\n"
             "output_res=auto\n"
+            "window_mode=fullscreen\n"
+            "fullscreen=1\n"
             "model_lod=0\n"
             "live_resolution=0\n"
             "effect_game_aa=0\n"
@@ -293,10 +295,15 @@ def _load_saved_launcher_and_ini(env, data):
     setdefault(env, 'BB_LANGUAGE', lang)
     setdefault(env, 'BB_MENU_LANGUAGE', 'en')
 
+    window_mode = ini.get('window_mode') or s.get('window_mode')
     fullscreen = ini.get('fullscreen')
-    if fullscreen is None:
-        fullscreen = '1' if s.get('fullscreen') else '0'
-    setdefault(env, 'BB_FULLSCREEN', fullscreen)
+    if window_mode in ('fullscreen', 'borderless', 'windowed'):
+        setdefault(env, 'BB_WINDOW_MODE', window_mode)
+        setdefault(env, 'BB_FULLSCREEN', '0' if window_mode == 'windowed' else '1')
+    else:
+        if fullscreen is None:
+            fullscreen = '1' if s.get('fullscreen', True) else '0'
+        setdefault(env, 'BB_FULLSCREEN', fullscreen)
 
     present_mode = ini.get('present_mode') or s.get('present_mode') or 'Mailbox'
     setdefault(env, 'BB_PRESENT_MODE', present_mode)
@@ -431,14 +438,23 @@ def run(extra_args=(), env=None, on_line=None):
         log(f'Test settings ({test_env.name}): ' + ' '.join(f'{key}={env[key]}' for key in test_keys))
     try:
         game = Path(env.get('BB_GAME_DIR') or PACKAGE_DIR.parent / 'CUSA03173')
+        import game_check
+        base_cand, patch_cand = game_check.resolve_patch_pair(game)
+        if not (game / 'eboot.bin').is_file() and (base_cand / 'eboot.bin').is_file():
+            game = base_cand
         if not (game / 'eboot.bin').is_file():
             chosen = _prompt_game_dir_once(data, Path(env['BB_CONFIG']))
             if chosen:
                 env['BB_GAME_DIR'] = chosen
                 game = Path(chosen)
+                base_cand, patch_cand = game_check.resolve_patch_pair(game)
+                if not (game / 'eboot.bin').is_file() and (base_cand / 'eboot.bin').is_file():
+                    game = base_cand
         if not (game / 'eboot.bin').is_file():
             log(f'No eboot.bin in {game} (choose the game folder in Launcher.py).')
             return 1
+        if patch_cand is not None:
+            log(f'Game: {base_cand} + update {patch_cand}')
         original_game = game  # the game's own files (shader recipes read program code there)
         os.environ.update(env)  # the scripts read BB_* from the environment
         game = Path(script('mods.py', game, '--out', out, '--mods-dir', env.get('BB_MODS_DIR', data / 'mods'),
@@ -551,7 +567,7 @@ def run(extra_args=(), env=None, on_line=None):
         # Image shapes (gpu/textures/image_spares.h): spare textures made ahead from the first session on.
         if 'BB_IMAGE_SHAPES' not in env and (PACKAGE_DIR / 'image_shapes.txt').is_file():
             env['BB_IMAGE_SHAPES'] = str(PACKAGE_DIR / 'image_shapes.txt')
-        setdefault(env, 'BB_SHADER_GAME_DIR', str(original_game))
+        setdefault(env, 'BB_SHADER_GAME_DIR', str(game))
         online(env, user, bindir)
         probe = Path(env.get('BB_PROBE') or bindir / 'bb-probe.exe')
         args = [str(probe), str(out / 'boot-linked.bin'), '--content-profile', str(out / 'content.bin'),

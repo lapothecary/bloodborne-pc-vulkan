@@ -193,6 +193,7 @@ void Presenter::RecreateFrame(Frame& frame, u32 width, u32 height) {
 Frame* Presenter::GetRenderFrame() {
     Frame* frame;
     {
+        BbSections::PauseADecodeScope pause_decode;
         BbStats::WaitTimer timer{BbStats::present_wait_ns};
         {
             std::unique_lock lock{free_mutex};
@@ -317,7 +318,7 @@ Frame* Presenter::PrepareFrame(const BbVideoOut::BufferAttributeGroup& attribute
                           : 0;
     // The encode pass holds no state: frames of different submissions may be recorded on two
     // threads at once.
-    GpuProfiler::HudMarkPass(&draw_scheduler, BbStats::GpuCat_UiPresent);
+    GpuProfiler::HudMarkPass(&draw_scheduler, BbStats::GpuSub_Ui_RcasPresent);
     draw_scheduler.Record([this, frame, source, encode, stream, crumb](vk::CommandBuffer cmdbuf) {
         if (crumb) {
             Breadcrumbs::Mark(cmdbuf, stream, crumb, false);

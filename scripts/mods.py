@@ -11,6 +11,9 @@ import sys
 import tempfile
 import time
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import game_check
+
 # Top-level folders of the game's dvdroot_ps4: a mod made of these is a dvdroot_ps4 itself (adhoc:
 # the debug menu's fonts, which the retail game does not ship).
 GAME_FOLDERS = {'action', 'adhoc', 'chr', 'event', 'facegen', 'font', 'map', 'menu', 'movie', 'msg', 'mtd',
@@ -111,24 +114,33 @@ def mod_files(folder):
 # (Developer Mode off) gets directory junctions and hard links (copies across volumes) instead,
 # which is_symlink() does not see: this table does.
 LINKS = {}
+_SYMLINK_SUPPORTED = None
 
 
 def make_link(link, target):
     """link -> target: a symbolic link, else (Windows) a junction for a folder, a hard link or a
     copy for a file."""
-    try:
-        link.symlink_to(target, target_is_directory=target.is_dir())
-    except OSError:
-        if os.name != 'nt':
-            raise
-        if target.is_dir():
-            import _winapi
-            _winapi.CreateJunction(str(target), str(link))
-        else:
-            try:
-                os.link(target, link)
-            except OSError:
-                shutil.copy2(target, link)
+    global _SYMLINK_SUPPORTED
+    is_dir = target.is_dir()
+    if _SYMLINK_SUPPORTED is not False:
+        try:
+            link.symlink_to(target, target_is_directory=is_dir)
+            _SYMLINK_SUPPORTED = True
+            LINKS[link] = target
+            return
+        except OSError as exc:
+            if os.name != 'nt':
+                raise
+            if getattr(exc, 'winerror', None) == 1314:
+                _SYMLINK_SUPPORTED = False
+    if is_dir:
+        import _winapi
+        _winapi.CreateJunction(str(target), str(link))
+    else:
+        try:
+            os.link(target, link)
+        except OSError:
+            shutil.copy2(target, link)
     LINKS[link] = target
 
 
@@ -161,8 +173,46 @@ def expand(directory):
         directory.mkdir(exist_ok=True)
 
 
-def build_overlay(game, out, mods):
+def merge_patch_tree(dest_dir, src_dir, base_game):
+    """Overlay a PS4 update folder (eboot.bin, sce_sys, sce_module, dvdroot_ps4) onto dest_dir.
+    Subdirectories absent from dest_dir are linked as a single directory link/junction."""
+    replaced = added = 0
+    for entry in sorted(src_dir.iterdir(), key=lambda p: p.name):
+        if entry.is_symlink():
+            raise ValueError(f'Patch symlinks are unsupported: {entry}')
+        target = child(dest_dir, entry.name)
+        if entry.is_dir():
+            if not is_link(target) and not target.exists():
+                make_link(target, entry)
+                added += 1
+            else:
+                expand(target)
+                r, a = merge_patch_tree(target, entry, base_game)
+                replaced += r
+                added += a
+        elif entry.is_file():
+            if is_link(target):
+                target_dest = LINKS.get(target) or target.resolve()
+                if target_dest.is_dir():
+                    raise ValueError(f'File/directory conflict: {entry}')
+                replaced += target_dest.is_relative_to(base_game)
+                unlink(target)
+            elif target.exists():
+                raise ValueError(f'File/directory conflict: {entry}')
+            else:
+                added += 1
+            make_link(target, entry)
+    return replaced, added
+
+
+def build_overlay(game, out, mods, patch=None):
+    if patch is None:
+        base_cand, patch_cand = game_check.resolve_patch_pair(game)
+        if patch_cand is not None:
+            game, patch = base_cand, patch_cand
     game = Path(game).resolve(strict=True)
+    if patch is not None:
+        patch = Path(patch).resolve(strict=True)
     replacements = []
     owners = {}
     for name, root in mods:
@@ -175,7 +225,7 @@ def build_overlay(game, out, mods):
             replacements.append((relative, source))
             count += 1
         print(f'Mods: {name}: {count} files', file=sys.stderr)
-    if not replacements:
+    if not replacements and patch is None:
         return game
     out = Path(out).resolve()
     out.mkdir(parents=True, exist_ok=True)
@@ -183,6 +233,10 @@ def build_overlay(game, out, mods):
     try:
         for entry in game.iterdir():
             make_link(overlay / entry.name, entry)
+        if patch is not None:
+            p_replaced, p_added = merge_patch_tree(overlay, patch, game)
+            print(f'Update: {patch.name} overlaid on {game.name} ({p_replaced} files replaced, {p_added} added)',
+                  file=sys.stderr)
         replaced = added = 0
         for relative, source in replacements:
             # Each component takes the game's spelling when it exists in another case.
@@ -192,14 +246,16 @@ def build_overlay(game, out, mods):
                 expand(parent)
             destination = child(parent, relative.parts[-1])
             if is_link(destination):
-                replaced += (LINKS.get(destination) or destination.resolve()).is_relative_to(game)
+                prev = LINKS.get(destination) or destination.resolve()
+                replaced += prev.is_relative_to(game) or (patch is not None and prev.is_relative_to(patch))
                 unlink(destination)
             elif destination.exists():
                 raise ValueError(f'File/directory conflict: {relative}')
             else:
                 added += 1
             make_link(destination, source)
-        print(f'Mods: {replaced} game files replaced, {added} added', file=sys.stderr)
+        if replacements:
+            print(f'Mods: {replaced} game files replaced, {added} added', file=sys.stderr)
         return overlay
     except BaseException:
         shutil.rmtree(overlay)
@@ -236,12 +292,17 @@ def main():
     parser.add_argument('--saves', type=Path, help='the save folder, copied when the set of mods changes')
     parser.add_argument('--state', type=Path, help='where the last launch\'s set of mods is kept')
     args = parser.parse_args()
+    base_game, patch_game = game_check.resolve_patch_pair(args.game)
     layers = []
     if args.enabled == '1':
         # shadPS4's loose overlay convention, beside the original game.
-        legacy = Path(str(args.game.resolve()) + '-mods')
-        if legacy.is_dir():
-            layers.append((legacy.name, legacy))
+        seen_legacy = set()
+        for root_cand in (base_game, args.game):
+            if root_cand.exists():
+                legacy = Path(str(root_cand.resolve()) + '-mods')
+                if legacy.is_dir() and legacy not in seen_legacy:
+                    seen_legacy.add(legacy)
+                    layers.append((legacy.name, legacy))
         # A directly selected loose overlay is also accepted.
         if child(args.mods_dir, 'dvdroot_ps4').is_dir():
             layers.append((args.mods_dir.name, args.mods_dir))
@@ -250,7 +311,7 @@ def main():
                 layers.append((name, args.mods_dir / name))
     if args.saves and args.state:
         backup_saves(args.saves, args.state, [name for name, _ in layers])
-    print(build_overlay(args.game, args.out, layers))
+    print(build_overlay(base_game, args.out, layers, patch=patch_game))
 
 
 if __name__ == '__main__':

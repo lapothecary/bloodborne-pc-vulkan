@@ -145,6 +145,12 @@ DRAW_PIPE = [
     ("Disabled (Safer, slower)", "0"),
 ]
 
+WINDOW_MODES = [
+    ("Fullscreen", "fullscreen"),
+    ("Borderless Windowed", "borderless"),
+    ("Windowed", "windowed"),
+]
+
 LANGUAGES = [
     ("English (US)", "1"),
     ("English (UK)", "18"),
@@ -273,7 +279,8 @@ DEFAULTS = {
     "mods_enabled": True,
     "patches_dir": "",
     "language": "1",
-    "fullscreen": False,
+    "window_mode": "fullscreen",
+    "fullscreen": True,
     "hdr": False,
     "present_mode": "Mailbox",
     "gamepad": "",
@@ -317,6 +324,7 @@ INI_DEFAULTS = {
     "sharpness": "0.50",
     "object_motion": "0",
     "show_fps": "1",
+    "window_mode": "fullscreen",
     "aspect_ratio": "auto",
     "output_res": "2560x1440",
     "model_lod": "0",
@@ -994,9 +1002,18 @@ class AdwLauncherWindow:
         self.fill_aspects(aspect if aspect in ASPECTS else "auto")
         self.fill_outputs(parse_size(self.ini.get("output_res", "2560x1440")))
 
-        self.fullscreen_row = AdwSwitchRow(
-            screen, title="Fullscreen",
-            active=self.ini.get("fullscreen", "1" if self.settings["fullscreen"] else "0") == "1",
+        init_wm = self.ini.get("window_mode")
+        if init_wm not in ("fullscreen", "borderless", "windowed"):
+            init_wm = "windowed" if self.ini.get("fullscreen") == "0" else (
+                self.settings.get("window_mode")
+                or ("fullscreen" if self.settings.get("fullscreen", True) else "windowed")
+            )
+        self.window_mode_row = AdwComboRow(
+            screen,
+            title="Window mode",
+            subtitle="Fullscreen, Borderless Windowed, or Windowed mode (switches live in-game, Alt+Enter)",
+            choices=WINDOW_MODES,
+            current=init_wm,
             on_change=lambda _v: self.store(),
         )
         self.hdr_row = AdwSwitchRow(
@@ -1625,7 +1642,7 @@ class AdwLauncherWindow:
         if not chosen:
             return
         p = Path(chosen)
-        for cand in (p, p / "CUSA03173", p / "game", p / "dvdroot_ps4"):
+        for cand in (p, p / "CUSA03173", p / "CUSA00900", p / "game", p / "dvdroot_ps4"):
             if (cand / "eboot.bin").is_file():
                 p = cand
                 break
@@ -1718,7 +1735,9 @@ class AdwLauncherWindow:
         s = self.settings
         s["gpu"] = self.gpu_row.get_value()
         s["display"] = self.display_row.get_value()
-        s["fullscreen"] = self.fullscreen_row.get_active()
+        wm_val = self.window_mode_row.get_value()
+        s["window_mode"] = wm_val
+        s["fullscreen"] = wm_val != "windowed"
         s["hdr"] = self.hdr_row.get_active()
         s["present_mode"] = self.present_row.get_value()
         s["fps_limit"] = int(round(self.limit_row.get_value()))
@@ -1756,7 +1775,8 @@ class AdwLauncherWindow:
             "ui_upscale": "1" if self.ui_upscale_row.get_active() else "0",
             "fps_limit": str(int(round(self.limit_row.get_value()))),
             "language": str(self.language_row.get_value()),
-            "fullscreen": "1" if self.fullscreen_row.get_active() else "0",
+            "window_mode": wm_val,
+            "fullscreen": "0" if wm_val == "windowed" else "1",
             "present_mode": str(self.present_row.get_value()),
             "skip_network_choice": "1" if self.skip_network_row.get_active() else "0",
             "sharpen": "1" if self.sharpen_row.get_active() else "0",
@@ -1796,8 +1816,12 @@ class AdwLauncherWindow:
                 s["game_dir"] = self.ini["game_dir"]
             if "language" in self.ini:
                 s["language"] = self.ini["language"]
-            if "fullscreen" in self.ini:
+            if "window_mode" in self.ini and self.ini["window_mode"] in ("fullscreen", "borderless", "windowed"):
+                s["window_mode"] = self.ini["window_mode"]
+                s["fullscreen"] = s["window_mode"] != "windowed"
+            elif "fullscreen" in self.ini:
                 s["fullscreen"] = self.ini["fullscreen"] == "1"
+                s["window_mode"] = "fullscreen" if s["fullscreen"] else "windowed"
             if "present_mode" in self.ini:
                 s["present_mode"] = self.ini["present_mode"]
             if "skip_network_choice" in self.ini:
@@ -1810,7 +1834,7 @@ class AdwLauncherWindow:
             aspect = self.ini.get("aspect_ratio", "auto")
             self.fill_aspects(aspect if aspect in ASPECTS else "auto")
             self.fill_outputs(parse_size(self.ini.get("output_res", "2560x1440")))
-            self.fullscreen_row.set_active(bool(s["fullscreen"]))
+            self.window_mode_row.set_value(s.get("window_mode", "fullscreen"))
             self.present_row.set_value(s["present_mode"])
             self.language_row.set_value(s["language"])
             self.skip_network_row.set_active(bool(s.get("skip_network_choice", True)))
@@ -1907,7 +1931,9 @@ class AdwLauncherWindow:
             env["BB_USER_DIR"] = str(self.settings["user_dir"])
         env["BB_LANGUAGE"] = str(self.settings.get("language", "1"))
         env["BB_MENU_LANGUAGE"] = "en"
-        env["BB_FULLSCREEN"] = "1" if self.settings.get("fullscreen") else "0"
+        wm = self.settings.get("window_mode") or ("fullscreen" if self.settings.get("fullscreen", True) else "windowed")
+        env["BB_WINDOW_MODE"] = wm
+        env["BB_FULLSCREEN"] = "0" if wm == "windowed" else "1"
         env["BB_PRESENT_MODE"] = str(self.settings.get("present_mode", "Mailbox"))
         env["BB_FPS"] = "uncap"
         env["BB_FPS_LIMIT"] = str(self.settings.get("fps_limit", 0) or 0)

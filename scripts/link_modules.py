@@ -19,6 +19,7 @@ from pathlib import Path
 import re
 import struct
 from prepare import parse_self, span, unpack
+import game_check
 import import_scopes
 from link_libc import encode_id
 
@@ -95,7 +96,7 @@ def patch_fs_loads(image, ph, base):
 
 
 def link(game, out, module_names=DEFAULT_MODULES):
-    main = module(game / 'eboot.bin')
+    main = module(game_check.game_file(game, 'eboot.bin'))
     raw = (out / 'boot.bin').read_bytes()
     magic, size, entry, ns, nr, ni, flags = unpack('<8s6Q', raw, 0)
     if magic != b'BBPROBE2':
@@ -133,7 +134,7 @@ def link(game, out, module_names=DEFAULT_MODULES):
     fs_patched = patch_fs_loads(image, main['ph'], 0)
     tls_module = 2
     for filename in module_names:
-        m = module(game / 'sce_module' / filename)
+        m = module(game_check.game_file(game, f'sce_module/{filename}'))
         loads = [p for p in m['ph'] if p['type'] in (1, 0x61000010)]
         modsize = max(p['vaddr'] + p['memsz'] for p in loads)
         if base + modsize > 512 * 1024 * 1024:

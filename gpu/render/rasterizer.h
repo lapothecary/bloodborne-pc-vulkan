@@ -428,6 +428,10 @@ public:
         return pipeline_cache;
     }
 
+    static bool DrawPipeWanted();
+    bool UseDrawPipe() const;
+    bool OnStageA() const;
+
     template <typename Func>
     void ForEachMappedRangeInRange(VAddr addr, u64 size, Func&& func) {
         const auto range = decltype(mapped_ranges)::interval_type::right_open(addr, addr + size);
@@ -495,7 +499,15 @@ private:
         u32 scene_size = 0;
         std::array<float, 2> target_scale{};
         UiPlacement ui_placement;
+        u64 cmd_epoch = 0;
     } begin_memo;
+    bool last_begin_memo_hit = false;
+    mutable u64 last_dyn_reg_epoch = 0;
+    mutable u64 last_dyn_cmd_epoch = 0;
+    mutable std::array<float, 2> last_dyn_target_scale{};
+    mutable std::array<float, 2> last_dyn_jitter{};
+    mutable bool last_dyn_is_indexed = false;
+    mutable bool last_dyn_feedback_loop = false;
     u64 begin_memo_hits = 0, begin_memo_misses = 0;
     static constexpr u64 kGdsSliceBytes = 256;
     std::array<VAddr, 16> gds_dword_mirror{};
@@ -542,9 +554,6 @@ private:
     /// Everything of a direct draw after the pipeline selection (GPU thread or stage B).
     void DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw* used_prepared,
                     bool is_indexed, u32 index_offset);
-    static bool DrawPipeWanted();
-    bool UseDrawPipe() const;
-    bool OnStageA() const;
     /// Arguments of an indirect draw: `args` holds `max_count` commands `stride` apart.
     struct IndirectDraw {
         VAddr args;
@@ -654,6 +663,8 @@ private:
         std::array<vk::VertexInputAttributeDescription2EXT, 16> attributes{};
         std::array<vk::VertexInputBindingDescription2EXT, 16> bindings{};
         std::array<std::pair<VAddr, VAddr>, 16> ranges{};
+        std::array<u64, 16> range_min_spans{};
+        std::array<u8, 16> range_indices{};
     };
     u64 stage_b_vertex_memo_clock = 0;
     std::unique_ptr<std::array<StageBVertexMemoEntry, StageBVertexMemoEntry::TableSize>>
@@ -675,7 +686,8 @@ private:
     /// Display pass: counts the frame (BbStats::gpu_frames) and, with BB_BUFFER_STATS, the lag.
     void NoteFrameStart();
     /// BB_GPU_PROFILE: a timestamp where a render pass starts (vk_gpu_profiler.h).
-    void MarkPass(const GraphicsPipeline* pipeline, const RenderState& state);
+    void MarkPass(const GraphicsPipeline* pipeline, const RenderState& state,
+                  bool will_begin = false);
     void BindVertexBuffers(const GraphicsPipeline* pipeline,
                            const PreparedDraw* prepared = nullptr);
     void BindIndexBuffer(u32 index_offset = 0);

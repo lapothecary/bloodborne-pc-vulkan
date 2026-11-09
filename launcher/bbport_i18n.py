@@ -144,6 +144,12 @@ EN = {
     "Соотношение сторон": "Aspect ratio",
     "Шире 16:9 — больше обзор по бокам, выше — сверху и снизу; интерфейс у краёв экрана": "Wider than 16:9 sees more to the sides, taller more above and below; the UI keeps to the screen edges",
     "Полноэкранный режим": "Fullscreen",
+    "Режим экрана": "Window mode",
+    "Полный экран": "Fullscreen",
+    "Окно без рамки": "Borderless Windowed",
+    "В окне": "Windowed",
+    "Полный экран, окно без рамки или оконный режим (переключается в игре на лету, Alt+Enter)":
+        "Fullscreen, Borderless Windowed or Windowed mode (switches live in-game, Alt+Enter)",
     "Смена разрешения на лету": "Live resolution changes",
     "Без перезапуска, но медленнее на Steam Deck и старых GPU":
         "No restart needed, but slower on the Steam Deck and older GPUs",
@@ -626,6 +632,12 @@ PT_BR = {
     "Шире 16:9 — больше обзор по бокам, выше — сверху и снизу; интерфейс у краёв экрана": "Mais larga que 16:9 mostra mais dos lados, mais alta mais acima e abaixo; a interface fica nas bordas da tela",
     "Авто": "Auto",
     "Полноэкранный режим": "Tela cheia",
+    "Режим экрана": "Modo de janela",
+    "Полный экран": "Tela cheia",
+    "Окно без рамки": "Janela sem bordas",
+    "В окне": "Modo janela",
+    "Полный экран, окно без рамки или оконный режим (переключается в игре на лету, Alt+Enter)":
+        "Tela cheia, Janela sem bordas ou Modo janela (alterna em tempo real no jogo, Alt+Enter)",
     "Смена разрешения на лету": "Alteração de resolução em tempo real",
     "Без перезапуска, но медленнее на Steam Deck и старых GPU":
         "Não exige reinicialização, mas é mais lento no Steam Deck e em GPUs mais antigas",
@@ -932,6 +944,12 @@ ZH_CN = {
     "Соотношение сторон": "宽高比",
     "Шире 16:9 — больше обзор по бокам, выше — сверху и снизу; интерфейс у краёв экрана": "比 16:9 更宽可看到两侧更多内容，更高可看到上下更多内容；界面贴靠屏幕边缘",
     "Полноэкранный режим": "全屏模式",
+    "Режим экрана": "窗口模式",
+    "Полный экран": "全屏",
+    "Окно без рамки": "无边框窗口",
+    "В окне": "窗口",
+    "Полный экран, окно без рамки или оконный режим (переключается в игре на лету, Alt+Enter)":
+        "全屏、无边框窗口或窗口模式（可在游戏中实时切换，Alt+Enter）",
     "Смена разрешения на лету": "实时切换分辨率",
     "Без перезапуска, но медленнее на Steam Deck и старых GPU":
         "无需重启，但在 Steam Deck 和较旧的显卡上速度更慢",

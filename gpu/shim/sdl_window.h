@@ -53,6 +53,10 @@ private:
     std::string text, text_prompt, base_title;
     void UpdateTextTitle();
     void UpdateCursor();
+    void ApplyWindowMode(int mode, s32 target_w, s32 target_h);
+    int applied_window_mode{-1};
+    s32 applied_output_w{0};
+    s32 applied_output_h{0};
     u64 last_mouse_motion_ms{}; ///< SDL_GetTicks of the last mouse motion (UpdateCursor)
     bool cursor_hidden{};
     u64 capture_settle_ms{}; ///< mouse motion before this (SDL_GetTicks) is not looking around

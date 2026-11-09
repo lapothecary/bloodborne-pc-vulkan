@@ -172,6 +172,10 @@ const char* TranslateForCurrentGameLang(const char* en) {
         {"Effects", "Effets", "Efectos", "Effekte", "Effetti", "Efeitos", "Efekty", "エフェクト", "효과", "特效"},
         {"Aspect Ratio", "Format d'image", "Relación de aspecto", "Seitenverhältnis", "Rapporto d'aspetto", "Proporção de tela", "Proporcje ekranu", "アスペクト比", "화면 비율", "宽高比"},
         {"Resolution", "Résolution", "Resolución", "Auflösung", "Risoluzione", "Resolução", "Rozdzielczość", "解像度", "해상도", "分辨率"},
+        {"Window Mode", "Mode d'affichage", "Modo de ventana", "Fenstermodus", "Modalità finestra", "Modo de janela", "Tryb okna", "画面モード", "화면 모드", "窗口模式"},
+        {"Fullscreen", "Plein écran", "Pantalla completa", "Vollbild", "Schermo intero", "Tela cheia", "Pełny ekran", "フルスクリーン", "전체 화면", "全屏"},
+        {"Borderless Windowed", "Fenêtré sans bordure", "Ventana sin bordes", "Rahmenloses Fenster", "Finestra senza bordi", "Janela sem bordas", "Okno bez ramki", "ボーダレスウィンドウ", "테두리 없는 창", "无边框窗口"},
+        {"Windowed", "Fenêtré", "Ventana", "Fenster", "Finestra", "Modo janela", "W oknie", "ウィンドウ", "창 모드", "窗口"},
         {"FPS Limit", "Limite de FPS", "Límite de FPS", "FPS-Limit", "Limite FPS", "Limite de FPS", "Limit FPS", "最大フレームレート", "FPS 제한", "帧率上限"},
         {"Anti-Aliasing", "Anticrénelage", "Antialiasing", "Kantenglättung", "Anti-Aliasing", "Anti-Aliasing", "Wygładzanie krawędzi", "アンチエイリアス", "안티앨리어싱", "抗锯齿"},
         {"Upscaler", "Mise à l'échelle", "Escalador", "Upscaler", "Upscaler", "Upscaler", "Skalowanie", "アップスケーラー", "업스케일러", "超分辨率"},
@@ -275,8 +279,8 @@ constexpr int ItemAutoTarget = FirstControlSettingItem + 5;
 constexpr int ItemCameraAdjust = FirstControlSettingItem + 6;
 constexpr int TotalControlsItems = BbSettings::KeyActionCount + 7; ///< 26 keybinds + Mouse Speed + 6 native settings
 constexpr int MaxControlsScroll = TotalControlsItems - ControlsSlotCount;
-constexpr int DisplaySlotCount = 6; ///< all 6 visible rows in Display scroll across 10 items
-constexpr int TotalDisplayItems = 10;
+constexpr int DisplaySlotCount = 6; ///< all 6 visible rows in Display scroll across 11 items
+constexpr int TotalDisplayItems = 11;
 constexpr int MaxDisplayScroll = TotalDisplayItems - DisplaySlotCount;
 constexpr int EffectsSlotCount = 6; ///< all 6 visible rows in Effects scroll across 11 items
 constexpr int TotalEffectsItems = 11;
@@ -1332,7 +1336,7 @@ void SetSharpnessStep(int step) {
 }
 
 int GetDisplayItemSliderValue(int item_idx) {
-    if (item_idx == 6) {
+    if (item_idx == 7) {
         return CurrentSharpnessStep();
     }
     return -1;
@@ -1341,7 +1345,7 @@ int GetDisplayItemSliderValue(int item_idx) {
 void SyncDisplaySlotSliderWidget(u8* row, int slot, bool is_focused) {
     const int item_idx = std::clamp(display_scroll + slot, 0, TotalDisplayItems - 1);
     const char16_t* combo_text =
-        (item_idx == 9) ? TextOf(DisplaySlotVal + u32(slot)) : nullptr;
+        (item_idx == 10) ? TextOf(DisplaySlotVal + u32(slot)) : nullptr;
     SyncPageSlotSliderWidget(active_display_page, row, slot, GetDisplayItemSliderValue(item_idx), is_focused,
                              combo_text);
 }
@@ -1481,6 +1485,14 @@ void BuildDisplaySlotChoices(int slot, std::vector<u32>& out_choices, int& out_s
     }
 
     if (item_idx == 2) {
+        add_choice("Fullscreen", "Полный экран");
+        add_choice("Borderless Windowed", "Окно без рамки");
+        add_choice("Windowed", "В окне");
+        out_selected_idx = std::clamp(s.window_mode.load(), 0, BbSettings::WindowModeCount - 1);
+        return;
+    }
+
+    if (item_idx == 3) {
         int cur_idx = 0;
         const std::vector<int> fps_vals = BuildFpsValuesList(&cur_idx);
         for (int fps : fps_vals) {
@@ -1500,7 +1512,7 @@ void BuildDisplaySlotChoices(int slot, std::vector<u32>& out_choices, int& out_s
         return;
     }
 
-    if (item_idx == 3) {
+    if (item_idx == 4) {
         std::vector<int> modes = {AaOff, AaFxaa, AaSmaa, AaSmaaT2x, AaTaa};
         add_choice("Off", "Выкл");
         add_choice("FXAA", "FXAA");
@@ -1521,7 +1533,7 @@ void BuildDisplaySlotChoices(int slot, std::vector<u32>& out_choices, int& out_s
         return;
     }
 
-    if (item_idx == 4) {
+    if (item_idx == 5) {
         const auto choices = GetAvailableUpscalerChoices();
         int sel = 0;
         for (int i = 0; i < int(choices.size()); ++i) {
@@ -1534,7 +1546,7 @@ void BuildDisplaySlotChoices(int slot, std::vector<u32>& out_choices, int& out_s
         return;
     }
 
-    if (item_idx == 5) {
+    if (item_idx == 6) {
         for (int p = int(BbSettings::NativeAA); p <= int(BbSettings::UltraPerformance); ++p) {
             const char *en = nullptr, *ru = nullptr;
             UpscalerModeLabels(p, en, ru);
@@ -1545,7 +1557,7 @@ void BuildDisplaySlotChoices(int slot, std::vector<u32>& out_choices, int& out_s
         return;
     }
 
-    if (item_idx == 7) {
+    if (item_idx == 8) {
         add_choice("Off (PS4 Default)", "Выкл (Как на PS4)");
         add_choice("4x (Medium)", "4x (Средняя)");
         add_choice("8x (High)", "8x (Высокая)");
@@ -1555,7 +1567,7 @@ void BuildDisplaySlotChoices(int slot, std::vector<u32>& out_choices, int& out_s
         return;
     }
 
-    if (item_idx == 8) {
+    if (item_idx == 9) {
         add_choice("Highest", "Максимальная");
         add_choice("Game Default", "Как в игре");
         add_choice("Lower", "Ниже");
@@ -1565,7 +1577,7 @@ void BuildDisplaySlotChoices(int slot, std::vector<u32>& out_choices, int& out_s
         return;
     }
 
-    if (item_idx == 9) {
+    if (item_idx == 10) {
         add_choice("Off (PS4 Default)", "Выкл (Как на PS4)");
         add_choice("On (AI / SDF 2x-4x)", "Вкл (AI / SDF 2x-4x)");
         out_selected_idx = s.ui_upscale.load() ? 1 : 0;
@@ -1605,6 +1617,22 @@ void RefreshDisplaySlotTexts(int slot) {
     }
 
     if (item_idx == 2) {
+        SetDynamic(name_id, "Window Mode", "Режим экрана");
+        SetDynamic(help_id,
+                   "Fullscreen, Borderless Windowed or Windowed mode (applies live, Alt+Enter toggles)",
+                   "Полный экран, окно без рамки или оконный режим (применяется сразу, Alt+Enter)");
+        const int wm = std::clamp(s.window_mode.load(), 0, BbSettings::WindowModeCount - 1);
+        if (wm == BbSettings::WindowModeFullscreen) {
+            SetDynamic(val_id, "Fullscreen", "Полный экран");
+        } else if (wm == BbSettings::WindowModeBorderless) {
+            SetDynamic(val_id, "Borderless Windowed", "Окно без рамки");
+        } else {
+            SetDynamic(val_id, "Windowed", "В окне");
+        }
+        return;
+    }
+
+    if (item_idx == 3) {
         SetDynamic(name_id, "FPS Limit", "Лимит FPS");
         SetDynamic(help_id,
                    "Maximum frame rate target: Uncapped or fixed FPS (custom value in Insert overlay)",
@@ -1624,7 +1652,7 @@ void RefreshDisplaySlotTexts(int slot) {
         return;
     }
 
-    if (item_idx == 3) {
+    if (item_idx == 4) {
         SetDynamic(name_id, "Anti-Aliasing", "Сглаживание");
         SetDynamic(help_id,
                    "Anti-Aliasing mode when Upscaler is Off (Off / FXAA / SMAA 1x / SMAA T2x / TAA / DLAA 4 / DLAA 3)",
@@ -1647,7 +1675,7 @@ void RefreshDisplaySlotTexts(int slot) {
         return;
     }
 
-    if (item_idx == 4) {
+    if (item_idx == 5) {
         SetDynamic(name_id, "Upscaler", "Апскейлер");
         SetDynamic(help_id,
                    "Super-resolution upscaler (Off = Native 100%; DLSS 4.5 Preset M/L, DLSS 4 Preset K, FSR 3.1)",
@@ -1658,7 +1686,7 @@ void RefreshDisplaySlotTexts(int slot) {
         return;
     }
 
-    if (item_idx == 5) {
+    if (item_idx == 6) {
         SetDynamic(name_id, "Upscaler Mode", "Режим апскейлера");
         SetDynamic(help_id,
                    "3D render scale when Upscaler is active: Native 100% (DLAA), Quality (67%), Balanced (58%), Performance (50%), Ultra Perf. (33%)",
@@ -1669,7 +1697,7 @@ void RefreshDisplaySlotTexts(int slot) {
         return;
     }
 
-    if (item_idx == 6) {
+    if (item_idx == 7) {
         SetDynamic(name_id, "Sharpness (RCAS)", "Резкость (RCAS)");
         SetDynamic(help_id, "Contrast-adaptive sharpening (RCAS): 0 off, 10 strongest (Left/Right)",
                    "Адаптивная резкость (RCAS): 0 выкл, 10 сильнее всего (Влево/Вправо)");
@@ -1679,7 +1707,7 @@ void RefreshDisplaySlotTexts(int slot) {
         return;
     }
 
-    if (item_idx == 7) {
+    if (item_idx == 8) {
         SetDynamic(name_id, "Anisotropic Filtering", "Фильтрация текстур");
         SetDynamic(help_id,
                    "Sharpens ground, cobblestones and wall textures at oblique angles (applies live)",
@@ -1697,7 +1725,7 @@ void RefreshDisplaySlotTexts(int slot) {
         return;
     }
 
-    if (item_idx == 8) {
+    if (item_idx == 9) {
         SetDynamic(name_id, "Model Detail (LOD)", "Детализация моделей");
         SetDynamic(help_id, "Level of detail distance for 3D models and geometry (applies live)",
                    "Дальность максимальной детализации 3D-моделей (применяется мгновенно)");
@@ -1714,7 +1742,7 @@ void RefreshDisplaySlotTexts(int slot) {
         return;
     }
 
-    if (item_idx == 9) {
+    if (item_idx == 10) {
         SetDynamic(name_id, "UI & Icons Upscale", "Апскейл иконок и UI");
         SetDynamic(help_id,
                    "2x/4x GPU Super-Resolution (SDF + De-Block + Edge Reconstruction) for logos, icons & HUD (applies live)",
@@ -1730,7 +1758,7 @@ void RefreshDisplaySlotTexts(int slot) {
 void UpdateDisplaySlotRowDisplay(u8* row, int slot) {
     if (!row) return;
     const int item_idx = std::clamp(display_scroll + slot, 0, TotalDisplayItems - 1);
-    if (item_idx == 6) {
+    if (item_idx == 7) {
         const std::vector<u32> single = {DisplaySlotVal + u32(slot), DisplaySlotVal + u32(slot)};
         PopulateSelectRowChoices(row, FirstDisplaySlot + slot, single, 0);
     } else {
@@ -1812,6 +1840,18 @@ void ApplyDisplaySlotChoiceIndex(u8* row, int slot, int choice_idx) {
     }
 
     if (item_idx == 2) {
+        const int new_wm = std::clamp(choice_idx, 0, BbSettings::WindowModeCount - 1);
+        if (new_wm != s.window_mode.load()) {
+            s.window_mode = new_wm;
+            s.window_mode_chosen = true;
+            BbSettings::Save();
+        }
+        RefreshDisplaySlotTexts(slot);
+        UpdateDisplaySlotRowDisplay(row, slot);
+        return;
+    }
+
+    if (item_idx == 3) {
         const std::vector<int> fps_vals = BuildFpsValuesList(nullptr);
         if (!fps_vals.empty()) {
             const int new_fps = fps_vals[std::clamp(choice_idx, 0, int(fps_vals.size()) - 1)];
@@ -1826,7 +1866,7 @@ void ApplyDisplaySlotChoiceIndex(u8* row, int slot, int choice_idx) {
         return;
     }
 
-    if (item_idx == 3) {
+    if (item_idx == 4) {
         std::vector<int> modes = {AaOff, AaFxaa, AaSmaa, AaSmaaT2x, AaTaa};
         if (s.dlss_supported.load()) {
             modes.push_back(AaDlaa);
@@ -1842,7 +1882,7 @@ void ApplyDisplaySlotChoiceIndex(u8* row, int slot, int choice_idx) {
         return;
     }
 
-    if (item_idx == 4) {
+    if (item_idx == 5) {
         const auto choices = GetAvailableUpscalerChoices();
         const auto new_up = choices[std::clamp(choice_idx, 0, int(choices.size()) - 1)];
         if (new_up != disp_upscaler_choice) {
@@ -1859,7 +1899,7 @@ void ApplyDisplaySlotChoiceIndex(u8* row, int slot, int choice_idx) {
         return;
     }
 
-    if (item_idx == 5) {
+    if (item_idx == 6) {
         const int new_preset = std::clamp(choice_idx, int(BbSettings::NativeAA), int(BbSettings::UltraPerformance));
         if (new_preset != disp_upscale_preset ||
             (new_preset != BbSettings::NativeAA && disp_upscaler_choice == DispUpOff)) {
@@ -1873,7 +1913,7 @@ void ApplyDisplaySlotChoiceIndex(u8* row, int slot, int choice_idx) {
         return;
     }
 
-    if (item_idx == 7) {
+    if (item_idx == 8) {
         const int new_aniso = AnisoValues[std::clamp(choice_idx, 0, AnisoValueCount - 1)];
         if (new_aniso != s.anisotropic.load()) {
             s.anisotropic = new_aniso;
@@ -1884,7 +1924,7 @@ void ApplyDisplaySlotChoiceIndex(u8* row, int slot, int choice_idx) {
         return;
     }
 
-    if (item_idx == 8) {
+    if (item_idx == 9) {
         const int idx = std::clamp(choice_idx, 0, 3);
         const int new_lod = LodValues[idx];
         if (new_lod != s.model_lod.load()) {
@@ -1899,7 +1939,7 @@ void ApplyDisplaySlotChoiceIndex(u8* row, int slot, int choice_idx) {
         return;
     }
 
-    if (item_idx == 9) {
+    if (item_idx == 10) {
         const bool new_ui_up = (choice_idx != 0);
         if (new_ui_up != s.ui_upscale.load()) {
             s.ui_upscale = new_ui_up;
@@ -1912,7 +1952,7 @@ void ApplyDisplaySlotChoiceIndex(u8* row, int slot, int choice_idx) {
 
 void StepDisplaySlotSetting(u8* row, int slot, int delta, bool wrap) {
     const int item_idx = std::clamp(display_scroll + slot, 0, TotalDisplayItems - 1);
-    if (item_idx == 6) {
+    if (item_idx == 7) {
         const int cur = CurrentSharpnessStep();
         int step = cur + delta;
         step = wrap ? (step + SharpnessSteps) % SharpnessSteps : std::clamp(step, 0, SharpnessSteps - 1);
@@ -2451,6 +2491,8 @@ u64 PS4_SYSV_ABI RowInputHook(u8* row, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, d
             disp_upscale_preset = BbSettings::Quality;
             disp_aa_mode = s.dlss_supported.load() ? AaDlaa : AaTaa;
             MarkDisplayHeavyDirty();
+            s.window_mode = BbSettings::WindowModeFullscreen;
+            s.window_mode_chosen = true;
             s.fps_limit = 0;
             BbFrameRate::SetLimit(0);
             SetSharpnessStep(2);
@@ -2464,7 +2506,7 @@ u64 PS4_SYSV_ABI RowInputHook(u8* row, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, d
         const int item_idx = std::clamp(display_scroll + slot, 0, TotalDisplayItems - 1);
         const u8 in = u8(a1);
         const bool is_focused = (slot == GetSelectedDisplayRow());
-        if (item_idx == 6) {
+        if (item_idx == 7) {
             // Sharpness slider row: Left/Right step the slider.
             SyncDisplaySlotSliderWidget(row, slot, is_focused);
             if (is_focused && in != 0) {
@@ -2475,7 +2517,7 @@ u64 PS4_SYSV_ABI RowInputHook(u8* row, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, d
             }
             return 0;
         }
-        if (item_idx == 9) {
+        if (item_idx == 10) {
             // 2-choice toggle row (UI & Icons Upscale): uses <| Off / On |> ComboBox arrows.
             SyncDisplaySlotSliderWidget(row, slot, is_focused);
             if (is_focused && in != 0) {
