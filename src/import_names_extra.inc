@@ -20,3 +20,4 @@
 {"1j3S3n-tTW4","sceKernelGetTscFrequency"},
 {"TywrFKCoLGY","sceSaveDataInitialize3"},
 {"0z45PIH+SNI","sceSaveDataMount2"},
+// Release v1.1.1

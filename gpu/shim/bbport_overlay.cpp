@@ -16,6 +16,7 @@
 #include <dlfcn.h>
 
 #include <SDL3/SDL.h>
+#include "bbport_game_menu.h"
 #include "bbport_guest_hooks.h"
 #include "bbport_frame_rate.h"
 #include "bbport_sections.h"
@@ -61,7 +62,6 @@ std::mutex imgui_mutex; // the ImGui context: window thread (input) and present 
 bool initialized = false;
 std::atomic<bool> menu_open{false};
 std::atomic<bool> reset_hud_avg{false};
-std::atomic<bool> show_xray_details{true};
 bool l3_down = false, r3_down = false;
 bool dirty = false; // settings changed while open: saved on close
 int rebinding_action = -1; // >= 0 while waiting for a key/mouse press to rebind KeyAction
@@ -987,6 +987,13 @@ void Menu() {
                         BbSettings::SetKeyBinding(rebinding_action, "");
                     } else {
                         BbSettings::SetKeyBinding(rebinding_action, bound);
+                        if (rebinding_action == BbSettings::KeyAdditionalDebug &&
+                            BbSettings::GetKeyBinding(BbSettings::KeyDebug) == bound) {
+                            BbSettings::SetKeyBinding(BbSettings::KeyDebug, "");
+                        } else if (rebinding_action == BbSettings::KeyDebug &&
+                                   BbSettings::GetKeyBinding(BbSettings::KeyAdditionalDebug) == bound) {
+                            BbSettings::SetKeyBinding(BbSettings::KeyAdditionalDebug, "");
+                        }
                     }
                     dirty = true;
                     BbSettings::Save();
@@ -2156,7 +2163,7 @@ void FpsCounter() {
         std::snprintf(upscaler_str, sizeof(upscaler_str), "%s", base_aa_str);
     }
 
-    const bool xray = show_xray_details.load(std::memory_order_relaxed);
+    const bool xray = s.show_additional_debug.load(std::memory_order_relaxed);
     if (xray) {
         ImGui::SetWindowFontScale(0.82f);
     }
@@ -2217,8 +2224,7 @@ void FpsCounter() {
                           ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_NoPadOuterX)) {
         ImGui::TableNextRow();
         ImGui::TableSetColumnIndex(0);
-        ImGui::TextDisabled(xray ? "CPU & GPU Breakdown [F9: X-Ray ON]"
-                                 : "CPU & GPU Breakdown [F9: X-Ray OFF]");
+        ImGui::TextDisabled("CPU & GPU Breakdown");
         ImGui::TableSetColumnIndex(1);
         ImGui::TextDisabled("   Now");
         ImGui::TableSetColumnIndex(2);
@@ -2600,6 +2606,138 @@ void UpdateTextInput(SDL_Window* window) {
     }
 }
 
+bool IsTokenDownNow(const std::string& tok) {
+    if (tok == "Mouse Left") return (SDL_GetMouseState(nullptr, nullptr) & SDL_BUTTON_LMASK) != 0;
+    if (tok == "Mouse Right") return (SDL_GetMouseState(nullptr, nullptr) & SDL_BUTTON_RMASK) != 0;
+    if (tok == "Mouse Middle") return (SDL_GetMouseState(nullptr, nullptr) & SDL_BUTTON_MMASK) != 0;
+    if (tok == "Mouse 4" || tok == "Mouse X1") return (SDL_GetMouseState(nullptr, nullptr) & SDL_BUTTON_X1MASK) != 0;
+    if (tok == "Mouse 5" || tok == "Mouse X2") return (SDL_GetMouseState(nullptr, nullptr) & SDL_BUTTON_X2MASK) != 0;
+    const char* lookup = (tok == "Enter") ? "Return" : tok.c_str();
+    const SDL_Scancode sc = SDL_GetScancodeFromName(lookup);
+    if (sc == SDL_SCANCODE_UNKNOWN) return false;
+    int num_keys = 0;
+    const bool* keys = SDL_GetKeyboardState(&num_keys);
+    return keys && int(sc) < num_keys && keys[sc];
+}
+
+bool MatchesHotkeyBinding(int action, const SDL_Event& event) {
+    std::string ev_tok;
+    if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat) {
+        const char* raw_name = SDL_GetScancodeName(event.key.scancode);
+        if (!raw_name || !*raw_name) {
+            raw_name = SDL_GetKeyName(event.key.key);
+        }
+        if (raw_name && *raw_name) {
+            ev_tok = raw_name;
+            if (ev_tok == "Return") ev_tok = "Enter";
+        }
+    } else if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN) {
+        switch (event.button.button) {
+        case SDL_BUTTON_LEFT: ev_tok = "Mouse Left"; break;
+        case SDL_BUTTON_RIGHT: ev_tok = "Mouse Right"; break;
+        case SDL_BUTTON_MIDDLE: ev_tok = "Mouse Middle"; break;
+        case SDL_BUTTON_X1: ev_tok = "Mouse 4"; break;
+        case SDL_BUTTON_X2: ev_tok = "Mouse 5"; break;
+        default: break;
+        }
+    }
+    if (ev_tok.empty()) return false;
+
+    const std::string raw = BbSettings::GetKeyBinding(action);
+    if (raw.empty() || raw == "None" || raw == "none" || raw == "Unbound") return false;
+
+    auto trim = [](std::string s) {
+        const auto a = s.find_first_not_of(" \t");
+        if (a == std::string::npos) return std::string{};
+        return s.substr(a, s.find_last_not_of(" \t") - a + 1);
+    };
+
+    std::size_t pos = 0;
+    while (pos < raw.size()) {
+        const std::size_t comma = raw.find(',', pos);
+        const std::string alt = trim(raw.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos));
+        pos = comma == std::string::npos ? raw.size() : comma + 1;
+        if (alt.empty() || alt == "None" || alt == "none" || alt == "Unbound") continue;
+
+        std::vector<std::string> toks;
+        std::size_t p2 = 0;
+        while (p2 < alt.size()) {
+            const std::size_t plus = alt.find('+', p2);
+            std::string tok;
+            if (plus != std::string::npos && plus + 1 < alt.size()) {
+                tok = trim(alt.substr(p2, plus - p2));
+                p2 = plus + 1;
+            } else {
+                tok = trim(alt.substr(p2));
+                p2 = alt.size();
+            }
+            if (tok == "Return") tok = "Enter";
+            if (tok == "Mouse X1") tok = "Mouse 4";
+            if (tok == "Mouse X2") tok = "Mouse 5";
+            if (!tok.empty()) toks.push_back(std::move(tok));
+        }
+        if (toks.empty()) continue;
+
+        bool has_ev = false;
+        bool all_down = true;
+        bool has_mod = false;
+        auto is_mod_tok = [](const std::string& s) {
+            return s == "Left Shift" || s == "Right Shift" || s == "Left Ctrl" ||
+                   s == "Right Ctrl" || s == "Left Alt" || s == "Right Alt";
+        };
+        for (const std::string& t : toks) {
+            if (is_mod_tok(t)) has_mod = true;
+            if (t == ev_tok) {
+                has_ev = true;
+            } else if (!IsTokenDownNow(t)) {
+                all_down = false;
+                break;
+            }
+        }
+        if (has_ev && all_down && !has_mod && event.type == SDL_EVENT_KEY_DOWN) {
+            if ((event.key.mod & (SDL_KMOD_CTRL | SDL_KMOD_SHIFT | SDL_KMOD_ALT)) != 0) {
+                all_down = false;
+            }
+        }
+        if (has_ev && all_down) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool TryHandleDebugHotkeys(const SDL_Event& event) {
+    if (BbGameMenu::CapturesInput() || BbGameMenu::InCaptureCooldown()) {
+        return false;
+    }
+    const bool match_add = MatchesHotkeyBinding(BbSettings::KeyAdditionalDebug, event);
+    const bool match_dbg = MatchesHotkeyBinding(BbSettings::KeyDebug, event) ||
+                           (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat && event.key.key == SDLK_F10);
+    if (match_add) {
+        auto& s = BbSettings::Get();
+        if (s.show_fps.load() && s.show_additional_debug.load()) {
+            s.show_fps = false;
+        } else {
+            s.show_fps = true;
+            s.show_additional_debug = true;
+        }
+        BbSettings::Save();
+        return true;
+    }
+    if (match_dbg) {
+        auto& s = BbSettings::Get();
+        if (s.show_fps.load() && !s.show_additional_debug.load()) {
+            s.show_fps = false;
+        } else {
+            s.show_fps = true;
+            s.show_additional_debug = false;
+        }
+        BbSettings::Save();
+        return true;
+    }
+    return false;
+}
+
 bool HandleEvent(const SDL_Event& event) {
     std::scoped_lock lock{imgui_mutex};
     if (!initialized) {
@@ -2619,16 +2757,7 @@ bool HandleEvent(const SDL_Event& event) {
             SetOpen(event.key.key == SDLK_INSERT ? !is_open : false);
             return true;
         }
-        if (down && !event.key.repeat &&
-            (event.key.key == SDLK_F8 || event.key.key == SDLK_F10)) {
-            auto& s = BbSettings::Get();
-            s.show_fps = !s.show_fps.load();
-            BbSettings::Save();
-            return true;
-        }
-        if (down && !event.key.repeat && event.key.key == SDLK_F9) {
-            show_xray_details.store(!show_xray_details.load(std::memory_order_relaxed),
-                                    std::memory_order_relaxed);
+        if (down && !event.key.repeat && TryHandleDebugHotkeys(event)) {
             return true;
         }
         if (!is_open) {
@@ -2683,6 +2812,9 @@ bool HandleEvent(const SDL_Event& event) {
     case SDL_EVENT_MOUSE_BUTTON_DOWN:
     case SDL_EVENT_MOUSE_BUTTON_UP: {
         if (!is_open) {
+            if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && TryHandleDebugHotkeys(event)) {
+                return true;
+            }
             return false;
         }
         if (rebinding_action >= 0) {

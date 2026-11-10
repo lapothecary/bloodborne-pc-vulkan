@@ -80,6 +80,8 @@ enum KeyAction : int {
     KeyLookDown,
     KeyLookLeft,
     KeyLookRight,
+    KeyDebug,
+    KeyAdditionalDebug,
     KeyActionCount
 };
 
@@ -143,11 +145,11 @@ struct Values {
     /// the menu merely started with keeps following the launcher's (#134).
     std::atomic<bool> menu_language_chosen{false};
     std::atomic<int> upscaler{UpscalerOff};
-    std::atomic<int> aa_mode{AaSmaaT2x};
+    std::atomic<int> aa_mode{AaOff};
     std::atomic<bool> aa_mode_chosen{false};
     std::atomic<int> preset{NativeAA};
-    std::atomic<bool> sharpen{true};
-    std::atomic<float> sharpness{0.3f};
+    std::atomic<bool> sharpen{false};
+    std::atomic<float> sharpness{0.0f};
     std::atomic<bool> jitter{true};
     std::atomic<bool> reactive{false};
     std::atomic<bool> object_motion{true};
@@ -156,6 +158,7 @@ struct Values {
     std::atomic<float> reactive_max{0.9f};
     std::atomic<int> debug_view{DebugNone};
     std::atomic<bool> show_fps{true};
+    std::atomic<bool> show_additional_debug{false};
     /// The settings menu's position (fraction of the screen), -1 until it is moved.
     std::atomic<float> menu_x{-1.0f}, menu_y{-1.0f};
     // FSR 4 checks (menu): the provider's auto exposure, the jitter sign it is given.
@@ -193,12 +196,12 @@ struct Values {
     std::atomic<float> mouse_sensitivity{1.0f};
     /// DLSS model preset: 11 = DLSS 4 Transformer (Preset K), 0 = DLSS 3 CNN Default.
     std::atomic<int> dlss_preset{11};
-    /// Forced anisotropic filtering on scene textures: 16, 8, 4, or 0 (game default).
-    std::atomic<int> anisotropic{16};
+    /// Forced anisotropic filtering on scene textures: 16, 8, 4, or 1/0 (game default).
+    std::atomic<int> anisotropic{1};
     /// Persistent FPS limit (0 = Uncapped, or 30..1000).
-    std::atomic<int> fps_limit{0};
+    std::atomic<int> fps_limit{30};
     /// AI / SDF UI & Icon Super-Resolution (2x/4x + disk cache) for 1-mip 2D UI textures.
-    std::atomic<bool> ui_upscale{true};
+    std::atomic<bool> ui_upscale{false};
     /// Enhanced Multi-Scale GTAO / Low-Noise SSAO in ps_cbbca5dc.frag.
     std::atomic<bool> ssao_quality{true};
     /// Screen-Space Contact Micro-Shadows + 12-Tap Vogel Disk Soft PCF in ps_f55643de.frag.

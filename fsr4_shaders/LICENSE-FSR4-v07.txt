@@ -34,3 +34,5 @@ This is an older source-v07 model payload, not AMD's binary-only FSR 4.1.1
 release. Q2RTX enforces each model asset's required size at runtime; the
 versioned shader manifests record the corresponding SHA-256 values for build
 and package verification.
+
+Release package: v1.1.1

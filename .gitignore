@@ -42,3 +42,4 @@ perf.data
 /*.mp4
 /*.zip
 !docs/images/*
+# Release v1.1.1

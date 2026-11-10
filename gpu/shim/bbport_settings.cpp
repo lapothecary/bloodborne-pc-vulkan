@@ -133,6 +133,14 @@ constexpr KeyActionDef kKeyDefs[KeyActionCount] = {
      "Rotate camera right using keyboard (Right Stick Right)",
      "Поворот камеры вправо с клавиатуры (Правый стик вправо)",
      "L"},
+    {"hotkey.debug", "Debug", "Дебаг",
+     "Show or hide compact performance debug overlay (default: F8)",
+     "Показать или скрыть обычный оверлей дебага (по умолч.: F8)",
+     "F8"},
+    {"hotkey.additional_debug", "Additional Debug", "Доп. дебаг",
+     "Open or switch to detailed CPU & GPU breakdown (default: F9)",
+     "Открыть или переключить на подробный дебаг CPU и GPU (по умолч.: F9)",
+     "F9"},
 };
 
 std::mutex key_mutex;
@@ -196,6 +204,8 @@ void Set(Values& v, const std::string& key, const std::string& value) {
         v.debug_view = std::clamp(i, 0, DebugViewCount - 1);
     } else if (key == "show_fps") {
         v.show_fps = i != 0;
+    } else if (key == "show_additional_debug") {
+        v.show_additional_debug = i != 0;
     } else if (key == "menu_pos") {
         float x = -1.0f, y = -1.0f;
         if (std::sscanf(value.c_str(), "%f,%f", &x, &y) == 2 && x >= 0.0f && x <= 1.0f && y >= 0.0f &&
@@ -272,7 +282,9 @@ void Set(Values& v, const std::string& key, const std::string& value) {
         v.true_black_hdr = (value != "0" && value != "false" && value != "off");
     } else {
         for (int k = 0; k < KeyActionCount; ++k) {
-            if (key == kKeyDefs[k].ini_key) {
+            if (key == kKeyDefs[k].ini_key ||
+                (k == KeyDebug && key == "key.debug") ||
+                (k == KeyAdditionalDebug && key == "key.additional_debug")) {
                 std::string trimmed = value;
                 const auto first = trimmed.find_first_not_of(" \t");
                 if (first != std::string::npos) {
@@ -589,7 +601,7 @@ void Load() {
             v.aa_mode = AaTaa;
             v.upscaler = UpscalerOff;
         } else {
-            v.aa_mode = v.effects[4].load() ? AaFxaa : AaOff;
+            v.aa_mode = AaOff;
         }
     } else {
         if (v.upscaler.load() == UpscalerTaa) {
@@ -712,6 +724,7 @@ void Save() {
     put("reactive_max", fixed(v.reactive_max, 2));
     put("debug_view", std::to_string(v.debug_view.load()));
     put("show_fps", flag(v.show_fps));
+    put("show_additional_debug", flag(v.show_additional_debug));
     put("fsr4_auto_exposure", flag(v.fsr4_auto_exposure));
     put("fsr4_invert_jitter", flag(v.fsr4_invert_jitter));
     // Read by patches.py at start.

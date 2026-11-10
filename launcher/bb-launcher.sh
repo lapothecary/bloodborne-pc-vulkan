@@ -8,3 +8,4 @@ if python3 -c 'import gi; gi.require_version("Gtk", "4.0"); gi.require_version("
 fi
 printf -v quoted '%q ' "${cmd[@]}"
 exec nix-shell "$here/shell.nix" --run "$quoted"
+# Release v1.1.1

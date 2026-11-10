@@ -312,3 +312,4 @@ if [[ -n ${mod_game:-} ]]; then
     exit "$mod_status"
 fi
 exec "$probe" "${probe_args[@]}"
+# Release v1.1.1

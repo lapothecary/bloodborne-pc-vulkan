@@ -34,25 +34,23 @@ jobs:
       - name: Create or Update GitHub Release (Linux x86_64)
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name || 'v1.1.0' }}
-          name: "Bloodborne PC Vulkan ${{ github.ref_name || 'v1.1.0' }} — Windows & Linux x86_64 Prebuilt Release"
+          tag_name: ${{ github.ref_name || 'v1.1.1' }}
+          name: "Bloodborne PC Vulkan ${{ github.ref_name || 'v1.1.1' }}"
           body: |
-            ## Bloodborne PC Vulkan ${{ github.ref_name || 'v1.1.0' }} — Windows & Linux `x86_64` Prebuilt Release
+            ## Bloodborne PC Vulkan ${{ github.ref_name || 'v1.1.1' }} (Windows & Linux `x86_64`)
 
-            ### ⚡ Quick Start (Unpack Next to `CUSA03173` & Play)
-            - **Windows 10/11 (`x86_64`)**: Download **`bloodborne-pc-vulkan-windows-x86_64-prebuilt.zip`**, extract next to your **`CUSA03173`** (`v1.09` GOTY) folder, and double-click **`Bloodborne.exe`** to launch directly (or **`Launcher.exe`** for settings).
-            - **Linux (`x86_64`)**: Download **`bloodborne-pc-vulkan-linux-x86_64-prebuilt.tar.gz`**, extract next to your **`CUSA03173`** (`v1.09` GOTY) folder, and run **`./play.sh`** (or **`./launcher.sh`** for settings).
-            - Press **`F8`** in-game to toggle the 10-pass hardware GPU/CPU telemetry HUD (`F9` toggles X-Ray sub-pass breakdown).
+            ### Quick Start
+            - **Windows 10/11**: Extract `bloodborne-pc-vulkan-windows-x86_64-prebuilt.zip` next to your `CUSA03173` (`v1.09`) folder and run **`Bloodborne.exe`** (or **`Launcher.exe`**).
+            - **Linux**: Extract `bloodborne-pc-vulkan-linux-x86_64-prebuilt.tar.gz` next to your `CUSA03173` (`v1.09`) folder and run **`./play.sh`** (or **`./launcher.sh`**).
 
-            ---
-
-            ### 🔍 Key Highlights in `${{ github.ref_name || 'v1.1.0' }}`:
-            - **Windows 10/11 & Linux 1:1 Parity (`Bloodborne.exe` + `Launcher.exe` + `bb-probe.exe`)**:
-              - Refactored C++20 Dantelion graphics & post-FX pipeline (`FD4` / `GX` / `Yebis 2`) paired with Direct-Inline `Stage A` Vulkan 1.3 recording (`Stage B = 0.00 ms`), single unified recorder stream (`DscSav: 54–62%`), hardware L3/CCD/Hybrid CPU thread topology pinning, and automatic NVIDIA **DXGI Flip-Model Swapchain** profile configuration (`0x20D690F8 = 1`, eliminating `dwm.exe` composition overhead in Borderless/Fullscreen).
-            - **Split PC VRAM, 3D Hardware Occlusion Culling & Clean GLSL 460 Shaders**:
-              - Native `DEVICE_LOCAL` `DirectBuffers` & `DirectTextures` (`0` page faults/s in steady gameplay), 3D hardware `SceneOcclusionCuller`, static vertex-buffer memoization, and clean vectorized GLSL 460 shaders for the heaviest passes (G-Buffer, Deferred PBR, 2-phase Adaptive SSR, SSAO, Yebis 2 Bloom/DoF/LUT, CSM/VSM shadows, two-sided foliage translucency, and CSM road-seam fix).
-            - **PC Display, 7 Anti-Aliasing Modes, Upscalers & Controls**:
-              - `SMAA T2x` (default), `SMAA 1x Ultra`, `DLAA 4 (Transformer Preset K)`, `DLAA 3 (CNN Fast)`, `TAA`, `FXAA`, `DLSS 4.5 / 4`, `FSR 4`, `FSR 3.1`, fused zero-pass `RCAS` sharpening, `2x/4x` GPU UI super-resolution, 3-state Window Mode (`Fullscreen` / `Borderless` / `Windowed` + `Alt+Enter`), native `output_res=auto` monitor detection, high-FPS Havok cloth & procedural foliage wind sway (`HookFoliageSway`), split `CUSAxxxxx + CUSAxxxxx-patch` support, cutscene skipping (`Enter / Esc / Options`), and Slow Walk (`Left Alt`).
+            ### What Changed in `${{ github.ref_name || 'v1.1.1' }}`:
+            - **Fixed Hardware Occlusion Culling on Windows (Fewer Draw Calls):** Fixed 3D hardware occlusion culling (`SceneOcclusionCuller`) on Windows — it was not active in the previous Windows build and now works properly, skipping hidden geometry and cutting draw calls per frame.
+            - **Windows Optimization (Roughly `+/-` Parity with Linux):** Ported the remaining Linux optimizations to Windows (`dantelion_gx` C++20 modules, CPU cache thread pinning, single-stream descriptor deduplication, and NVIDIA DXGI Flip-Model swapchain). Based on tests on friends' PCs, Windows performance should now be roughly on par (`+/-`) with Linux — please test on your hardware and report how it runs.
+            - **High-FPS Grass & Foliage Wind Fix:** Reverse-engineered and fixed the procedural wind phase step in the binary so grass, bushes, and flowers sway at normal 30 Hz speed at any frame rate instead of speeding up at high FPS (plus foliage lighting and shadow cascade seam fixes).
+            - **Automatic Split Folder Support (`CUSAxxxxx` + `CUSAxxxxx-patch`) & Windows `Launcher.exe`:** Automatically detects a sibling `-patch` update folder without manually merging files into one directory.
+            - **In-Game `Controls` & `Display` Defaults:**
+              - Added rebindable **`Debug`** (`F8` by default) and **`Additional Debug`** (`F9` by default, detailed breakdown) hotkeys to `System -> Controls` (`Delete` unbinds to `None`, `Defaults` restores `F8`/`F9`).
+              - `Defaults` in `System -> Display` now resets to clean vanilla PS4 settings (`30 FPS`, AA Off, Upscaler Off, Sharpness `0`, Anisotropic Off, UI Upscale Off).
           files: |
             bloodborne-pc-vulkan-linux-x86_64-prebuilt.tar.gz
             bloodborne-pc-vulkan-linux-x86_64-prebuilt.tar.gz.sha256
@@ -104,9 +102,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: build_win32_gpu
-          key: win32-gpu-build-${{ hashFiles('gpu/CMakeLists.txt', 'src/**', 'gpu/shim/**', 'gpu/platform/**', 'gpu/render/**', 'gpu/buffers/**', 'gpu/cp/**', 'gpu/shader/backend/spirv/**') }}
+          key: win32-gpu-build-v111-${{ hashFiles('gpu/CMakeLists.txt', 'src/**', 'gpu/shim/**', 'gpu/platform/**', 'gpu/render/**', 'gpu/buffers/**', 'gpu/cp/**', 'gpu/shader/backend/spirv/**') }}
           restore-keys: |
-            win32-gpu-build-
+            win32-gpu-build-v111-
 
       - name: Build Windows x86_64 bb-probe.exe & bb-gpu-capabilities.exe
         run: |
@@ -115,12 +113,13 @@ jobs:
           if [ ! -f dantelion_gx/build_win32/libbb_gx_engine_native.a ]; then
             python3 tools/build_gx_win32_coff.py
           fi
-          if [ -f build_win32_gpu/build.ninja ]; then
+          if [ -f build_win32_gpu/build.ninja ] && ! grep -q "our_cpp_100000_source" build_win32_gpu/build.ninja; then
             find build_win32_gpu -type f \( -name "*.obj" -o -name "*.a" -o -name "*.spv" -o -name "*.h" \) -exec touch {} +
             rm -f build_win32_gpu/include/bbgpu/shaders/ps_0ef50047_pbr_frag.h build_win32_gpu/include/bbgpu/shaders/ps_3fe9e964_frag.h build_win32_gpu/include/bbgpu/shaders/ps_6b42fc89_frag.h build_win32_gpu/include/bbgpu/shaders/ps_a22c7f71_pbr_frag.h build_win32_gpu/include/bbgpu/shaders/ps_d92266b9_pbr_frag.h build_win32_gpu/include/bbgpu/shaders/ps_e55e45eb_frag.h build_win32_gpu/include/bbgpu/shaders/ps_e96447c3_pbr_frag.h build_win32_gpu/include/bbgpu/shaders/ps_f55643de_frag.h
             find build_win32_gpu/CMakeFiles/bb-probe.dir -name "*.obj" -delete || true
             rm -f build_win32_gpu/CMakeFiles/bbgpu.dir/shim/*.obj build_win32_gpu/CMakeFiles/bbgpu.dir/platform/win32/*.obj build_win32_gpu/CMakeFiles/bbgpu.dir/platform/avplayer/*.obj build_win32_gpu/CMakeFiles/bbgpu.dir/platform/videoout/frame_stats.cpp.obj build_win32_gpu/CMakeFiles/bbgpu.dir/buffers/*.obj build_win32_gpu/CMakeFiles/bbgpu.dir/render/*.obj build_win32_gpu/CMakeFiles/bbgpu.dir/cp/*.obj build_win32_gpu/CMakeFiles/bbgpu.dir/shader/backend/spirv/native_shaders.cpp.obj build_win32_gpu/CMakeFiles/bbgpu.dir/upscale/vk_temporal_upscaler.cpp.obj build_win32_gpu/libbbgpu.a build_win32_gpu/bb-probe.exe build_win32_gpu/libbbgpu.dll
           else
+            rm -rf build_win32_gpu
             if ! cmake -S gpu -B build_win32_gpu -G Ninja \
               -DCMAKE_BUILD_TYPE=RelWithDebInfo \
               -DBB_LTO=OFF -DBB_PGO=off -DBB_NET=OFF > cmake_win32.log 2>&1; then
@@ -152,7 +151,7 @@ jobs:
       - name: Upload Windows x86_64 Asset to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name || 'v1.1.0' }}
+          tag_name: ${{ github.ref_name || 'v1.1.1' }}
           files: |
             bloodborne-pc-vulkan-windows-x86_64-prebuilt.zip
             bloodborne-pc-vulkan-windows-x86_64-prebuilt.zip.sha256

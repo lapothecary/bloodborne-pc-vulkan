@@ -221,6 +221,8 @@ const char* TranslateForCurrentGameLang(const char* en) {
         {"Contact Micro-Shadows", "Micro-ombres de contact", "Micro-sombras de contacto", "Kontakt-Mikroschatten", "Micro-ombre di contatto", "Micro-sombras de contato", "Kontaktowe mikro-cienie", "コンタクトマイクロシャドウ", "접촉 마이크로 그림자", "屏幕空间接触微阴影"},
         {"High-Precision Ultra SSR", "Ultra SSR haute précision", "Ultra SSR de alta precisión", "Hochpräzises Ultra-SSR", "Ultra SSR ad alta precisione", "Ultra SSR de alta precisão", "Wysokoprecyzyjne Ultra SSR", "高精度ウルトラ SSR", "고정밀 울트라 SSR", "高精度 Ultra SSR (2x 步进)"},
         {"True Black & Vibrance", "Noir profond (OLED) & Vibrance", "Negro puro (OLED) y viveza", "Tiefschwarz (OLED) & Brillanz", "Nero puro (OLED) e vividezza", "Preto puro (OLED) e vivacidade", "Głęboka czerń (OLED) i nasycenie", "トゥルーブラック (OLED) & 彩度", "트루 블랙 (OLED) 및 채도", "纯黑去雾 (OLED) 与色彩鲜艳度"},
+        {"Debug", "Debug", "Depuración", "Debug", "Debug", "Debug", "Debug", "デバッグ", "디버그", "调试信息"},
+        {"Additional Debug", "Debug détaillé", "Depuración detallada", "Erweitertes Debug", "Debug dettagliato", "Debug detalhado", "Szczegółowy debug", "詳細デバッグ", "상세 디버그", "详细调试信息"},
     };
     for (const auto& e : Table) {
         if (std::strcmp(en, e.en) == 0) {
@@ -1273,9 +1275,9 @@ enum DisplayUpscalerChoice : int {
 
 int disp_aspect = BbSettings::AspectAuto;
 int disp_output_idx = 0;
-int disp_aa_mode = AaTaa;
+int disp_aa_mode = AaOff;
 DisplayUpscalerChoice disp_upscaler_choice = DispUpOff;
-int disp_upscale_preset = BbSettings::Quality;
+int disp_upscale_preset = BbSettings::NativeAA;
 std::atomic<bool> display_heavy_dirty{false};
 std::atomic<long long> display_heavy_dirty_ms{0};
 
@@ -2265,10 +2267,16 @@ void StepKeyCapture(u8* row, int slot, int k) {
             BbSettings::SetKeyBinding(k, "");
         } else {
             BbSettings::SetKeyBinding(k, new_binding);
+            if (k == BbSettings::KeyAdditionalDebug &&
+                BbSettings::GetKeyBinding(BbSettings::KeyDebug) == new_binding) {
+                BbSettings::SetKeyBinding(BbSettings::KeyDebug, "");
+            } else if (k == BbSettings::KeyDebug &&
+                       BbSettings::GetKeyBinding(BbSettings::KeyAdditionalDebug) == new_binding) {
+                BbSettings::SetKeyBinding(BbSettings::KeyAdditionalDebug, "");
+            }
         }
         BbSettings::Save();
-        RefreshSlotTexts(slot);
-        UpdateSlotRowDisplay(row, slot);
+        RefreshControlsPage();
         PlayMenuClickSound();
         capture_cooldown_ms.store(NowSteadyMs() + 300, std::memory_order_relaxed);
         capturing_action.store(-1, std::memory_order_relaxed);
@@ -2487,18 +2495,20 @@ u64 PS4_SYSV_ABI RowInputHook(u8* row, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, d
             menu_outputs = BbSettings::Outputs(disp_aspect);
             disp_output_idx =
                 MenuOutputIndex(disp_aspect, BbSettings::NearestOutput(disp_aspect, BbSettings::Monitor()));
+            s.output_res = BbSettings::PackSize(MenuOutput(disp_aspect, disp_output_idx));
+            s.output_res_auto = true;
             disp_upscaler_choice = DispUpOff;
-            disp_upscale_preset = BbSettings::Quality;
-            disp_aa_mode = s.dlss_supported.load() ? AaDlaa : AaTaa;
+            disp_upscale_preset = BbSettings::NativeAA;
+            disp_aa_mode = AaOff;
             MarkDisplayHeavyDirty();
             s.window_mode = BbSettings::WindowModeFullscreen;
             s.window_mode_chosen = true;
-            s.fps_limit = 0;
-            BbFrameRate::SetLimit(0);
-            SetSharpnessStep(2);
-            s.anisotropic = 16;
+            s.fps_limit = 30;
+            BbFrameRate::SetLimit(30);
+            SetSharpnessStep(0);
+            s.anisotropic = 1;
             s.model_lod = 0;
-            s.ui_upscale = true;
+            s.ui_upscale = false;
             BbSettings::Save();
             RefreshDisplayPage();
             return 0;
@@ -2579,12 +2589,26 @@ u64 PS4_SYSV_ABI RowInputHook(u8* row, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, d
             }
             if (active_k < 0 && !InCaptureCooldown() && is_focused) {
                 bool right = (in != 0) && (HorizontalMenuStep(in) > 0);
-                if (!right && SDL_WasInit(SDL_INIT_VIDEO)) {
+                bool del_pressed = false;
+                if (SDL_WasInit(SDL_INIT_VIDEO)) {
                     int num_keys = 0;
                     const bool* keys = SDL_GetKeyboardState(&num_keys);
-                    if (keys && num_keys > SDL_SCANCODE_RIGHT && keys[SDL_SCANCODE_RIGHT]) {
-                        right = true;
+                    if (keys) {
+                        if (!right && num_keys > SDL_SCANCODE_RIGHT && keys[SDL_SCANCODE_RIGHT]) {
+                            right = true;
+                        }
+                        if (num_keys > SDL_SCANCODE_DELETE && keys[SDL_SCANCODE_DELETE]) {
+                            del_pressed = true;
+                        }
                     }
+                }
+                if (del_pressed) {
+                    BbSettings::SetKeyBinding(k, "");
+                    BbSettings::Save();
+                    RefreshControlsPage();
+                    PlayMenuClickSound();
+                    capture_cooldown_ms.store(NowSteadyMs() + 300, std::memory_order_relaxed);
+                    return 0;
                 }
                 const bool confirm =
                     !right && (in != 0) && Game<bool (PS4_SYSV_ABI*)(const u8*)>(IsConfirmPressed)(&in);

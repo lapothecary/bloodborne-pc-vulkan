@@ -13,3 +13,4 @@ sleep "${HOLD:-60}"
 tools/stop_own.sh
 cp out/session.log "$base.log"
 echo "$base.log"
+# Release v1.1.1

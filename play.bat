@@ -7,3 +7,4 @@ if exist "Bloodborne.exe" (
 ) else (
     python run.py %*
 )
+REM Release v1.1.1

@@ -25,3 +25,4 @@ export BB_OBJECT_MOTION="${BB_OBJECT_MOTION:-0}"
 export BB_LIVE_RES="${BB_LIVE_RES:-0}"
 
 exec python3 ./launcher/bbport_launcher.py "$@"
+# Release v1.1.1

@@ -174,3 +174,4 @@ if(UNIX AND EXISTS "${BBHOST_ROOT}/src/core/elf.cpp")
     target_link_libraries(gx_live_combat_test PRIVATE bb_gx_engine_native m pthread dl)
     target_link_options(gx_live_combat_test PRIVATE -Wl,--gc-sections)
 endif()
+# Release v1.1.1

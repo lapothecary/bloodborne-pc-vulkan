@@ -48,3 +48,4 @@ export BB_SKIP_NETWORK_CHOICE="${BB_SKIP_NETWORK_CHOICE:-$(ini_val skip_network_
 export BB_LANGUAGE="${BB_LANGUAGE:-$(ini_val language 1)}"
 
 exec bash ./run.sh "$@"
+# Release v1.1.1

@@ -27,3 +27,4 @@ pkgs.mkShell {
     protobuf nlohmann_json openssl zlib miniupnpc
   ];
 }
+# Release v1.1.1

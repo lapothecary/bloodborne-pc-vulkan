@@ -94,3 +94,5 @@ with the shadnet address left as a placeholder.
 
 This script is a standalone reimplementation rather than a fork: no Flask dependency, and it can
 retune the summon parameters on the way out.
+
+<!-- Release v1.1.1 -->

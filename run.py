@@ -623,3 +623,4 @@ if __name__ == '__main__':
         runpy.run_path(str(PACKAGE_DIR / 'Launcher.py'), run_name='__main__')
         sys.exit(0)
     sys.exit(run(sys.argv[1:]))
+# Release v1.1.1
