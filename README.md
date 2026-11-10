@@ -55,38 +55,37 @@ Click any topic below to expand its details:
 </details>
 
 <details>
-<summary><b>2. ⚙️ Architecture: What Was Refactored in Dantelion vs. What Remains PS4 Context</b></summary>
+<summary><b>2. ⚙️ Architecture: Refactored Dantelion Modules vs. PS4 Runtime</b></summary>
 <br/>
 
-To be 100% transparent about what this project is and isn't:
-* **This is NOT a 100% from-scratch rewrite of the entire Bloodborne engine.** *Bloodborne* runs on FromSoftware's proprietary **Dantelion2** engine alongside **Havok** (physics/cloth/ragdolls), **Morpheme** (character animation), **FMOD** (audio), and **Scaleform GFx** (UI).
+* **Engine overview:** *Bloodborne* runs on FromSoftware's proprietary **Dantelion2** engine alongside **Havok** (physics/cloth/ragdolls), **Morpheme** (character animation), **FMOD** (audio), and **Scaleform GFx** (UI).
 * **What still runs from the original PS4 binary (`eboot.bin`):**
-  * Gameplay logic, AI, combat state machines, world streaming, Havok physics & cloth simulation, Morpheme animation graphs, FMOD audio mixing, and remnants of the PS4 system/GNM context still execute from the relinked original binary over the `bbport` POSIX/Win32 runtime layer.
-* **What we refactored and replaced (~90% of the critical graphics bottleneck):**
-  * We decompiled the core Dantelion graphics & post-processing modules (`01_CoreGraphics2_GNM`, `02_GX_GraphicsFramework`, `03_TPF_GNF_ShaderContainers`, `04_SceneRenderer`, `05_PostProcess_Yebis2`, `06_DeferredLightingAndAO`, `07_SFX_ParticleGpuRenderer`) into native **C++20** (`our_cpp_100000_source/`) and connected them to our **DirectVk Vulkan 1.3** backend (`gpu/`).
-  * We replaced the heaviest machine-translated shaders with clean, human-readable **GLSL 460** shaders (`gpu/shader/backend/spirv/native/`), verified mathematically against the original shader outputs.
-  * For the remaining non-graphics bottlenecks (such as Havok cloth stiffness above 30 FPS, procedural wind sway on bushes/flowers at high FPS, and PS4 thread scheduling on modern multi-CCD / hybrid CPUs), we applied targeted native binary hooks and OS thread-topology pinning.
+  * Gameplay logic, AI, combat state machines, world streaming, Havok physics & cloth simulation, Morpheme animation graphs, FMOD audio mixing, and parts of the PS4 system/GNM context still execute from the relinked original binary over the `bbport` POSIX/Win32 runtime layer.
+* **What was refactored and replaced (~90% of the critical graphics bottleneck):**
+  * The core Dantelion graphics & post-processing modules (`01_CoreGraphics2_GNM`, `02_GX_GraphicsFramework`, `03_TPF_GNF_ShaderContainers`, `04_SceneRenderer`, `05_PostProcess_Yebis2`, `06_DeferredLightingAndAO`, `07_SFX_ParticleGpuRenderer`) were decompiled into native **C++20** (`our_cpp_100000_source/`) and wired directly into the **DirectVk Vulkan 1.3** backend (`gpu/`).
+  * The heaviest machine-translated shaders were replaced with clean, human-readable **GLSL 460** shaders (`gpu/shader/backend/spirv/native/`), verified mathematically against the original shader outputs.
+  * Remaining non-graphics bottlenecks at high frame rates (Havok cloth stiffness above 30 FPS, procedural wind sway on bushes/flowers, and PS4 thread scheduling on modern multi-CCD / hybrid CPUs) are handled via targeted binary hooks and OS thread-topology pinning.
 
 </details>
 
 <details>
-<summary><b>3. 📊 Honest Performance Notes (Measured Strictly on My Personal PC)</b></summary>
+<summary><b>3. 📊 Performance Examples (Ryzen 9 7950X + RTX 4090 @ 2560×1440)</b></summary>
 <br/>
 
-> **Important Disclaimer:** Performance on PC always depends on your specific CPU (especially L3 cache size and single-core speed), GPU, RAM, resolution, and OS. **Do not treat the numbers below as a guarantee that every PC will get the exact same frame rate.** These are honest measurements from **my personal machine** to show what this optimization pass achieves in practice.
+> **Note:** Frame rate depends on your specific CPU (especially L3 cache and single-core speed), GPU, RAM, resolution, and OS. The numbers below were measured on a single test system and are shown as a concrete reference example rather than a universal baseline for every PC.
 
-**My Test Configuration:**
+**Test Configuration:**
 * **CPU:** `AMD Ryzen 9 7950X` (16 cores / 32 threads, Dual-CCD)
 * **GPU:** `NVIDIA GeForce RTX 4090` (`24 GB`)
 * **Resolution & Settings:** `2560×1440` Native (`100%` render scale), all in-game graphics effects enabled (`SSR`, `SSAO`, `Bloom`, `Depth of Field`, `Motion Blur`, `Contact Shadows`), `DLAA 3 / DLAA 4 / SMAA T2x + RCAS`.
 
-| In-Game Scenario (`2560×1440` Native on My PC) | Observed Frame Rate | Pure HW GPU Busy (All 10 Passes) | CPU Stage A (DirectVk RHI) | VRAM / System RAM |
+| In-Game Scenario (`2560×1440` Native) | Observed Frame Rate | Pure HW GPU Busy (All 10 Passes) | CPU Stage A (DirectVk RHI) | VRAM / System RAM |
 | :--- | :---: | :---: | :---: | :---: |
 | **Heavy Central Yharnam Street / Carriage Scene** (`~1,200–1,760` active draws after occlusion culling, `DLAA + RCAS`, All Post-FX On) | **`166 – 168 FPS`** (`~5.97 ms`, capped at `170`) | **`2.80 – 2.98 ms`** (`~47%` GPU busy, `~235 W`) | `4.09 – 5.29 ms` (`Stage B: 0.00 ms`) | `~6.2 GB` VRAM / `~3.8 GB` RAM (`0` Faults/s) |
 | **Heaviest Found Multi-Shadow Indoor/Outdoor Portal** (`1,976` draws, `10` compute dispatches, `DLAA + RCAS`, All Post-FX On) | **`154 – 160 FPS`** (`~6.23 – 6.51 ms`) | **`3.69 – 3.73 ms`** (`~57%` GPU busy, `~241 W`) | `6.06 – 6.41 ms` (`Stage B: 0.00 ms`) | `~6.6 GB` VRAM / `~4.0 GB` RAM (`0` Faults/s) |
 | **Lighter / Enclosed Areas (e.g. Hunter's Dream)** (`2560×1440` Native, Uncapped, `Off + RCAS`) | **`500 – 650+ FPS`** (`~1.54 – 1.95 ms`) | **`1.17 – 1.60 ms`** | `1.11 – 1.24 ms` (`Stage B: 0.00 ms`) | `~2.3 – 3.4 GB` VRAM / `~2.8 GB` RAM (`0` Faults/s) |
 
-*(Side-by-side heavy-scene benchmarks across additional scenes and GPUs will be added as playthrough testing continues).*
+*(Additional side-by-side scene comparisons will be added as testing progresses).*
 
 </details>
 
@@ -137,28 +136,28 @@ BB_GX_SKIP_MIN=0x22900a0 BB_GX_SKIP_MAX=0x2292000 ./play.sh
 </details>
 
 <details>
-<summary><b>6. 🇷🇺 Документация на русском языке (О проекте, честное устройство, отличия и запуск)</b></summary>
+<summary><b>6. 🇷🇺 Документация на русском языке (О проекте, архитектура, отличия и запуск)</b></summary>
 <br/>
 
-### О проекте — честно и без кликбейта
+### О проекте
 Это оптимизированный порт и слой трансляции **Bloodborne** (`CUSA03173` / `CUSA00900` v1.09) для **Windows 10/11** и **Linux (`x86_64`)**, созданный на базе [`bbport`](https://github.com/deadinside28/bloodborne_pc) и [`shadPS4`](https://github.com/shadps4-emu/shadPS4).
 
-* **Что именно переделано под капотом (и что осталось от PS4):**
+* **Архитектура движка (что отрефакторено и что осталось от PS4):**
   * *Bloodborne* работает на внутреннем движке FromSoftware **Dantelion2** в связке с физикой **Havok**, анимацией **Morpheme**, звуком **FMOD** и интерфейсом **Scaleform GFx**.
-  * Мы **не** переписывали 100% всего движка игры с нуля: игровая логика, ИИ, боевая система, физика Havok, анимации и часть системного контекста PS4 всё ещё выполняются из перелинкованного оригинального бинарника (`eboot.bin`) поверх хост-рантайма `bbport`.
-  * Но мы полностью декомпилировали и отрефакторили **самую критическую и тяжёлую графическую часть Dantelion (~90% графического бутылочного горлышка)** — модули рендера `FD4` / `GX` / `CoreGraphics2_GNM` / `Yebis 2` переведены в нативный **C++20** и подключены напрямую к **Vulkan 1.3 (`DirectVk`)**, а самые тяжёлые шейдеры переписаны в чистый векторизованный **GLSL 460** без эмуляции общей памяти PS4 и без десятков тысяч страничных прерываний в секунду.
-* **В чём отличие от `shadPS4` и обычного `bbport`:**
-  1. **Честная раздельная видеопамять ПК (`DirectBuffers` и `DirectTextures`):** буферы и текстуры сразу живут в `DEVICE_LOCAL` памяти видеокарты с динамическим переименованием до `4 МБ` внутри RenderPass (`0` страничных ошибок `Faults/s`, в 2–2.5 раза меньше потребление VRAM и ОЗУ).
-  2. **Прямая одностадийная запись команд (`Direct-Inline Stage A`, `Stage B = 0.00 мс`)** + мемоизация состояний (`pso_sig_epoch`, мемоизация вершинных буферов `DirectBuffers`, дедупликация дескрипторов `DscSav: 54–62%`) + умная привязка потоков к L3-кэшу (`CCD0` / `P-cores`) на Windows и Linux.
+  * Игровая логика, ИИ, боевая система, физика Havok, анимации и часть системного контекста PS4 выполняются из перелинкованного оригинального бинарника (`eboot.bin`) поверх хост-рантайма `bbport`.
+  * Основная работа в этом проекте сосредоточена на **критической графической части Dantelion (~90% графического конвейера)** — модули рендера `FD4` / `GX` / `CoreGraphics2_GNM` / `Yebis 2` декомпилированы в нативный **C++20** и подключены напрямую к **Vulkan 1.3 (`DirectVk`)**, а наиболее тяжёлые шейдеры переписаны в чистый векторизованный **GLSL 460** без эмуляции общей памяти PS4 и страничных прерываний.
+* **Отличия от `shadPS4` и базового `bbport`:**
+  1. **Раздельная видеопамять ПК (`DirectBuffers` и `DirectTextures`):** буферы и текстуры размещаются напрямую в `DEVICE_LOCAL` памяти видеокарты с динамическим переименованием до `4 МБ` внутри RenderPass (`0` страничных ошибок `Faults/s`, снижено потребление VRAM и ОЗУ).
+  2. **Одностадийная запись команд (`Direct-Inline Stage A`, `Stage B = 0.00 мс`)** + мемоизация состояний (`pso_sig_epoch`, мемоизация вершинных буферов `DirectBuffers`, дедупликация дескрипторов `DscSav: 54–62%`) + привязка потоков к L3-кэшу (`CCD0` / `P-cores`) на Windows и Linux.
   3. **Аппаратное отсечение невидимой геометрии (`SceneOcclusionCuller`),** урезание лишних проходов мип-пирамид SSR/Bloom (`vkCmdCopyImage`) и отключение холостых перезаливок таблиц гаммы/DoF LUT.
-  4. **Чистые шейдеры GLSL 460 и фиксы физики на высоком FPS:** исправлено двустороннее подповерхностное освещение листвы, шов каскадов теней CSM, плавная физика плащей Havok выше 30 FPS и **правильное качание травы, кустов и цветов на любом FPS (`HookFoliageSway`)**.
-  5. **Нативное ПК-меню (`Display`, `Effects`, `Controls`),** `SMAA T2x`, `DLAA 4 (Preset K)`, `DLSS 4.5`, `FSR 4`, однопроходный `RCAS`, 3 режима окна (`Fullscreen / Borderless / Windowed`), автоматическое включение **DXGI Flip-Model Swapchain** в драйвере NVIDIA на Windows (чтобы `dwm.exe` не грузил видеокарту в безрамочном режиме) и рентген-профайлер `F8` / `F9`.
+  4. **Шейдеры GLSL 460 и фиксы физики на высоком FPS:** двустороннее подповерхностное освещение листвы, сглаживание шва каскадов теней CSM, плавная физика плащей Havok выше 30 FPS и **корректное качание травы, кустов и цветов на любом FPS (`HookFoliageSway`)**.
+  5. **Встроенное ПК-меню (`Display`, `Effects`, `Controls`),** `SMAA T2x`, `DLAA 4 (Preset K)`, `DLSS 4.5`, `FSR 4`, однопроходный `RCAS`, 3 режима окна (`Fullscreen / Borderless / Windowed`), автоматическое включение **DXGI Flip-Model Swapchain** в драйвере NVIDIA на Windows (убирает нагрузку `dwm.exe` в безрамочном режиме) и профайлер `F8` / `F9`.
 
-### Реальные замеры (строго на моём личном ПК — не обещание таких же цифр на любом железе)
-> **Важно:** у каждого компьютера свой процессор, видеокарта и память, поэтому никто не может гарантировать одинаковый FPS у всех. Приведённые ниже цифры — это честные замеры **конкретно на моём ПК (`AMD Ryzen 9 7950X + NVIDIA RTX 4090, 2560×1440 Native`)** со всеми включёнными эффектами (`DLAA + RCAS`):
-* **Тяжёлые уличные сцены Центрального Ярнама (`~1200–1760` дровов):** **`166–168 FPS`** (упор в лимит `170`), чистое время работы GPU по всем 10 проходам — **`2.80–2.98 мс`** (`~47%` загрузки GPU), `~6.2 ГБ` VRAM, `~3.8 ГБ` ОЗУ.
-* **Самый тяжёлый найденный портал с наложением каскадных и точечных теней (`1976` дровов):** **`154–160 FPS`** (`~6.2–6.5 мс`), чистое время работы GPU — **`3.69–3.73 мс`** (`~57%` загрузки GPU).
-* **Лёгкие закрытые локации (Сон Охотника, без лимита FPS и без DLAA):** **`500–650+ FPS`** (`~1.17–1.60 мс` GPU).
+### Примеры производительности (`Ryzen 9 7950X + RTX 4090`, `2560×1440 Native`)
+> **Примечание:** итоговый FPS зависит от конкретного процессора (особенно объёма L3-кэша и частоты на ядро), видеокарты, памяти и разрешения. Ниже приведены результаты замеров на тестовом ПК (`AMD Ryzen 9 7950X + NVIDIA RTX 4090, 2560×1440 Native`, все эффекты включены, `DLAA + RCAS`) для ориентира:
+* **Уличные сцены Центрального Ярнама (`~1200–1760` дровов):** **`166–168 FPS`** (лимит `170`), чистое время работы GPU по всем 10 проходам — **`2.80–2.98 мс`** (`~47%` загрузки GPU), `~6.2 ГБ` VRAM, `~3.8 ГБ` ОЗУ.
+* **Сложный портал с наложением каскадных и точечных теней (`1976` дровов):** **`154–160 FPS`** (`~6.2–6.5 мс`), чистое время работы GPU — **`3.69–3.73 мс`** (`~57%` загрузки GPU).
+* **Закрытые локации (Сон Охотника, без лимита FPS и без DLAA):** **`500–650+ FPS`** (`~1.17–1.60 мс` GPU).
 
 ### Как запустить за 30 секунд:
 1. Скачайте архив для **Windows** (`.zip`) или **Linux** (`.tar.gz`) из раздела **[Releases](https://github.com/lapothecary/bloodborne-pc-vulkan/releases/latest)**.
