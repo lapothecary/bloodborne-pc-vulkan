@@ -475,9 +475,13 @@ std::atomic<bool> click{false};            ///< a left click not yet used
 std::atomic<std::int64_t> click_ms{0};
 std::atomic<bool> left_held{false};
 std::atomic<std::uint32_t> presses{0};     ///< buttons to press once (pad thread)
+std::atomic<int> wheel_steps{0};           ///< queued mouse-wheel notches (+up, -down)
 std::atomic<std::uint32_t> repeat_press{0};///< an arrow held under the pointer
 std::atomic<bool> pad_steering{false};     ///< the pad's directions are in use: hover waits
 std::atomic<std::int64_t> list_focus_ms{0};
+std::atomic<std::int64_t> wheel_or_nav_ms{0};
+std::atomic<float> nav_anchor_x{0.0f}, nav_anchor_y{0.0f};
+std::atomic<bool> nav_hover_locked{false};
 
 constexpr std::int64_t ClickLifeMs = 250;
 
@@ -523,28 +527,34 @@ bool TakeClick() {
 }
 
 /// Where the pointer was over each list the last time it was seen: hovering acts on a move only,
-/// so a pointer resting somewhere does not fight the keyboard or the pad.
+/// so a pointer resting somewhere does not fight the keyboard, the pad, or the mouse wheel.
 struct Seen {
     const std::uint8_t* list = nullptr;
     float x = 0.0f, y = 0.0f;
     std::int64_t ms = 0;
+    std::uint64_t last_slot = ~0ull;
 };
 Seen seen[32];
 unsigned seen_next = 0;
 
-/// Whether the pointer moved over `list` since it was last seen (a list not seen for a while
-/// counts as not moved: it just opened under the pointer).
-bool PointerMoved(const std::uint8_t* list, float x, float y) {
+Seen& GetSeen(const std::uint8_t* list, float x, float y, bool& just_opened) {
     const std::int64_t now = NowMs();
     for (Seen& s : seen) {
         if (s.list == list) {
-            const bool moved = now - s.ms <= 250 && (s.x != x || s.y != y);
-            s = {list, x, y, now};
-            return moved;
+            just_opened = (now - s.ms > 250);
+            if (just_opened) {
+                s.x = x;
+                s.y = y;
+                s.last_slot = ~0ull;
+            }
+            s.ms = now;
+            return s;
         }
     }
-    seen[seen_next++ % 32] = {list, x, y, now};
-    return false;
+    Seen& s = seen[seen_next++ % 32];
+    s = {list, x, y, now, ~0ull};
+    just_opened = true;
+    return s;
 }
 
 std::atomic<const void*> last_updated_list{nullptr};
@@ -567,7 +577,8 @@ void PS4_SYSV_ABI OnListUpdate(std::uint64_t, const Core::GuestRegisterSnapshot*
     }
     const float x = pointer_x.load(std::memory_order_relaxed);
     const float y = pointer_y.load(std::memory_order_relaxed);
-    const bool moved = PointerMoved(component, x, y);
+    bool just_opened = false;
+    Seen& s = GetSeen(component, x, y, just_opened);
     const bool clicked = TakeClick();
 
     if (list.IsSpinner()) {
@@ -580,17 +591,75 @@ void PS4_SYSV_ABI OnListUpdate(std::uint64_t, const Core::GuestRegisterSnapshot*
         }
         return;
     }
-    if ((!moved && !clicked) || pad_steering.load(std::memory_order_relaxed)) {
-        return;
+
+    if (just_opened) {
+        std::uint64_t init_slot = ~0ull;
+        if (list.ItemAt(x, y, init_slot) >= 0) {
+            s.last_slot = init_slot;
+        }
+        if (!nav_hover_locked.load(std::memory_order_relaxed)) {
+            nav_anchor_x.store(x, std::memory_order_relaxed);
+            nav_anchor_y.store(y, std::memory_order_relaxed);
+        }
     }
+
+    const float dx = x - s.x, dy = y - s.y;
+    const float move_dist2 = dx * dx + dy * dy;
+    // Ignore sub-pixel / 1-2px sensor micro-jitter on the desk.
+    const bool moved = !just_opened && move_dist2 >= 3.0f * 3.0f;
+    if (moved) {
+        s.x = x;
+        s.y = y;
+    }
+
+    if (!clicked) {
+        if (!moved || pad_steering.load(std::memory_order_relaxed)) {
+            if (pad_steering.load(std::memory_order_relaxed)) {
+                std::uint64_t cur_slot = ~0ull;
+                if (list.ItemAt(x, y, cur_slot) >= 0) {
+                    s.last_slot = cur_slot;
+                }
+            }
+            return;
+        }
+        if (nav_hover_locked.load(std::memory_order_relaxed)) {
+            const std::int64_t since_nav = NowMs() - wheel_or_nav_ms.load(std::memory_order_relaxed);
+            const float adx = x - nav_anchor_x.load(std::memory_order_relaxed);
+            const float ady = y - nav_anchor_y.load(std::memory_order_relaxed);
+            const float anchor_dist2 = adx * adx + ady * ady;
+            if (since_nav < 300 || anchor_dist2 < 18.0f * 18.0f) {
+                std::uint64_t cur_slot = ~0ull;
+                if (list.ItemAt(x, y, cur_slot) >= 0) {
+                    s.last_slot = cur_slot;
+                }
+                return;
+            }
+        }
+    }
+
     std::uint64_t slot = 0;
     const int index = list.ItemAt(x, y, slot);
     if (index < 0) {
         return;
     }
-    if (clicked) {
+    if (!clicked) {
+        // Row-slot hysteresis: if the pointer is still sitting inside the same visual row slot
+        // it occupied before wheel/key navigation moved the cursor elsewhere, require a large
+        // intentional sweep (>= 45 px) before snapping selection back to that row.
+        if (slot == s.last_slot && list.CursorIndex() != index) {
+            const float adx = x - nav_anchor_x.load(std::memory_order_relaxed);
+            const float ady = y - nav_anchor_y.load(std::memory_order_relaxed);
+            const float req = nav_hover_locked.load(std::memory_order_relaxed) ? 45.0f : 15.0f;
+            if (adx * adx + ady * ady < req * req) {
+                return;
+            }
+        }
+        nav_hover_locked.store(false, std::memory_order_relaxed);
+    } else {
         click.store(false, std::memory_order_relaxed);
+        nav_hover_locked.store(false, std::memory_order_relaxed);
     }
+    s.last_slot = slot;
     static const bool trace = std::getenv("BB_MENU_POINTER_FILE") != nullptr;
     if (trace) {
         std::printf("Menu pointer: list %p item %d (cursor %d)%s\n", static_cast<void*>(component),
@@ -705,7 +774,14 @@ int OnEvent(const void* sdl_event, void* sdl_window) {
         const float notches =
             event.wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? -event.wheel.y : event.wheel.y;
         if (notches != 0.0f) {
-            presses.fetch_or(notches > 0.0f ? Up : Down, std::memory_order_relaxed);
+            const int step = notches > 0.0f ? 1 : -1;
+            const int cur = wheel_steps.load(std::memory_order_relaxed);
+            const int next = (cur != 0 && (cur > 0) != (step > 0)) ? step : std::clamp(cur + step, -6, 6);
+            wheel_steps.store(next, std::memory_order_relaxed);
+            wheel_or_nav_ms.store(NowMs(), std::memory_order_relaxed);
+            nav_anchor_x.store(pointer_x.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            nav_anchor_y.store(pointer_y.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            nav_hover_locked.store(true, std::memory_order_relaxed);
         }
         return 1;
     }
@@ -756,9 +832,8 @@ void ReadTestFile() {
 /// the game to see it, with a gap after.
 void OnPad(std::uint32_t* buttons, const std::uint8_t* sticks) {
     const auto off_centre = [](std::uint8_t v) { return v < 64 || v > 192; };
-    pad_steering.store((*buttons & (Up | Right | Down | Left)) || off_centre(sticks[0]) ||
-                           off_centre(sticks[1]),
-                       std::memory_order_relaxed);
+    const bool raw_steering = (*buttons & (Up | Right | Down | Left)) || off_centre(sticks[0]) ||
+                              off_centre(sticks[1]);
     ReadTestFile();
     static std::uint32_t holding = 0;
     static std::int64_t until_ms = 0, repeat_ms = 0;
@@ -770,11 +845,13 @@ void OnPad(std::uint32_t* buttons, const std::uint8_t* sticks) {
             click.store(false, std::memory_order_relaxed);
         }
         presses.store(0, std::memory_order_relaxed);
+        wheel_steps.store(0, std::memory_order_relaxed);
         repeat_press.store(0, std::memory_order_relaxed);
+        pad_steering.store(false, std::memory_order_relaxed);
         holding = 0;
         return;
     }
-    constexpr std::int64_t PressMs = 50, GapMs = 40, RepeatDelayMs = 400, RepeatMs = 120;
+    constexpr std::int64_t PressMs = 45, GapMs = 35, RepeatDelayMs = 400, RepeatMs = 120;
     if (holding && now >= until_ms) {
         holding = 0;
         until_ms = now + GapMs;
@@ -782,6 +859,11 @@ void OnPad(std::uint32_t* buttons, const std::uint8_t* sticks) {
     if (!holding && now >= until_ms) {
         if (const std::uint32_t next = presses.exchange(0, std::memory_order_relaxed)) {
             holding = next;
+            until_ms = now + PressMs;
+            repeat_ms = now + RepeatDelayMs;
+        } else if (const int w = wheel_steps.load(std::memory_order_relaxed); w != 0) {
+            wheel_steps.store(w > 0 ? w - 1 : w + 1, std::memory_order_relaxed);
+            holding = w > 0 ? Up : Down;
             until_ms = now + PressMs;
             repeat_ms = now + RepeatDelayMs;
         } else if (const std::uint32_t arrow = repeat_press.load(std::memory_order_relaxed);
@@ -792,6 +874,15 @@ void OnPad(std::uint32_t* buttons, const std::uint8_t* sticks) {
         }
     }
     *buttons |= holding;
+    const bool active_nav = raw_steering || (holding & (Up | Right | Down | Left)) != 0 ||
+                            wheel_steps.load(std::memory_order_relaxed) != 0;
+    pad_steering.store(active_nav, std::memory_order_relaxed);
+    if (active_nav) {
+        wheel_or_nav_ms.store(now, std::memory_order_relaxed);
+        nav_anchor_x.store(pointer_x.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        nav_anchor_y.store(pointer_y.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        nav_hover_locked.store(true, std::memory_order_relaxed);
+    }
 }
 
 } // namespace
