@@ -32,7 +32,7 @@ build=$win/gpu-package
 echo "Windows build: PGO $pgo, LTO $lto"
 stage=$win/stage/bbport-windows
 
-# 1. Build the 2,940-function C++20 native GX engine (our_cpp_100000_source) to Windows COFF64, then build bb-probe.exe.
+# 1. Build the 2,940-function C++20 native GX engine (dantelion_gx) to Windows COFF64, then build bb-probe.exe.
 python3 "$root/tools/build_gx_win32_coff.py"
 nix-shell -p cmake ninja pkg-config glslang python3 spirv-tools protobuf --run "
     set -e

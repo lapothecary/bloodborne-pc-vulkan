@@ -62,7 +62,7 @@ Click any topic below to expand its details:
 * **What still runs from the original PS4 binary (`eboot.bin`):**
   * Gameplay logic, AI, combat state machines, world streaming, Havok physics & cloth simulation, Morpheme animation graphs, FMOD audio mixing, and parts of the PS4 system/GNM context still execute from the relinked original binary over the `bbport` POSIX/Win32 runtime layer.
 * **What was refactored and replaced (~90% of the critical graphics bottleneck):**
-  * The core Dantelion graphics & post-processing modules (`01_CoreGraphics2_GNM`, `02_GX_GraphicsFramework`, `03_TPF_GNF_ShaderContainers`, `04_SceneRenderer`, `05_PostProcess_Yebis2`, `06_DeferredLightingAndAO`, `07_SFX_ParticleGpuRenderer`) were decompiled into native **C++20** (`our_cpp_100000_source/`) and wired directly into the **DirectVk Vulkan 1.3** backend (`gpu/`).
+  * The core Dantelion graphics & post-processing modules (`01_CoreGraphics2_GNM`, `02_GX_GraphicsFramework`, `03_TPF_GNF_ShaderContainers`, `04_SceneRenderer`, `05_PostProcess_Yebis2`, `06_DeferredLightingAndAO`, `07_SFX_ParticleGpuRenderer`) were decompiled into native **C++20** (`dantelion_gx/`) and wired directly into the **DirectVk Vulkan 1.3** backend (`gpu/`).
   * The heaviest machine-translated shaders were replaced with clean, human-readable **GLSL 460** shaders (`gpu/shader/backend/spirv/native/`), verified mathematically against the original shader outputs.
   * Remaining non-graphics bottlenecks at high frame rates (Havok cloth stiffness above 30 FPS, procedural wind sway on bushes/flowers, and PS4 thread scheduling on modern multi-CCD / hybrid CPUs) are handled via targeted binary hooks and OS thread-topology pinning.
 
@@ -112,9 +112,9 @@ Click any topic below to expand its details:
 <br/>
 
 ```bash
-# 1. Build the C++20 Graphics Engine (our_cpp_100000_source -> libbb_gx_engine_native.a):
-cmake -S our_cpp_100000_source -B our_cpp_100000_source/build -G Ninja -DCMAKE_BUILD_TYPE=Release
-ninja -C our_cpp_100000_source/build
+# 1. Build the C++20 Graphics Engine (dantelion_gx -> libbb_gx_engine_native.a):
+cmake -S dantelion_gx -B dantelion_gx/build -G Ninja -DCMAKE_BUILD_TYPE=Release
+ninja -C dantelion_gx/build
 
 # 2. Build the Vulkan 1.3 RHI Library & Runtime (Linux):
 ninja -C build_gpu && cp -f build_gpu/libbbgpu.so out/gpu/libbbgpu.so
@@ -174,5 +174,5 @@ BB_GX_SKIP_MIN=0x22900a0 BB_GX_SKIP_MAX=0x2292000 ./play.sh
   * **[`bbport` (`deadinside28/bloodborne_pc`)](https://github.com/deadinside28/bloodborne_pc)** — Host ELF/PE loader, PS4 kernel/system runtime (`src/`), base in-game Display menu & upscaler bridges (`FSR 3.1/4`, `DLSS`, `TAA`), and frame-pacing hooks.
   * **[`shadPS4` (`shadps4-emu/shadPS4`)](https://github.com/shadps4-emu/shadPS4)** — Original PS4 Vulkan video core and shader recompiler foundation (`GPL-2.0-or-later`).
 * **`bloodborne-pc-vulkan` Engineering ([@lapothecary](https://github.com/lapothecary)):**
-  * Refactored C++20 Dantelion graphics & post-FX pipeline ([`our_cpp_100000_source/`](our_cpp_100000_source), [`bb_golden_engine.cpp`](gpu/shim/bb_golden_engine.cpp)), DirectVk 1.3 split VRAM architecture ([`direct_buffers.cpp`](gpu/buffers/direct_buffers.cpp), [`direct_textures.cpp`](gpu/textures/direct_textures.cpp)), clean vectorized GLSL 460 shader suite ([`gpu/shader/backend/spirv/native/`](gpu/shader/backend/spirv/native)), 3D hardware `SceneOcclusionCuller`, Direct-Inline Stage A memoization, high-FPS foliage sway & physics fixes, sealed Scaleform GFx menu engine ([`bbport_menu_engine.h`](gpu/shim/bbport_menu_engine.h)), `SMAA T2x` / `SMAA 1x Ultra`, `2x/4x` UI super-resolution, 21-subpass X-Ray GPU/CPU profiler HUD, and Windows/Linux L3/CCD thread topology & NVAPI DXGI swapchain integration.
+  * Refactored C++20 Dantelion graphics & post-FX pipeline ([`dantelion_gx/`](dantelion_gx), [`bb_golden_engine.cpp`](gpu/shim/bb_golden_engine.cpp)), DirectVk 1.3 split VRAM architecture ([`direct_buffers.cpp`](gpu/buffers/direct_buffers.cpp), [`direct_textures.cpp`](gpu/textures/direct_textures.cpp)), clean vectorized GLSL 460 shader suite ([`gpu/shader/backend/spirv/native/`](gpu/shader/backend/spirv/native)), 3D hardware `SceneOcclusionCuller`, Direct-Inline Stage A memoization, high-FPS foliage sway & physics fixes, sealed Scaleform GFx menu engine ([`bbport_menu_engine.h`](gpu/shim/bbport_menu_engine.h)), `SMAA T2x` / `SMAA 1x Ultra`, `2x/4x` UI super-resolution, 21-subpass X-Ray GPU/CPU profiler HUD, and Windows/Linux L3/CCD thread topology & NVAPI DXGI swapchain integration.
 * **License:** **[GNU General Public License v3.0](LICENSE)** (`GPL-3.0`).

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-or-later
 """
-Builds our_cpp_100000_source/build_win32/libbb_gx_engine_native.a (Windows x86_64 COFF archive).
+Builds dantelion_gx/build_win32/libbb_gx_engine_native.a (Windows x86_64 COFF archive).
 
 Why this two-stage Clang pipeline exists:
-1. All 2,940 decompiled C++20 functions in `our_cpp_100000_source/` (102,597 LOC) and their 1,496
+1. All 2,940 decompiled C++20 functions in `dantelion_gx/` (102,597 LOC) and their 1,496
    vtable/function-pointer calls use the PS4 Orbis / System V AMD64 ABI (`rdi, rsi, rdx, rcx, r8, r9`,
    `xmm0..7`, `rax/rdx`, `xmm6..15` caller-saved, and LP64 Itanium C++ mangling where `uint64_t`/`size_t`
    mangles as `m`).
@@ -28,7 +28,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-GX_DIR = ROOT / "our_cpp_100000_source"
+GX_DIR = ROOT / "dantelion_gx"
 INC_DIR = GX_DIR / "include"
 BUILD_WIN32 = GX_DIR / "build_win32"
 OBJ_DIR = BUILD_WIN32 / "obj"

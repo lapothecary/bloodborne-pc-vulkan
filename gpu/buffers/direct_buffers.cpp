@@ -18,7 +18,7 @@
 #include "shim/bbport_toggles.h"
 #include "textures/texture_cache.h"
 #include "vulkan/instance.h"
-#include "../../our_cpp_100000_source/include/gx_direct_vulkan.h"
+#include "../../dantelion_gx/include/gx_direct_vulkan.h"
 
 extern "C" void runtime_memory_note_write(uintptr_t address, uint64_t size);
 extern "C" bool BbLookupMappedEnd(u64 address, uintptr_t& out_end);

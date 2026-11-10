@@ -23,7 +23,7 @@
 #include "shim/bbport_toggles.h"
 #include "vulkan/instance.h"
 #include "vulkan/shader_module.h"
-#include "../../our_cpp_100000_source/include/gx_direct_vulkan.h"
+#include "../../dantelion_gx/include/gx_direct_vulkan.h"
 
 namespace Vulkan {
 

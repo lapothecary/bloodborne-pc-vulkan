@@ -112,7 +112,7 @@ jobs:
         run: |
           echo "MSYS2_CLANG64_BIN=$(cygpath -w /clang64/bin)" >> "$GITHUB_ENV"
           cmd //c "if not exist D:\\a\\_temp\\msys64 mklink /J D:\\a\\_temp\\msys64 C:\\msys64" || true
-          if [ ! -f our_cpp_100000_source/build_win32/libbb_gx_engine_native.a ]; then
+          if [ ! -f dantelion_gx/build_win32/libbb_gx_engine_native.a ]; then
             python3 tools/build_gx_win32_coff.py
           fi
           if [ -f build_win32_gpu/build.ninja ]; then

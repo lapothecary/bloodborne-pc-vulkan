@@ -8,7 +8,7 @@
 #include "bbport_fx_init_clear.h"
 #include "bbport_effect_flags.h"
 #include "platform/gnm/gnm.h"
-#include "../../our_cpp_100000_source/include/gx_direct_vulkan.h"
+#include "../../dantelion_gx/include/gx_direct_vulkan.h"
 
 #include <algorithm>
 #include <array>

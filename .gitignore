@@ -2,8 +2,8 @@
 /out/
 /bin
 /build_gpu/
-/our_cpp_100000_source/build/
-/our_cpp_100000_source/build_win32/obj/
+/dantelion_gx/build/
+/dantelion_gx/build_win32/obj/
 /pgo/
 /dist/
 __pycache__/
@@ -16,7 +16,7 @@ __pycache__/
 
 # Read-only frozen golden snapshot & raw shader binary dumps (stored in Tier 0 / Tier 1)
 /01_GOLDEN_CPP20_2940_READONLY_NEVER_TOUCH/
-/our_cpp_100000_source/shaders/*/
+/dantelion_gx/shaders/*/
 
 # Nested upstream third-party git clones & bundled local assets/mods
 /bundled/

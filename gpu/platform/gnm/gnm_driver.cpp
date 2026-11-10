@@ -46,7 +46,7 @@
 #include "cp/command_processor.h"
 #include "render/presenter.h"
 #include "render/rasterizer.h"
-#include "../../../our_cpp_100000_source/include/gx_direct_vulkan.h"
+#include "../../../dantelion_gx/include/gx_direct_vulkan.h"
 
 namespace Frontend {
 class WindowSDL;

@@ -5,7 +5,7 @@
 #include "render/raster_internal.h"
 #include "buffers/direct_buffers.h"
 #include "cp/cp_tasks.h"
-#include "../../our_cpp_100000_source/include/gx_direct_vulkan.h"
+#include "../../dantelion_gx/include/gx_direct_vulkan.h"
 
 extern "C" bool BbLookupMappedEnd(u64 address, uintptr_t& out_end);
 

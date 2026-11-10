@@ -69,7 +69,7 @@ struct Telemetry {
 };
 
 /// Initializes the O(1) 752-shader manifest hash table and verifies the 6-bundle shader archive
-/// (`our_cpp_100000_source/shaders/{gxshader,gxgui,gxposteffect,gxrenderershader,gxdecal,gxffxshader}`).
+/// (`dantelion_gx/shaders/{gxshader,gxgui,gxposteffect,gxrenderershader,gxdecal,gxffxshader}`).
 void InitializeManifestLibrary() noexcept;
 
 /// O(1) lookup into the 752-shader manifest by 64-bit OrbShdr hash (with optional crc32/code_bytes

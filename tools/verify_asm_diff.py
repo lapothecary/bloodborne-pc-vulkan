@@ -20,7 +20,7 @@ from pathlib import Path
 ROOT = Path("/home/kekw3/Documents/BloodBorne/bb_vulkan")
 EBOOT_BIN = Path("/home/kekw3/Documents/bloodborne engine decompile project/original file/eboot.bin")
 BOOT_BIN = ROOT / "out/boot.bin"
-NATIVE_ARCHIVE = ROOT / "our_cpp_100000_source/build/libbb_gx_engine_native.a"
+NATIVE_ARCHIVE = ROOT / "dantelion_gx/build/libbb_gx_engine_native.a"
 GOLDEN_ENGINE_CPP = ROOT / "gpu/shim/bb_golden_engine.cpp"
 FUNCTIONS_DB = Path("/home/kekw3/Documents/bloodborne engine decompile project/db/functions.json")
 

@@ -3,7 +3,7 @@
 // bb_vulkan: Golden Engine C++20 Native GX Bridge
 // File: gpu/shim/bb_golden_engine.cpp
 // Connects our 102,597 lines of decompiled C++20 GX code
-// (our_cpp_100000_source / libbb_gx_engine_native.a) into bb_vulkan.
+// (dantelion_gx / libbb_gx_engine_native.a) into bb_vulkan.
 // ============================================================================
 #include "bb_golden_engine.h"
 #include "bbport_guest_code_hooks.h"
@@ -18,10 +18,10 @@
 #if defined(_WIN32)
 #define GX_DISABLE_WEAK_EXTERNAL_IMPORTS 1
 #endif
-#include "../../our_cpp_100000_source/include/gx_runtime_vma_and_tls.h"
-#include "../../our_cpp_100000_source/include/gx_eboot_external_imports.h"
-#include "../../our_cpp_100000_source/include/gx_decomp_registry.h"
-#include "../../our_cpp_100000_source/include/gx_direct_vulkan.h"
+#include "../../dantelion_gx/include/gx_runtime_vma_and_tls.h"
+#include "../../dantelion_gx/include/gx_eboot_external_imports.h"
+#include "../../dantelion_gx/include/gx_decomp_registry.h"
+#include "../../dantelion_gx/include/gx_direct_vulkan.h"
 
 #include <algorithm>
 #include <atomic>
@@ -55,7 +55,7 @@ int bb_guest_tls_slot(void) noexcept;
 __attribute__((no_instrument_function)) void GX_SYSV_ABI __cyg_profile_func_enter(void*, void*) noexcept {}
 __attribute__((no_instrument_function)) void GX_SYSV_ABI __cyg_profile_func_exit(void*, void*) noexcept {}
 
-// System V AMD64 ABI C/math runtime bridges for our_cpp_100000_source on Windows (and Linux)
+// System V AMD64 ABI C/math runtime bridges for dantelion_gx on Windows (and Linux)
 void* GX_SYSV_ABI __gx_sysv_memcpy(void* dst, const void* src, std::size_t n) noexcept {
     return std::memcpy(dst, src, n);
 }

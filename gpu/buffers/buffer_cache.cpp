@@ -30,7 +30,7 @@
 #include "render/runtime.h"
 #include "render/scheduler.h"
 #include "textures/texture_cache.h"
-#include "../../our_cpp_100000_source/include/gx_direct_vulkan.h"
+#include "../../dantelion_gx/include/gx_direct_vulkan.h"
 
 #include <mutex>
 #include <pthread.h>

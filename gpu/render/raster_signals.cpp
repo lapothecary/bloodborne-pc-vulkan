@@ -8,7 +8,7 @@
 #include "bbport_copy.h"
 #include "bbport_threads.h"
 #include "bbport_toggles.h"
-#include "../../our_cpp_100000_source/include/gx_direct_vulkan.h"
+#include "../../dantelion_gx/include/gx_direct_vulkan.h"
 #include <pthread.h>
 
 namespace Vulkan {

@@ -333,10 +333,10 @@ if (NOT WIN32)
     target_link_options(bbgpu PRIVATE -Wl,--allow-shlib-undefined -Wl,-Bsymbolic-functions)
 endif()
 if (WIN32)
-    set(BB_GX_ENGINE_ARCHIVE "${CMAKE_CURRENT_SOURCE_DIR}/../our_cpp_100000_source/build_win32/libbb_gx_engine_native.a")
+    set(BB_GX_ENGINE_ARCHIVE "${CMAKE_CURRENT_SOURCE_DIR}/../dantelion_gx/build_win32/libbb_gx_engine_native.a")
 else()
     target_link_directories(bbgpu PUBLIC "/home/kekw3/Documents/BloodBorne/AI_WORK_FOR_PORTING/toolchain/sysroot/usr/lib")
-    set(BB_GX_ENGINE_ARCHIVE "${CMAKE_CURRENT_SOURCE_DIR}/../our_cpp_100000_source/build/libbb_gx_engine_native.a")
+    set(BB_GX_ENGINE_ARCHIVE "${CMAKE_CURRENT_SOURCE_DIR}/../dantelion_gx/build/libbb_gx_engine_native.a")
 endif()
 target_link_libraries(bbgpu PRIVATE ffx-vulkan::portable ffx-vulkan::fsr4-v07-vulkan
     PkgConfig::SPIRV_TOOLS

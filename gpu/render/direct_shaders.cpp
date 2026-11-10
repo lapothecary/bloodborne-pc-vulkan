@@ -170,9 +170,9 @@ void InsertManifestKey(u64 key_hash, u16 idx) noexcept {
         }
     }
     const std::array<fs::path, 4> candidates = {
-        fs::path{"/home/kekw3/Documents/BloodBorne/bb_vulkan/our_cpp_100000_source/shaders"},
-        fs::current_path() / "our_cpp_100000_source" / "shaders",
-        fs::current_path().parent_path() / "our_cpp_100000_source" / "shaders",
+        fs::path{"/home/kekw3/Documents/BloodBorne/bb_vulkan/dantelion_gx/shaders"},
+        fs::current_path() / "dantelion_gx" / "shaders",
+        fs::current_path().parent_path() / "dantelion_gx" / "shaders",
         fs::current_path() / "shaders",
     };
     std::error_code ec;

@@ -26,7 +26,7 @@
 #include "vulkan/instance.h"
 #include "render/direct_shaders.h"
 #include "render/scheduler.h"
-#include "../../our_cpp_100000_source/include/gx_direct_vulkan.h"
+#include "../../dantelion_gx/include/gx_direct_vulkan.h"
 
 // DejaVu Sans (Cyrillic), embedded (third_party/fonts, Bitstream Vera license).
 #ifdef _WIN32
