@@ -35,32 +35,24 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name || 'v1.1.0' }}
-          name: "Bloodborne PC Vulkan ${{ github.ref_name || 'v1.1.0' }} (Linux & Windows x86_64 Prebuilt — Up to 651 Avg FPS, 2,940 C++20 Engine + 109 Clean GLSL Shaders)"
+          name: "Bloodborne PC Vulkan ${{ github.ref_name || 'v1.1.0' }} — Windows & Linux x86_64 Prebuilt Release"
           body: |
-            ## Bloodborne PC Vulkan ${{ github.ref_name || 'v1.1.0' }} — Linux & Windows `x86_64` Prebuilt Release
+            ## Bloodborne PC Vulkan ${{ github.ref_name || 'v1.1.0' }} — Windows & Linux `x86_64` Prebuilt Release
 
-            ### ⚡ 30-Second Quick Start (Just Unpack Next to `CUSA03173` & Play)
-            - **Linux (`x86_64`)**: Download **`bloodborne-pc-vulkan-linux-x86_64-prebuilt.tar.gz`**, extract next to your **`CUSA03173`** (`v1.09` GOTY) folder, and run **`./play.sh`** (or **`python3 Launcher.py`** / **`./launcher.sh`**).
-            - **Windows 10/11 (`x86_64`)**: Download **`bloodborne-pc-vulkan-windows-x86_64-prebuilt.zip`**, extract next to your **`CUSA03173`** (`v1.09` GOTY) folder, and double-click **`Bloodborne.exe`** to launch the game directly (or **`Launcher.py`** / **`Launcher.exe`** for the settings launcher).
-            - Press **`F8`** in-game to toggle the 10-pass hardware GPU/CPU telemetry HUD.
+            ### ⚡ Quick Start (Unpack Next to `CUSA03173` & Play)
+            - **Windows 10/11 (`x86_64`)**: Download **`bloodborne-pc-vulkan-windows-x86_64-prebuilt.zip`**, extract next to your **`CUSA03173`** (`v1.09` GOTY) folder, and double-click **`Bloodborne.exe`** to launch directly (or **`Launcher.exe`** for settings).
+            - **Linux (`x86_64`)**: Download **`bloodborne-pc-vulkan-linux-x86_64-prebuilt.tar.gz`**, extract next to your **`CUSA03173`** (`v1.09` GOTY) folder, and run **`./play.sh`** (or **`./launcher.sh`** for settings).
+            - Press **`F8`** in-game to toggle the 10-pass hardware GPU/CPU telemetry HUD (`F9` toggles X-Ray sub-pass breakdown).
 
             ---
 
-            ### 🔥 What's New in `${{ github.ref_name || 'v1.1.0' }}`:
-            - **Native Windows 10/11 `x86_64` Port (`Bloodborne.exe` + `Launcher.py` / `Launcher.exe` + `bb-probe.exe`)**:
-              - All `2,940 / 2,940` decompiled C++20 engine functions (`102,597` LOC) compiled into a zero-relocation Windows `COFF64` library (`libbb_gx_engine_native.a`) with explicit `sysv_abi` ↔ Win64 `ms_abi` bridge and Windows TEB `gs:[0x1480 + 8*slot]` guest TLS.
-            - **Up to `666 Avg FPS (1.50 ms)` & `51.7%` Hardware Occlusion Culling at `2560×1440` Native**:
-              - **Expanded `SceneOcclusionCuller` & Direct-Inline `Stage A` (`2a..2d`) Memoization**: Covers instanced G-Buffer world shaders (`vs_6a833138`, `vs_ecbef4c7`), static building palettes, and 6-MRT cutout/foliage draws (skipping up to **`51.7%` / `415 draws/frame`** of occluded geometry in heavy multi-room portals), paired with `O(1)` static `DirectBuffers` vertex memoization (`ResolveVertexBuffers` `1.63 -> 0.91 ms`) and `cueHeap` constant-buffer fast paths (`3.0–3.2 µs/draw`).
-              - **`100% NatBuf` & `100% NatTex` (`0` Page Faults/s)**: `4 MiB` in-pass dynamic buffer renaming (`GXDynamicBufferRingOwner`), unified graphics push-descriptor `VkPipelineLayout` (`DscSav: 62%`), single-view private guest memory (`MAP_PRIVATE` / `VirtualAlloc2` `MEM_PRIVATE`), and dirty-gated `3×1025×1 R32F` gamma LUT uploads.
-              - **Physical-Core #0 `MOMainThread` Isolation + Multi-CCD Worker Pool (`bbport_threads.h` / `posix_win32.cpp`)**: Reaches `154–170 FPS` in the heaviest multi-shadow indoor portals and `600–666+ FPS` in lighter areas at `2560×1440`.
-              - **All `111` Core Shaders (`109` Unique Files) Rewritten in Clean, Vectorized Vulkan 1.3 GLSL 460 (`0` `tXXX` register dumps)**: Mathematically verified via `tools/verify_clean_glsl.py`, with genuine `gl_FrontFacing`, physical two-sided foliage subsurface translucency (`85%` backface transmission), exact quotient-rule CSM contact-shadow gradient in `ps_f55643de.frag` (fixing the Cascade 0/1 road seam), Lagarde `Specular AO`, Jimenez IGN volumetric godray dithering, and VSM Chebyshev light-bleeding suppression.
-            - **7 Anti-Aliasing Modes, Upscalers, 3-State Window Mode & Zero-Pass `RCAS` Sharpening**:
-              - Native **`DLAA 4 (Transformer Preset K)`**, **`DLAA 3 (CNN Fast Preset F)`**, **`SMAA T2x` (Morphological Ultra + 2x Motion-Vector Temporal Resolve)**, **`SMAA 1x Ultra` (`~0.16 ms`)**, `TAA`, `FXAA`, plus `DLSS 4.5 / 4`, `FSR 4`, and `FSR 3.1`.
-              - **3-State Window Mode (`Fullscreen` / `Borderless Windowed` / `Windowed` + `Alt+Enter`)** & **Fused Zero-Pass `RCAS` Contrast-Adaptive Sharpening** inside `Presenter::EncodePass`.
-            - **High-FPS Foliage/Cloth Physics, Controls & 21-Subpass X-Ray GPU/CPU Profiler HUD (`F8` / `F9`)**:
-              - **Frame-Rate-Independent FLVER Foliage & Flower Sway (`HookFoliageSway` at `0x2313870`)** + **Havok Cloth Physics Stiffness Scaling above 30 FPS (`#58`)** + high-FPS `Mv_AudioPlayThread` startup handshake + save play-time carry + HUD item-icon stencil mask fix.
-              - **Automatic Split Base + Update Folder Support (`CUSAxxxxx` + `CUSAxxxxx-patch`)**, **Cutscene Video Skipping (`Enter / Esc / Options`)**, & **Slow-Walk Key (`Left Alt`, `40%` speed)**.
-              - **10-Category / 21-Subpass Hardware GPU & CPU X-Ray Breakdown (`F8` / `F9` HUD)**: Real-time `vkCmdWriteTimestamp2` timing for `Shadow Maps`, `G-Buffer`, `SSAO`, `Deferred PBR`, `SSR`, `Forward Alpha`, `Compute/HLE`, `Yebis 2 Post-FX`, `AA/Upscaler`, and `Scaleform UI & Present`, plus `CPU 2a..2e` Stage A breakdown and live `W / MHz / °C / VRAM` sensors.
+            ### 🔍 Key Highlights in `${{ github.ref_name || 'v1.1.0' }}`:
+            - **Windows 10/11 & Linux 1:1 Parity (`Bloodborne.exe` + `Launcher.exe` + `bb-probe.exe`)**:
+              - Refactored C++20 Dantelion graphics & post-FX pipeline (`FD4` / `GX` / `Yebis 2`) paired with Direct-Inline `Stage A` Vulkan 1.3 recording (`Stage B = 0.00 ms`), single unified recorder stream (`DscSav: 54–62%`), hardware L3/CCD/Hybrid CPU thread topology pinning, and automatic NVIDIA **DXGI Flip-Model Swapchain** profile configuration (`0x20D690F8 = 1`, eliminating `dwm.exe` composition overhead in Borderless/Fullscreen).
+            - **Split PC VRAM, 3D Hardware Occlusion Culling & Clean GLSL 460 Shaders**:
+              - Native `DEVICE_LOCAL` `DirectBuffers` & `DirectTextures` (`0` page faults/s in steady gameplay), 3D hardware `SceneOcclusionCuller`, static vertex-buffer memoization, and clean vectorized GLSL 460 shaders for the heaviest passes (G-Buffer, Deferred PBR, 2-phase Adaptive SSR, SSAO, Yebis 2 Bloom/DoF/LUT, CSM/VSM shadows, two-sided foliage translucency, and CSM road-seam fix).
+            - **PC Display, 7 Anti-Aliasing Modes, Upscalers & Controls**:
+              - `SMAA T2x` (default), `SMAA 1x Ultra`, `DLAA 4 (Transformer Preset K)`, `DLAA 3 (CNN Fast)`, `TAA`, `FXAA`, `DLSS 4.5 / 4`, `FSR 4`, `FSR 3.1`, fused zero-pass `RCAS` sharpening, `2x/4x` GPU UI super-resolution, 3-state Window Mode (`Fullscreen` / `Borderless` / `Windowed` + `Alt+Enter`), native `output_res=auto` monitor detection, high-FPS Havok cloth & procedural foliage wind sway (`HookFoliageSway`), split `CUSAxxxxx + CUSAxxxxx-patch` support, cutscene skipping (`Enter / Esc / Options`), and Slow Walk (`Left Alt`).
           files: |
             bloodborne-pc-vulkan-linux-x86_64-prebuilt.tar.gz
             bloodborne-pc-vulkan-linux-x86_64-prebuilt.tar.gz.sha256
