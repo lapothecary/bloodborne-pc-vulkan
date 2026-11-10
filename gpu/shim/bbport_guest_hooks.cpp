@@ -369,7 +369,16 @@ void ApplyHotEffects(bool force, u64 fresh = 0) {
             continue; // not mapped any more
         }
         std::memcpy(block, reinterpret_cast<const void*>(object + 0x2960), sizeof(block));
-        bool plausible = std::memcmp(block + 0x20, reinterpret_cast<const void*>(ImageBase + 0x5128a40), 32) == 0;
+        bool has_targets = false;
+        if (runtime_memory_is_mapped(object + 0x48, 8) &&
+            runtime_memory_is_mapped(object + 0x10d0, 8) &&
+            runtime_memory_is_mapped(object + 0x24f8, 8)) {
+            const u32 ctx_flags = *reinterpret_cast<const u32*>(object + 0x48);
+            const u64 ssao_target = *reinterpret_cast<const u64*>(object + 0x10d0);
+            const u64 ssr_target = *reinterpret_cast<const u64*>(object + 0x24f8);
+            has_targets = ((ctx_flags & 0x10008u) != 0) && (ssao_target != 0 || ssr_target != 0);
+        }
+        bool plausible = std::memcmp(block + 0x20, reinterpret_cast<const void*>(ImageBase + 0x5128a40), 32) == 0 || has_targets;
         for (int b = 8; b <= 0x10; ++b) {
             plausible &= block[b] <= 1;
         }
@@ -379,9 +388,12 @@ void ApplyHotEffects(bool force, u64 fresh = 0) {
         ++live_objects;
         for (const auto& flag : hot_flags) {
             int want = settings.effects[flag.effect].load(std::memory_order_relaxed) ? 1 : 0;
-            if (flag.effect == 3) {
+            if (flag.effect == 3 && !is_fresh) {
                 // Menus and auxiliary contexts can deliberately have no SSAO target.
                 // Preserve that restriction instead of overriding the game's safety flag.
+                // Note: when is_fresh is true (at 0x22c254c inside sub_22c1f70), sub_22c39f0 has
+                // not run yet to allocate +0x10d0; keep want as the setting so sub_22c39f0 preserves
+                // it on main scene views and zeroes +0x2968 on non-SSAO views.
                 want = BbEffectFlags::SsaoEnabled(
                     {reinterpret_cast<const u8*>(object), 0x29a0}, want != 0);
             }

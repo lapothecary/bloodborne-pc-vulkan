@@ -116,7 +116,7 @@ std::map<uintptr_t, Piece>::iterator Carve(uintptr_t a, uintptr_t b) {
     --first; // the piece holding a
     auto last = pieces.lower_bound(b); // first piece starting at or after b
     // Already exactly one placeholder?
-    if (std::next(first) == last && !first->second.view && first->first == a &&
+    if (std::next(first) == last && !first->second.view && !first->second.owned && first->first == a &&
         first->second.end == b) {
         return first;
     }
@@ -301,7 +301,7 @@ void* mmap(void* address, size_t size, int prot, int flags, int fd, off_t offset
         if ((flags & MAP_FIXED_NOREPLACE)) {
             auto it = pieces.upper_bound(start);
             --it;
-            if (it->second.view || it->second.end < start + size) {
+            if (it->second.view || it->second.owned || it->second.end < start + size) {
                 errno = EEXIST;
                 return MAP_FAILED;
             }

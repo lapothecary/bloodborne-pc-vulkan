@@ -251,6 +251,27 @@ __attribute__((noinline)) void sub_229e990(void* pSelf, void* pRenderDev, void* 
         }
     }
 
+    {
+        const uint32_t ctxFlags = *reinterpret_cast<const uint32_t*>(viewBytes + 0x48);
+        viewBytes[0x2969] = gx_direct_vk::IsEffectEnabled(gx_direct_vk::kEffectMotionBlur) ? 1u : 0u;
+        viewBytes[0x296a] = gx_direct_vk::IsEffectEnabled(gx_direct_vk::kEffectGameAa) ? 1u : 0u;
+        viewBytes[0x296e] = gx_direct_vk::IsEffectEnabled(gx_direct_vk::kEffectDynamicShadows) ? 1u : 0u;
+        if ((ctxFlags & 0x8u) != 0u) {
+            const uint8_t wantBloom = gx_direct_vk::IsEffectEnabled(gx_direct_vk::kEffectBloom) ? 1u : 0u;
+            viewBytes[0x296b] = wantBloom;
+            viewBytes[0x2979] = wantBloom;
+            if (*reinterpret_cast<const uint64_t*>(viewBytes + 0x10d0) != 0ULL) {
+                viewBytes[0x2968] = gx_direct_vk::IsEffectEnabled(gx_direct_vk::kEffectSsao) ? 1u : 0u;
+            }
+        }
+        if ((ctxFlags & 0x10000u) != 0u && *reinterpret_cast<const uint64_t*>(viewBytes + 0x24f8) != 0ULL) {
+            const uint8_t wantSsr = gx_direct_vk::IsEffectEnabled(gx_direct_vk::kEffectReflections) ? 1u : 0u;
+            viewBytes[0x296f] = wantSsr;
+            viewBytes[0x2974] = wantSsr;
+            viewBytes[0x2977] = static_cast<uint8_t>(wantSsr ^ 1u);
+        }
+    }
+
     struct PassDispatchBlock {
         void*    pSelf;
         void*    pRenderDev;
@@ -597,7 +618,7 @@ __attribute__((noinline)) void sub_229e990(void* pSelf, void* pRenderDev, void* 
                 std::memcpy(pYebisState + 0x31a0, evalBuf + 0x60, 16);
             }
 
-            if (gx_direct_vk::IsEffectEnabled(gx_direct_vk::kEffectDof)) {
+            {
                 float w4 = *reinterpret_cast<float*>(viewBytes + 0x2b50);
                 uint8_t* p4A = static_cast<uint8_t*>(sub_21ef2e0(*reinterpret_cast<void**>(selfBytes + 0x5990), viewBytes + 0x2a88));
                 uint8_t* p4B = static_cast<uint8_t*>(sub_21ef2e0(*reinterpret_cast<void**>(selfBytes + 0x5990), viewBytes + 0x2af0));
@@ -677,11 +698,11 @@ __attribute__((noinline)) void sub_229e990(void* pSelf, void* pRenderDev, void* 
                     std::memcpy(pGlobalPostCfg + 0x2ec, evalBuf + 0x4c, 16);
                     *reinterpret_cast<uint32_t*>(pGlobalPostCfg + 0x2fc) = *reinterpret_cast<uint32_t*>(evalBuf + 0x5c);
                     *reinterpret_cast<uint32_t*>(pGlobalPostCfg + 0x1d8) = *reinterpret_cast<uint32_t*>(evalBuf + 0x84);
+                    if (!gx_direct_vk::IsEffectEnabled(gx_direct_vk::kEffectDof)) {
+                        *reinterpret_cast<uint32_t*>(pGlobalPostCfg + 0x1ac) = 0u;
+                        *reinterpret_cast<uint32_t*>(pGlobalPostCfg + 0x2d0) = 0u;
+                    }
                 }
-            } else if (pYebisState[0x3200] == 0) {
-                *reinterpret_cast<uint32_t*>(pGlobalPostCfg + 0x188) = 0u;
-                *reinterpret_cast<uint32_t*>(pGlobalPostCfg + 0x1ac) = 0u;
-                *reinterpret_cast<uint32_t*>(pGlobalPostCfg + 0x2d0) = 0u;
             }
 
             float w5 = *reinterpret_cast<float*>(viewBytes + 0x2b64);
