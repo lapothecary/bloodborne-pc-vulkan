@@ -398,6 +398,7 @@ bool Smaa::Record(vk::ImageView color_view, vk::ImageLayout color_layout, u32 wi
                  vk::ImageLayout::eGeneral, motion_v, vk::ImageLayout::eGeneral, resolve_sub);
             Barrier(cmdbuf, hist_cur_img, vk::ImageLayout::eGeneral, compute, write, all, any);
         });
+    scheduler.BumpDescriptorStateEpoch();
     return true;
 }
 

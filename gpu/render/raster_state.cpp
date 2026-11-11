@@ -86,8 +86,11 @@ bool UsesOpValue(Gcn::StencilFunc fail, Gcn::StencilFunc zpass, Gcn::StencilFunc
 
 void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool is_indexed) const {
     BB_SECTION(UpdateDynamicState);
-    if (!stage_regs && !scheduler.GetDynamicState().AnyDirty() &&
-        last_dyn_reg_epoch == liverpool->dyn_reg_epoch &&
+    const bool on_stage_b = (stage_regs != nullptr);
+    const u64 cur_dyn_epoch = on_stage_b ? pipe_dyn_reg_epoch : liverpool->dyn_reg_epoch;
+    if (!scheduler.GetDynamicState().AnyDirty() &&
+        last_dyn_from_stage_b == on_stage_b &&
+        last_dyn_reg_epoch == cur_dyn_epoch &&
         last_dyn_cmd_epoch == scheduler.DescriptorStateEpoch() &&
         last_dyn_is_indexed == is_indexed &&
         last_dyn_target_scale == target_scale &&
@@ -111,14 +114,13 @@ void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool
         instance.IsDepthBoundsSupported(), instance.IsDynamicColorWriteMaskSupported(),
         instance.IsAttachmentFeedbackLoopLayoutSupported(),
         [&](auto&& command) { scheduler.Record(std::move(command)); });
-    if (!stage_regs) {
-        last_dyn_reg_epoch = liverpool->dyn_reg_epoch;
-        last_dyn_cmd_epoch = scheduler.DescriptorStateEpoch();
-        last_dyn_is_indexed = is_indexed;
-        last_dyn_target_scale = target_scale;
-        last_dyn_jitter = draw_jitter;
-        last_dyn_feedback_loop = attachment_feedback_loop;
-    }
+    last_dyn_from_stage_b = on_stage_b;
+    last_dyn_reg_epoch = cur_dyn_epoch;
+    last_dyn_cmd_epoch = scheduler.DescriptorStateEpoch();
+    last_dyn_is_indexed = is_indexed;
+    last_dyn_target_scale = target_scale;
+    last_dyn_jitter = draw_jitter;
+    last_dyn_feedback_loop = attachment_feedback_loop;
 }
 
 void Rasterizer::UpdateViewportScissorState() const {

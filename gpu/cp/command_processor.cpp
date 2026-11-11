@@ -120,19 +120,31 @@ bool CommandProcessor::ApplyGraphicsRegisterPacket(Regs& regs, const u32* packet
             dirty->Mark(index, count);
         }
     };
-    const auto set = [&](u32 bank) {
-        const u32 index = bank + (body[0] & 0xFFFF);
-        const u32 count = body_words - 1;
-        std::memcpy(&regs.reg_array[index], body + 1, count * sizeof(u32));
+    const auto set = [&](u32 bank) -> bool {
+        const u32 index = bank + (body[0] & 0xFFFFu);
+        const u32 count = body_words - 1u;
+        const u32* src = body + 1u;
+        bool any_changed = false;
+        for (u32 i = 0; i < count; ++i) {
+            if (regs.reg_array[index + i] != src[i]) {
+                regs.reg_array[index + i] = src[i];
+                any_changed = true;
+            }
+        }
         if (bank == Bank::Sh) {
             mark_sh(index, count);
-        } else {
+        } else if (any_changed || track_all) {
             mark(index, count);
         }
+        return any_changed;
     };
     const auto write = [&](u32 index, u32 value) {
-        regs.reg_array[index] = value;
-        mark(index, 1);
+        if (regs.reg_array[index] != value) {
+            regs.reg_array[index] = value;
+            mark(index, 1);
+        } else if (track_all) [[unlikely]] {
+            mark(index, 1);
+        }
     };
     switch (Header{header}.Opcode()) {
     case Op::ClearState:
@@ -144,8 +156,9 @@ bool CommandProcessor::ApplyGraphicsRegisterPacket(Regs& regs, const u32* packet
         bump_pso_and_dyn();
         break;
     case Op::SetConfigReg:
-        set(Bank::Config);
-        bump_pso_and_dyn();
+        if (set(Bank::Config)) {
+            bump_pso_and_dyn();
+        }
         handled_completely = true;
         break;
     case Op::SetContextReg: {
@@ -160,7 +173,9 @@ bool CommandProcessor::ApplyGraphicsRegisterPacket(Regs& regs, const u32* packet
                 any_changed = true;
             }
         }
-        mark(dst_reg, count);
+        if (any_changed || track_all) {
+            mark(dst_reg, count);
+        }
         if (any_changed) {
             if (dyn_reg_epoch) {
                 ++(*dyn_reg_epoch);
@@ -195,8 +210,9 @@ bool CommandProcessor::ApplyGraphicsRegisterPacket(Regs& regs, const u32* packet
         break;
     }
     case Op::SetUconfigReg:
-        set(Bank::Uconfig);
-        bump_pso_and_dyn();
+        if (set(Bank::Uconfig)) {
+            bump_pso_and_dyn();
+        }
         handled_completely = true;
         break;
     case Op::IndexType:
@@ -271,15 +287,24 @@ bool CommandProcessor::ApplyGraphicsRegisterPacket(Regs& regs, const u32* packet
         if (vk_op == DirectVk::Op::DrawIndexed && body_words == 6u) {
             DirectVk::DrawIndexedArgs a{};
             std::memcpy(&a, body + 2u, sizeof(a));
-            regs.reg_array[Reg::VgtIndxOffset] = static_cast<u32>(a.base_vertex);
+            const u32 base_vtx = static_cast<u32>(a.base_vertex);
+            const bool chg_idx_off = (regs.reg_array[Reg::VgtIndxOffset] != base_vtx);
+            const bool chg_inst = (regs.reg_array[Reg::VgtNumInstances] != a.instance_count);
+            const bool chg_max = (regs.reg_array[Reg::VgtDmaMaxSize] != a.index_count);
+            const bool chg_num = (regs.reg_array[Reg::VgtNumIndices] != a.index_count);
+            const bool chg_init = (regs.reg_array[Reg::VgtDrawInitiator] != 0u);
+            regs.reg_array[Reg::VgtIndxOffset] = base_vtx;
             regs.reg_array[Reg::VgtNumInstances] = a.instance_count;
             regs.reg_array[Reg::VgtDmaMaxSize] = a.index_count;
             regs.reg_array[Reg::VgtNumIndices] = a.index_count;
             regs.reg_array[Reg::VgtDrawInitiator] = 0u;
             if (dirty) {
                 if (!track_all) [[likely]] {
-                    dirty->stage_b_mask[0] |= (1ULL << 32) | (1ULL << 63);
-                    dirty->stage_b_mask[1] |= (1ULL << (83 - 64)) | (1ULL << (116 - 64));
+                    dirty->stage_b_mask[0] |=
+                        (chg_idx_off ? (1ULL << 32) : 0ULL) | (chg_init ? (1ULL << 63) : 0ULL);
+                    dirty->stage_b_mask[1] |=
+                        (chg_max ? (1ULL << (83 - 64)) : 0ULL) |
+                        ((chg_inst || chg_num) ? (1ULL << (116 - 64)) : 0ULL);
                 } else {
                     mark(Reg::VgtIndxOffset, 1u);
                     mark(Reg::VgtNumInstances, 1u);
@@ -378,7 +403,9 @@ bool CommandProcessor::ApplyGraphicsRegisterPacket(Regs& regs, const u32* packet
                         pso_changed = true;
                     }
                 }
-                mark(dst_reg, count);
+                if (span_changed || track_all) {
+                    mark(dst_reg, count);
+                }
                 idx += count;
             }
             if (idx != body_words) {
@@ -443,16 +470,23 @@ bool CommandProcessor::ApplyGraphicsRegisterPacket(Regs& regs, const u32* packet
             std::memcpy(&regs.reg_array[Bank::Sh + 0x48u], vs, 4u * sizeof(u32));
             mark_sh(Bank::Sh + 0x48u, 4u);
             if (!only_sh) {
-                changed |= (regs.reg_array[Bank::Context + 0x1B1u] != body[6]) ||
-                           (regs.reg_array[Bank::Context + 0x1C3u] != body[7]) ||
-                           (regs.reg_array[Bank::Context + 0x207u] != body[8]);
+                const bool c54 = (regs.reg_array[Bank::Context + 0x1B1u] != body[6]);
+                const bool c56 = (regs.reg_array[Bank::Context + 0x1C3u] != body[7]);
+                const bool c64 = (regs.reg_array[Bank::Context + 0x207u] != body[8]);
+                changed |= c54 || c56 || c64;
                 regs.reg_array[Bank::Context + 0x1B1u] = body[6];
                 regs.reg_array[Bank::Context + 0x1C3u] = body[7];
                 regs.reg_array[Bank::Context + 0x207u] = body[8];
                 if (dirty) {
                     if (!track_all) [[likely]] {
-                        dirty->stage_b_mask[0] |= (1ULL << 54) | (1ULL << 56);
-                        dirty->stage_b_mask[1] |= (1ULL << 0);
+                        dirty->stage_b_mask[0] |=
+                            (c54 ? (1ULL << 54) : 0ULL) | (c56 ? (1ULL << 56) : 0ULL);
+                        if (c64) {
+                            dirty->stage_b_mask[1] |= (1ULL << 0);
+                            if (dyn_reg_epoch) {
+                                ++(*dyn_reg_epoch);
+                            }
+                        }
                     } else {
                         mark(Bank::Context + 0x1B1u, 1u);
                         mark(Bank::Context + 0x1C3u, 1u);
@@ -479,14 +513,15 @@ bool CommandProcessor::ApplyGraphicsRegisterPacket(Regs& regs, const u32* packet
                 std::memcpy(&regs.reg_array[Bank::Sh + 0x08u], ps, 4u * sizeof(u32));
                 mark_sh(Bank::Sh + 0x08u, 4u);
                 if (!only_sh) {
-                    changed |= (regs.reg_array[Bank::Context + 0x1C4u] != ps[4]) ||
-                               (regs.reg_array[Bank::Context + 0x1C5u] != ps[5]) ||
-                               (regs.reg_array[Bank::Context + 0x1B3u] != ps[6]) ||
-                               (regs.reg_array[Bank::Context + 0x1B4u] != ps[7]) ||
-                               (regs.reg_array[Bank::Context + 0x1B6u] != ps[8]) ||
-                               (regs.reg_array[Bank::Context + 0x1B8u] != ps[9]) ||
-                               (regs.reg_array[Bank::Context + 0x203u] != ps[10]) ||
-                               (regs.reg_array[Bank::Context + 0x08Fu] != ps[11]);
+                    const bool c56 = (regs.reg_array[Bank::Context + 0x1C4u] != ps[4]) ||
+                                     (regs.reg_array[Bank::Context + 0x1C5u] != ps[5]);
+                    const bool c54 = (regs.reg_array[Bank::Context + 0x1B3u] != ps[6]) ||
+                                     (regs.reg_array[Bank::Context + 0x1B4u] != ps[7]) ||
+                                     (regs.reg_array[Bank::Context + 0x1B6u] != ps[8]);
+                    const bool c55 = (regs.reg_array[Bank::Context + 0x1B8u] != ps[9]);
+                    const bool c64 = (regs.reg_array[Bank::Context + 0x203u] != ps[10]);
+                    const bool c17 = (regs.reg_array[Bank::Context + 0x08Fu] != ps[11]);
+                    changed |= c56 || c54 || c55 || c64 || c17;
                     regs.reg_array[Bank::Context + 0x1C4u] = ps[4];
                     regs.reg_array[Bank::Context + 0x1C5u] = ps[5];
                     regs.reg_array[Bank::Context + 0x1B3u] = ps[6];
@@ -497,9 +532,13 @@ bool CommandProcessor::ApplyGraphicsRegisterPacket(Regs& regs, const u32* packet
                     regs.reg_array[Bank::Context + 0x08Fu] = ps[11];
                     if (dirty) {
                         if (!track_all) [[likely]] {
-                            dirty->stage_b_mask[0] |=
-                                (1ULL << 17) | (1ULL << 54) | (1ULL << 55) | (1ULL << 56);
-                            dirty->stage_b_mask[1] |= (1ULL << 0);
+                            dirty->stage_b_mask[0] |= (c17 ? (1ULL << 17) : 0ULL) |
+                                                      (c54 ? (1ULL << 54) : 0ULL) |
+                                                      (c55 ? (1ULL << 55) : 0ULL) |
+                                                      (c56 ? (1ULL << 56) : 0ULL);
+                            if (c64) {
+                                dirty->stage_b_mask[1] |= (1ULL << 0);
+                            }
                         } else {
                             mark(Bank::Context + 0x1C4u, 2u);
                             mark(Bank::Context + 0x1B3u, 2u);
@@ -971,7 +1010,7 @@ void CommandProcessor::ReportStall(const char* why) {
 void CommandProcessor::Run(std::stop_token stop) {
     Common::SetCurrentThreadName("bb:GpuComm");
     BbSections::command_thread = true;
-    BbThreads::PinToGpuDomain();
+    BbThreads::PinToGpuCommCore();
     BbThreads::ApplyProcessThreadTopology();
     if (clockid_t clock; pthread_getcpuclockid(pthread_self(), &clock) == 0) {
         BbStats::gpu_thread_clock.store(int(clock));

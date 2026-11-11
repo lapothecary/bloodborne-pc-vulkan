@@ -365,6 +365,7 @@ void SceneTargets::Resample(vk::Image src, vk::Image dst, const VideoCore::Image
         cmd.endRendering();
     });
     // The guest pipelines' dynamic state must be emitted again after this pipeline.
+    scheduler.BumpDescriptorStateEpoch();
     scheduler.GetDynamicState().Invalidate();
 }
 void SceneTargets::CreateResampleResources() {

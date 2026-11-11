@@ -153,6 +153,7 @@ bool GpuTimestamps::Write(VAddr address, bool end_of_pipe) {
     Split(valid_bits >= 64 ? ~0ull : (1ull << valid_bits) - 1, push.mask);
     push.ratio = ratio;
     push.slot = slot;
+    scheduler.BumpDescriptorStateEpoch();
     scheduler.Record([this, slot, end_of_pipe, push](vk::CommandBuffer cmdbuf) {
         cmdbuf.resetQueryPool(*pool, slot, 1);
         // The end of the pipe: after all the work before it; else when the GPU gets here.

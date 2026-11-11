@@ -11,6 +11,7 @@
 #include <thread>
 #include <x86intrin.h>
 
+#include "bbport_threads.h"
 #include "common/thread.h"
 #include "common/types.h"
 
@@ -82,6 +83,7 @@ public:
 private:
     void Run(std::stop_token stop) {
         Common::SetCurrentThreadName("bb:TexBind");
+        BbThreads::PinToGpuDomain();
         on_helper = true;
         u64 seen = 0;
         while (!stop.stop_requested()) {

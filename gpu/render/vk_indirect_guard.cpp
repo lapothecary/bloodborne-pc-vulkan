@@ -154,6 +154,7 @@ std::pair<vk::Buffer, u64> IndirectGuard::CheckArgs(const VideoCore::Buffer& arg
     const u64 bind_size = (offset - bind_offset) + 3 * sizeof(u32);
     const u32 slot = next_slot.fetch_add(1, std::memory_order_relaxed) % NumSlots;
     const Push push{{max_count[0], max_count[1], max_count[2]}, first, max_total, slot * 4};
+    scheduler.BumpDescriptorStateEpoch();
     scheduler.Record([this, source = args.Handle(), bind_offset, bind_size,
                       push](vk::CommandBuffer cmdbuf) {
         const vk::MemoryBarrier2 before{
@@ -211,6 +212,7 @@ std::pair<vk::Buffer, u64> IndirectGuard::CheckDrawArgs(const VideoCore::Buffer&
     next_draw_slot += num_draws;
     draws_checked.fetch_add(num_draws, std::memory_order_relaxed);
     const DrawPush push{first, stride / 4, num_draws, words, slot * words, max_vertices};
+    scheduler.BumpDescriptorStateEpoch();
     scheduler.Record([this, source = args.Handle(), bind_offset, bind_size, push,
                       num_draws](vk::CommandBuffer cmdbuf) {
         const vk::MemoryBarrier2 before{

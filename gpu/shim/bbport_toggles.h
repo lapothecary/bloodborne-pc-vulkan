@@ -194,9 +194,10 @@ inline std::atomic<std::uint64_t> sync_recording_ns{0}, host_copies_wait_ns{0}, 
 /// Wall time the frame preparation waited for the GPU to finish an earlier frame (BB_FRAMES_AHEAD):
 /// how GPU-bound the frames are (BB_FRAME_LOG).
 inline std::atomic<std::uint64_t> present_wait_ns{0};
-/// V7.3: Hardware GPU execution vs inter-submission idle gap nanoseconds (zero-RenderPass-break
-/// submission-boundary Vulkan timestamp queries, collected 7 frames behind without waiting).
-inline std::atomic<std::uint64_t> hw_gpu_busy_ns{0}, hw_gpu_gap_ns{0}, hw_gpu_frames{0};
+/// V7.3: Hardware GPU execution vs intra-frame submission bubble vs inter-frame wait nanoseconds
+/// (zero-RenderPass-break submission-boundary Vulkan timestamp queries, collected 7 frames behind).
+inline std::atomic<std::uint64_t> hw_gpu_busy_ns{0}, hw_gpu_gap_ns{0}, hw_gpu_inter_gap_ns{0},
+    hw_gpu_frames{0};
 /// Per-category hardware GPU render-pass breakdown (10 semantic pass buckets, sum == hw_gpu_busy_ns).
 enum HudGpuCat : std::uint8_t {
     GpuCat_Shadows = 0,        // 1. Shadow Maps (CSM / Spot / VSM)

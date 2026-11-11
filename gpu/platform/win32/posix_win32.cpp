@@ -387,12 +387,18 @@ void SampleThread(HANDLE thread, std::string name) {
 
 struct Win32TopologyMasks {
     DWORD_PTR game_main = 0;
+    DWORD_PTR gpu_comm = 0;
+    DWORD_PTR draw_rec = 0;
+    DWORD_PTR vk_recorder = 0;
     DWORD_PTR game_workers = 0;
     DWORD_PTR gpu = 0;
     DWORD_PTR helper = 0;
 };
 
 const DWORD g_main_thread_id = GetCurrentThreadId();
+std::atomic<DWORD> g_gpu_comm_thread_id{0};
+std::atomic<DWORD> g_draw_rec_thread_id{0};
+std::atomic<DWORD> g_vk_recorder_thread_id{0};
 
 const Win32TopologyMasks& GetWin32Topology() {
     static const Win32TopologyMasks topo = [] {
@@ -546,6 +552,34 @@ const Win32TopologyMasks& GetWin32Topology() {
                     best_idx = i;
                 }
             }
+            size_t gcomm_idx = size_t(-1);
+            size_t drec_idx = size_t(-1);
+            size_t vkrec_idx = size_t(-1);
+            int gpu_phys = 0;
+            for (size_t i = 0; i < cores.size(); ++i) {
+                if (cores[i].domain != game_dom && (gpu_dom < 0 || cores[i].domain == gpu_dom)) {
+                    ++gpu_phys;
+                    if (gcomm_idx == size_t(-1) || cores[i].eff_class > cores[gcomm_idx].eff_class) {
+                        gcomm_idx = i;
+                    }
+                }
+            }
+            if (gpu_phys >= 6) {
+                for (size_t i = 0; i < cores.size(); ++i) {
+                    if (cores[i].domain != game_dom && (gpu_dom < 0 || cores[i].domain == gpu_dom) &&
+                        i != gcomm_idx &&
+                        (drec_idx == size_t(-1) || cores[i].eff_class > cores[drec_idx].eff_class)) {
+                        drec_idx = i;
+                    }
+                }
+                for (size_t i = 0; i < cores.size(); ++i) {
+                    if (cores[i].domain != game_dom && (gpu_dom < 0 || cores[i].domain == gpu_dom) &&
+                        i != gcomm_idx && i != drec_idx &&
+                        (vkrec_idx == size_t(-1) || cores[i].eff_class > cores[vkrec_idx].eff_class)) {
+                        vkrec_idx = i;
+                    }
+                }
+            }
             for (size_t i = 0; i < cores.size(); ++i) {
                 const auto& c = cores[i];
                 if (c.domain == game_dom) {
@@ -555,8 +589,16 @@ const Win32TopologyMasks& GetWin32Topology() {
                         res.game_workers |= c.mask;
                     }
                 } else if (gpu_dom < 0 || c.domain == gpu_dom) {
-                    res.gpu |= c.mask;
-                    res.helper |= c.mask;
+                    if (gpu_phys >= 4 && i == gcomm_idx) {
+                        res.gpu_comm = c.primary;     // c.smt intentionally left idle
+                    } else if (gpu_phys >= 6 && i == drec_idx) {
+                        res.draw_rec = c.primary;     // c.smt intentionally left idle (same CCD1 L3 as gpu_comm)
+                    } else if (gpu_phys >= 6 && i == vkrec_idx) {
+                        res.vk_recorder = c.primary;  // c.smt intentionally left idle (same CCD1 L3 as gpu_comm)
+                    } else {
+                        res.gpu |= c.mask;
+                        res.helper |= c.mask;
+                    }
                 }
             }
             if (res.game_main == 0) {
@@ -566,6 +608,15 @@ const Win32TopologyMasks& GetWin32Topology() {
             if (res.gpu == 0) {
                 res.gpu = res.game_workers;
             }
+            if (res.gpu_comm == 0) {
+                res.gpu_comm = res.gpu;
+            }
+            if (res.draw_rec == 0) {
+                res.draw_rec = res.gpu;
+            }
+            if (res.vk_recorder == 0) {
+                res.vk_recorder = res.gpu;
+            }
             if (res.helper == 0) {
                 res.helper = res.gpu;
             }
@@ -574,12 +625,18 @@ const Win32TopologyMasks& GetWin32Topology() {
             DWORD_PTR p_mask = 0, e_mask = 0;
             size_t p_phys = 0;
             size_t best_p = size_t(-1);
+            size_t second_p = size_t(-1);
+            size_t third_p = size_t(-1);
             if (max_eff > min_eff) {
                 for (size_t i = 0; i < cores.size(); ++i) {
                     if (cores[i].eff_class == max_eff) {
                         p_mask |= cores[i].mask;
                         if (best_p == size_t(-1)) {
                             best_p = i;
+                        } else if (second_p == size_t(-1)) {
+                            second_p = i;
+                        } else if (third_p == size_t(-1)) {
+                            third_p = i;
                         }
                         ++p_phys;
                     } else {
@@ -593,8 +650,17 @@ const Win32TopologyMasks& GetWin32Topology() {
                 // Main + Game Workers + Vulkan RHI stay strictly on P-cores; Helpers/IO/Audio run on E-cores.
                 if (p_phys >= 6 && best_p != size_t(-1)) {
                     res.game_main = cores[best_p].primary; // SMT sibling left idle
+                    const size_t gcomm_p = (p_phys >= 8) ? second_p : size_t(-1);
+                    const size_t drec_p = (p_phys >= 8) ? third_p : size_t(-1);
+                    if (gcomm_p != size_t(-1)) {
+                        res.gpu_comm = cores[gcomm_p].primary; // SMT sibling left idle
+                    }
+                    if (drec_p != size_t(-1)) {
+                        res.draw_rec = cores[drec_p].primary; // SMT sibling left idle
+                    }
                     for (size_t i = 0; i < cores.size(); ++i) {
-                        if (cores[i].eff_class == max_eff && i != best_p) {
+                        if (cores[i].eff_class == max_eff && i != best_p && i != gcomm_p &&
+                            i != drec_p) {
                             res.game_workers |= cores[i].mask;
                         }
                     }
@@ -603,24 +669,53 @@ const Win32TopologyMasks& GetWin32Topology() {
                     res.game_workers = p_mask;
                 }
                 res.gpu = res.game_workers;
+                if (res.gpu_comm == 0) {
+                    res.gpu_comm = res.gpu;
+                }
+                if (res.draw_rec == 0) {
+                    res.draw_rec = res.gpu;
+                }
+                if (res.vk_recorder == 0) {
+                    res.vk_recorder = res.gpu;
+                }
                 res.helper = e_mask;
             } else {
                 // CASE 3: Single-L3 Homogeneous CPU with >= 6 Physical Cores
                 // (e.g. Ryzen 5 5600X/7600X, Ryzen 7 5800X3D/7800X3D/9800X3D, Intel 6c/8c).
-                // Core 0 primary -> Main game thread (SMT sibling idle); all remaining cores -> Workers & GPU.
+                // Core 0 primary -> Main game thread; Core 1 -> GpuComm; Core 2 -> DrawRec (>= 8 cores).
                 res.game_main = cores[0].primary;
-                for (size_t i = 1; i < cores.size(); ++i) {
+                size_t start_w = 1;
+                if (cores.size() >= 8) {
+                    res.gpu_comm = cores[1].primary;
+                    res.draw_rec = cores[2].primary;
+                    start_w = 3;
+                }
+                if (cores.size() >= 10) {
+                    res.vk_recorder = cores[3].primary;
+                    start_w = 4;
+                }
+                for (size_t i = start_w; i < cores.size(); ++i) {
                     res.game_workers |= cores[i].mask;
                 }
                 res.gpu = res.game_workers;
+                if (res.gpu_comm == 0) {
+                    res.gpu_comm = res.gpu;
+                }
+                if (res.draw_rec == 0) {
+                    res.draw_rec = res.gpu;
+                }
+                if (res.vk_recorder == 0) {
+                    res.vk_recorder = res.gpu;
+                }
                 res.helper = res.game_workers;
             }
         }
 
         std::printf("GPU: Win32 thread topology: %zu physical cores across %zu L3 domains "
-                    "(main=%#llx, workers=%#llx, gpu=%#llx, helper=%#llx)\n",
+                    "(main=%#llx, gpu_comm=%#llx, workers=%#llx, gpu=%#llx, helper=%#llx)\n",
                     cores.size(), domains.size(),
                     static_cast<unsigned long long>(res.game_main),
+                    static_cast<unsigned long long>(res.gpu_comm),
                     static_cast<unsigned long long>(res.game_workers),
                     static_cast<unsigned long long>(res.gpu),
                     static_cast<unsigned long long>(res.helper));
@@ -662,8 +757,32 @@ void ApplyWin32ThreadTopologyByName(const char* name) {
         if (starts_with(name, "HavokWorker") || starts_with(name, "GXRenderThread")) {
             boost = true;
         }
-    } else if (std::strcmp(name, "bb:GpuComm") == 0 ||
-               std::strcmp(name, "bb:DrawRec") == 0 ||
+    } else if (std::strcmp(name, "bb:GpuComm") == 0) {
+        DWORD expected = 0;
+        const DWORD self_tid = GetCurrentThreadId();
+        g_gpu_comm_thread_id.compare_exchange_strong(expected, self_tid, std::memory_order_relaxed);
+        mask = (g_gpu_comm_thread_id.load(std::memory_order_relaxed) == self_tid && topo.gpu_comm != 0)
+                   ? topo.gpu_comm
+                   : topo.gpu;
+        boost = true;
+    } else if (std::strcmp(name, "bb:DrawRec") == 0) {
+        DWORD expected = 0;
+        const DWORD self_tid = GetCurrentThreadId();
+        g_draw_rec_thread_id.compare_exchange_strong(expected, self_tid, std::memory_order_relaxed);
+        mask = (g_draw_rec_thread_id.load(std::memory_order_relaxed) == self_tid && topo.draw_rec != 0)
+                   ? topo.draw_rec
+                   : topo.gpu;
+        boost = true;
+    } else if (std::strcmp(name, "bb:VkRecorder") == 0) {
+        DWORD expected = 0;
+        const DWORD self_tid = GetCurrentThreadId();
+        g_vk_recorder_thread_id.compare_exchange_strong(expected, self_tid, std::memory_order_relaxed);
+        mask = (g_vk_recorder_thread_id.load(std::memory_order_relaxed) == self_tid && topo.vk_recorder != 0)
+                   ? topo.vk_recorder
+                   : topo.gpu;
+        boost = true;
+    } else if (starts_with(name, "bb:Resolve") ||
+               std::strcmp(name, "bb:TexBind") == 0 ||
                starts_with(name, "bb:VkRecorder") ||
                std::strcmp(name, "bb:Present") == 0) {
         mask = topo.gpu;
@@ -827,6 +946,39 @@ void bb_win32_background_thread(void) {
 void bb_win32_critical_thread(int level) {
     SetThreadPriority(GetCurrentThread(),
                       level >= 2 ? THREAD_PRIORITY_HIGHEST : THREAD_PRIORITY_ABOVE_NORMAL);
+}
+
+void bb_win32_pin_gpu_comm_core(void) {
+    const auto& topo = GetWin32Topology();
+    const DWORD self_tid = GetCurrentThreadId();
+    g_gpu_comm_thread_id.store(self_tid, std::memory_order_relaxed);
+    const DWORD_PTR m = topo.gpu_comm != 0 ? topo.gpu_comm : topo.gpu;
+    if (m != 0) {
+        SetThreadAffinityMask(GetCurrentThread(), m);
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    }
+}
+
+void bb_win32_pin_draw_rec_core(void) {
+    const auto& topo = GetWin32Topology();
+    const DWORD self_tid = GetCurrentThreadId();
+    g_draw_rec_thread_id.store(self_tid, std::memory_order_relaxed);
+    const DWORD_PTR m = topo.draw_rec != 0 ? topo.draw_rec : topo.gpu;
+    if (m != 0) {
+        SetThreadAffinityMask(GetCurrentThread(), m);
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    }
+}
+
+void bb_win32_pin_vk_recorder_core(void) {
+    const auto& topo = GetWin32Topology();
+    const DWORD self_tid = GetCurrentThreadId();
+    g_vk_recorder_thread_id.store(self_tid, std::memory_order_relaxed);
+    const DWORD_PTR m = topo.vk_recorder != 0 ? topo.vk_recorder : topo.gpu;
+    if (m != 0) {
+        SetThreadAffinityMask(GetCurrentThread(), m);
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    }
 }
 
 void bb_win32_pin_gpu_domain(void) {

@@ -235,6 +235,19 @@ struct RegDirty {
     // Uconfig [0xC038, 0xC040) (bit 114), and Uconfig [0xC240, 0xC258) (bits 115..117) = 118 bits.
     static constexpr u32 StageBChunkWords = 8;
     static constexpr u32 StageBNumChunks = 118;
+    // Stage B 8-dword chunks that contain ZERO dynamic-state registers:
+    // - mask[0] bits 50..63: [0xA190, 0xA200) = ps_inputs, vs_output_config, ps_input_ena/addr,
+    //   num_interp, barycentric_control, shader_pos/z/col_format, blend_control[0..7],
+    //   index_base_address, draw_initiator
+    // - mask[1] bit 19 (chunk 83): [0xA298, 0xA2A0) = index_size, max_index_size, index_buffer_type
+    // - mask[1] bits 21..26 (chunks 85..90): [0xA2A8, 0xA2D8) = step_rate, ring_itemsize,
+    //   gs_max_vert_out, stage_enable, ls_hs_config, vgt_gs_vert_itemsize[0]
+    // - mask[1] bits 35..49 (chunks 99..113): [0xA318, 0xA390) = color_buffers[0..7]
+    // - mask[1] bit 52 (chunk 116): [0xC248, 0xC250) = num_indices, num_instances
+    static constexpr u64 kStageBDynIgnoreMask0 = (((1ULL << 14u) - 1ULL) << 50u);
+    static constexpr u64 kStageBDynIgnoreMask1 =
+        (1ULL << (83u - 64u)) | (((1ULL << 6u) - 1ULL) << (85u - 64u)) |
+        (((1ULL << 15u) - 1ULL) << (99u - 64u)) | (1ULL << (116u - 64u));
 
     std::bitset<NumBlocks> blocks;
     u64 stage_b_mask[2]{};

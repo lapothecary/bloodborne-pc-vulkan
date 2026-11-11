@@ -134,6 +134,7 @@ bool GpuProfiler::TryCollectHudSlice(u32 s) {
         if (res == vk::Result::eSuccess) {
             double busy_ns = 0.0;
             double gap_ns = 0.0;
+            double inter_gap_ns = 0.0;
             std::array<double, BbStats::GpuCat_Count> cat_ns{};
             std::array<double, BbStats::GpuSub_Count> subcat_ns{};
             u64 cursor = stamps[0];
@@ -141,7 +142,7 @@ bool GpuProfiler::TryCollectHudSlice(u32 s) {
                 if (stamps[0] > hud_prev_end_stamp) {
                     const double cross_ns = double(stamps[0] - hud_prev_end_stamp) * period_ns;
                     if (cross_ns < 2e8) {
-                        gap_ns += cross_ns;
+                        inter_gap_ns += cross_ns;
                     }
                 } else {
                     cursor = hud_prev_end_stamp;
@@ -169,6 +170,8 @@ bool GpuProfiler::TryCollectHudSlice(u32 s) {
             hud_has_prev_end = true;
             BbStats::hw_gpu_busy_ns.fetch_add(static_cast<u64>(busy_ns), std::memory_order_relaxed);
             BbStats::hw_gpu_gap_ns.fetch_add(static_cast<u64>(gap_ns), std::memory_order_relaxed);
+            BbStats::hw_gpu_inter_gap_ns.fetch_add(static_cast<u64>(inter_gap_ns),
+                                                   std::memory_order_relaxed);
             for (u32 c = 0; c < BbStats::GpuCat_Count; ++c) {
                 if (cat_ns[c] > 0.0) {
                     BbStats::hw_gpu_cat_ns[c].fetch_add(static_cast<u64>(cat_ns[c]),

@@ -174,6 +174,7 @@ void ImageBlitter::Draw(vk::Pipeline pipeline, vk::ImageView source_view, u32 wi
     }
     cmd.draw(3, 1, 0, 0);
     scheduler.EndRendering();
+    scheduler.BumpDescriptorStateEpoch();
     scheduler.GetDynamicState().Invalidate();
 }
 

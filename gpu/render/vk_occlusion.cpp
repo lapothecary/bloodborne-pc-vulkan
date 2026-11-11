@@ -197,6 +197,7 @@ void OcclusionQueries::Resolve() {
         stream.Copy(scales.data(), scales_size, instance.StorageMinAlignment());
     const bool clear_total = !total_cleared;
     total_cleared = true;
+    scheduler.BumpDescriptorStateEpoch();
     scheduler.Record([this, first, count, num_events, clear_total, stream = stream.Handle(),
                       entries_offset, entries_size, scales_offset, scales_size](vk::CommandBuffer cmdbuf) {
         if (clear_total) {

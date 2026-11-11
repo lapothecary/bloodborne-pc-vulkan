@@ -604,29 +604,21 @@ void Rasterizer::ResolveVertexBuffers(const GraphicsPipeline* pipeline,
             : nullptr;
     StageBVertexMemoEntry* memo_hit_slot = nullptr;
     StageBVertexMemoEntry* memo_fill_slot = nullptr;
-    if (ready) {
-        attributes.assign(ready->attributes, ready->attributes + ready->count);
-        bindings.assign(ready->bindings, ready->bindings + ready->count);
-        guest_buffers.assign(ready->buffers, ready->buffers + ready->count);
-        if (BbCeStats::Enabled() && packet_vsharps.size() == ready->count) {
-            static u64 compared = 0, differed = 0;
-            ++compared;
-            differed += std::memcmp(ready->buffers, packet_vsharps.data(),
-                                    ready->count * sizeof(Gcn::Buffer)) != 0;
-            if ((compared & 0xFFFF) == 0) {
-                std::printf("CE stats: prepared V#s differed from the packet's in %llu of %llu "
-                            "draws\n",
-                            (unsigned long long)differed, (unsigned long long)compared);
-            }
-        }
-    } else if (instance.IsVertexInputDynamicState() && fetch && !packet_vsharps.empty() &&
-               packet_vsharps.size() == fetch->attributes.size() && packet_vsharps.size() <= 16 &&
-               !FrameCapture::Active() && !BbCeStats::Enabled()) {
+    const bool ce_stats = BbCeStats::Enabled();
+    const std::span<const Gcn::Buffer> memo_vsharps =
+        (ready && ready->count > 0 && ready->count <= 16 && !ce_stats)
+            ? std::span<const Gcn::Buffer>{ready->buffers, ready->count}
+            : ((instance.IsVertexInputDynamicState() && fetch && !packet_vsharps.empty() &&
+                packet_vsharps.size() == fetch->attributes.size() && packet_vsharps.size() <= 16 &&
+                !FrameCapture::Active() && !ce_stats)
+                   ? packet_vsharps
+                   : std::span<const Gcn::Buffer>{});
+    if (!memo_vsharps.empty()) {
         if (!stage_b_vertex_memo) [[unlikely]] {
             stage_b_vertex_memo = std::make_unique<
                 std::array<StageBVertexMemoEntry, StageBVertexMemoEntry::TableSize>>();
         }
-        const u32 cnt = static_cast<u32>(packet_vsharps.size());
+        const u32 cnt = static_cast<u32>(memo_vsharps.size());
         const u32 step0 = regs.vgt_instance_step_rate_0;
         const u32 step1 = regs.vgt_instance_step_rate_1;
         const u32 cur_frame = BbStats::frame_number.load(std::memory_order_relaxed);
@@ -636,7 +628,9 @@ void Rasterizer::ResolveVertexBuffers(const GraphicsPipeline* pipeline,
                          (u64(step0) * 0x9E3779B97F4A7C15ULL) ^
                          (u64(step1) * 0xBF58476D1CE4E5B9ULL);
         const u64 vsharp_hash =
-            XXH3_64bits(packet_vsharps.data(), cnt * sizeof(Gcn::Buffer));
+            (ready && ready->buffers_hash != 0)
+                ? ready->buffers_hash
+                : XXH3_64bits(memo_vsharps.data(), cnt * sizeof(Gcn::Buffer));
         const u64 memo_key = (vsharp_hash ^ seed) | 1ULL;
         const size_t set_base =
             ((memo_key >> 1) & (StageBVertexMemoEntry::NumSets - 1)) *
@@ -648,7 +642,7 @@ void Rasterizer::ResolveVertexBuffers(const GraphicsPipeline* pipeline,
                 (!cand.has_transient_cue || cand.frame_number == cur_frame) &&
                 cand.pipeline == pipeline && cand.step_rate_0 == step0 &&
                 cand.step_rate_1 == step1 && cand.count == cnt &&
-                std::memcmp(cand.vsharps.data(), packet_vsharps.data(),
+                std::memcmp(cand.vsharps.data(), memo_vsharps.data(),
                             cnt * sizeof(Gcn::Buffer)) == 0) {
                 cand.last_use = ++stage_b_vertex_memo_clock;
                 attributes.assign(cand.attributes.begin(), cand.attributes.begin() + cnt);
@@ -685,8 +679,14 @@ void Rasterizer::ResolveVertexBuffers(const GraphicsPipeline* pipeline,
             }
         }
         if (!memo_hit_slot) {
-            pipeline->GetVertexInputs(attributes, bindings, divisors, guest_buffers, step0, step1,
-                                      packet_vsharps);
+            if (ready) {
+                attributes.assign(ready->attributes, ready->attributes + ready->count);
+                bindings.assign(ready->bindings, ready->bindings + ready->count);
+                guest_buffers.assign(ready->buffers, ready->buffers + ready->count);
+            } else {
+                pipeline->GetVertexInputs(attributes, bindings, divisors, guest_buffers, step0,
+                                          step1, memo_vsharps);
+            }
             if (attributes.size() == cnt && bindings.size() == cnt && guest_buffers.size() == cnt) {
                 auto& w0 = (*stage_b_vertex_memo)[set_base];
                 auto& w1 = (*stage_b_vertex_memo)[set_base + 1];
@@ -696,11 +696,11 @@ void Rasterizer::ResolveVertexBuffers(const GraphicsPipeline* pipeline,
                 VideoCore::DirectBuffers::GetTransientCueHeapBounds(cue_base, cue_end);
                 bool any_cue = false;
                 for (u32 i = 0; i < cnt; ++i) {
-                    const VAddr b_addr = packet_vsharps[i].base_address;
+                    const VAddr b_addr = memo_vsharps[i].base_address;
                     if (b_addr != 0 &&
                         ((b_addr >= cue_base && b_addr < cue_end) ||
                          VideoCore::DirectBuffers::IsTransientCueHeap(
-                             b_addr, packet_vsharps[i].GetSize()))) {
+                             b_addr, memo_vsharps[i].GetSize()))) {
                         any_cue = true;
                         break;
                     }
@@ -717,11 +717,26 @@ void Rasterizer::ResolveVertexBuffers(const GraphicsPipeline* pipeline,
                 slot.step_rate_1 = step1;
                 slot.count = cnt;
                 slot.buffers_hash = vsharp_hash;
-                std::memcpy(slot.vsharps.data(), packet_vsharps.data(), cnt * sizeof(Gcn::Buffer));
+                std::memcpy(slot.vsharps.data(), memo_vsharps.data(), cnt * sizeof(Gcn::Buffer));
                 std::copy_n(attributes.begin(), cnt, slot.attributes.begin());
                 std::copy_n(bindings.begin(), cnt, slot.bindings.begin());
                 slot.num_ranges = 0;
                 memo_fill_slot = &slot;
+            }
+        }
+    } else if (ready) {
+        attributes.assign(ready->attributes, ready->attributes + ready->count);
+        bindings.assign(ready->bindings, ready->bindings + ready->count);
+        guest_buffers.assign(ready->buffers, ready->buffers + ready->count);
+        if (ce_stats && packet_vsharps.size() == ready->count) {
+            static u64 compared = 0, differed = 0;
+            ++compared;
+            differed += std::memcmp(ready->buffers, packet_vsharps.data(),
+                                    ready->count * sizeof(Gcn::Buffer)) != 0;
+            if ((compared & 0xFFFF) == 0) {
+                std::printf("CE stats: prepared V#s differed from the packet's in %llu of %llu "
+                            "draws\n",
+                            (unsigned long long)differed, (unsigned long long)compared);
             }
         }
     } else {
@@ -783,6 +798,28 @@ void Rasterizer::ResolveVertexBuffers(const GraphicsPipeline* pipeline,
     if (ready) {
         for (u32 i = 0; i < ready->num_ranges; ++i) {
             ranges.push_back({ready->ranges[i].base, ready->ranges[i].end});
+        }
+        if (memo_fill_slot && ranges.size() <= memo_fill_slot->ranges.size()) {
+            memo_fill_slot->num_ranges = static_cast<u32>(ranges.size());
+            for (u32 i = 0; i < memo_fill_slot->num_ranges; ++i) {
+                memo_fill_slot->ranges[i] = {ranges[i].begin, ranges[i].end};
+                u64 min_span = 1;
+                for (const auto& b : guest_buffers) {
+                    if (b.base_address >= ranges[i].begin && b.base_address < ranges[i].end) {
+                        min_span = std::max<u64>(
+                            min_span, (b.base_address - ranges[i].begin) +
+                                          std::max<u64>(1, b.GetStride()));
+                    }
+                }
+                memo_fill_slot->range_min_spans[i] = min_span;
+            }
+            u32 swm = 0;
+            for (const auto& buffer : guest_buffers) {
+                if (buffer.base_address != 0 && buffer.GetSize() > 0) {
+                    memo_fill_slot->range_indices[swm] = ready->range_index[swm];
+                    ++swm;
+                }
+            }
         }
     } else if (memo_hit_slot) {
         for (u32 i = 0; i < memo_hit_slot->num_ranges; ++i) {

@@ -14,6 +14,8 @@
 #include <atomic>
 #include <immintrin.h>
 
+#include "gx_motion_activity.h"
+
 namespace Bloodborne::SceneRenderer {
 
 // ----------------------------------------------------------------------------
@@ -379,6 +381,8 @@ void sub_21c8c50(void* self, const float* bone_matrices,
                         const __m128i sign_lo1  = _mm_set_epi32(0, 0, static_cast<int>(0x80000000u), 0);
                         const __m128  sign_hi1  = _mm_castsi128_ps(_mm_set_epi32(static_cast<int>(0x80000000u), 0, 0, 0));
                         const __m128  c_0001    = _mm_load_ps(kSimd0001_4920ca0);
+                        const __m128  abs_mask  = _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF));
+                        __m128 max_bone_diff    = _mm_setzero_ps();
 
                         for (int32_t i = 0; i < static_cast<int32_t>(bone_count); ++i) {
                             // Load 3x4 previous matrix rows (xmm7, xmm1, xmm4) and invert 3x4 -> multiply by cur_ptr
@@ -489,6 +493,13 @@ void sub_21c8c50(void* self, const float* bone_matrices,
                             __m128 c0 = _mm_loadu_ps(cur_ptr - 8);
                             __m128 c1 = _mm_loadu_ps(cur_ptr - 4);
                             __m128 c2 = _mm_loadu_ps(cur_ptr);
+                            max_bone_diff = _mm_max_ps(
+                                max_bone_diff,
+                                _mm_max_ps(
+                                    _mm_and_ps(_mm_sub_ps(c0, _mm_loadu_ps(prv_ptr - 8)), abs_mask),
+                                    _mm_max_ps(
+                                        _mm_and_ps(_mm_sub_ps(c1, _mm_loadu_ps(prv_ptr - 4)), abs_mask),
+                                        _mm_and_ps(_mm_sub_ps(c2, _mm_loadu_ps(prv_ptr)), abs_mask))));
 
                             auto mul_row = [&](const __m128& row) -> __m128 {
                                 __m128 x = _mm_castsi128_ps(_mm_shuffle_epi32(_mm_castps_si128(row), 0x00));
@@ -507,6 +518,15 @@ void sub_21c8c50(void* self, const float* bone_matrices,
                             dst_ptr += 12;
                             cur_ptr += 12;
                             prv_ptr += 12;
+                        }
+
+                        alignas(16) float diff_lanes[4];
+                        _mm_store_ps(diff_lanes, max_bone_diff);
+                        const float m01 = (diff_lanes[0] > diff_lanes[1]) ? diff_lanes[0] : diff_lanes[1];
+                        const float m23 = (diff_lanes[2] > diff_lanes[3]) ? diff_lanes[2] : diff_lanes[3];
+                        const float max_delta = (m01 > m23) ? m01 : m23;
+                        if (max_delta > gx_direct_vk::kObjectVelocityBoneDeltaThreshold) {
+                            gx_direct_vk::NoteActiveObjectVelocity();
                         }
                     }
 

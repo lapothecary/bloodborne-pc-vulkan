@@ -1040,6 +1040,7 @@ void TemporalUpscaler::ExtraSharpen(vk::Image target, bool ldr, u32 w, u32 h) {
                       vk::PipelineStageFlagBits2::eComputeShader,
                       vk::AccessFlagBits2::eShaderStorageWrite, all, rw);
     });
+    scheduler.BumpDescriptorStateEpoch();
 }
 
 void TemporalUpscaler::OnBlendedSceneDraw() {
@@ -1221,14 +1222,20 @@ bool TemporalUpscaler::RecordReactive(vk::ImageView color_view) {
         };
         cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_read});
     });
+    scheduler.BumpDescriptorStateEpoch();
     return true;
 }
 
 void TemporalUpscaler::Run() {
     GpuProfiler::HudMarkPass(&scheduler, BbStats::GpuSub_Aa_Upscaler);
     if (auto* profiler = GpuProfiler::Get()) {
-        const char* label = BbSettings::EffectiveUpscaler() == BbSettings::UpscalerTaa
-            ? "upscaler Run (TAA)" : "upscaler Run (FSR)";
+        const auto eff = BbSettings::EffectiveUpscaler();
+        const char* label =
+            eff == BbSettings::UpscalerDlss     ? "upscaler Run (DLSS/DLAA)"
+            : eff == BbSettings::UpscalerFsr411 ? "upscaler Run (FSR 4.1.1)"
+            : eff == BbSettings::UpscalerFsr4   ? "upscaler Run (FSR 4)"
+            : eff == BbSettings::UpscalerTaa    ? "upscaler Run (TAA/SMAA)"
+                                                : "upscaler Run (FSR 3.1)";
         profiler->Mark(0xF5A0'0000ull ^ std::hash<std::string_view>{}(label),
                        [label] { return std::string{label}; });
     }
@@ -1484,6 +1491,7 @@ void TemporalUpscaler::Run() {
                              sizeof(mode), &mode);
         cmdbuf.dispatch((ow + 7) / 8, (oh + 7) / 8, 1);
     }
+    scheduler.BumpDescriptorStateEpoch();
 }
 
 vk::ImageView TemporalUpscaler::CachedView(const VideoCore::Image& image, vk::Format format,
@@ -2009,8 +2017,13 @@ void TemporalUpscaler::EnsureLiveInputResources(u32 w, u32 h, vk::Format color_f
 void TemporalUpscaler::RunScaled() {
     GpuProfiler::HudMarkPass(&scheduler, BbStats::GpuSub_Aa_Upscaler);
     if (auto* profiler = GpuProfiler::Get()) {
-        const char* label = BbSettings::EffectiveUpscaler() == BbSettings::UpscalerTaa
-            ? "upscaler RunScaled (TAA)" : "upscaler RunScaled (FSR)";
+        const auto eff = BbSettings::EffectiveUpscaler();
+        const char* label =
+            eff == BbSettings::UpscalerDlss     ? "upscaler RunScaled (DLSS/DLAA)"
+            : eff == BbSettings::UpscalerFsr411 ? "upscaler RunScaled (FSR 4.1.1)"
+            : eff == BbSettings::UpscalerFsr4   ? "upscaler RunScaled (FSR 4)"
+            : eff == BbSettings::UpscalerTaa    ? "upscaler RunScaled (TAA/SMAA)"
+                                                : "upscaler RunScaled (FSR 3.1)";
         profiler->Mark(0xF5A0'0000ull ^ std::hash<std::string_view>{}(label),
                        [label] { return std::string{label}; });
     }
@@ -2457,6 +2470,7 @@ void TemporalUpscaler::RunScaled() {
         CaptureFrameGenScene(depth_image, depth_format, w, h, ow, oh, frame_ms, frame_reset);
     }
     done_this_frame = true; // the UI is not jittered
+    scheduler.BumpDescriptorStateEpoch();
     if (ok) {
         ui_phase = true;
         hudless_taken = false;

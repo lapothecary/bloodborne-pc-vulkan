@@ -106,12 +106,9 @@ public:
         // Single StoreLoad barrier pairing with sleeping/resolvers_sleeping seq_cst stores instead
         // of 4 separate `memory_order_seq_cst` XCHG instructions per draw packet.
         std::atomic_thread_fence(std::memory_order_seq_cst);
-        if (has_resolvers && resolvers_sleeping.load(std::memory_order_relaxed)) [[unlikely]] {
-            const u64 backlog_pkts = packets - consumed_packets.load(std::memory_order_relaxed);
-            if (!resolve ? false : (backlog_pkts <= 4 || (packets & 15u) == 0)) {
-                resolve_wake.fetch_add(1, std::memory_order_release);
-                resolve_wake.notify_all();
-            }
+        if (has_resolvers && resolve && resolvers_sleeping.load(std::memory_order_relaxed)) [[unlikely]] {
+            resolve_wake.fetch_add(1, std::memory_order_release);
+            resolve_wake.notify_all();
         }
         if (sleeping.load(std::memory_order_relaxed)) [[unlikely]] {
             wake.fetch_add(1, std::memory_order_release);
@@ -307,7 +304,7 @@ private:
 
     void Run(std::stop_token stop) {
         Common::SetCurrentThreadName("bb:DrawRec");
-        BbThreads::PinToGpuDomain();
+        BbThreads::PinToDrawRecCore();
         on_stage_b = true;
         BbSections::recording_thread = true;
         stage_b_tid.store(static_cast<u32>(gettid()), std::memory_order_release);
@@ -319,12 +316,15 @@ private:
             if (available == at) {
                 BbTimeline::Note(BbTimeline::RecorderIdleBegin);
                 // With few hardware threads (Steam Deck: 8) a long spin takes time from the
-                // game's own threads. BB_PIPE_SPIN_US overrides.
+                // game's own threads; on >= 16 threads Stage B has an isolated physical core
+                // inside CCD1, so 150 us keeps it awake across intra-frame pass transitions
+                // while sleeping cleanly during the 2+ ms inter-frame wait. BB_PIPE_SPIN_US overrides.
                 static const auto spin_time = std::chrono::microseconds([] {
                     if (const char* env = std::getenv("BB_PIPE_SPIN_US")) {
                         return std::max(0, std::atoi(env));
                     }
-                    return BbThreads::Available() >= 12 ? 25 : 15;
+                    const u32 cpus = BbThreads::Available();
+                    return cpus >= 16 ? 150 : (cpus >= 12 ? 35 : 15);
                 }());
                 const auto spin_until = std::chrono::steady_clock::now() + spin_time;
                 for (u32 spins = 1; available == at; ++spins) {
@@ -386,12 +386,12 @@ private:
         char name[16];
         std::snprintf(name, sizeof(name), "bb:Resolve%u", worker);
         Common::SetCurrentThreadName(name);
-        BbThreads::PinToHelperDomain();
+        BbThreads::PinToGpuDomain();
         static const int spin_us = [] {
             if (const char* env = std::getenv("BB_RESOLVE_SPIN_US")) {
                 return std::max(0, std::atoi(env));
             }
-            return 0;
+            return BbThreads::Available() >= 12 ? 100 : 20;
         }();
         static const auto spin_time = std::chrono::microseconds(spin_us);
         const bool single_worker = (num_resolvers == 1);

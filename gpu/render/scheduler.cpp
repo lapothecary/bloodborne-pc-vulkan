@@ -185,7 +185,6 @@ void Scheduler::BeginRendering(const RenderState& state, u8 color_dont_care_mask
     CarrySuspend(false);
     GpuProfiler::HudOnBeginRendering(this);
     is_rendering = true;
-    ++descriptor_state_epoch;
     render_state = state;
     for (u32 i = 0; i < render_state.num_color_attachments; ++i) {
         render_state.color_attachments[i].is_clear = 0;
@@ -291,7 +290,6 @@ void Scheduler::EndRendering() {
     }
     CarrySuspend(true);
     is_rendering = false;
-    ++descriptor_state_epoch;
     Record([](vk::CommandBuffer cmdbuf) { cmdbuf.endRendering(); });
     CarryResume(false);
     if (has_end_rendering_work) {
@@ -793,12 +791,13 @@ void Scheduler::RecorderThread(std::stop_token stoken, u32 index) {
     BbThreads::gpu_side_helper = true; // the submissions go out from here (ordered tasks)
     if (index == 0) {
         Common::SetCurrentThreadName("bb:VkRecorder");
+        BbThreads::PinToVkRecorderCore(); // dedicated physical core in CCD1 sharing L3 with bb:GpuComm
     } else {
         char name[16];
         std::snprintf(name, sizeof(name), "bb:VkRecorder%u", index);
         Common::SetCurrentThreadName(name);
+        BbThreads::PinToGpuDomain(); // with the draw recording thread whose chunks it records
     }
-    BbThreads::PinToGpuDomain(); // with the draw recording thread whose chunks it records
     Worker& worker = *workers[index];
     std::vector<std::unique_ptr<RecordChunk>> ordered;
     std::vector<std::unique_ptr<RecordChunk>> local_chunks;

@@ -15,8 +15,19 @@
 namespace Vulkan {
 
 namespace {
-thread_local u32 tls_draws_in_frame = 0;
-thread_local bool tls_mid_frame_flushed = false;
+std::atomic<u32> g_draws_in_frame{0};
+std::atomic<bool> g_mid_frame_flushed{false};
+std::atomic<u64> g_frame_first_draw_ns{0};
+u64 tls_avg_decode_ns = 0;
+u64 tls_avg_gpu_busy_ns = 0;
+u64 tls_prev_hw_busy_ns = 0;
+u64 tls_prev_hw_frames = 0;
+
+inline u64 SteadyNowNs() noexcept {
+    return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count());
+}
 
 /// Block 10: Hardware Temporal Scene Occlusion Culler + Micro-Shadow Clutter Culler (Stage B).
 /// Tracks static/instanced opaque 6-MRT G-Buffer world meshes via non-precise hardware
@@ -1073,16 +1084,29 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     if (HasPendingHleCopies() && will_begin_pass) {
         FlushPendingHleCopies(*this);
     }
-    ++tls_draws_in_frame;
+    const u32 cur_draw_in_frame = g_draws_in_frame.fetch_add(1u, std::memory_order_relaxed) + 1u;
+    if (cur_draw_in_frame == 1u) {
+        g_frame_first_draw_ns.store(SteadyNowNs(), std::memory_order_relaxed);
+    }
+    static const bool mid_flush_env_forced = std::getenv("BB_MID_FLUSH_DRAWS") != nullptr;
     static const u32 mid_flush_draws = [] {
         if (const char* env = std::getenv("BB_MID_FLUSH_DRAWS")) {
             return static_cast<u32>(std::max(0, std::atoi(env)));
         }
-        return 1150u;
+        return 1350u;
     }();
-    if (!HonestLabels() && mid_flush_draws != 0 && !tls_mid_frame_flushed &&
-        tls_draws_in_frame >= mid_flush_draws && will_begin_pass) {
-        tls_mid_frame_flushed = true;
+    // Skip the mid-frame submission split when Stage A/B active decode/record is strictly the
+    // bottleneck (`tls_avg_decode_ns > tls_avg_gpu_busy_ns + 0.40 ms`), or when Stage B (`DrawPipe`)
+    // is already streaming `48 KiB` command buffer chunks continuously to `bb:VkRecorder` on its
+    // dedicated core: an extra mid-frame vkQueueSubmit + descriptor epoch reset only adds ~0.25 ms.
+    const bool cpu_decode_bound =
+        !mid_flush_env_forced &&
+        (DrawPipe::OnStageB() ||
+         (tls_avg_gpu_busy_ns > 0 && tls_avg_decode_ns > tls_avg_gpu_busy_ns + 400'000ULL));
+    if (!HonestLabels() && mid_flush_draws != 0 &&
+        !g_mid_frame_flushed.load(std::memory_order_relaxed) && !cpu_decode_bound &&
+        cur_draw_in_frame >= mid_flush_draws && will_begin_pass) {
+        g_mid_frame_flushed.store(true, std::memory_order_relaxed);
         GetSceneCuller().SealCurrentSlice(scheduler.CurrentTick());
         SubmitInfo info{};
         scheduler.Flush(info);
@@ -2807,6 +2831,31 @@ void Rasterizer::OnSubmit() {
     texture_cache.ProcessDownloadImages();
     texture_cache.RunGarbageCollector();
     runtime.TickFrame();
+    if (const u64 first_draw_ns = g_frame_first_draw_ns.exchange(0, std::memory_order_relaxed);
+        first_draw_ns != 0) {
+        const u64 now = SteadyNowNs();
+        if (now > first_draw_ns) {
+            const u64 dec_ns = std::min<u64>(now - first_draw_ns, 50'000'000ULL);
+            tls_avg_decode_ns = tls_avg_decode_ns == 0
+                                    ? dec_ns
+                                    : ((tls_avg_decode_ns * 7ULL + dec_ns) >> 3);
+        }
+    }
+    g_draws_in_frame.store(0, std::memory_order_relaxed);
+    g_mid_frame_flushed.store(false, std::memory_order_relaxed);
+    const u64 cur_hw_frames = BbStats::hw_gpu_frames.load(std::memory_order_relaxed);
+    if (cur_hw_frames > tls_prev_hw_frames) {
+        const u64 cur_hw_busy = BbStats::hw_gpu_busy_ns.load(std::memory_order_relaxed);
+        const u64 df = cur_hw_frames - tls_prev_hw_frames;
+        if (cur_hw_busy >= tls_prev_hw_busy_ns && df <= 256ULL) {
+            const u64 sample_busy = (cur_hw_busy - tls_prev_hw_busy_ns) / df;
+            tls_avg_gpu_busy_ns = tls_avg_gpu_busy_ns == 0
+                                      ? sample_busy
+                                      : ((tls_avg_gpu_busy_ns * 7ULL + sample_busy) >> 3);
+        }
+        tls_prev_hw_frames = cur_hw_frames;
+        tls_prev_hw_busy_ns = cur_hw_busy;
+    }
 }
 
 namespace {
@@ -2975,8 +3024,9 @@ void Rasterizer::MarkPass(const GraphicsPipeline* pipeline, const RenderState& s
 }
 
 void Rasterizer::NoteFrameStart() {
-    tls_draws_in_frame = 0;
-    tls_mid_frame_flushed = false;
+    g_draws_in_frame.store(0, std::memory_order_relaxed);
+    g_mid_frame_flushed.store(false, std::memory_order_relaxed);
+    g_frame_first_draw_ns.store(0, std::memory_order_relaxed);
     GetSceneCuller().OnFrameStart(instance, scheduler, camera_motion.get());
     InvalidateGdsMirror();
     if (HasPendingHleCopies()) {

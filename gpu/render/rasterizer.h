@@ -508,6 +508,8 @@ private:
     mutable std::array<float, 2> last_dyn_jitter{};
     mutable bool last_dyn_is_indexed = false;
     mutable bool last_dyn_feedback_loop = false;
+    mutable bool last_dyn_from_stage_b = false;
+    u64 pipe_dyn_reg_epoch = 1;
     u64 begin_memo_hits = 0, begin_memo_misses = 0;
     static constexpr u64 kGdsSliceBytes = 256;
     std::array<VAddr, 16> gds_dword_mirror{};
@@ -945,6 +947,32 @@ private:
     Gcn::CbDbExtent pipe_db_extent{};
     std::array<u16, Gcn::NUM_COLOR_BUFFERS> pipe_cb_uid{};
     u16 pipe_db_uid = 0;
+    // Stage 7: FIFO packet compression caches between Stage A (`PostDraw`) and Stage B
+    // (`RunDrawPacket`), separated onto distinct cache lines and stored on `Rasterizer` (0 bytes PT_TLS).
+    static constexpr u32 kMaxCachedStageWords = 256;
+    struct PipeRtMeta {
+        std::array<Gcn::CbDbExtent, Gcn::NUM_COLOR_BUFFERS> cb_extent{};
+        Gcn::CbDbExtent db_extent{};
+        std::array<u16, Gcn::NUM_COLOR_BUFFERS> cb_uid{};
+        u16 db_uid = 0;
+        u16 uid_pad = 0;
+    };
+    static_assert(sizeof(PipeRtMeta) == 56);
+    struct StageAUdMemo {
+        const Shader::Info* info = nullptr;
+        VAddr pgm_base = 0;
+        u32 ud_size = 0;
+        u32 flat_size = 0;
+        std::array<u32, kMaxCachedStageWords> words{};
+    };
+    alignas(64) std::array<StageAUdMemo, Shader::MaxStageTypes> stage_a_ud_memo{};
+    std::array<Gcn::Buffer, Shader::NUM_BUFFERS> stage_a_last_vsharps{};
+    u32 stage_a_last_num_vsharps = ~0u;
+    PipeRtMeta stage_a_last_rt_meta{};
+    bool stage_a_rt_meta_valid = false;
+    alignas(64) std::array<std::array<u32, kMaxCachedStageWords>, Shader::MaxStageTypes>
+        stage_b_ud_cache{};
+    std::array<Gcn::Buffer, Shader::NUM_BUFFERS> stage_b_last_vsharps{};
     /// Stage A: small read-only guest buffers copied into the constant ring for a packet.
     struct RingBinding {
         u32 index;  ///< buffer resource of the stage

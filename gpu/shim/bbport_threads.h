@@ -7,6 +7,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -21,22 +22,43 @@
 
 namespace BbThreads {
 
+#ifndef _WIN32
+/// Captures the OS/taskset/container process-wide CPU affinity mask once at DSO load time, BEFORE
+/// ApplyProcessThreadTopology() pins MOMainThread to a single dedicated core. Without this,
+/// calling sched_getaffinity(0, ...) from MOMainThread (or child threads spawned from it) after
+/// topology pinning erroneously reported 1 hardware thread instead of 32.
+inline const cpu_set_t& InitialProcessMask() {
+    static const cpu_set_t mask = [] {
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        if (sched_getaffinity(0, sizeof(set), &set) == 0 && CPU_COUNT(&set) > 0) {
+            return set;
+        }
+        const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
+        CPU_ZERO(&set);
+        for (unsigned c = 0; c < hw && c < CPU_SETSIZE; ++c) {
+            CPU_SET(static_cast<int>(c), &set);
+        }
+        return set;
+    }();
+    return mask;
+}
+#endif
+
 /// Hardware threads the OS lets this process run on (respects taskset / containers).
 inline unsigned Available() {
 #ifdef _WIN32
     return bb_win32_available_cpus();
 #else
-    cpu_set_t set;
-    CPU_ZERO(&set);
-    if (sched_getaffinity(0, sizeof(set), &set) == 0) {
-        const int n = CPU_COUNT(&set);
-        if (n > 0) {
-            return static_cast<unsigned>(n);
-        }
-    }
-    return std::max(1u, std::thread::hardware_concurrency());
+    static const unsigned count =
+        static_cast<unsigned>(std::max(1, CPU_COUNT(&InitialProcessMask())));
+    return count;
 #endif
 }
+
+#ifndef _WIN32
+inline const unsigned kPrimeInitialProcessMask = Available();
+#endif
 
 /// The calling thread only runs on otherwise idle cores (falls back to the lowest nice level).
 inline void MakeBackground() {
@@ -70,13 +92,26 @@ inline void MakeLowPriority() {
 inline thread_local bool gpu_side_helper = false;
 
 #ifndef _WIN32
+inline std::atomic<int> g_gpu_comm_tid{0};
+inline std::atomic<int> g_draw_rec_tid{0};
+inline std::atomic<int> g_vk_recorder_tid{0};
+
 struct TopologyMasks {
-    cpu_set_t game_main;    // MOMainThread (dedicated top physical core when >= 6 phys cores)
+    cpu_set_t game_main;    // MOMainThread (dedicated #1 physical core in CCD0 when >= 6 phys cores)
+    cpu_set_t gpu_comm;     // bb:GpuComm / Stage A (dedicated #1 physical core in CCD1, sharing L3 with DrawRec & VkRecorder)
+    cpu_set_t draw_rec;     // bb:DrawRec / Stage B (dedicated #2 physical core in CCD1, sharing L3 with GpuComm & VkRecorder)
+    cpu_set_t vk_recorder;  // bb:VkRecorder (dedicated #3 physical core in CCD1, sharing L3 with GpuComm & DrawRec)
     cpu_set_t game_workers; // HavokWorker*, CSChrThread*, CSClothThread*, SpCloth*, GXRender*, GXWorker*
-    cpu_set_t gpu;          // bb:GpuComm (Stage A), bb:DrawRec (Stage B), bb:VkRecorder*, bb:Present
-    cpu_set_t helper;       // bb:Resolve*, bb:Copy*, bb:DrawScan, EzWorkPool*, Core.Res.*, FMOD*
+    cpu_set_t gpu;          // bb:Resolve*, bb:TexBind, bb:VkRecorder1+, bb:Present, driver helper threads
+    cpu_set_t helper;       // bb:Copy*, bb:DrawScan, EzWorkPool*, Core.Res.*, FMOD*, NGX/CUDA/SDL helpers
     int best_main_cpu = -1;
     int best_main_sibling = -1;
+    int best_gpu_comm_cpu = -1;
+    int best_gpu_comm_sibling = -1;
+    int best_draw_rec_cpu = -1;
+    int best_draw_rec_sibling = -1;
+    int best_vk_rec_cpu = -1;
+    int best_vk_rec_sibling = -1;
     bool enabled = false;
 };
 
@@ -142,6 +177,9 @@ inline const TopologyMasks& GetTopology() {
     static const TopologyMasks topo = [] {
         TopologyMasks none{};
         CPU_ZERO(&none.game_main);
+        CPU_ZERO(&none.gpu_comm);
+        CPU_ZERO(&none.draw_rec);
+        CPU_ZERO(&none.vk_recorder);
         CPU_ZERO(&none.game_workers);
         CPU_ZERO(&none.gpu);
         CPU_ZERO(&none.helper);
@@ -153,9 +191,8 @@ inline const TopologyMasks& GetTopology() {
             return none;
         }
 
-        cpu_set_t allowed;
-        CPU_ZERO(&allowed);
-        if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0 || CPU_COUNT(&allowed) <= 1) {
+        const cpu_set_t allowed = InitialProcessMask();
+        if (CPU_COUNT(&allowed) <= 1) {
             return none;
         }
 
@@ -365,9 +402,7 @@ inline const TopologyMasks& GetTopology() {
             if (domains[game_dom].phys_cores >= 6 && result.best_main_cpu >= 0) {
                 CPU_ZERO(&result.game_main);
                 CPU_SET(result.best_main_cpu, &result.game_main);
-                // Isolate MOMainThread's physical core (and its SMT sibling) from workers,
-                // while keeping all remaining physical + SMT threads in game_workers (14 threads
-                // on 8-core CCD0) so 5 Havok + 1 GXRender + 5 GXWorker (11 threads) never wait in a runqueue.
+                // Isolate MOMainThread's physical core (and its SMT sibling) from workers.
                 for (int s = 0; s < 256; ++s) {
                     if (CPU_ISSET(s, &cpus[result.best_main_cpu].siblings)) {
                         CPU_CLR(s, &result.game_workers);
@@ -376,8 +411,68 @@ inline const TopologyMasks& GetTopology() {
             } else {
                 result.game_main = game_pool;
             }
+
             result.gpu = gpu_pool;
             result.helper = gpu_pool;
+
+            if (domains[gpu_dom].phys_cores >= 4) {
+                // Multi-CCD Ryzen / Threadripper (e.g. 5900X/5950X/7900X/7950X/7950X3D/9900X/9950X/9950X3D):
+                // Co-locate `bb:GpuComm` (Stage A), `bb:DrawRec` (Stage B), and `bb:VkRecorder`
+                // inside the EXACT SAME CCD1 32 MB L3 domain (~10 ns L3 cache-to-cache handoff,
+                // zero ~85 ns CCD0<->CCD1 Infinity Fabric SPSC ping-pong across ~1,800 draws/frame),
+                // while carving THREE separate physical cores (SMT siblings idle) so Stage A,
+                // Stage B, and VkRecorder never contend on ALU/L1/L2!
+                pick_best_core(result.gpu, &result.best_gpu_comm_cpu, &result.best_gpu_comm_sibling);
+                if (result.best_gpu_comm_cpu >= 0) {
+                    CPU_ZERO(&result.gpu_comm);
+                    CPU_SET(result.best_gpu_comm_cpu, &result.gpu_comm);
+                    for (int s = 0; s < 256; ++s) {
+                        if (CPU_ISSET(s, &cpus[result.best_gpu_comm_cpu].siblings)) {
+                            CPU_CLR(s, &result.gpu);
+                            CPU_CLR(s, &result.helper);
+                        }
+                    }
+                } else {
+                    result.gpu_comm = result.gpu;
+                }
+
+                if (domains[gpu_dom].phys_cores >= 6) {
+                    pick_best_core(result.gpu, &result.best_draw_rec_cpu, &result.best_draw_rec_sibling);
+                    if (result.best_draw_rec_cpu >= 0) {
+                        CPU_ZERO(&result.draw_rec);
+                        CPU_SET(result.best_draw_rec_cpu, &result.draw_rec);
+                        for (int s = 0; s < 256; ++s) {
+                            if (CPU_ISSET(s, &cpus[result.best_draw_rec_cpu].siblings)) {
+                                CPU_CLR(s, &result.gpu);
+                                CPU_CLR(s, &result.helper);
+                            }
+                        }
+                    } else {
+                        result.draw_rec = result.gpu;
+                    }
+
+                    pick_best_core(result.gpu, &result.best_vk_rec_cpu, &result.best_vk_rec_sibling);
+                    if (result.best_vk_rec_cpu >= 0) {
+                        CPU_ZERO(&result.vk_recorder);
+                        CPU_SET(result.best_vk_rec_cpu, &result.vk_recorder);
+                        for (int s = 0; s < 256; ++s) {
+                            if (CPU_ISSET(s, &cpus[result.best_vk_rec_cpu].siblings)) {
+                                CPU_CLR(s, &result.gpu);
+                                CPU_CLR(s, &result.helper);
+                            }
+                        }
+                    } else {
+                        result.vk_recorder = result.gpu;
+                    }
+                } else {
+                    result.draw_rec = result.gpu;
+                    result.vk_recorder = result.gpu;
+                }
+            } else {
+                result.gpu_comm = result.gpu;
+                result.draw_rec = result.gpu;
+                result.vk_recorder = result.gpu;
+            }
         } else {
             // Single L3 domain: check if Hybrid P-Core + E-Core (Intel 12th-15th Gen) or
             // Homogeneous (Ryzen 5/7, 5800X3D/7800X3D/9800X3D, Intel 6c/8c, Steam Deck).
@@ -411,8 +506,9 @@ inline const TopologyMasks& GetTopology() {
                 // =============================================================================
                 // CASE 2: Single-L3 Hybrid P-Core + E-Core CPU (Intel 12th-15th Gen).
                 // - MOMainThread gets the #1 P-core (isolated from its SMT sibling when >=6P).
-                // - Havok/CSChr/GX workers + Vulkan Stage A/B stay strictly on P-cores so a
-                //   slow E-core never stalls a Havok physics barrier.
+                // - When >=8 P-cores (13700K/13900K/14700K/14900K), bb:GpuComm gets the #2 P-core
+                //   and bb:VkRecorder gets the #3 P-core (isolated from SMT siblings, same L3).
+                // - Havok/CSChr/GX workers + Vulkan helpers stay strictly on remaining P-cores.
                 // - Async helpers, file decompression, and FMOD audio run on E-cores.
                 // =============================================================================
                 pick_best_core(p_cores, &result.best_main_cpu, &result.best_main_sibling);
@@ -428,15 +524,66 @@ inline const TopologyMasks& GetTopology() {
                 } else {
                     result.game_main = p_cores;
                 }
+                if (p_phys_cores >= 8) {
+                    pick_best_core(result.game_workers, &result.best_gpu_comm_cpu,
+                                   &result.best_gpu_comm_sibling);
+                    if (result.best_gpu_comm_cpu >= 0) {
+                        CPU_ZERO(&result.gpu_comm);
+                        CPU_SET(result.best_gpu_comm_cpu, &result.gpu_comm);
+                        for (int s = 0; s < 256; ++s) {
+                            if (CPU_ISSET(s, &cpus[result.best_gpu_comm_cpu].siblings)) {
+                                CPU_CLR(s, &result.game_workers);
+                            }
+                        }
+                    } else {
+                        result.gpu_comm = result.game_workers;
+                    }
+                    pick_best_core(result.game_workers, &result.best_draw_rec_cpu,
+                                   &result.best_draw_rec_sibling);
+                    if (result.best_draw_rec_cpu >= 0) {
+                        CPU_ZERO(&result.draw_rec);
+                        CPU_SET(result.best_draw_rec_cpu, &result.draw_rec);
+                        for (int s = 0; s < 256; ++s) {
+                            if (CPU_ISSET(s, &cpus[result.best_draw_rec_cpu].siblings)) {
+                                CPU_CLR(s, &result.game_workers);
+                            }
+                        }
+                    } else {
+                        result.draw_rec = result.game_workers;
+                    }
+                    if (p_phys_cores >= 10) {
+                        pick_best_core(result.game_workers, &result.best_vk_rec_cpu,
+                                       &result.best_vk_rec_sibling);
+                        if (result.best_vk_rec_cpu >= 0) {
+                            CPU_ZERO(&result.vk_recorder);
+                            CPU_SET(result.best_vk_rec_cpu, &result.vk_recorder);
+                            for (int s = 0; s < 256; ++s) {
+                                if (CPU_ISSET(s, &cpus[result.best_vk_rec_cpu].siblings)) {
+                                    CPU_CLR(s, &result.game_workers);
+                                }
+                            }
+                        } else {
+                            result.vk_recorder = result.game_workers;
+                        }
+                    } else {
+                        result.vk_recorder = result.game_workers;
+                    }
+                } else {
+                    result.gpu_comm = result.game_workers;
+                    result.draw_rec = result.game_workers;
+                    result.vk_recorder = result.game_workers;
+                }
                 result.gpu = result.game_workers;
                 result.helper = e_cores;
             } else if (total_phys_cores >= 6) {
                 // =============================================================================
                 // CASE 3: Single-L3 Homogeneous CPU with >= 6 Physical Cores
                 // (e.g. Ryzen 5 5600X/7600X, Ryzen 7 5800X3D/7800X3D/9800X3D, Intel 6c/8c).
-                // - MOMainThread gets a dedicated top physical core (with its SMT sibling
-                //   excluded from all worker/GPU masks to prevent SMT contention).
-                // - All remaining physical cores run Havok/CSChr/GX workers and Vulkan threads.
+                // - MOMainThread gets #1 physical core (SMT sibling idle).
+                // - When >= 8 physical cores (5800X3D/7800X3D/9800X3D), bb:GpuComm gets #2
+                //   physical core and bb:DrawRec gets #3 physical core (SMT siblings idle,
+                //   5 physical cores = 10 threads left for Havok/GX workers + VkRecorder).
+                // - When >= 10 physical cores, bb:VkRecorder also gets #4 physical core.
                 // =============================================================================
                 pick_best_core(allowed, &result.best_main_cpu, &result.best_main_sibling);
                 result.game_workers = allowed;
@@ -451,6 +598,54 @@ inline const TopologyMasks& GetTopology() {
                 } else {
                     result.game_main = allowed;
                 }
+                if (total_phys_cores >= 8) {
+                    pick_best_core(result.game_workers, &result.best_gpu_comm_cpu,
+                                   &result.best_gpu_comm_sibling);
+                    if (result.best_gpu_comm_cpu >= 0) {
+                        CPU_ZERO(&result.gpu_comm);
+                        CPU_SET(result.best_gpu_comm_cpu, &result.gpu_comm);
+                        for (int s = 0; s < 256; ++s) {
+                            if (CPU_ISSET(s, &cpus[result.best_gpu_comm_cpu].siblings)) {
+                                CPU_CLR(s, &result.game_workers);
+                            }
+                        }
+                    } else {
+                        result.gpu_comm = result.game_workers;
+                    }
+                    pick_best_core(result.game_workers, &result.best_draw_rec_cpu,
+                                   &result.best_draw_rec_sibling);
+                    if (result.best_draw_rec_cpu >= 0) {
+                        CPU_ZERO(&result.draw_rec);
+                        CPU_SET(result.best_draw_rec_cpu, &result.draw_rec);
+                        for (int s = 0; s < 256; ++s) {
+                            if (CPU_ISSET(s, &cpus[result.best_draw_rec_cpu].siblings)) {
+                                CPU_CLR(s, &result.game_workers);
+                            }
+                        }
+                    } else {
+                        result.draw_rec = result.game_workers;
+                    }
+                } else {
+                    result.gpu_comm = result.game_workers;
+                    result.draw_rec = result.game_workers;
+                }
+                if (total_phys_cores >= 10) {
+                    pick_best_core(result.game_workers, &result.best_vk_rec_cpu,
+                                   &result.best_vk_rec_sibling);
+                    if (result.best_vk_rec_cpu >= 0) {
+                        CPU_ZERO(&result.vk_recorder);
+                        CPU_SET(result.best_vk_rec_cpu, &result.vk_recorder);
+                        for (int s = 0; s < 256; ++s) {
+                            if (CPU_ISSET(s, &cpus[result.best_vk_rec_cpu].siblings)) {
+                                CPU_CLR(s, &result.game_workers);
+                            }
+                        }
+                    } else {
+                        result.vk_recorder = result.game_workers;
+                    }
+                } else {
+                    result.vk_recorder = result.game_workers;
+                }
                 result.gpu = result.game_workers;
                 result.helper = result.game_workers;
             } else {
@@ -460,22 +655,35 @@ inline const TopologyMasks& GetTopology() {
                 // =============================================================================
                 pick_best_core(allowed, &result.best_main_cpu, &result.best_main_sibling);
                 result.game_main = allowed;
+                result.gpu_comm = allowed;
+                result.draw_rec = allowed;
+                result.vk_recorder = allowed;
                 result.game_workers = allowed;
                 result.gpu = allowed;
                 result.helper = allowed;
             }
         }
 
-        char main_str[64], work_str[64], gpu_str[64], help_str[64];
+        char main_str[64], gcomm_str[64], drec_str[64], vkrec_str[64], work_str[64], gpu_str[64], help_str[64];
         FormatCpuList(result.game_main, main_str, sizeof(main_str));
+        FormatCpuList(result.gpu_comm, gcomm_str, sizeof(gcomm_str));
+        FormatCpuList(result.draw_rec, drec_str, sizeof(drec_str));
+        FormatCpuList(result.vk_recorder, vkrec_str, sizeof(vkrec_str));
         FormatCpuList(result.game_workers, work_str, sizeof(work_str));
         FormatCpuList(result.gpu, gpu_str, sizeof(gpu_str));
         FormatCpuList(result.helper, help_str, sizeof(help_str));
         std::printf("CPU Topology (%d L3 domain%s, %d phys cores): "
-                    "MOMainThread=[%s] (SMT sibling %d idle), "
+                    "MOMainThread=[%s] (SMT %d idle), "
+                    "GpuComm/StageA=[%s] (SMT %d idle), "
+                    "DrawRec/StageB=[%s] (SMT %d idle), "
+                    "VkRecorder=[%s] (SMT %d idle), "
                     "Game/Havok/GX=[%s], Vulkan RHI=[%s], Helpers/IO=[%s]\n",
                     domain_count, domain_count == 1 ? "" : "s", total_phys_cores,
-                    main_str, result.best_main_sibling, work_str, gpu_str, help_str);
+                    main_str, result.best_main_sibling,
+                    gcomm_str, result.best_gpu_comm_sibling,
+                    drec_str, result.best_draw_rec_sibling,
+                    vkrec_str, result.best_vk_rec_sibling,
+                    work_str, gpu_str, help_str);
         std::fflush(stdout);
         return result;
     }();
@@ -486,7 +694,43 @@ inline const TopologyMasks& GetL3Domains() {
     return GetTopology();
 }
 
-/// Pins the calling host Vulkan pipeline thread (bb:GpuComm, bb:DrawRec, bb:VkRecorder*, bb:Present)
+/// Pins the single Stage A DirectVk command processor thread (bb:GpuComm) to its dedicated
+/// isolated physical core in CCD1 (sharing L3 with bb:VkRecorder) and records its exact Linux TID
+/// so any child threads spawned by the Vulkan ICD get migrated off its core onto `topo.gpu`.
+inline void PinToGpuCommCore() {
+    g_gpu_comm_tid.store(int(::gettid()), std::memory_order_relaxed);
+    const auto& domain = GetTopology().gpu_comm;
+    if (CPU_COUNT(&domain) != 0) {
+        sched_setaffinity(0, sizeof(domain), &domain);
+        setpriority(PRIO_PROCESS, static_cast<id_t>(::gettid()), -2);
+    }
+}
+
+/// Pins the Stage B draw recording thread (bb:DrawRec) to its own dedicated isolated physical core
+/// in the exact same CCD1 L3 domain as bb:GpuComm and bb:VkRecorder (SMT sibling idle), and records
+/// its TID so any child driver threads spawned during Stage B calls migrate onto `topo.gpu`.
+inline void PinToDrawRecCore() {
+    g_draw_rec_tid.store(int(::gettid()), std::memory_order_relaxed);
+    const auto& domain = GetTopology().draw_rec;
+    if (CPU_COUNT(&domain) != 0) {
+        sched_setaffinity(0, sizeof(domain), &domain);
+        setpriority(PRIO_PROCESS, static_cast<id_t>(::gettid()), -2);
+    }
+}
+
+/// Pins the primary Vulkan command buffer recording + submission thread (bb:VkRecorder) to its own
+/// dedicated physical core in the same CCD1 L3 domain as bb:GpuComm (SMT sibling idle), and records
+/// its TID so lazy Vulkan ICD driver threads spawned during vkQueueSubmit migrate onto `topo.gpu`.
+inline void PinToVkRecorderCore() {
+    g_vk_recorder_tid.store(int(::gettid()), std::memory_order_relaxed);
+    const auto& domain = GetTopology().vk_recorder;
+    if (CPU_COUNT(&domain) != 0) {
+        sched_setaffinity(0, sizeof(domain), &domain);
+        setpriority(PRIO_PROCESS, static_cast<id_t>(::gettid()), -2);
+    }
+}
+
+/// Pins secondary host Vulkan pipeline threads (bb:DrawRec, bb:VkRecorder*, bb:Present)
 /// to the GPU domain (CCD1 on Multi-CCD Ryzen; P-cores on Intel Hybrid; non-MOMainThread cores on Single-CCD).
 inline void PinToGpuDomain() {
     const auto& domain = GetTopology().gpu;
@@ -563,9 +807,23 @@ inline void ApplyProcessThreadTopology() {
             }
         }
         const bool is_main_tid = (tid == main_pid);
-        // Wait until non-main guest threads set their real pthread name (not the initial process name).
+        // Wait until non-main guest threads set their real pthread name (not the initial process name),
+        // while immediately evacuating any unnamed host/driver/NGX child threads that inherited a
+        // 1-core isolated mask from MOMainThread, bb:GpuComm, or bb:VkRecorder onto `topo.helper`.
         if (!is_main_tid && (comm[0] == '\0' || std::strcmp(comm, "bb-probe") == 0 ||
                              std::strcmp(comm, "probe") == 0)) {
+            if (CPU_COUNT(&topo.helper) > 0) {
+                cpu_set_t cur_mask;
+                CPU_ZERO(&cur_mask);
+                if (sched_getaffinity(tid, sizeof(cur_mask), &cur_mask) == 0 &&
+                    CPU_COUNT(&cur_mask) <= 1 &&
+                    ((CPU_COUNT(&topo.game_main) > 0 && CPU_EQUAL(&cur_mask, &topo.game_main)) ||
+                     (CPU_COUNT(&topo.gpu_comm) > 0 && CPU_EQUAL(&cur_mask, &topo.gpu_comm)) ||
+                     (CPU_COUNT(&topo.draw_rec) > 0 && CPU_EQUAL(&cur_mask, &topo.draw_rec)) ||
+                     (CPU_COUNT(&topo.vk_recorder) > 0 && CPU_EQUAL(&cur_mask, &topo.vk_recorder)))) {
+                    sched_setaffinity(tid, sizeof(cpu_set_t), &topo.helper);
+                }
+            }
             continue;
         }
 
@@ -582,9 +840,21 @@ inline void ApplyProcessThreadTopology() {
 
         const cpu_set_t* target_mask = nullptr;
         bool boost_prio = false;
+        const int gpu_comm_tid = g_gpu_comm_tid.load(std::memory_order_relaxed);
+        const int draw_rec_tid = g_draw_rec_tid.load(std::memory_order_relaxed);
+        const int vk_rec_tid = g_vk_recorder_tid.load(std::memory_order_relaxed);
 
         if (is_main_tid) {
             target_mask = &topo.game_main;
+            boost_prio = true;
+        } else if (gpu_comm_tid > 0 && tid == gpu_comm_tid) {
+            target_mask = &topo.gpu_comm;
+            boost_prio = true;
+        } else if (draw_rec_tid > 0 && tid == draw_rec_tid) {
+            target_mask = &topo.draw_rec;
+            boost_prio = true;
+        } else if (vk_rec_tid > 0 && tid == vk_rec_tid) {
+            target_mask = &topo.vk_recorder;
             boost_prio = true;
         } else if (starts_with(comm, "HavokWorker") ||
                    starts_with(comm, "CSChrThread") ||
@@ -601,8 +871,17 @@ inline void ApplyProcessThreadTopology() {
             }
         } else if (std::strcmp(comm, "bb:GpuComm") == 0 ||
                    std::strcmp(comm, "bb:DrawRec") == 0 ||
+                   starts_with(comm, "bb:Resolve") ||
+                   std::strcmp(comm, "bb:TexBind") == 0 ||
                    starts_with(comm, "bb:VkRecorder") ||
-                   std::strcmp(comm, "bb:Present") == 0) {
+                   std::strcmp(comm, "bb:Present") == 0 ||
+                   starts_with(comm, "[vkps]") ||
+                   starts_with(comm, "vk_") ||
+                   starts_with(comm, "nvidia") ||
+                   starts_with(comm, "radv") ||
+                   starts_with(comm, "amdgpu")) {
+            // Note: any child driver thread spawned from bb:GpuComm/bb:DrawRec inherits comm
+            // with tid != owner_tid, and is immediately migrated onto topo.gpu!
             target_mask = &topo.gpu;
         } else if (starts_with(comm, "bb:") ||
                    starts_with(comm, "bb-probe:") ||
@@ -629,6 +908,10 @@ inline void ApplyProcessThreadTopology() {
                    starts_with(comm, "FaceGen") ||
                    starts_with(comm, "KatanaMain")) {
             target_mask = &topo.helper;
+        } else {
+            // Keep any third-party host threads (SDL audio, PipeWire/PulseAudio, NGX/CUDA workers)
+            // off the isolated single-core lanes (MOMainThread, GpuComm, VkRecorder).
+            target_mask = &topo.helper;
         }
 
         if (!target_mask || CPU_COUNT(target_mask) == 0) {
@@ -654,6 +937,9 @@ inline void ApplyProcessThreadTopology() {
     ::closedir(dir);
 }
 #else
+inline void PinToGpuCommCore() { bb_win32_pin_gpu_comm_core(); }
+inline void PinToDrawRecCore() { bb_win32_pin_draw_rec_core(); }
+inline void PinToVkRecorderCore() { bb_win32_pin_vk_recorder_core(); }
 inline void PinToGpuDomain() { bb_win32_pin_gpu_domain(); }
 inline void PinToHelperDomain() { bb_win32_pin_helper_domain(); }
 inline void ApplyProcessThreadTopology() { bb_win32_apply_thread_topology(); }

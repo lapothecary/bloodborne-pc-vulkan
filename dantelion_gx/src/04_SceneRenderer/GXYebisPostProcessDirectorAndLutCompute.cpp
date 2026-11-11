@@ -14,6 +14,7 @@
 #include <immintrin.h>
 
 #include "gx_direct_vulkan.h"
+#include "gx_motion_activity.h"
 
 namespace {
 
@@ -2545,7 +2546,8 @@ void sub_21d5f80(void* self, void* renderCmdCtx, void* filterParam) {
         const int32_t mbType = ((resetFlags & 2u) != 0u)
                                    ? 1
                                    : *reinterpret_cast<const int32_t*>(param + 0x1e0);
-        const bool hasObjVel = (mbType == 2) && (velWrap != nullptr);
+        const bool objMoved  = gx_direct_vk::ConsumeActiveObjectVelocity();
+        const bool hasObjVel = (mbType == 2) && (velWrap != nullptr) && objMoved;
         const bool camMoved  = (maxCamDelta > f0_0001) || hasObjVel;
         const bool mbAllowed = gx_direct_vk::IsEffectEnabled(gx_direct_vk::kEffectMotionBlur) &&
                                (*reinterpret_cast<const int32_t*>(param + 0x1dc) != 0) &&
@@ -2572,7 +2574,8 @@ void sub_21d5f80(void* self, void* renderCmdCtx, void* filterParam) {
 
         sub_bb2800(ppfxCtx, *reinterpret_cast<const float*>(param + 0x004));
 
-        if (*reinterpret_cast<const int32_t*>(param + 0x1dc) != 0 &&
+        if (mbAllowed &&
+            *reinterpret_cast<const int32_t*>(param + 0x1dc) != 0 &&
             *reinterpret_cast<const int32_t*>(param + 0x1e0) == 2 &&
             velWrap != nullptr)
         {

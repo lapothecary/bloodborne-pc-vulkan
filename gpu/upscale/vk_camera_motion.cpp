@@ -286,6 +286,7 @@ void CameraMotion::RecordMotion(vk::ImageView depth_view, vk::ImageView motion_v
         cmdbuf.pushConstants(layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
         cmdbuf.dispatch((width + 7) / 8, (height + 7) / 8, 1);
     });
+    scheduler.BumpDescriptorStateEpoch();
 }
 
 void CameraMotion::OnConstants(const float* data) {
@@ -543,6 +544,7 @@ void CameraMotion::Overlay(VideoCore::ImageId frame) {
     };
     cmdbuf.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &frame_barrier});
     cmdbuf.dispatch((color.info.size.width + 7) / 8, (color.info.size.height + 7) / 8, 1);
+    scheduler.BumpDescriptorStateEpoch();
 
     scheduler.DeferOperation([device, depth_view, color_view] {
         device.destroyImageView(depth_view);
