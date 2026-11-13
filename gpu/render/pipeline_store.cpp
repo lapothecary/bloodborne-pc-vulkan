@@ -36,6 +36,9 @@ std::string MetaName(u64 perm_hash) {
 }
 
 std::string BinaryName(u64 pgm_hash, size_t perm_idx) {
+    if (Shader::Backend::SPIRV::IsSpvPatchedLightAccPsHash(pgm_hash)) {
+        return fmt::format("ltb2_{:#018x}_{}", pgm_hash, perm_idx);
+    }
     return fmt::format("{:#018x}_{}", pgm_hash, perm_idx);
 }
 
@@ -43,16 +46,20 @@ std::string OptBinaryName(u64 pgm_hash, size_t perm_idx) {
     const bool hw_interp = Shader::Backend::SPIRV::HwInterpEnabled();
     const bool fast_fp = Shader::Backend::SPIRV::FastFpEnabled();
     const bool native_sh = Shader::Backend::SPIRV::NativeShadersEnabled();
+    const bool ltb_patched = Shader::Backend::SPIRV::IsSpvPatchedLightAccPsHash(pgm_hash);
     const char* prefix = "opt1";
     if (hw_interp) {
         if (fast_fp) {
-            prefix = native_sh ? ((pgm_hash == 0x0000000024042a9bULL) ? "opt32" : "opt31")
-                               : "opt6_nonat";
+            prefix = native_sh
+                         ? ((pgm_hash == 0x0000000024042a9bULL || ltb_patched) ? "opt32" : "opt31")
+                         : (ltb_patched ? "opt6_ltb2" : "opt6_nonat");
         } else {
-            prefix = "opt3_strict";
+            prefix = ltb_patched ? "opt3_ltb2" : "opt3_strict";
         }
     } else if (fast_fp) {
-        prefix = "opt2_r2";
+        prefix = ltb_patched ? "opt2_ltb2" : "opt2_r2";
+    } else if (ltb_patched) {
+        prefix = "opt1_ltb2";
     }
     return fmt::format("{}_{:#018x}_{}", prefix, pgm_hash, perm_idx);
 }

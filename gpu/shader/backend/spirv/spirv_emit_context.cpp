@@ -15,6 +15,7 @@
 #include "shader/ir/attribute.h"
 #include "shader/ir/microinstruction.h"
 #include "shader/runtime_info.h"
+#include "shader/backend/spirv/native_shaders.h"
 #include "shader/backend/spirv/spirv_emit_context.h"
 
 namespace Shader::Backend::SPIRV {
@@ -236,9 +237,12 @@ Id EmitContext::GetBufferSize(const u32 sharp_idx) {
 /// The byte offset of each guest buffer below the host's alignment (bound aligned down), from
 /// the push data.
 void EmitContext::DefineBufferProperties() {
-    if (!profile.needs_buffer_offsets) {
+    const bool patch_ltb_ps =
+        hw_stage == HwStage::Fragment && IsSpvPatchedLightAccPsHash(info.pgm_hash);
+    if (!profile.needs_buffer_offsets && !patch_ltb_ps) {
         return;
     }
+    u32 guest_buf_ordinal = 0u;
     for (u32 i = 0; i < buffers.size(); i++) {
         auto& buffer = buffers[i];
         const auto& desc = info.buffers[i];
@@ -246,16 +250,138 @@ void EmitContext::DefineBufferProperties() {
         if (buffer.buffer_type != BufferType::Guest) {
             continue;
         }
+        const u32 cur_guest_ord = guest_buf_ordinal++;
 
-        const u32 half = PushData::BufOffsetIndex + (binding >> 4);
-        const u32 comp = (binding & 0xf) >> 2;
-        const u32 offset = (binding & 0x3) << 3;
-        const Id ptr{OpAccessChain(TypePointer(spv::StorageClass::PushConstant, U32[1]),
-                                   push_data_block, ConstU32(half), ConstU32(comp))};
-        const Id value{OpLoad(U32[1], ptr)};
+        Id buf_offset = u32_zero_value;
+        if (profile.needs_buffer_offsets) {
+            const u32 half = PushData::BufOffsetIndex + (binding >> 4);
+            const u32 comp = (binding & 0xf) >> 2;
+            const u32 offset = (binding & 0x3) << 3;
+            const Id ptr{OpAccessChain(TypePointer(spv::StorageClass::PushConstant, U32[1]),
+                                       push_data_block, ConstU32(half), ConstU32(comp))};
+            const Id value{OpLoad(U32[1], ptr)};
+            buf_offset = OpBitFieldUExtract(U32[1], value, ConstU32(offset), ConstU32(8U));
+            Name(buf_offset, fmt::format("buf{}_off", binding));
+        }
 
-        const Id buf_offset{OpBitFieldUExtract(U32[1], value, ConstU32(offset), ConstU32(8U))};
-        Name(buf_offset, fmt::format("buf{}_off", binding));
+        // Stage 8 (`LightTileBatcher`): per-tile `[z_bounds_min, z_bounds_max]` early-demote and
+        // `cbLightAccLightParam` (`guest_ord == 1`) byte-offset rebase from `fs_in_attr1.z`.
+        if (patch_ltb_ps && cur_guest_ord == 1u && !buffer.paged) {
+            const auto& in1 = input_params[1];
+            const auto u32_alias = buffer.Alias(PointerType::U32);
+            if (!in1.is_integer && Sirit::ValidId(in1.id) && in1.num_components >= 3u &&
+                Sirit::ValidId(u32_alias.id) && !images.empty() && !samplers.empty() &&
+                !images[0].is_storage && images[0].view_type == ::Gcn::ImageType::Color2D) {
+                const auto load_in1_comp = [&](u32 comp) -> Id {
+                    if (!in1.is_array) {
+                        return OpLoad(F32[1],
+                                      OpAccessChain(in1.pointer_type, in1.id, ConstU32(comp)));
+                    }
+                    const auto load_vtx = [&](u32 vtx) -> Id {
+                        if (in1.is_loaded) {
+                            return OpCompositeExtract(F32[1], in1.id_array[vtx], comp);
+                        }
+                        return OpLoad(F32[1], OpAccessChain(in1.pointer_type, in1.id, ConstU32(vtx),
+                                                            ConstU32(comp)));
+                    };
+                    const Id p0 = load_vtx(0u);
+                    const Id p1 = load_vtx(1u);
+                    const Id p2 = load_vtx(2u);
+                    if (Sirit::ValidId(bary_coord) || Sirit::ValidId(bary_coord_nopersp)) {
+                        const Id bary_var =
+                            Sirit::ValidId(bary_coord) ? bary_coord : bary_coord_nopersp;
+                        const Id bi =
+                            OpLoad(F32[1], OpAccessChain(input_f32, bary_var, ConstU32(1u)));
+                        const Id bj =
+                            OpLoad(F32[1], OpAccessChain(input_f32, bary_var, ConstU32(2u)));
+                        const Id t1 = OpFma(F32[1], OpFSub(F32[1], p1, p0), bi, p0);
+                        return OpFma(F32[1], OpFSub(F32[1], p2, p0), bj, t1);
+                    }
+                    if (Sirit::ValidId(bary_coord_smooth)) {
+                        const Id bi = OpLoad(
+                            F32[1], OpAccessChain(input_f32, bary_coord_smooth, ConstU32(0u)));
+                        const Id bj = OpLoad(
+                            F32[1], OpAccessChain(input_f32, bary_coord_smooth, ConstU32(1u)));
+                        const Id t1 = OpFma(F32[1], OpFSub(F32[1], p1, p0), bi, p0);
+                        return OpFma(F32[1], OpFSub(F32[1], p2, p0), bj, t1);
+                    }
+                    return p0;
+                };
+                const Id uv_x = load_in1_comp(0u);
+                const Id uv_y = load_in1_comp(1u);
+                const Id tile_tag = load_in1_comp(2u);
+                const Id clamped_tag = OpFMax(F32[1], tile_tag, f32_zero_value);
+                const Id tile_v4 = OpConvertFToU(
+                    U32[1], OpFAdd(F32[1], clamped_tag, Constant(F32[1], 0.5f)));
+                const Id is_batched = OpUGreaterThan(U1[1], tile_v4, u32_zero_value);
+
+                const Id entry_lbl = last_label;
+                const Id batched_lbl = OpLabel();
+                const Id cull_lbl = OpLabel();
+                const Id keep_lbl = OpLabel();
+                const Id merge_lbl = OpLabel();
+
+                OpSelectionMerge(merge_lbl, spv::SelectionControlMask::MaskNone);
+                OpBranchConditional(is_batched, batched_lbl, merge_lbl);
+
+                AddLabel(batched_lbl);
+                const Id tile_idx = OpISub(U32[1], tile_v4, u32_one_value);
+                const Id thdr_bytes =
+                    OpIAdd(U32[1], buf_offset, OpShiftLeftLogical(U32[1], tile_idx, ConstU32(4u)));
+                const Id thdr_dw = OpShiftRightLogical(U32[1], thdr_bytes, ConstU32(2u));
+                const Id z_min_u32 = OpLoad(
+                    U32[1], OpAccessChain(u32_alias.pointer_type, u32_alias.id, u32_zero_value,
+                                          thdr_dw));
+                const Id z_max_u32 = OpLoad(
+                    U32[1], OpAccessChain(u32_alias.pointer_type, u32_alias.id, u32_zero_value,
+                                          OpIAdd(U32[1], thdr_dw, u32_one_value)));
+                const Id z_min = OpBitcast(F32[1], z_min_u32);
+                const Id z_max = OpBitcast(F32[1], z_max_u32);
+
+                const auto& tex0 = images[0];
+                const Id img_val = OpLoad(tex0.image_type, tex0.id);
+                const Id smp_val = OpLoad(sampler_type, samplers[0]);
+                const Id sampled = OpSampledImage(tex0.sampled_type, img_val, smp_val);
+                const Id uv = OpCompositeConstruct(F32[2], uv_x, uv_y);
+                const Id depth_v4 =
+                    OpImageSampleExplicitLod(tex0.data_types->Get(4), sampled, uv,
+                                             spv::ImageOperandsMask::Lod, f32_zero_value);
+                const Id depth_c0 = OpCompositeExtract(tex0.data_types->Get(1), depth_v4, 0u);
+                const Id depth = tex0.is_integer ? OpBitcast(F32[1], depth_c0) : depth_c0;
+
+                const Id out_of_z = OpLogicalOr(U1[1], OpFOrdLessThan(U1[1], depth, z_min),
+                                                OpFOrdGreaterThan(U1[1], depth, z_max));
+                OpSelectionMerge(keep_lbl, spv::SelectionControlMask::MaskNone);
+                OpBranchConditional(out_of_z, cull_lbl, keep_lbl);
+
+                AddLabel(cull_lbl);
+                const Id one_f32 = Constant(F32[1], 1.0f);
+                for (u32 rt = 0; rt < IR::NumRenderTargets; ++rt) {
+                    const auto& fo = frag_outputs[rt];
+                    if (!Sirit::ValidId(fo.id) || fo.is_integer) {
+                        continue;
+                    }
+                    if (fo.num_components == 1u) {
+                        OpStore(fo.id, f32_zero_value);
+                    } else {
+                        for (u32 c = 0; c < fo.num_components; ++c) {
+                            OpStore(OpAccessChain(fo.pointer_type, fo.id, ConstU32(c)),
+                                    c == 3u ? one_f32 : f32_zero_value);
+                        }
+                    }
+                }
+                OpDemoteToHelperInvocationEXT();
+                OpReturn();
+
+                AddLabel(keep_lbl);
+                const Id tile_data_bytes = OpIAdd(U32[1], thdr_bytes, ConstU32(16u));
+                OpBranch(merge_lbl);
+
+                AddLabel(merge_lbl);
+                buf_offset = OpPhi(U32[1], buf_offset, entry_lbl, tile_data_bytes, keep_lbl);
+            }
+        }
+
         buffer.Offset(PointerSize::B8) = buf_offset;
 
         // The offset in the access's elements.
@@ -267,7 +393,7 @@ void EmitContext::DefineBufferProperties() {
             }
         };
         scaled(IR::Type::U16, 1U, PointerSize::B16, "word");
-        scaled(IR::Type::U32, 2U, PointerSize::B32, "dword");
+        scaled(IR::Type::U32 | IR::Type::F32, 2U, PointerSize::B32, "dword");
         scaled(IR::Type::U64, 3U, PointerSize::B64, "qword");
     }
 }
@@ -442,13 +568,18 @@ void EmitContext::DefineInputs() {
         // Emulated clip distances come as the last input (location 0, the others after it).
         const auto num_inputs = runtime_info.hw.fs.num_inputs - (has_clip_distance_inputs ? 1 : 0);
 
+        const bool patch_ltb_ps =
+            hw_stage == HwStage::Fragment && IsSpvPatchedLightAccPsHash(info.pgm_hash);
         for (s32 i = 0; i < num_inputs; i++) {
             const auto& input = runtime_info.hw.fs.inputs[i];
             if (input.IsDefault()) {
                 continue;
             }
             const IR::Attribute param = IR::Attribute::Param0 + i;
-            const u32 num_components = info.loads.NumComponents(param);
+            u32 num_components = info.loads.NumComponents(param);
+            if (patch_ltb_ps && i == 1) {
+                num_components = std::max(num_components, 4u);
+            }
             const auto [primary, auxiliary] = info.fs_interpolation[i];
             const Id type = F32[num_components];
             const Id attr_id = [&] {
@@ -855,6 +986,9 @@ EmitContext::BufferSpv EmitContext::DefineBuffer(bool is_written, bool is_cohere
 };
 
 void EmitContext::DefineBuffers() {
+    const bool patch_ltb_ps =
+        hw_stage == HwStage::Fragment && IsSpvPatchedLightAccPsHash(info.pgm_hash);
+    u32 guest_buf_ordinal = 0u;
     for (const auto& desc : info.buffers) {
         const auto buf_sharp = desc.GetSharp(info);
         // MTYPE 3: shared between invocations (and LDS lowered to a buffer).
@@ -868,6 +1002,8 @@ void EmitContext::DefineBuffers() {
         } else if (desc.buffer_type == BufferType::FaultBuffer) {
             fault_buffer_index = buffers.size();
         }
+        const bool force_ltb_u32 =
+            patch_ltb_ps && desc.buffer_type == BufferType::Guest && (guest_buf_ordinal++ == 1u);
 
         // One view per element type the shader uses.
         auto& spv_buffer = buffers.emplace_back(binding.buffer++, desc.buffer_type);
@@ -885,7 +1021,7 @@ void EmitContext::DefineBuffers() {
             spv_buffer.Alias(PointerType::U64) =
                 DefineBuffer(desc.is_written, is_coherent, 3, desc.buffer_type, U64);
         }
-        if (True(desc.used_types & IR::Type::U32)) {
+        if (True(desc.used_types & IR::Type::U32) || force_ltb_u32) {
             spv_buffer.Alias(PointerType::U32) =
                 DefineBuffer(desc.is_written, is_coherent, 2, desc.buffer_type, U32[1]);
         }

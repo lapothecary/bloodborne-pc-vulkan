@@ -22,4 +22,10 @@ namespace Shader::Backend::SPIRV {
 [[nodiscard]] bool TryReplaceWithNativeShader(u64 pgm_hash, const std::vector<u32>& ref_spv,
                                               std::vector<u32>& out_spv);
 
+/// Returns true for the 50 manifest-verified non-native local-light `Filter\GXLightAcc_*.ppo`
+/// shaders (`DSpotLightShadowed1..4`, `DPointLightShadowed3..4`, `DLineLight1..4`, `PointLight*`,
+/// `SpotLight*`, `LegacyPointLight*`) whose GCN->SPIR-V module receives the `LightTileBatcher`
+/// per-tile `[z_min, z_max]` + `cbLightAccLightParam` offset prologue in `spirv_emit_context.cpp`.
+[[nodiscard]] bool IsSpvPatchedLightAccPsHash(u64 pgm_hash) noexcept;
+
 } // namespace Shader::Backend::SPIRV

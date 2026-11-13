@@ -1307,8 +1307,10 @@ struct HudBreakdown {
     float bottleneck_ms = 0.0f;
     float avg_bottleneck_ms = 0.0f;
     int fps_cap_active = 0;
-    int bottleneck_kind = 0; // 0=gpu, 1=game cpu, 2=stage A, 3=stage B, 4=gnm serialized, 5=fps cap
+    int bottleneck_kind = 0; // 0=gpu, 1=game cpu, 2=stage A, 3=stage B, 4=gnm serialized, 5=fps cap, 6=ext vsync
 };
+
+std::atomic<const Vulkan::Instance*> g_vk_instance{nullptr};
 
 void PollGpuHwSensors(HudBreakdown& h) noexcept {
     struct NvmlUtil {
@@ -1376,18 +1378,12 @@ void PollGpuHwSensors(HudBreakdown& h) noexcept {
             fn_temp = reinterpret_cast<FnGetTemp>(dlsym(lib, "nvmlDeviceGetTemperature"));
             fn_util = reinterpret_cast<FnGetUtil>(dlsym(lib, "nvmlDeviceGetUtilizationRates"));
             fn_mem = reinterpret_cast<FnGetMem>(dlsym(lib, "nvmlDeviceGetMemoryInfo"));
+            // Note: `NvmlProcInfo` is the 24-byte `nvmlProcessInfo_v2_t` layout (`_v1` is 16 bytes
+            // and `_v3` is 32 bytes, which shifts `procs[1..n-1]` on multi-process Windows 11).
             fn_gfx_procs = reinterpret_cast<FnGetProcs>(
-                dlsym(lib, "nvmlDeviceGetGraphicsRunningProcesses_v3"));
-            if (!fn_gfx_procs) {
-                fn_gfx_procs = reinterpret_cast<FnGetProcs>(
-                    dlsym(lib, "nvmlDeviceGetGraphicsRunningProcesses_v2"));
-            }
+                dlsym(lib, "nvmlDeviceGetGraphicsRunningProcesses_v2"));
             fn_cmp_procs = reinterpret_cast<FnGetProcs>(
-                dlsym(lib, "nvmlDeviceGetComputeRunningProcesses_v3"));
-            if (!fn_cmp_procs) {
-                fn_cmp_procs = reinterpret_cast<FnGetProcs>(
-                    dlsym(lib, "nvmlDeviceGetComputeRunningProcesses_v2"));
-            }
+                dlsym(lib, "nvmlDeviceGetComputeRunningProcesses_v2"));
             if (fn_init && fn_dev && fn_init() == 0 && fn_dev(0, &nvml_dev) == 0 && nvml_dev) {
                 nvml_ok = true;
             }
@@ -1438,6 +1434,21 @@ void PollGpuHwSensors(HudBreakdown& h) noexcept {
         query_self_vram(fn_gfx_procs);
         query_self_vram(fn_cmp_procs);
         h.vram_proc_gb = proc_bytes > 0 ? float(double(proc_bytes) * kInvGiB) : 0.0f;
+#ifdef _WIN32
+        // On Windows WDDM, consumer GeForce drivers may return NVML_VALUE_NOT_AVAILABLE (~0ULL)
+        // for per-process `usedGpuMemory`; `VK_EXT_memory_budget` queries WDDM DXGI
+        // `IDXGIAdapter3::QueryVideoMemoryInfo` (`CurrentUsage` of this process) on the exact
+        // active `VkPhysicalDevice` (safe on Optimus multi-GPU laptops).
+        if (h.vram_proc_gb <= 0.01f) {
+            if (const auto* vk_inst = g_vk_instance.load(std::memory_order_acquire);
+                vk_inst && vk_inst->CanReportMemoryUsage()) {
+                const u64 usage_bytes = vk_inst->GetDeviceMemoryUsage();
+                if (usage_bytes > 0) {
+                    h.vram_proc_gb = float(double(usage_bytes) * kInvGiB);
+                }
+            }
+        }
+#endif
         return;
     }
 
@@ -1530,9 +1541,23 @@ void PollGpuHwSensors(HudBreakdown& h) noexcept {
             break;
         }
     }
-#else
-    (void)h;
 #endif
+
+    // Universal `VK_EXT_memory_budget` fallback (primary path for AMD Radeon / Intel Arc on
+    // Windows WDDM via DXGI `QueryVideoMemoryInfo`, and fallback on Linux iGPUs without sysfs VRAM):
+    if (h.vram_proc_gb <= 0.01f) {
+        if (const auto* vk_inst = g_vk_instance.load(std::memory_order_acquire);
+            vk_inst && vk_inst->CanReportMemoryUsage()) {
+            const u64 usage_bytes = vk_inst->GetDeviceMemoryUsage();
+            const u64 budget_bytes = vk_inst->GetDeviceMemoryBudgetNow();
+            if (usage_bytes > 0) {
+                h.vram_proc_gb = float(double(usage_bytes) * kInvGiB);
+            }
+            if (budget_bytes > 0 && h.vram_total_gb <= 0.01f) {
+                h.vram_total_gb = float(double(budget_bytes) * kInvGiB);
+            }
+        }
+    }
 }
 
 void UpdateHudBreakdown(HudBreakdown& h) {
@@ -2082,8 +2107,35 @@ void UpdateHudBreakdown(HudBreakdown& h) {
         }
         h.bottleneck_ru = h.bottleneck_en;
     } else {
-        if (h.gnm_wait_ms >= 1.50f && stage_a_work_ms < h.frame_ms * 0.78f &&
-            h.b_busy_pct < 78.0f && h.gpu_present_ms < 0.50f) {
+        const float max_unit_ms =
+            std::max({stage_b_work_ms, stage_a_work_ms, h.hw_gpu_busy_ms, game_cpu_bound_ms});
+        const bool ext_present_throttled =
+            h.hw_gpu_inter_gap_ms >= 1.25f &&
+            (h.frame_ms - max_unit_ms) >= std::max(1.25f, h.frame_ms * 0.14f) &&
+            (h.gpu_present_ms >= 1.00f || h.gnm_wait_ms >= 1.50f);
+        if (ext_present_throttled) {
+            h.bottleneck_kind = 6;
+            if (h.hw_gpu_busy_ms >= stage_b_work_ms && h.hw_gpu_busy_ms >= game_cpu_bound_ms &&
+                h.hw_gpu_busy_ms >= stage_a_work_ms) {
+                h.bottleneck_ms = h.hw_gpu_busy_ms;
+                h.avg_bottleneck_ms = h.avg_hw_gpu_busy_ms;
+                h.bottleneck_en = "External VSync / Present Cap (Max: GPU)";
+            } else if (game_cpu_bound_ms >= stage_b_work_ms &&
+                       game_cpu_bound_ms >= stage_a_work_ms) {
+                h.bottleneck_ms = game_cpu_bound_ms;
+                h.avg_bottleneck_ms = h.avg_game_cpu_work_ms;
+                h.bottleneck_en = "External VSync / Present Cap (Max: Game CPU)";
+            } else if (stage_b_work_ms >= stage_a_work_ms) {
+                h.bottleneck_ms = stage_b_work_ms;
+                h.avg_bottleneck_ms = h.avg_b_total_ms;
+                h.bottleneck_en = "External VSync / Present Cap (Max: Stage B)";
+            } else {
+                h.bottleneck_ms = stage_a_work_ms;
+                h.avg_bottleneck_ms = avg_stage_a_work_ms;
+                h.bottleneck_en = "External VSync / Present Cap (Max: Stage A)";
+            }
+        } else if (h.gnm_wait_ms >= 1.50f && stage_a_work_ms < h.frame_ms * 0.78f &&
+                   h.b_busy_pct < 78.0f && h.gpu_present_ms < 0.50f) {
             h.bottleneck_kind = 4;
             h.bottleneck_ms = h.gnm_wait_ms;
             h.avg_bottleneck_ms = h.avg_gnm_wait_ms;
@@ -2309,7 +2361,7 @@ void FpsCounter() {
         const ImVec4 gpu_col = h.gpu_power_w >= 220.0f ? ImVec4(1.0f, 0.68f, 0.42f, 1.0f)
                              : h.gpu_power_w >= 140.0f ? ImVec4(0.95f, 0.90f, 0.65f, 1.0f)
                                                        : ImVec4(0.62f, 0.92f, 0.75f, 1.0f);
-        if (h.vram_proc_gb > 0.01f && h.vram_used_gb > h.vram_proc_gb + 0.15f) {
+        if (h.vram_proc_gb > 0.01f && h.vram_used_gb > h.vram_proc_gb + 0.05f) {
             ImGui::TextColored(
                 gpu_col,
                 "GPU: %.0f W | %.0f%% Busy (Drv %d%%) | %d MHz | %d C | VRAM: %.2f GB (Sys %.1f)",
@@ -2322,6 +2374,10 @@ void FpsCounter() {
                 h.gpu_power_w, gpu_busy_pct, h.gpu_drv_util_pct, h.gpu_clock_mhz, h.gpu_temp_c,
                 h.vram_proc_gb > 0.01f ? h.vram_proc_gb : h.vram_used_gb);
         }
+    } else if (h.vram_proc_gb > 0.01f || h.vram_used_gb > 0.01f) {
+        ImGui::TextColored(ImVec4(0.62f, 0.92f, 0.75f, 1.0f),
+                           "GPU: %.0f%% Busy | VRAM: %.2f GB", gpu_busy_pct,
+                           h.vram_proc_gb > 0.01f ? h.vram_proc_gb : h.vram_used_gb);
     }
     const int fps_cap = h.fps_cap_active;
     char cap_buf[32];
@@ -2509,8 +2565,12 @@ void FpsCounter() {
         // CPU section (active work cleanly separated from FPS cap sleep / Gnm sync + X-Ray sub-rows)
         row_cpu("CPU 1. Game Engine (Work)",
                 h.game_cpu_work_ms, h.avg_game_cpu_work_ms, h.bottleneck_kind == 1);
-        row_cpu(h.fps_cap_active > 0 ? "  FPS Cap Sleep + GnmSync"
-                                     : "  Gnm Frame Sync (GPU Wait)",
+        const bool cap_sleeping =
+            h.fps_cap_active > 0 && (h.fps_cap_sleep_ms >= 0.05f || h.avg_fps_cap_sleep_ms >= 0.05f);
+        const char* sync_row_label = cap_sleeping               ? "  FPS Cap Sleep + GnmSync"
+                                   : (h.bottleneck_kind == 6)   ? "  Gnm Sync (External VSync)"
+                                                                : "  Gnm Frame Sync (GPU Wait)";
+        row_cpu(sync_row_label,
                 h.fps_cap_sleep_ms + h.gnm_wait_ms, h.avg_fps_cap_sleep_ms + h.avg_gnm_wait_ms,
                 h.bottleneck_kind == 4, true);
         row_cpu("CPU 2. Stage A (DirectVk RHI)",
@@ -2617,8 +2677,9 @@ void FpsCounter() {
         ImGui::PopStyleVar();
     }
     ImGui::Separator();
-    const ImVec4 limit_col = h.bottleneck_kind == 5 ? ImVec4(0.55f, 0.90f, 0.68f, 1.0f)
-                                                    : ImVec4(1.0f, 0.78f, 0.28f, 1.0f);
+    const ImVec4 limit_col = (h.bottleneck_kind == 5 || h.bottleneck_kind == 6)
+                                 ? ImVec4(0.55f, 0.90f, 0.68f, 1.0f)
+                                 : ImVec4(1.0f, 0.78f, 0.28f, 1.0f);
     ImGui::TextColored(
         limit_col,
         "LIMIT: %s (%.2f ms | Avg %.2f)",
@@ -2723,6 +2784,7 @@ void Init(const Vulkan::Instance& instance, vk::Format format, u32 image_count) 
     if (initialized) {
         return;
     }
+    g_vk_instance.store(&instance, std::memory_order_release);
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();

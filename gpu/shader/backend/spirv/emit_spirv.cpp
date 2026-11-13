@@ -19,6 +19,7 @@
 #include "shader/ir/program.h"
 #include "shader/runtime_info.h"
 #include "shader/backend/spirv/emit_spirv_instructions.h"
+#include "shader/backend/spirv/native_shaders.h"
 #include "shader/backend/spirv/spirv_emit_context.h"
 
 namespace Shader::Backend::SPIRV {
@@ -456,7 +457,8 @@ void DefineEntryPoint(const Info& info, EmitContext& ctx, Id main) {
         ctx.AddExecutionMode(main, ctx.profile.lower_left_origin_mode
                                        ? spv::ExecutionMode::OriginLowerLeft
                                        : spv::ExecutionMode::OriginUpperLeft);
-        if (info.has_discard) {
+        if (info.has_discard || IsSpvPatchedLightAccPsHash(info.pgm_hash)) {
+            ctx.AddExtension("SPV_EXT_demote_to_helper_invocation");
             ctx.AddCapability(spv::Capability::DemoteToHelperInvocation);
         }
         if (info.stores.GetAny(IR::Attribute::Depth)) {

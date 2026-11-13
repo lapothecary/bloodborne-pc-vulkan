@@ -209,6 +209,7 @@ LightTileBatcher::LightTileBatcher()
         g.ssbo2_dwords.reserve(4096);
         g.ps_images.reserve(20);
         g.ps_samplers.reserve(4);
+        g.norm_ps_flat.reserve(64);
         for (auto& st : g.stages) {
             st.user_data.reserve(16);
             st.flattened_ud_buf.reserve(64);
@@ -262,7 +263,7 @@ bool LightTileBatcher::IsBatchedLightAccPsHash(u64 pgm_hash) noexcept {
     case 0x00000000f81596cdULL:
         return true;
     default:
-        return false;
+        return Shader::Backend::SPIRV::IsSpvPatchedLightAccPsHash(pgm_hash);
     }
 }
 
@@ -549,11 +550,18 @@ bool LightTileBatcher::TryBatchDraw(Rasterizer& rasterizer, const GraphicsPipeli
 
     // Locate buffer descriptors: exactly 1 non-special in VS (`cbLightAccVtxParam`, ignoring
     // unused `BufferType::ClipPlanes` when `user_clip_plane_enable == 0`) and 2 non-special in PS
-    // (`ssbo_1`, `ssbo_2`).
+    // (`ssbo_1`, `ssbo_2`), plus at most 1 `BufferType::Flatbuf` (`srt_flatbuf`) per stage for
+    // SPIR-V patched non-native `GXLightAcc_*.ppo` shaders.
     u32 vs_buf_idx = ~0u;
+    u32 vs_flatbuf_idx = ~0u;
     u32 vs_non_special = 0u;
     for (u32 i = 0; i < vs.buffers.size(); ++i) {
         if (vs.buffers[i].buffer_type == Shader::BufferType::ClipPlanes) {
+            continue;
+        }
+        if (vs.buffers[i].buffer_type == Shader::BufferType::Flatbuf && !vs.buffers[i].is_written &&
+            vs_flatbuf_idx == ~0u) {
+            vs_flatbuf_idx = i;
             continue;
         }
         if (vs.buffers[i].IsSpecial() || vs.buffers[i].is_written || vs_non_special >= 1u) {
@@ -563,8 +571,14 @@ bool LightTileBatcher::TryBatchDraw(Rasterizer& rasterizer, const GraphicsPipeli
         ++vs_non_special;
     }
     u32 ps_buf_idx[2]{~0u, ~0u};
+    u32 ps_flatbuf_idx = ~0u;
     u32 ps_non_special = 0u;
     for (u32 i = 0; i < ps->buffers.size(); ++i) {
+        if (ps->buffers[i].buffer_type == Shader::BufferType::Flatbuf &&
+            !ps->buffers[i].is_written && ps_flatbuf_idx == ~0u) {
+            ps_flatbuf_idx = i;
+            continue;
+        }
         if (ps->buffers[i].IsSpecial() || ps->buffers[i].is_written || ps_non_special >= 2u) {
             return fail(fb_layout);
         }
@@ -884,6 +898,24 @@ bool LightTileBatcher::TryBatchDraw(Rasterizer& rasterizer, const GraphicsPipeli
         res_hash = XXH3_64bits_withSeed(cand_samplers.data(), num_ps_smp * sizeof(Gcn::Sampler),
                                         res_hash);
     }
+    std::array<u32, 128> cand_norm_flat{};
+    u32 num_norm_flat = 0u;
+    if (ps_flatbuf_idx != ~0u && !ps->flattened_ud_buf.empty()) {
+        if (ps->flattened_ud_buf.size() > cand_norm_flat.size()) {
+            return fail(fb_layout);
+        }
+        num_norm_flat = static_cast<u32>(ps->flattened_ud_buf.size());
+        std::memcpy(cand_norm_flat.data(), ps->flattened_ud_buf.data(),
+                    num_norm_flat * sizeof(u32));
+        const auto& sf1 = ps->buffers[ps_buf_idx[1]].sharp_fetch;
+        for (u32 d = 0; d < 4u; ++d) {
+            if (((sf1.load_mask >> d) & 1u) != 0u && sf1.offsets[d] < num_norm_flat) {
+                cand_norm_flat[sf1.offsets[d]] = 0u;
+            }
+        }
+        res_hash =
+            XXH3_64bits_withSeed(cand_norm_flat.data(), num_norm_flat * sizeof(u32), res_hash);
+    }
 
     const u32 aligned_ssbo2_bytes = Common::AlignUp(ssbo2_bytes, 16u);
     const u32 add_ssbo2_dwords = 4u + (aligned_ssbo2_bytes >> 2u);
@@ -891,7 +923,8 @@ bool LightTileBatcher::TryBatchDraw(Rasterizer& rasterizer, const GraphicsPipeli
     auto group_matches = [&](const BatchGroup& g) noexcept {
         if (g.pipeline != pipeline || g.resource_hash != res_hash ||
             g.ssbo1_bytes != ssbo1_bytes || g.ps_images.size() != num_ps_img ||
-            g.ps_samplers.size() != num_ps_smp || g.has_vport_scissor != use_vp_sc) {
+            g.ps_samplers.size() != num_ps_smp || g.norm_ps_flat.size() != num_norm_flat ||
+            g.has_vport_scissor != use_vp_sc) {
             return false;
         }
         if (use_vp_sc &&
@@ -913,6 +946,11 @@ bool LightTileBatcher::TryBatchDraw(Rasterizer& rasterizer, const GraphicsPipeli
         if (num_ps_smp != 0u &&
             std::memcmp(g.ps_samplers.data(), cand_samplers.data(),
                         num_ps_smp * sizeof(Gcn::Sampler)) != 0) {
+            return false;
+        }
+        if (num_norm_flat != 0u &&
+            std::memcmp(g.norm_ps_flat.data(), cand_norm_flat.data(),
+                        num_norm_flat * sizeof(u32)) != 0) {
             return false;
         }
         return true;
@@ -959,6 +997,8 @@ bool LightTileBatcher::TryBatchDraw(Rasterizer& rasterizer, const GraphicsPipeli
         std::memcpy(target_group->ssbo1.data(), ssbo1_ptr, ssbo1_bytes);
         target_group->ps_images.assign(cand_images.begin(), cand_images.begin() + num_ps_img);
         target_group->ps_samplers.assign(cand_samplers.begin(), cand_samplers.begin() + num_ps_smp);
+        target_group->norm_ps_flat.assign(cand_norm_flat.begin(),
+                                          cand_norm_flat.begin() + num_norm_flat);
         target_group->orig_vsharps = {orig_vsharps[0], orig_vsharps[1]};
         target_group->attr_semantics = {sem0, sem1};
         target_group->base_chunks = cur_base_chunks;
@@ -980,10 +1020,12 @@ bool LightTileBatcher::TryBatchDraw(Rasterizer& rasterizer, const GraphicsPipeli
             if (st == &vs) {
                 snap.non_special_buf_indices[0] = vs_buf_idx;
                 snap.num_non_special_bufs = 1u;
+                snap.flatbuf_idx = vs_flatbuf_idx;
             } else {
                 snap.non_special_buf_indices[0] = ps_buf_idx[0];
                 snap.non_special_buf_indices[1] = ps_buf_idx[1];
                 snap.num_non_special_bufs = 2u;
+                snap.flatbuf_idx = ps_flatbuf_idx;
             }
         }
         target_group->num_stages = slot;
@@ -1152,12 +1194,14 @@ void LightTileBatcher::Flush(Rasterizer& rasterizer) {
         }
 
         // Build per-stage `RingBinding` and `BatchedLightStageOverride` arrays.
-        std::array<std::array<Rasterizer::RingBinding, 2>, Shader::MaxStageTypes> stage_rings{};
+        std::array<std::array<Rasterizer::RingBinding, 3>, Shader::MaxStageTypes> stage_rings{};
         std::array<BatchedLightStageOverride, Shader::MaxStageTypes> stage_ovrs{};
+        bool ring_alloc_ok = true;
         for (u32 s = 0; s < g.num_stages; ++s) {
             const auto& snap = g.stages[s];
+            u32 num_rings = 0u;
             if (snap.num_non_special_bufs == 1u) {
-                stage_rings[s][0] = Rasterizer::RingBinding{
+                stage_rings[s][num_rings++] = Rasterizer::RingBinding{
                     .index = snap.non_special_buf_indices[0],
                     .size = sizeof(kDummyVsCb0),
                     .offset = *dummy_vs_off,
@@ -1166,7 +1210,7 @@ void LightTileBatcher::Flush(Rasterizer& rasterizer) {
                     .always_note = 0u,
                 };
             } else if (snap.num_non_special_bufs == 2u) {
-                stage_rings[s][0] = Rasterizer::RingBinding{
+                stage_rings[s][num_rings++] = Rasterizer::RingBinding{
                     .index = snap.non_special_buf_indices[0],
                     .size = static_cast<u32>(ssbo1_alloc_bytes),
                     .offset = *ssbo1_off,
@@ -1174,10 +1218,29 @@ void LightTileBatcher::Flush(Rasterizer& rasterizer) {
                     .ring = 0u,
                     .always_note = 0u,
                 };
-                stage_rings[s][1] = Rasterizer::RingBinding{
+                stage_rings[s][num_rings++] = Rasterizer::RingBinding{
                     .index = snap.non_special_buf_indices[1],
                     .size = static_cast<u32>(ssbo2_bytes),
                     .offset = *ssbo2_off,
+                    .address = 0u,
+                    .ring = 0u,
+                    .always_note = 0u,
+                };
+            }
+            if (snap.flatbuf_idx != ~0u && !snap.flattened_ud_buf.empty()) {
+                const u64 flat_bytes = snap.flattened_ud_buf.size() * sizeof(u32);
+                const auto flat_off = rasterizer.constant_ring->Allocate(flat_bytes, cb_align);
+                if (!flat_off) {
+                    ring_alloc_ok = false;
+                    break;
+                }
+                std::memcpy(rasterizer.constant_ring->Data(*flat_off), snap.flattened_ud_buf.data(),
+                            flat_bytes);
+                rasterizer.constant_ring->Flush(*flat_off, flat_bytes);
+                stage_rings[s][num_rings++] = Rasterizer::RingBinding{
+                    .index = snap.flatbuf_idx,
+                    .size = static_cast<u32>(flat_bytes),
+                    .offset = *flat_off,
                     .address = 0u,
                     .ring = 0u,
                     .always_note = 0u,
@@ -1187,9 +1250,13 @@ void LightTileBatcher::Flush(Rasterizer& rasterizer) {
                 .pgm_base = snap.pgm_base,
                 .user_data = snap.user_data,
                 .flattened_ud_buf = snap.flattened_ud_buf,
-                .ring_bindings = std::span<const Rasterizer::RingBinding>{
-                    stage_rings[s].data(), snap.num_non_special_bufs},
+                .ring_bindings =
+                    std::span<const Rasterizer::RingBinding>{stage_rings[s].data(), num_rings},
             };
+        }
+        if (!ring_alloc_ok) {
+            g.Reset();
+            continue;
         }
 
         RestoreStageBChunks(lp.regs, g.base_chunks);

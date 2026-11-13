@@ -890,4 +890,62 @@ bool TryReplaceWithNativeShader(u64 pgm_hash, const std::vector<u32>& ref_spv,
     return false;
 }
 
+bool IsSpvPatchedLightAccPsHash(u64 pgm_hash) noexcept {
+    switch (pgm_hash) {
+    case 0x0000000002aee188ULL: // Filter\GXLightAcc_DLineLight1.ppo
+    case 0x0000000007aa7c3eULL: // Filter\GXLightAcc_PointLightShadowed2.ppo
+    case 0x00000000093a99d8ULL: // Filter\GXLightAcc_PointLight11.ppo
+    case 0x000000000a8a518bULL: // Filter\GXLightAcc_LegacyPointLightShadowed2.ppo
+    case 0x000000001ac8be70ULL: // Filter\GXLightAcc_SpotLight4.ppo
+    case 0x00000000205c82b3ULL: // Filter\GXLightAcc_DPointLightShadowed4.ppo
+    case 0x00000000294503baULL: // Filter\GXLightAcc_DSpotLightShadowed2.ppo
+    case 0x000000002994a496ULL: // Filter\GXLightAcc_LegacyPointLightShadowed4.ppo
+    case 0x000000002aaa5cb1ULL: // Filter\GXLightAcc_PointLight7.ppo
+    case 0x00000000376e0a37ULL: // Filter\GXLightAcc_DSpotLightShadowed4.ppo
+    case 0x000000003aafbe57ULL: // Filter\GXLightAcc_PointLight9.ppo
+    case 0x000000003b397883ULL: // Filter\GXLightAcc_DLineLight3.ppo
+    case 0x000000003cd2ac34ULL: // Filter\GXLightAcc_PointLight6.ppo
+    case 0x0000000040727870ULL: // Filter\GXLightAcc_PointLightShadowed4.ppo
+    case 0x00000000428a80bfULL: // Filter\GXLightAcc_LegacyPointLight10.ppo
+    case 0x0000000042bd4804ULL: // Filter\GXLightAcc_PointLight4.ppo
+    case 0x0000000043d26ee3ULL: // Filter\GXLightAcc_LegacyPointLight7.ppo
+    case 0x0000000046323550ULL: // Filter\GXLightAcc_SpotLight3.ppo
+    case 0x0000000057a66dedULL: // Filter\GXLightAcc_PointLight1.ppo
+    case 0x000000005e210809ULL: // Filter\GXLightAcc_LegacyPointLightShadowed3.ppo
+    case 0x0000000065ff4c81ULL: // Filter\GXLightAcc_PointLight12.ppo
+    case 0x000000006ab6cecbULL: // Filter\GXLightAcc_LegacyPointLight1.ppo
+    case 0x00000000761d2013ULL: // Filter\GXLightAcc_DSpotLightShadowed3.ppo
+    case 0x000000007b33e949ULL: // Filter\GXLightAcc_SpotLightShadowed4.ppo
+    case 0x0000000082951fa5ULL: // Filter\GXLightAcc_DSpotLightShadowed1.ppo
+    case 0x000000008aa6908eULL: // Filter\GXLightAcc_LegacyPointLightShadowed1.ppo
+    case 0x000000008e4d8f54ULL: // Filter\GXLightAcc_SpotLightShadowed1.ppo
+    case 0x0000000098506debULL: // Filter\GXLightAcc_PointLightShadowed1.ppo
+    case 0x00000000a422d554ULL: // Filter\GXLightAcc_LegacyPointLight9.ppo
+    case 0x00000000b3c63c01ULL: // Filter\GXLightAcc_LegacyPointLight6.ppo
+    case 0x00000000b464a1f2ULL: // Filter\GXLightAcc_LegacyPointLight8.ppo
+    case 0x00000000b47e0972ULL: // Filter\GXLightAcc_LegacyPointLight5.ppo
+    case 0x00000000ba81fc0aULL: // Filter\GXLightAcc_PointLight5.ppo
+    case 0x00000000bb2ac1cbULL: // Filter\GXLightAcc_DPointLightShadowed3.ppo
+    case 0x00000000bcf67c52ULL: // Filter\GXLightAcc_SpotLight1.ppo
+    case 0x00000000c023d70fULL: // Filter\GXLightAcc_LegacyPointLight4.ppo
+    case 0x00000000c12ac9e5ULL: // Filter\GXLightAcc_SpotLight2.ppo
+    case 0x00000000c37e6323ULL: // Filter\GXLightAcc_DLineLight2.ppo
+    case 0x00000000c3eb1d3aULL: // Filter\GXLightAcc_PointLight3.ppo
+    case 0x00000000c44db5d0ULL: // Filter\GXLightAcc_SpotLightShadowed3.ppo
+    case 0x00000000d3143e39ULL: // Filter\GXLightAcc_DLineLight4.ppo
+    case 0x00000000d3a7b5a0ULL: // Filter\GXLightAcc_LegacyPointLight11.ppo
+    case 0x00000000d776fb27ULL: // Filter\GXLightAcc_LegacyPointLight3.ppo
+    case 0x00000000db92e75cULL: // Filter\GXLightAcc_PointLight10.ppo
+    case 0x00000000dea6db05ULL: // Filter\GXLightAcc_PointLight2.ppo
+    case 0x00000000e1610d5bULL: // Filter\GXLightAcc_PointLight8.ppo
+    case 0x00000000e4daeaaeULL: // Filter\GXLightAcc_LegacyPointLight12.ppo
+    case 0x00000000e72d12aeULL: // Filter\GXLightAcc_SpotLightShadowed2.ppo
+    case 0x00000000ea36a1b0ULL: // Filter\GXLightAcc_PointLightShadowed3.ppo
+    case 0x00000000ecda90f6ULL: // Filter\GXLightAcc_LegacyPointLight2.ppo
+        return true;
+    default:
+        return false;
+    }
+}
+
 } // namespace Shader::Backend::SPIRV

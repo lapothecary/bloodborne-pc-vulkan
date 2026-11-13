@@ -524,7 +524,7 @@ inline const TopologyMasks& GetTopology() {
                 } else {
                     result.game_main = p_cores;
                 }
-                if (p_phys_cores >= 8) {
+                if (p_phys_cores >= 6) {
                     pick_best_core(result.game_workers, &result.best_gpu_comm_cpu,
                                    &result.best_gpu_comm_sibling);
                     if (result.best_gpu_comm_cpu >= 0) {
@@ -538,15 +538,19 @@ inline const TopologyMasks& GetTopology() {
                     } else {
                         result.gpu_comm = result.game_workers;
                     }
-                    pick_best_core(result.game_workers, &result.best_draw_rec_cpu,
-                                   &result.best_draw_rec_sibling);
-                    if (result.best_draw_rec_cpu >= 0) {
-                        CPU_ZERO(&result.draw_rec);
-                        CPU_SET(result.best_draw_rec_cpu, &result.draw_rec);
-                        for (int s = 0; s < 256; ++s) {
-                            if (CPU_ISSET(s, &cpus[result.best_draw_rec_cpu].siblings)) {
-                                CPU_CLR(s, &result.game_workers);
+                    if (p_phys_cores >= 8) {
+                        pick_best_core(result.game_workers, &result.best_draw_rec_cpu,
+                                       &result.best_draw_rec_sibling);
+                        if (result.best_draw_rec_cpu >= 0) {
+                            CPU_ZERO(&result.draw_rec);
+                            CPU_SET(result.best_draw_rec_cpu, &result.draw_rec);
+                            for (int s = 0; s < 256; ++s) {
+                                if (CPU_ISSET(s, &cpus[result.best_draw_rec_cpu].siblings)) {
+                                    CPU_CLR(s, &result.game_workers);
+                                }
                             }
+                        } else {
+                            result.draw_rec = result.game_workers;
                         }
                     } else {
                         result.draw_rec = result.game_workers;
@@ -580,9 +584,9 @@ inline const TopologyMasks& GetTopology() {
                 // CASE 3: Single-L3 Homogeneous CPU with >= 6 Physical Cores
                 // (e.g. Ryzen 5 5600X/7600X, Ryzen 7 5800X3D/7800X3D/9800X3D, Intel 6c/8c).
                 // - MOMainThread gets #1 physical core (SMT sibling idle).
-                // - When >= 8 physical cores (5800X3D/7800X3D/9800X3D), bb:GpuComm gets #2
-                //   physical core and bb:DrawRec gets #3 physical core (SMT siblings idle,
-                //   5 physical cores = 10 threads left for Havok/GX workers + VkRecorder).
+                // - bb:GpuComm gets #2 physical core (SMT sibling idle, >= 6 physical cores).
+                // - When >= 8 physical cores (5800X3D/7800X3D/9800X3D), bb:DrawRec gets #3
+                //   physical core (SMT sibling idle, 5 physical cores = 10 threads left for workers).
                 // - When >= 10 physical cores, bb:VkRecorder also gets #4 physical core.
                 // =============================================================================
                 pick_best_core(allowed, &result.best_main_cpu, &result.best_main_sibling);
@@ -598,20 +602,20 @@ inline const TopologyMasks& GetTopology() {
                 } else {
                     result.game_main = allowed;
                 }
-                if (total_phys_cores >= 8) {
-                    pick_best_core(result.game_workers, &result.best_gpu_comm_cpu,
-                                   &result.best_gpu_comm_sibling);
-                    if (result.best_gpu_comm_cpu >= 0) {
-                        CPU_ZERO(&result.gpu_comm);
-                        CPU_SET(result.best_gpu_comm_cpu, &result.gpu_comm);
-                        for (int s = 0; s < 256; ++s) {
-                            if (CPU_ISSET(s, &cpus[result.best_gpu_comm_cpu].siblings)) {
-                                CPU_CLR(s, &result.game_workers);
-                            }
+                pick_best_core(result.game_workers, &result.best_gpu_comm_cpu,
+                               &result.best_gpu_comm_sibling);
+                if (result.best_gpu_comm_cpu >= 0) {
+                    CPU_ZERO(&result.gpu_comm);
+                    CPU_SET(result.best_gpu_comm_cpu, &result.gpu_comm);
+                    for (int s = 0; s < 256; ++s) {
+                        if (CPU_ISSET(s, &cpus[result.best_gpu_comm_cpu].siblings)) {
+                            CPU_CLR(s, &result.game_workers);
                         }
-                    } else {
-                        result.gpu_comm = result.game_workers;
                     }
+                } else {
+                    result.gpu_comm = result.game_workers;
+                }
+                if (total_phys_cores >= 8) {
                     pick_best_core(result.game_workers, &result.best_draw_rec_cpu,
                                    &result.best_draw_rec_sibling);
                     if (result.best_draw_rec_cpu >= 0) {
@@ -626,7 +630,6 @@ inline const TopologyMasks& GetTopology() {
                         result.draw_rec = result.game_workers;
                     }
                 } else {
-                    result.gpu_comm = result.game_workers;
                     result.draw_rec = result.game_workers;
                 }
                 if (total_phys_cores >= 10) {

@@ -114,6 +114,7 @@ private:
         VAddr pgm_base = 0;
         u32 non_special_buf_indices[2]{0, 0};
         u32 num_non_special_bufs = 0;
+        u32 flatbuf_idx = ~0u;
         std::vector<u32> user_data;
         std::vector<u32> flattened_ud_buf;
     };
@@ -125,6 +126,7 @@ private:
         std::array<u8, kMaxShadowBytes> ssbo1{};
         std::vector<Gcn::Image> ps_images;
         std::vector<Gcn::Sampler> ps_samplers;
+        std::vector<u32> norm_ps_flat;
         std::array<Gcn::Buffer, 2> orig_vsharps{};
         std::array<u32, 2> attr_semantics{0, 1};
         u32 num_stages = 0;
@@ -144,6 +146,7 @@ private:
             ssbo1_bytes = 0;
             ps_images.clear();
             ps_samplers.clear();
+            norm_ps_flat.clear();
             num_stages = 0;
             has_vport_scissor = false;
             tile_count = 0;

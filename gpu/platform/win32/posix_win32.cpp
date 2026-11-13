@@ -650,7 +650,7 @@ const Win32TopologyMasks& GetWin32Topology() {
                 // Main + Game Workers + Vulkan RHI stay strictly on P-cores; Helpers/IO/Audio run on E-cores.
                 if (p_phys >= 6 && best_p != size_t(-1)) {
                     res.game_main = cores[best_p].primary; // SMT sibling left idle
-                    const size_t gcomm_p = (p_phys >= 8) ? second_p : size_t(-1);
+                    const size_t gcomm_p = (p_phys >= 6) ? second_p : size_t(-1);
                     const size_t drec_p = (p_phys >= 8) ? third_p : size_t(-1);
                     if (gcomm_p != size_t(-1)) {
                         res.gpu_comm = cores[gcomm_p].primary; // SMT sibling left idle
@@ -682,11 +682,15 @@ const Win32TopologyMasks& GetWin32Topology() {
             } else {
                 // CASE 3: Single-L3 Homogeneous CPU with >= 6 Physical Cores
                 // (e.g. Ryzen 5 5600X/7600X, Ryzen 7 5800X3D/7800X3D/9800X3D, Intel 6c/8c).
-                // Core 0 primary -> Main game thread; Core 1 -> GpuComm; Core 2 -> DrawRec (>= 8 cores).
+                // Core 0 primary -> Main game thread; Core 1 -> GpuComm (>= 6 cores);
+                // Core 2 -> DrawRec (>= 8 cores).
                 res.game_main = cores[0].primary;
                 size_t start_w = 1;
-                if (cores.size() >= 8) {
+                if (cores.size() >= 6) {
                     res.gpu_comm = cores[1].primary;
+                    start_w = 2;
+                }
+                if (cores.size() >= 8) {
                     res.draw_rec = cores[2].primary;
                     start_w = 3;
                 }

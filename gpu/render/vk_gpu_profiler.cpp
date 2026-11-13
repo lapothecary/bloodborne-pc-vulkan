@@ -397,7 +397,14 @@ void GpuProfiler::Collect(u32 which) {
         return;
     }
     for (u32 i = 0; i + 1 < count; ++i) {
-        const double ms = double(stamps[i + 1] - stamps[i]) * period_ns / 1e6;
+        if (stamps[i] == 0u || stamps[i + 1] <= stamps[i]) {
+            continue;
+        }
+        const double delta_ns = double(stamps[i + 1] - stamps[i]) * period_ns;
+        if (!(delta_ns > 0.0 && delta_ns < 2e8)) {
+            continue;
+        }
+        const double ms = delta_ns / 1e6;
         auto& total = totals[keys[which][i]];
         total.ms += ms;
         ++total.segments;

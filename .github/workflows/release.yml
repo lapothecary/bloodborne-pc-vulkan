@@ -44,16 +44,17 @@ jobs:
             - **Linux**: Extract `bloodborne-pc-vulkan-linux-x86_64-prebuilt.tar.gz` next to your `CUSA03173` (`v1.09`) folder and run **`./play.sh`** (or **`./launcher.sh`**).
 
             ### What Changed in `${{ github.ref_name || 'v1.1.3' }}`:
-            - **Draw-Call Batching, VSM Shadow Memoization & Stationary Velocity Culling (`Stages 8–11`, `113` Native GLSL 460 Shaders):**
-              - **Deferred Local-Light Tile Batching (`LightTileBatcher` + `vs_8747a367`):** Coalesces `64x64` deferred local-light tile quads into multi-quad draws (`-40.5%` total draws in Cathedral Ward: `1,786 -> 1,062`, `-26%` `Stage B` recording time).
+            - **100% Local-Light Tile Batching (`84/84` Shaders), VSM Shadow Memoization & Stationary Velocity Culling (`Stages 8–11`, `113` Native GLSL 460 Shaders):**
+              - **Deferred Local-Light Tile Batching (`LightTileBatcher` + `vs_8747a367` + SPIR-V `ltb2`/`opt32` Prologue):** Coalesces `64x64` deferred local-light tile quads across **all `84/84` (`100%`)** local-light `GXLightAcc` shaders (`34` native GLSL 460 shaders + `50` SPIR-V-instrumented `GXLightAcc_*.ppo` spot/shadowed/clip permutations including `GXLightAcc_DSpotLightShadowed1.ppo`), cutting total scene draws by `40–55%` and eliminating mid-pass batch flushes in Central Yharnam & Cathedral Ward.
               - **Stationary Object-Velocity Culling (`ObjectVelocityCuller`):** Skips stationary world & skinned meshes in the `1280x720` Object-Velocity pass via a 3-tier SSE2 matrix-palette cache (`-220..295 draws/frame` in Central Yharnam Bonfire Plaza, `-50%` GPU Motion Blur cost) while preserving moving characters and silhouette masks.
               - **Local VSM Shadow & 13-Tap Blur Memoization (`VsmShadowMemo`):** Memoizes unchanged `R16G16Sfloat` local shadow faces and skips redundant `Sample13Weight` blur passes (`92%` hit rate).
               - **Scaleform UI & Particle Quad Coalescing (`VfxUiBatcher` + `vs_24042a9b`):** Batches consecutive UI & particle draws with `0` task flushes (`opt32` shader cache).
-            - **Long-Session CPU `Stage A` Stability & `2 MiB` 4-Way VMA TLB:**
-              - Eliminated progressive `Stage A` slowdowns after extended map traversal/streaming by replacing linear cache invalidations on `>32 KiB` particle/ring buffer writes with `O(1)` `256 KiB` coarse epochs and upgrading `RegionCache` to a heap-allocated `1,024`-entry 4-way `2 MiB` TLB (caching both mapped and unmapped spans while reducing static `PT_TLS` by `1 KiB`).
-            - **Sun/Moon 4-Cascade CSM Shadow Fix & `15s Avg` HUD Window Fix:**
+            - **Hybrid `6P+E` & `6-Core` CPU `Stage A` Isolation + Long-Session VMA TLB:**
+              - Isolates `bb:GpuComm` (`Stage A`) onto its own dedicated P-core / physical core (SMT sibling idle) on `6P+E` Intel CPUs (`i7-13620H`, `i7-12700H`, `i5-13600K`, `i5-14600K`) and 6-core Ryzen/Intel CPUs on both Windows and Linux so Havok/GX workers never preempt `Stage A`.
+              - Replaced linear cache invalidations on `>32 KiB` particle/ring buffer writes with `O(1)` `256 KiB` coarse epochs and upgraded `RegionCache` to a heap-allocated `1,024`-entry 4-way `2 MiB` TLB (`PT_TLS` reduced by `1 KiB`).
+            - **Sun/Moon 4-Cascade CSM Shadow Fix, Windows 11 Per-Process VRAM & Honest External VSync Telemetry:**
               - Fixed missing player shadow and camera-following cascade seam when `Dynamic Shadows` is `Off` by decoupling local point/spot VSM shadows (`+0x296e`) from 4-cascade Sun/Moon CSM (`+0x296c` in `sub_229cb70`).
-              - Fixed the `15s Avg` sliding window (`F8` / `F9`) stalling in `<300`-draw interiors/menus and added instant average reset when toggling FPS cap, AA, upscaler, or render resolution.
+              - Fixed Windows 11 per-process `VRAM: X.XX GB (Sys Y.Y)` reporting (`nvmlProcessInfo_v2_t` + WDDM `VK_EXT_memory_budget` fallback for NVIDIA/AMD/Intel GPUs and Optimus laptops), guarded WDDM `GpuProfiler` timestamp queries against zero/out-of-order wraparound, and added honest `External VSync / Present Cap` detection + `15s Avg` reset on settings changes.
             - **Previously in `v1.1.2` / `v1.1.1`:** L3-co-located `Stage A -> Stage B -> VkRecorder` CPU pipeline, `80 B` delta `DrawPacket` compression, live `SSAO`/`SSR`/`DoF` toggles, high-FPS foliage sway (`HookFoliageSway`), and NVIDIA DXGI Flip-Model swapchain.
           files: |
             bloodborne-pc-vulkan-linux-x86_64-prebuilt.tar.gz
@@ -122,7 +123,7 @@ jobs:
             touch dantelion_gx/build_win32/libbb_gx_engine_native.a
             rm -f build_win32_gpu/include/bbgpu/shaders/*.h build_win32_gpu/include/bbgpu/shaders/*.spv
             find build_win32_gpu/CMakeFiles/bb-probe.dir -name "*.obj" -delete || true
-            rm -f build_win32_gpu/CMakeFiles/bbgpu.dir/shim/*.obj build_win32_gpu/CMakeFiles/bbgpu.dir/games/*.obj build_win32_gpu/CMakeFiles/bbgpu.dir/gcn/*.obj build_win32_gpu/CMakeFiles/bbgpu.dir/textures/*.obj build_win32_gpu/CMakeFiles/bbgpu.dir/platform/win32/*.obj build_win32_gpu/CMakeFiles/bbgpu.dir/platform/avplayer/*.obj build_win32_gpu/CMakeFiles/bbgpu.dir/platform/videoout/frame_stats.cpp.obj build_win32_gpu/CMakeFiles/bbgpu.dir/buffers/*.obj build_win32_gpu/CMakeFiles/bbgpu.dir/render/*.obj build_win32_gpu/CMakeFiles/bbgpu.dir/cp/*.obj build_win32_gpu/CMakeFiles/bbgpu.dir/shader/backend/spirv/native_shaders.cpp.obj build_win32_gpu/CMakeFiles/bbgpu.dir/upscale/*.obj build_win32_gpu/libbbgpu.a build_win32_gpu/bb-probe.exe build_win32_gpu/libbbgpu.dll
+            rm -f build_win32_gpu/CMakeFiles/bbgpu.dir/shim/*.obj build_win32_gpu/CMakeFiles/bbgpu.dir/games/*.obj build_win32_gpu/CMakeFiles/bbgpu.dir/gcn/*.obj build_win32_gpu/CMakeFiles/bbgpu.dir/textures/*.obj build_win32_gpu/CMakeFiles/bbgpu.dir/platform/win32/*.obj build_win32_gpu/CMakeFiles/bbgpu.dir/platform/avplayer/*.obj build_win32_gpu/CMakeFiles/bbgpu.dir/platform/videoout/frame_stats.cpp.obj build_win32_gpu/CMakeFiles/bbgpu.dir/buffers/*.obj build_win32_gpu/CMakeFiles/bbgpu.dir/render/*.obj build_win32_gpu/CMakeFiles/bbgpu.dir/cp/*.obj build_win32_gpu/CMakeFiles/bbgpu.dir/shader/backend/spirv/*.obj build_win32_gpu/CMakeFiles/bbgpu.dir/upscale/*.obj build_win32_gpu/libbbgpu.a build_win32_gpu/bb-probe.exe build_win32_gpu/libbbgpu.dll
           else
             rm -rf build_win32_gpu
             if ! cmake -S gpu -B build_win32_gpu -G Ninja \
