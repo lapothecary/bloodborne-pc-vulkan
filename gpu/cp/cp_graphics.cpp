@@ -591,6 +591,7 @@ CommandProcessor::Step CommandProcessor::Graphics(Work& work, Level& level, cons
                                     rasterizer->NotePendingGpuWrite(base_addr, clear_bytes);
                                 }
                             } else if (query_op <= 1u) {
+                                rasterizer->FlushLightTileBatches();
                                 constexpr u64 Valid = 0x8000000000000000ull;
                                 constexpr u64 Step = 0x2FFFFFFull;
                                 if (query_op == 0u) {
@@ -617,6 +618,7 @@ CommandProcessor::Step CommandProcessor::Graphics(Work& work, Level& level, cons
                 case DirectVk::Op::CopyBufferBatch: {
                     const u32 count = op_word >> 16;
                     if (rasterizer && count > 0 && count <= 32 && body_words == 2u + count * 6u) {
+                        rasterizer->NotifyVsmBeforeCopyBatch(body + 2u, count);
                         for (u32 i = 0; i < count; ++i) {
                             DirectVk::CopyRegion reg{};
                             std::memcpy(&reg, body + 2u + i * 6u, sizeof(reg));
@@ -632,11 +634,13 @@ CommandProcessor::Step CommandProcessor::Graphics(Work& work, Level& level, cons
                             std::memcpy(&reg, body + 2u + i * 6u, sizeof(reg));
                             if (reg.dst_va && reg.byte_size) {
                                 if (queued) {
-                                    rasterizer->NotePendingGpuWrite(reg.dst_va, reg.byte_size);
+                                    rasterizer->NotePendingGpuWrite(reg.dst_va, reg.byte_size,
+                                                                    false);
                                 }
                                 rasterizer->NoteCopyIntoMemory(reg.dst_va, reg.byte_size);
                             }
                         }
+                        rasterizer->NoteStageACpuCopyBatch(body + 2u, count);
                     }
                     break;
                 }
@@ -645,10 +649,11 @@ CommandProcessor::Step CommandProcessor::Graphics(Work& work, Level& level, cons
                         DirectVk::FillArgs args{};
                         std::memcpy(&args, body + 2u, sizeof(args));
                         if (args.dst_va && args.byte_size) {
+                            rasterizer->InvalidateStageACpuShadow(args.dst_va, args.byte_size);
                             if (rasterizer->RunInOrder(&Tasks::DirectVkFillTask, body + 2u,
                                                        sizeof(DirectVk::FillArgs),
                                                        BbToggle::PipelinedMemoryWrites, false)) {
-                                rasterizer->NotePendingGpuWrite(args.dst_va, args.byte_size);
+                                rasterizer->NotePendingGpuWrite(args.dst_va, args.byte_size, false);
                             }
                             rasterizer->NoteCopyIntoMemory(args.dst_va, args.byte_size);
                         }
@@ -657,13 +662,17 @@ CommandProcessor::Step CommandProcessor::Graphics(Work& work, Level& level, cons
                 }
                 case DirectVk::Op::ClearColorImage: {
                     if (rasterizer && body_words == 18u) {
-                        DirectVk::ClearColorArgs args{};
+                        Vulkan::Rasterizer::DirectClearColorArgs args{};
+                        static_assert(sizeof(args) == sizeof(DirectVk::ClearColorArgs));
                         std::memcpy(&args, body + 2u, sizeof(args));
                         if (args.dst_va && args.byte_size) {
-                            if (rasterizer->RunInOrder(&Tasks::DirectVkClearColorTask, body + 2u,
-                                                       sizeof(DirectVk::ClearColorArgs),
-                                                       BbToggle::PipelinedMemoryWrites, false)) {
-                                rasterizer->NotePendingGpuWrite(args.dst_va, args.byte_size);
+                            if (!rasterizer->TryInterceptVsmClearColor(args)) {
+                                if (rasterizer->RunInOrder(
+                                        &Tasks::DirectVkClearColorTask, body + 2u,
+                                        sizeof(DirectVk::ClearColorArgs),
+                                        BbToggle::PipelinedMemoryWrites, false)) {
+                                    rasterizer->NotePendingGpuWrite(args.dst_va, args.byte_size);
+                                }
                             }
                         }
                     }
@@ -671,18 +680,22 @@ CommandProcessor::Step CommandProcessor::Graphics(Work& work, Level& level, cons
                 }
                 case DirectVk::Op::CopyTextureRegion: {
                     if (rasterizer && body_words == 34u) {
-                        DirectVk::CopyTextureRegionArgs args{};
+                        Vulkan::Rasterizer::DirectCopyTextureRegionArgs args{};
+                        static_assert(sizeof(args) == sizeof(DirectVk::CopyTextureRegionArgs));
                         std::memcpy(&args, body + 2u, sizeof(args));
                         if (args.copy_w && args.copy_h && args.copy_d) {
-                            if (args.src_va && args.src_byte_size) {
-                                rasterizer->NotePendingRead(args.src_va, args.src_byte_size);
-                            }
-                            const bool queued = rasterizer->RunInOrder(
-                                &Tasks::DirectVkCopyTextureRegionTask, body + 2u,
-                                sizeof(DirectVk::CopyTextureRegionArgs),
-                                BbToggle::PipelinedMemoryWrites, false);
-                            if (args.dst_va && args.dst_byte_size && queued) {
-                                rasterizer->NotePendingGpuWrite(args.dst_va, args.dst_byte_size);
+                            if (!rasterizer->TryInterceptVsmCopyTextureRegion(args)) {
+                                if (args.src_va && args.src_byte_size) {
+                                    rasterizer->NotePendingRead(args.src_va, args.src_byte_size);
+                                }
+                                const bool queued = rasterizer->RunInOrder(
+                                    &Tasks::DirectVkCopyTextureRegionTask, body + 2u,
+                                    sizeof(DirectVk::CopyTextureRegionArgs),
+                                    BbToggle::PipelinedMemoryWrites, false);
+                                if (args.dst_va && args.dst_byte_size && queued) {
+                                    rasterizer->NotePendingGpuWrite(args.dst_va,
+                                                                    args.dst_byte_size);
+                                }
                             }
                         }
                     }
@@ -693,6 +706,10 @@ CommandProcessor::Step CommandProcessor::Graphics(Work& work, Level& level, cons
                         DirectVk::DecompressDepthArgs args{};
                         std::memcpy(&args, body + 2u, sizeof(args));
                         if (args.slice_count) {
+                            if (args.dst_va && args.dst_byte_size) {
+                                rasterizer->InvalidateVsmTargetRange(args.dst_va,
+                                                                     args.dst_byte_size);
+                            }
                             const bool queued = rasterizer->RunInOrder(
                                 &Tasks::DirectVkDecompressDepthTask, body + 2u,
                                 sizeof(DirectVk::DecompressDepthArgs),
@@ -709,6 +726,10 @@ CommandProcessor::Step CommandProcessor::Graphics(Work& work, Level& level, cons
                         DirectVk::EliminateFastClearArgs args{};
                         std::memcpy(&args, body + 2u, sizeof(args));
                         if (args.slice_count) {
+                            if (args.dst_va && args.dst_byte_size) {
+                                rasterizer->InvalidateVsmTargetRange(args.dst_va,
+                                                                     args.dst_byte_size);
+                            }
                             const bool queued = rasterizer->RunInOrder(
                                 &Tasks::DirectVkEliminateFastClearTask, body + 2u,
                                 sizeof(DirectVk::EliminateFastClearArgs),
@@ -725,6 +746,10 @@ CommandProcessor::Step CommandProcessor::Graphics(Work& work, Level& level, cons
                         DirectVk::ResolveColorArgs args{};
                         std::memcpy(&args, body + 2u, sizeof(args));
                         if (args.dst_va && args.src_va) {
+                            if (args.dst_byte_size) {
+                                rasterizer->InvalidateVsmTargetRange(args.dst_va,
+                                                                     args.dst_byte_size);
+                            }
                             if (args.src_byte_size) {
                                 rasterizer->NotePendingRead(args.src_va, args.src_byte_size);
                             }
@@ -745,6 +770,10 @@ CommandProcessor::Step CommandProcessor::Graphics(Work& work, Level& level, cons
                         std::memcpy(&args, body + 2u, sizeof(args));
                         if (args.src_stage_va && args.src_byte_size &&
                             args.extent_w && args.extent_h && args.extent_d) {
+                            if (args.dst_va && args.dst_byte_size) {
+                                rasterizer->InvalidateVsmTargetRange(args.dst_va,
+                                                                     args.dst_byte_size);
+                            }
                             rasterizer->NotePendingRead(args.src_stage_va, args.src_byte_size);
                             const bool queued = rasterizer->RunInOrder(
                                 &Tasks::DirectVkUploadTextureTask, body + 2u,
@@ -759,15 +788,19 @@ CommandProcessor::Step CommandProcessor::Graphics(Work& work, Level& level, cons
                 }
                 case DirectVk::Op::ClearDepthStencil: {
                     if (rasterizer && body_words == 20u) {
-                        DirectVk::ClearDepthStencilArgs args{};
+                        Vulkan::Rasterizer::DirectClearDepthStencilArgs args{};
+                        static_assert(sizeof(args) == sizeof(DirectVk::ClearDepthStencilArgs));
                         std::memcpy(&args, body + 2u, sizeof(args));
                         if (args.slice_count) {
-                            const bool queued = rasterizer->RunInOrder(
-                                &Tasks::DirectVkClearDepthStencilTask, body + 2u,
-                                sizeof(DirectVk::ClearDepthStencilArgs),
-                                BbToggle::PipelinedMemoryWrites, false);
-                            if (args.dst_va && args.dst_byte_size && queued) {
-                                rasterizer->NotePendingGpuWrite(args.dst_va, args.dst_byte_size);
+                            if (!rasterizer->TryInterceptVsmClearDepth(args)) {
+                                const bool queued = rasterizer->RunInOrder(
+                                    &Tasks::DirectVkClearDepthStencilTask, body + 2u,
+                                    sizeof(DirectVk::ClearDepthStencilArgs),
+                                    BbToggle::PipelinedMemoryWrites, false);
+                                if (args.dst_va && args.dst_byte_size && queued) {
+                                    rasterizer->NotePendingGpuWrite(args.dst_va,
+                                                                    args.dst_byte_size);
+                                }
                             }
                         }
                     }

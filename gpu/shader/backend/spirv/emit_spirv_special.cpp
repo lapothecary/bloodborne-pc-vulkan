@@ -185,20 +185,65 @@ void EmitFragmentMotion(EmitContext& ctx) {
                     ctx.OpSelect(f32_type, front, dy, zero), valid, depth}));
 }
 
+// Stage 8: Multi-tile vertex batching for Filter\GXLightAcc.vpo (`0x000000008747a367`).
+// Unbatched fullscreen draws pass `vs_in_attr0.w == +1.0f` and run 100% unmodified.
+// Batched sub-screen tile quads encode `vs_in_attr0.z = tile_vtx_z` and
+// `vs_in_attr0.w = -float(tile_ssbo2_vec4_offset + 1u)` (`< -0.5f`), setting `gl_Position.w = 1.0f`
+// and forwarding `+float(tile_ssbo2_vec4_offset + 1u)` in `out_attr1.z` (`fs_in_attr1_p.z`).
+Id EmitLightTileBatchPatch(EmitContext& ctx) {
+    if (ctx.hw_stage != HwStage::Vertex || ctx.info.pgm_hash != 0x000000008747a367ULL) {
+        return {};
+    }
+    const auto& in0 = ctx.input_params[0];
+    const auto& out0 = ctx.output_params[0];
+    const auto& out1 = ctx.output_params[1];
+    if (!Sirit::ValidId(in0.id) || in0.num_components < 4 || in0.is_integer || in0.is_array ||
+        !Sirit::ValidId(ctx.output_position) || !Sirit::ValidId(out0.id) ||
+        out0.num_components < 4 || out0.is_integer || !Sirit::ValidId(out1.id) ||
+        out1.num_components < 3 || out1.is_integer) {
+        return {};
+    }
+    const Id f32 = ctx.F32[1];
+    const Id b1 = ctx.U1[1];
+    const Id in_x = ctx.OpLoad(f32, ctx.OpAccessChain(in0.pointer_type, in0.id, ctx.ConstU32(0u)));
+    const Id in_y = ctx.OpLoad(f32, ctx.OpAccessChain(in0.pointer_type, in0.id, ctx.ConstU32(1u)));
+    const Id in_z = ctx.OpLoad(f32, ctx.OpAccessChain(in0.pointer_type, in0.id, ctx.ConstU32(2u)));
+    const Id in_w = ctx.OpLoad(f32, ctx.OpAccessChain(in0.pointer_type, in0.id, ctx.ConstU32(3u)));
+    const Id batched = ctx.OpFOrdLessThan(b1, in_w, ctx.Constant(f32, -0.5f));
+    const Id one = ctx.Constant(f32, 1.0f);
+    const Id batched_pos = ctx.OpCompositeConstruct(ctx.F32[4], in_x, in_y, in_z, one);
+    const Id cur_pos = ctx.OpLoad(ctx.F32[4], ctx.output_position);
+    const Id b4 = ctx.OpCompositeConstruct(ctx.U1[4], batched, batched, batched, batched);
+    ctx.OpStore(ctx.output_position, ctx.OpSelect(ctx.F32[4], b4, batched_pos, cur_pos));
+
+    const Id out0_z_ptr = ctx.OpAccessChain(out0.pointer_type, out0.id, ctx.ConstU32(2u));
+    const Id out0_w_ptr = ctx.OpAccessChain(out0.pointer_type, out0.id, ctx.ConstU32(3u));
+    ctx.OpStore(out0_z_ptr, ctx.OpSelect(f32, batched, in_z, ctx.OpLoad(f32, out0_z_ptr)));
+    ctx.OpStore(out0_w_ptr, ctx.OpSelect(f32, batched, one, ctx.OpLoad(f32, out0_w_ptr)));
+
+    const Id out1_z_ptr = ctx.OpAccessChain(out1.pointer_type, out1.id, ctx.ConstU32(2u));
+    const Id tile_tag = ctx.OpFNegate(f32, in_w);
+    ctx.OpStore(out1_z_ptr, ctx.OpSelect(f32, batched, tile_tag, ctx.OpLoad(f32, out1_z_ptr)));
+    return batched;
+}
+
 // The game's UI on an output of another aspect ratio (UiComposition::EdgeParam): with
 // motion_param set, a vertex in a corner of the game's 16:9 screen or past it (on or beyond its
 // edges in both x and y: normalized edges, 16 bits each) goes to that corner of the output, so
 // that full-screen fills and backgrounds (the game draws some a little larger than its screen)
 // cover the output; and (subtitles' backdrops, lower screen) a vertex on a side edge. What the
 // HUD moved past one edge only stays where it is.
-void EmitUiEdgeStretch(EmitContext& ctx) {
+void EmitUiEdgeStretch(EmitContext& ctx, Id skip_when = {}) {
     const Id f32 = ctx.F32[1];
     const Id u32 = ctx.U32[1];
     const Id b1 = ctx.U1[1];
     const Id param = ctx.OpLoad(u32, ctx.OpAccessChain(
         ctx.TypePointer(spv::StorageClass::PushConstant, u32), ctx.push_data_block,
         ctx.ConstU32(PushData::MotionParamIndex)));
-    const Id on = ctx.OpINotEqual(b1, param, ctx.u32_zero_value);
+    Id on = ctx.OpINotEqual(b1, param, ctx.u32_zero_value);
+    if (Sirit::ValidId(skip_when)) {
+        on = ctx.OpLogicalAnd(b1, on, ctx.OpLogicalNot(b1, skip_when));
+    }
     const Id unit = ctx.Constant(f32, 1.0f / 65535.0f);
     const Id ex = ctx.OpFMul(f32, ctx.OpConvertUToF(f32, ctx.OpShiftRightLogical(u32, param, ctx.ConstU32(16u))), unit);
     const Id ey = ctx.OpFMul(f32, ctx.OpConvertUToF(f32, ctx.OpShiftRightLogical(u32,
@@ -243,6 +288,7 @@ void EmitUiEdgeStretch(EmitContext& ctx) {
 } // namespace
 
 void EmitEpilogue(EmitContext& ctx) {
+    const Id light_tile_batched = EmitLightTileBatchPatch(ctx);
     if (Sirit::ValidId(ctx.motion_out_cur)) {
         EmitVertexMotion(ctx);
     }
@@ -258,7 +304,7 @@ void EmitEpilogue(EmitContext& ctx) {
     } else if (ctx.hw_stage == HwStage::Vertex && !Sirit::ValidId(ctx.motion_out_cur)) {
         // Any vertex shader can draw the UI (Scaleform's, the HUD's gauges and icons); outside
         // the UI motion_param is 0 and this does nothing.
-        EmitUiEdgeStretch(ctx);
+        EmitUiEdgeStretch(ctx, light_tile_batched);
     }
 }
 

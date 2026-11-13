@@ -45,8 +45,21 @@ namespace Vulkan {
 
 class GraphicsPipeline;
 class Runtime;
+struct BatchedLightStageOverride;
+struct BatchedLightDrawOverride;
+class LightTileBatcher;
+class VsmShadowMemo;
+class ObjectVelocityCuller;
+class VfxUiBatcher;
 
 class Rasterizer {
+    friend struct BatchedLightStageOverride;
+    friend struct BatchedLightDrawOverride;
+    friend class LightTileBatcher;
+    friend class VsmShadowMemo;
+    friend class ObjectVelocityCuller;
+    friend class VfxUiBatcher;
+
 public:
     explicit Rasterizer(const Instance& instance, Scheduler& scheduler, Runtime& runtime,
                         BbCp::CommandProcessor* liverpool);
@@ -218,8 +231,25 @@ public:
     /// bbport (any thread): the command processor wrote these bytes outside the command stream
     /// (labels, timestamps, occlusion results): VRAM copies of them get them too.
     void NoteLateCommandWrite(VAddr addr, const void* data, u64 size) {
+        InvalidateStageACpuShadow(addr, size);
         buffer_cache.NoteLateCommandWrite(addr, data, size);
     }
+    /// Stage 8: Stage-A CPU-source constant shadow & deferred local-light tile batcher hooks.
+    void NoteStageACpuCopyBatch(const u32* raw_regions, u32 count) noexcept;
+    void InvalidateStageACpuShadow(VAddr addr, u64 size) noexcept;
+    void FlushLightTileBatches();
+    [[nodiscard]] bool HasPendingLightTiles() const noexcept;
+    /// Stage 9: Stage-A local VSM point/spot shadow map & Sample13Weight blur memoization hooks.
+    [[nodiscard]] bool TryInterceptVsmClearColor(const DirectClearColorArgs& args);
+    [[nodiscard]] bool TryInterceptVsmClearDepth(const DirectClearDepthStencilArgs& args);
+    [[nodiscard]] bool TryInterceptVsmCopyTextureRegion(const DirectCopyTextureRegionArgs& args);
+    void NotifyVsmBeforeCopyBatch(const u32* raw_regions, u32 count);
+    void InvalidateVsmTargetRange(VAddr dst_va, u64 byte_size);
+    void FlushVsmShadowMemo();
+    [[nodiscard]] bool HasPendingVsmShadowWork() const noexcept;
+    /// Stage 11: Stage-A VFX soft-particle, Scaleform 2D HUD & small-draw batcher hooks.
+    void FlushVfxUiBatches();
+    [[nodiscard]] bool HasPendingVfxUiBatches() const noexcept;
     /// bbport: the command processor wrote `size` bytes of `data` at addr with the CPU in decode order
     /// (WriteData, a constant RAM dump; the decoder reads them there). Where the GPU's own data there
     /// is in VRAM the bytes go into it in stream order, else the caches are invalidated (no write
@@ -239,6 +269,7 @@ public:
     /// NoteCommandWrite for a write made on stage A: handed to the recording thread in order (a copy
     /// of the bytes) instead of draining it first.
     void NoteCommandWriteInOrder(VAddr addr, const void* data, u64 size);
+    static void NoteCommandWriteTask(Rasterizer& self, const u8* bytes);
     /// bbport: a guest thread wrote [addr, addr + size) with a libc import (memcpy, memset, memmove)
     /// over pages the caches watch (no write tracking): what a write fault did.
     void OnCpuWrite(VAddr addr, u64 size);
@@ -296,7 +327,7 @@ public:
     void RetireSubmission();
     /// Stage A: guest memory the recording thread will write for work handed to it (storage
     /// buffers, DMA, WriteData, fences); constants overlapping it are bound there, not copied here.
-    void NotePendingGpuWrite(VAddr address, u64 size);
+    void NotePendingGpuWrite(VAddr address, u64 size, bool invalidate_stage_a_shadow = true);
     /// GPU command thread: a copy into guest memory by the command processor (DMA_DATA), kept
     /// until the GPU has run it for the program checks (SyncProgramWrites).
     void NoteCopyIntoMemory(VAddr address, u64 size);
@@ -571,7 +602,8 @@ private:
     /// Hands a draw (or, with `cs`, a dispatch) to the recording thread.
     void PostDraw(const Pipeline* pipeline, const PreparedDraw* used_prepared, bool is_indexed,
                   u32 index_offset, const Gcn::ComputeProgram* cs = nullptr,
-                  const IndirectDraw* indirect = nullptr);
+                  const IndirectDraw* indirect = nullptr,
+                  const BatchedLightDrawOverride* batch_override = nullptr);
     /// Everything of a direct dispatch after the pipeline selection (GPU thread or stage B).
     void DispatchRecord(const ComputePipeline* pipeline);
     /// The compute registers of the dispatch being recorded.
@@ -580,7 +612,8 @@ private:
     struct RingBinding;
     void CollectRingBindings(const Shader::Info& stage, const PreparedDraw* prepared,
                              boost::container::static_vector<RingBinding, Shader::NUM_BUFFERS>& out,
-                             const Gcn::ComputeProgram* cs = nullptr);
+                             const Gcn::ComputeProgram* cs = nullptr,
+                             const BatchedLightStageOverride* st_ovr = nullptr);
     void PrintPipeStats();
     /// The registers of the draw being recorded: stage B's copy there, else Liverpool's.
     const Gcn::Regs& Regs() const;
@@ -1299,6 +1332,10 @@ private:
     std::array<DirectBufImgCopyMemo, kDirectBufImgCopyMemoSlots> direct_buf_img_copy_memo{};
     VideoCore::DirectBuffers::Manager direct_buffers{instance, scheduler, runtime};
     std::unique_ptr<ConstantRing> constant_ring;
+    std::unique_ptr<LightTileBatcher> light_tile_batcher;
+    std::unique_ptr<VsmShadowMemo> vsm_shadow_memo;
+    std::unique_ptr<ObjectVelocityCuller> object_vel_culler;
+    std::unique_ptr<VfxUiBatcher> vfx_ui_batcher;
     std::unique_ptr<class OcclusionQueries> occlusion;
     std::unique_ptr<class ButtonPrompts> prompts; ///< bbport: the key guide icons for the device in use
     std::unique_ptr<class GpuTimestamps> timestamps;

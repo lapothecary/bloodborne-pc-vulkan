@@ -54,6 +54,22 @@ public:
         return at % Capacity;
     }
 
+    /// Stage A: checks whether `size` bytes at `alignment` fit without advancing `position`.
+    [[nodiscard]] bool HasFreeSpace(u64 size, u64 alignment = 256) noexcept {
+        u64 at = (position + alignment - 1) & ~(alignment - 1);
+        if (at % Capacity + size > Capacity) {
+            at += Capacity - at % Capacity;
+        }
+        const auto in_use = [&] { return at + size > Capacity && at + size - Capacity > retired; };
+        if (in_use()) {
+            Retire();
+            if (in_use()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     [[nodiscard]] u8* Data(u64 offset) noexcept {
         return buffer.mapped_data.data() + offset;
     }

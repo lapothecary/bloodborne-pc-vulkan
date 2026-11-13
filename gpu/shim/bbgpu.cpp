@@ -17,6 +17,7 @@
 #include <condition_variable>
 #include "common/polyfill_thread.h"
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <chrono>
@@ -110,21 +111,42 @@ namespace {
 // it was read at. The GPU command thread clamps and copies thousands of constant ranges a frame,
 // nearly all within the region of the one before: two calls into the runtime each (~5% of it).
 struct RegionCache {
-    struct Entry {
-        uintptr_t start = 0, end = 0;
+    static constexpr u32 kSets = 256u;
+    static constexpr u32 kWays = 4u;
+    static constexpr u32 kMaxSpans = 256u;
+
+    struct Span {
+        uintptr_t start = 0;
+        uintptr_t end = 0;
+        u8 mapped = 0;
     };
+    struct TlbSlot {
+        u64 page2m = ~u64{0};
+        u16 span_idx = 0;
+        u16 lru = 0;
+    };
+
     u64 generation = 1; // odd: invalid
-    u32 last = 0;
-    u32 count = 0;
-    u32 next = 0;
-    std::array<Entry, 64> entries{};
+    u32 last_span = 0;
+    u32 span_count = 0;
+    u32 span_next = 0;
+    u16 lru_clock = 0;
+    std::array<Span, kMaxSpans> spans{};
+    std::array<TlbSlot, kSets * kWays> tlb{};
+
+    static size_t SetIndex(u64 page2m) noexcept {
+        u64 h = page2m * 0x9E3779B97F4A7C15ULL;
+        h ^= h >> 32;
+        return static_cast<size_t>(h & (kSets - 1u));
+    }
 };
-thread_local RegionCache region_cache;
+// Heap-allocated per thread to save ~1 KiB of static PT_TLS (FMOD threads use 64 KiB stacks).
+thread_local std::unique_ptr<RegionCache> tls_region_cache;
 const uint64_t* g_memory_generation_ptr = nullptr;
 
-// V6.2: Resolves the maximal contiguous mapped span [start, end) containing `address` against the
-// 64-slot per-thread cache, eliminating 8.6M+ pthread_rwlock acquisitions in runtime_memory_clamp
-// on unbounded 0xFFFFFFFF V# bindings across Stage A, Resolvers, and Stage B.
+// V6.2+: Resolves the maximal contiguous mapped/unmapped span [start, end) containing `address`
+// via an O(1) 1,024-entry 4-way 2 MiB TLB + 256-span table, preventing linear scans and FIFO
+// rwlock thrashing even after map streaming fragments guest VMAs into >64 non-contiguous spans.
 bool LookupMappedEnd(VAddr address, uintptr_t& out_end) {
     const uint64_t* gen_ptr = g_memory_generation_ptr;
     if (!gen_ptr) [[unlikely]] {
@@ -135,32 +157,92 @@ bool LookupMappedEnd(VAddr address, uintptr_t& out_end) {
     if (generation & 1) {
         return false; // being changed
     }
-    auto& cache = region_cache;
+    RegionCache* ptr = tls_region_cache.get();
+    if (!ptr) [[unlikely]] {
+        tls_region_cache = std::make_unique<RegionCache>();
+        ptr = tls_region_cache.get();
+    }
+    auto& cache = *ptr;
+    const u64 page2m = address >> 21;
+    const size_t set_base = RegionCache::SetIndex(page2m) * RegionCache::kWays;
+
+    auto insert_tlb = [&](u16 s_idx) noexcept {
+        size_t victim = set_base;
+        for (size_t w = 0; w < RegionCache::kWays; ++w) {
+            const auto& sl = cache.tlb[set_base + w];
+            if (sl.page2m == ~u64{0} || sl.page2m == page2m) {
+                victim = set_base + w;
+                break;
+            }
+            if (static_cast<u16>(cache.lru_clock - sl.lru) >
+                static_cast<u16>(cache.lru_clock - cache.tlb[victim].lru)) {
+                victim = set_base + w;
+            }
+        }
+        cache.tlb[victim] = {page2m, s_idx, ++cache.lru_clock};
+    };
+
     if (cache.generation == generation) {
-        if (cache.count != 0) {
-            const auto& mru = cache.entries[cache.last];
+        if (cache.span_count != 0) {
+            const auto& mru = cache.spans[cache.last_span];
             if (address >= mru.start && address < mru.end) {
+                if (!mru.mapped) {
+                    return false;
+                }
                 out_end = mru.end;
                 return true;
             }
-            for (u32 i = 0; i < cache.count; ++i) {
-                const auto& e = cache.entries[i];
-                if (address >= e.start && address < e.end) {
-                    cache.last = i;
-                    out_end = e.end;
+            for (size_t w = 0; w < RegionCache::kWays; ++w) {
+                auto& sl = cache.tlb[set_base + w];
+                if (sl.page2m == page2m && sl.span_idx < cache.span_count) {
+                    const auto& sp = cache.spans[sl.span_idx];
+                    if (address >= sp.start && address < sp.end) {
+                        sl.lru = ++cache.lru_clock;
+                        cache.last_span = sl.span_idx;
+                        if (!sp.mapped) {
+                            return false;
+                        }
+                        out_end = sp.end;
+                        return true;
+                    }
+                }
+            }
+            for (u32 i = 0; i < cache.span_count; ++i) {
+                const auto& sp = cache.spans[i];
+                if (address >= sp.start && address < sp.end) {
+                    cache.last_span = i;
+                    insert_tlb(static_cast<u16>(i));
+                    if (!sp.mapped) {
+                        return false;
+                    }
+                    out_end = sp.end;
                     return true;
                 }
             }
         }
     } else {
         cache.generation = generation;
-        cache.last = 0;
-        cache.count = 0;
-        cache.next = 0;
+        cache.last_span = 0;
+        cache.span_count = 0;
+        cache.span_next = 0;
+        cache.lru_clock = 0;
+        cache.tlb.fill({});
     }
+
     uintptr_t start = 0, end = 0;
     int mapped = 0;
-    if (!runtime_memory_region(address, &start, &end, &mapped) || !mapped || end <= start) {
+    if (!runtime_memory_region(address, &start, &end, &mapped) || end <= start) {
+        return false;
+    }
+    if (!mapped) {
+        if (__atomic_load_n(gen_ptr, __ATOMIC_ACQUIRE) == generation) {
+            const u32 slot = (cache.span_count < RegionCache::kMaxSpans)
+                                 ? cache.span_count++
+                                 : (cache.span_next++ & (RegionCache::kMaxSpans - 1u));
+            cache.spans[slot] = {start, end, 0u};
+            cache.last_span = slot;
+            insert_tlb(static_cast<u16>(slot));
+        }
         return false;
     }
     uintptr_t contig_start = start;
@@ -186,11 +268,12 @@ bool LookupMappedEnd(VAddr address, uintptr_t& out_end) {
     if (__atomic_load_n(gen_ptr, __ATOMIC_ACQUIRE) != generation) {
         return false;
     }
-    const u32 slot = (cache.count < cache.entries.size())
-                         ? cache.count++
-                         : (cache.next++ & (cache.entries.size() - 1));
-    cache.entries[slot] = {contig_start, contig_end};
-    cache.last = slot;
+    const u32 slot = (cache.span_count < RegionCache::kMaxSpans)
+                         ? cache.span_count++
+                         : (cache.span_next++ & (RegionCache::kMaxSpans - 1u));
+    cache.spans[slot] = {contig_start, contig_end, 1u};
+    cache.last_span = slot;
+    insert_tlb(static_cast<u16>(slot));
     out_end = contig_end;
     return true;
 }

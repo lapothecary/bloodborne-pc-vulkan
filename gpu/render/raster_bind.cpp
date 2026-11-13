@@ -596,6 +596,30 @@ void Rasterizer::ResolveVertexBuffers(const GraphicsPipeline* pipeline,
     VertexInputs<Gcn::Buffer> guest_buffers;
     // Inputs a draw-preparation worker read from the same registers and (verified) user data.
     const auto& fetch = pipeline->GetFetchShader();
+    if (constant_ring && !packet_vsharps.empty() &&
+        packet_vsharps[0].base_address >= kConstRingVertexBase) {
+        const bool dynamic_input = instance.IsVertexInputDynamicState();
+        pipeline->GetVertexInputs(attributes, bindings, divisors, guest_buffers,
+                                  regs.vgt_instance_step_rate_0, regs.vgt_instance_step_rate_1,
+                                  packet_vsharps);
+        const vk::Buffer ring_handle = constant_ring->Handle();
+        const u64 ring_cap = ConstantRing::Capacity;
+        for (const auto& buffer : guest_buffers) {
+            const u64 off = buffer.base_address >= kConstRingVertexBase
+                                ? (buffer.base_address - kConstRingVertexBase)
+                                : 0ULL;
+            v.host_buffers.push_back(ring_handle);
+            v.host_offsets.push_back(off);
+            if (!dynamic_input) {
+                const u64 max_sz = ring_cap > off ? (ring_cap - off) : 0ULL;
+                v.host_sizes.push_back(std::min<u64>(buffer.GetSize(), max_sz));
+                v.host_strides.push_back(buffer.GetStride());
+            }
+        }
+        v.num_buffers = static_cast<u32>(guest_buffers.size());
+        BbStats::native_buf_hits.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     const PreparedVertexInputs* ready =
         prepared && prepared->vertex.valid && instance.IsVertexInputDynamicState() && fetch &&
                 fetch->attributes.size() == prepared->vertex.count && !FrameCapture::Active() &&

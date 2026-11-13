@@ -6,6 +6,7 @@
 #include <cstring>
 #include <mutex>
 
+#include "render/vk_vsm_shadow_memo.h"
 #include "textures/texture_cache.h"
 
 namespace VideoCore::DirectTextures {
@@ -265,6 +266,8 @@ void PS4_SYSV_ABI bb_direct_vk_prepare_texture_write(const void* gpu_addr, uint6
     if (!gpu_addr || byte_size == 0) {
         return;
     }
+    Vulkan::VsmShadowMemo::NoteRetiredTextureRangeGlobal(reinterpret_cast<VAddr>(gpu_addr),
+                                                         byte_size);
     if (auto* cache =
             VideoCore::DirectTextures::g_active_cache.load(std::memory_order_acquire)) {
         cache->DisarmWatchedRange(reinterpret_cast<VAddr>(gpu_addr),
@@ -277,6 +280,8 @@ void PS4_SYSV_ABI bb_direct_vk_unwatch_texture_range(const void* gpu_addr, uint6
     if (!gpu_addr || byte_size == 0) {
         return;
     }
+    Vulkan::VsmShadowMemo::NoteRetiredTextureRangeGlobal(reinterpret_cast<VAddr>(gpu_addr),
+                                                         byte_size);
     if (auto* cache =
             VideoCore::DirectTextures::g_active_cache.load(std::memory_order_acquire)) {
         cache->DisarmWatchedRange(reinterpret_cast<VAddr>(gpu_addr),
@@ -290,6 +295,7 @@ void PS4_SYSV_ABI bb_direct_vk_retire_gpu_range(const void* gpu_addr, uint64_t b
         return;
     }
     const VAddr addr = reinterpret_cast<VAddr>(gpu_addr);
+    Vulkan::VsmShadowMemo::NoteRetiredTextureRangeGlobal(addr, byte_size);
     bool has_registered_image = false;
     if (auto* cache =
             VideoCore::DirectTextures::g_active_cache.load(std::memory_order_acquire)) {

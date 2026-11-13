@@ -15,6 +15,7 @@
 #include "render/direct_shaders.h"
 #include "render/runtime.h"
 #include "render/scheduler.h"
+#include "render/vk_vsm_shadow_memo.h"
 #include "shim/bbport_toggles.h"
 #include "textures/texture_cache.h"
 #include "vulkan/instance.h"
@@ -179,6 +180,10 @@ constexpr u32 kNativeOwnedGranuleShift = 2u; // 4 bytes per bit
 constexpr u32 kNativeOwnedWordShift = kNativeOwnedGranuleShift + 6u; // 256 bytes per u64 word
 constexpr size_t kNativeOwnedWords = static_cast<size_t>(kNativeDirSpan >> kNativeOwnedWordShift);
 std::array<std::atomic<u64>, kNativeOwnedWords> g_native_owned_4b{};
+// Stage 11: Lock-free 4-byte-granule bitmap of native GXGnmBuffers initialized on the CPU
+// (`has_initial_data != 0` and never GPU-written/retired), allowing Stage-A VfxUiBatcher to read
+// static quad index/vertex buffers directly from guest RAM in 2 ns without touching Stage-B locks.
+std::array<std::atomic<u64>, kNativeOwnedWords> g_cpu_immutable_4b{};
 
 // N1.2 / N1.2c: 262,144-slot (32,768 sets x 8 ways + 4-set linear probe = 32 candidate ways per
 // address, 4 MiB BSS) Murmur3-avalanched lock-free ExactBufferTable keyed by exact
@@ -220,6 +225,11 @@ void SetActiveCaches(BufferCache* buf_cache, TextureCache* tex_cache) noexcept {
             }
         }
         for (auto& word : g_native_owned_4b) {
+            if (word.load(std::memory_order_relaxed) != 0ULL) {
+                word.store(0ULL, std::memory_order_relaxed);
+            }
+        }
+        for (auto& word : g_cpu_immutable_4b) {
             if (word.load(std::memory_order_relaxed) != 0ULL) {
                 word.store(0ULL, std::memory_order_relaxed);
             }
@@ -772,6 +782,104 @@ bool OverlapsNativeOwnedRange(VAddr addr, u64 byte_size) noexcept {
     return IsExactNativeOwnedBuffer(addr);
 }
 
+void MarkCpuImmutableRange(VAddr addr, u64 byte_size) noexcept {
+    if (byte_size < 4ULL || addr < kNativeDirBase) {
+        return;
+    }
+    const u64 rel_start = addr - kNativeDirBase;
+    if (rel_start >= kNativeDirMaxBytes) {
+        return;
+    }
+    const u64 rel_end = std::min<u64>(rel_start + byte_size, kNativeDirMaxBytes);
+    const u64 first_bit = (rel_start + 3ULL) >> kNativeOwnedGranuleShift;
+    const u64 end_bit = rel_end >> kNativeOwnedGranuleShift;
+    if (end_bit <= first_bit) {
+        return;
+    }
+    const u64 last_bit = end_bit - 1ULL;
+    const u64 first_word = first_bit >> 6;
+    const u64 last_word = last_bit >> 6;
+    const u64 lo_mask = ~0ULL << (first_bit & 63ULL);
+    const u64 hi_mask = ~0ULL >> (63ULL - (last_bit & 63ULL));
+    if (first_word == last_word) {
+        g_cpu_immutable_4b[first_word].fetch_or(lo_mask & hi_mask, std::memory_order_release);
+        return;
+    }
+    g_cpu_immutable_4b[first_word].fetch_or(lo_mask, std::memory_order_release);
+    for (u64 w = first_word + 1ULL; w < last_word; ++w) {
+        g_cpu_immutable_4b[w].store(~0ULL, std::memory_order_release);
+    }
+    g_cpu_immutable_4b[last_word].fetch_or(hi_mask, std::memory_order_release);
+}
+
+void ClearCpuImmutableRange(VAddr addr, u64 byte_size) noexcept {
+    if (byte_size == 0 || addr >= kNativeDirBase + kNativeDirMaxBytes) {
+        return;
+    }
+    const VAddr end_va = addr + byte_size;
+    if (end_va <= kNativeDirBase) {
+        return;
+    }
+    const u64 rel_start = (addr > kNativeDirBase) ? (addr - kNativeDirBase) : 0ULL;
+    const u64 rel_end = std::min<u64>(end_va - kNativeDirBase, kNativeDirMaxBytes);
+    if (rel_end <= rel_start) {
+        return;
+    }
+    const u64 first_bit = rel_start >> kNativeOwnedGranuleShift;
+    const u64 end_bit =
+        (rel_end + ((1ULL << kNativeOwnedGranuleShift) - 1ULL)) >> kNativeOwnedGranuleShift;
+    if (end_bit <= first_bit) {
+        return;
+    }
+    const u64 last_bit = end_bit - 1ULL;
+    const u64 first_word = first_bit >> 6;
+    const u64 last_word = last_bit >> 6;
+    const u64 lo_mask = ~0ULL << (first_bit & 63ULL);
+    const u64 hi_mask = ~0ULL >> (63ULL - (last_bit & 63ULL));
+    if (first_word == last_word) {
+        g_cpu_immutable_4b[first_word].fetch_and(~(lo_mask & hi_mask), std::memory_order_release);
+        return;
+    }
+    g_cpu_immutable_4b[first_word].fetch_and(~lo_mask, std::memory_order_release);
+    for (u64 w = first_word + 1ULL; w < last_word; ++w) {
+        g_cpu_immutable_4b[w].store(0ULL, std::memory_order_release);
+    }
+    g_cpu_immutable_4b[last_word].fetch_and(~hi_mask, std::memory_order_release);
+}
+
+bool IsCpuReadableImmutableRange(VAddr addr, u64 byte_size) noexcept {
+    if (!g_ever_registered.load(std::memory_order_acquire) || byte_size == 0 ||
+        addr < kNativeDirBase) {
+        return false;
+    }
+    const u64 rel_start = addr - kNativeDirBase;
+    if (rel_start >= kNativeDirMaxBytes || byte_size > (kNativeDirMaxBytes - rel_start)) {
+        return false;
+    }
+    const u64 rel_end = rel_start + byte_size;
+    const u64 first_bit = rel_start >> kNativeOwnedGranuleShift;
+    const u64 last_bit =
+        ((rel_end + ((1ULL << kNativeOwnedGranuleShift) - 1ULL)) >> kNativeOwnedGranuleShift) -
+        1ULL;
+    const u64 first_word = first_bit >> 6;
+    const u64 last_word = last_bit >> 6;
+    const u64 lo_mask = ~0ULL << (first_bit & 63ULL);
+    const u64 hi_mask = ~0ULL >> (63ULL - (last_bit & 63ULL));
+    if (first_word == last_word) {
+        const u64 want = lo_mask & hi_mask;
+        return (g_cpu_immutable_4b[first_word].load(std::memory_order_acquire) & want) == want;
+    }
+    if ((g_cpu_immutable_4b[first_word].load(std::memory_order_acquire) & lo_mask) != lo_mask) {
+        return false;
+    }
+    for (u64 w = first_word + 1ULL; w < last_word; ++w) {
+        if (g_cpu_immutable_4b[w].load(std::memory_order_acquire) != ~0ULL) {
+            return false;
+        }
+    }
+    return (g_cpu_immutable_4b[last_word].load(std::memory_order_acquire) & hi_mask) == hi_mask;
+}
+
 namespace {
 std::atomic<u64> g_exact_buf_topology_gen{1};
 } // namespace
@@ -1145,6 +1253,7 @@ void Manager::OnGpuWrite(VAddr addr, u64 size) noexcept {
     if (size == 0) {
         return;
     }
+    ClearCpuImmutableRange(addr, size);
     NoteTransientCueHeapGpuWrite(addr, size);
     Vulkan::DirectShaders::InvalidateRange(addr, size);
     if (entries_by_base.empty()) {
@@ -2175,6 +2284,7 @@ void PS4_SYSV_ABI bb_direct_vk_note_fresh_gpu_range(const void* gpu_addr, uint64
         return;
     }
     const VAddr addr = reinterpret_cast<VAddr>(gpu_addr);
+    Vulkan::VsmShadowMemo::NoteBufferWriteGlobal(addr, byte_size);
     if (VideoCore::DirectBuffers::IsTransientCueHeap(addr, byte_size)) {
         VideoCore::DirectBuffers::NoteTransientCueHeapAlloc(addr, byte_size);
         if (auto* buf = VideoCore::DirectBuffers::g_active_buf_cache.load(std::memory_order_acquire)) {
@@ -2185,6 +2295,7 @@ void PS4_SYSV_ABI bb_direct_vk_note_fresh_gpu_range(const void* gpu_addr, uint64
     const bool had_native = VideoCore::DirectBuffers::OverlapsNativeOwnedRange(addr, byte_size);
     if (had_native) {
         VideoCore::DirectBuffers::ClearNativeOwnedRange(addr, byte_size);
+        VideoCore::DirectBuffers::ClearCpuImmutableRange(addr, byte_size);
     }
     VideoCore::DirectBuffers::NoteTransientCueHeapAlloc(addr, byte_size);
     VideoCore::DirectBuffers::NoteNativeGpuBlockAlloc(addr, byte_size);
@@ -2210,6 +2321,7 @@ void PS4_SYSV_ABI bb_direct_vk_prepare_buffer_write(const void* gpu_addr, uint64
         return;
     }
     const VAddr addr = reinterpret_cast<VAddr>(gpu_addr);
+    Vulkan::VsmShadowMemo::NoteBufferWriteGlobal(addr, byte_size);
     BbLayer::WriteTraps::Set(addr, byte_size, BbLayer::WriteTraps::Mirror, false);
     if (auto* buf = VideoCore::DirectBuffers::g_active_buf_cache.load(std::memory_order_acquire)) {
         buf->DisarmWatchedRange(addr, byte_size);
@@ -2254,9 +2366,14 @@ void PS4_SYSV_ABI bb_direct_vk_register_immutable_buffer(uint32_t resource_id,
     }
     const VAddr addr = reinterpret_cast<VAddr>(gpu_addr);
     const u64 span = alloc_byte_size >= raw_byte_size ? alloc_byte_size : raw_byte_size;
+    Vulkan::VsmShadowMemo::NoteBufferWriteGlobal(addr, span);
     VideoCore::DirectBuffers::g_ever_registered.store(true, std::memory_order_release);
     VideoCore::DirectBuffers::NoteNativeGpuBlockAlloc(addr, span);
     VideoCore::DirectBuffers::MarkNativeOwnedRange(addr, span);
+    VideoCore::DirectBuffers::ClearCpuImmutableRange(addr, span);
+    if ((bind_flags & 0x90u) == 0u) {
+        VideoCore::DirectBuffers::MarkCpuImmutableRange(addr, raw_byte_size);
+    }
     VideoCore::DirectBuffers::NoteExactNativeBuffer(addr, raw_byte_size, static_cast<u32>(span),
                                                     true);
     VideoCore::DirectBuffers::MarkGuestImmutableRange(addr, span);
@@ -2285,9 +2402,14 @@ void PS4_SYSV_ABI bb_direct_vk_register_native_buffer(uint32_t resource_id,
     }
     const VAddr addr = reinterpret_cast<VAddr>(gpu_addr);
     const u64 span = alloc_byte_size >= raw_byte_size ? alloc_byte_size : raw_byte_size;
+    Vulkan::VsmShadowMemo::NoteBufferWriteGlobal(addr, span);
     VideoCore::DirectBuffers::g_ever_registered.store(true, std::memory_order_release);
     VideoCore::DirectBuffers::NoteNativeGpuBlockAlloc(addr, span);
     VideoCore::DirectBuffers::MarkNativeOwnedRange(addr, span);
+    VideoCore::DirectBuffers::ClearCpuImmutableRange(addr, span);
+    if (usage_type == 1u && has_initial_data != 0u && (bind_flags & 0x90u) == 0u) {
+        VideoCore::DirectBuffers::MarkCpuImmutableRange(addr, raw_byte_size);
+    }
     VideoCore::DirectBuffers::NoteExactNativeBuffer(addr, raw_byte_size, static_cast<u32>(span),
                                                     true);
     VideoCore::DirectBuffers::MarkGuestImmutableRange(addr, span);
@@ -2311,6 +2433,7 @@ void PS4_SYSV_ABI bb_direct_vk_retire_buffer_range(const void* gpu_addr, uint64_
         return;
     }
     const VAddr addr = reinterpret_cast<VAddr>(gpu_addr);
+    Vulkan::VsmShadowMemo::NoteBufferWriteGlobal(addr, byte_size);
     if (VideoCore::DirectBuffers::IsTransientCueHeap(addr, byte_size)) {
         VideoCore::DirectBuffers::NoteTransientCueHeapFree(addr, byte_size);
         return;
@@ -2322,6 +2445,7 @@ void PS4_SYSV_ABI bb_direct_vk_retire_buffer_range(const void* gpu_addr, uint64_
     const bool had_native = VideoCore::DirectBuffers::OverlapsNativeOwnedRange(addr, byte_size);
     if (had_native) {
         VideoCore::DirectBuffers::ClearNativeOwnedRange(addr, byte_size);
+        VideoCore::DirectBuffers::ClearCpuImmutableRange(addr, byte_size);
     }
     VideoCore::DirectBuffers::NoteTransientCueHeapFree(addr, byte_size);
     VideoCore::DirectBuffers::NoteNativeGpuBlockFree(addr, byte_size);

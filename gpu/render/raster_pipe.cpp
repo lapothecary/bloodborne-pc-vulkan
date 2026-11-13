@@ -3,6 +3,10 @@
 // (dirty registers, user data, constants) and stage B (draw recording thread) records it.
 
 #include "render/raster_internal.h"
+#include "render/vk_light_tile_batch.h"
+#include "render/vk_vsm_shadow_memo.h"
+#include "render/vk_obj_vel_cull.h"
+#include "render/vk_vfx_ui_batch.h"
 #include "buffers/direct_buffers.h"
 #include "cp/cp_tasks.h"
 #include "../../dantelion_gx/include/gx_direct_vulkan.h"
@@ -116,10 +120,128 @@ namespace {
 std::unordered_map<const char*, std::unordered_map<u32, u64>> drain_sites;
 } // namespace
 
+void Rasterizer::NoteStageACpuCopyBatch(const u32* raw_regions, u32 count) noexcept {
+    if (raw_regions && count > 0u && count <= 32u) {
+        for (u32 i = 0; i < count; ++i) {
+            DirectCopyRegion reg{};
+            std::memcpy(&reg, raw_regions + i * 6u, sizeof(reg));
+            if (reg.dst_va && reg.byte_size) {
+                VsmShadowMemo::NoteBufferWriteGlobal(reg.dst_va, reg.byte_size);
+            }
+        }
+    }
+    if (light_tile_batcher && OnStageA()) {
+        light_tile_batcher->NoteStageACpuCopyBatch(raw_regions, count);
+    }
+    if (object_vel_culler && OnStageA()) {
+        object_vel_culler->NoteStageACpuCopyBatch(raw_regions, count);
+    }
+    if (vfx_ui_batcher && OnStageA()) {
+        vfx_ui_batcher->NoteStageACpuCopyBatch(raw_regions, count);
+    }
+}
+
+void Rasterizer::InvalidateStageACpuShadow(VAddr addr, u64 size) noexcept {
+    VsmShadowMemo::NoteBufferWriteGlobal(addr, size);
+    if (light_tile_batcher && OnStageA()) {
+        light_tile_batcher->InvalidateCpuShadow(addr, size);
+    }
+    if (object_vel_culler && OnStageA()) {
+        object_vel_culler->InvalidateCpuShadow(addr, size);
+    }
+    if (vfx_ui_batcher && OnStageA()) {
+        vfx_ui_batcher->InvalidateCpuShadow(addr, size);
+    }
+}
+
+bool Rasterizer::HasPendingLightTiles() const noexcept {
+    return light_tile_batcher && light_tile_batcher->HasPendingTiles();
+}
+
+void Rasterizer::FlushLightTileBatches() {
+    if (light_tile_batcher && OnStageA() && light_tile_batcher->HasPendingTiles()) {
+        light_tile_batcher->Flush(*this);
+    }
+}
+
+bool Rasterizer::HasPendingVfxUiBatches() const noexcept {
+    return vfx_ui_batcher && vfx_ui_batcher->HasPendingDraws();
+}
+
+void Rasterizer::FlushVfxUiBatches() {
+    if (vfx_ui_batcher && OnStageA() && vfx_ui_batcher->HasPendingDraws()) {
+        vfx_ui_batcher->Flush(*this);
+    }
+}
+
+bool Rasterizer::HasPendingVsmShadowWork() const noexcept {
+    return vsm_shadow_memo && vsm_shadow_memo->HasPendingWork();
+}
+
+void Rasterizer::FlushVsmShadowMemo() {
+    if (vsm_shadow_memo && OnStageA() && vsm_shadow_memo->HasPendingWork()) {
+        vsm_shadow_memo->FlushAll(*this);
+    }
+}
+
+bool Rasterizer::TryInterceptVsmClearColor(const DirectClearColorArgs& args) {
+    if (!vsm_shadow_memo || !UseDrawPipe() || !OnStageA()) {
+        return false;
+    }
+    if (HasPendingVfxUiBatches()) {
+        FlushVfxUiBatches();
+    }
+    if (HasPendingLightTiles()) {
+        FlushLightTileBatches();
+    }
+    return vsm_shadow_memo->TryInterceptClearColor(*this, args);
+}
+
+bool Rasterizer::TryInterceptVsmClearDepth(const DirectClearDepthStencilArgs& args) {
+    if (!vsm_shadow_memo || !UseDrawPipe() || !OnStageA()) {
+        return false;
+    }
+    if (HasPendingVfxUiBatches()) {
+        FlushVfxUiBatches();
+    }
+    if (HasPendingLightTiles()) {
+        FlushLightTileBatches();
+    }
+    return vsm_shadow_memo->TryInterceptClearDepth(*this, args);
+}
+
+bool Rasterizer::TryInterceptVsmCopyTextureRegion(const DirectCopyTextureRegionArgs& args) {
+    if (!vsm_shadow_memo || !UseDrawPipe() || !OnStageA()) {
+        return false;
+    }
+    if (HasPendingVfxUiBatches()) {
+        FlushVfxUiBatches();
+    }
+    if (HasPendingLightTiles()) {
+        FlushLightTileBatches();
+    }
+    return vsm_shadow_memo->TryInterceptCopyTextureRegion(*this, args);
+}
+
+void Rasterizer::NotifyVsmBeforeCopyBatch(const u32* raw_regions, u32 count) {
+    if (vsm_shadow_memo && OnStageA()) {
+        vsm_shadow_memo->NotifyBeforeCopyBatch(*this, raw_regions, count);
+    }
+}
+
+void Rasterizer::InvalidateVsmTargetRange(VAddr dst_va, u64 byte_size) {
+    if (vsm_shadow_memo && OnStageA()) {
+        vsm_shadow_memo->InvalidateTargetRangeOnStageA(*this, dst_va, byte_size);
+    }
+}
+
 void Rasterizer::DrainDrawPipe(u32 reason, u32 line, const char* function) {
     if (!draw_pipe || !OnStageA()) {
         return;
     }
+    FlushVsmShadowMemo();
+    FlushLightTileBatches();
+    FlushVfxUiBatches();
     FlushStageAReadCoalescer();
     static const bool stats = std::getenv("BB_FRAME_STATS") != nullptr;
     if (!stats) {
@@ -147,9 +269,12 @@ bool Rasterizer::IsGpuSideThreadId(u32 tid) const {
     return tid == liverpool->GetGpuCommandProcessorThreadId();
 }
 
-void Rasterizer::NotePendingGpuWrite(VAddr address, u64 size) {
+void Rasterizer::NotePendingGpuWrite(VAddr address, u64 size, bool invalidate_stage_a_shadow) {
     if (!draw_pipe || !size) {
         return;
+    }
+    if (invalidate_stage_a_shadow) {
+        InvalidateStageACpuShadow(address, size);
     }
     VideoCore::DirectBuffers::NoteTransientCueHeapGpuWrite(address, size);
     // Numbered by packet (a position, the packet's start, counted as reached once the packet
@@ -295,6 +420,8 @@ void Rasterizer::WaitForPendingReads(VAddr address, u64 size) {
     if (!draw_pipe || !OnStageA()) {
         return;
     }
+    FlushVsmShadowMemo();
+    FlushLightTileBatches();
     FlushStageAReadCoalescer();
     // BB_EXP_CONSTRAM_FINISH=1 (experiment): every dump waits until the GPU has run all earlier work.
     // 2: stage B catches up and submits, no GPU wait; 3: waits for the GPU only (work submitted).
@@ -438,7 +565,21 @@ void Rasterizer::WaitForInPlaceReads(u64 packet) {
     constram_gpu_wait_cycles += __rdtsc() - start;
 }
 
+namespace {
+struct CmdWriteTaskHeader {
+    VAddr addr;
+    u64 size;
+};
+} // namespace
+
+void Rasterizer::NoteCommandWriteTask(Rasterizer& self, const u8* bytes) {
+    CmdWriteTaskHeader write{};
+    std::memcpy(&write, bytes, sizeof(write));
+    self.NoteCommandWrite(write.addr, bytes + sizeof(write), write.size, true);
+}
+
 void Rasterizer::NoteCommandWriteInOrder(VAddr addr, const void* data, u64 size) {
+    InvalidateStageACpuShadow(addr, size);
     const bool enabled = ConstRamPipe();
     if (VideoCore::WriteTracking() || !IsMapped(addr, size)) {
         return;
@@ -449,22 +590,13 @@ void Rasterizer::NoteCommandWriteInOrder(VAddr addr, const void* data, u64 size)
     }
     // The caches belong to the recording thread while it has packets: it updates them in order
     // (later packets see the new bytes there; the memory already holds them for this thread).
-    struct Header {
-        VAddr addr;
-        u64 size;
-    };
     thread_local std::vector<u8> payload;
-    payload.resize(sizeof(Header) + size);
-    const Header header{addr, size};
+    payload.resize(sizeof(CmdWriteTaskHeader) + size);
+    const CmdWriteTaskHeader header{addr, size};
     std::memcpy(payload.data(), &header, sizeof(header));
     std::memcpy(payload.data() + sizeof(header), data, size);
-    RunInOrder(
-        [](Rasterizer& self, const u8* bytes) {
-            Header write;
-            std::memcpy(&write, bytes, sizeof(write));
-            self.NoteCommandWrite(write.addr, bytes + sizeof(write), write.size, true);
-        },
-        payload.data(), static_cast<u32>(payload.size()), BbToggle::PipelinedTasks, false);
+    RunInOrder(&Rasterizer::NoteCommandWriteTask, payload.data(), static_cast<u32>(payload.size()),
+               BbToggle::PipelinedTasks, false);
 }
 
 bool Rasterizer::PendingWriteOverlaps(VAddr address, u64 size) {
@@ -478,13 +610,14 @@ bool Rasterizer::PendingWriteOverlaps(VAddr address, u64 size) {
 
 void Rasterizer::CollectRingBindings(const Shader::Info& stage, const PreparedDraw* prepared,
                            boost::container::static_vector<RingBinding, Shader::NUM_BUFFERS>& out,
-                           const Gcn::ComputeProgram* cs) {
+                           const Gcn::ComputeProgram* cs,
+                           const BatchedLightStageOverride* st_ovr) {
     if (stage.buffers.empty()) {
         return;
     }
     BB_SECTION(ARing);
     const PreparedStage* prepared_stage = nullptr;
-    if (prepared && !BbToggle::Disabled(BbToggle::PreparedResources)) {
+    if (prepared && !st_ovr && !BbToggle::Disabled(BbToggle::PreparedResources)) {
         for (u32 i = 0; i < prepared->num_stages; ++i) {
             const auto& candidate = prepared->stages[i];
             if (&candidate.program->info == &stage &&
@@ -582,8 +715,10 @@ void Rasterizer::CollectRingBindings(const Shader::Info& stage, const PreparedDr
     const bool is_copy_shader = (stage.pgm_hash == Game::BufferCopyShader());
     static const bool n1_native_buf =
         gx_direct_vk::EnabledNativeVk(gx_direct_vk::kN1_NativeBuffers);
-    const u32* const stage_flat = stage.FlatUserData().data();
-    const VAddr stage_pgm_base = stage.ProgramBase();
+    const std::span<const u32> active_flat =
+        st_ovr ? st_ovr->flattened_ud_buf : std::span<const u32>{stage.flattened_ud_buf};
+    const u32* const stage_flat = active_flat.data();
+    const VAddr stage_pgm_base = st_ovr ? st_ovr->pgm_base : stage.ProgramBase();
     VAddr cue_base = 0;
     VAddr cue_end = 0;
     VideoCore::DirectBuffers::GetTransientCueHeapBounds(cue_base, cue_end);
@@ -596,12 +731,12 @@ void Rasterizer::CollectRingBindings(const Shader::Info& stage, const PreparedDr
         const auto& desc = stage.buffers[index];
         if (desc.IsSpecial()) {
             if (desc.buffer_type == Shader::BufferType::Flatbuf &&
-                !stage.flattened_ud_buf.empty()) {
-                const u64 flat_bytes = stage.flattened_ud_buf.size() * sizeof(u32);
+                !active_flat.empty()) {
+                const u64 flat_bytes = active_flat.size() * sizeof(u32);
                 if (resolvers) {
                     out.push_back({index, static_cast<u32>(flat_bytes), RingPending, 0, 0, 0});
                 } else {
-                    copy(index, stage.flattened_ud_buf.data(), 0, flat_bytes);
+                    copy(index, active_flat.data(), 0, flat_bytes);
                 }
             }
             continue;
@@ -896,7 +1031,19 @@ void Rasterizer::CollectRingBindings(const Shader::Info& stage, const PreparedDr
 
 void Rasterizer::PostDraw(const Pipeline* pipeline, const PreparedDraw* used_prepared,
                           bool is_indexed, u32 index_offset, const Gcn::ComputeProgram* cs,
-                          const IndirectDraw* indirect) {
+                          const IndirectDraw* indirect,
+                          const BatchedLightDrawOverride* batch_override) {
+    if (!batch_override) {
+        if (HasPendingVsmShadowWork()) {
+            FlushVsmShadowMemo();
+        }
+        if (HasPendingLightTiles()) {
+            FlushLightTileBatches();
+        }
+        if (HasPendingVfxUiBatches()) {
+            FlushVfxUiBatches();
+        }
+    }
     BB_SECTION(APostDraw);
     auto& dirty = liverpool->pipe_dirty;
     if (!pipe_synced) {
@@ -1024,10 +1171,22 @@ void Rasterizer::PostDraw(const Pipeline* pipeline, const PreparedDraw* used_pre
                     untracked_reads_packet = draw_pipe->NextPacket();
                 }
             }
+            const u32 cur_stage_slot = num_stages++;
+            const BatchedLightStageOverride* st_ovr =
+                (batch_override && cur_stage_slot < batch_override->stages.size())
+                    ? &batch_override->stages[cur_stage_slot]
+                    : nullptr;
+            const VAddr st_pgm_base = st_ovr ? st_ovr->pgm_base : stage->pgm_base;
+            const std::span<const u32> st_ud =
+                st_ovr ? st_ovr->user_data : std::span<const u32>{stage->user_data};
+            const std::span<const u32> st_flat =
+                st_ovr ? st_ovr->flattened_ud_buf : std::span<const u32>{stage->flattened_ud_buf};
             ring.clear();
             bool has_pending_flatbuf = false;
-            if (constant_ring && !BbToggle::Disabled(BbToggle::ConstantRing)) {
-                CollectRingBindings(*stage, used_prepared, ring, cs);
+            if (st_ovr && !st_ovr->collect_ring_bindings) {
+                ring.assign(st_ovr->ring_bindings.begin(), st_ovr->ring_bindings.end());
+            } else if (constant_ring && !BbToggle::Disabled(BbToggle::ConstantRing)) {
+                CollectRingBindings(*stage, st_ovr ? nullptr : used_prepared, ring, cs, st_ovr);
                 for (const auto& binding : ring) {
                     resolve |= binding.offset == RingPending;
                     if (binding.offset == RingPending && binding.address == 0) {
@@ -1037,30 +1196,28 @@ void Rasterizer::PostDraw(const Pipeline* pipeline, const PreparedDraw* used_pre
             } else {
                 untracked_reads_packet = draw_pipe->NextPacket(); // bindings not listed
             }
-            const u32 cur_stage_slot = num_stages++;
             const bool shared_ud_flat =
-                !Shader::flat_buf_replay &&
-                stage->flattened_ud_buf.size() >= stage->user_data.size();
-            const u32 flat_words = static_cast<u32>(stage->flattened_ud_buf.size());
-            const u32 ud_words = static_cast<u32>(stage->user_data.size());
+                !Shader::flat_buf_replay && st_flat.size() >= st_ud.size();
+            const u32 flat_words = static_cast<u32>(st_flat.size());
+            const u32 ud_words = static_cast<u32>(st_ud.size());
             bool reuse_stage_ud = false;
             if (cur_stage_slot < stage_a_ud_memo.size()) {
                 auto& memo = stage_a_ud_memo[cur_stage_slot];
                 if (!verify && shared_ud_flat && !has_pending_flatbuf &&
                     flat_words <= kMaxCachedStageWords) {
-                    if (memo.info == stage && memo.pgm_base == stage->pgm_base &&
+                    if (memo.info == stage && memo.pgm_base == st_pgm_base &&
                         memo.ud_size == ud_words && memo.flat_size == flat_words &&
                         (flat_words == 0u ||
-                         std::memcmp(memo.words.data(), stage->flattened_ud_buf.data(),
+                         std::memcmp(memo.words.data(), st_flat.data(),
                                      flat_words * sizeof(u32)) == 0)) {
                         reuse_stage_ud = true;
                     } else {
                         memo.info = stage;
-                        memo.pgm_base = stage->pgm_base;
+                        memo.pgm_base = st_pgm_base;
                         memo.ud_size = ud_words;
                         memo.flat_size = flat_words;
                         if (flat_words > 0u) {
-                            std::memcpy(memo.words.data(), stage->flattened_ud_buf.data(),
+                            std::memcpy(memo.words.data(), st_flat.data(),
                                         flat_words * sizeof(u32));
                         }
                     }
@@ -1124,7 +1281,43 @@ void Rasterizer::PostDraw(const Pipeline* pipeline, const PreparedDraw* used_pre
     vsharps.clear();
     const boost::container::static_vector<Gcn::Buffer, Shader::NUM_BUFFERS>* active_vsharps =
         &vsharps;
-    if (pipeline && !pipeline->IsCompute()) {
+    if (batch_override) {
+        vsharps.assign(batch_override->vsharps.begin(), batch_override->vsharps.end());
+        if (batch_override->note_guest_vb_ib_reads && pipeline && !pipeline->IsCompute()) {
+            if (!fast_native_post_skip || has_any_constram || BbCeStats::Enabled()) {
+                for (const auto& buffer : vsharps) {
+                    if (buffer.base_address != 0 && buffer.GetSize() > 0) {
+                        if (fast_native_post_skip &&
+                            VideoCore::DirectBuffers::IsNativeOwnedAddress(buffer.base_address)) {
+                            continue;
+                        }
+                        const u64 vb_bytes = VideoCore::DirectBuffers::ClampNativeGpuReadSize(
+                            buffer.base_address, buffer.GetSize());
+                        if (BbCeStats::Enabled()) {
+                            BbCeStats::Check(BbCeStats::Vertex, buffer.base_address, vb_bytes);
+                        }
+                        note_stage_b_read(buffer.base_address, vb_bytes);
+                    }
+                }
+            }
+            if (is_indexed &&
+                (!fast_native_post_skip || has_any_constram || BbCeStats::Enabled())) {
+                const auto& regs = liverpool->regs;
+                const u32 index_size =
+                    regs.index_buffer_type.index_type == Gcn::IndexType::Index16 ? 2 : 4;
+                const VAddr index_address =
+                    regs.index_base_address.Address<VAddr>() + u64(index_offset) * index_size;
+                const u64 index_bytes = u64(regs.num_indices) * index_size;
+                if (BbCeStats::Enabled()) {
+                    BbCeStats::Check(BbCeStats::Index, index_address, index_bytes);
+                }
+                if (!(fast_native_post_skip &&
+                      VideoCore::DirectBuffers::IsNativeOwnedAddress(index_address))) {
+                    note_stage_b_read(index_address, index_bytes);
+                }
+            }
+        }
+    } else if (pipeline && !pipeline->IsCompute()) {
         const auto* graphics = static_cast<const GraphicsPipeline*>(pipeline);
         if (const auto& fetch = graphics->GetFetchShader();
             fetch && fetch->attributes.size() <= vsharps.capacity()) {
@@ -1288,18 +1481,26 @@ void Rasterizer::PostDraw(const Pipeline* pipeline, const PreparedDraw* used_pre
             continue;
         }
         const u32 cur_slot = stage_index++;
+        const BatchedLightStageOverride* st_ovr =
+            (batch_override && cur_slot < batch_override->stages.size())
+                ? &batch_override->stages[cur_slot]
+                : nullptr;
+        const VAddr st_pgm_base = st_ovr ? st_ovr->pgm_base : stage->pgm_base;
+        const std::span<const u32> st_ud =
+            st_ovr ? st_ovr->user_data : std::span<const u32>{stage->user_data};
+        const std::span<const u32> st_flat =
+            st_ovr ? st_ovr->flattened_ud_buf : std::span<const u32>{stage->flattened_ud_buf};
         const auto& ring = rings[cur_slot];
         const u32 pad_flags = cur_slot < stage_ud_flags.size()
                                   ? stage_ud_flags[cur_slot]
-                                  : ((!Shader::flat_buf_replay &&
-                                      stage->flattened_ud_buf.size() >= stage->user_data.size())
+                                  : ((!Shader::flat_buf_replay && st_flat.size() >= st_ud.size())
                                          ? PacketStage::kSharedUdFlat
                                          : 0u);
         auto& header = *reinterpret_cast<PacketStage*>(out);
         header = {stage,
-                  stage->pgm_base,
-                  static_cast<u32>(stage->user_data.size()),
-                  static_cast<u32>(stage->flattened_ud_buf.size()),
+                  st_pgm_base,
+                  static_cast<u32>(st_ud.size()),
+                  static_cast<u32>(st_flat.size()),
                   static_cast<u32>(ring.size()),
                   pad_flags};
         out += sizeof(PacketStage);
@@ -1309,22 +1510,18 @@ void Rasterizer::PostDraw(const Pipeline* pipeline, const PreparedDraw* used_pre
         }
         if ((pad_flags & PacketStage::kReusePrevStageUd) == 0u) {
             if (pad_flags & PacketStage::kSharedUdFlat) {
-                if (!stage->flattened_ud_buf.empty()) {
-                    std::memcpy(out, stage->flattened_ud_buf.data(),
-                                stage->flattened_ud_buf.size() * sizeof(u32));
+                if (!st_flat.empty()) {
+                    std::memcpy(out, st_flat.data(), st_flat.size_bytes());
                 }
-                out += AlignPacket(u32(stage->flattened_ud_buf.size()) * sizeof(u32));
+                out += AlignPacket(u32(st_flat.size()) * sizeof(u32));
             } else {
-                if (!stage->user_data.empty()) {
-                    std::memcpy(out, stage->user_data.data(), stage->user_data.size_bytes());
+                if (!st_ud.empty()) {
+                    std::memcpy(out, st_ud.data(), st_ud.size_bytes());
                 }
-                if (!stage->flattened_ud_buf.empty()) {
-                    std::memcpy(out + stage->user_data.size_bytes(),
-                                stage->flattened_ud_buf.data(),
-                                stage->flattened_ud_buf.size() * sizeof(u32));
+                if (!st_flat.empty()) {
+                    std::memcpy(out + st_ud.size_bytes(), st_flat.data(), st_flat.size_bytes());
                 }
-                out += AlignPacket(u32(stage->user_data.size() + stage->flattened_ud_buf.size()) *
-                                   sizeof(u32));
+                out += AlignPacket(u32(st_ud.size() + st_flat.size()) * sizeof(u32));
             }
         }
     }
@@ -1357,6 +1554,9 @@ void Rasterizer::RetireSubmission() {
     if (!draw_pipe || !OnStageA()) {
         return;
     }
+    FlushVsmShadowMemo();
+    FlushLightTileBatches();
+    FlushVfxUiBatches();
     FlushStageAReadCoalescer();
     while (!pipe_keepalive.empty() && draw_pipe->Reached(pipe_keepalive.front().first)) {
         pipe_keepalive.pop_front();
@@ -1373,6 +1573,22 @@ bool Rasterizer::RunInOrder(OrderedTask task, const void* data, u32 size, u64 to
         BB_SECTION(Task);
         task(*this, static_cast<const u8*>(data));
         return false;
+    }
+    if (HasPendingVsmShadowWork() && OnStageA() &&
+        task != &BbCp::Tasks::DirectVkCopyBatchTask &&
+        task != &BbCp::Tasks::DirectVkReleaseLabelsBatchTask &&
+        task != &BbCp::Tasks::DirectVkReleaseU32LabelsBatchTask) {
+        FlushVsmShadowMemo();
+    }
+    if (HasPendingLightTiles() && OnStageA() &&
+        !LightTileBatcher::IsBatchSafeCpuConstantCopyTask(task, data, size)) {
+        light_tile_batcher->NoteTaskFlush();
+        FlushLightTileBatches();
+    }
+    if (HasPendingVfxUiBatches() && OnStageA() &&
+        !VfxUiBatcher::IsBatchSafeTask(task, data, size)) {
+        vfx_ui_batcher->NoteTaskFlush();
+        FlushVfxUiBatches();
     }
     if (reads_guest_memory) {
         untracked_reads_packet = draw_pipe->NextPacket();

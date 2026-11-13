@@ -4,7 +4,19 @@
 #include <cstdint>
 #include <cstdlib>
 
+#include "gx_runtime_vma_and_tls.h"
+
+extern "C" {
+GX_HOST_IMPORT void bb_direct_vk_note_vel_silhouette_mask() noexcept;
+}
+
 namespace gx_direct_vk {
+
+inline void NoteVelocitySilhouetteMask() noexcept {
+    if (bb_direct_vk_note_vel_silhouette_mask) {
+        bb_direct_vk_note_vel_silhouette_mask();
+    }
+}
 
 // Minimum single-frame 3x4 bone matrix delta (~1.2 cm world translation or ~0.7 deg rotation)
 // required to produce >= 1 pixel of visible Yebis2 object motion blur. Idle character breathing

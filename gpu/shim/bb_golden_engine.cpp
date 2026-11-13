@@ -11,6 +11,7 @@
 #include "bbport_settings.h"
 #include "bbport_toggles.h"
 #include "render/direct_shaders.h"
+#include "render/vk_obj_vel_cull.h"
 
 #define GX_HOST_PROVIDES_CYG_PROFILE 1
 #define GX_HOST_PROVIDES_CGMEMORY_MEMCPY 1
@@ -196,6 +197,10 @@ int GX_SYSV_ABI bb_direct_vk_is_effect_enabled(std::uint32_t effect_index) noexc
         return BbSettings::Get().effects[effect_index].load(std::memory_order_relaxed) ? 1 : 0;
     }
     return 1;
+}
+
+extern "C" void GX_SYSV_ABI bb_direct_vk_note_vel_silhouette_mask() noexcept {
+    Vulkan::ObjectVelocityCuller::NoteSilhouetteMaskActiveGlobal();
 }
 
 std::uint32_t GX_SYSV_ABI bb_direct_vk_gx_command_heap_bytes() noexcept {

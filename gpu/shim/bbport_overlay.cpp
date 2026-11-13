@@ -1103,6 +1103,7 @@ void Menu() {
 }
 
 struct HudSampleSlot {
+    std::chrono::steady_clock::time_point end_time{};
     std::uint64_t frames = 0;
     double time_s = 0.0;
     double present_ms_sum = 0.0;
@@ -1145,9 +1146,11 @@ struct HudSampleSlot {
     std::uint64_t hw_gpu_frames = 0;
 };
 
-// Sliding ~15-second ring buffer (44 * 0.35s = 15.4s, O(1) update, zero heap allocations).
+// Exact wall-clock 15.0-second sliding ring buffer (64 slots >= 22.4s @ 0.35s/tick,
+// drift-free direct sum recomputation, zero heap allocations).
 struct HudSlidingWindow {
-    static constexpr std::size_t kSlots = 44;
+    static constexpr std::size_t kSlots = 64;
+    static constexpr double kWindowSeconds = 15.0;
     std::array<HudSampleSlot, kSlots> slots{};
     HudSampleSlot sum{};
     std::size_t head = 0;
@@ -1155,104 +1158,77 @@ struct HudSlidingWindow {
 
     void Reset() noexcept { *this = HudSlidingWindow{}; }
 
-    void Push(const HudSampleSlot& s) noexcept {
-        if (count == kSlots) {
-            const HudSampleSlot& old = slots[head];
-            auto sub_u64 = [](std::uint64_t& acc, std::uint64_t v) { acc = acc >= v ? acc - v : 0; };
-            auto sub_f64 = [](double& acc, double v) { acc = std::max(0.0, acc - v); };
-            sub_u64(sum.frames, old.frames);
-            sub_f64(sum.time_s, old.time_s);
-            sub_f64(sum.present_ms_sum, old.present_ms_sum);
-            sub_f64(sum.present_ms_sq_sum, old.present_ms_sq_sum);
-            sub_u64(sum.present_ms_count, old.present_ms_count);
-            sub_u64(sum.draws, old.draws);
-            sub_u64(sum.dispatches, old.dispatches);
-            sub_u64(sum.submits, old.submits);
-            sub_u64(sum.faults, old.faults);
-            sub_u64(sum.native_buf_hits, old.native_buf_hits);
-            sub_u64(sum.native_buf_total, old.native_buf_total);
-            sub_u64(sum.native_tex_hits, old.native_tex_hits);
-            sub_u64(sum.native_tex_total, old.native_tex_total);
-            sub_u64(sum.desc_saved, old.desc_saved);
-            sub_u64(sum.desc_total, old.desc_total);
-            sub_f64(sum.idle_a_ms, old.idle_a_ms);
-            sub_f64(sum.gnm_wait_ms, old.gnm_wait_ms);
-            sub_f64(sum.game_cpu_work_ms, old.game_cpu_work_ms);
-            sub_f64(sum.fps_cap_sleep_ms, old.fps_cap_sleep_ms);
-            sub_f64(sum.a_pm4_pipe_ms, old.a_pm4_pipe_ms);
-            sub_f64(sum.a_ring_ms, old.a_ring_ms);
-            sub_f64(sum.a_drain_ms, old.a_drain_ms);
-            sub_f64(sum.a_decode_pso_ms, old.a_decode_pso_ms);
-            sub_f64(sum.a_buf_ring_ms, old.a_buf_ring_ms);
-            sub_f64(sum.a_tex_desc_ms, old.a_tex_desc_ms);
-            sub_f64(sum.a_state_draw_ms, old.a_state_draw_ms);
-            sub_f64(sum.a_submit_sync_ms, old.a_submit_sync_ms);
-            sub_f64(sum.b_total_ms, old.b_total_ms);
-            sub_f64(sum.b_buffers_ms, old.b_buffers_ms);
-            sub_f64(sum.b_tex_desc_ms, old.b_tex_desc_ms);
-            sub_f64(sum.b_state_pass_ms, old.b_state_pass_ms);
-            sub_f64(sum.b_tasks_ms, old.b_tasks_ms);
-            sub_f64(sum.b_packet_misc_ms, old.b_packet_misc_ms);
-            sub_f64(sum.gpu_wait_ms, old.gpu_wait_ms);
-            sub_f64(sum.hw_gpu_busy_ms, old.hw_gpu_busy_ms);
-            sub_f64(sum.hw_gpu_gap_ms, old.hw_gpu_gap_ms);
-            sub_f64(sum.hw_gpu_inter_gap_ms, old.hw_gpu_inter_gap_ms);
+    void EvictExpired(std::chrono::steady_clock::time_point now) noexcept {
+        while (count > 0) {
+            const std::size_t tail = (head + kSlots - count) % kSlots;
+            const double age_s = std::chrono::duration<double>(now - slots[tail].end_time).count();
+            if (age_s <= kWindowSeconds) {
+                break;
+            }
+            --count;
+        }
+    }
+
+    void RecomputeSum() noexcept {
+        sum = HudSampleSlot{};
+        const std::size_t start = (head + kSlots - count) % kSlots;
+        for (std::size_t i = 0; i < count; ++i) {
+            const HudSampleSlot& s = slots[(start + i) % kSlots];
+            sum.frames += s.frames;
+            sum.time_s += s.time_s;
+            sum.present_ms_sum += s.present_ms_sum;
+            sum.present_ms_sq_sum += s.present_ms_sq_sum;
+            sum.present_ms_count += s.present_ms_count;
+            sum.draws += s.draws;
+            sum.dispatches += s.dispatches;
+            sum.submits += s.submits;
+            sum.faults += s.faults;
+            sum.native_buf_hits += s.native_buf_hits;
+            sum.native_buf_total += s.native_buf_total;
+            sum.native_tex_hits += s.native_tex_hits;
+            sum.native_tex_total += s.native_tex_total;
+            sum.desc_saved += s.desc_saved;
+            sum.desc_total += s.desc_total;
+            sum.idle_a_ms += s.idle_a_ms;
+            sum.gnm_wait_ms += s.gnm_wait_ms;
+            sum.game_cpu_work_ms += s.game_cpu_work_ms;
+            sum.fps_cap_sleep_ms += s.fps_cap_sleep_ms;
+            sum.a_pm4_pipe_ms += s.a_pm4_pipe_ms;
+            sum.a_ring_ms += s.a_ring_ms;
+            sum.a_drain_ms += s.a_drain_ms;
+            sum.a_decode_pso_ms += s.a_decode_pso_ms;
+            sum.a_buf_ring_ms += s.a_buf_ring_ms;
+            sum.a_tex_desc_ms += s.a_tex_desc_ms;
+            sum.a_state_draw_ms += s.a_state_draw_ms;
+            sum.a_submit_sync_ms += s.a_submit_sync_ms;
+            sum.b_total_ms += s.b_total_ms;
+            sum.b_buffers_ms += s.b_buffers_ms;
+            sum.b_tex_desc_ms += s.b_tex_desc_ms;
+            sum.b_state_pass_ms += s.b_state_pass_ms;
+            sum.b_tasks_ms += s.b_tasks_ms;
+            sum.b_packet_misc_ms += s.b_packet_misc_ms;
+            sum.gpu_wait_ms += s.gpu_wait_ms;
+            sum.hw_gpu_busy_ms += s.hw_gpu_busy_ms;
+            sum.hw_gpu_gap_ms += s.hw_gpu_gap_ms;
+            sum.hw_gpu_inter_gap_ms += s.hw_gpu_inter_gap_ms;
             for (std::size_t c = 0; c < BbStats::GpuCat_Count; ++c) {
-                sub_f64(sum.hw_gpu_cat_ms[c], old.hw_gpu_cat_ms[c]);
+                sum.hw_gpu_cat_ms[c] += s.hw_gpu_cat_ms[c];
             }
             for (std::size_t sc = 0; sc < BbStats::GpuSub_Count; ++sc) {
-                sub_f64(sum.hw_gpu_subcat_ms[sc], old.hw_gpu_subcat_ms[sc]);
+                sum.hw_gpu_subcat_ms[sc] += s.hw_gpu_subcat_ms[sc];
             }
-            sub_u64(sum.hw_gpu_frames, old.hw_gpu_frames);
-        } else {
-            ++count;
+            sum.hw_gpu_frames += s.hw_gpu_frames;
         }
+    }
+
+    void Push(const HudSampleSlot& s) noexcept {
         slots[head] = s;
         head = (head + 1) % kSlots;
-        sum.frames += s.frames;
-        sum.time_s += s.time_s;
-        sum.present_ms_sum += s.present_ms_sum;
-        sum.present_ms_sq_sum += s.present_ms_sq_sum;
-        sum.present_ms_count += s.present_ms_count;
-        sum.draws += s.draws;
-        sum.dispatches += s.dispatches;
-        sum.submits += s.submits;
-        sum.faults += s.faults;
-        sum.native_buf_hits += s.native_buf_hits;
-        sum.native_buf_total += s.native_buf_total;
-        sum.native_tex_hits += s.native_tex_hits;
-        sum.native_tex_total += s.native_tex_total;
-        sum.desc_saved += s.desc_saved;
-        sum.desc_total += s.desc_total;
-        sum.idle_a_ms += s.idle_a_ms;
-        sum.gnm_wait_ms += s.gnm_wait_ms;
-        sum.game_cpu_work_ms += s.game_cpu_work_ms;
-        sum.fps_cap_sleep_ms += s.fps_cap_sleep_ms;
-        sum.a_pm4_pipe_ms += s.a_pm4_pipe_ms;
-        sum.a_ring_ms += s.a_ring_ms;
-        sum.a_drain_ms += s.a_drain_ms;
-        sum.a_decode_pso_ms += s.a_decode_pso_ms;
-        sum.a_buf_ring_ms += s.a_buf_ring_ms;
-        sum.a_tex_desc_ms += s.a_tex_desc_ms;
-        sum.a_state_draw_ms += s.a_state_draw_ms;
-        sum.a_submit_sync_ms += s.a_submit_sync_ms;
-        sum.b_total_ms += s.b_total_ms;
-        sum.b_buffers_ms += s.b_buffers_ms;
-        sum.b_tex_desc_ms += s.b_tex_desc_ms;
-        sum.b_state_pass_ms += s.b_state_pass_ms;
-        sum.b_tasks_ms += s.b_tasks_ms;
-        sum.b_packet_misc_ms += s.b_packet_misc_ms;
-        sum.gpu_wait_ms += s.gpu_wait_ms;
-        sum.hw_gpu_busy_ms += s.hw_gpu_busy_ms;
-        sum.hw_gpu_gap_ms += s.hw_gpu_gap_ms;
-        sum.hw_gpu_inter_gap_ms += s.hw_gpu_inter_gap_ms;
-        for (std::size_t c = 0; c < BbStats::GpuCat_Count; ++c) {
-            sum.hw_gpu_cat_ms[c] += s.hw_gpu_cat_ms[c];
+        if (count < kSlots) {
+            ++count;
         }
-        for (std::size_t sc = 0; sc < BbStats::GpuSub_Count; ++sc) {
-            sum.hw_gpu_subcat_ms[sc] += s.hw_gpu_subcat_ms[sc];
-        }
-        sum.hw_gpu_frames += s.hw_gpu_frames;
+        EvictExpired(s.end_time);
+        RecomputeSum();
     }
 };
 
@@ -1638,7 +1614,9 @@ void UpdateHudBreakdown(HudBreakdown& h) {
         return;
     }
     PollGpuHwSensors(h);
-    const std::uint64_t df = cur_frames > last_frames ? cur_frames - last_frames : 1;
+    const std::uint32_t raw_df32 =
+        static_cast<std::uint32_t>(cur_frames) - static_cast<std::uint32_t>(last_frames);
+    const std::uint64_t df = raw_df32 > 0 ? static_cast<std::uint64_t>(raw_df32) : 1ULL;
     const double inv_f = 1.0 / double(df);
     const std::uint64_t dtsc = tsc > last_tsc ? tsc - last_tsc : 1;
     const double cyc_per_ms = double(dtsc) / (dt * 1000.0);
@@ -1867,15 +1845,31 @@ void UpdateHudBreakdown(HudBreakdown& h) {
         h.fps_cap_sleep_ms = std::clamp(h.frame_ms - max_pipeline_ms, 0.0f, max_sleep_ms);
     }
 
-    // O(1) ~15-second sliding window gameplay average (ignores <300-draw loading/menu screens).
+    // Exact 15.0-second wall-clock sliding average across all active render scenes
+    // (including <300-draw interiors/menus after occlusion/batch culling). Automatically
+    // resets on FPS cap / AA / upscaler / render-scale changes so stale regime samples
+    // never linger after toggling settings.
     static HudSlidingWindow win{};
-    if (reset_hud_avg.exchange(false, std::memory_order_relaxed)) {
+    static bool has_prev_mode = false;
+    static std::uint64_t prev_mode_sig = 0;
+    const auto& cfg_s = BbSettings::Get();
+    const std::uint64_t mode_sig =
+        (static_cast<std::uint64_t>(static_cast<std::uint32_t>(fps_cap)) << 32) ^
+        (static_cast<std::uint64_t>(static_cast<std::uint8_t>(BbSettings::EffectiveUpscaler())) << 24) ^
+        (static_cast<std::uint64_t>(static_cast<std::uint8_t>(cfg_s.aa_mode.load(std::memory_order_relaxed))) << 16) ^
+        (static_cast<std::uint64_t>(static_cast<std::uint16_t>(cfg_s.active_render_width.load(std::memory_order_relaxed))) << 48) ^
+        static_cast<std::uint64_t>(static_cast<std::uint16_t>(cfg_s.active_render_height.load(std::memory_order_relaxed)));
+    const bool mode_changed = has_prev_mode && (mode_sig != prev_mode_sig);
+    has_prev_mode = true;
+    prev_mode_sig = mode_sig;
+    if (reset_hud_avg.exchange(false, std::memory_order_relaxed) || mode_changed) {
         win.Reset();
     }
     const float gpu_wait_now_ms = h.gpu_present_ms + h.sync_rec_ms + h.host_copy_ms;
-    if (h.draws_pf >= 300.0f) {
+    if (raw_df32 > 0 && dt > 0.0 && dt <= 5.0 && h.draws_pf >= 1.0f) {
         const double f_weight = double(df);
         HudSampleSlot s{};
+        s.end_time = now;
         s.frames = df;
         s.time_s = dt;
         s.present_ms_sum = present_ms_sum_accum;
@@ -1924,6 +1918,9 @@ void UpdateHudBreakdown(HudBreakdown& h) {
             }
         }
         win.Push(s);
+    } else if (win.count > 0) {
+        win.EvictExpired(now);
+        win.RecomputeSum();
     }
     present_ms_sum_accum = 0.0;
     present_ms_sq_sum_accum = 0.0;

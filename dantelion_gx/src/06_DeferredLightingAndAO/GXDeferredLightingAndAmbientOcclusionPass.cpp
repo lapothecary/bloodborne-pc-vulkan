@@ -5,6 +5,7 @@
 #include <immintrin.h>
 
 #include "gx_direct_vulkan.h"
+#include "gx_motion_activity.h"
 
 // ============================================================================
 // Module 06: Deferred Lighting and Ambient Occlusion (Step 2)
@@ -270,6 +271,15 @@ __attribute__((noinline)) void sub_229e990(void* pSelf, void* pRenderDev, void* 
             viewBytes[0x2974] = wantSsr;
             viewBytes[0x2977] = static_cast<uint8_t>(wantSsr ^ 1u);
         }
+    }
+
+    // `velWrap` (`*(viewBytes + 0xcf8)`) is only consumed as a silhouette mask outside Yebis 2
+    // Motion Blur when FeedbackBlur (`viewBytes[0x2970]`, line 323) or RadialBlur
+    // (`viewBytes[0x2971]`, line 345, which also consumes `viewBytes + 0x28b0`) is active.
+    // Note: `*(uint32_t*)(viewBytes + 0x2960)` is a non-zero default blur parameter on every frame.
+    if ((viewBytes[0x2970] != 0u || viewBytes[0x2971] != 0u) &&
+        viewBytes[0x2969] != 0u && selfBytes[0x78b0] == 0u) [[unlikely]] {
+        gx_direct_vk::NoteVelocitySilhouetteMask();
     }
 
     struct PassDispatchBlock {
@@ -1491,9 +1501,14 @@ void sub_229cb70(void* pSelf, void* pRenderDevHolder, const void* pCamera,
         alignas(16) uint8_t cascadeCam[0x90];
         alignas(16) uint8_t passCtx[0x870];
 
+        // NOTE: Do NOT gate `sub_229cb70` on `kEffectDynamicShadows` (`effect_dynamic_shadows` /
+        // `viewBytes[0x296e]`, VMA `0x22c2538`), which disables ONLY local dynamic point/spot VSM
+        // shadows. `sub_229cb70` renders the 4-Cascade Sun/Moon CSM shadow map gated strictly by
+        // `viewBytes[0x296c]` (line 1396). Aborting here after `sub_eac210` leaves `viewBytes[0x296c] == 1`
+        // so the sun shader (`ps_f55643de`) samples an unrendered CSM depth map (missing player
+        // shadow + horizontal cascade-boundary shadow line following the camera).
         if (pRenderDevHolder == nullptr ||
-            reinterpret_cast<uintptr_t>(pRenderDevHolder) == 0x2a2a2a2a2a2a2a2aULL ||
-            !gx_direct_vk::IsEffectEnabled(gx_direct_vk::kEffectDynamicShadows)) {
+            reinterpret_cast<uintptr_t>(pRenderDevHolder) == 0x2a2a2a2a2a2a2a2aULL) {
             return;
         }
 

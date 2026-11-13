@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdlib>
+#include <cstring>
 #include <span>
 #include <vector>
 
@@ -42,6 +43,8 @@
 #include "bbgpu/shaders/vs_061fbbf6_vert.h"
 #include "bbgpu/shaders/vs_167daba6_vsm_shadow_vert.h"
 #include "bbgpu/shaders/vs_1ea5a07e_vert.h"
+#include "bbgpu/shaders/vs_24042a9b_vert.h"
+#include "bbgpu/shaders/vs_8747a367_vert.h"
 #include "bbgpu/shaders/vs_637500e0_vert.h"
 #include "bbgpu/shaders/vs_6a833138_gbuf_inst_vert.h"
 #include "bbgpu/shaders/vs_7620368b_gbuf_uv2_vert.h"
@@ -129,6 +132,7 @@ namespace {
 constexpr u32 kSpirvMagic = 0x07230203u;
 
 // SPIR-V opcodes
+constexpr u32 kOpName = 5u;
 constexpr u32 kOpExtInst = 12u;
 constexpr u32 kOpEntryPoint = 15u;
 constexpr u32 kOpTypeInt = 21u;
@@ -139,6 +143,8 @@ constexpr u32 kOpTypeSampler = 26u;
 constexpr u32 kOpTypeSampledImage = 27u;
 constexpr u32 kOpTypeStruct = 30u;
 constexpr u32 kOpTypePointer = 32u;
+constexpr u32 kOpConstant = 43u;
+constexpr u32 kOpSpecConstant = 50u;
 constexpr u32 kOpFunction = 54u;
 constexpr u32 kOpFunctionCall = 57u;
 constexpr u32 kOpVariable = 59u;
@@ -155,9 +161,11 @@ constexpr u32 kStorageClassUniformConstant = 0u;
 constexpr u32 kStorageClassInput = 1u;
 constexpr u32 kStorageClassUniform = 2u;
 constexpr u32 kStorageClassOutput = 3u;
+constexpr u32 kStorageClassPushConstant = 9u;
 constexpr u32 kStorageClassStorageBuffer = 12u;
 
 // Decorations
+constexpr u32 kDecoSpecId = 1u;
 constexpr u32 kDecoBlock = 2u;
 constexpr u32 kDecoBufferBlock = 3u;
 constexpr u32 kDecoBuiltIn = 11u;
@@ -182,7 +190,7 @@ struct NativeShaderCandidate {
     const char* label;
 };
 
-constexpr std::array<NativeShaderCandidate, 111> kNativeRegistry{{
+constexpr std::array<NativeShaderCandidate, 113> kNativeRegistry{{
     {0x000000000f61fd27ull, PS_0F61FD27_VSM_BLUR_FRAG, "ps_0f61fd27_vsm_blur"},
     {0x000000001ae03d75ull, PS_1AE03D75_VSM_MOMENT_CLDIST_FRAG, "ps_1ae03d75_vsm_moment_cldist"},
     {0x000000001ae03d75ull, PS_1AE03D75_VSM_MOMENT_NOCLIP_FRAG, "ps_1ae03d75_vsm_moment_noclip"},
@@ -294,6 +302,8 @@ constexpr std::array<NativeShaderCandidate, 111> kNativeRegistry{{
     {0x0000000052738b8aull, PS_52738B8A_FRAG, "ps_52738b8a_gbuf6_foliage2"},
     {0x00000000dbb222ebull, PS_DBB222EB_FRAG, "ps_dbb222eb_gbuf6_foliage_lm"},
     {0x000000009e3394c8ull, PS_9E3394C8_FRAG, "ps_9e3394c8_gbuf6_foliage"},
+    {0x000000008747a367ull, VS_8747A367_VERT, "vs_8747a367_light_acc"},
+    {0x0000000024042a9bull, VS_24042A9B_VERT, "vs_24042a9b_scaleform_texgen"},
 }};
 
 struct DescSlot {
@@ -590,9 +600,140 @@ u32 NativeShadersMinIdx() noexcept {
 }
 
 u32 NativeShadersMaxIdx() noexcept {
-    static const u32 max_idx = ParseEnvU32("BB_NATIVE_SHADER_MAX", 110u);
+    static const u32 max_idx =
+        ParseEnvU32("BB_NATIVE_SHADER_MAX", static_cast<u32>(kNativeRegistry.size() - 1u));
     return max_idx;
 }
+
+namespace {
+
+s32 ExtractVs8747BufSlot(std::span<const u32> spv) {
+    if (spv.size() < 5 || spv[0] != kSpirvMagic) {
+        return -1;
+    }
+    const u32 bound = spv[3];
+    if (bound == 0 || bound > 2'000'000u) {
+        return -1;
+    }
+    std::vector<u8> is_u32_type(bound, 0u);
+    std::vector<u32> const_u32_val(bound, 0xFFFFFFFFu);
+    u32 push_data_id = 0xFFFFFFFFu;
+    s32 buf_slot = -1;
+    bool in_func = false;
+
+    for (size_t pos = 5; pos < spv.size();) {
+        const u32 wc = spv[pos] >> 16;
+        const u32 op = spv[pos] & 0xFFFFu;
+        if (wc == 0 || pos + wc > spv.size()) {
+            return -1;
+        }
+        const u32* w = &spv[pos];
+        if (op == kOpFunction) {
+            in_func = true;
+        }
+        if (!in_func) {
+            if (op == kOpName && wc >= 3) {
+                const char* s = reinterpret_cast<const char*>(&w[2]);
+                const size_t max_chars = (wc - 2u) * 4u;
+                if (std::memchr(s, '\0', max_chars) != nullptr && s[0] == 'b' && s[1] == 'u' &&
+                    s[2] == 'f' && s[3] >= '0' && s[3] <= '9') {
+                    u32 val = 0u;
+                    size_t p = 3u;
+                    while (s[p] >= '0' && s[p] <= '9' && val < 40u) {
+                        val = val * 10u + static_cast<u32>(s[p] - '0');
+                        ++p;
+                    }
+                    if (val < 40u && std::strcmp(s + p, "_off") == 0) {
+                        buf_slot = static_cast<s32>(val);
+                    }
+                }
+            } else if (op == kOpTypeInt && wc == 4 && w[1] < bound && w[2] == 32u) {
+                is_u32_type[w[1]] = 1u;
+            } else if (op == kOpConstant && wc == 4 && w[1] < bound && w[2] < bound &&
+                       is_u32_type[w[1]]) {
+                const_u32_val[w[2]] = w[3];
+            } else if (op == kOpVariable && wc >= 4 && w[2] < bound &&
+                       w[3] == kStorageClassPushConstant) {
+                push_data_id = w[2];
+            }
+        } else if ((op == kOpAccessChain || op == kOpInBoundsAccessChain) && wc >= 5 &&
+                   w[3] == push_data_id) {
+            const u32 member_id = w[4];
+            const u32 member_idx = (member_id < bound) ? const_u32_val[member_id] : 0xFFFFFFFFu;
+            // Reject non-standard permutations that access `xoffset..yscale` (`clip_disable` /
+            // `emulate_depth_negative_one_to_one`) or `ud_regs0..3`.
+            if (member_idx < 8u || member_idx == 0xFFFFFFFFu) {
+                return -1;
+            }
+        }
+        pos += wc;
+    }
+    return buf_slot;
+}
+
+bool SpecializeConstantId0(std::vector<u32>& spv, u32 value) {
+    if (spv.size() < 5 || spv[0] != kSpirvMagic) {
+        return false;
+    }
+    u32 spec_id = 0xFFFFFFFFu;
+    for (size_t pos = 5; pos < spv.size();) {
+        const u32 wc = spv[pos] >> 16;
+        const u32 op = spv[pos] & 0xFFFFu;
+        if (wc == 0 || pos + wc > spv.size() || op == kOpFunction) {
+            break;
+        }
+        if (op == kOpDecorate && wc == 4 && spv[pos + 2] == kDecoSpecId && spv[pos + 3] == 0u) {
+            spec_id = spv[pos + 1];
+            break;
+        }
+        pos += wc;
+    }
+    if (spec_id == 0xFFFFFFFFu) {
+        return false;
+    }
+
+    std::vector<u32> patched;
+    patched.reserve(spv.size());
+    patched.insert(patched.end(), spv.begin(), spv.begin() + 5);
+
+    bool in_func = false;
+    bool specialized = false;
+    for (size_t pos = 5; pos < spv.size();) {
+        const u32 wc = spv[pos] >> 16;
+        const u32 op = spv[pos] & 0xFFFFu;
+        if (wc == 0 || pos + wc > spv.size()) {
+            return false;
+        }
+        if (op == kOpFunction) {
+            in_func = true;
+        }
+        if (!in_func) {
+            if (op == kOpDecorate && wc == 4 && spv[pos + 1] == spec_id &&
+                spv[pos + 2] == kDecoSpecId) {
+                pos += wc;
+                continue;
+            }
+            if (op == kOpSpecConstant && wc == 4 && spv[pos + 2] == spec_id) {
+                patched.push_back((4u << 16) | kOpConstant);
+                patched.push_back(spv[pos + 1]);
+                patched.push_back(spv[pos + 2]);
+                patched.push_back(value);
+                specialized = true;
+                pos += wc;
+                continue;
+            }
+        }
+        patched.insert(patched.end(), spv.begin() + pos, spv.begin() + pos + wc);
+        pos += wc;
+    }
+    if (!specialized) {
+        return false;
+    }
+    spv = std::move(patched);
+    return true;
+}
+
+} // namespace
 
 u32 NativeShadersSkipMinIdx() noexcept {
     static const u32 skip_min = ParseEnvU32("BB_NATIVE_SHADER_SKIP_MIN", 0xFFFFFFFFu);
@@ -606,7 +747,7 @@ u32 NativeShadersSkipMaxIdx() noexcept {
 
 bool NativeShadersCustomRange() noexcept {
     return NativeShadersMinIdx() != 0u ||
-           NativeShadersMaxIdx() + 1u < static_cast<u32>(kNativeRegistry.size()) ||
+           static_cast<size_t>(NativeShadersMaxIdx()) + 1u < kNativeRegistry.size() ||
            NativeShadersSkipMinIdx() != 0xFFFFFFFFu ||
            NativeShadersSkipMaxIdx() != 0xFFFFFFFFu;
 }
@@ -651,6 +792,13 @@ bool TryReplaceWithNativeShader(u64 pgm_hash, const std::vector<u32>& ref_spv,
     }
     if (pgm_hash == 0x000000004b766f62ull && ref_sig.bgra_export) {
         return false;
+    }
+    s32 vs_8747_buf_slot = -1;
+    if (pgm_hash == 0x000000008747a367ull || pgm_hash == 0x0000000024042a9bull) {
+        vs_8747_buf_slot = ExtractVs8747BufSlot(ref_spv);
+        if (vs_8747_buf_slot < 0) {
+            return false;
+        }
     }
 
     for (size_t idx = min_i; idx < max_i; ++idx) {
@@ -731,6 +879,10 @@ bool TryReplaceWithNativeShader(u64 pgm_hash, const std::vector<u32>& ref_spv,
                 }
                 pos += wc;
             }
+        }
+        if ((pgm_hash == 0x000000008747a367ull || pgm_hash == 0x0000000024042a9bull) &&
+            !SpecializeConstantId0(out_spv, static_cast<u32>(vs_8747_buf_slot))) {
+            return false;
         }
         return true;
     }

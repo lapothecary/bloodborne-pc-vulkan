@@ -90,12 +90,23 @@ vec3 cube_array_uv(vec3 d) {
 void main() {
     const uint bo0 = push_data.buf_offsets0.x;
     const uint buf0_dword_off = bitfieldExtract(bo0, 0, 8) >> 2u;
-    const uint buf1_dword_off = bitfieldExtract(bo0, 8, 8) >> 2u;
+    uint buf1_dword_off = bitfieldExtract(bo0, 8, 8) >> 2u;
 
     const vec2 uv = fs_in_attr1_p.xy;
     const vec2 ndc = fs_in_attr0_p.xy;
 
     const float depth = texture(sampler2D(fs_img1, fs_samp0), uv).x;
+    const uint tile_v4 = uint(fs_in_attr1_p.z + 0.5);
+    if (tile_v4 > 0u) {
+        const uint thdr = buf1_dword_off + ((tile_v4 - 1u) << 2u);
+        if (depth < s2f(thdr) || depth > s2f(thdr + 1u)) {
+            frag_color0 = vec4(0.0, 0.0, 0.0, 1.0);
+            frag_color1 = vec4(0.0, 0.0, 0.0, 1.0);
+            demote;
+            return;
+        }
+        buf1_dword_off = thdr + 4u;
+    }
 
     const vec4 col0 = vec4(s1f(0u + buf0_dword_off), s1f(4u + buf0_dword_off), s1f(8u + buf0_dword_off), s1f(12u + buf0_dword_off));
     const vec4 col1 = vec4(s1f(1u + buf0_dword_off), s1f(5u + buf0_dword_off), s1f(9u + buf0_dword_off), s1f(13u + buf0_dword_off));

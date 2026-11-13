@@ -51,6 +51,10 @@
 
 namespace Vulkan {
 
+/// Stage 8: Synthetic 40-bit VAddr tag (`>= 0xFF00000000`) encoding an offset directly inside
+/// `ConstantRing` (`offset = base_address - kConstRingVertexBase`) for batched light-tile quads.
+static constexpr VAddr kConstRingVertexBase = 0xFF00000000ULL;
+
 inline const Gcn::Regs& Rasterizer::Regs() const {
     return stage_regs ? *stage_regs : liverpool->regs;
 }

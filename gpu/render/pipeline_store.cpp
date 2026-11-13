@@ -46,7 +46,8 @@ std::string OptBinaryName(u64 pgm_hash, size_t perm_idx) {
     const char* prefix = "opt1";
     if (hw_interp) {
         if (fast_fp) {
-            prefix = native_sh ? "opt29" : "opt6_nonat";
+            prefix = native_sh ? ((pgm_hash == 0x0000000024042a9bULL) ? "opt32" : "opt31")
+                               : "opt6_nonat";
         } else {
             prefix = "opt3_strict";
         }
@@ -65,7 +66,7 @@ const char* DriverCacheBlobName() noexcept {
     const bool native_sh = Shader::Backend::SPIRV::NativeShadersEnabled();
     if (hw_interp) {
         if (fast_fp) {
-            return native_sh ? "vk_driver_cache_opt29" : "vk_driver_cache_opt6_nonat";
+            return native_sh ? "vk_driver_cache_opt31" : "vk_driver_cache_opt6_nonat";
         }
         return "vk_driver_cache_opt3_strict";
     }

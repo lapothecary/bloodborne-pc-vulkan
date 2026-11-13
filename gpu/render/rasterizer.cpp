@@ -8,6 +8,10 @@
 #include <filesystem>
 #include "render/raster_internal.h"
 #include "render/shader_hle.h"
+#include "render/vk_light_tile_batch.h"
+#include "render/vk_vsm_shadow_memo.h"
+#include "render/vk_obj_vel_cull.h"
+#include "render/vk_vfx_ui_batch.h"
 #include "shim/bbport_settings.h"
 #include "textures/direct_textures.h"
 #include <vk_mem_alloc.h>
@@ -342,8 +346,14 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     VideoCore::DirectBuffers::SetActiveCaches(&buffer_cache, &texture_cache);
 
     GpuProfiler::Init(instance, scheduler);
+    if (!EmulatorSettings.IsNullGPU()) {
+        object_vel_culler = std::make_unique<ObjectVelocityCuller>();
+    }
     if (DrawPipeWanted()) {
         constant_ring = std::make_unique<ConstantRing>(instance, scheduler);
+        light_tile_batcher = std::make_unique<LightTileBatcher>();
+        vsm_shadow_memo = std::make_unique<VsmShadowMemo>();
+        vfx_ui_batcher = std::make_unique<VfxUiBatcher>();
         draw_pipe = std::make_unique<DrawPipe>(&RunDrawPacket, this);
         // Keep 1 constant resolve worker by default (`spin_us = 0` in `vk_draw_pipe.h` so it
         // never burns idle spin CPU): offloading `XXH3` + Write-Combined ReBAR `memcpy` from
@@ -600,7 +610,34 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const PreparedDraw* pre
         return;
     }
     if (pipelined && FilterDrawPasses()) {
+        if (vfx_ui_batcher && vfx_ui_batcher->HasPendingDraws() &&
+            vfx_ui_batcher->CurrentPipeline() != pipeline) {
+            vfx_ui_batcher->Flush(*this);
+        }
+        if (vsm_shadow_memo &&
+            vsm_shadow_memo->TryHandleDraw(*this, pipeline, used_prepared, is_indexed,
+                                           index_offset)) {
+            return;
+        }
+        if (light_tile_batcher &&
+            light_tile_batcher->TryBatchDraw(*this, pipeline, used_prepared, is_indexed,
+                                             index_offset)) {
+            return;
+        }
+        if (object_vel_culler &&
+            object_vel_culler->TryCullDraw(*this, pipeline, is_indexed)) {
+            return;
+        }
+        if (vfx_ui_batcher &&
+            vfx_ui_batcher->TryBatchDraw(*this, pipeline, used_prepared, is_indexed,
+                                         index_offset)) {
+            return;
+        }
         PostDraw(pipeline, used_prepared, is_indexed, index_offset);
+        return;
+    }
+    if (object_vel_culler && OnStageA() && FilterDrawPasses() &&
+        object_vel_culler->TryCullDraw(*this, pipeline, is_indexed)) {
         return;
     }
     const auto* fast_vs = pipeline_cache.PeekFastVsharps(pipeline);
@@ -767,7 +804,11 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
                                ((vp_w > 0.0f && vp_w <= 65.0f && vp_h > 0.0f && vp_h <= 65.0f) ||
                                 (sc_w > 0 && sc_w <= 64 && sc_h > 0 && sc_h <= 64));
             if (is_32 || is_64) {
-                const VAddr cb_addr = regs.color_buffers[0] ? regs.color_buffers[0].Address() : 0;
+                const VAddr cb_addr =
+                    regs.color_buffers[0]
+                        ? (regs.color_buffers[0].Address() ^
+                           (u64(regs.color_buffers[0].view.slice_start) << 40))
+                        : 0;
                 const VAddr db_addr = regs.depth_buffer.DepthAddress();
                 if (regs.depth_render_control.depth_clear_enable ||
                     cb_addr != culler.last_shadow_cb_addr ||
@@ -1248,11 +1289,12 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
         }
         traced_inputs_frame = BbStats::gpu_frames.load(std::memory_order_relaxed);
     }
-    BeginDraw(pipeline, state, is_indexed,
-              regs.num_indices > 6 || regs.num_instances.NumInstances() > 1, draw_prepared,
-              index_offset, true);
-
     const auto& vs_info = pipeline->GetStage(Shader::SwStage::Vertex);
+    const bool jitter_eligible =
+        vs_info.pgm_hash != 0x000000008747a367ULL &&
+        (regs.num_indices > 6 || regs.num_instances.NumInstances() > 1);
+    BeginDraw(pipeline, state, is_indexed, jitter_eligible, draw_prepared, index_offset, true);
+
     const auto& fetch_shader = pipeline->GetFetchShader();
     const auto [vertex_offset, instance_offset] = GetDrawOffsets(regs, vs_info, fetch_shader);
 

@@ -107,6 +107,17 @@ void main() {
 
     vec2 uv = fs_in_attr1_p.xy;
     float depth = texture(sampler2D(fs_img1, fs_samp0), uv).x;
+    uint tile_v4 = uint(fs_in_attr1_p.z + 0.5);
+    if (tile_v4 > 0u) {
+        uint thdr = d1 + ((tile_v4 - 1u) << 2u);
+        if (depth < s2f(thdr) || depth > s2f(thdr + 1u)) {
+            frag_color0 = vec4(0.0, 0.0, 0.0, 1.0);
+            frag_color1 = vec4(0.0, 0.0, 0.0, 1.0);
+            demote;
+            return;
+        }
+        d1 = thdr + 4u;
+    }
 
     vec4 clip_p = vec4(fs_in_attr0_p.xy, depth, 1.0);
     float inv_w = 1.0 / dot(s1_v4(d0 + 12u), clip_p);

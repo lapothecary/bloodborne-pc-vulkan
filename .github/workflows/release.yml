@@ -34,23 +34,27 @@ jobs:
       - name: Create or Update GitHub Release (Linux x86_64)
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name || 'v1.1.2' }}
-          name: "Bloodborne PC Vulkan ${{ github.ref_name || 'v1.1.2' }}"
+          tag_name: ${{ github.ref_name || 'v1.1.3' }}
+          name: "Bloodborne PC Vulkan ${{ github.ref_name || 'v1.1.3' }}"
           body: |
-            ## Bloodborne PC Vulkan ${{ github.ref_name || 'v1.1.2' }} (Windows & Linux `x86_64`)
+            ## Bloodborne PC Vulkan ${{ github.ref_name || 'v1.1.3' }} (Windows & Linux `x86_64`)
 
             ### Quick Start
             - **Windows 10/11**: Extract `bloodborne-pc-vulkan-windows-x86_64-prebuilt.zip` next to your `CUSA03173` (`v1.09`) folder and run **`Bloodborne.exe`** (or **`Launcher.exe`**).
             - **Linux**: Extract `bloodborne-pc-vulkan-linux-x86_64-prebuilt.tar.gz` next to your `CUSA03173` (`v1.09`) folder and run **`./play.sh`** (or **`./launcher.sh`**).
 
-            ### What Changed in `${{ github.ref_name || 'v1.1.2' }}`:
-            - **L3-Co-Located `Stage A -> Stage B -> VkRecorder` CPU Pipeline & Frame-Pacing Overhaul:**
-              - Pinned `Stage A` (`bb:GpuComm`), `Stage B` (`bb:DrawRec`), `bb:VkRecorder`, and `bb:Resolve0` onto dedicated physical cores inside the same L3/CCD domain (clearing SMT siblings and evacuating background child threads), cutting `Stage A` CPU time by `-69%` (`5.57 -> 1.74 ms`) and frame-pacing jitter by `3.5x` (`1.59 -> 0.30-0.45 ms`) in heavy `~1,780`-draw Cathedral Ward / Central Yharnam scenes.
-              - Added value-aware register dirty tracking, delta `DrawPacket` compression (`136 -> 80 B` headers, deduplicated `flattened_ud_buf`, `vsharps`, and RT metadata), cross-RenderPass `PushDescriptor` / vertex-buffer preservation, and `O(1)` `UpdateDynamicState` epoch memoization on `Stage B`.
-            - **Idle-Scene Motion Blur Skip & Accurate `F8` / `F9` Telemetry:**
-              - Skips object/camera Motion Blur passes automatically when both the camera and 3-frame SIMD character bone deltas are stationary.
-              - Added per-process VRAM reporting (`VRAM: X.XX GB (Sys Y.Y)`), separated intra-frame `HW GPU Mid-Frame Bubble` from `HW GPU Inter-Frame Wait`, added a 15-second `Avg %` column, and unclamped `CPU 1. Game Engine (Work)` & `FPS Cap Sleep`.
-            - **Previously in `v1.1.1`:** Fixed `SSAO`, `SSR` & `DoF` initialization and live toggles (`System -> Effects`), Windows hardware occlusion culling & DXGI Flip-Model swapchain, frame-rate-independent grass/foliage wind sway (`HookFoliageSway`), split `CUSAxxxxx + CUSAxxxxx-patch` folder detection, and rebindable `Debug` (`F8`) / `Additional Debug` (`F9`) hotkeys.
+            ### What Changed in `${{ github.ref_name || 'v1.1.3' }}`:
+            - **Draw-Call Batching, VSM Shadow Memoization & Stationary Velocity Culling (`Stages 8–11`, `113` Native GLSL 460 Shaders):**
+              - **Deferred Local-Light Tile Batching (`LightTileBatcher` + `vs_8747a367`):** Coalesces `64x64` deferred local-light tile quads into multi-quad draws (`-40.5%` total draws in Cathedral Ward: `1,786 -> 1,062`, `-26%` `Stage B` recording time).
+              - **Stationary Object-Velocity Culling (`ObjectVelocityCuller`):** Skips stationary world & skinned meshes in the `1280x720` Object-Velocity pass via a 3-tier SSE2 matrix-palette cache (`-220..295 draws/frame` in Central Yharnam Bonfire Plaza, `-50%` GPU Motion Blur cost) while preserving moving characters and silhouette masks.
+              - **Local VSM Shadow & 13-Tap Blur Memoization (`VsmShadowMemo`):** Memoizes unchanged `R16G16Sfloat` local shadow faces and skips redundant `Sample13Weight` blur passes (`92%` hit rate).
+              - **Scaleform UI & Particle Quad Coalescing (`VfxUiBatcher` + `vs_24042a9b`):** Batches consecutive UI & particle draws with `0` task flushes (`opt32` shader cache).
+            - **Long-Session CPU `Stage A` Stability & `2 MiB` 4-Way VMA TLB:**
+              - Eliminated progressive `Stage A` slowdowns after extended map traversal/streaming by replacing linear cache invalidations on `>32 KiB` particle/ring buffer writes with `O(1)` `256 KiB` coarse epochs and upgrading `RegionCache` to a heap-allocated `1,024`-entry 4-way `2 MiB` TLB (caching both mapped and unmapped spans while reducing static `PT_TLS` by `1 KiB`).
+            - **Sun/Moon 4-Cascade CSM Shadow Fix & `15s Avg` HUD Window Fix:**
+              - Fixed missing player shadow and camera-following cascade seam when `Dynamic Shadows` is `Off` by decoupling local point/spot VSM shadows (`+0x296e`) from 4-cascade Sun/Moon CSM (`+0x296c` in `sub_229cb70`).
+              - Fixed the `15s Avg` sliding window (`F8` / `F9`) stalling in `<300`-draw interiors/menus and added instant average reset when toggling FPS cap, AA, upscaler, or render resolution.
+            - **Previously in `v1.1.2` / `v1.1.1`:** L3-co-located `Stage A -> Stage B -> VkRecorder` CPU pipeline, `80 B` delta `DrawPacket` compression, live `SSAO`/`SSR`/`DoF` toggles, high-FPS foliage sway (`HookFoliageSway`), and NVIDIA DXGI Flip-Model swapchain.
           files: |
             bloodborne-pc-vulkan-linux-x86_64-prebuilt.tar.gz
             bloodborne-pc-vulkan-linux-x86_64-prebuilt.tar.gz.sha256
@@ -102,9 +106,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: build_win32_gpu
-          key: win32-gpu-build-v111-${{ hashFiles('gpu/CMakeLists.txt', 'src/**', 'dantelion_gx/build_win32/libbb_gx_engine_native.a', 'gpu/shim/**', 'gpu/games/**', 'gpu/platform/**', 'gpu/render/**', 'gpu/buffers/**', 'gpu/cp/**', 'gpu/shader/backend/spirv/**') }}
+          key: win32-gpu-build-v113-${{ hashFiles('gpu/CMakeLists.txt', 'src/**', 'dantelion_gx/build_win32/libbb_gx_engine_native.a', 'gpu/shim/**', 'gpu/games/**', 'gpu/platform/**', 'gpu/render/**', 'gpu/buffers/**', 'gpu/cp/**', 'gpu/shader/backend/spirv/**') }}
           restore-keys: |
-            win32-gpu-build-v111-
+            win32-gpu-build-v113-
 
       - name: Build Windows x86_64 bb-probe.exe & bb-gpu-capabilities.exe
         run: |
@@ -114,9 +118,9 @@ jobs:
             python3 tools/build_gx_win32_coff.py
           fi
           if [ -f build_win32_gpu/build.ninja ] && ! grep -q "our_cpp_100000_source" build_win32_gpu/build.ninja; then
-            find build_win32_gpu -type f \( -name "*.obj" -o -name "*.a" -o -name "*.spv" -o -name "*.h" \) -exec touch {} +
+            find build_win32_gpu -type f \( -name "*.obj" -o -name "*.a" \) -exec touch {} +
             touch dantelion_gx/build_win32/libbb_gx_engine_native.a
-            rm -f build_win32_gpu/include/bbgpu/shaders/ps_0ef50047_pbr_frag.h build_win32_gpu/include/bbgpu/shaders/ps_3fe9e964_frag.h build_win32_gpu/include/bbgpu/shaders/ps_6b42fc89_frag.h build_win32_gpu/include/bbgpu/shaders/ps_a22c7f71_pbr_frag.h build_win32_gpu/include/bbgpu/shaders/ps_d92266b9_pbr_frag.h build_win32_gpu/include/bbgpu/shaders/ps_e55e45eb_frag.h build_win32_gpu/include/bbgpu/shaders/ps_e96447c3_pbr_frag.h build_win32_gpu/include/bbgpu/shaders/ps_f55643de_frag.h
+            rm -f build_win32_gpu/include/bbgpu/shaders/*.h build_win32_gpu/include/bbgpu/shaders/*.spv
             find build_win32_gpu/CMakeFiles/bb-probe.dir -name "*.obj" -delete || true
             rm -f build_win32_gpu/CMakeFiles/bbgpu.dir/shim/*.obj build_win32_gpu/CMakeFiles/bbgpu.dir/games/*.obj build_win32_gpu/CMakeFiles/bbgpu.dir/gcn/*.obj build_win32_gpu/CMakeFiles/bbgpu.dir/textures/*.obj build_win32_gpu/CMakeFiles/bbgpu.dir/platform/win32/*.obj build_win32_gpu/CMakeFiles/bbgpu.dir/platform/avplayer/*.obj build_win32_gpu/CMakeFiles/bbgpu.dir/platform/videoout/frame_stats.cpp.obj build_win32_gpu/CMakeFiles/bbgpu.dir/buffers/*.obj build_win32_gpu/CMakeFiles/bbgpu.dir/render/*.obj build_win32_gpu/CMakeFiles/bbgpu.dir/cp/*.obj build_win32_gpu/CMakeFiles/bbgpu.dir/shader/backend/spirv/native_shaders.cpp.obj build_win32_gpu/CMakeFiles/bbgpu.dir/upscale/*.obj build_win32_gpu/libbbgpu.a build_win32_gpu/bb-probe.exe build_win32_gpu/libbbgpu.dll
           else
@@ -152,7 +156,7 @@ jobs:
       - name: Upload Windows x86_64 Asset to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name || 'v1.1.2' }}
+          tag_name: ${{ github.ref_name || 'v1.1.3' }}
           files: |
             bloodborne-pc-vulkan-windows-x86_64-prebuilt.zip
             bloodborne-pc-vulkan-windows-x86_64-prebuilt.zip.sha256

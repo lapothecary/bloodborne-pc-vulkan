@@ -23990,6 +23990,7 @@ __attribute__((weak, visibility("hidden"))) void bb_direct_vk_retire_buffer_rang
 __attribute__((weak, visibility("hidden"))) void bb_direct_vk_register_shader_binary(const void*, uint32_t, const void*, uint32_t, uint32_t) noexcept {}
 __attribute__((weak, visibility("hidden"))) void bb_direct_vk_retire_shader_range(const void*, uint64_t) noexcept {}
 __attribute__((weak, visibility("hidden"))) int bb_direct_vk_is_effect_enabled(uint32_t) noexcept { return 1; }
+__attribute__((weak, visibility("hidden"))) void bb_direct_vk_note_vel_silhouette_mask() noexcept {}
 __attribute__((weak, visibility("hidden"))) uint32_t bb_direct_vk_gx_command_heap_bytes() noexcept { return 0; }
 __attribute__((weak, visibility("hidden"))) int bb_direct_vk_intel_tonemap_fix() noexcept { return 0; }
 __attribute__((weak, visibility("hidden"))) int bb_direct_vk_light_grid_override(uint32_t*, uint32_t*) noexcept { return 0; }

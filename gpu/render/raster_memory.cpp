@@ -1463,6 +1463,7 @@ u32 Rasterizer::ReadDataFromGds(u32 gds_offset) {
 }
 
 bool Rasterizer::InvalidateMemory(VAddr addr, u64 size, bool assume_locks) {
+    InvalidateStageACpuShadow(addr, size);
     DrainDrawPipe();
     InvalidateGdsMirrorRange(addr, size);
     if (!IsMapped(addr, size)) {
@@ -1482,6 +1483,7 @@ void Rasterizer::NoteAssetWrite(VAddr addr, u64 size) {
 }
 
 void Rasterizer::InvalidateAfterWrite(VAddr addr, u64 size) {
+    InvalidateStageACpuShadow(addr, size);
     InvalidateGdsMirrorRange(addr, size);
     if (VideoCore::WriteTracking() || !buffer_cache.IsRegionGpuModified(addr, size)) {
         InvalidateMemory(addr, size);
@@ -1499,6 +1501,9 @@ void Rasterizer::InvalidateAfterWrite(VAddr addr, u64 size) {
 }
 
 void Rasterizer::NoteCommandWrite(VAddr addr, const void* data, u64 size, bool recording_thread) {
+    if (!recording_thread) {
+        InvalidateStageACpuShadow(addr, size);
+    }
     InvalidateGdsMirrorRange(addr, size);
     if (VideoCore::WriteTracking() || !IsMapped(addr, size)) {
         return; // tracking catches it, or the GPU does not use it
