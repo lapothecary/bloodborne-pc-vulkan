@@ -1433,6 +1433,7 @@ MtResolvedBuffer Manager::TryResolveReadMt(VAddr addr, u64 requested_size,
                 .clamped_size = clamped,
                 .is_static_immutable = s.is_static_immutable,
                 .is_gpu_written = s.is_gpu_written,
+                .is_uav_or_ext_gpu = s.is_uav_or_ext_gpu,
                 .is_direct_vram = s.is_direct_vram,
             };
         }
@@ -1503,9 +1504,10 @@ MtResolvedBuffer Manager::TryResolveReadMt(VAddr addr, u64 requested_size,
     const u64 locked_gen = static_imm
                                ? atomic_map_erase_gen.load(std::memory_order_relaxed)
                                : atomic_override_gen.load(std::memory_order_relaxed);
+    const bool uav_or_ext_gpu =
+        (e.buffer && e.buffer->uav_written) || e.gpu_written_without_shadow;
     const bool gpu_written =
-        (e.buffer && e.buffer->uav_written) || e.gpu_written_without_shadow ||
-        e.stream_override_buf != nullptr || e.dirty_writeback;
+        uav_or_ext_gpu || e.stream_override_buf != nullptr || e.dirty_writeback;
     const bool direct_vram =
         (e.buffer != nullptr && !e.stream_override_buf && !e.needs_zero_init);
     const MtReadMru::Slot populated{
@@ -1513,11 +1515,12 @@ MtResolvedBuffer Manager::TryResolveReadMt(VAddr addr, u64 requested_size,
         .raw_size = e.raw_size,
         .alloc_size = e.alloc_size,
         .vk_handle = active_buf->Handle(),
-        .vram_handle = e.buffer ? VkBuffer{e.buffer->Handle()} : VK_NULL_HANDLE,
+        .vram_handle = (e.buffer && !e.needs_zero_init) ? VkBuffer{e.buffer->Handle()} : VK_NULL_HANDLE,
         .base_offset = e.stream_override_buf ? e.stream_override_off : 0ULL,
         .gen = locked_gen,
         .is_static_immutable = static_imm,
         .is_gpu_written = gpu_written,
+        .is_uav_or_ext_gpu = uav_or_ext_gpu,
         .is_direct_vram = direct_vram,
     };
     lock.unlock();

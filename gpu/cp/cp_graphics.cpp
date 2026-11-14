@@ -615,6 +615,11 @@ CommandProcessor::Step CommandProcessor::Graphics(Work& work, Level& level, cons
                                         last_db_extent.raw = 0u;
                                         last_cb_uid.fill(0u);
                                         last_db_uid = 0u;
+                                        auto* cs =
+                                            reinterpret_cast<u32*>(&queues[GfxQueueId].cs_state);
+                                        cs[0x216u - ComputeShOffset] = 0xFFFFFFFFu;
+                                        cs[0x217u - ComputeShOffset] = 0xFFFFFFFFu;
+                                        cs[0x215u - ComputeShOffset] = 0u;
                                     }
                                     u8 cb_mask = meta->end_cb_written_mask;
                                     while (cb_mask != 0u) {

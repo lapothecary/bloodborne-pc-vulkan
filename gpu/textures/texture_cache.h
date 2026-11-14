@@ -132,7 +132,8 @@ public:
     /// Phase 4.1: Cold-miss thread-safe resolution of a settled `DirectImmutable` read-only asset
     /// `VkImageView` in `eShaderReadOnlyOptimal` layout under `TextureCache::mutex`.
     [[nodiscard]] vk::ImageView TryResolveDirectImmutableViewMt(
-        const Gcn::Image& clean_sharp, const Shader::ImageResource& res);
+        const Gcn::Image& clean_sharp, const Shader::ImageResource& res,
+        ImageId* out_id = nullptr);
     /// Phase 4.2b/4.3: Read-only thread-safe inspection of an existing render/depth target image
     /// and view on `GXWorker:1..5` without mutating cache state.
     [[nodiscard]] bool TryInspectTargetMt(ImageDesc& desc, ImageId& out_id, ImageInfo& out_info,
@@ -198,6 +199,20 @@ public:
     /// with UpdateImage.
     void MarkFound(ImageId image_id) {
         slot_images[image_id].tick_accessed_last = CurrentTick();
+    }
+    void TouchImage(const Image& image);
+    /// Phase 4.3d: Lock-free freshness stamp for `GXWorker:1..5` (and zero-touch Stage B fast
+    /// paths), updating `mt_last_access_tick` + `mt_last_gc_tick` at most once per tick.
+    void NoteMtImageAccess(const Image& image) const noexcept {
+        image.NoteMtAccess(CurrentTick(), atomic_gc_tick.load(std::memory_order_relaxed));
+    }
+    void NoteMtImageAccess(ImageId image_id) const noexcept {
+        if (!image_id) {
+            return;
+        }
+        if (const Image* img = slot_images.try_at_mt(image_id)) [[likely]] {
+            img->NoteMtAccess(CurrentTick(), atomic_gc_tick.load(std::memory_order_relaxed));
+        }
     }
 
     // Keeping images up to date.
@@ -425,7 +440,6 @@ private:
     void MarkAsMaybeDirty(ImageId image_id, Image& image);
     void NoteHotImageHit(Image& image) noexcept;
     [[nodiscard]] bool IsHotGranuleRange(VAddr addr, u64 size) const noexcept;
-    void TouchImage(const Image& image);
     void DeleteImage(ImageId image_id);
     void FreeImage(ImageId image_id) {
         UntrackImage(image_id);

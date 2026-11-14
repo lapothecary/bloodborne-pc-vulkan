@@ -365,6 +365,7 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
                 }
             }
             image_id = bound_images.emplace_back(resolved);
+            texture_cache.MarkFound(image_id);
             auto& image = texture_cache.GetImage(image_id);
             if (!image.binding.is_target &&
                 VideoCore::True(image.flags & VideoCore::ImageFlagBits::DirectImmutable)) {
@@ -400,6 +401,7 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
                 }
             }
             image_id = bound_images.emplace_back(resolved);
+            texture_cache.MarkFound(image_id);
             auto& image = texture_cache.GetImage(image_id);
             if (!image.binding.is_target &&
                 VideoCore::True(image.flags & VideoCore::ImageFlagBits::DirectImmutable)) {
@@ -740,10 +742,10 @@ bool Rasterizer::InspectMtPassTargets(
     return true;
 }
 
-RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline, bool secondary_contents) {
+RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline, u8 secondary_mode) {
     BB_SECTION(BeginRendering);
     // bbport: RenderStateMemo (see BeginMemo).
-    const u8 want_sec = secondary_contents ? 1u : 0u;
+    const u8 want_sec = secondary_mode;
     const bool memo_on = !BbToggle::Disabled(BbToggle::RenderStateMemo) && !FrameCapture::Active();
     static const bool verbose_stats = [] {
         const char* env = std::getenv("BB_VERBOSE_STATS");

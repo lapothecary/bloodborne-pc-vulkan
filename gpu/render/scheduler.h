@@ -61,6 +61,8 @@ struct RenderState {
     u16 height;
     u16 num_layers;
     u8 num_color_attachments;
+    /// 0: inline primary pass; 1: secondary pass with occlusionQueryEnable=VK_TRUE;
+    /// 2: secondary pass without inherited occlusion queries.
     u8 secondary_contents;
 
     bool operator==(const RenderState& other) const noexcept {

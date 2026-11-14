@@ -83,6 +83,7 @@ struct alignas(64) MtCompletedPassMeta {
     u32 recorded_draws{0};
     bool is_gbuffer{false};
     bool has_camera_cb{false};
+    bool inherits_occlusion_query{false};
     u8 num_sampled_rt_refs{0};
     u8 motion_slot{0xFFu};
     std::array<SampledRtRef, kMaxSampledRts> sampled_rt_refs{};
@@ -104,41 +105,7 @@ struct alignas(64) MtCompletedPassMeta {
     std::array<u16, Gcn::NUM_COLOR_BUFFERS> end_cb_uid{};
     u16 end_db_uid{0};
 
-    void ApplyEndSyncToRegs(Gcn::Regs& dst, Gcn::RegDirty* dirty, bool track_all) const noexcept {
-        if (!has_end_sync) {
-            return;
-        }
-        if (end_reset) {
-            dst.SetDefaults();
-            if (dirty) {
-                dirty->Clear();
-                dirty->reset = true;
-            }
-        }
-        size_t val_cursor = 0;
-        for (const u32 hdr : end_span_headers) {
-            const u32 word_off = hdr & 0xFFFFu;
-            const u32 count = hdr >> 16u;
-            if (count != 0u && word_off + count <= Gcn::Regs::NumRegs &&
-                val_cursor + count <= end_span_values.size()) {
-                std::memcpy(&dst.reg_array[word_off], &end_span_values[val_cursor],
-                            count * sizeof(u32));
-                if (dirty && dirty->exact_words) [[unlikely]] {
-                    for (u32 w = word_off; w < word_off + count; ++w) {
-                        dirty->exact_words->set(w);
-                    }
-                }
-            }
-            val_cursor += count;
-        }
-        if (dirty) {
-            dirty->stage_b_mask[0] |= end_stage_b_mask[0];
-            dirty->stage_b_mask[1] |= end_stage_b_mask[1];
-            if (dirty->track_all_blocks || track_all) {
-                dirty->blocks |= end_dirty_blocks;
-            }
-        }
-    }
+    void ApplyEndSyncToRegs(Gcn::Regs& dst, Gcn::RegDirty* dirty, bool track_all) const noexcept;
 
     void CaptureFromRegs(const Gcn::Regs& src) noexcept {
         std::memcpy(sh_gfx_regs.data(), &src.reg_array[0x2C00],

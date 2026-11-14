@@ -247,6 +247,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
                 }
                 fe.imm_epoch16 = cur_imm_epoch16;
             }
+            texture_cache.NoteMtImageAccess(fe.id);
             image_infos.emplace_back(VK_NULL_HANDLE, fe.view,
                                      vk::ImageLayout::eShaderReadOnlyOptimal);
         }
@@ -755,10 +756,12 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
                                     mp.view = static_cast<VkImageView>(view);
                                     mp.imm_epoch16 = fe.imm_epoch16;
                                     mp.res_flags = fe.res_flags;
+                                    mp.image_id = image_id;
                                     std::atomic_thread_fence(std::memory_order_release);
                                     mp.seq.store(exp + 2u, std::memory_order_release);
                                 }
                             }
+                            texture_cache.NoteMtImageAccess(image_id);
                         }
                     }
                 }
@@ -1180,6 +1183,7 @@ bool Rasterizer::BindTexturesFromSet(const Shader::Info& stage, const u64* image
                     image_infos.emplace_back(VK_NULL_HANDLE, VK_NULL_HANDLE,
                                              vk::ImageLayout::eGeneral);
                 } else {
+                    texture_cache.NoteMtImageAccess(entry.id);
                     image_infos.emplace_back(VK_NULL_HANDLE, entry.view,
                                              vk::ImageLayout::eShaderReadOnlyOptimal);
                 }
@@ -1211,6 +1215,7 @@ bool Rasterizer::BindTexturesFromSet(const Shader::Info& stage, const u64* image
                 fast_ok = false;
                 break;
             }
+            texture_cache.NoteMtImageAccess(image);
             image_infos.emplace_back(VK_NULL_HANDLE, entry.view,
                                      vk::ImageLayout::eShaderReadOnlyOptimal);
         }
@@ -1264,6 +1269,7 @@ bool Rasterizer::BindTexturesFromSet(const Shader::Info& stage, const u64* image
             image.backing->subresource_states.empty() &&
             image.backing->state.layout == vk::ImageLayout::eShaderReadOnlyOptimal &&
             image.backing->state.access_mask == vk::AccessFlagBits2::eShaderRead) {
+            texture_cache.NoteMtImageAccess(image);
             image_infos.emplace_back(VK_NULL_HANDLE, entry.view,
                                      vk::ImageLayout::eShaderReadOnlyOptimal);
             continue;
@@ -1319,10 +1325,12 @@ vk::ImageView Rasterizer::ResolveSrvViewMt(const Gcn::Image& raw_sharp,
                 const VkImageView view = mp.view;
                 const u16 imm_ep = mp.imm_epoch16;
                 const u8 rf = mp.res_flags;
+                const VideoCore::ImageId pub_id = mp.image_id;
                 std::atomic_thread_fence(std::memory_order_acquire);
                 const u32 s2 = mp.seq.load(std::memory_order_relaxed);
                 if (s1 == s2 && dw7_tag == raw_dw7 && qw0 == raw_qw0 && rf == rflags &&
                     imm_ep == cur_imm_epoch16 && view != VK_NULL_HANDLE) [[likely]] {
+                    texture_cache.NoteMtImageAccess(pub_id);
                     if (out_hits) {
                         ++(*out_hits);
                     }
@@ -1337,7 +1345,9 @@ vk::ImageView Rasterizer::ResolveSrvViewMt(const Gcn::Image& raw_sharp,
     Gcn::Image clean_sharp = raw_sharp;
     u8 dummy_gen8 = 0;
     (void)VideoCore::DirectTextures::UnpackAndCleanSrv(clean_sharp, dummy_gen8);
-    const vk::ImageView resolved = texture_cache.TryResolveDirectImmutableViewMt(clean_sharp, res);
+    VideoCore::ImageId resolved_id{};
+    const vk::ImageView resolved =
+        texture_cache.TryResolveDirectImmutableViewMt(clean_sharp, res, &resolved_id);
     if (!resolved) {
         if (out_misses) {
             ++(*out_misses);
@@ -1357,6 +1367,7 @@ vk::ImageView Rasterizer::ResolveSrvViewMt(const Gcn::Image& raw_sharp,
             mp.view = static_cast<VkImageView>(resolved);
             mp.imm_epoch16 = VideoCore::DirectTextures::ImmutableRoEpoch16();
             mp.res_flags = rflags;
+            mp.image_id = resolved_id;
             std::atomic_thread_fence(std::memory_order_release);
             mp.seq.store(exp + 2u, std::memory_order_release);
         }

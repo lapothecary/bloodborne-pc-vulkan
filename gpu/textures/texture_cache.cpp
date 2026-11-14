@@ -290,7 +290,7 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& info
                                                            ImageId merged_id) {
     Image& cached = slot_images[cache_id];
     const ImageInfo& old = cached.info;
-    const bool stale = CurrentTick() - cached.tick_accessed_last > TicksBeforeRemoval;
+    const bool stale = CurrentTick() - cached.LastAccessTick() > TicksBeforeRemoval;
 
     if (info.guest_address == old.guest_address) {
         // Different block layouts at one address: most likely memory reused from a pool.
@@ -343,7 +343,7 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& info
                   vk::to_string(old.pixel_format), u64(old.type), old.pitch, old.resources.levels,
                   old.resources.layers, old.num_samples, u32(old.tile_mode), old.num_bits,
                   bool(old.props.is_block), old.guest_size, bool(old.props.is_pow2),
-                  old.alt_tile, CurrentTick() - cached.tick_accessed_last, info.size.width,
+                  old.alt_tile, CurrentTick() - cached.LastAccessTick(), info.size.width,
                   info.size.height, info.size.depth, vk::to_string(info.pixel_format),
                   u64(info.type), info.pitch, info.resources.levels, info.resources.layers,
                   info.num_samples, u32(info.tile_mode), info.num_bits, bool(info.props.is_block),
@@ -429,9 +429,10 @@ ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure
         u64 best_tick = 0;
         for (const ImageId id : candidates) {
             const Image& img = slot_images[id];
-            if (img.info.guest_size == size && (!exact || img.tick_accessed_last >= best_tick)) {
+            const u64 last_tick = img.LastAccessTick();
+            if (img.info.guest_size == size && (!exact || last_tick >= best_tick)) {
                 exact = id;
-                best_tick = img.tick_accessed_last;
+                best_tick = last_tick;
             }
         }
         if (exact) {
@@ -446,12 +447,13 @@ ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure
         for (const ImageId id : candidates) {
             const Image& img = slot_images[id];
             const size_t guest_size = img.info.guest_size;
+            const u64 last_tick = img.LastAccessTick();
             if (guest_size <= size && size - guest_size <= effective_max_tail &&
                 (guest_size > best_size ||
-                 (guest_size == best_size && img.tick_accessed_last >= best_tick))) {
+                 (guest_size == best_size && last_tick >= best_tick))) {
                 best = id;
                 best_size = guest_size;
-                best_tick = img.tick_accessed_last;
+                best_tick = last_tick;
             }
         }
         if (best) {
@@ -463,6 +465,7 @@ ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure
         u64 best_tick = 0;
         for (const ImageId id : candidates) {
             const Image& img = slot_images[id];
+            const u64 last_tick = img.LastAccessTick();
             bool matches_sub = false;
             if (img.info.resources.layers > 1) {
                 const size_t slice_size = img.info.guest_size / img.info.resources.layers;
@@ -476,9 +479,9 @@ ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure
                     matches_sub = true;
                 }
             }
-            if (matches_sub && (!sub_best || img.tick_accessed_last >= best_tick)) {
+            if (matches_sub && (!sub_best || last_tick >= best_tick)) {
                 sub_best = id;
-                best_tick = img.tick_accessed_last;
+                best_tick = last_tick;
             }
         }
         if (sub_best) {
@@ -506,10 +509,11 @@ std::pair<ImageId, s32> TextureCache::FindImageSliceFromRange(VAddr address, siz
                     const u64 layer = offset / slice_size;
                     if (layer < image.info.resources.layers) {
                         const bool is_exact = (slice_size == size);
+                        const u64 last_tick = image.LastAccessTick();
                         if (found.second < 0 || (is_exact && !best_exact) ||
-                            (is_exact == best_exact && image.tick_accessed_last >= best_tick)) {
+                            (is_exact == best_exact && last_tick >= best_tick)) {
                             found = {id, static_cast<s32>(layer)};
-                            best_tick = image.tick_accessed_last;
+                            best_tick = last_tick;
                             best_exact = is_exact;
                         }
                     }
@@ -757,7 +761,11 @@ vk::Sampler TextureCache::GetSamplerMt(const Gcn::Sampler& sampler,
 }
 
 vk::ImageView TextureCache::TryResolveDirectImmutableViewMt(const Gcn::Image& clean_sharp,
-                                                            const Shader::ImageResource& res) {
+                                                            const Shader::ImageResource& res,
+                                                            ImageId* out_id) {
+    if (out_id) {
+        *out_id = {};
+    }
     if (!clean_sharp.Valid() || clean_sharp.Address() == 0 || clean_sharp.IsMsaa() ||
         res.is_written || res.mip_fallback_mode != Shader::MipStorageFallbackMode::None) {
         return {};
@@ -804,7 +812,15 @@ vk::ImageView TextureCache::TryResolveDirectImmutableViewMt(const Gcn::Image& cl
         img.info.num_samples != desc.info.num_samples) {
         return {};
     }
-    return img.TryFindExistingViewMt(desc.view_info);
+    const vk::ImageView view = img.TryFindExistingViewMt(desc.view_info);
+    if (!view) {
+        return {};
+    }
+    NoteMtImageAccess(img);
+    if (out_id) {
+        *out_id = id;
+    }
+    return view;
 }
 
 ImageId TextureCache::TryFindExistingImageLocked(ImageDesc& desc) const {
@@ -859,7 +875,7 @@ ImageId TextureCache::TryFindExistingImageLocked(ImageDesc& desc) const {
         for (const ImageId id : overlapping) {
             const Image& cand = slot_images[id];
             const ImageInfo& old = cand.info;
-            const bool stale = cur_tick - cand.tick_accessed_last > TicksBeforeRemoval;
+            const bool stale = cur_tick - cand.LastAccessTick() > TicksBeforeRemoval;
             const ImageInfo& merged = image_id ? slot_images[image_id].info : info;
 
             if (merged.guest_address == old.guest_address) {
@@ -959,6 +975,7 @@ bool TextureCache::TryInspectTargetMt(ImageDesc& desc, ImageId& out_id, ImageInf
     if (!img.TryFindExistingViewMt(desc.view_info)) {
         return false;
     }
+    NoteMtImageAccess(img);
     out_id = id;
     out_info = img.info;
     out_backing_samples = img.backing->num_samples;
@@ -1005,12 +1022,24 @@ bool TextureCache::TryResolveSceneSrvViewMt(
     if (!id || !slot_images.is_allocated(id)) {
         return false;
     }
-    const Image& img = slot_images[id];
+    Image& img = slot_images[id];
     if (!True(img.flags & ImageFlagBits::Registered) || True(img.flags & ImageFlagBits::Dirty) ||
-        True(img.flags & ImageFlagBits::SharedHotPage) || img.prompt_icon || img.prompt_atlas ||
-        img.MaybePromptIcon() || img.binding.needs_rebind || img.binding.force_general ||
-        !img.backing) {
+        img.prompt_icon || img.prompt_atlas || img.MaybePromptIcon() ||
+        img.binding.needs_rebind || img.binding.force_general || !img.backing) {
         return false;
+    }
+    if (True(img.flags & ImageFlagBits::SharedHotPage)) {
+        if (True(img.flags & ImageFlagBits::GpuModified) || img.hash == 0 ||
+            img.info.guest_size == 0 || img.info.guest_size > kSharedHotPageMaxBytes) {
+            return false;
+        }
+        const u64 cur_gc = atomic_gc_tick.load(std::memory_order_relaxed);
+        if (img.hot_check_tick != cur_gc) {
+            if (ComputeSmallOrSampleHash(img.info) != img.hash) {
+                return false;
+            }
+            img.hot_check_tick = cur_gc;
+        }
     }
     if (reduced_scene_active && scene_targets &&
         (img.scene_proxy ||
@@ -1022,6 +1051,7 @@ bool TextureCache::TryResolveSceneSrvViewMt(
     if (!view) {
         return false;
     }
+    NoteMtImageAccess(img);
 
     const bool already_settled_ro =
         !img.info.props.is_depth && !img.scene_proxy && !img.binding.is_target &&

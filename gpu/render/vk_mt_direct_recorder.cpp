@@ -43,6 +43,39 @@
 
 namespace Vulkan {
 
+void MtCompletedPassMeta::ApplyEndSyncToRegs(Gcn::Regs& dst, Gcn::RegDirty* dirty,
+                                             bool track_all) const noexcept {
+    if (!has_end_sync) {
+        return;
+    }
+    if (end_reset) {
+        BbCp::CommandProcessor::InitGnmDefaultRegs(dst, 3u, dirty, track_all);
+    }
+    size_t val_cursor = 0;
+    for (const u32 hdr : end_span_headers) {
+        const u32 word_off = hdr & 0xFFFFu;
+        const u32 count = hdr >> 16u;
+        if (count != 0u && word_off + count <= Gcn::Regs::NumRegs &&
+            val_cursor + count <= end_span_values.size()) {
+            std::memcpy(&dst.reg_array[word_off], &end_span_values[val_cursor],
+                        count * sizeof(u32));
+            if (dirty && dirty->exact_words) [[unlikely]] {
+                for (u32 w = word_off; w < word_off + count; ++w) {
+                    dirty->exact_words->set(w);
+                }
+            }
+        }
+        val_cursor += count;
+    }
+    if (dirty) {
+        dirty->stage_b_mask[0] |= end_stage_b_mask[0];
+        dirty->stage_b_mask[1] |= end_stage_b_mask[1];
+        if (dirty->track_all_blocks || track_all) {
+            dirty->blocks |= end_dirty_blocks;
+        }
+    }
+}
+
 class VkMtDirectRecorder::MtGuestCopyShadowCache {
 public:
     static constexpr size_t kNumShards = 16;
@@ -748,6 +781,7 @@ struct VkMtDirectRecorder::WorkerCompileScratch {
         u32 recorded_draws{0};
         bool is_gbuffer{false};
         bool has_camera_cb{false};
+        bool inherits_occlusion_query{false};
         u8 num_sampled_rt_refs{0};
         u8 motion_slot{0xFFu};
         std::array<MtCompletedPassMeta::SampledRtRef, MtCompletedPassMeta::kMaxSampledRts>
@@ -930,8 +964,13 @@ bool VkMtDirectRecorder::BeginWorkerPass(u32 worker_id, const MtPassInheritanceD
         .stencilAttachmentFormat = pass_desc.stencil_format,
         .rasterizationSamples = pass_desc.rasterization_samples,
     };
+    const bool inherit_occ = instance.IsInheritedQueriesSupported();
     const vk::CommandBufferInheritanceInfo inh_info{
         .pNext = &rendering_inh,
+        .occlusionQueryEnable = inherit_occ ? VK_TRUE : VK_FALSE,
+        .queryFlags = (inherit_occ && instance.IsOcclusionQueryPrecise())
+                          ? vk::QueryControlFlagBits::ePrecise
+                          : vk::QueryControlFlags{},
     };
     const vk::CommandBufferBeginInfo begin_info{
         .flags = vk::CommandBufferUsageFlagBits::eRenderPassContinue |
@@ -1599,7 +1638,7 @@ std::atomic<u32> g_mt_last_report_frame{0};
 std::array<std::atomic<u32>, 16> g_mt_seen_bail_ops{};
 std::array<std::atomic<u64>, 8> g_mt_seen_unsafe_pso{};
 std::array<std::atomic<u64>, 8> g_mt_seen_bail_buf{};
-std::array<std::atomic<u64>, 8> g_mt_seen_bail_target{};
+std::array<std::array<std::atomic<u64>, 4>, 6> g_mt_seen_bail_target_by_site{};
 
 [[nodiscard]] bool MtTryClaimDiagKey(std::span<std::atomic<u64>> table, u64 raw_key) noexcept {
     const u64 key = raw_key | (1ULL << 63u);
@@ -1686,8 +1725,7 @@ void MtMaybeLogUnsafePsoSample(u8 reason, u64 vs_hash, u64 ps_hash) noexcept {
 void MtMaybeLogBailBufSample(u8 site, u8 step, bool is_fmt, VAddr addr, u64 sz,
                              u64 vs_hash) noexcept {
     const u64 key = (static_cast<u64>(site) << 56u) | (static_cast<u64>(step) << 48u) |
-                    (static_cast<u64>(is_fmt ? 1u : 0u) << 47u) | ((addr >> 20u) & 0x7FFFULL) |
-                    ((vs_hash & 0xFFFFFFFFULL) << 15u);
+                    (static_cast<u64>(is_fmt ? 1u : 0u) << 47u) | ((addr >> 4u) & 0x7FFFFFFFFFFFULL);
     if (!MtTryClaimDiagKey(g_mt_seen_bail_buf, key)) {
         return;
     }
@@ -1718,10 +1756,11 @@ void MtMaybeLogBailBufSample(u8 site, u8 step, bool is_fmt, VAddr addr, u64 sz,
 
 void MtMaybeLogBailTargetSample(u8 site, VAddr addr, u32 fmt_or_mrt, u64 vs_hash,
                                 u64 ps_hash) noexcept {
+    const size_t bucket = std::min<size_t>(site, g_mt_seen_bail_target_by_site.size() - 1u);
     const u64 key = (static_cast<u64>(site) << 56u) |
                     (static_cast<u64>(fmt_or_mrt & 0xFFFFu) << 40u) |
-                    (((vs_hash ^ ps_hash) & 0xFFFFFFFFFFULL));
-    if (!MtTryClaimDiagKey(g_mt_seen_bail_target, key)) {
+                    (((addr >> 8u) ^ vs_hash ^ ps_hash) & 0xFFFFFFFFFFULL);
+    if (!MtTryClaimDiagKey(g_mt_seen_bail_target_by_site[bucket], key)) {
         return;
     }
     std::printf("[BB-MT] bail_target sample: site=%u(%s) addr=0x%llx info=0x%x vs=0x%016llx "
@@ -2007,15 +2046,33 @@ struct MtDecodedPkt {
             out.kind = MtPktKind::StateOnly;
             return out;
 
-        case BbCp::DirectVk::Op::SetStageUserData:
-            if (body_words < 3u || (body[2] & 0xFFFFu) >= 0x200u) {
-                return {}; // Reject compute stage user data
+        case BbCp::DirectVk::Op::SetStageUserData: {
+            if (body_words < 3u) {
+                return {};
+            }
+            const u32 sh_offset = body[2] & 0xFFFFu;
+            if (sh_offset >= 0x200u) {
+                const u32 mask = body[2] >> 16u;
+                if (sh_offset <= 0x250u &&
+                    static_cast<u32>(std::popcount(mask)) == body_words - 3u) {
+                    out.kind = MtPktKind::PostSyncRetain;
+                    return out;
+                }
+                return {};
             }
             if (!BbCp::CommandProcessor::ApplyGraphicsRegisterPacket(
                     regs, cur, dummy_csum, dirty, false, &pso_epoch, &dyn_epoch)) {
                 return {};
             }
             out.kind = MtPktKind::StateOnly;
+            return out;
+        }
+
+        case BbCp::DirectVk::Op::BindCsShader:
+            if (body_words != 9u) {
+                return {};
+            }
+            out.kind = MtPktKind::PostSyncRetain;
             return out;
 
         case BbCp::DirectVk::Op::InitDefaultHardwareState:
@@ -2880,6 +2937,7 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
     }
 
     u32 cur_subpass_idx = ~0u;
+    bool cur_inherits_occ = false;
     u8 cur_motion_slot = 0xFFu;
     u8 cur_num_sampled_rts = 0u;
     std::array<MtCompletedPassMeta::SampledRtRef, MtCompletedPassMeta::kMaxSampledRts>
@@ -2899,8 +2957,14 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
             .stencilAttachmentFormat = ts.stencil_format,
             .rasterizationSamples = ts.rasterization_samples,
         };
+        const bool inherit_occ =
+            instance.IsInheritedQueriesSupported() && occ_block_id == 0xFFFFu;
         const vk::CommandBufferInheritanceInfo inh_info{
             .pNext = &rendering_inh,
+            .occlusionQueryEnable = inherit_occ ? VK_TRUE : VK_FALSE,
+            .queryFlags = (inherit_occ && instance.IsOcclusionQueryPrecise())
+                              ? vk::QueryControlFlagBits::ePrecise
+                              : vk::QueryControlFlags{},
         };
         const vk::CommandBufferBeginInfo begin_info{
             .flags = vk::CommandBufferUsageFlagBits::eRenderPassContinue |
@@ -2918,6 +2982,7 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
         w.push_tracker.InvalidateAll();
         w.dyn_state.Invalidate();
         cur_subpass_idx = sp_idx;
+        cur_inherits_occ = inherit_occ;
         cur_motion_slot = 0xFFu;
         cur_num_sampled_rts = 0u;
         return true;
@@ -2944,6 +3009,7 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
         sp.uconfig_vgt_regs = plan.uconfig_vgt_regs;
         sp.recorded_draws = w.recorded_draws;
         sp.is_gbuffer = plan.target_summary.is_gbuffer;
+        sp.inherits_occlusion_query = cur_inherits_occ;
         sp.num_sampled_rt_refs = cur_num_sampled_rts;
         sp.motion_slot = cur_motion_slot;
         sp.sampled_rt_refs = cur_sampled_rts;
@@ -3282,15 +3348,18 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
         if (!in_transient) {
             const auto resolved = ResolveBuffer(worker_id, addr, req_size);
             if (resolved && resolved.clamped_size >= min_span) {
-                if (!resolved.is_gpu_written) {
-                    if (WasCoarseRangeModifiedRecently(addr, resolved.clamped_size,
-                                                       cur_guest_frame) ||
-                        rasterizer.IsRegionGpuModifiedForMt(addr, resolved.clamped_size)) {
-                        return fail(7u);
-                    }
+                if (!resolved.is_gpu_written &&
+                    !WasCoarseRangeModifiedRecently(addr, req_size, cur_guest_frame) &&
+                    !rasterizer.IsRegionGpuModifiedForMt(addr, req_size)) {
                     out_buf = vk::Buffer{resolved.handle};
                     out_off = resolved.offset;
                     out_total_bytes = resolved.offset + resolved.clamped_size;
+                    return true;
+                }
+                if (!resolved.is_uav_or_ext_gpu && resolved.vram_handle != VK_NULL_HANDLE) {
+                    out_buf = vk::Buffer{resolved.vram_handle};
+                    out_off = resolved.vram_offset;
+                    out_total_bytes = resolved.vram_offset + resolved.clamped_size;
                     return true;
                 }
                 if (resolved.vram_handle != VK_NULL_HANDLE && guest_copy_shadow &&
@@ -3300,6 +3369,7 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
                     out_total_bytes = resolved.vram_offset + resolved.clamped_size;
                     return true;
                 }
+                return fail(7u);
             }
         }
 
@@ -4205,6 +4275,7 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
         pub_meta.occ_block_id = sp_occ_id;
         pub_meta.is_gbuffer = sp.is_gbuffer;
         pub_meta.has_camera_cb = sp.is_gbuffer && has_camera_cb;
+        pub_meta.inherits_occlusion_query = sp.inherits_occlusion_query;
         pub_meta.num_sampled_rt_refs = sp.num_sampled_rt_refs;
         pub_meta.motion_slot = sp.motion_slot;
         if (sp.num_sampled_rt_refs != 0u) {

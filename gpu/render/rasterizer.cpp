@@ -74,10 +74,12 @@ struct SceneOcclusionCuller {
     vk::UniqueQueryPool mt_pool;
     bool initialized = false;
     bool enabled = true;
+    bool mt_occ_cull = false;
     bool micro_shadow_cull = true;
     std::atomic<u32> cur_frame{1};
     u32 cur_slice = 0;
     u32 gbuf_draws_in_frame = 0;
+    u32 log_frame_counter = 0;
     std::atomic<u32> mt_gbuf_frame{0};
     std::atomic<u32> mt_gbuf_draws_in_frame{0};
     std::atomic<u32> mt_block_hint{0};
@@ -113,6 +115,9 @@ struct SceneOcclusionCuller {
         if (const char* e = std::getenv("BB_HW_OCCLUSION_CULL")) {
             enabled = (e[0] != '0');
         }
+        if (const char* e = std::getenv("BB_MT_OCC_CULL")) {
+            mt_occ_cull = (e[0] == '1');
+        }
         if (const char* e = std::getenv("BB_MICRO_SHADOW_CULL")) {
             micro_shadow_cull = (e[0] != '0');
         }
@@ -144,8 +149,8 @@ struct SceneOcclusionCuller {
     }
 
     [[nodiscard]] u32 ActiveFrameTag() const noexcept {
-        return std::max(cur_frame.load(std::memory_order_relaxed),
-                        BbStats::guest_frame_number.load(std::memory_order_relaxed));
+        const u32 gf = BbStats::guest_frame_number.load(std::memory_order_relaxed);
+        return (gf != 0u) ? gf : cur_frame.load(std::memory_order_relaxed);
     }
 
     void ApplyQuerySamplesToEntries(const u16* idx_arr, const u64* samples, u32 count,
@@ -314,17 +319,19 @@ struct SceneOcclusionCuller {
             return;
         }
         SealCurrentSlice(scheduler.CurrentTick());
+        const u32 prev_f = cur_frame.load(std::memory_order_relaxed);
         const u32 gf = BbStats::guest_frame_number.load(std::memory_order_relaxed);
-        const u32 next_f = std::max(cur_frame.load(std::memory_order_relaxed) + 1u, gf);
+        const u32 next_f = (gf != 0u) ? gf : (prev_f + 1u);
         cur_frame.store(next_f, std::memory_order_relaxed);
-        if (cam_updated_frame.load(std::memory_order_relaxed) != next_f) {
+        const u32 last_cam_f = cam_updated_frame.load(std::memory_order_acquire);
+        if (next_f > last_cam_f + 1u) {
             camera_moving.store(false, std::memory_order_relaxed);
             fast_camera_turn.store(false, std::memory_order_relaxed);
         }
 
         CollectRetiredSlices(instance.GetDevice(), scheduler);
 
-        if ((next_f % 600u) == 0u) {
+        if ((++log_frame_counter % 600u) == 0u) {
             const u64 cand = stat_gbuf_candidates.exchange(0, std::memory_order_relaxed);
             const u64 skip = stat_gbuf_skipped.exchange(0, std::memory_order_relaxed);
             const u64 prob = stat_gbuf_probed.exchange(0, std::memory_order_relaxed);
@@ -817,7 +824,8 @@ bool Rasterizer::TryCullMicroShadowDrawMt(const Gcn::Regs& regs, const GraphicsP
 }
 
 u16 Rasterizer::AcquireMtOcclusionQueryBlock(u32 frame_tag) noexcept {
-    if (!scene_occlusion_culler) {
+    if (!scene_occlusion_culler || !scene_occlusion_culler->mt_occ_cull ||
+        guest_occlusion_seen.load(std::memory_order_relaxed)) {
         return 0xFFFFu;
     }
     const u32 eff_tag =
@@ -880,8 +888,10 @@ Rasterizer::MtOcclusionDecision Rasterizer::EvaluateGBufferOcclusionMt(
         return decision;
     }
     auto& culler = *scene_occlusion_culler;
-    if (!culler.enabled || !culler.mt_pool || !is_indexed ||
-        (pipeline->GetGraphicsKey().mrt_mask & 0x3fu) != 0x3fu || regs.blend_control[0].enable ||
+    const u32 expected_mrt_mask = pipeline->GetGraphicsKey().motion_vectors ? 0x7fu : 0x3fu;
+    if (!culler.enabled || !culler.mt_occ_cull || !culler.mt_pool ||
+        guest_occlusion_seen.load(std::memory_order_relaxed) || !is_indexed ||
+        pipeline->GetGraphicsKey().mrt_mask != expected_mrt_mask || regs.blend_control[0].enable ||
         !regs.depth_control.depth_enable || !regs.depth_control.depth_write_enable ||
         regs.depth_render_control.depth_clear_enable ||
         regs.depth_render_control.stencil_clear_enable || regs.num_indices < 36u) {
@@ -1148,7 +1158,8 @@ void Rasterizer::ExecuteSecondaryCmdBuf(u32 worker_id, u64 cmd_seq, u32 recorded
         const auto& ref = meta->sampled_rt_refs[i];
         if (auto* img = texture_cache.TryGetImage(ref.id, ref.uid);
             img && img->backing && !img->binding.needs_rebind) {
-            img->tick_accessed_last = scheduler.CurrentTick();
+            texture_cache.MarkFound(ref.id);
+            texture_cache.TouchImage(*img);
             constexpr auto ShaderStages =
                 vk::PipelineStageFlagBits2::eAllGraphics | vk::PipelineStageFlagBits2::eComputeShader;
             const auto read_access =
@@ -1169,11 +1180,18 @@ void Rasterizer::ExecuteSecondaryCmdBuf(u32 worker_id, u64 cmd_seq, u32 recorded
 
     PrepareRenderState(pipeline);
     NoteUpscalerDraw(pipeline);
-    if (gbuffer_draw && meta->has_camera_cb && camera_motion && !camera_motion->PassHasCamera()) {
-        camera_motion->OnConstants(meta->camera_cb_floats.data());
+    if (gbuffer_draw && meta->has_camera_cb) {
+        if (camera_motion && !camera_motion->PassHasCamera()) {
+            camera_motion->OnConstants(meta->camera_cb_floats.data());
+        }
+        if (scene_occlusion_culler) {
+            scene_occlusion_culler->UpdateCameraFromSceneConstants(
+                meta->camera_cb_floats.data(), scene_occlusion_culler->ActiveFrameTag());
+        }
     }
 
-    const auto state = BeginRendering(pipeline, /*secondary_contents=*/true);
+    const u8 sec_mode = (meta->inherits_occlusion_query && occ_block_id == 0xFFFFu) ? 1u : 2u;
+    const auto state = BeginRendering(pipeline, sec_mode);
     const bool will_begin_pass = !last_begin_memo_hit && scheduler.WillBeginRendering(state);
     if (HasPendingHleCopies() && will_begin_pass) {
         FlushPendingHleCopies(*this);

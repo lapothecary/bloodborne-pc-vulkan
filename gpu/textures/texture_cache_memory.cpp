@@ -204,6 +204,7 @@ void TextureCache::GarbageCollectImages() {
     if (!BbToggle::Disabled(BbToggle::TextureCollector) && new_second &&
         total_used_memory < trigger_gc_memory && idle_tick != 0 && gc_tick > idle_tick) {
         std::scoped_lock lock{mutex};
+        const u64 cur_sched_tick = CurrentTick();
         size_t idle_deletions = 16;
         u32 idle_visited = 0;
         lru_cache.ForEachItemBelow(idle_tick, [&](ImageId image_id) {
@@ -212,8 +213,9 @@ void TextureCache::GarbageCollectImages() {
             }
             Image& image = slot_images[image_id];
             if (True(image.flags & (ImageFlagBits::DirectImmutable | ImageFlagBits::GpuModified)) ||
-                image.SafeToDownload()) {
-                lru_cache.Touch(image.lru_id, gc_tick);
+                image.SafeToDownload() || image.MtLastGcTick() >= idle_tick ||
+                cur_sched_tick - image.LastAccessTick() <= 64u) {
+                TouchImage(image);
                 return false;
             }
             --idle_deletions;
@@ -227,8 +229,10 @@ void TextureCache::GarbageCollectImages() {
     }
 
     std::scoped_lock lock{mutex};
+    const u64 cur_sched_tick = CurrentTick();
     bool pressured = false;
     bool aggressive = false;
+    bool is_emergency = false;
     u64 below_tick = 0;
     size_t deletions = 0;
     u32 visited = 0;
@@ -236,6 +240,7 @@ void TextureCache::GarbageCollectImages() {
     const auto configure = [&](bool allow_aggressive, bool emergency = false) {
         pressured = total_used_memory >= pressure_gc_memory;
         aggressive = allow_aggressive && total_used_memory >= critical_gc_memory;
+        is_emergency = emergency;
         below_tick = gc_tick - std::min<u64>(aggressive ? 160 : pressured ? 80 : 16, gc_tick);
         if (!pressured && !aggressive) {
             below_tick = std::min(below_tick, idle_tick);
@@ -251,9 +256,16 @@ void TextureCache::GarbageCollectImages() {
             return true;
         }
         Image& image = slot_images[image_id];
+        if (!is_emergency &&
+            (image.MtLastGcTick() >= below_tick ||
+             cur_sched_tick - image.LastAccessTick() <= 32u)) {
+            TouchImage(image);
+            BbStats::gc_kept_images.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
         if (True(image.flags & ImageFlagBits::DirectImmutable) &&
             True(image.flags & ImageFlagBits::GpuModified)) {
-            lru_cache.Touch(image.lru_id, gc_tick);
+            TouchImage(image);
             BbStats::gc_kept_images.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
@@ -262,7 +274,7 @@ void TextureCache::GarbageCollectImages() {
         // ones only under pressure) neither use up the deletions nor stay first in line: the
         // oldest ten being such targets stopped the collector for good.
         if ((write_back && image.info.IsTiled()) || (write_back && !pressured)) {
-            lru_cache.Touch(image.lru_id, gc_tick);
+            TouchImage(image);
             BbStats::gc_kept_images.fetch_add(1, std::memory_order_relaxed);
             return false;
         }

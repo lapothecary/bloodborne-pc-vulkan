@@ -303,10 +303,10 @@ struct RegDirty {
             for (u32 block = word / BlockWords; block <= last / BlockWords; ++block) {
                 blocks.set(block);
             }
-            if (exact_words) [[unlikely]] {
-                for (u32 w = word; w < end; ++w) {
-                    exact_words->set(w);
-                }
+        }
+        if (exact_words) [[unlikely]] {
+            for (u32 w = word; w < end; ++w) {
+                exact_words->set(w);
             }
         }
     }

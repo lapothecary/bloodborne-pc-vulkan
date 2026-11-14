@@ -230,6 +230,7 @@ bool Rasterizer::OcclusionEvent(VAddr address, u32 pairs) {
     if (!occlusion) {
         occlusion = std::make_unique<OcclusionQueries>(instance, scheduler, buffer_cache);
     }
+    guest_occlusion_seen.store(true, std::memory_order_relaxed);
     occlusion->Event(address, pairs);
     return true;
 }
@@ -248,6 +249,7 @@ void Rasterizer::DirectOcclusionQuery(VAddr base_addr, u32 pairs, u32 query_op) 
     if (!occlusion) {
         occlusion = std::make_unique<OcclusionQueries>(instance, scheduler, buffer_cache);
     }
+    guest_occlusion_seen.store(true, std::memory_order_relaxed);
     const u32 clear_bytes = pairs * 16u;
     if (!occlusion->TryClearOnCpu(base_addr, pairs, texture_cache)) {
         FillBuffer(base_addr, clear_bytes, 0u, false);

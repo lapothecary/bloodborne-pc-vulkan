@@ -179,6 +179,9 @@ public:
     bool IsOcclusionQueryPrecise() const {
         return features.occlusionQueryPrecise;
     }
+    bool IsInheritedQueriesSupported() const noexcept {
+        return bool(features.inheritedQueries);
+    }
     bool IsGeometryStageSupported() const {
         return features.geometryShader;
     }

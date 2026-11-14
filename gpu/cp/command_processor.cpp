@@ -101,7 +101,7 @@ constexpr u32 ComputeWords = sizeof(ComputeProgram) / 4;
 
 [[gnu::always_inline]] inline void MarkShReg(Gcn::RegDirty* dirty, bool track_all, u32 index,
                                              u32 count) noexcept {
-    if (track_all) [[unlikely]] {
+    if (dirty && (track_all || dirty->exact_words != nullptr)) [[unlikely]] {
         dirty->Mark(index, count);
     }
 }

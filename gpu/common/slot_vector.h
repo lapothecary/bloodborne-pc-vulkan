@@ -5,6 +5,8 @@
 // are reused last-in first-out; new ones count up from 0.
 #pragma once
 
+#include <array>
+#include <atomic>
 #include <bit>
 #include <compare>
 #include <cstddef>
@@ -124,13 +126,32 @@ public:
         return block < blocks.size() && blocks[block]->Used(id.index & (BlockSize - 1));
     }
 
+    /// Phase 4.3d: Wait-free, lock-free lookup of a live slot from `GXWorker:1..5` without racing
+    /// on `blocks` `std::vector` growth on Stage B (`Block` storage never moves once allocated).
+    [[nodiscard]] const T* try_at_mt(SlotId id) const noexcept {
+        const u32 block = id.index >> BlockShift;
+        if (block >= MaxMtBlocks) [[unlikely]] {
+            return nullptr;
+        }
+        const Block* blk = mt_blocks[block].load(std::memory_order_acquire);
+        if (!blk) [[unlikely]] {
+            return nullptr;
+        }
+        const u32 i = id.index & (BlockSize - 1);
+        const u64 mask = __atomic_load_n(&blk->used[i >> 6], __ATOMIC_ACQUIRE);
+        if (((mask >> (i & 63)) & 1u) == 0u) [[unlikely]] {
+            return nullptr;
+        }
+        return blk->At(i);
+    }
+
     template <typename... Args>
     SlotId insert(Args&&... args) {
         const u32 index = TakeFreeIndex();
         Block& block = *blocks[index >> BlockShift];
         const u32 i = index & (BlockSize - 1);
         std::construct_at(block.At(i), std::forward<Args>(args)...);
-        block.used[i >> 6] |= u64{1} << (i & 63);
+        __atomic_or_fetch(&block.used[i >> 6], u64{1} << (i & 63), __ATOMIC_RELEASE);
         ++live;
         return SlotId{index};
     }
@@ -138,8 +159,8 @@ public:
     void erase(SlotId id) {
         Block& block = *blocks[id.index >> BlockShift];
         const u32 i = id.index & (BlockSize - 1);
+        __atomic_and_fetch(&block.used[i >> 6], ~(u64{1} << (i & 63)), __ATOMIC_RELEASE);
         std::destroy_at(block.At(i));
-        block.used[i >> 6] &= ~(u64{1} << (i & 63));
         free_ids.push_back(id.index);
         --live;
     }
@@ -168,6 +189,8 @@ public:
     }
 
 private:
+    static constexpr u32 MaxMtBlocks = 256; ///< Up to 262,144 slots reachable lock-free on workers
+
     u32 TakeFreeIndex() {
         if (!free_ids.empty()) {
             const u32 index = free_ids.back();
@@ -175,11 +198,17 @@ private:
             return index;
         }
         if (capacity % BlockSize == 0) {
-            blocks.push_back(std::make_unique<Block>());
+            auto blk = std::make_unique<Block>();
+            const u32 bidx = capacity >> BlockShift;
+            if (bidx < MaxMtBlocks) {
+                mt_blocks[bidx].store(blk.get(), std::memory_order_release);
+            }
+            blocks.push_back(std::move(blk));
         }
         return capacity++;
     }
 
+    std::array<std::atomic<Block*>, MaxMtBlocks> mt_blocks{};
     std::vector<std::unique_ptr<Block>> blocks;
     std::vector<u32> free_ids;
     u32 capacity = 0; ///< ids handed out so far (free or not)

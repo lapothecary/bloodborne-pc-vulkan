@@ -269,7 +269,7 @@ void Scheduler::BeginRendering(const RenderState& state, u8 color_dont_care_mask
     } else {
         Record([pass](vk::CommandBuffer cmdbuf) mutable { pass.Begin(cmdbuf); });
     }
-    if (!state.secondary_contents) {
+    if (state.secondary_contents != 2u) {
         CarryResume(true);
     }
 }
@@ -292,7 +292,7 @@ void Scheduler::EndRendering() {
     if (trace) {
         pass_end_caller = __builtin_return_address(0);
     }
-    if (!render_state.secondary_contents) {
+    if (render_state.secondary_contents != 2u) {
         CarrySuspend(true);
     }
     is_rendering = false;
@@ -574,7 +574,9 @@ void Scheduler::MaybeSplit() {
         return;
     }
     if (is_rendering) {
-        CarrySuspend(true);
+        if (render_state.secondary_contents != 2u) {
+            CarrySuspend(true);
+        }
         Record([](vk::CommandBuffer cmdbuf) { cmdbuf.endRendering(); });
         is_rendering = false;
         resume_rendering = true;
@@ -731,7 +733,7 @@ void Scheduler::EnterDirectMode() {
     if (own_segment && async_submit && current_segment + 2 < MaxSegments &&
         !BbToggle::Disabled(BbToggle::ThreadedRecording)) {
         if (is_rendering) {
-            if (!render_state.secondary_contents) {
+            if (render_state.secondary_contents != 2u) {
                 CarrySuspend(true);
             }
             Record([](vk::CommandBuffer cmdbuf) { cmdbuf.endRendering(); });
@@ -775,7 +777,7 @@ void Scheduler::EnterDirectMode() {
 
 void Scheduler::LeaveDirectSegment() {
     if (is_rendering) {
-        if (!render_state.secondary_contents) {
+        if (render_state.secondary_contents != 2u) {
             CarrySuspend(true);
         }
         current_cmdbuf.endRendering();

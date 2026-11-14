@@ -4,6 +4,7 @@
 // it (dirty flags, the pages watched, when it was used).
 #pragma once
 
+#include <atomic>
 #include <deque>
 #include <optional>
 #include <vector>
@@ -152,8 +153,47 @@ struct Image {
     VAddr guest_end = 0;   ///< its end
     struct BackingImage;
     BackingImage* backing{};
+    struct MovableAtomicU64 {
+        mutable std::atomic<u64> val{0};
+        constexpr MovableAtomicU64() noexcept = default;
+        MovableAtomicU64(const MovableAtomicU64&) = delete;
+        MovableAtomicU64& operator=(const MovableAtomicU64&) = delete;
+        MovableAtomicU64(MovableAtomicU64&& o) noexcept
+            : val{o.val.load(std::memory_order_relaxed)} {}
+        MovableAtomicU64& operator=(MovableAtomicU64&& o) noexcept {
+            val.store(o.val.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            return *this;
+        }
+        [[nodiscard]] u64 Load() const noexcept {
+            return val.load(std::memory_order_relaxed);
+        }
+        void Store(u64 v) const noexcept {
+            val.store(v, std::memory_order_relaxed);
+        }
+    };
+
     mutable u64 lru_touched_tick = ~0ull; ///< the GC tick of the last LRU touch
     u64 tick_accessed_last{};
+    /// Phase 4.3d: Lock-free freshness stamps updated by `GXWorker:1..5` (and zero-touch Stage B
+    /// fast paths) with read-before-write filtering (at most 1 write per tick across all workers).
+    MovableAtomicU64 mt_last_access_tick{}; ///< scheduler `CurrentTick()` domain (`TicksBeforeRemoval`)
+    MovableAtomicU64 mt_last_gc_tick{};     ///< `gc_tick` domain (`GarbageCollectImages` LRU)
+
+    [[nodiscard]] u64 LastAccessTick() const noexcept {
+        const u64 mt = mt_last_access_tick.Load();
+        return tick_accessed_last >= mt ? tick_accessed_last : mt;
+    }
+    [[nodiscard]] u64 MtLastGcTick() const noexcept {
+        return mt_last_gc_tick.Load();
+    }
+    void NoteMtAccess(u64 sched_tick, u64 gc_t) const noexcept {
+        if (mt_last_access_tick.Load() < sched_tick) [[unlikely]] {
+            mt_last_access_tick.Store(sched_tick);
+        }
+        if (mt_last_gc_tick.Load() < gc_t) [[unlikely]] {
+            mt_last_gc_tick.Store(gc_t);
+        }
+    }
     u64 gpu_write_tick{}; ///< the scheduler tick of the last binding the GPU may write
     ImageId depth_id{};
     u64 depth_uid{};

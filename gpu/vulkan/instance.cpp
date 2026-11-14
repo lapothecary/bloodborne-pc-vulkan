@@ -346,6 +346,7 @@ void Instance::CreateDevice() {
             .shaderInt16 = features.shaderInt16,
             .sparseBinding = features.sparseBinding,
             .sparseResidencyBuffer = features.sparseResidencyBuffer,
+            .inheritedQueries = features.inheritedQueries,
         },
     };
     vk::PhysicalDeviceVulkan11Features enable11{

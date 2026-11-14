@@ -261,6 +261,7 @@ BB_ENV(BB_VEL_CULL_EPS, TUNING, "=float (default 0.008): 3x4 bone matrix delta t
 BB_ENV(BB_VFX_UI_BATCH, TUNING, "=0: disable Stage-A VFX soft-particle, Scaleform 2D HUD & small-draw batching (default 1)")
 BB_ENV(BB_DRAW_BUNDLE, TUNING, "=1 / 0: opt-in fuse per-draw DirectVk state + draw packets into Op::DrawBundle (default 0)")
 BB_ENV(BB_MT_DIRECT_VK, TUNING, "=0 / 1 / 2: multi-threaded Direct Vulkan 1.3 secondary command buffer recording on GXWorker:1..5 (default 1)")
+BB_ENV(BB_MT_OCC_CULL, TUNING, "=1 / 0: opt-in worker-thread G-Buffer hardware occlusion culling in secondary command buffers (default 0)")
 BB_ENV(BB_LIVE_HYBRID, TUNING, "=1: the startup resolution patch with live presets over it")
 BB_ENV(BB_MEM_SEMAPHORE_ORDER, TUNING, "=0: memory semaphores without ordering")
 BB_ENV(BB_MIRROR_ALLOC_PERCENT, TUNING, "=N (0 off): a mirror that would take device memory past N percent is refused")

@@ -599,7 +599,7 @@ public:
 
 private:
     void PrepareRenderState(const GraphicsPipeline* pipeline);
-    RenderState BeginRendering(const GraphicsPipeline* pipeline, bool secondary_contents = false);
+    RenderState BeginRendering(const GraphicsPipeline* pipeline, u8 secondary_mode = 0u);
     RenderState BeginRenderingFull(const GraphicsPipeline* pipeline);
     /// The upscaler's redirection of the pass's targets to its output-size images.
     struct TargetRedirect {
@@ -987,7 +987,7 @@ private:
         u16 imm_epoch16{0};
         u8 res_flags{0xFFu};
         u8 pad0{0};
-        u32 pad1{0};
+        VideoCore::ImageId image_id{};
     };
     static_assert(sizeof(MtSrvPublishEntry) == 32);
     std::unique_ptr<MtSrvPublishEntry[]> mt_srv_publish;
@@ -1511,6 +1511,7 @@ private:
     std::unique_ptr<SceneOcclusionCuller> scene_occlusion_culler;
     std::unique_ptr<VfxUiBatcher> vfx_ui_batcher;
     std::unique_ptr<class OcclusionQueries> occlusion;
+    std::atomic<bool> guest_occlusion_seen{false};
     std::unique_ptr<class ButtonPrompts> prompts; ///< bbport: the key guide icons for the device in use
     std::unique_ptr<class GpuTimestamps> timestamps;
     std::unique_ptr<class IndirectGuard> indirect_guard; ///< stage B only (lazily)
