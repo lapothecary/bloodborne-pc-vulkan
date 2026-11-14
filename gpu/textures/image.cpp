@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <unordered_map>
 #include <fmt/format.h>
@@ -236,6 +237,14 @@ Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
 
 Image::~Image() = default;
 
+namespace {
+
+std::shared_mutex& MtViewInsertMutex() noexcept {
+    static std::shared_mutex m;
+    return m;
+}
+} // namespace
+
 ImageView& Image::FindView(const ImageViewInfo& view_info, bool ensure_guest_samples) {
     if (ensure_guest_samples && (backing->num_samples > 1) != (info.num_samples > 1)) {
         runtime->SetBackingSamples(this, info.num_samples);
@@ -249,10 +258,28 @@ ImageView& Image::FindView(const ImageViewInfo& view_info, bool ensure_guest_sam
         backing->last_view = u32(it - infos.begin());
         return (*slot_image_views)[ids[backing->last_view]];
     }
+    std::unique_lock lk{MtViewInsertMutex()};
     const ImageViewId id = slot_image_views->insert(runtime->GetInstance(), view_info, *this);
     infos.push_back(view_info);
     ids.push_back(id);
     return (*slot_image_views)[id];
+}
+
+vk::ImageView Image::TryFindExistingViewMt(const ImageViewInfo& view_info) const noexcept {
+    if (!backing || !slot_image_views ||
+        (backing->num_samples > 1) != (info.num_samples > 1)) {
+        return {};
+    }
+    std::shared_lock lk{MtViewInsertMutex()};
+    const auto& infos = backing->image_view_infos;
+    const auto& ids = backing->image_view_ids;
+    const size_t n = std::min(infos.size(), ids.size());
+    for (size_t i = 0; i < n; ++i) {
+        if (infos[i] == view_info && slot_image_views->is_allocated(ids[i])) {
+            return *(*slot_image_views)[ids[i]].image_view;
+        }
+    }
+    return {};
 }
 
 void Image::GetBarriers(Barriers& out, vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,

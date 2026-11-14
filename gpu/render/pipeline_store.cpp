@@ -528,7 +528,10 @@ void PipelineCache::DropPreloaded() {
     // Modules of a damaged entry may sit in programs that later lookups would reuse: nothing
     // preloaded is kept.
     InvalidateFastSelect();
-    graphics_pipelines.clear();
+    {
+        std::unique_lock gr_lk{graphics_pipelines_mutex};
+        graphics_pipelines.clear();
+    }
     compute_pipelines.clear();
     std::unordered_set<VkShaderModule> modules;
     for (const auto& [_, program] : program_cache) {
@@ -741,10 +744,13 @@ void PipelineCache::WarmUp() {
             compute_pipelines.emplace(item.key, std::move(item.built));
         }
     }
-    graphics_pipelines.reserve(num_graphics);
-    for (auto& item : graphics_items) {
-        if (item.built) {
-            graphics_pipelines.emplace(item.key, std::move(item.built));
+    {
+        std::unique_lock gr_lk{graphics_pipelines_mutex};
+        graphics_pipelines.reserve(num_graphics);
+        for (auto& item : graphics_items) {
+            if (item.built) {
+                graphics_pipelines.emplace(item.key, std::move(item.built));
+            }
         }
     }
 

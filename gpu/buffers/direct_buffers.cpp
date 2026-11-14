@@ -1202,11 +1202,12 @@ void Manager::RetireOverlapping(VAddr addr, u64 size, bool clear_global_owned) {
         return;
     }
     const VAddr range_end = addr + size;
+    const u64 tick = scheduler.CurrentTick();
+    std::unique_lock lock{entries_rw_mutex};
     auto it = entries_by_base.lower_bound(addr);
     if (it != entries_by_base.begin()) {
         --it;
     }
-    const u64 tick = scheduler.CurrentTick();
     bool erased_any = false;
     while (it != entries_by_base.end() && it->first < range_end) {
         const VAddr e_start = it->first;
@@ -1228,6 +1229,10 @@ void Manager::RetireOverlapping(VAddr addr, u64 size, bool clear_global_owned) {
     if (erased_any) {
         ++erase_generation;
         ++map_erase_generation;
+        atomic_live_count.store(static_cast<u32>(entries_by_base.size()),
+                                std::memory_order_release);
+        atomic_map_erase_gen.fetch_add(1, std::memory_order_release);
+        atomic_override_gen.fetch_add(1, std::memory_order_release);
     }
 }
 
@@ -1351,6 +1356,131 @@ std::pair<const Buffer*, u64> Manager::TryResolveReadClamped(
     return {nullptr, 0};
 }
 
+MtResolvedBuffer Manager::TryResolveReadMt(VAddr addr, u64 requested_size,
+                                           MtReadMru& worker_mru) const noexcept {
+    if (requested_size == 0 || addr >= kMaxGuestVa ||
+        atomic_live_count.load(std::memory_order_acquire) == 0u) {
+        return {};
+    }
+
+    static const bool n1_enabled =
+        gx_direct_vk::EnabledNativeVk(gx_direct_vk::kN1_NativeBuffers);
+
+    const auto note_hit = []() noexcept {
+        BbStats::native_buf_hits.fetch_add(1ULL, std::memory_order_relaxed);
+    };
+    const auto note_miss = [addr]() noexcept {
+        if (IsNativeOwnedAddress(addr)) {
+            BbStats::native_buf_misses.fetch_add(1ULL, std::memory_order_relaxed);
+        }
+    };
+
+    const auto clamp_slot = [&](const MtReadMru::Slot& s, u64 req) noexcept -> MtResolvedBuffer {
+        const u64 sub_off = addr - s.base_addr;
+        const u64 rem = s.alloc_size - sub_off;
+        if (req <= rem || n1_enabled) {
+            u64 clamped = req;
+            if (clamped > rem) {
+                const u64 raw_rem = (s.raw_size > sub_off) ? (s.raw_size - sub_off) : rem;
+                clamped = std::min<u64>(raw_rem, rem);
+            }
+            note_hit();
+            return MtResolvedBuffer{
+                .handle = s.vk_handle,
+                .offset = s.base_offset + sub_off,
+                .clamped_size = clamped,
+                .is_static_immutable = s.is_static_immutable,
+            };
+        }
+        return {};
+    };
+
+    const u64 cur_erase_gen = atomic_map_erase_gen.load(std::memory_order_acquire);
+    const u64 cur_override_gen = atomic_override_gen.load(std::memory_order_acquire);
+
+    const size_t h0 = MtReadMru::Hash(addr);
+    const size_t h1 = (h0 + 1u) & (MtReadMru::kSlots - 1);
+    for (const size_t idx : {h0, h1}) {
+        const auto& s = worker_mru.slots[idx];
+        if (s.vk_handle != VK_NULL_HANDLE && addr >= s.base_addr &&
+            addr < s.base_addr + s.alloc_size) {
+            const u64 expected_gen = s.is_static_immutable ? cur_erase_gen : cur_override_gen;
+            if (s.gen == expected_gen) {
+                if (const auto res = clamp_slot(s, requested_size)) {
+                    return res;
+                }
+            }
+        }
+    }
+
+    // Cold worker MRU miss: resolve under shared reader lock and populate worker's private MRU.
+    std::shared_lock lock{entries_rw_mutex};
+    if (entries_by_base.empty()) {
+        lock.unlock();
+        note_miss();
+        return {};
+    }
+
+    const u64 page = addr >> kPageShift64K;
+    if ((bitmap_64k[page >> 6] & (1ULL << (page & 63ULL))) == 0ULL) {
+        lock.unlock();
+        note_miss();
+        return {};
+    }
+
+    auto it = entries_by_base.upper_bound(addr);
+    if (it == entries_by_base.begin()) {
+        lock.unlock();
+        note_miss();
+        return {};
+    }
+    --it;
+    const VAddr base = it->first;
+    const Entry& e = it->second;
+    if (addr < base || addr >= base + e.alloc_size) {
+        lock.unlock();
+        note_miss();
+        return {};
+    }
+
+    const Buffer* active_buf =
+        e.stream_override_buf
+            ? e.stream_override_buf
+            : (e.needs_zero_init && zero_buffer ? zero_buffer.get() : e.buffer.get());
+    if (!active_buf) {
+        lock.unlock();
+        note_miss();
+        return {};
+    }
+    const bool static_imm =
+        (e.usage_type == 1u && !e.stream_override_buf && !e.needs_zero_init &&
+         !e.dirty_writeback && !e.noted_ext_gpu_mod && !e.gpu_written_without_shadow &&
+         !e.zero_known);
+    const u64 locked_gen = static_imm
+                               ? atomic_map_erase_gen.load(std::memory_order_relaxed)
+                               : atomic_override_gen.load(std::memory_order_relaxed);
+    const MtReadMru::Slot populated{
+        .base_addr = base,
+        .raw_size = e.raw_size,
+        .alloc_size = e.alloc_size,
+        .vk_handle = active_buf->Handle(),
+        .base_offset = e.stream_override_buf ? e.stream_override_off : 0ULL,
+        .gen = locked_gen,
+        .is_static_immutable = static_imm,
+    };
+    lock.unlock();
+
+    if (const auto res = clamp_slot(populated, requested_size)) {
+        if (worker_mru.slots[h0].base_addr != base || worker_mru.slots[h0].gen != locked_gen) {
+            worker_mru.slots[h1] = worker_mru.slots[h0];
+        }
+        worker_mru.slots[h0] = populated;
+        return res;
+    }
+    note_miss();
+    return {};
+}
+
 const u8* Manager::TryGetCpuMirrorPtr(VAddr addr, u64 size) noexcept {
     if (size == 0 || addr >= kMaxGuestVa || entries_by_base.empty()) {
         return nullptr;
@@ -1463,20 +1593,36 @@ std::pair<const Buffer*, u64> Manager::TryResolveWrite(VAddr addr, u64 size, boo
             }
             hit_entry = &it->second;
         }
-        if (!hit_entry->noted_ext_gpu_mod) {
-            hit_entry->noted_ext_gpu_mod = true;
-            Vulkan::DirectShaders::InvalidateRange(base, hit_entry->alloc_size);
-        }
         const Buffer* dst_buf = hit_entry->buffer.get();
-        if (!hit_entry->gpu_written_without_shadow) {
-            hit_entry->gpu_written_without_shadow = true;
-            ++erase_generation;
+        const u64 entry_alloc_size = hit_entry->alloc_size;
+        bool do_invalidate_shaders = false;
+        bool do_zero_fill = false;
+        {
+            std::unique_lock lock{entries_rw_mutex};
+            if (!hit_entry->noted_ext_gpu_mod) {
+                hit_entry->noted_ext_gpu_mod = true;
+                do_invalidate_shaders = true;
+            }
+            if (!hit_entry->gpu_written_without_shadow) {
+                hit_entry->gpu_written_without_shadow = true;
+                ++erase_generation;
+            }
+            hit_entry->has_cpu_shadow = false;
+            hit_entry->zero_known = false;
+            hit_entry->cpu_shadow.reset();
+            if (hit_entry->needs_zero_init) {
+                hit_entry->needs_zero_init = false;
+                do_zero_fill = true;
+            }
+            if (hit_entry->usage_type == 1u) {
+                atomic_map_erase_gen.fetch_add(1, std::memory_order_release);
+            }
+            atomic_override_gen.fetch_add(1, std::memory_order_release);
         }
-        hit_entry->has_cpu_shadow = false;
-        hit_entry->zero_known = false;
-        hit_entry->cpu_shadow.reset();
-        if (hit_entry->needs_zero_init) {
-            hit_entry->needs_zero_init = false;
+        if (do_invalidate_shaders) {
+            Vulkan::DirectShaders::InvalidateRange(base, entry_alloc_size);
+        }
+        if (do_zero_fill) {
             if (!full_overwrite || addr > base || size < dst_buf->SizeBytes()) {
                 runtime.FillBuffer(dst_buf, 0, dst_buf->SizeBytes(), 0);
                 runtime.FlushBarriers();
@@ -1687,27 +1833,47 @@ void Manager::StageNativeCpuCopyBatch(std::span<const NativeCopyRegion> regions,
         }
 
         BbStats::buffer_upload_bytes.fetch_add(total_bytes, std::memory_order_relaxed);
-        for (u32 k = 0; k < staged_count; ++k) {
-            const auto& s = staged[k];
-            out_handled[s.region_idx] = 1u;
-            if (!s.emit_to_stream || !s.entry) {
-                continue;
+        struct DeferredInvalidate {
+            VAddr base_va;
+            u64 alloc_size;
+        };
+        std::array<DeferredInvalidate, kMaxStagedSlices> inv_list;
+        u32 inv_count = 0;
+        {
+            std::unique_lock lock{entries_rw_mutex};
+            bool modified_any = false;
+            for (u32 k = 0; k < staged_count; ++k) {
+                const auto& s = staged[k];
+                out_handled[s.region_idx] = 1u;
+                if (!s.emit_to_stream || !s.entry) {
+                    continue;
+                }
+                auto& e = *s.entry;
+                const u64 stream_off = base_off + s.rel_offset;
+                e.needs_zero_init = false;
+                e.stream_override_buf = &sbuf;
+                e.stream_override_off = stream_off;
+                modified_any = true;
+                if (!e.dirty_writeback) {
+                    e.dirty_writeback = true;
+                    dirty_writeback_bases.push_back(s.base_va);
+                }
+                if (!e.noted_ext_gpu_mod) {
+                    e.noted_ext_gpu_mod = true;
+                    ++erase_generation;
+                    if (e.usage_type == 1u) {
+                        atomic_map_erase_gen.fetch_add(1, std::memory_order_release);
+                    }
+                    inv_list[inv_count++] = DeferredInvalidate{s.base_va, e.alloc_size};
+                }
             }
-            auto& e = *s.entry;
-            const u64 stream_off = base_off + s.rel_offset;
-            e.needs_zero_init = false;
-            e.stream_override_buf = &sbuf;
-            e.stream_override_off = stream_off;
-            if (!e.dirty_writeback) {
-                e.dirty_writeback = true;
-                dirty_writeback_bases.push_back(s.base_va);
+            if (modified_any) {
+                atomic_override_gen.fetch_add(1, std::memory_order_release);
             }
-            if (!e.noted_ext_gpu_mod) {
-                e.noted_ext_gpu_mod = true;
-                ++erase_generation;
-                buf_cache.NoteExternalGpuModified(s.base_va, e.alloc_size);
-                Vulkan::DirectShaders::InvalidateRange(s.base_va, e.alloc_size);
-            }
+        }
+        for (u32 k = 0; k < inv_count; ++k) {
+            buf_cache.NoteExternalGpuModified(inv_list[k].base_va, inv_list[k].alloc_size);
+            Vulkan::DirectShaders::InvalidateRange(inv_list[k].base_va, inv_list[k].alloc_size);
         }
         staged_count = 0;
         total_bytes = 0;
@@ -1881,6 +2047,7 @@ void Manager::FlushPendingWritebacks() {
 
     auto* buf_cache = g_active_buf_cache.load(std::memory_order_acquire);
     if (!buf_cache) {
+        std::unique_lock lock{entries_rw_mutex};
         for (const VAddr base : dirty) {
             if (auto it = entries_by_base.find(base); it != entries_by_base.end()) {
                 it->second.stream_override_buf = nullptr;
@@ -1890,6 +2057,7 @@ void Manager::FlushPendingWritebacks() {
                 UpdateMruEntry(base, it->second.alloc_size, it->second.buffer.get(), 0);
             }
         }
+        atomic_override_gen.fetch_add(1, std::memory_order_release);
         return;
     }
 
@@ -1906,34 +2074,38 @@ void Manager::FlushPendingWritebacks() {
 
     const Buffer& sbuf = buf_cache->GetStreamBuffer();
     const u64 sbuf_bytes = sbuf.SizeBytes();
-    for (const VAddr base : dirty) {
-        auto it = entries_by_base.find(base);
-        if (it == entries_by_base.end()) {
-            continue;
-        }
-        auto& e = it->second;
-        if (!e.dirty_writeback || !e.stream_override_buf || !e.buffer) {
+    {
+        std::unique_lock lock{entries_rw_mutex};
+        for (const VAddr base : dirty) {
+            auto it = entries_by_base.find(base);
+            if (it == entries_by_base.end()) {
+                continue;
+            }
+            auto& e = it->second;
+            if (!e.dirty_writeback || !e.stream_override_buf || !e.buffer) {
+                e.stream_override_buf = nullptr;
+                e.stream_override_off = 0;
+                e.dirty_writeback = false;
+                continue;
+            }
+            const u64 copy_bytes =
+                std::min<u64>(e.buffer->SizeBytes(), Common::AlignUp<u64>(e.alloc_size, 16ULL));
+            const u64 src_off = e.stream_override_off;
             e.stream_override_buf = nullptr;
             e.stream_override_off = 0;
             e.dirty_writeback = false;
-            continue;
+            e.needs_zero_init = false;
+            UpdateMruEntry(base, e.alloc_size, e.buffer.get(), 0);
+            if (copy_bytes == 0 || src_off + copy_bytes > sbuf_bytes) {
+                continue;
+            }
+            cmds.push_back(WritebackCmd{
+                .dst_vk = e.buffer->Handle(),
+                .src_off = src_off,
+                .size = copy_bytes,
+            });
         }
-        const u64 copy_bytes =
-            std::min<u64>(e.buffer->SizeBytes(), Common::AlignUp<u64>(e.alloc_size, 16ULL));
-        const u64 src_off = e.stream_override_off;
-        e.stream_override_buf = nullptr;
-        e.stream_override_off = 0;
-        e.dirty_writeback = false;
-        e.needs_zero_init = false;
-        UpdateMruEntry(base, e.alloc_size, e.buffer.get(), 0);
-        if (copy_bytes == 0 || src_off + copy_bytes > sbuf_bytes) {
-            continue;
-        }
-        cmds.push_back(WritebackCmd{
-            .dst_vk = e.buffer->Handle(),
-            .src_off = src_off,
-            .size = copy_bytes,
-        });
+        atomic_override_gen.fetch_add(1, std::memory_order_release);
     }
 
     if (cmds.empty()) {
@@ -2043,9 +2215,14 @@ void Manager::ProcessEvents(Core::MemoryManager* memory) {
     auto* active_buf_cache = g_active_buf_cache.load(std::memory_order_acquire);
 
     if (!is_rendering && !zero_buffer) {
-        zero_buffer = std::make_unique<Buffer>(instance, 0, kSharedZeroBytes,
-                                               MemoryType::DeviceLocal, "DirectSharedZeroBuf");
-        runtime.FillBuffer(zero_buffer.get(), 0, kSharedZeroBytes, 0);
+        auto zb = std::make_unique<Buffer>(instance, 0, kSharedZeroBytes,
+                                           MemoryType::DeviceLocal, "DirectSharedZeroBuf");
+        runtime.FillBuffer(zb.get(), 0, kSharedZeroBytes, 0);
+        {
+            std::unique_lock lock{entries_rw_mutex};
+            zero_buffer = std::move(zb);
+            atomic_override_gen.fetch_add(1, std::memory_order_release);
+        }
         needs_barrier_flush = true;
     }
 
@@ -2147,10 +2324,16 @@ void Manager::ProcessEvents(Core::MemoryManager* memory) {
                 entry.stream_override_buf = sbuf_ptr;
                 entry.stream_override_off = stream_off;
                 entry.buffer = std::move(buf);
-                auto& inserted = (entries_by_base[ev.addr] = std::move(entry));
+                {
+                    std::unique_lock lock{entries_rw_mutex};
+                    auto& inserted = (entries_by_base[ev.addr] = std::move(entry));
+                    SetBitmapRange(ev.addr, ev.addr + guest_span);
+                    InsertMru(ev.addr, ev.addr, guest_span, &inserted);
+                    atomic_live_count.store(static_cast<u32>(entries_by_base.size()),
+                                            std::memory_order_release);
+                    atomic_override_gen.fetch_add(1, std::memory_order_release);
+                }
                 dirty_writeback_bases.push_back(ev.addr);
-                SetBitmapRange(ev.addr, ev.addr + guest_span);
-                InsertMru(ev.addr, ev.addr, guest_span, &inserted);
                 continue;
             }
 
@@ -2172,9 +2355,15 @@ void Manager::ProcessEvents(Core::MemoryManager* memory) {
                     active_buf_cache->NoteExternalGpuModified(ev.addr, guest_span);
                     entry.noted_ext_gpu_mod = true;
                 }
-                auto& inserted = (entries_by_base[ev.addr] = std::move(entry));
-                SetBitmapRange(ev.addr, ev.addr + guest_span);
-                InsertMru(ev.addr, ev.addr, guest_span, &inserted);
+                {
+                    std::unique_lock lock{entries_rw_mutex};
+                    auto& inserted = (entries_by_base[ev.addr] = std::move(entry));
+                    SetBitmapRange(ev.addr, ev.addr + guest_span);
+                    InsertMru(ev.addr, ev.addr, guest_span, &inserted);
+                    atomic_live_count.store(static_cast<u32>(entries_by_base.size()),
+                                            std::memory_order_release);
+                    atomic_override_gen.fetch_add(1, std::memory_order_release);
+                }
                 continue;
             }
             u64 stream_off = 0;
@@ -2203,10 +2392,16 @@ void Manager::ProcessEvents(Core::MemoryManager* memory) {
                 active_buf_cache->NoteExternalGpuModified(ev.addr, guest_span);
                 entry.noted_ext_gpu_mod = true;
             }
-            auto& inserted = (entries_by_base[ev.addr] = std::move(entry));
+            {
+                std::unique_lock lock{entries_rw_mutex};
+                auto& inserted = (entries_by_base[ev.addr] = std::move(entry));
+                SetBitmapRange(ev.addr, ev.addr + guest_span);
+                InsertMru(ev.addr, ev.addr, guest_span, &inserted);
+                atomic_live_count.store(static_cast<u32>(entries_by_base.size()),
+                                        std::memory_order_release);
+                atomic_override_gen.fetch_add(1, std::memory_order_release);
+            }
             dirty_writeback_bases.push_back(ev.addr);
-            SetBitmapRange(ev.addr, ev.addr + guest_span);
-            InsertMru(ev.addr, ev.addr, guest_span, &inserted);
             continue;
         }
 
@@ -2277,9 +2472,15 @@ void Manager::ProcessEvents(Core::MemoryManager* memory) {
         entry.alloc_size = guest_span;
         entry.cpu_shadow = std::move(init_shadow);
         entry.buffer = std::move(buf);
-        auto& inserted = (entries_by_base[ev.addr] = std::move(entry));
-        SetBitmapRange(ev.addr, ev.addr + guest_span);
-        InsertMru(ev.addr, ev.addr, guest_span, &inserted);
+        {
+            std::unique_lock lock{entries_rw_mutex};
+            auto& inserted = (entries_by_base[ev.addr] = std::move(entry));
+            SetBitmapRange(ev.addr, ev.addr + guest_span);
+            InsertMru(ev.addr, ev.addr, guest_span, &inserted);
+            atomic_live_count.store(static_cast<u32>(entries_by_base.size()),
+                                    std::memory_order_release);
+            atomic_override_gen.fetch_add(1, std::memory_order_release);
+        }
 
         if (uploaded_bytes_since_flush >= (32ULL << 20)) {
             FlushPendingWritebacks();

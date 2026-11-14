@@ -24000,6 +24000,10 @@ __attribute__((weak, visibility("hidden"))) void bb_direct_vk_register_transient
 __attribute__((weak, visibility("hidden"))) void bb_direct_vk_register_transient_cpu_ring(const void*, uint64_t) noexcept {}
 __attribute__((weak, visibility("hidden"))) void bb_direct_vk_register_native_sampler(void*) noexcept {}
 __attribute__((weak, visibility("hidden"))) void bb_direct_vk_register_native_srv(void*, uint32_t, uint32_t) noexcept {}
+__attribute__((weak, visibility("hidden"))) int bb_direct_vk_mt_mode() noexcept { return 0; }
+__attribute__((weak, visibility("hidden"))) int bb_direct_vk_mt_worker_begin_pass(uint32_t, const void*) noexcept { return 0; }
+__attribute__((weak, visibility("hidden"))) uint64_t bb_direct_vk_mt_worker_end_pass(uint32_t) noexcept { return 0ULL; }
+__attribute__((weak, visibility("hidden"))) void bb_direct_vk_mt_execute_secondaries(const uint64_t*, uint32_t) noexcept {}
 __attribute__((weak, visibility("hidden"))) void BbGoldenEngine_OnYebisJitter(float, float) {}
 __attribute__((weak, visibility("hidden"))) void BbGoldenEngine_OnYebisCameraMatrix(uint32_t, const float*) {}
 __attribute__((weak, visibility("hidden"))) void BbGoldenEngine_OnYebisCameraParams(float, float, float) {}

@@ -109,6 +109,8 @@ struct PrepWorker {
         Shader::HwStage hw_stage;
         VAddr pgm_base;
         const std::vector<u32>* flat;
+        Shader::SwStage sw_stage{};
+        u32 perm_idx = 0;
     };
     struct ProgramState {
         Shader::Info info;
@@ -125,6 +127,41 @@ struct PrepWorker {
 
 struct PreparedDraw;
 class PipelineCompiler;
+
+/// Phase 4.1: Heap-allocated per-worker graphics PSO selection & specialization state
+/// (`+0 B` static `PT_TLS`). Owns private `Shader::Info` clones, fetch-shader decode cache,
+/// flat-UD specialization memos, and vertex-table `vsharps` so `GXWorker:1..5` never touch
+/// shared `Program::info` or `FastSelect` mutable fields.
+struct MtWorkerPsoState {
+    struct CachedFetch {
+        std::vector<u32> words;
+        Shader::Gcn::FetchShaderData data;
+    };
+    struct StageMemo {
+        u64 last_flat_hash = 0;
+        u32 last_flat_words = 0;
+        std::array<u32, 4> last_ud_head{};
+        Shader::Backend::Bindings last_start{};
+    };
+
+    PrepWorker prep_worker{};
+    PipelineSelection sel{};
+    std::unordered_map<const void*, Shader::Info> stage_info_cache;
+    std::array<std::pair<const void*, Shader::Info*>, 64> stage_info_mru{};
+    std::unordered_map<const void*, StageMemo> stage_memo_cache;
+    std::array<std::pair<const void*, StageMemo*>, 64> stage_memo_mru{};
+    std::unordered_map<const u32*, CachedFetch> fetch_map;
+    std::array<std::pair<const u32*, const CachedFetch*>, 64> fetch_mru{};
+    std::array<const Shader::Info*, MaxShaderStages> bound_stage_infos{};
+    boost::container::static_vector<Gcn::Buffer, Shader::NUM_BUFFERS> vsharps;
+    bool has_vsharps = false;
+
+    void ResetForPass() noexcept {
+        bound_stage_infos.fill(nullptr);
+        vsharps.clear();
+        has_vsharps = false;
+    }
+};
 
 class PipelineCache {
 public:
@@ -150,6 +187,17 @@ public:
     const GraphicsPipeline* GetGraphicsPipeline(const DrawIndirectParams params = {},
                                                 const PreparedDraw* prepared = nullptr,
                                                 bool indirect = false);
+
+    /// Phase 4.1: Thread-safe lock-free graphics PSO selection for `GXWorker:1..5` and Stage B.
+    /// Hits `MtFastPsoTable` in O(1) via atomic raw pointers (0 LOCK XADD, 0 shared Program::info
+    /// mutations), populating `worker_state.bound_stage_infos` and `worker_state.vsharps`.
+    /// Cold misses fall back safely to `PrepareGraphicsPipeline` + `graphics_pipelines_mutex`
+    /// (and optional synchronous `compile_fallback_mutex` when `allow_compile_fallback` is true).
+    const GraphicsPipeline* SelectGraphicsPipelineMt(const Gcn::Regs& regs,
+                                                     MtWorkerPsoState& worker_state,
+                                                     DrawIndirectParams params = {},
+                                                     bool indirect = false,
+                                                     bool allow_compile_fallback = false);
 
     /// Worker side of draw preparation: selects the pipeline key for `sel.regs` without
     /// creating anything. False when a program or permutation does not exist yet.
@@ -236,6 +284,8 @@ private:
     const GraphicsPipeline* last_graphics_pipeline = nullptr;
     tsl::robin_map<ComputePipelineKey, std::unique_ptr<ComputePipeline>> compute_pipelines;
     tsl::robin_map<GraphicsPipelineKey, std::unique_ptr<GraphicsPipeline>> graphics_pipelines;
+    mutable std::shared_mutex graphics_pipelines_mutex;
+    std::mutex compile_fallback_mutex;
     PipelineSelection sel{}; ///< GPU thread selection state
     ComputePipelineKey compute_key{};
 
@@ -262,6 +312,8 @@ private:
     /// cross-checks every hit against full selection.
     struct FastSelect;
     std::unique_ptr<FastSelect> fast;
+    struct MtFastPsoTable;
+    std::unique_ptr<MtFastPsoTable> mt_fast;
     const GraphicsPipeline* SelectGraphicsPipelineFull(const DrawIndirectParams params,
                                                        bool indirect);
     const GraphicsPipeline* TryFastSelect(const DrawIndirectParams& params);

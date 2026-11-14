@@ -96,6 +96,14 @@ GX_HOST_IMPORT void bb_direct_vk_register_native_sampler(void* ssharp_4dw) noexc
 GX_HOST_IMPORT void bb_direct_vk_register_native_srv(void* tsharp_8dw,
                                                      uint32_t resource_id,
                                                      uint32_t is_immutable) noexcept;
+
+// Phase 4 (Path 2A): Direct Multi-Threaded Vulkan 1.3 Secondary Command Buffer Recorder
+GX_HOST_IMPORT int bb_direct_vk_mt_mode() noexcept;
+GX_HOST_IMPORT int bb_direct_vk_mt_worker_begin_pass(uint32_t worker_id,
+                                                     const void* pass_desc_raw) noexcept;
+GX_HOST_IMPORT uint64_t bb_direct_vk_mt_worker_end_pass(uint32_t worker_id) noexcept;
+GX_HOST_IMPORT void bb_direct_vk_mt_execute_secondaries(const uint64_t* cmd_handles,
+                                                        uint32_t count) noexcept;
 }
 
 namespace gx_direct_vk {
@@ -2493,6 +2501,46 @@ inline bool TryDirectTimestampQuery(void* dcb_raw,
     pkt[3] = static_cast<uint32_t>(addr);
     pkt[4] = static_cast<uint32_t>(addr >> 32);
     return true;
+}
+
+// ============================================================================
+// Phase 4 (Path 2A): Multi-Threaded Direct Vulkan 1.3 Worker Context Bridge
+// ============================================================================
+// Reads Orbis `GXWorkerThreadContext*` from guest TLS slot `0x53e4658` (`+0xa0` = `worker_id`:
+// `0` = master render thread, `1..5` = `GXWorker:1..5`, `7` = fallback/other) with `+0 B` host
+// static `PT_TLS` overhead.
+inline constexpr uint32_t kMaxMtDirectWorkers = 8u;
+
+inline uint32_t CurrentGxWorkerId() noexcept {
+    if (__builtin_expect(g_eboot_live_slide == 0ULL, 0)) {
+        return 0u;
+    }
+    const void* ctx = *reinterpret_cast<void* const*>(gx_guest_tls_slot(0x53e4658ULL));
+    if (!ctx) {
+        return 7u;
+    }
+    const uint32_t wid =
+        *reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(ctx) + 0xa0u);
+    return wid < kMaxMtDirectWorkers ? wid : 7u;
+}
+
+inline int MtDirectVkMode() noexcept {
+    static const int mode = []() -> int {
+        const char* env = std::getenv("BB_MT_DIRECT_VK");
+        if (env && env[0] != '\0') {
+            const long parsed = std::strtol(env, nullptr, 10);
+            if (parsed <= 0) {
+                return 0;
+            }
+            return parsed >= 2 ? 2 : 1;
+        }
+        return bb_direct_vk_mt_mode ? bb_direct_vk_mt_mode() : 0;
+    }();
+    return mode;
+}
+
+inline bool MtDirectVkEnabled() noexcept {
+    return MtDirectVkMode() > 0;
 }
 
 } // namespace gx_direct_vk

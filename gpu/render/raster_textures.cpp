@@ -744,6 +744,21 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
                             fe.imm_epoch16 = VideoCore::DirectTextures::ImmutableRoEpoch16();
                             fe.res_flags = resolved_res_flags[binding_index];
                             fe.valid = 1u;
+                            if (mt_srv_publish) {
+                                auto& mp = mt_srv_publish[f_uid];
+                                u32 exp = mp.seq.load(std::memory_order_relaxed) & ~1u;
+                                if (mp.seq.compare_exchange_strong(exp, exp + 1u,
+                                                                   std::memory_order_acquire,
+                                                                   std::memory_order_relaxed)) {
+                                    mp.dw7_tag = raw_dw7;
+                                    mp.qw0 = raw_qw0;
+                                    mp.view = static_cast<VkImageView>(view);
+                                    mp.imm_epoch16 = fe.imm_epoch16;
+                                    mp.res_flags = fe.res_flags;
+                                    std::atomic_thread_fence(std::memory_order_release);
+                                    mp.seq.store(exp + 2u, std::memory_order_release);
+                                }
+                            }
                         }
                     }
                 }
@@ -979,6 +994,25 @@ void Rasterizer::BindSamplers(const Shader::Info& stage, const PreparedStage* pr
                 sc.desc_infos[variant] = vk::DescriptorImageInfo{
                     vk_sampler, VK_NULL_HANDLE, vk::ImageLayout::eGeneral};
                 sc.touched_ticks[variant] = cur_evict_gen;
+                if (mt_sampler_publish && variant != 1u) {
+                    auto& mp = mt_sampler_publish[smp_uid];
+                    u32 exp = mp.seq.load(std::memory_order_relaxed) & ~1u;
+                    if (mp.seq.compare_exchange_strong(exp, exp + 1u, std::memory_order_acquire,
+                                                       std::memory_order_relaxed)) {
+                        std::memcpy(mp.tagged_words.data(), &tagged_ssharp, sizeof(tagged_ssharp));
+                        mp.bias_bits = color_bias_bits;
+                        mp.bc_base_addr = bc_base.base_addr;
+                        mp.evict_gen = cur_evict_gen;
+                        mp.forced_aniso = forced_aniso;
+                        mp.forced_aniso_off = static_cast<u8>(aniso_off);
+                        mp.handles[0] = static_cast<VkSampler>(
+                            sc.touched_ticks[0] == cur_evict_gen ? sc.handles[0] : vk::Sampler{});
+                        mp.handles[1] = static_cast<VkSampler>(
+                            sc.touched_ticks[2] == cur_evict_gen ? sc.handles[2] : vk::Sampler{});
+                        std::atomic_thread_fence(std::memory_order_release);
+                        mp.seq.store(exp + 2u, std::memory_order_release);
+                    }
+                }
             }
         } else {
             ++local_native_misses;
@@ -1259,6 +1293,167 @@ bool Rasterizer::BindTexturesFromSet(const Shader::Info& stage, const u64* image
         image_infos.emplace_back(VK_NULL_HANDLE, entry.view, image.backing->state.layout);
     }
     return true;
+}
+
+vk::ImageView Rasterizer::ResolveSrvViewMt(const Gcn::Image& raw_sharp,
+                                           const Shader::ImageResource& res) {
+    if (res.is_written || res.mip_fallback_mode != Shader::MipStorageFallbackMode::None) {
+        return {};
+    }
+    const u32 raw_dw7 = reinterpret_cast<const u32*>(&raw_sharp)[7];
+    const u8 rflags = (u8(res.is_depth) << 1) | (u8(res.is_array) << 2);
+    const u16 cur_imm_epoch16 = VideoCore::DirectTextures::ImmutableRoEpoch16();
+    u16 srv_uid = 0;
+    u64 raw_qw0 = 0;
+    std::memcpy(&raw_qw0, &raw_sharp, sizeof(u64));
+
+    if ((raw_dw7 >> 24) == VideoCore::DirectTextures::kSrvTagMagic) {
+        srv_uid = static_cast<u16>(raw_dw7 & 0xFFFFu);
+        if (srv_uid != 0u && mt_srv_publish) [[likely]] {
+            const auto& mp = mt_srv_publish[srv_uid];
+            const u32 s1 = mp.seq.load(std::memory_order_acquire);
+            if ((s1 & 1u) == 0u && s1 != 0u) [[likely]] {
+                const u32 dw7_tag = mp.dw7_tag;
+                const u64 qw0 = mp.qw0;
+                const VkImageView view = mp.view;
+                const u16 imm_ep = mp.imm_epoch16;
+                const u8 rf = mp.res_flags;
+                std::atomic_thread_fence(std::memory_order_acquire);
+                const u32 s2 = mp.seq.load(std::memory_order_relaxed);
+                if (s1 == s2 && dw7_tag == raw_dw7 && qw0 == raw_qw0 && rf == rflags &&
+                    imm_ep == cur_imm_epoch16 && view != VK_NULL_HANDLE) [[likely]] {
+                    BbStats::native_tex_hits.fetch_add(1ULL, std::memory_order_relaxed);
+                    return vk::ImageView{view};
+                }
+            }
+        }
+    }
+
+    // Cold seqlock miss or immutable epoch bump: resolve safely under `TextureCache::mutex`
+    // and publish into `mt_srv_publish` if tagged.
+    Gcn::Image clean_sharp = raw_sharp;
+    u8 dummy_gen8 = 0;
+    (void)VideoCore::DirectTextures::UnpackAndCleanSrv(clean_sharp, dummy_gen8);
+    const vk::ImageView resolved = texture_cache.TryResolveDirectImmutableViewMt(clean_sharp, res);
+    if (!resolved) {
+        BbStats::native_tex_misses.fetch_add(1ULL, std::memory_order_relaxed);
+        return {};
+    }
+    BbStats::native_tex_hits.fetch_add(1ULL, std::memory_order_relaxed);
+    if (srv_uid != 0u && mt_srv_publish) {
+        auto& mp = mt_srv_publish[srv_uid];
+        u32 exp = mp.seq.load(std::memory_order_relaxed) & ~1u;
+        if (mp.seq.compare_exchange_strong(exp, exp + 1u, std::memory_order_acquire,
+                                           std::memory_order_relaxed)) {
+            mp.dw7_tag = raw_dw7;
+            mp.qw0 = raw_qw0;
+            mp.view = static_cast<VkImageView>(resolved);
+            mp.imm_epoch16 = VideoCore::DirectTextures::ImmutableRoEpoch16();
+            mp.res_flags = rflags;
+            std::atomic_thread_fence(std::memory_order_release);
+            mp.seq.store(exp + 2u, std::memory_order_release);
+        }
+    }
+    return resolved;
+}
+
+vk::Sampler Rasterizer::ResolveSamplerMt(const Gcn::Sampler& raw_ssharp, bool is_depth,
+                                         float lod_bias, Gcn::BorderColorBuffer bc_base) {
+    const u32 color_bias_bits = std::bit_cast<u32>(lod_bias);
+    const bool aniso_off = BbToggle::Disabled(BbToggle::ForcedAniso);
+    const u8 forced_aniso =
+        aniso_off ? u8(0)
+                  : u8(std::clamp(BbSettings::Get().anisotropic.load(std::memory_order_relaxed),
+                                  0, 16));
+    const u64 cur_evict_gen = texture_cache.SamplerEvictGeneration();
+    const u32 slot_idx = is_depth ? 1u : 0u;
+
+    std::array<u32, 4> raw_words{};
+    std::memcpy(raw_words.data(), &raw_ssharp, sizeof(raw_words));
+    const u32 dw3 = raw_words[3];
+    u16 smp_uid = 0;
+
+    if (((dw3 >> 24) & 0x3Fu) == VideoCore::DirectTextures::kSamplerTagMagic) {
+        const u32 cand_uid = (dw3 >> 12) & 0xFFFu;
+        if (cand_uid != 0u && cand_uid < VideoCore::DirectTextures::kMaxNativeSamplers) [[likely]] {
+            smp_uid = static_cast<u16>(cand_uid);
+            if (mt_sampler_publish) [[likely]] {
+                const auto& mp = mt_sampler_publish[smp_uid];
+                const u32 s1 = mp.seq.load(std::memory_order_acquire);
+                if ((s1 & 1u) == 0u && s1 != 0u) [[likely]] {
+                    const auto tw = mp.tagged_words;
+                    const u32 bb = mp.bias_bits;
+                    const u64 bca = mp.bc_base_addr;
+                    const u64 eg = mp.evict_gen;
+                    const VkSampler h = mp.handles[slot_idx];
+                    const u8 fa = mp.forced_aniso;
+                    const u8 fa_off = mp.forced_aniso_off;
+                    std::atomic_thread_fence(std::memory_order_acquire);
+                    const u32 s2 = mp.seq.load(std::memory_order_relaxed);
+                    if (s1 == s2 && h != VK_NULL_HANDLE && eg == cur_evict_gen &&
+                        tw == raw_words && fa == forced_aniso && fa_off == u8(aniso_off) &&
+                        (is_depth || bb == color_bias_bits) && bca == bc_base.base_addr)
+                        [[likely]] {
+                        BbStats::native_tex_hits.fetch_add(1ULL, std::memory_order_relaxed);
+                        return vk::Sampler{h};
+                    }
+                }
+            }
+        }
+    }
+
+    // Cold seqlock miss: clean S#, apply graphics forced anisotropy without reading mutable
+    // `pipeline_is_compute`, resolve safely via `TextureCache::GetSamplerMt` (+0 B PT_TLS),
+    // and publish into `mt_sampler_publish` if tagged.
+    Gcn::Sampler clean_sharp = raw_ssharp;
+    (void)VideoCore::DirectTextures::UnpackAndCleanSampler(clean_sharp);
+    if (forced_aniso > 1u && !is_depth && !aniso_off &&
+        clean_sharp.mip_filter != Gcn::MipFilter::None &&
+        (clean_sharp.xy_min_filter == Gcn::Filter::Bilinear ||
+         clean_sharp.xy_min_filter == Gcn::Filter::AnisoLinear)) {
+        const auto ratio = forced_aniso >= 16 ? Gcn::AnisoRatio::Sixteen
+                         : forced_aniso >= 8  ? Gcn::AnisoRatio::Eight
+                         : forced_aniso >= 4  ? Gcn::AnisoRatio::Four
+                                              : Gcn::AnisoRatio::Two;
+        if (!(Gcn::IsAnisoFilter(clean_sharp.xy_min_filter) &&
+              clean_sharp.MaxAniso() >= int(forced_aniso))) {
+            clean_sharp.xy_min_filter = Gcn::Filter::AnisoLinear;
+            if (clean_sharp.xy_mag_filter == Gcn::Filter::Bilinear) {
+                clean_sharp.xy_mag_filter = Gcn::Filter::AnisoLinear;
+            }
+            clean_sharp.max_aniso = ratio;
+        }
+    }
+
+    const vk::Sampler resolved =
+        texture_cache.GetSamplerMt(clean_sharp, bc_base, is_depth, is_depth ? 0.0f : lod_bias);
+    if (smp_uid != 0u && mt_sampler_publish && resolved) {
+        auto& mp = mt_sampler_publish[smp_uid];
+        u32 exp = mp.seq.load(std::memory_order_relaxed) & ~1u;
+        if (mp.seq.compare_exchange_strong(exp, exp + 1u, std::memory_order_acquire,
+                                           std::memory_order_relaxed)) {
+            const bool same_cfg =
+                (exp != 0u && mp.tagged_words == raw_words && mp.evict_gen == cur_evict_gen &&
+                 mp.forced_aniso == forced_aniso && mp.forced_aniso_off == u8(aniso_off) &&
+                 mp.bc_base_addr == bc_base.base_addr &&
+                 (is_depth || mp.bias_bits == color_bias_bits));
+            if (!same_cfg) {
+                mp.handles = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+            }
+            mp.tagged_words = raw_words;
+            if (!is_depth || !same_cfg) {
+                mp.bias_bits = color_bias_bits;
+            }
+            mp.bc_base_addr = bc_base.base_addr;
+            mp.evict_gen = cur_evict_gen;
+            mp.forced_aniso = forced_aniso;
+            mp.forced_aniso_off = u8(aniso_off);
+            mp.handles[slot_idx] = static_cast<VkSampler>(resolved);
+            std::atomic_thread_fence(std::memory_order_release);
+            mp.seq.store(exp + 2u, std::memory_order_release);
+        }
+    }
+    return resolved;
 }
 
 } // namespace Vulkan

@@ -737,6 +737,75 @@ vk::Sampler TextureCache::GetSampler(const Gcn::Sampler& raw_sampler,
     return handle;
 }
 
+vk::Sampler TextureCache::GetSamplerMt(const Gcn::Sampler& sampler,
+                                       Gcn::BorderColorBuffer border_color_base, bool is_depth,
+                                       float extra_lod_bias) {
+    const u32 bias_bits = std::bit_cast<u32>(extra_lod_bias);
+    const u64 key = HashCombine(HashCombine(XXH3_64bits(&sampler, sizeof(sampler)), is_depth),
+                                u64(bias_bits));
+    const u64 tick = atomic_gc_tick.load(std::memory_order_relaxed);
+    std::scoped_lock lock{samplers_mutex};
+    const auto [it, created] =
+        samplers.try_emplace(key, instance, sampler, border_color_base, is_depth, extra_lod_bias);
+    if (created) {
+        it.value().lru_id = sampler_lru.Insert(key, tick);
+    } else {
+        sampler_lru.Touch(it->second.lru_id, tick);
+    }
+    return it->second.Handle();
+}
+
+vk::ImageView TextureCache::TryResolveDirectImmutableViewMt(const Gcn::Image& clean_sharp,
+                                                            const Shader::ImageResource& res) {
+    if (!clean_sharp.Valid() || clean_sharp.Address() == 0 || clean_sharp.IsMsaa() ||
+        res.is_written || res.mip_fallback_mode != Shader::MipStorageFallbackMode::None) {
+        return {};
+    }
+    const auto valid_swizzle = [](u64 sel) noexcept {
+        return sel <= u64(Gcn::CompSwizzle::Alpha) && sel != 2 && sel != 3;
+    };
+    if (!valid_swizzle(clean_sharp.dst_sel_x) || !valid_swizzle(clean_sharp.dst_sel_y) ||
+        !valid_swizzle(clean_sharp.dst_sel_z) || !valid_swizzle(clean_sharp.dst_sel_w)) {
+        return {};
+    }
+    if (Vulkan::GcnToVk::TrySurfaceFormat(clean_sharp.GetDataFmt(), clean_sharp.GetNumberFmt()) ==
+        vk::Format::eUndefined) {
+        return {};
+    }
+
+    ImageDesc desc{clean_sharp, res};
+    if (desc.info.guest_address == 0 || desc.info.guest_size == 0) {
+        return {};
+    }
+
+    std::scoped_lock lock{mutex};
+    const auto it = direct_assets_by_addr.find(desc.info.guest_address);
+    if (it == direct_assets_by_addr.end()) {
+        return {};
+    }
+    const ImageId id = it->second;
+    if (!id || !slot_images.is_allocated(id)) {
+        return {};
+    }
+    const Image& img = slot_images[id];
+    constexpr auto Required = ImageFlagBits::Registered | ImageFlagBits::DirectImmutable;
+    constexpr auto BadFlags =
+        ImageFlagBits::Dirty | ImageFlagBits::GpuModified | ImageFlagBits::SharedHotPage;
+    if ((img.flags & Required) != Required || True(img.flags & BadFlags) ||
+        img.info.props.is_depth || img.scene_proxy || img.prompt_icon || img.prompt_atlas ||
+        img.MaybePromptIcon() || img.binding.needs_rebind || img.binding.is_target ||
+        !img.backing || !img.backing->subresource_states.empty() ||
+        img.backing->state.layout != vk::ImageLayout::eShaderReadOnlyOptimal ||
+        img.backing->state.access_mask != vk::AccessFlagBits2::eShaderRead ||
+        img.info.pixel_format != desc.info.pixel_format ||
+        img.info.size.width != desc.info.size.width ||
+        img.info.size.height != desc.info.size.height ||
+        img.info.num_samples != desc.info.num_samples) {
+        return {};
+    }
+    return img.TryFindExistingViewMt(desc.view_info);
+}
+
 void TextureCache::MarkDirectImmutableAsset(ImageId image_id) {
     if (!image_id || !slot_images.is_allocated(image_id)) {
         return;

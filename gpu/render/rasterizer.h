@@ -51,6 +51,7 @@ class LightTileBatcher;
 class VsmShadowMemo;
 class ObjectVelocityCuller;
 class VfxUiBatcher;
+class VkMtDirectRecorder;
 
 class Rasterizer {
     friend struct BatchedLightStageOverride;
@@ -59,6 +60,7 @@ class Rasterizer {
     friend class VsmShadowMemo;
     friend class ObjectVelocityCuller;
     friend class VfxUiBatcher;
+    friend class VkMtDirectRecorder;
 
 public:
     explicit Rasterizer(const Instance& instance, Scheduler& scheduler, Runtime& runtime,
@@ -84,6 +86,25 @@ public:
     [[nodiscard]] VideoCore::TextureCache& GetTextureCache() noexcept {
         return texture_cache;
     }
+
+    [[nodiscard]] Scheduler& GetScheduler() noexcept {
+        return scheduler;
+    }
+
+    [[nodiscard]] const Instance& GetInstance() const noexcept {
+        return instance;
+    }
+
+    [[nodiscard]] VkMtDirectRecorder* GetMtDirectRecorder() noexcept {
+        return mt_direct_recorder.get();
+    }
+
+    /// Phase 4.1: Thread-safe lock-free read-only SRV `VkImageView` + `VkSampler` resolution for
+    /// `GXWorker:1..5` and Stage B (wait-free seqlock fast path, safe mutex fallback on cold miss).
+    [[nodiscard]] vk::ImageView ResolveSrvViewMt(const Gcn::Image& raw_sharp,
+                                                 const Shader::ImageResource& res);
+    [[nodiscard]] vk::Sampler ResolveSamplerMt(const Gcn::Sampler& raw_ssharp, bool is_depth,
+                                               float lod_bias, Gcn::BorderColorBuffer bc_base);
 
     void Draw(bool is_indexed, u32 index_offset = 0, const PreparedDraw* prepared = nullptr);
 
@@ -860,6 +881,35 @@ private:
         std::array<vk::DescriptorImageInfo, 3> desc_infos{};
     };
     std::unique_ptr<NativeSamplerStageBEntry[]> native_sampler_cache;
+    /// Phase 4.1: Heap-allocated wait-free seqlock publication mirrors for DirectSrvs [65536] and
+    /// DirectSamplers [4096] read concurrently by `GXWorker:1..5` and Stage B (+0 B PT_TLS).
+    struct alignas(32) MtSrvPublishEntry {
+        std::atomic<u32> seq{0};
+        u32 dw7_tag{0};
+        u64 qw0{0};
+        VkImageView view{VK_NULL_HANDLE};
+        u16 imm_epoch16{0};
+        u8 res_flags{0xFFu};
+        u8 pad0{0};
+        u32 pad1{0};
+    };
+    static_assert(sizeof(MtSrvPublishEntry) == 32);
+    std::unique_ptr<MtSrvPublishEntry[]> mt_srv_publish;
+
+    struct alignas(64) MtSamplerPublishEntry {
+        std::atomic<u32> seq{0};
+        u32 bias_bits{0};
+        std::array<u32, 4> tagged_words{};
+        u64 bc_base_addr{0};
+        u64 evict_gen{~0ULL};
+        std::array<VkSampler, 2> handles{VK_NULL_HANDLE, VK_NULL_HANDLE}; // [0]=gfx_color, [1]=depth
+        u8 forced_aniso{16};
+        u8 forced_aniso_off{0};
+        std::array<u8, 6> pad{};
+    };
+    static_assert(sizeof(MtSamplerPublishEntry) == 64);
+    std::unique_ptr<MtSamplerPublishEntry[]> mt_sampler_publish;
+    std::unique_ptr<VkMtDirectRecorder> mt_direct_recorder;
     u64 desc_use_counter = 0;
     /// Entries replacing pinned cache slots during one BindTextures call.
     boost::container::static_vector<ImageDescCacheEntry, Shader::NUM_IMAGES> image_desc_overflow;

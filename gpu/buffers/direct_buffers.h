@@ -18,9 +18,11 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <deque>
 #include <map>
 #include <memory>
+#include <shared_mutex>
 #include <utility>
 #include <vector>
 
@@ -129,6 +131,45 @@ void SetExactNativeBufferOwned(VAddr addr, bool is_native_owned) noexcept;
                                          bool for_write = false) noexcept;
 [[nodiscard]] u64 ExactBufferTopologyGen() noexcept;
 
+/// Phase 4.1: Value-returned lock-free buffer binding resolved for multi-threaded workers.
+struct MtResolvedBuffer {
+    VkBuffer handle{VK_NULL_HANDLE};
+    u64 offset{0};
+    u64 clamped_size{0};
+    bool is_static_immutable{false};
+
+    [[nodiscard]] explicit operator bool() const noexcept {
+        return handle != VK_NULL_HANDLE;
+    }
+};
+
+/// Phase 4.1: Heap-allocated per-worker 2-way MRU cache for lock-free DirectBuffers resolution
+/// (+0 B static PT_TLS). Value-copies buffer handles and sizes so workers never touch `Entry*`
+/// outside `Manager::entries_rw_mutex`.
+struct MtReadMru {
+    static constexpr size_t kSlots = 2048;
+
+    struct Slot {
+        VAddr base_addr{0};
+        u64 raw_size{0};
+        u64 alloc_size{0};
+        VkBuffer vk_handle{VK_NULL_HANDLE};
+        u64 base_offset{0};
+        u64 gen{0};
+        bool is_static_immutable{false};
+    };
+
+    std::array<Slot, kSlots> slots{};
+
+    [[nodiscard]] static constexpr size_t Hash(VAddr addr) noexcept {
+        return static_cast<size_t>(((addr >> 6) ^ (addr >> 15) ^ (addr >> 23)) & (kSlots - 1));
+    }
+
+    void Clear() noexcept {
+        slots.fill(Slot{});
+    }
+};
+
 class Manager {
 public:
     Manager(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,
@@ -161,6 +202,13 @@ public:
     [[nodiscard]] std::pair<const Buffer*, u64> TryResolveRead(VAddr addr, u64 size) noexcept {
         return TryResolveReadClamped(addr, size);
     }
+
+    /// Phase 4.1: Thread-safe lock-free read-only resolution for `GXWorker:1..5` and Stage B.
+    /// Hits `worker_mru` in O(1) without locking (`is_static_immutable` FLVER VB/IBs validate
+    /// against `atomic_map_erase_gen`; mutable buffers validate against `atomic_override_gen`).
+    /// Cold misses fall back to `std::shared_lock{entries_rw_mutex}`.
+    [[nodiscard]] MtResolvedBuffer TryResolveReadMt(VAddr addr, u64 requested_size,
+                                                    MtReadMru& worker_mru) const noexcept;
 
     /// N2.5: O(1) lookup of a valid CPU-side mirror pointer (`cpu_shadow` or untouched
     /// initial-data guest RAM) for `[addr, addr + size)` when scanning index buffers of dynamic
@@ -266,6 +314,10 @@ private:
     u64 erase_generation{1};
     u64 map_erase_generation{1};
     u32 mru_hand{0};
+    mutable std::shared_mutex entries_rw_mutex;
+    std::atomic<u64> atomic_map_erase_gen{1};
+    std::atomic<u64> atomic_override_gen{1};
+    std::atomic<u32> atomic_live_count{0};
 };
 
 } // namespace DirectBuffers

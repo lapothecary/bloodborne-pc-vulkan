@@ -371,6 +371,45 @@ struct PipelineCache::FastSelect {
     std::chrono::steady_clock::time_point window = std::chrono::steady_clock::now();
 };
 
+struct PipelineCache::MtFastPsoTable {
+    static constexpr u32 MaxStages = FastSelect::MaxStages;
+    static constexpr u32 MaxSigWords = FastSelect::MaxSigWords;
+    static constexpr u32 NumSets = FastSelect::NumSets;
+    static constexpr u32 NumWays = FastSelect::NumWays;
+    static constexpr u32 TableSize = NumSets * NumWays;
+
+    struct StageSnap {
+        Shader::Info info_template{};
+        Shader::StageSpecialization spec{};
+        Shader::RuntimeInfo runtime_info{};
+        HwStage hw_stage{};
+        SwStage sw_stage{};
+        VAddr pgm_base = 0;
+        u64 shader_hash = 0;
+        VAddr copy_pgm_base = 0;
+        u64 copy_shader_hash = 0;
+        bool rt_verified = false;
+    };
+
+    struct Entry {
+        u64 key = 0;
+        u64 publish_seq = 0;
+        mutable std::atomic<u64> shader_epoch{0};
+        const GraphicsPipeline* pipeline = nullptr;
+        u16 sig_words = 0;
+        u8 num_stages = 0;
+        bool motion = false;
+        bool motion_possible = false;
+        std::array<u32, MaxSigWords> sig{};
+        std::array<StageSnap, MaxStages> stages{};
+    };
+
+    std::array<std::atomic<const Entry*>, TableSize> slots{};
+    std::mutex publish_mutex;
+    std::vector<std::unique_ptr<Entry>> arena;
+    u64 publish_clock = 0;
+};
+
 void PipelineCache::InvalidateFastSelect() {
     if (fast) {
         for (auto& e : fast->entries) {
@@ -386,6 +425,12 @@ void PipelineCache::InvalidateFastSelect() {
         fast->last_matching_ways_mask = 0;
         fast->last_vsharps_pipeline = nullptr;
         fast->last_vsharps.clear();
+    }
+    if (mt_fast) {
+        std::scoped_lock lk{mt_fast->publish_mutex};
+        for (auto& slot : mt_fast->slots) {
+            slot.store(nullptr, std::memory_order_release);
+        }
     }
 }
 
@@ -415,6 +460,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
       desc_heap{instance, scheduler.GetWorkSemaphore(), DescriptorHeapSizes},
       profile{MakeProfile(instance_, sparse_page_shift)} {
     fast = std::make_unique<FastSelect>();
+    mt_fast = std::make_unique<MtFastPsoTable>();
     sel.regs = &liverpool->regs;
     WarmUp();
 
@@ -1066,6 +1112,69 @@ void PipelineCache::CommitFastSelect(const GraphicsPipeline* pipeline,
             target->stages[i].copy_shader_hash = copy_hash;
         }
     }
+
+    if (mt_fast) {
+        bool snap_ok = true;
+        auto entry = std::make_unique<MtFastPsoTable::Entry>();
+        entry->key = sig_key;
+        entry->shader_epoch.store(target->shader_epoch, std::memory_order_relaxed);
+        entry->pipeline = pipeline;
+        entry->sig_words = static_cast<u16>(sig_len);
+        entry->num_stages = static_cast<u8>(f.num_pending);
+        entry->motion = sel.motion;
+        entry->motion_possible = f.pending_motion_possible;
+        std::memcpy(entry->sig.data(), sig.data(), sig_len * sizeof(u32));
+        for (u32 i = 0; i < f.num_pending; ++i) {
+            const auto& src = target->stages[i];
+            if (!src.program || !src.program->info_template ||
+                src.perm_idx >= src.program->modules.size()) {
+                snap_ok = false;
+                break;
+            }
+            auto& dst = entry->stages[i];
+            dst.info_template = *src.program->info_template;
+            dst.spec = src.program->modules[src.perm_idx].spec;
+            dst.spec.info = &dst.info_template;
+            dst.runtime_info = src.runtime_info;
+            dst.hw_stage = src.hw_stage;
+            dst.sw_stage = src.sw_stage;
+            dst.pgm_base = src.pgm_base;
+            dst.shader_hash = src.shader_hash;
+            dst.copy_pgm_base = src.copy_pgm_base;
+            dst.copy_shader_hash = src.copy_shader_hash;
+            dst.rt_verified = !dst.info_template.has_fetch_shader;
+        }
+        if (snap_ok) {
+            std::scoped_lock lk{mt_fast->publish_mutex};
+            u32 victim_way = 0;
+            u64 oldest_seq = ~0ULL;
+            bool duplicate = false;
+            for (u32 w = 0; w < MtFastPsoTable::NumWays; ++w) {
+                const auto* cur = mt_fast->slots[set_base + w].load(std::memory_order_relaxed);
+                if (!cur) {
+                    victim_way = w;
+                    oldest_seq = 0;
+                    break;
+                }
+                if (cur->key == sig_key && cur->pipeline == pipeline &&
+                    cur->sig_words == sig_len &&
+                    std::memcmp(cur->sig.data(), sig.data(), sig_len * sizeof(u32)) == 0) {
+                    duplicate = true;
+                    break;
+                }
+                if (cur->publish_seq < oldest_seq) {
+                    oldest_seq = cur->publish_seq;
+                    victim_way = w;
+                }
+            }
+            if (!duplicate) {
+                entry->publish_seq = ++mt_fast->publish_clock;
+                const MtFastPsoTable::Entry* raw = entry.get();
+                mt_fast->arena.push_back(std::move(entry));
+                mt_fast->slots[set_base + victim_way].store(raw, std::memory_order_release);
+            }
+        }
+    }
 }
 
 const GraphicsPipeline* PipelineCache::TryFastSelect(const DrawIndirectParams& params) {
@@ -1538,15 +1647,19 @@ const GraphicsPipeline* PipelineCache::SelectGraphicsPipelineFull(const DrawIndi
     LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x}", pipeline_hash);
     CompileTimer timer;
     GraphicsPipeline::SerializationSupport sdata{};
-    auto& slot = graphics_pipelines[sel.graphics_key];
-    slot = std::make_unique<GraphicsPipeline>(instance, scheduler, desc_heap, profile,
-                                              sel.graphics_key, *pipeline_cache, sel.infos,
-                                              sel.runtime_infos, sel.fetch_shader, sel.modules,
-                                              sdata, false);
+    auto built = std::make_unique<GraphicsPipeline>(instance, scheduler, desc_heap, profile,
+                                                    sel.graphics_key, *pipeline_cache, sel.infos,
+                                                    sel.runtime_infos, sel.fetch_shader,
+                                                    sel.modules, sdata, false);
     PipelineStore::SaveGraphics(sel.graphics_key, pipeline_hash, sdata);
     NoteDriverPipelineCacheDirty();
     sel.fetch_shader.reset();
-    return slot.get();
+    const GraphicsPipeline* result = built.get();
+    {
+        std::unique_lock gr_lk{graphics_pipelines_mutex};
+        graphics_pipelines.insert_or_assign(sel.graphics_key, std::move(built));
+    }
+    return result;
 }
 
 const GraphicsPipeline* PipelineCache::CompileInBackground(const PipelineSelection& selection) {
@@ -1586,9 +1699,428 @@ const GraphicsPipeline* PipelineCache::FinishPipeline(const GraphicsPipelineKey&
                                                       PendingPipeline& job) {
     PipelineStore::SaveGraphics(key, std::hash<GraphicsPipelineKey>{}(key), job.sdata);
     NoteDriverPipelineCacheDirty();
-    auto& slot = graphics_pipelines[key];
-    slot = std::move(job.pipeline);
-    return slot.get();
+    const GraphicsPipeline* result = job.pipeline.get();
+    {
+        std::unique_lock gr_lk{graphics_pipelines_mutex};
+        graphics_pipelines.insert_or_assign(key, std::move(job.pipeline));
+    }
+    return result;
+}
+
+const GraphicsPipeline* PipelineCache::SelectGraphicsPipelineMt(const Gcn::Regs& regs,
+                                                                MtWorkerPsoState& worker_state,
+                                                                DrawIndirectParams params,
+                                                                bool indirect,
+                                                                bool allow_compile_fallback) {
+    worker_state.ResetForPass();
+
+    std::array<u32, MtFastPsoTable::MaxSigWords> sig;
+    const u32 sig_len =
+        BuildFastSelectSig(regs, params, instance.IsVertexInputDynamicState(),
+                           instance.IsTessellationSupported(), sig);
+    u64 sig_key = 0;
+    size_t set_base = 0;
+
+    const auto lookup_worker_info =
+        [&](const MtFastPsoTable::StageSnap& snap) -> Shader::Info& {
+        const void* key = &snap;
+        auto& mru = worker_state.stage_info_mru[(reinterpret_cast<uintptr_t>(key) >> 6) & 63];
+        if (mru.first == key && mru.second != nullptr) [[likely]] {
+            return *mru.second;
+        }
+        auto& inserted =
+            worker_state.stage_info_cache.try_emplace(key, snap.info_template).first->second;
+        mru = {key, &inserted};
+        return inserted;
+    };
+
+    const auto lookup_worker_memo =
+        [&](const MtFastPsoTable::StageSnap& snap) -> MtWorkerPsoState::StageMemo& {
+        const void* key = &snap;
+        auto& mru = worker_state.stage_memo_mru[(reinterpret_cast<uintptr_t>(key) >> 6) & 63];
+        if (mru.first == key && mru.second != nullptr) [[likely]] {
+            return *mru.second;
+        }
+        auto& inserted = worker_state.stage_memo_cache[key];
+        mru = {key, &inserted};
+        return inserted;
+    };
+
+    const auto verify_code_hash_mt = [](VAddr base, u64 expected_hash) noexcept -> bool {
+        if (base == 0) {
+            return false;
+        }
+        DirectShaders::Snapshot direct_snap;
+        if (DirectShaders::TryLookup(base, direct_snap, /*is_worker=*/true) &&
+            direct_snap.cpu_immutable != 0) {
+            return direct_snap.shader_hash == expected_hash;
+        }
+        const auto* bin = Gcn::DirectBinaryInfo(reinterpret_cast<const u32*>(base));
+        return bin && bin->shader_hash == expected_hash;
+    };
+
+    const auto lookup_fetch_mt =
+        [&](const Shader::Info& info, bool epoch_valid) -> const Shader::Gcn::FetchShaderData* {
+        const u32* const code =
+            Shader::Gcn::GetFetchShaderCode(info, info.fetch_shader_sgpr_base);
+        if (!code) {
+            return nullptr;
+        }
+        auto& mru = worker_state.fetch_mru[(reinterpret_cast<uintptr_t>(code) >> 4) & 63];
+        if (!BbToggle::Disabled(BbToggle::FetchShaderCache) && mru.first == code && mru.second &&
+            (epoch_valid ||
+             std::memcmp(code, mru.second->words.data(),
+                         mru.second->words.size() * sizeof(u32)) == 0)) [[likely]] {
+            return &mru.second->data;
+        }
+        if (const auto it = worker_state.fetch_map.find(code);
+            !BbToggle::Disabled(BbToggle::FetchShaderCache) &&
+            it != worker_state.fetch_map.end() &&
+            (epoch_valid ||
+             std::memcmp(code, it->second.words.data(),
+                         it->second.words.size() * sizeof(u32)) == 0)) {
+            mru = {code, &it->second};
+            return &it->second.data;
+        }
+        if (!FetchCodeDecodes(code)) {
+            return nullptr;
+        }
+        auto parsed = Shader::Gcn::ParseFetchShader(info);
+        if (!parsed || parsed->size == 0 || (parsed->size & 3u) != 0) {
+            return nullptr;
+        }
+        if (worker_state.fetch_map.size() >= 1024) {
+            worker_state.fetch_map.clear();
+            worker_state.fetch_mru.fill({});
+        }
+        auto& slot = worker_state.fetch_map[code];
+        slot.words.assign(code, code + (parsed->size / sizeof(u32)));
+        slot.data = std::move(*parsed);
+        mru = {code, &slot};
+        return &slot.data;
+    };
+
+    if (sig_len != 0 && mt_fast && FastSelectEnabled()) {
+        sig_key = XXH3_64bits(sig.data(), sig_len * sizeof(u32)) | 1ULL;
+        set_base = ((sig_key >> 1) & (MtFastPsoTable::NumSets - 1)) * MtFastPsoTable::NumWays;
+
+        std::array<const MtFastPsoTable::Entry*, MtFastPsoTable::NumWays> ways{};
+        const MtFastPsoTable::Entry* first_match = nullptr;
+        u32 matching_ways_mask = 0;
+        for (u32 w = 0; w < MtFastPsoTable::NumWays; ++w) {
+            const auto* cand = mt_fast->slots[set_base + w].load(std::memory_order_acquire);
+            ways[w] = cand;
+            if (cand && cand->key == sig_key && cand->sig_words == sig_len &&
+                std::memcmp(cand->sig.data(), sig.data(), sig_len * sizeof(u32)) == 0) {
+                if (!first_match) {
+                    first_match = cand;
+                }
+                matching_ways_mask |= (1u << w);
+            }
+        }
+
+        if (first_match) {
+            const u64 cur_epoch = DirectShaders::InvalidationEpoch();
+            for (u32 w = 0; w < MtFastPsoTable::NumWays; ++w) {
+                if (((matching_ways_mask >> w) & 1u) == 0) {
+                    continue;
+                }
+                const auto& way = *ways[w];
+                const bool epoch_valid =
+                    (way.shader_epoch.load(std::memory_order_relaxed) == cur_epoch);
+
+                std::array<Shader::Info*, MtFastPsoTable::MaxStages> way_infos{};
+                std::array<const Shader::Gcn::FetchShaderData*, MtFastPsoTable::MaxStages>
+                    way_fetch{};
+                const Shader::Info* vs_info = nullptr;
+                bool programs_ok = true;
+
+                for (u32 i = 0; i < way.num_stages; ++i) {
+                    const auto& st = way.stages[i];
+                    const auto* pgm = regs.ProgramForStage(static_cast<u32>(st.hw_stage));
+                    if (!pgm) {
+                        programs_ok = false;
+                        break;
+                    }
+                    const VAddr base = pgm->Address<VAddr>();
+                    if (base != st.pgm_base || base == 0 ||
+                        (!epoch_valid && !verify_code_hash_mt(base, st.shader_hash))) {
+                        programs_ok = false;
+                        break;
+                    }
+                    if (st.hw_stage == HwStage::Geometry) {
+                        const VAddr copy_base = regs.vs_program.Address<VAddr>();
+                        if (copy_base != st.copy_pgm_base || copy_base == 0 ||
+                            (!epoch_valid &&
+                             !verify_code_hash_mt(copy_base, st.copy_shader_hash))) {
+                            programs_ok = false;
+                            break;
+                        }
+                    }
+                    auto& winfo = lookup_worker_info(st);
+                    winfo.pgm_base = base;
+                    winfo.user_data = pgm->user_data;
+                    winfo.RefreshFlatBuf();
+                    if (winfo.has_fetch_shader) {
+                        way_fetch[i] = lookup_fetch_mt(winfo, epoch_valid);
+                        if (!way_fetch[i]) {
+                            programs_ok = false;
+                            break;
+                        }
+                    }
+                    way_infos[i] = &winfo;
+                    if (st.sw_stage == SwStage::Vertex) {
+                        vs_info = &winfo;
+                    }
+                }
+                if (!programs_ok) {
+                    continue;
+                }
+
+                if (way.motion_possible) {
+                    const bool cur_motion = AllMotionEnv() || (vs_info && VsSelectsMotion(*vs_info));
+                    if (way.motion != cur_motion) {
+                        continue;
+                    }
+                }
+
+                Shader::Backend::Bindings binding{};
+                bool spec_ok = true;
+                bool filled_vsharps = false;
+                const Shader::Info* tcs_info = nullptr;
+                for (u32 i = 0; i < way.num_stages; ++i) {
+                    const auto& st = way.stages[i];
+                    auto& info = *way_infos[i];
+                    if (st.sw_stage == SwStage::TessellationControl) {
+                        tcs_info = &info;
+                    }
+                    if (st.hw_stage == HwStage::Local && tcs_info) {
+                        Shader::TessellationDataConstantBuffer tess_constants{};
+                        tcs_info->ReadTessConstantBuffer(tess_constants);
+                        if (st.runtime_info.hw.ls.ls_stride != tess_constants.ls_stride) {
+                            spec_ok = false;
+                            break;
+                        }
+                    }
+                    const bool want_vsharps =
+                        (st.sw_stage == SwStage::Vertex && info.has_fetch_shader &&
+                         way_fetch[i] != nullptr);
+                    const bool can_memo_flat =
+                        !want_vsharps && !info.has_fetch_shader && st.hw_stage != HwStage::Local &&
+                        st.sw_stage != SwStage::TessellationControl;
+                    u64 flat_hash = 0;
+                    u32 flat_words = 0;
+                    bool head_same = false;
+                    const auto start_binding = binding;
+                    MtWorkerPsoState::StageMemo* memo = nullptr;
+                    if (can_memo_flat) {
+                        memo = &lookup_worker_memo(st);
+                        flat_words = static_cast<u32>(info.flattened_ud_buf.size());
+                        const u32* flat_ptr = info.flattened_ud_buf.data();
+                        if (flat_words >= 4u && flat_words == memo->last_flat_words &&
+                            start_binding == memo->last_start &&
+                            flat_ptr[0] == memo->last_ud_head[0] &&
+                            flat_ptr[1] == memo->last_ud_head[1] &&
+                            flat_ptr[2] == memo->last_ud_head[2] &&
+                            flat_ptr[3] == memo->last_ud_head[3]) {
+                            head_same = true;
+                            flat_hash = XXH3_64bits(flat_ptr, flat_words * sizeof(u32)) | 1ULL;
+                            if (flat_hash == memo->last_flat_hash) {
+                                info.AddBindings(binding);
+                                continue;
+                            }
+                        }
+                    }
+                    if (!st.spec.MatchesInPlace(info, st.runtime_info, profile, binding,
+                                                way_fetch[i], st.rt_verified,
+                                                want_vsharps ? &worker_state.vsharps : nullptr)) {
+                        spec_ok = false;
+                        break;
+                    }
+                    if (memo && flat_words >= 4u) {
+                        const u32* flat_ptr = info.flattened_ud_buf.data();
+                        memo->last_ud_head = {flat_ptr[0], flat_ptr[1], flat_ptr[2], flat_ptr[3]};
+                        memo->last_flat_words = flat_words;
+                        memo->last_start = start_binding;
+                        memo->last_flat_hash =
+                            head_same ? flat_hash
+                                      : (XXH3_64bits(flat_ptr, flat_words * sizeof(u32)) | 1ULL);
+                    }
+                    if (want_vsharps) {
+                        filled_vsharps = true;
+                    }
+                    info.AddBindings(binding);
+                }
+
+                if (spec_ok) {
+                    if (!epoch_valid) {
+                        way.shader_epoch.store(cur_epoch, std::memory_order_relaxed);
+                    }
+                    worker_state.bound_stage_infos.fill(nullptr);
+                    for (u32 i = 0; i < way.num_stages; ++i) {
+                        worker_state.bound_stage_infos[static_cast<u32>(way.stages[i].sw_stage)] =
+                            way_infos[i];
+                    }
+                    worker_state.has_vsharps = filled_vsharps;
+                    return way.pipeline;
+                }
+            }
+        }
+    }
+
+    // Cold MtFastPsoTable miss: resolve via thread-safe `PrepareGraphicsPipeline` (`programs_mutex`
+    // shared lock) and look up in `graphics_pipelines` under `graphics_pipelines_mutex`.
+    (void)indirect;
+    worker_state.prep_worker.stages.clear();
+    worker_state.prep_worker.failed = false;
+    worker_state.sel.regs = &regs;
+    worker_state.sel.worker = &worker_state.prep_worker;
+    worker_state.sel.draw_indirect_params = params;
+    if (!PrepareGraphicsPipeline(worker_state.sel)) {
+        return nullptr;
+    }
+
+    const GraphicsPipeline* resolved_pso = nullptr;
+    {
+        std::shared_lock gr_lk{graphics_pipelines_mutex};
+        if (const auto it = graphics_pipelines.find(worker_state.sel.graphics_key);
+            it != graphics_pipelines.end()) {
+            resolved_pso = it->second.get();
+        }
+    }
+    if (!resolved_pso && allow_compile_fallback) {
+        std::scoped_lock c_lk{compile_fallback_mutex};
+        {
+            std::shared_lock gr_lk{graphics_pipelines_mutex};
+            if (const auto it = graphics_pipelines.find(worker_state.sel.graphics_key);
+                it != graphics_pipelines.end()) {
+                resolved_pso = it->second.get();
+            }
+        }
+        if (!resolved_pso) {
+            const auto pipeline_hash =
+                std::hash<GraphicsPipelineKey>{}(worker_state.sel.graphics_key);
+            GraphicsPipeline::SerializationSupport sdata{};
+            auto built = std::make_unique<GraphicsPipeline>(
+                instance, scheduler, desc_heap, profile, worker_state.sel.graphics_key,
+                *pipeline_cache, worker_state.sel.infos, worker_state.sel.runtime_infos,
+                worker_state.sel.fetch_shader, worker_state.sel.modules, sdata, false);
+            PipelineStore::SaveGraphics(worker_state.sel.graphics_key, pipeline_hash, sdata);
+            NoteDriverPipelineCacheDirty();
+            resolved_pso = built.get();
+            std::unique_lock gr_lk{graphics_pipelines_mutex};
+            graphics_pipelines.insert_or_assign(worker_state.sel.graphics_key, std::move(built));
+        }
+    }
+    if (!resolved_pso) {
+        return nullptr;
+    }
+
+    worker_state.bound_stage_infos = worker_state.sel.infos;
+    worker_state.vsharps.clear();
+    worker_state.has_vsharps = false;
+    if (const Shader::Info* vs_info =
+            worker_state.bound_stage_infos[static_cast<u32>(SwStage::Vertex)];
+        vs_info && vs_info->has_fetch_shader && worker_state.sel.fetch_shader.has_value()) {
+        for (const auto& desc : worker_state.sel.fetch_shader->attributes) {
+            if (worker_state.vsharps.size() < worker_state.vsharps.capacity()) {
+                worker_state.vsharps.push_back(desc.GetSharpDirect(vs_info->user_data));
+            }
+        }
+        worker_state.has_vsharps = true;
+    }
+
+    // Publish warmed PSO into `MtFastPsoTable` so subsequent draws hit lock-free O(1).
+    if (sig_len != 0 && mt_fast && FastSelectEnabled() &&
+        !worker_state.prep_worker.stages.empty() &&
+        worker_state.prep_worker.stages.size() <= MtFastPsoTable::MaxStages) {
+        if (sig_key == 0) {
+            sig_key = XXH3_64bits(sig.data(), sig_len * sizeof(u32)) | 1ULL;
+            set_base = ((sig_key >> 1) & (MtFastPsoTable::NumSets - 1)) * MtFastPsoTable::NumWays;
+        }
+        auto entry = std::make_unique<MtFastPsoTable::Entry>();
+        entry->key = sig_key;
+        entry->shader_epoch.store(DirectShaders::InvalidationEpoch(), std::memory_order_relaxed);
+        entry->pipeline = resolved_pso;
+        entry->sig_words = static_cast<u16>(sig_len);
+        entry->num_stages = static_cast<u8>(worker_state.prep_worker.stages.size());
+        entry->motion = worker_state.sel.motion;
+        entry->motion_possible =
+            BbSettings::Get().object_motion.load(std::memory_order_relaxed) &&
+            Shader::MotionVectors::positions_address != 0 &&
+            regs.color_buffers[0] && regs.color_buffers[1] && regs.color_buffers[2] &&
+            regs.depth_buffer.DepthValid();
+        std::memcpy(entry->sig.data(), sig.data(), sig_len * sizeof(u32));
+
+        bool snap_ok = true;
+        {
+            std::shared_lock p_lk{programs_mutex};
+            for (u32 i = 0; i < entry->num_stages; ++i) {
+                const auto& src = worker_state.prep_worker.stages[i];
+                if (!src.program || !src.program->info_template ||
+                    src.perm_idx >= src.program->modules.size()) {
+                    snap_ok = false;
+                    break;
+                }
+                auto& dst = entry->stages[i];
+                dst.info_template = *src.program->info_template;
+                dst.spec = src.program->modules[src.perm_idx].spec;
+                dst.spec.info = &dst.info_template;
+                dst.runtime_info =
+                    worker_state.sel.runtime_infos[static_cast<u32>(src.sw_stage)];
+                dst.hw_stage = src.hw_stage;
+                dst.sw_stage = src.sw_stage;
+                dst.pgm_base = src.pgm_base;
+                dst.shader_hash = src.hash;
+                if (src.hw_stage == HwStage::Geometry) {
+                    const VAddr copy_base = regs.vs_program.Address<VAddr>();
+                    dst.copy_pgm_base = copy_base;
+                    if (copy_base != 0) {
+                        DirectShaders::Snapshot copy_snap;
+                        if (DirectShaders::TryLookup(copy_base, copy_snap, /*is_worker=*/true)) {
+                            dst.copy_shader_hash = copy_snap.shader_hash;
+                        } else if (const auto* bin = Gcn::DirectBinaryInfo(
+                                       reinterpret_cast<const u32*>(copy_base))) {
+                            dst.copy_shader_hash = bin->shader_hash;
+                        }
+                    }
+                }
+                dst.rt_verified = !dst.info_template.has_fetch_shader;
+            }
+        }
+
+        if (snap_ok) {
+            std::scoped_lock lk{mt_fast->publish_mutex};
+            u32 victim_way = 0;
+            u64 oldest_seq = ~0ULL;
+            bool duplicate = false;
+            for (u32 w = 0; w < MtFastPsoTable::NumWays; ++w) {
+                const auto* cur = mt_fast->slots[set_base + w].load(std::memory_order_relaxed);
+                if (!cur) {
+                    victim_way = w;
+                    oldest_seq = 0;
+                    break;
+                }
+                if (cur->key == sig_key && cur->pipeline == resolved_pso &&
+                    cur->sig_words == sig_len &&
+                    std::memcmp(cur->sig.data(), sig.data(), sig_len * sizeof(u32)) == 0) {
+                    duplicate = true;
+                    break;
+                }
+                if (cur->publish_seq < oldest_seq) {
+                    oldest_seq = cur->publish_seq;
+                    victim_way = w;
+                }
+            }
+            if (!duplicate) {
+                entry->publish_seq = ++mt_fast->publish_clock;
+                const MtFastPsoTable::Entry* raw = entry.get();
+                mt_fast->arena.push_back(std::move(entry));
+                mt_fast->slots[set_base + victim_way].store(raw, std::memory_order_release);
+            }
+        }
+    }
+    return resolved_pso;
 }
 
 bool PipelineCache::AsyncSkippable(const PipelineSelection& selection, bool indirect) {
@@ -2126,8 +2658,8 @@ PipelineCache::Result PipelineCache::LookUpProgram(PipelineSelection& sel,
     info.AddBindings(binding);
     const size_t perm_idx = static_cast<size_t>(std::distance(modules.begin(), it));
     prog_state->last_perm_idx = perm_idx;
-    worker.stages.push_back(
-        {program, &info, params.hash, hw_stage, info.pgm_base, &info.flattened_ud_buf});
+    worker.stages.push_back({program, &info, params.hash, hw_stage, info.pgm_base,
+                             &info.flattened_ud_buf, info.sw_stage, static_cast<u32>(perm_idx)});
     return {&info, it->module, std::move(spec.fetch_shader_data),
             HashCombine(params.hash, perm_idx)};
 }

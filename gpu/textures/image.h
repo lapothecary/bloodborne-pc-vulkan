@@ -109,6 +109,10 @@ struct Image {
     /// backing of the guest's sample count first.
     ImageView& FindView(const ImageViewInfo& view_info, bool ensure_guest_samples = true);
 
+    /// Phase 4.1: Read-only thread-safe lookup of an already-created `VkImageView` for workers.
+    /// Caller must hold `TextureCache::mutex`. Never mutates `last_view` or `slot_image_views`.
+    [[nodiscard]] vk::ImageView TryFindExistingViewMt(const ImageViewInfo& view_info) const noexcept;
+
     using Barriers = boost::container::small_vector<vk::ImageMemoryBarrier2, 32>;
     /// The barriers that bring `range` (else the whole image) to `dst_layout`, `dst_mask` at
     /// `dst_stage`; the state is updated as if they ran.

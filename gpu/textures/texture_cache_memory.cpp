@@ -144,7 +144,7 @@ bool TextureCache::VramShort() {
 
 void TextureCache::RunGarbageCollector() {
     SCOPE_EXIT {
-        ++gc_tick;
+        atomic_gc_tick.store(++gc_tick, std::memory_order_relaxed);
     };
     GarbageCollectImages();
     GarbageCollectSamplers();

@@ -62,6 +62,14 @@ public:
         return pipeline_layout;
     }
 
+    vk::DescriptorSetLayout GetDescriptorSetLayout() const noexcept {
+        return desc_layout;
+    }
+
+    bool UsesPushDescriptors() const noexcept {
+        return uses_push_descriptors;
+    }
+
     /// The stages present (the compute slot, or the graphics ones), null where absent.
     auto GetStages() const {
         static_assert(static_cast<u32>(Shader::SwStage::Compute) == Shader::MaxStageTypes - 1);

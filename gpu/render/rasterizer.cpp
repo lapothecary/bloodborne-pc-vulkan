@@ -9,6 +9,7 @@
 #include "render/raster_internal.h"
 #include "render/shader_hle.h"
 #include "render/vk_light_tile_batch.h"
+#include "render/vk_mt_direct_recorder.h"
 #include "render/vk_vsm_shadow_memo.h"
 #include "render/vk_obj_vel_cull.h"
 #include "render/vk_vfx_ui_batch.h"
@@ -316,6 +317,11 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
         std::make_unique<NativeSrvFastEntry[]>(VideoCore::DirectTextures::kMaxNativeSrvs);
     native_sampler_cache =
         std::make_unique<NativeSamplerStageBEntry[]>(VideoCore::DirectTextures::kMaxNativeSamplers);
+    mt_srv_publish =
+        std::make_unique<MtSrvPublishEntry[]>(VideoCore::DirectTextures::kMaxNativeSrvs);
+    mt_sampler_publish =
+        std::make_unique<MtSamplerPublishEntry[]>(VideoCore::DirectTextures::kMaxNativeSamplers);
+    mt_direct_recorder = std::make_unique<VkMtDirectRecorder>(instance, scheduler, *this);
     draw_prep = std::make_unique<DrawPreparation>(pipeline_cache);
     // A program (or fetch shader) that does not look like one yet: the game may have copied it
     // into place with the GPU (DMA) in work recorded but not run yet (another game: all-zero
@@ -388,6 +394,7 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
 }
 
 Rasterizer::~Rasterizer() {
+    mt_direct_recorder.reset();
     buffer_cache.SetDirectBuffersManager(nullptr);
     VideoCore::DirectBuffers::SetActiveCaches(nullptr, nullptr);
 }

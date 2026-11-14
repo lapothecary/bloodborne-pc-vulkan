@@ -124,6 +124,14 @@ public:
     [[nodiscard]] vk::Sampler GetSampler(const Gcn::Sampler& sampler,
                                          Gcn::BorderColorBuffer border_color_base, bool is_depth,
                                          float extra_lod_bias = 0.0f);
+    /// Phase 4.1: Thread-safe, zero-TLS sampler resolution for multi-threaded workers (+0 B PT_TLS).
+    [[nodiscard]] vk::Sampler GetSamplerMt(const Gcn::Sampler& sampler,
+                                           Gcn::BorderColorBuffer border_color_base, bool is_depth,
+                                           float extra_lod_bias = 0.0f);
+    /// Phase 4.1: Cold-miss thread-safe resolution of a settled `DirectImmutable` read-only asset
+    /// `VkImageView` in `eShaderReadOnlyOptimal` layout under `TextureCache::mutex`.
+    [[nodiscard]] vk::ImageView TryResolveDirectImmutableViewMt(
+        const Gcn::Image& clean_sharp, const Shader::ImageResource& res);
 
     Image* TryGetImage(ImageId id, u64 uid) {
         if (!slot_images.is_allocated(id)) {
@@ -465,6 +473,7 @@ private:
     // Garbage collection.
     Common::LeastRecentlyUsedCache<ImageId, u64> lru_cache;
     u64 gc_tick = 0;
+    std::atomic<u64> atomic_gc_tick{0};
     u64 total_used_memory = 0;
     u64 trigger_gc_memory = 0;
     u64 pressure_gc_memory = 0;
