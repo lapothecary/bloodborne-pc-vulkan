@@ -1203,7 +1203,7 @@ void Rasterizer::ExecuteSecondaryCmdBuf(u32 worker_id, u64 cmd_seq, u32 recorded
         }
     }
 
-    const u8 sec_mode = (meta->inherits_occlusion_query && occ_block_id == 0xFFFFu) ? 1u : 2u;
+    const u8 sec_mode = 2u;
     const auto state = BeginRendering(pipeline, sec_mode);
     const bool will_begin_pass = !last_begin_memo_hit && scheduler.WillBeginRendering(state);
     if (HasPendingHleCopies() && will_begin_pass) {

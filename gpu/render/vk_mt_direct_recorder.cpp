@@ -964,13 +964,10 @@ bool VkMtDirectRecorder::BeginWorkerPass(u32 worker_id, const MtPassInheritanceD
         .stencilAttachmentFormat = pass_desc.stencil_format,
         .rasterizationSamples = pass_desc.rasterization_samples,
     };
-    const bool inherit_occ = instance.IsInheritedQueriesSupported();
     const vk::CommandBufferInheritanceInfo inh_info{
         .pNext = &rendering_inh,
-        .occlusionQueryEnable = inherit_occ ? VK_TRUE : VK_FALSE,
-        .queryFlags = (inherit_occ && instance.IsOcclusionQueryPrecise())
-                          ? vk::QueryControlFlagBits::ePrecise
-                          : vk::QueryControlFlags{},
+        .occlusionQueryEnable = VK_FALSE,
+        .queryFlags = {},
     };
     const vk::CommandBufferBeginInfo begin_info{
         .flags = vk::CommandBufferUsageFlagBits::eRenderPassContinue |
@@ -2971,14 +2968,10 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
             .stencilAttachmentFormat = ts.stencil_format,
             .rasterizationSamples = ts.rasterization_samples,
         };
-        const bool inherit_occ =
-            instance.IsInheritedQueriesSupported() && occ_block_id == 0xFFFFu;
         const vk::CommandBufferInheritanceInfo inh_info{
             .pNext = &rendering_inh,
-            .occlusionQueryEnable = inherit_occ ? VK_TRUE : VK_FALSE,
-            .queryFlags = (inherit_occ && instance.IsOcclusionQueryPrecise())
-                              ? vk::QueryControlFlagBits::ePrecise
-                              : vk::QueryControlFlags{},
+            .occlusionQueryEnable = VK_FALSE,
+            .queryFlags = {},
         };
         const vk::CommandBufferBeginInfo begin_info{
             .flags = vk::CommandBufferUsageFlagBits::eRenderPassContinue |
@@ -2996,7 +2989,7 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
         w.push_tracker.InvalidateAll();
         w.dyn_state.Invalidate();
         cur_subpass_idx = sp_idx;
-        cur_inherits_occ = inherit_occ;
+        cur_inherits_occ = false;
         cur_motion_slot = 0xFFu;
         cur_num_sampled_rts = 0u;
         return true;

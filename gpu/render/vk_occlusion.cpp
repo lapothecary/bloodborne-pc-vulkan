@@ -102,7 +102,7 @@ OcclusionQueries::~OcclusionQueries() {
     scheduler.SetCarriedScope(nullptr);
 }
 
-void OcclusionQueries::BeginSegment(bool inside_render_pass, bool use_pass_scale) {
+void OcclusionQueries::BeginSegment(bool inside_render_pass) {
     if (begun == reset_until) {
         if (inside_render_pass) {
             ++starved; // no reset can be recorded in a render pass: these samples go uncounted
@@ -112,7 +112,7 @@ void OcclusionQueries::BeginSegment(bool inside_render_pass, bool use_pass_scale
     }
     const u32 slot = static_cast<u32>(begun % NumSlots);
     const bool precise = instance.IsOcclusionQueryPrecise();
-    slot_scale[slot] = (inside_render_pass || use_pass_scale) ? pass_scale : 256;
+    slot_scale[slot] = inside_render_pass ? pass_scale : 256;
     scheduler.Record([pool = *pool, slot, precise](vk::CommandBuffer cmdbuf) {
         cmdbuf.beginQuery(pool, slot,
                           precise ? vk::QueryControlFlagBits::ePrecise : vk::QueryControlFlags{});
@@ -252,12 +252,14 @@ void OcclusionQueries::Resolve() {
 }
 
 void OcclusionQueries::WriteBeforeLabel() {
-    std::scoped_lock lk{mutex};
-    if (pending.empty()) {
-        return;
+    {
+        std::scoped_lock lk{mutex};
+        if (pending.empty()) {
+            return;
+        }
+        const bool in_pass = scheduler.IsRendering();
+        ++(in_pass ? labels_ahead_in_pass : labels_ahead);
     }
-    const bool in_pass = scheduler.IsRendering();
-    ++(in_pass ? labels_ahead_in_pass : labels_ahead);
     // A label ahead of results not written yet would let the CPU see the label before them. (Once
     // taken for the cause of slow launches; that was volatile blocks' refresh copies breaking
     // render passes, BufferCache::LayerVolatileAllowed. The game reads its results 2-10 ms after
@@ -269,7 +271,13 @@ void OcclusionQueries::WriteBeforeLabel() {
     if (!ordered) {
         return;
     }
-    scheduler.EndRendering();
+    if (scheduler.IsRendering()) {
+        scheduler.EndRendering();
+    }
+    std::scoped_lock lk{mutex};
+    if (pending.empty()) {
+        return;
+    }
     if (active) {
         EndSegment();
     }
@@ -292,10 +300,10 @@ void OcclusionQueries::Suspend(bool inside_render_pass) {
     }
 }
 
-void OcclusionQueries::Resume(bool inside_render_pass, bool use_pass_scale) {
+void OcclusionQueries::Resume(bool inside_render_pass) {
     std::scoped_lock lk{mutex};
     if (started && !active) {
-        BeginSegment(inside_render_pass, use_pass_scale);
+        BeginSegment(inside_render_pass);
     }
 }
 

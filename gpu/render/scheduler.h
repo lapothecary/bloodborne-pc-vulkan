@@ -61,8 +61,8 @@ struct RenderState {
     u16 height;
     u16 num_layers;
     u8 num_color_attachments;
-    /// 0: inline primary pass; 1: secondary pass with occlusionQueryEnable=VK_TRUE;
-    /// 2: secondary pass without inherited occlusion queries.
+    /// 0: inline primary pass; non-zero: secondary command buffer pass without primary occlusion
+    /// queries (guest BeginQuery..EndQuery pairs stay inside a single inline command list).
     u8 secondary_contents;
 
     bool operator==(const RenderState& other) const noexcept {
@@ -345,7 +345,7 @@ public:
     /// the recording side, as Record.
     struct CarriedScope {
         virtual void Suspend(bool inside_render_pass) = 0;
-        virtual void Resume(bool inside_render_pass, bool use_pass_scale = false) = 0;
+        virtual void Resume(bool inside_render_pass) = 0;
     protected:
         ~CarriedScope() = default;
     };
@@ -767,9 +767,9 @@ private:
             carried_scope->Suspend(inside_render_pass);
         }
     }
-    void CarryResume(bool inside_render_pass, bool use_pass_scale = false) {
+    void CarryResume(bool inside_render_pass) {
         if (carried_scope) {
-            carried_scope->Resume(inside_render_pass, use_pass_scale);
+            carried_scope->Resume(inside_render_pass);
         }
     }
     std::unique_ptr<CommandPool> direct_pool; ///< used by the producer thread only
