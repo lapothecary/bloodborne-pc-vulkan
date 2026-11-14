@@ -137,6 +137,7 @@ struct MtResolvedBuffer {
     u64 offset{0};
     u64 clamped_size{0};
     bool is_static_immutable{false};
+    bool is_gpu_written{false};
 
     [[nodiscard]] explicit operator bool() const noexcept {
         return handle != VK_NULL_HANDLE;
@@ -157,6 +158,7 @@ struct MtReadMru {
         u64 base_offset{0};
         u64 gen{0};
         bool is_static_immutable{false};
+        bool is_gpu_written{false};
     };
 
     std::array<Slot, kSlots> slots{};
@@ -203,12 +205,20 @@ public:
         return TryResolveReadClamped(addr, size);
     }
 
-    /// Phase 4.1: Thread-safe lock-free read-only resolution for `GXWorker:1..5` and Stage B.
+    /// Phase 4.1/4.2: Thread-safe lock-free read-only resolution for `GXWorker:1..5` and Stage B.
     /// Hits `worker_mru` in O(1) without locking (`is_static_immutable` FLVER VB/IBs validate
     /// against `atomic_map_erase_gen`; mutable buffers validate against `atomic_override_gen`).
-    /// Cold misses fall back to `std::shared_lock{entries_rw_mutex}`.
+    /// Cold misses fall back to `std::shared_lock{entries_rw_mutex}`. Accumulates stats into
+    /// caller-owned non-atomic worker counters (`out_hits` / `out_misses`) to avoid cross-CCD
+    /// cache-line ping-pong.
     [[nodiscard]] MtResolvedBuffer TryResolveReadMt(VAddr addr, u64 requested_size,
-                                                    MtReadMru& worker_mru) const noexcept;
+                                                    MtReadMru& worker_mru,
+                                                    u64* out_hits = nullptr,
+                                                    u64* out_misses = nullptr) const noexcept;
+
+    /// Phase 4.2: Thread-safe read-only copy of CPU mirror bytes (`cpu_shadow` or untouched
+    /// initial guest RAM) into caller buffer `dst` under `entries_rw_mutex` shared reader lock.
+    [[nodiscard]] bool TryCopyCpuMirrorMt(VAddr addr, void* dst, u64 size) const noexcept;
 
     /// N2.5: O(1) lookup of a valid CPU-side mirror pointer (`cpu_shadow` or untouched
     /// initial-data guest RAM) for `[addr, addr + size)` when scanning index buffers of dynamic
@@ -315,6 +325,7 @@ private:
     u64 map_erase_generation{1};
     u32 mru_hand{0};
     mutable std::shared_mutex entries_rw_mutex;
+    bool mt_lock_enabled{false};
     std::atomic<u64> atomic_map_erase_gen{1};
     std::atomic<u64> atomic_override_gen{1};
     std::atomic<u32> atomic_live_count{0};

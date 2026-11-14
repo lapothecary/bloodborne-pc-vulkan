@@ -339,6 +339,9 @@ std::uint32_t GXGnmCommandContext_BeginCommandList(void* context, void* unused, 
     if (res != 0) {
         return res;
     }
+    if (*reinterpret_cast<const std::uint32_t*>(ctxBase + 0xB510) != 0u) {
+        (void)gx_direct_vk::TryCompileMtCommandList(ctxBase, cmdListImpl);
+    }
 
     void* omCache = ctxBase + 0xB558;
     CGOutputMergerCacheGnm_SnapshotAndInvalidateTargets(omCache, cmdListImpl + 0x20, cmdListImpl + 0x68);

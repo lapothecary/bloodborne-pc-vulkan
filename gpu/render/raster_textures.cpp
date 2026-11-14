@@ -1296,7 +1296,8 @@ bool Rasterizer::BindTexturesFromSet(const Shader::Info& stage, const u64* image
 }
 
 vk::ImageView Rasterizer::ResolveSrvViewMt(const Gcn::Image& raw_sharp,
-                                           const Shader::ImageResource& res) {
+                                           const Shader::ImageResource& res,
+                                           u64* out_hits, u64* out_misses) {
     if (res.is_written || res.mip_fallback_mode != Shader::MipStorageFallbackMode::None) {
         return {};
     }
@@ -1322,7 +1323,9 @@ vk::ImageView Rasterizer::ResolveSrvViewMt(const Gcn::Image& raw_sharp,
                 const u32 s2 = mp.seq.load(std::memory_order_relaxed);
                 if (s1 == s2 && dw7_tag == raw_dw7 && qw0 == raw_qw0 && rf == rflags &&
                     imm_ep == cur_imm_epoch16 && view != VK_NULL_HANDLE) [[likely]] {
-                    BbStats::native_tex_hits.fetch_add(1ULL, std::memory_order_relaxed);
+                    if (out_hits) {
+                        ++(*out_hits);
+                    }
                     return vk::ImageView{view};
                 }
             }
@@ -1336,10 +1339,14 @@ vk::ImageView Rasterizer::ResolveSrvViewMt(const Gcn::Image& raw_sharp,
     (void)VideoCore::DirectTextures::UnpackAndCleanSrv(clean_sharp, dummy_gen8);
     const vk::ImageView resolved = texture_cache.TryResolveDirectImmutableViewMt(clean_sharp, res);
     if (!resolved) {
-        BbStats::native_tex_misses.fetch_add(1ULL, std::memory_order_relaxed);
+        if (out_misses) {
+            ++(*out_misses);
+        }
         return {};
     }
-    BbStats::native_tex_hits.fetch_add(1ULL, std::memory_order_relaxed);
+    if (out_hits) {
+        ++(*out_hits);
+    }
     if (srv_uid != 0u && mt_srv_publish) {
         auto& mp = mt_srv_publish[srv_uid];
         u32 exp = mp.seq.load(std::memory_order_relaxed) & ~1u;
@@ -1358,7 +1365,8 @@ vk::ImageView Rasterizer::ResolveSrvViewMt(const Gcn::Image& raw_sharp,
 }
 
 vk::Sampler Rasterizer::ResolveSamplerMt(const Gcn::Sampler& raw_ssharp, bool is_depth,
-                                         float lod_bias, Gcn::BorderColorBuffer bc_base) {
+                                         float lod_bias, Gcn::BorderColorBuffer bc_base,
+                                         u64* out_hits) {
     const u32 color_bias_bits = std::bit_cast<u32>(lod_bias);
     const bool aniso_off = BbToggle::Disabled(BbToggle::ForcedAniso);
     const u8 forced_aniso =
@@ -1394,7 +1402,9 @@ vk::Sampler Rasterizer::ResolveSamplerMt(const Gcn::Sampler& raw_ssharp, bool is
                         tw == raw_words && fa == forced_aniso && fa_off == u8(aniso_off) &&
                         (is_depth || bb == color_bias_bits) && bca == bc_base.base_addr)
                         [[likely]] {
-                        BbStats::native_tex_hits.fetch_add(1ULL, std::memory_order_relaxed);
+                        if (out_hits) {
+                            ++(*out_hits);
+                        }
                         return vk::Sampler{h};
                     }
                 }

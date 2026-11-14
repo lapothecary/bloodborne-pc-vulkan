@@ -52,6 +52,7 @@ class VsmShadowMemo;
 class ObjectVelocityCuller;
 class VfxUiBatcher;
 class VkMtDirectRecorder;
+struct SceneOcclusionCuller;
 
 class Rasterizer {
     friend struct BatchedLightStageOverride;
@@ -99,12 +100,70 @@ public:
         return mt_direct_recorder.get();
     }
 
-    /// Phase 4.1: Thread-safe lock-free read-only SRV `VkImageView` + `VkSampler` resolution for
-    /// `GXWorker:1..5` and Stage B (wait-free seqlock fast path, safe mutex fallback on cold miss).
+    /// Phase 4.1/4.2: Thread-safe lock-free read-only SRV `VkImageView` + `VkSampler` resolution
+    /// for `GXWorker:1..5` and Stage B (wait-free seqlock fast path, safe mutex fallback on cold
+    /// miss). Counts hits/misses into caller-owned non-atomic worker counters.
     [[nodiscard]] vk::ImageView ResolveSrvViewMt(const Gcn::Image& raw_sharp,
-                                                 const Shader::ImageResource& res);
+                                                 const Shader::ImageResource& res,
+                                                 u64* out_hits = nullptr,
+                                                 u64* out_misses = nullptr);
     [[nodiscard]] vk::Sampler ResolveSamplerMt(const Gcn::Sampler& raw_ssharp, bool is_depth,
-                                               float lod_bias, Gcn::BorderColorBuffer bc_base);
+                                               float lod_bias, Gcn::BorderColorBuffer bc_base,
+                                               u64* out_hits = nullptr);
+
+    struct MtShadowCullState {
+        VAddr cb_addr{0};
+        VAddr db_addr{0};
+        u32 face_draw_idx{0};
+    };
+
+    struct MtOcclusionDecision {
+        bool skip_draw{false};
+        s32 query_slot{-1};
+        vk::QueryPool pool{};
+    };
+
+    struct MtPassTargetSummary {
+        u32 num_color_attachments{0};
+        std::array<vk::Format, 8> color_formats{};
+        vk::Format depth_format{vk::Format::eUndefined};
+        vk::Format stencil_format{vk::Format::eUndefined};
+        vk::SampleCountFlagBits rasterization_samples{vk::SampleCountFlagBits::e1};
+        float sampler_lod_bias{0.0f};
+        bool is_gbuffer{false};
+    };
+
+    using MtResolveCbBytesFn = bool (*)(void* ctx, const Gcn::Buffer& sharp, const u8*& out_ptr,
+                                        u32& out_size) noexcept;
+
+    [[nodiscard]] bool InspectMtPassTargets(const Gcn::Regs& regs,
+                                            const GraphicsPipeline* first_pso,
+                                            MtPassTargetSummary& out) const noexcept;
+    void ExecuteSecondaryCmdBuf(u32 worker_id, u64 cmd_seq, u32 recorded_draws, u16 occ_block_id);
+    [[nodiscard]] Core::MemoryManager* GetMemoryManager() const noexcept {
+        return memory;
+    }
+    [[nodiscard]] bool IsRegionGpuModifiedForMt(VAddr addr, u64 size) noexcept;
+    [[nodiscard]] ObjectVelocityCuller* GetObjectVelocityCuller() noexcept {
+        return object_vel_culler.get();
+    }
+
+    [[nodiscard]] static bool TryCullMicroShadowDrawMt(const Gcn::Regs& regs,
+                                                       const GraphicsPipeline* pipeline,
+                                                       bool is_indexed, MtShadowCullState& state,
+                                                       u64* out_skipped = nullptr) noexcept;
+    [[nodiscard]] u16 AcquireMtOcclusionQueryBlock(u32 frame_tag) noexcept;
+    void SealMtOcclusionQueryBlock(u16& io_block_id) noexcept;
+    void AbortMtOcclusionQueryBlock(u16 block_id) noexcept;
+    void NoteMtOcclusionQueryBlockExecuted(u16 block_id, u64 submit_tick) noexcept;
+    [[nodiscard]] MtOcclusionDecision EvaluateGBufferOcclusionMt(
+        const Gcn::Regs& regs, const GraphicsPipeline* pipeline, const u32* vs_flat_ud,
+        VAddr vs_pgm_base, bool is_indexed, u32 index_offset,
+        std::span<const Gcn::Buffer> vsharps, u16 mt_query_block_id, MtResolveCbBytesFn resolve_cb,
+        void* resolve_ctx, u64* out_candidates = nullptr, u64* out_skipped = nullptr,
+        u64* out_probed = nullptr) noexcept;
+    void FlushWorkerCullerStats(u64 occ_cand, u64 occ_skip, u64 occ_probe, u64 shadow_skip,
+                                u64 vel_seen, u64 vel_culled) noexcept;
 
     void Draw(bool is_indexed, u32 index_offset = 0, const PreparedDraw* prepared = nullptr);
 
@@ -503,7 +562,7 @@ public:
 
 private:
     void PrepareRenderState(const GraphicsPipeline* pipeline);
-    RenderState BeginRendering(const GraphicsPipeline* pipeline);
+    RenderState BeginRendering(const GraphicsPipeline* pipeline, bool secondary_contents = false);
     RenderState BeginRenderingFull(const GraphicsPipeline* pipeline);
     /// The upscaler's redirection of the pass's targets to its output-size images.
     struct TargetRedirect {
@@ -910,6 +969,7 @@ private:
     static_assert(sizeof(MtSamplerPublishEntry) == 64);
     std::unique_ptr<MtSamplerPublishEntry[]> mt_sampler_publish;
     std::unique_ptr<VkMtDirectRecorder> mt_direct_recorder;
+    std::unique_ptr<Gcn::Regs> mt_stage_b_regs;
     u64 desc_use_counter = 0;
     /// Entries replacing pinned cache slots during one BindTextures call.
     boost::container::static_vector<ImageDescCacheEntry, Shader::NUM_IMAGES> image_desc_overflow;
@@ -1411,6 +1471,7 @@ private:
     std::unique_ptr<LightTileBatcher> light_tile_batcher;
     std::unique_ptr<VsmShadowMemo> vsm_shadow_memo;
     std::unique_ptr<ObjectVelocityCuller> object_vel_culler;
+    std::unique_ptr<SceneOcclusionCuller> scene_occlusion_culler;
     std::unique_ptr<VfxUiBatcher> vfx_ui_batcher;
     std::unique_ptr<class OcclusionQueries> occlusion;
     std::unique_ptr<class ButtonPrompts> prompts; ///< bbport: the key guide icons for the device in use

@@ -68,6 +68,7 @@ void DirectVkReleaseLabelsBatchTask(Vulkan::Rasterizer& rasterizer, const u8* da
 void DirectVkReleaseU32LabelsBatchTask(Vulkan::Rasterizer& rasterizer, const u8* data);
 void DirectVkOcclusionQueryTask(Vulkan::Rasterizer& rasterizer, const u8* data);
 void DirectVkTimestampQueryTask(Vulkan::Rasterizer& rasterizer, const u8* data);
+void DirectVkExecuteSecondaryTask(Vulkan::Rasterizer& rasterizer, const u8* data);
 
 /// An end-of-pipe fence now (no draw recording thread).
 void SignalEop(const EventWriteEop& eop, u64 seq);

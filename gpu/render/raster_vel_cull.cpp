@@ -134,6 +134,10 @@ bool ObjectVelocityCuller::Enabled() noexcept {
     return enabled;
 }
 
+bool ObjectVelocityCuller::IsObjectVelocityPs(u64 ps_hash) noexcept {
+    return IsObjectVelPsHash(ps_hash);
+}
+
 float ObjectVelocityCuller::EpsilonThreshold() noexcept {
     static const float eps = [] {
         if (const char* env = std::getenv("BB_VEL_CULL_EPS"); env && env[0] != '\0') {
@@ -832,6 +836,257 @@ bool ObjectVelocityCuller::TryCullDraw(Rasterizer& rasterizer, const GraphicsPip
     ++stat_moving;
     maybe_log_summary();
     return false;
+}
+
+bool ObjectVelocityCuller::TryCullDrawMt(const Gcn::Regs& regs, const GraphicsPipeline* pipeline,
+                                         const u32* vs_flat_ud, VAddr vs_pgm_base, bool is_indexed,
+                                         MtResolveCbFn resolve_fn, void* resolve_ctx,
+                                         std::span<PairMemoEntry, kPairMemoSize> worker_pair_memo,
+                                         u64* out_seen, u64* out_culled) noexcept {
+    if (!pipeline || !is_indexed || !vs_flat_ud || !resolve_fn) {
+        return false;
+    }
+    const auto* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+    if (!ps || !IsObjectVelPsHash(ps->pgm_hash)) [[likely]] {
+        return false;
+    }
+    if (!Enabled() || FrameCapture::Active() || BbCeStats::Enabled()) {
+        return false;
+    }
+
+    const auto& vs = pipeline->GetStage(Shader::SwStage::Vertex);
+    const u64 vs_hash = vs.pgm_hash;
+    if (IsHavokClothObjectVelVsHash(vs_hash)) {
+        return false;
+    }
+
+    const bool is_std_vs = IsStdObjectVelVsHash(vs_hash);
+    const bool is_hyb_vs = IsHybridObjectVelVsHash(vs_hash);
+    if (out_seen) {
+        ++(*out_seen);
+    }
+    if (!is_std_vs && !is_hyb_vs) {
+        return false;
+    }
+    if (IsSilhouetteMaskActive()) [[unlikely]] {
+        return false;
+    }
+
+    const u32 mrt_mask = pipeline->GetGraphicsKey().mrt_mask;
+    if ((mrt_mask & ~0x81u) != 0u || (mrt_mask & 0x1u) == 0u || !regs.color_buffers[0] ||
+        regs.depth_render_control.depth_clear_enable ||
+        regs.depth_render_control.stencil_clear_enable || vs.uses_dma || ps->uses_dma) {
+        return false;
+    }
+    for (u32 st = 0u; st < Shader::MaxStageTypes; ++st) {
+        const auto* s = pipeline->GetStages()[st];
+        if (s && st != u32(Shader::SwStage::Vertex) && st != u32(Shader::SwStage::Fragment)) {
+            return false;
+        }
+    }
+
+    u32 ns_indices[8]{};
+    u32 ns_count = 0u;
+    for (u32 bi = 0u; bi < vs.buffers.size(); ++bi) {
+        const auto& desc = vs.buffers[bi];
+        if (desc.IsSpecial()) {
+            continue;
+        }
+        if (desc.is_written) {
+            return false;
+        }
+        if (ns_count < 8u) {
+            ns_indices[ns_count++] = bi;
+        }
+    }
+    if ((is_std_vs && ns_count < 4u) || (is_hyb_vs && ns_count < 5u)) {
+        return false;
+    }
+
+    const float eps = EpsilonThreshold();
+    u32 model_cb_slot = 0u;
+    u32 cur_pal_slot = 0u;
+    u32 prev_pal_slot = 0u;
+
+    if (is_hyb_vs) {
+        const Gcn::Buffer flag_sharp =
+            vs.buffers[ns_indices[0]].GetSharpDirect(vs_flat_ud, vs_pgm_base);
+        const u8* flag_ptr = nullptr;
+        u32 flag_sz = 0u;
+        u64 flag_gen = 0ULL;
+        if (!resolve_fn(resolve_ctx, flag_sharp, 132u, flag_ptr, flag_sz, flag_gen) || !flag_ptr) {
+            return false;
+        }
+        u32 is_rigid_pair = 0u;
+        std::memcpy(&is_rigid_pair, flag_ptr + 128u, sizeof(u32));
+        if (is_rigid_pair != 0u) {
+            const Gcn::Buffer inst_sharp =
+                vs.buffers[ns_indices[1]].GetSharpDirect(vs_flat_ud, vs_pgm_base);
+            const u8* inst_ptr = nullptr;
+            u32 inst_sz = 0u;
+            u64 inst_gen = 0ULL;
+            if (!resolve_fn(resolve_ctx, inst_sharp, 96u, inst_ptr, inst_sz, inst_gen) ||
+                !inst_ptr) {
+                return false;
+            }
+            if (MatricesStationarySse2(inst_ptr, inst_ptr + 48u, 48u, eps)) {
+                if (out_culled) {
+                    ++(*out_culled);
+                }
+                return true;
+            }
+            return false;
+        }
+        model_cb_slot = ns_indices[2];
+        cur_pal_slot = ns_indices[3];
+        prev_pal_slot = ns_indices[4];
+    } else {
+        model_cb_slot = ns_indices[0];
+        cur_pal_slot = ns_indices[2];
+        prev_pal_slot = ns_indices[3];
+    }
+
+    const Gcn::Buffer cur_sharp =
+        vs.buffers[cur_pal_slot].GetSharpDirect(vs_flat_ud, vs_pgm_base);
+    const Gcn::Buffer prev_sharp =
+        vs.buffers[prev_pal_slot].GetSharpDirect(vs_flat_ud, vs_pgm_base);
+    if (!cur_sharp.Valid() || !prev_sharp.Valid() || !cur_sharp.base_address ||
+        !prev_sharp.base_address) {
+        return false;
+    }
+
+    if (cur_sharp.base_address == prev_sharp.base_address &&
+        cur_sharp.GetSize() == prev_sharp.GetSize()) {
+        if (out_culled) {
+            ++(*out_culled);
+        }
+        return true;
+    }
+
+    u32 base_bone_idx = 0u;
+    bool has_base_bone = false;
+    {
+        const Gcn::Buffer model_sharp =
+            vs.buffers[model_cb_slot].GetSharpDirect(vs_flat_ud, vs_pgm_base);
+        const u8* model_ptr = nullptr;
+        u32 model_sz = 0u;
+        u64 model_gen = 0ULL;
+        if (resolve_fn(resolve_ctx, model_sharp, 84u, model_ptr, model_sz, model_gen) &&
+            model_ptr) {
+            std::memcpy(&base_bone_idx, model_ptr + 80u, sizeof(u32));
+            has_base_bone = true;
+        }
+    }
+
+    const u64 min_needed_bytes =
+        (vs_hash == 0x00000000f2c65c37ULL && has_base_bone && base_bone_idx <= 512u)
+            ? (u64(base_bone_idx + 1u) * 48ULL)
+            : 48ULL;
+    if (min_needed_bytes > kMaxLargeBytes) {
+        return false;
+    }
+
+    const u8* cur_ptr = nullptr;
+    u32 cur_sz = 0u;
+    u64 cur_gen = 0ULL;
+    if (!resolve_fn(resolve_ctx, cur_sharp, static_cast<u32>(min_needed_bytes), cur_ptr, cur_sz,
+                    cur_gen) ||
+        !cur_ptr) {
+        return false;
+    }
+
+    const u8* prev_ptr = nullptr;
+    u32 prev_sz = 0u;
+    u64 prev_gen = 0ULL;
+    if (!resolve_fn(resolve_ctx, prev_sharp, static_cast<u32>(min_needed_bytes), prev_ptr, prev_sz,
+                    prev_gen) ||
+        !prev_ptr) {
+        return false;
+    }
+
+    u32 byte_off = 0u;
+    u32 cmp_bytes = 0u;
+    if (vs_hash == 0x00000000f2c65c37ULL && has_base_bone) {
+        const u64 off64 = u64(base_bone_idx) * 48ULL;
+        if (off64 + 48ULL > cur_sz || off64 + 48ULL > prev_sz) {
+            return false;
+        }
+        byte_off = static_cast<u32>(off64);
+        cmp_bytes = 48u;
+    } else {
+        if (cur_sz != prev_sz || cur_sz < 48u || cur_sz > kMaxLargeBytes) {
+            return false;
+        }
+        const u32 pal_bytes = (cur_sz / 48u) * 48u;
+        if (has_base_bone) {
+            const u64 off64 = u64(base_bone_idx) * 48ULL;
+            if (off64 + 48ULL <= pal_bytes) {
+                byte_off = static_cast<u32>(off64);
+                cmp_bytes = std::min<u32>(pal_bytes - byte_off, 256u * 48u);
+            } else {
+                cmp_bytes = pal_bytes;
+            }
+        } else {
+            cmp_bytes = pal_bytes;
+        }
+    }
+
+    const bool memo_eligible = (cur_gen != 0ULL && prev_gen != 0ULL);
+    size_t memo_idx = 0u;
+    if (memo_eligible) {
+        memo_idx = HashPairKey(cur_sharp.base_address, prev_sharp.base_address, cur_gen, prev_gen,
+                               byte_off, cmp_bytes);
+        const auto& m = worker_pair_memo[memo_idx];
+        if (m.valid != 0u && m.cur_addr == cur_sharp.base_address &&
+            m.prev_addr == prev_sharp.base_address && m.cur_gen == cur_gen &&
+            m.prev_gen == prev_gen && m.byte_off == byte_off && m.cmp_bytes == cmp_bytes) {
+            if (m.stationary != 0u) {
+                if (out_culled) {
+                    ++(*out_culled);
+                }
+                return true;
+            }
+            return false;
+        }
+    }
+
+    const bool stationary =
+        MatricesStationarySse2(cur_ptr + byte_off, prev_ptr + byte_off, cmp_bytes, eps);
+    if (memo_eligible) {
+        auto& m = worker_pair_memo[memo_idx];
+        m.cur_addr = cur_sharp.base_address;
+        m.prev_addr = prev_sharp.base_address;
+        m.cur_gen = cur_gen;
+        m.prev_gen = prev_gen;
+        m.byte_off = byte_off;
+        m.cmp_bytes = cmp_bytes;
+        m.stationary = stationary ? 1u : 0u;
+        m.valid = 1u;
+    }
+
+    if (stationary) {
+        if (out_culled) {
+            ++(*out_culled);
+        }
+        return true;
+    }
+    return false;
+}
+
+void ObjectVelocityCuller::FlushWorkerStats(u64 seen, u64 culled) noexcept {
+    if (seen == 0u && culled == 0u) {
+        return;
+    }
+    const u64 tot_seen = mt_stat_seen.fetch_add(seen, std::memory_order_relaxed) + seen;
+    const u64 tot_culled = mt_stat_culled.fetch_add(culled, std::memory_order_relaxed) + culled;
+    if (tot_seen >= 1000u &&
+        !mt_first_summary_logged.exchange(true, std::memory_order_relaxed)) {
+        std::printf("[ObjVelCull-MT] Summary(seen=%llu): culled=%llu (%.1f%%)\n",
+                    static_cast<unsigned long long>(tot_seen),
+                    static_cast<unsigned long long>(tot_culled),
+                    tot_seen ? (100.0 * double(tot_culled) / double(tot_seen)) : 0.0);
+        std::fflush(stdout);
+    }
 }
 
 } // namespace Vulkan

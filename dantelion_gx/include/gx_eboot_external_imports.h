@@ -24004,6 +24004,9 @@ __attribute__((weak, visibility("hidden"))) int bb_direct_vk_mt_mode() noexcept 
 __attribute__((weak, visibility("hidden"))) int bb_direct_vk_mt_worker_begin_pass(uint32_t, const void*) noexcept { return 0; }
 __attribute__((weak, visibility("hidden"))) uint64_t bb_direct_vk_mt_worker_end_pass(uint32_t) noexcept { return 0ULL; }
 __attribute__((weak, visibility("hidden"))) void bb_direct_vk_mt_execute_secondaries(const uint64_t*, uint32_t) noexcept {}
+__attribute__((weak, visibility("hidden"))) int bb_direct_vk_mt_try_compile_cmd_list(const void*, void*) noexcept { return 0; }
+__attribute__((weak, visibility("hidden"))) void bb_direct_vk_mt_note_copy_batch(const void*, uint32_t) noexcept {}
+__attribute__((weak, visibility("hidden"))) void bb_direct_vk_mt_invalidate_copy_shadow(uint64_t, uint64_t) noexcept {}
 __attribute__((weak, visibility("hidden"))) void BbGoldenEngine_OnYebisJitter(float, float) {}
 __attribute__((weak, visibility("hidden"))) void BbGoldenEngine_OnYebisCameraMatrix(uint32_t, const float*) {}
 __attribute__((weak, visibility("hidden"))) void BbGoldenEngine_OnYebisCameraParams(float, float, float) {}

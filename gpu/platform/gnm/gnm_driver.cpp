@@ -348,6 +348,7 @@ s32 PatchFlip(u32* cmdbuf, u32 size, u32 vo_handle, u32 buf_idx, u32 flip_mode, 
     default:
         break; // the label written, nothing else
     }
+    BbStats::guest_frame_number.fetch_add(1u, std::memory_order_relaxed);
     return BbErr::Ok;
 }
 

@@ -596,6 +596,22 @@ CommandProcessor::Step CommandProcessor::Graphics(Work& work, Level& level, cons
                     }
                     break;
                 }
+                case DirectVk::Op::ExecuteSecondaryCmds: {
+                    if (rasterizer && body_words == 6u) {
+                        DirectVk::ExecuteSecondaryArgs args{};
+                        std::memcpy(&args, body + 2u, sizeof(args));
+                        const u32 recorded_draws = args.worker_and_draws >> 8;
+                        if (recorded_draws != 0u) {
+                            BbStats::draws.fetch_add(recorded_draws, std::memory_order_relaxed);
+                        }
+                        rasterizer->FlushVsmShadowMemo();
+                        rasterizer->FlushLightTileBatches();
+                        rasterizer->FlushVfxUiBatches();
+                        rasterizer->RunInOrder(&Tasks::DirectVkExecuteSecondaryTask, body + 2u,
+                                               sizeof(args), BbToggle::PipelinedTasks, false);
+                    }
+                    break;
+                }
                 case DirectVk::Op::DrawIndexed: {
                     if (rasterizer && body_words == 6u) {
                         DirectVk::DrawIndexedArgs args{};

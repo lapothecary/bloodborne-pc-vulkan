@@ -636,6 +636,15 @@ void DirectVkTimestampQueryTask(Vulkan::Rasterizer& rasterizer, const u8* data) 
     BbStats::eop_written.fetch_add(label_count, std::memory_order_relaxed);
 }
 
+void DirectVkExecuteSecondaryTask(Vulkan::Rasterizer& rasterizer, const u8* data) {
+    DirectVk::ExecuteSecondaryArgs args{};
+    std::memcpy(&args, data, sizeof(args));
+    const u32 worker_id = args.worker_and_draws & 0xFFu;
+    const u32 recorded_draws = args.worker_and_draws >> 8;
+    const u16 occ_block_id = static_cast<u16>(args.occ_and_flags & 0xFFFFu);
+    rasterizer.ExecuteSecondaryCmdBuf(worker_id, args.cmd_seq, recorded_draws, occ_block_id);
+}
+
 } // namespace Tasks
 
 } // namespace BbCp

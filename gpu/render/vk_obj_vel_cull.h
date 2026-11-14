@@ -54,10 +54,43 @@ public:
 
     [[nodiscard]] static bool Enabled() noexcept;
     [[nodiscard]] static float EpsilonThreshold() noexcept;
+    [[nodiscard]] static bool IsObjectVelocityPs(u64 ps_hash) noexcept;
 
     /// Called from guest engine (`sub_229e990`) when feedback/radial/silhouette blur is active.
     static void NoteSilhouetteMaskActiveGlobal() noexcept;
     [[nodiscard]] static bool IsSilhouetteMaskActive() noexcept;
+
+    struct PairMemoEntry {
+        VAddr cur_addr = 0;
+        VAddr prev_addr = 0;
+        u64 cur_gen = 0;
+        u64 prev_gen = 0;
+        u32 byte_off = 0;
+        u32 cmp_bytes = 0;
+        u8 stationary = 0;
+        u8 valid = 0;
+        u16 pad = 0;
+        u32 pad2 = 0;
+    };
+    static_assert(sizeof(PairMemoEntry) == 48);
+
+    using MtResolveCbFn = bool (*)(void* user_ctx, const Gcn::Buffer& sharp, u32 min_bytes,
+                                   const u8*& out_ptr, u32& out_size, u64& out_gen) noexcept;
+
+    /// Phase 4.2: Lock-free worker-side stationary object-velocity culling (`Pass 0x2e`) for
+    /// `GXWorker:0..5` secondary command buffer recording. Uses caller-provided guest-timeline
+    /// constant resolver (`resolve_fn`) and worker-private `worker_pair_memo` with zero global
+    /// atomic contention.
+    [[nodiscard]] static bool TryCullDrawMt(const Gcn::Regs& regs,
+                                            const GraphicsPipeline* pipeline,
+                                            const u32* vs_flat_ud, VAddr vs_pgm_base,
+                                            bool is_indexed, MtResolveCbFn resolve_fn,
+                                            void* resolve_ctx,
+                                            std::span<PairMemoEntry, kPairMemoSize> worker_pair_memo,
+                                            u64* out_seen = nullptr,
+                                            u64* out_culled = nullptr) noexcept;
+
+    void FlushWorkerStats(u64 seen, u64 culled) noexcept;
 
     /// Records CPU-source constant/palette buffer copies (`16..24576 B`) on Stage A.
     void NoteStageACpuCopyBatch(const u32* raw_regions, u32 count) noexcept;
@@ -82,20 +115,6 @@ private:
         u32 coarse_e1 = 0;
     };
     static_assert(sizeof(ShadowMeta) == 32);
-
-    struct PairMemoEntry {
-        VAddr cur_addr = 0;
-        VAddr prev_addr = 0;
-        u64 cur_gen = 0;
-        u64 prev_gen = 0;
-        u32 byte_off = 0;
-        u32 cmp_bytes = 0;
-        u8 stationary = 0;
-        u8 valid = 0;
-        u16 pad = 0;
-        u32 pad2 = 0;
-    };
-    static_assert(sizeof(PairMemoEntry) == 48);
 
     [[nodiscard]] static size_t TinyPageSet(VAddr page512) noexcept {
         u64 x = page512 * 0x9E3779B97F4A7C15ULL;
@@ -153,6 +172,9 @@ private:
     u64 last_unk_vs = 0;
     u32 last_reg_bits = 0;
     bool first_summary_logged = false;
+    std::atomic<u64> mt_stat_seen{0};
+    std::atomic<u64> mt_stat_culled{0};
+    std::atomic<bool> mt_first_summary_logged{false};
 };
 
 } // namespace Vulkan

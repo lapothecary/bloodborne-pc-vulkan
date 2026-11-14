@@ -104,6 +104,12 @@ GX_HOST_IMPORT int bb_direct_vk_mt_worker_begin_pass(uint32_t worker_id,
 GX_HOST_IMPORT uint64_t bb_direct_vk_mt_worker_end_pass(uint32_t worker_id) noexcept;
 GX_HOST_IMPORT void bb_direct_vk_mt_execute_secondaries(const uint64_t* cmd_handles,
                                                         uint32_t count) noexcept;
+GX_HOST_IMPORT int bb_direct_vk_mt_try_compile_cmd_list(const void* ctx_base,
+                                                        void* cmd_list_impl) noexcept;
+GX_HOST_IMPORT void bb_direct_vk_mt_note_copy_batch(const void* raw_regions,
+                                                    uint32_t count) noexcept;
+GX_HOST_IMPORT void bb_direct_vk_mt_invalidate_copy_shadow(uint64_t dst_va,
+                                                           uint64_t byte_size) noexcept;
 }
 
 namespace gx_direct_vk {
@@ -702,6 +708,8 @@ enum class Op : uint32_t {
     SetVgtControl            = 33u,
     // Phase 3 Step 3.3: Fused DirectVk state + draw super-packet
     DrawBundle               = 34u,
+    // Phase 4 Step 4.2: Execute pre-compiled GXWorker secondary VkCommandBuffer inside Dynamic Rendering
+    ExecuteSecondaryCmds     = 35u,
 };
 
 // Tag stored in `CopyRegion::reserved` / `CopyRecord::reserved` when the C++20 engine itself
@@ -709,6 +717,16 @@ enum class Op : uint32_t {
 // allowing `StageNativeCpuCopyBatch` & `DirectCopyBuffers` to bypass false-positive 4 KiB-page
 // `IsRegionGpuModified` flags on shared `cueHeap` / `dcbHeap` pages.
 inline constexpr uint32_t kCopyFlagKnownCpuSource = 0x43505531u; // 'CPU1'
+// Tag used exclusively for `MtGuestCopyShadowCache` when `MapDynamicBuffer_B` maps a live staging
+// node on the immediate context whose CPU bytes are populated between `Map` and `GXWorker` launch.
+inline constexpr uint32_t kCopyFlagLiveStagingPtr = 0x4C495645u; // 'LIVE'
+
+struct ExecuteSecondaryArgs {
+    uint32_t worker_and_draws; // [0..7] = worker_id, [8..31] = recorded_draws
+    uint32_t occ_and_flags;    // [0..15] = occ_query_block_id (0xFFFF = none), [16..31] = reserved
+    uint64_t cmd_seq;
+};
+static_assert(sizeof(ExecuteSecondaryArgs) == 16, "ExecuteSecondaryArgs is 4 dwords");
 
 struct CopyRegion {
     uint64_t dst_va;
@@ -846,10 +864,23 @@ inline constexpr uint32_t MakeNopHeader(uint32_t body_dwords) noexcept {
     return 0xC0001000u | ((body_dwords - 1u) << 16);
 }
 
+inline bool IsImmediateGfxDcb(const void* dcb_raw) noexcept {
+    if (!dcb_raw) {
+        return false;
+    }
+    const auto* dcb_bytes = static_cast<const uint8_t*>(dcb_raw);
+    const auto* outer_ctx = *reinterpret_cast<const uint8_t* const*>(dcb_bytes + 0xB490);
+    return outer_ctx && (outer_ctx + 0x10 == dcb_bytes) &&
+           (*reinterpret_cast<const uint32_t*>(outer_ctx + 0xB510) == 0u);
+}
+
 // Emits batched GPU buffer copies directly to Vulkan::Rasterizer::DirectCopyBuffers (up to 32 regions per packet = 195 dwords).
 inline bool EmitCopyBufferBatch(void* dcb_raw, const CopyRegion* regions, uint32_t count) noexcept {
     if (!dcb_raw || !regions || count == 0u) {
         return true;
+    }
+    if (bb_direct_vk_mt_note_copy_batch && IsImmediateGfxDcb(dcb_raw)) {
+        bb_direct_vk_mt_note_copy_batch(regions, count);
     }
     constexpr uint32_t kMaxRegionsPerPacket = 32u;
     uint32_t offset = 0u;
@@ -902,6 +933,9 @@ inline bool EmitCopyBufferFromCpu(void* dcb_raw,
 inline bool EmitFillBuffer(void* dcb_raw, uint64_t dst_va, uint64_t byte_size, uint32_t fill_value) noexcept {
     if (!dcb_raw || !dst_va || byte_size == 0ULL) {
         return true;
+    }
+    if (bb_direct_vk_mt_invalidate_copy_shadow && IsImmediateGfxDcb(dcb_raw)) {
+        bb_direct_vk_mt_invalidate_copy_shadow(dst_va, byte_size);
     }
     constexpr uint64_t kMaxChunk = 0x10000000ULL;
     while (byte_size != 0ULL) {
@@ -2541,6 +2575,26 @@ inline int MtDirectVkMode() noexcept {
 
 inline bool MtDirectVkEnabled() noexcept {
     return MtDirectVkMode() > 0;
+}
+
+inline void NoteImmediateBufferShadow(uint64_t dst_va,
+                                      uint64_t src_va,
+                                      uint32_t byte_size,
+                                      uint32_t flags = kCopyFlagKnownCpuSource) noexcept {
+    if (!MtDirectVkEnabled() || !bb_direct_vk_mt_note_copy_batch || dst_va == 0ULL ||
+        src_va == 0ULL || byte_size == 0u) {
+        return;
+    }
+    const CopyRegion reg{dst_va, src_va, byte_size, flags};
+    bb_direct_vk_mt_note_copy_batch(&reg, 1u);
+}
+
+inline bool TryCompileMtCommandList(const void* ctx_base, void* cmd_list_impl) noexcept {
+    if (!MtDirectVkEnabled() || !bb_direct_vk_mt_try_compile_cmd_list || !ctx_base ||
+        !cmd_list_impl) {
+        return false;
+    }
+    return bb_direct_vk_mt_try_compile_cmd_list(ctx_base, cmd_list_impl) != 0;
 }
 
 } // namespace gx_direct_vk

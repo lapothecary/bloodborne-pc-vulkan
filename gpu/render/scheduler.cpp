@@ -255,6 +255,8 @@ void Scheduler::BeginRendering(const RenderState& state, u8 color_dont_care_mask
                                                                    : vk::AttachmentStoreOp::eStore;
     pass.stencil.clearValue = vk::ClearValue{.depthStencil = {.stencil = ds.clear_value[1]}};
     pass.info = {
+        .flags = state.secondary_contents ? vk::RenderingFlagBits::eContentsSecondaryCommandBuffers
+                                          : vk::RenderingFlags{},
         .renderArea = {{0, 0}, {state.width, state.height}},
         .layerCount = state.num_layers,
         .colorAttachmentCount = state.num_color_attachments,
@@ -267,7 +269,9 @@ void Scheduler::BeginRendering(const RenderState& state, u8 color_dont_care_mask
     } else {
         Record([pass](vk::CommandBuffer cmdbuf) mutable { pass.Begin(cmdbuf); });
     }
-    CarryResume(true);
+    if (!state.secondary_contents) {
+        CarryResume(true);
+    }
 }
 
 void Scheduler::EndRendering() {
@@ -288,7 +292,9 @@ void Scheduler::EndRendering() {
     if (trace) {
         pass_end_caller = __builtin_return_address(0);
     }
-    CarrySuspend(true);
+    if (!render_state.secondary_contents) {
+        CarrySuspend(true);
+    }
     is_rendering = false;
     Record([](vk::CommandBuffer cmdbuf) { cmdbuf.endRendering(); });
     CarryResume(false);
@@ -725,7 +731,9 @@ void Scheduler::EnterDirectMode() {
     if (own_segment && async_submit && current_segment + 2 < MaxSegments &&
         !BbToggle::Disabled(BbToggle::ThreadedRecording)) {
         if (is_rendering) {
-            CarrySuspend(true);
+            if (!render_state.secondary_contents) {
+                CarrySuspend(true);
+            }
             Record([](vk::CommandBuffer cmdbuf) { cmdbuf.endRendering(); });
             is_rendering = false;
             resume_rendering = true;
@@ -767,7 +775,9 @@ void Scheduler::EnterDirectMode() {
 
 void Scheduler::LeaveDirectSegment() {
     if (is_rendering) {
-        CarrySuspend(true);
+        if (!render_state.secondary_contents) {
+            CarrySuspend(true);
+        }
         current_cmdbuf.endRendering();
         is_rendering = false;
         resume_rendering = true;

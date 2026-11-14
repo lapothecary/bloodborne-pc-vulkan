@@ -290,8 +290,9 @@ inline std::array<std::atomic<std::uint64_t>, GpuCat_Count> hw_gpu_cat_ns{};
 inline std::array<std::atomic<std::uint64_t>, GpuSub_Count> hw_gpu_subcat_ns{};
 /// Active CPU execution nanoseconds of the game's Main thread (CLOCK_THREAD_CPUTIME_ID, excluding FPS cap sleep).
 inline std::atomic<std::uint64_t> main_cpu_busy_ns{0}, main_cpu_frames{0};
-/// Frames shown (Presenter::PrepareFrame), and bytes the background pre-upload put into the arena.
+/// Frames shown (Presenter::PrepareFrame), guest flip frames (PatchFlip), and bytes the background pre-upload put into the arena.
 inline std::atomic<std::uint32_t> frame_number{0};
+inline std::atomic<std::uint32_t> guest_frame_number{1};
 inline std::atomic<std::uint64_t> preupload_bytes{0};
 /// Device memory allocated (VMA blocks, arena residency) and freed, bytes.
 inline std::atomic<std::uint64_t> device_alloc_bytes{0}, device_free_bytes{0};

@@ -514,9 +514,93 @@ Rasterizer::BeginSignature Rasterizer::MakeBeginSignature(const GraphicsPipeline
     return sig;
 }
 
-RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
+bool Rasterizer::InspectMtPassTargets(const Gcn::Regs& regs, const GraphicsPipeline* first_pso,
+                                      MtPassTargetSummary& out) const noexcept {
+    out = {};
+    if (!first_pso || host_markers_enabled || guest_markers_enabled || FrameCapture::Active() ||
+        Breadcrumbs::Enabled() || DynCheck::Enabled()) {
+        return false;
+    }
+    if ((upscaler && (upscaler->Enabled() || upscaler->RasterScaling())) ||
+        (scene_targets && scene_targets->Reduced()) ||
+        (camera_motion && camera_motion->DebugOverlay()) ||
+        (occlusion && occlusion->Events() != 0u)) {
+        return false;
+    }
+    if (DrawPassOf(regs).pass != DrawPass::Draw || regs.color_control.degamma_enable ||
+        regs.depth_render_control.depth_clear_enable ||
+        regs.depth_render_control.stencil_clear_enable) {
+        return false;
+    }
+
+    const auto& key = first_pso->GetGraphicsKey();
+    if (key.motion_vectors != 0u || key.num_color_attachments > Gcn::NUM_COLOR_BUFFERS) {
+        return false;
+    }
+
+    // Ensure `PrepareRenderState`'s `want_depth` agrees with `GraphicsPipelineKey`'s depth/stencil
+    // formats so `VkCommandBufferInheritanceRenderingInfo` and `VkRenderingInfo` match 100%.
+    const bool has_bound_ds = regs.depth_buffer.DepthValid() || regs.depth_buffer.StencilValid();
+    const bool want_depth =
+        (regs.depth_control.depth_enable && regs.depth_buffer.DepthValid()) ||
+        (regs.depth_control.stencil_enable && regs.depth_buffer.StencilValid());
+    if (has_bound_ds != want_depth) {
+        return false;
+    }
+    if (has_bound_ds && regs.depth_buffer.DepthAddress() == 0 &&
+        regs.depth_buffer.StencilAddress() == 0) {
+        return false;
+    }
+
+    const bool color_disabled =
+        regs.color_control.mode == Gcn::ColorControl::OperationMode::Disable;
+    for (u32 cb = 0; cb < key.num_color_attachments; ++cb) {
+        if ((key.mrt_mask & (1u << cb)) == 0u) {
+            continue;
+        }
+        if (color_disabled || !regs.color_buffers[cb] ||
+            regs.color_target_mask.GetMask(cb) == 0u || regs.color_buffers[cb].Address() == 0) {
+            return false;
+        }
+        if (FrameCapture::IsDisplayBuffer(regs.color_buffers[cb].Address())) {
+            return false;
+        }
+    }
+
+    if (instance.IsMixedDepthSamplesSupported() && key.num_color_attachments > 0u) {
+        for (u32 cb = 0; cb < key.num_color_attachments; ++cb) {
+            if ((key.mrt_mask & (1u << cb)) != 0u && key.color_samples[cb] != key.depth_samples) {
+                return false;
+            }
+        }
+    }
+
+    const auto depth_format =
+        instance.GetSupportedFormat(GcnToVk::DepthFormat(key.z_format, key.stencil_format),
+                                    vk::FormatFeatureFlagBits2::eDepthStencilAttachment);
+    out.num_color_attachments = key.num_color_attachments;
+    for (u32 i = 0; i < key.num_color_attachments; ++i) {
+        const auto& color = key.color_buffers[i];
+        out.color_formats[i] = instance.GetSupportedFormat(
+            GcnToVk::SurfaceFormat(color.data_format, color.num_format),
+            vk::FormatFeatureFlagBits2::eColorAttachment);
+    }
+    out.depth_format =
+        key.z_format != Gcn::DepthBuffer::ZFormat::Invalid ? depth_format : vk::Format::eUndefined;
+    out.stencil_format = key.stencil_format != Gcn::DepthBuffer::StencilFormat::Invalid
+                             ? depth_format
+                             : vk::Format::eUndefined;
+    out.rasterization_samples = GcnToVk::NumSamples(
+        key.num_samples, instance.GetColorSampleCounts() & instance.GetDepthSampleCounts());
+    out.is_gbuffer = (std::popcount(key.mrt_mask) >= 5 && want_depth);
+    out.sampler_lod_bias = 0.0f;
+    return true;
+}
+
+RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline, bool secondary_contents) {
     BB_SECTION(BeginRendering);
     // bbport: RenderStateMemo (see BeginMemo).
+    const u8 want_sec = secondary_contents ? 1u : 0u;
     const bool memo_on = !BbToggle::Disabled(BbToggle::RenderStateMemo) && !FrameCapture::Active();
     static const bool verbose_stats = [] {
         const char* env = std::getenv("BB_VERBOSE_STATS");
@@ -546,7 +630,8 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         signature = MakeBeginSignature(pipeline);
         const auto& regs = Regs();
         const u64 cur_cmd_epoch = scheduler.DescriptorStateEpoch();
-        bool usable = begin_memo.valid && scheduler.IsRenderingWith(begin_memo.state) &&
+        bool usable = begin_memo.valid && begin_memo.state.secondary_contents == want_sec &&
+                      scheduler.IsRenderingWith(begin_memo.state) &&
                       !regs.depth_render_control.depth_clear_enable &&
                       !regs.depth_render_control.stencil_clear_enable &&
                       signature == begin_memo.signature;
@@ -575,6 +660,7 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
     }
     begin_memo.valid = false;
     RenderState state = BeginRenderingFull(pipeline);
+    state.secondary_contents = want_sec;
     if (memo_on && !attachment_feedback_loop) {
         const auto& regs = Regs();
         const bool reg_clear = regs.depth_render_control.depth_clear_enable ||

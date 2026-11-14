@@ -33,41 +33,59 @@ inline u64 SteadyNowNs() noexcept {
                                 std::chrono::steady_clock::now().time_since_epoch())
                                 .count());
 }
+} // namespace
 
-/// Block 10: Hardware Temporal Scene Occlusion Culler + Micro-Shadow Clutter Culler (Stage B).
-/// Tracks static/instanced opaque 6-MRT G-Buffer world meshes via non-precise hardware
-/// VkQueryPool(eOcclusion) queries and skips 100%-occluded draws (samples_passed == 0) before
-/// resource binding, descriptor set updates, vertex/index buffer emission, and vkCmdDrawIndexed.
+/// Block 10 + Phase 4.2: Hardware Temporal Scene Occlusion Culler (`Stage B` + `GXWorker:0..5`
+/// lock-free MT `VkQueryPool` blocks, `+0 B` `PT_TLS`).
 struct SceneOcclusionCuller {
     static constexpr u32 NumSlices = 8;
     static constexpr u32 SliceQueries = 512;
+    static constexpr u32 MtQueryBlocks = 64;
+    static constexpr u32 MtQueriesPerBlock = 256;
     static constexpr u32 TableBuckets = 1024;
     static constexpr u32 BucketWays = 4;
     static constexpr u32 TotalEntries = TableBuckets * BucketWays;
-    static constexpr u32 OccSlots = 2048;
 
     struct Entry {
-        u64 key = 0;
-        u32 last_seen_frame = 0;
-        u32 skip_until_frame = 0;
-        u16 zero_streak = 0;
-        bool probe_in_flight = false;
-        bool multi_occ = false;
+        std::atomic<u64> key{0};
+        std::atomic<u32> last_seen_frame{0};
+        std::atomic<u32> skip_until_frame{0};
+        std::atomic<u16> zero_streak{0};
+        std::atomic<u8> probe_in_flight{0};
+        std::atomic<u8> multi_occ{0};
+    };
+
+    enum class MtBlockState : u8 {
+        Free = 0,
+        Recording = 1,
+        ReadyToExecute = 2,
+        Submitted = 3,
+    };
+
+    struct MtQueryBlock {
+        std::atomic<u8> state{static_cast<u8>(MtBlockState::Free)};
+        u32 used{0};
+        u32 frame_tag{0};
+        u64 submit_tick{0};
+        std::array<u16, MtQueriesPerBlock> entry_idx{};
     };
 
     vk::UniqueQueryPool pool;
+    vk::UniqueQueryPool mt_pool;
     bool initialized = false;
     bool enabled = true;
     bool micro_shadow_cull = true;
-    u32 cur_frame = 1;
+    std::atomic<u32> cur_frame{1};
     u32 cur_slice = 0;
     u32 gbuf_draws_in_frame = 0;
-    VAddr last_shadow_cb_addr = 0;
-    VAddr last_shadow_db_addr = 0;
-    u32 shadow_face_draw_idx = 0;
-    bool camera_moving = false;
-    bool fast_camera_turn = false;
-    bool cam_updated_in_frame = false;
+    std::atomic<u32> mt_gbuf_frame{0};
+    std::atomic<u32> mt_gbuf_draws_in_frame{0};
+    std::atomic<u32> mt_block_hint{0};
+    u32 mt_last_collect_frame = 0;
+    std::atomic<bool> camera_moving{false};
+    std::atomic<bool> fast_camera_turn{false};
+    std::atomic<u32> cam_updated_frame{0};
+    std::mutex cam_mutex;
     bool has_prev_cam = false;
     std::array<float, 3> prev_cam_pos{};
     std::array<float, 3> prev_cam_fwd{};
@@ -77,14 +95,15 @@ struct SceneOcclusionCuller {
     std::array<bool, NumSlices> slice_sealed{};
     std::array<std::array<u16, SliceQueries>, NumSlices> slice_entry_idx{};
 
+    std::array<MtQueryBlock, MtQueryBlocks> mt_blocks{};
     std::array<Entry, TotalEntries> entries{};
 
-    u64 stat_gbuf_candidates = 0;
-    u64 stat_gbuf_skipped = 0;
-    u64 stat_gbuf_probed = 0;
-    u64 stat_shadow_skipped = 0;
-    u64 stat_light_candidates = 0;
-    u64 stat_light_skipped = 0;
+    std::atomic<u64> stat_gbuf_candidates{0};
+    std::atomic<u64> stat_gbuf_skipped{0};
+    std::atomic<u64> stat_gbuf_probed{0};
+    std::atomic<u64> stat_shadow_skipped{0};
+    std::atomic<u64> stat_light_candidates{0};
+    std::atomic<u64> stat_light_skipped{0};
 
     void EnsureInit(const Instance& instance) {
         if (initialized) {
@@ -111,6 +130,54 @@ struct SceneOcclusionCuller {
             device.resetQueryPool(*pool, 0, NumSlices * SliceQueries);
         } else {
             enabled = false;
+            return;
+        }
+        const vk::QueryPoolCreateInfo mt_info{
+            .queryType = vk::QueryType::eOcclusion,
+            .queryCount = MtQueryBlocks * MtQueriesPerBlock,
+        };
+        auto mt_res = device.createQueryPoolUnique(mt_info);
+        if (mt_res.result == vk::Result::eSuccess) {
+            mt_pool = std::move(mt_res.value);
+            device.resetQueryPool(*mt_pool, 0, MtQueryBlocks * MtQueriesPerBlock);
+        }
+    }
+
+    [[nodiscard]] u32 ActiveFrameTag() const noexcept {
+        return std::max(cur_frame.load(std::memory_order_relaxed),
+                        BbStats::guest_frame_number.load(std::memory_order_relaxed));
+    }
+
+    void ApplyQuerySamplesToEntries(const u16* idx_arr, const u64* samples, u32 count,
+                                    u32 ref_frame) noexcept {
+        const bool fast_turn = fast_camera_turn.load(std::memory_order_relaxed);
+        const bool cam_mov = camera_moving.load(std::memory_order_relaxed);
+        for (u32 i = 0; i < count; ++i) {
+            const u16 idx = idx_arr[i];
+            Entry& e = entries[idx];
+            if (e.multi_occ.load(std::memory_order_relaxed) != 0u) {
+                e.zero_streak.store(0, std::memory_order_relaxed);
+                e.skip_until_frame.store(0, std::memory_order_relaxed);
+            } else if (samples[i] == 0) {
+                u16 zs = e.zero_streak.load(std::memory_order_relaxed);
+                if (zs < 32u) {
+                    ++zs;
+                    e.zero_streak.store(zs, std::memory_order_relaxed);
+                }
+                if (zs >= 3u && !fast_turn) {
+                    const u32 stagger = static_cast<u32>(idx & 1u);
+                    const u32 skip_len =
+                        cam_mov ? (zs >= 6u ? (2u + stagger) : (1u + stagger))
+                                : (zs >= 8u   ? (6u + static_cast<u32>(idx & 3u))
+                                   : zs >= 5u ? (4u + stagger)
+                                              : (2u + stagger));
+                    e.skip_until_frame.store(ref_frame + skip_len, std::memory_order_relaxed);
+                }
+            } else {
+                e.zero_streak.store(0, std::memory_order_relaxed);
+                e.skip_until_frame.store(0, std::memory_order_relaxed);
+            }
+            e.probe_in_flight.store(0u, std::memory_order_release);
         }
     }
 
@@ -130,6 +197,7 @@ struct SceneOcclusionCuller {
         if (!pool) {
             return;
         }
+        const u32 ref_frame = ActiveFrameTag();
         std::array<u64, SliceQueries> samples{};
         for (u32 s = 0; s < NumSlices; ++s) {
             if (!slice_sealed[s] || !scheduler.IsFree(slice_last_tick[s])) {
@@ -141,35 +209,12 @@ struct SceneOcclusionCuller {
                     *pool, s * SliceQueries, count, count * sizeof(u64), samples.data(),
                     sizeof(u64), vk::QueryResultFlagBits::e64);
                 if (res == vk::Result::eSuccess) {
-                    for (u32 i = 0; i < count; ++i) {
-                        const u16 idx = slice_entry_idx[s][i];
-                        Entry& e = entries[idx];
-                        e.probe_in_flight = false;
-                        if (e.multi_occ) {
-                            e.zero_streak = 0;
-                            e.skip_until_frame = 0;
-                        } else if (samples[i] == 0) {
-                            if (e.zero_streak < 32) {
-                                ++e.zero_streak;
-                            }
-                            if (e.zero_streak >= 3 && !fast_camera_turn) {
-                                const u32 stagger = static_cast<u32>(idx & 1u);
-                                const u32 skip_len =
-                                    camera_moving
-                                        ? (e.zero_streak >= 6 ? (2u + stagger) : (1u + stagger))
-                                        : (e.zero_streak >= 8   ? (6u + static_cast<u32>(idx & 3u))
-                                           : e.zero_streak >= 5 ? (4u + stagger)
-                                                                : (2u + stagger));
-                                e.skip_until_frame = cur_frame + skip_len;
-                            }
-                        } else {
-                            e.zero_streak = 0;
-                            e.skip_until_frame = 0;
-                        }
-                    }
+                    ApplyQuerySamplesToEntries(slice_entry_idx[s].data(), samples.data(), count,
+                                               ref_frame);
                 } else {
                     for (u32 i = 0; i < count; ++i) {
-                        entries[slice_entry_idx[s][i]].probe_in_flight = false;
+                        entries[slice_entry_idx[s][i]].probe_in_flight.store(
+                            0u, std::memory_order_release);
                     }
                 }
                 device.resetQueryPool(*pool, s * SliceQueries, count);
@@ -177,23 +222,62 @@ struct SceneOcclusionCuller {
             slice_used[s] = 0;
             slice_sealed[s] = false;
         }
+
+        if (!mt_pool) {
+            return;
+        }
+        for (u32 b = 0; b < MtQueryBlocks; ++b) {
+            auto& blk = mt_blocks[b];
+            if (blk.state.load(std::memory_order_acquire) !=
+                static_cast<u8>(MtBlockState::Submitted)) {
+                continue;
+            }
+            if (!scheduler.IsFree(blk.submit_tick)) {
+                continue;
+            }
+            const u32 count = blk.used;
+            if (count > 0) {
+                const auto res = device.getQueryPoolResults(
+                    *mt_pool, b * MtQueriesPerBlock, count, count * sizeof(u64), samples.data(),
+                    sizeof(u64), vk::QueryResultFlagBits::e64);
+                const u32 blk_ref = std::max(ref_frame, blk.frame_tag);
+                if (res == vk::Result::eSuccess) {
+                    ApplyQuerySamplesToEntries(blk.entry_idx.data(), samples.data(), count,
+                                               blk_ref);
+                } else {
+                    for (u32 i = 0; i < count; ++i) {
+                        entries[blk.entry_idx[i]].probe_in_flight.store(0u,
+                                                                        std::memory_order_release);
+                    }
+                }
+                device.resetQueryPool(*mt_pool, b * MtQueriesPerBlock, count);
+            }
+            blk.used = 0;
+            blk.submit_tick = 0;
+            blk.state.store(static_cast<u8>(MtBlockState::Free), std::memory_order_release);
+        }
     }
 
-    void UpdateCameraFromSceneConstants(const float* data) noexcept {
-        if (cam_updated_in_frame || !data) {
+    void UpdateCameraFromSceneConstants(const float* data, u32 frame_tag) noexcept {
+        if (!data || cam_updated_frame.load(std::memory_order_acquire) == frame_tag) {
             return;
         }
         if (data[0] != 3000.0f || data[4] < 64.0f || data[5] < 64.0f ||
             std::abs(data[1] * data[0] - 1.0f) > 1e-3f) {
             return;
         }
-        cam_updated_in_frame = true;
         const float pos[3] = {data[183], data[187], data[191]};
         const float fwd[3] = {data[182], data[186], data[190]};
         if (!std::isfinite(pos[0]) || !std::isfinite(pos[1]) || !std::isfinite(pos[2]) ||
             !std::isfinite(fwd[0]) || !std::isfinite(fwd[1]) || !std::isfinite(fwd[2])) {
             return;
         }
+        std::scoped_lock lk{cam_mutex};
+        if (cam_updated_frame.load(std::memory_order_relaxed) == frame_tag) {
+            return;
+        }
+        bool mov = false;
+        bool fast_turn = false;
         if (has_prev_cam) {
             const float cos_ang =
                 fwd[0] * prev_cam_fwd[0] + fwd[1] * prev_cam_fwd[1] + fwd[2] * prev_cam_fwd[2];
@@ -202,77 +286,91 @@ struct SceneOcclusionCuller {
             const float dz = pos[2] - prev_cam_pos[2];
             const float dist_sq = dx * dx + dy * dy + dz * dz;
             if (cos_ang < 0.9990f || dist_sq > 0.0100f) {
-                fast_camera_turn = true;
-                camera_moving = true;
+                fast_turn = true;
+                mov = true;
                 for (auto& e : entries) {
-                    e.skip_until_frame = 0;
-                    if (e.zero_streak > 2) {
-                        e.zero_streak = 2;
+                    e.skip_until_frame.store(0, std::memory_order_relaxed);
+                    if (e.zero_streak.load(std::memory_order_relaxed) > 2u) {
+                        e.zero_streak.store(2u, std::memory_order_relaxed);
                     }
                 }
             } else if (cos_ang < 0.99995f || dist_sq > 0.0002f) {
-                camera_moving = true;
+                mov = true;
             }
         }
         prev_cam_pos = {pos[0], pos[1], pos[2]};
         prev_cam_fwd = {fwd[0], fwd[1], fwd[2]};
         has_prev_cam = true;
+        camera_moving.store(mov, std::memory_order_relaxed);
+        fast_camera_turn.store(fast_turn, std::memory_order_relaxed);
+        cam_updated_frame.store(frame_tag, std::memory_order_release);
     }
 
     void OnFrameStart(const Instance& instance, Scheduler& scheduler,
                       const CameraMotion* /*cam*/) noexcept {
         EnsureInit(instance);
         gbuf_draws_in_frame = 0;
-        last_shadow_cb_addr = 0;
-        last_shadow_db_addr = 0;
-        shadow_face_draw_idx = 0;
-        cam_updated_in_frame = false;
-        camera_moving = false;
-        fast_camera_turn = false;
         if (!pool) {
             return;
         }
         SealCurrentSlice(scheduler.CurrentTick());
-        ++cur_frame;
+        const u32 gf = BbStats::guest_frame_number.load(std::memory_order_relaxed);
+        const u32 next_f = std::max(cur_frame.load(std::memory_order_relaxed) + 1u, gf);
+        cur_frame.store(next_f, std::memory_order_relaxed);
+        if (cam_updated_frame.load(std::memory_order_relaxed) != next_f) {
+            camera_moving.store(false, std::memory_order_relaxed);
+            fast_camera_turn.store(false, std::memory_order_relaxed);
+        }
 
         CollectRetiredSlices(instance.GetDevice(), scheduler);
 
-        if ((cur_frame % 600) == 0 &&
-            (stat_gbuf_candidates > 0 || stat_shadow_skipped > 0 || stat_light_candidates > 0)) {
-            std::printf("[BB-CULL] 600f: GBuf occluded skipped %llu/%llu (%.1f%%, probed %llu), "
-                        "Lights skipped %llu/%llu, MicroShadow skipped %llu\n",
-                        static_cast<unsigned long long>(stat_gbuf_skipped),
-                        static_cast<unsigned long long>(stat_gbuf_candidates),
-                        stat_gbuf_candidates
-                            ? (100.0 * double(stat_gbuf_skipped) / double(stat_gbuf_candidates))
-                            : 0.0,
-                        static_cast<unsigned long long>(stat_gbuf_probed),
-                        static_cast<unsigned long long>(stat_light_skipped),
-                        static_cast<unsigned long long>(stat_light_candidates),
-                        static_cast<unsigned long long>(stat_shadow_skipped));
-            stat_gbuf_candidates = 0;
-            stat_gbuf_skipped = 0;
-            stat_gbuf_probed = 0;
-            stat_light_candidates = 0;
-            stat_light_skipped = 0;
-            stat_shadow_skipped = 0;
+        if ((next_f % 600u) == 0u) {
+            const u64 cand = stat_gbuf_candidates.exchange(0, std::memory_order_relaxed);
+            const u64 skip = stat_gbuf_skipped.exchange(0, std::memory_order_relaxed);
+            const u64 prob = stat_gbuf_probed.exchange(0, std::memory_order_relaxed);
+            const u64 sh_skip = stat_shadow_skipped.exchange(0, std::memory_order_relaxed);
+            const u64 lt_cand = stat_light_candidates.exchange(0, std::memory_order_relaxed);
+            const u64 lt_skip = stat_light_skipped.exchange(0, std::memory_order_relaxed);
+            if (cand > 0 || sh_skip > 0 || lt_cand > 0) {
+                std::printf(
+                    "[BB-CULL] 600f: GBuf occluded skipped %llu/%llu (%.1f%%, probed %llu), "
+                    "Lights skipped %llu/%llu, MicroShadow skipped %llu\n",
+                    static_cast<unsigned long long>(skip), static_cast<unsigned long long>(cand),
+                    cand ? (100.0 * double(skip) / double(cand)) : 0.0,
+                    static_cast<unsigned long long>(prob), static_cast<unsigned long long>(lt_skip),
+                    static_cast<unsigned long long>(lt_cand),
+                    static_cast<unsigned long long>(sh_skip));
+            }
         }
     }
 
-    u16 FindOrInsertEntry(u64 key) noexcept {
+    u16 FindOrInsertEntry(u64 key, u32 frame_tag) noexcept {
         const u32 bucket = static_cast<u32>((key ^ (key >> 33)) & (TableBuckets - 1));
         const u16 base = static_cast<u16>(bucket * BucketWays);
         for (u16 w = 0; w < BucketWays; ++w) {
-            if (entries[base + w].key == key) {
+            if (entries[base + w].key.load(std::memory_order_relaxed) == key) {
                 return base + w;
             }
         }
         for (u16 w = 0; w < BucketWays; ++w) {
-            if (!entries[base + w].probe_in_flight &&
-                (entries[base + w].key == 0 ||
-                 entries[base + w].last_seen_frame + 4 < cur_frame)) {
-                entries[base + w] = Entry{.key = key, .last_seen_frame = 0};
-                return base + w;
+            Entry& cand = entries[base + w];
+            if (cand.probe_in_flight.load(std::memory_order_acquire) != 0u) {
+                continue;
+            }
+            u64 old_key = cand.key.load(std::memory_order_relaxed);
+            const u32 old_seen = cand.last_seen_frame.load(std::memory_order_relaxed);
+            if (old_key == 0 || old_seen + 4u < frame_tag) {
+                if (cand.key.compare_exchange_strong(old_key, key, std::memory_order_acq_rel,
+                                                     std::memory_order_relaxed)) {
+                    cand.last_seen_frame.store(0, std::memory_order_relaxed);
+                    cand.skip_until_frame.store(0, std::memory_order_relaxed);
+                    cand.zero_streak.store(0, std::memory_order_relaxed);
+                    cand.multi_occ.store(0, std::memory_order_relaxed);
+                    return base + w;
+                }
+                if (old_key == key) {
+                    return base + w;
+                }
             }
         }
         return 0xFFFFu;
@@ -283,23 +381,92 @@ struct SceneOcclusionCuller {
         if (slice_sealed[s] || slice_used[s] >= SliceQueries) {
             return -1;
         }
+        u8 expected = 0u;
+        if (!entries[entry_idx].probe_in_flight.compare_exchange_strong(
+                expected, 1u, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+            return -1;
+        }
         const u32 q = slice_used[s]++;
         slice_entry_idx[s][q] = entry_idx;
-        entries[entry_idx].probe_in_flight = true;
-        ++stat_gbuf_probed;
+        stat_gbuf_probed.fetch_add(1, std::memory_order_relaxed);
         return static_cast<s32>(s * SliceQueries + q);
     }
-};
 
-thread_local std::unique_ptr<SceneOcclusionCuller> tls_scene_culler_ptr;
-
-inline SceneOcclusionCuller& GetSceneCuller() {
-    if (!tls_scene_culler_ptr) [[unlikely]] {
-        tls_scene_culler_ptr = std::make_unique<SceneOcclusionCuller>();
+    [[nodiscard]] u16 AcquireMtQueryBlock(u32 frame_tag) noexcept {
+        if (!enabled || !mt_pool) {
+            return 0xFFFFu;
+        }
+        const u32 start = mt_block_hint.fetch_add(1u, std::memory_order_relaxed);
+        for (u32 i = 0; i < MtQueryBlocks; ++i) {
+            const u16 b = static_cast<u16>((start + i) & (MtQueryBlocks - 1u));
+            u8 exp = static_cast<u8>(MtBlockState::Free);
+            if (mt_blocks[b].state.compare_exchange_strong(
+                    exp, static_cast<u8>(MtBlockState::Recording), std::memory_order_acq_rel,
+                    std::memory_order_relaxed)) {
+                mt_blocks[b].used = 0;
+                mt_blocks[b].frame_tag = frame_tag;
+                mt_blocks[b].submit_tick = 0;
+                return b;
+            }
+        }
+        return 0xFFFFu;
     }
-    return *tls_scene_culler_ptr;
-}
-} // namespace
+
+    [[nodiscard]] s32 AllocateMtQuery(u16 block_id, u16 entry_idx) noexcept {
+        if (block_id >= MtQueryBlocks || !mt_pool) {
+            return -1;
+        }
+        auto& blk = mt_blocks[block_id];
+        if (blk.used >= MtQueriesPerBlock) {
+            return -1;
+        }
+        u8 expected = 0u;
+        if (!entries[entry_idx].probe_in_flight.compare_exchange_strong(
+                expected, 1u, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+            return -1;
+        }
+        const u32 q = blk.used++;
+        blk.entry_idx[q] = entry_idx;
+        return static_cast<s32>(u32(block_id) * MtQueriesPerBlock + q);
+    }
+
+    void SealMtQueryBlockOnWorkerEnd(u16& io_block_id) noexcept {
+        if (io_block_id >= MtQueryBlocks) {
+            io_block_id = 0xFFFFu;
+            return;
+        }
+        auto& blk = mt_blocks[io_block_id];
+        if (blk.used == 0u) {
+            blk.state.store(static_cast<u8>(MtBlockState::Free), std::memory_order_release);
+            io_block_id = 0xFFFFu;
+        } else {
+            blk.state.store(static_cast<u8>(MtBlockState::ReadyToExecute),
+                            std::memory_order_release);
+        }
+    }
+
+    void AbortMtQueryBlock(u16 block_id) noexcept {
+        if (block_id >= MtQueryBlocks) {
+            return;
+        }
+        auto& blk = mt_blocks[block_id];
+        for (u32 i = 0; i < blk.used; ++i) {
+            entries[blk.entry_idx[i]].probe_in_flight.store(0u, std::memory_order_release);
+        }
+        blk.used = 0;
+        blk.submit_tick = 0;
+        blk.state.store(static_cast<u8>(MtBlockState::Free), std::memory_order_release);
+    }
+
+    void NoteMtQueryBlockExecuted(u16 block_id, u64 submit_tick) noexcept {
+        if (block_id >= MtQueryBlocks) {
+            return;
+        }
+        auto& blk = mt_blocks[block_id];
+        blk.submit_tick = submit_tick;
+        blk.state.store(static_cast<u8>(MtBlockState::Submitted), std::memory_order_release);
+    }
+};
 
 Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime& runtime_,
                        BbCp::CommandProcessor* liverpool_)
@@ -354,8 +521,10 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     VideoCore::DirectBuffers::SetActiveCaches(&buffer_cache, &texture_cache);
 
     GpuProfiler::Init(instance, scheduler);
+    scene_occlusion_culler = std::make_unique<SceneOcclusionCuller>();
     if (!EmulatorSettings.IsNullGPU()) {
         object_vel_culler = std::make_unique<ObjectVelocityCuller>();
+        scene_occlusion_culler->EnsureInit(instance);
     }
     if (DrawPipeWanted()) {
         constant_ring = std::make_unique<ConstantRing>(instance, scheduler);
@@ -578,7 +747,438 @@ std::pair<u32, u32> GetDrawOffsets(
     }
     return {vertex_offset, instance_offset};
 }
+
+std::pair<u32, u32> GetDrawOffsetsFromFlatUd(
+    const Gcn::Regs& regs, const u32* vs_flat_ud,
+    const std::optional<const Shader::Gcn::FetchShaderData>& fetch_shader) noexcept {
+    u32 vertex_offset = regs.index_offset;
+    u32 instance_offset = 0;
+    if (fetch_shader && vs_flat_ud) {
+        if (vertex_offset == 0 && fetch_shader->vertex_offset_sgpr != -1) {
+            vertex_offset = vs_flat_ud[fetch_shader->vertex_offset_sgpr];
+        }
+        if (fetch_shader->instance_offset_sgpr != -1) {
+            instance_offset = vs_flat_ud[fetch_shader->instance_offset_sgpr];
+        }
+    }
+    return {vertex_offset, instance_offset};
+}
 } // namespace
+
+bool Rasterizer::TryCullMicroShadowDrawMt(const Gcn::Regs& regs, const GraphicsPipeline* pipeline,
+                                          bool is_indexed, MtShadowCullState& state,
+                                          u64* out_skipped) noexcept {
+    static const bool enabled = [] {
+        const char* e = std::getenv("BB_MICRO_SHADOW_CULL");
+        return !e || e[0] != '0';
+    }();
+    if (!enabled || !is_indexed || !pipeline) {
+        return false;
+    }
+    const auto& vs_stage = pipeline->GetStage(Shader::SwStage::Vertex);
+    if (vs_stage.pgm_hash != 0x167daba6ull) {
+        return false;
+    }
+    const float vp_w = std::abs(regs.viewports[0].xscale) * 2.0f;
+    const float vp_h = std::abs(regs.viewports[0].yscale) * 2.0f;
+    const s32 sc_w =
+        s32(regs.screen_scissor.bottom_right_x) - s32(regs.screen_scissor.top_left_x);
+    const s32 sc_h =
+        s32(regs.screen_scissor.bottom_right_y) - s32(regs.screen_scissor.top_left_y);
+    const bool is_32 = (vp_w > 0.0f && vp_w <= 33.0f && vp_h > 0.0f && vp_h <= 33.0f) ||
+                       (sc_w > 0 && sc_w <= 32 && sc_h > 0 && sc_h <= 32);
+    const bool is_64 = !is_32 &&
+                       ((vp_w > 0.0f && vp_w <= 65.0f && vp_h > 0.0f && vp_h <= 65.0f) ||
+                        (sc_w > 0 && sc_w <= 64 && sc_h > 0 && sc_h <= 64));
+    if (!is_32 && !is_64) {
+        return false;
+    }
+    const VAddr cb_addr =
+        regs.color_buffers[0]
+            ? (regs.color_buffers[0].Address() ^
+               (u64(regs.color_buffers[0].view.slice_start) << 40))
+            : 0;
+    const VAddr db_addr = regs.depth_buffer.DepthAddress();
+    if (regs.depth_render_control.depth_clear_enable || cb_addr != state.cb_addr ||
+        db_addr != state.db_addr) {
+        state.cb_addr = cb_addr;
+        state.db_addr = db_addr;
+        state.face_draw_idx = 0;
+        return false;
+    }
+    ++state.face_draw_idx;
+    if ((is_32 && state.face_draw_idx >= 1u) || (is_64 && state.face_draw_idx >= 2u)) {
+        if (out_skipped) {
+            ++(*out_skipped);
+        }
+        return true;
+    }
+    return false;
+}
+
+u16 Rasterizer::AcquireMtOcclusionQueryBlock(u32 frame_tag) noexcept {
+    if (!scene_occlusion_culler) {
+        return 0xFFFFu;
+    }
+    const u32 eff_tag =
+        std::max(frame_tag, scene_occlusion_culler->cur_frame.load(std::memory_order_relaxed));
+    return scene_occlusion_culler->AcquireMtQueryBlock(eff_tag);
+}
+
+void Rasterizer::SealMtOcclusionQueryBlock(u16& io_block_id) noexcept {
+    if (scene_occlusion_culler) {
+        scene_occlusion_culler->SealMtQueryBlockOnWorkerEnd(io_block_id);
+    } else {
+        io_block_id = 0xFFFFu;
+    }
+}
+
+void Rasterizer::AbortMtOcclusionQueryBlock(u16 block_id) noexcept {
+    if (scene_occlusion_culler) {
+        scene_occlusion_culler->AbortMtQueryBlock(block_id);
+    }
+}
+
+void Rasterizer::NoteMtOcclusionQueryBlockExecuted(u16 block_id, u64 submit_tick) noexcept {
+    if (scene_occlusion_culler) {
+        scene_occlusion_culler->NoteMtQueryBlockExecuted(block_id, submit_tick);
+    }
+}
+
+void Rasterizer::FlushWorkerCullerStats(u64 occ_cand, u64 occ_skip, u64 occ_probe,
+                                        u64 shadow_skip, u64 vel_seen, u64 vel_culled) noexcept {
+    if (scene_occlusion_culler) {
+        if (occ_cand != 0) {
+            scene_occlusion_culler->stat_gbuf_candidates.fetch_add(occ_cand,
+                                                                   std::memory_order_relaxed);
+        }
+        if (occ_skip != 0) {
+            scene_occlusion_culler->stat_gbuf_skipped.fetch_add(occ_skip,
+                                                                std::memory_order_relaxed);
+        }
+        if (occ_probe != 0) {
+            scene_occlusion_culler->stat_gbuf_probed.fetch_add(occ_probe,
+                                                               std::memory_order_relaxed);
+        }
+        if (shadow_skip != 0) {
+            scene_occlusion_culler->stat_shadow_skipped.fetch_add(shadow_skip,
+                                                                  std::memory_order_relaxed);
+        }
+    }
+    if (object_vel_culler && (vel_seen != 0 || vel_culled != 0)) {
+        object_vel_culler->FlushWorkerStats(vel_seen, vel_culled);
+    }
+}
+
+Rasterizer::MtOcclusionDecision Rasterizer::EvaluateGBufferOcclusionMt(
+    const Gcn::Regs& regs, const GraphicsPipeline* pipeline, const u32* vs_flat_ud,
+    VAddr vs_pgm_base, bool is_indexed, u32 index_offset, std::span<const Gcn::Buffer> vsharps,
+    u16 mt_query_block_id, MtResolveCbBytesFn resolve_cb, void* resolve_ctx, u64* out_candidates,
+    u64* out_skipped, u64* out_probed) noexcept {
+    MtOcclusionDecision decision{};
+    if (!scene_occlusion_culler || !pipeline || !vs_flat_ud || !resolve_cb) {
+        return decision;
+    }
+    auto& culler = *scene_occlusion_culler;
+    if (!culler.enabled || !culler.mt_pool || !is_indexed ||
+        pipeline->GetGraphicsKey().mrt_mask != 0x3fu || regs.blend_control[0].enable ||
+        !regs.depth_control.depth_enable || !regs.depth_control.depth_write_enable ||
+        regs.depth_render_control.depth_clear_enable ||
+        regs.depth_render_control.stencil_clear_enable || regs.num_indices < 36u ||
+        (occlusion && occlusion->Events() != 0u)) {
+        return decision;
+    }
+
+    const u32 frame_tag = culler.ActiveFrameTag();
+    u32 prev_gf = culler.mt_gbuf_frame.load(std::memory_order_relaxed);
+    if (prev_gf != frame_tag &&
+        culler.mt_gbuf_frame.compare_exchange_strong(prev_gf, frame_tag, std::memory_order_acq_rel,
+                                                     std::memory_order_relaxed)) {
+        culler.mt_gbuf_draws_in_frame.store(0u, std::memory_order_relaxed);
+    }
+    const u32 gbuf_ord =
+        culler.mt_gbuf_draws_in_frame.fetch_add(1u, std::memory_order_relaxed) + 1u;
+
+    VAddr cue_base = 0;
+    VAddr cue_end = 0;
+    VideoCore::DirectBuffers::GetTransientCueHeapBounds(cue_base, cue_end);
+    bool has_transient_vb = false;
+    u64 vtx_buf_hash = 0;
+    for (const auto& vb : vsharps) {
+        if (vb.base_address >= cue_base && vb.base_address < cue_end) {
+            has_transient_vb = true;
+            break;
+        }
+        vtx_buf_hash ^=
+            (vb.base_address * 0x9E3779B97F4A7C15ull) ^ (vb.GetSize() * 0xBF58476D1CE4E5B9ull);
+    }
+    if (has_transient_vb) {
+        return decision;
+    }
+
+    const auto& vs_stage = pipeline->GetStage(Shader::SwStage::Vertex);
+    const auto* ps_stage = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+    const u64 vs_hash = vs_stage.pgm_hash;
+    const bool is_inst_gbuf_vs = (vs_hash == 0x6a833138ull || vs_hash == 0xecbef4c7ull);
+    bool is_skeleton = false;
+    bool has_model_cb = false;
+    u32 model_base_matrix_idx = 0;
+    const u8* inst_cb_ptr = nullptr;
+    u32 inst_cb_size = 0;
+    const u8* palette_ptr = nullptr;
+    u32 palette_size = 0;
+
+    for (u32 b_idx = 0; b_idx < vs_stage.buffers.size(); ++b_idx) {
+        const auto& res = vs_stage.buffers[b_idx];
+        if (res.IsSpecial()) {
+            continue;
+        }
+        const Gcn::Buffer sharp = res.GetSharpDirect(vs_flat_ud, vs_pgm_base);
+        if (!sharp.Valid() || sharp.GetStride() != 16u) {
+            continue;
+        }
+        const u32 req_sz = sharp.GetSize();
+        if (req_sz != 864u && req_sz != 416u &&
+            !(is_inst_gbuf_vs && req_sz >= 208u && req_sz <= 32768u && (req_sz % 208u) == 0u) &&
+            !(req_sz >= 48u && req_sz <= 16384u && (req_sz % 48u) == 0u)) {
+            continue;
+        }
+        const u8* cb_ptr = nullptr;
+        u32 cb_size = 0;
+        if (!resolve_cb(resolve_ctx, sharp, cb_ptr, cb_size) || !cb_ptr) {
+            continue;
+        }
+        if (req_sz == 864u && cb_size >= 864u) {
+            culler.UpdateCameraFromSceneConstants(reinterpret_cast<const float*>(cb_ptr),
+                                                  frame_tag);
+        } else if (req_sz == 416u && !is_inst_gbuf_vs && cb_size >= 84u) {
+            std::memcpy(&model_base_matrix_idx, cb_ptr + 80u, sizeof(u32));
+            has_model_cb = true;
+        } else if (is_inst_gbuf_vs && req_sz >= 208u && req_sz <= 32768u &&
+                   (req_sz % 208u) == 0u && !inst_cb_ptr && cb_size >= 84u) {
+            inst_cb_ptr = cb_ptr;
+            inst_cb_size = std::min<u32>(cb_size, req_sz);
+            std::memcpy(&model_base_matrix_idx, cb_ptr + 80u, sizeof(u32));
+            has_model_cb = true;
+        } else if (req_sz >= 48u && req_sz <= 16384u && (req_sz % 48u) == 0u && !palette_ptr &&
+                   cb_size >= 48u) {
+            palette_ptr = cb_ptr;
+            palette_size = std::min<u32>(cb_size, req_sz);
+        }
+    }
+
+    if ((!has_model_cb && palette_size >= 640u) ||
+        (has_model_cb && !is_inst_gbuf_vs && model_base_matrix_idx == 0u && palette_size >= 640u)) {
+        is_skeleton = true;
+    }
+    if (is_skeleton || !palette_ptr || palette_size < 48u) {
+        return decision;
+    }
+
+    if (out_candidates) {
+        ++(*out_candidates);
+    }
+    const u32 mat_byte_off =
+        (has_model_cb && u64(model_base_matrix_idx) * 48ull + 48ull <= u64(palette_size))
+            ? (model_base_matrix_idx * 48u)
+            : 0u;
+    const u32 hash_bytes =
+        std::min<u32>(palette_size - mat_byte_off, is_inst_gbuf_vs ? 384u : 192u);
+    u64 world_palette_hash = XXH3_64bits_withSeed(
+        palette_ptr + mat_byte_off, hash_bytes,
+        (u64(model_base_matrix_idx) * 0x9E3779B97F4A7C15ull) ^ u64(palette_size));
+    if (inst_cb_ptr && inst_cb_size > 0u) {
+        world_palette_hash ^= XXH3_64bits_withSeed(
+            inst_cb_ptr, std::min<u32>(inst_cb_size, 1040u), 0xD6E8FEB86659FD93ull);
+    }
+
+    const u32 index_size =
+        regs.index_buffer_type.index_type == Gcn::IndexType::Index16 ? 2u : 4u;
+    const VAddr index_address =
+        regs.index_base_address.Address<VAddr>() + u64(index_offset) * index_size;
+    const auto [vtx_off, inst_off] =
+        GetDrawOffsetsFromFlatUd(regs, vs_flat_ud, pipeline->GetFetchShader());
+    const u64 ps_hash = ps_stage ? ps_stage->pgm_hash : 0ull;
+    const u32 num_indices = regs.num_indices;
+    const u32 num_instances = regs.num_instances.NumInstances();
+    const u64 off_mix =
+        (u64(vtx_off) * 0x9E3779B97F4A7C15ull) ^ (u64(inst_off) * 0xBF58476D1CE4E5B9ull);
+    u64 draw_key = index_address ^ (vs_hash * 0x9E3779B97F4A7C15ull) ^
+                   (ps_hash * 0xD6E8FEB86659FD93ull) ^
+                   (u64(num_indices) * 0xBF58476D1CE4E5B9ull) ^
+                   (u64(num_instances) * 0x94D049BB133111EBull) ^ off_mix ^
+                   (vtx_buf_hash * 0xC2B2AE3D27D4EB4Full) ^ world_palette_hash;
+    if (draw_key == 0ull) {
+        draw_key = 1ull;
+    }
+
+    const u16 e_idx = culler.FindOrInsertEntry(draw_key, frame_tag);
+    if (e_idx == 0xFFFFu) {
+        return decision;
+    }
+
+    auto& e = culler.entries[e_idx];
+    const u32 prev_seen = e.last_seen_frame.exchange(frame_tag, std::memory_order_acq_rel);
+    if (prev_seen == frame_tag) {
+        e.multi_occ.store(1u, std::memory_order_relaxed);
+        e.zero_streak.store(0u, std::memory_order_relaxed);
+        e.skip_until_frame.store(0u, std::memory_order_relaxed);
+        return decision;
+    }
+    if (prev_seen != 0u && prev_seen + 16u < frame_tag) {
+        e.zero_streak.store(0u, std::memory_order_relaxed);
+        e.skip_until_frame.store(0u, std::memory_order_relaxed);
+        e.multi_occ.store(0u, std::memory_order_relaxed);
+    }
+
+    if (gbuf_ord > 12u && e.multi_occ.load(std::memory_order_relaxed) == 0u &&
+        !culler.fast_camera_turn.load(std::memory_order_relaxed)) {
+        const u16 zs = e.zero_streak.load(std::memory_order_relaxed);
+        const u8 p_if = e.probe_in_flight.load(std::memory_order_acquire);
+        if (zs >= 3u && p_if == 0u &&
+            frame_tag < e.skip_until_frame.load(std::memory_order_relaxed)) {
+            decision.skip_draw = true;
+            if (out_skipped) {
+                ++(*out_skipped);
+            }
+            return decision;
+        }
+        const u32 probe_mask = culler.camera_moving.load(std::memory_order_relaxed) ? 1u : 3u;
+        if (p_if == 0u && !Breadcrumbs::Enabled() && !DynCheck::Enabled() &&
+            (zs > 0u || ((frame_tag + u32(e_idx)) & probe_mask) == 0u)) {
+            const s32 q_slot = culler.AllocateMtQuery(mt_query_block_id, e_idx);
+            if (q_slot >= 0) {
+                decision.query_slot = q_slot;
+                decision.pool = *culler.mt_pool;
+                if (out_probed) {
+                    ++(*out_probed);
+                }
+            }
+        }
+    }
+    return decision;
+}
+
+bool Rasterizer::IsRegionGpuModifiedForMt(VAddr addr, u64 size) noexcept {
+    if (size == 0) {
+        return false;
+    }
+    if (buffer_cache.IsConstRamRange(addr, size)) {
+        return true;
+    }
+    const u64 retired = gpu_retired_packet.load(std::memory_order_relaxed);
+    return pending_write_table.Newest(addr, size, retired + 1) > retired;
+}
+
+void Rasterizer::ExecuteSecondaryCmdBuf(u32 worker_id, u64 cmd_seq, u32 recorded_draws,
+                                        u16 occ_block_id) {
+    if (!mt_direct_recorder) {
+        return;
+    }
+    MtCompletedPassMeta* meta = mt_direct_recorder->LookupCompletedPass(worker_id, cmd_seq);
+    if (!meta || !meta->first_pso) {
+        mt_direct_recorder->StampEmptyPassOnStageB(worker_id, cmd_seq, occ_block_id);
+        if (meta) {
+            meta->MarkConsumed(cmd_seq);
+        }
+        return;
+    }
+
+    if ((meta->is_gbuffer || occ_block_id != 0xFFFFu) && scene_occlusion_culler &&
+        scene_occlusion_culler->initialized) {
+        auto& culler = *scene_occlusion_culler;
+        const u32 ftag = culler.ActiveFrameTag();
+        if (culler.mt_last_collect_frame != ftag) {
+            culler.mt_last_collect_frame = ftag;
+            culler.CollectRetiredSlices(instance.GetDevice(), scheduler);
+        }
+    }
+
+    if (recorded_draws == 0) {
+        mt_direct_recorder->StampEmptyPassOnStageB(worker_id, cmd_seq, occ_block_id);
+        meta->MarkConsumed(cmd_seq);
+        return;
+    }
+
+    if (!mt_stage_b_regs) [[unlikely]] {
+        mt_stage_b_regs = std::make_unique<Gcn::Regs>();
+        mt_stage_b_regs->SetDefaults();
+    }
+    meta->ApplyToRegs(*mt_stage_b_regs);
+
+    struct ScopedMtPipeRegs {
+        Rasterizer& self;
+        const Gcn::Regs* prev_stage_regs;
+        std::array<Gcn::CbDbExtent, Gcn::NUM_COLOR_BUFFERS> prev_cb_ext;
+        Gcn::CbDbExtent prev_db_ext;
+        std::array<u16, Gcn::NUM_COLOR_BUFFERS> prev_cb_uid;
+        u16 prev_db_uid;
+
+        ScopedMtPipeRegs(Rasterizer& r, const MtCompletedPassMeta& m) noexcept
+            : self(r), prev_stage_regs(stage_regs), prev_cb_ext(r.pipe_cb_extent),
+              prev_db_ext(r.pipe_db_extent), prev_cb_uid(r.pipe_cb_uid),
+              prev_db_uid(r.pipe_db_uid) {
+            stage_regs = r.mt_stage_b_regs.get();
+            r.pipe_cb_extent = m.cb_extent;
+            r.pipe_db_extent = m.db_extent;
+            r.pipe_cb_uid = m.cb_uid;
+            r.pipe_db_uid = m.db_uid;
+        }
+        ~ScopedMtPipeRegs() {
+            stage_regs = prev_stage_regs;
+            self.pipe_cb_extent = prev_cb_ext;
+            self.pipe_db_extent = prev_db_ext;
+            self.pipe_cb_uid = prev_cb_uid;
+            self.pipe_db_uid = prev_db_uid;
+        }
+    } reg_scope{*this, *meta};
+
+    const GraphicsPipeline* pipeline = meta->first_pso;
+    PrepareRenderState(pipeline);
+    NoteUpscalerDraw(pipeline);
+    if (gbuffer_draw && meta->has_camera_cb && camera_motion && !camera_motion->PassHasCamera()) {
+        camera_motion->OnConstants(meta->camera_cb_floats.data());
+    }
+
+    const auto state = BeginRendering(pipeline, /*secondary_contents=*/true);
+    const bool will_begin_pass = !last_begin_memo_hit && scheduler.WillBeginRendering(state);
+    if (HasPendingHleCopies() && will_begin_pass) {
+        FlushPendingHleCopies(*this);
+    }
+
+    const u32 prev_draws_in_frame =
+        g_draws_in_frame.fetch_add(recorded_draws, std::memory_order_relaxed);
+    if (prev_draws_in_frame == 0u) {
+        g_frame_first_draw_ns.store(SteadyNowNs(), std::memory_order_relaxed);
+    }
+
+    if (needs_barrier || (will_begin_pass && runtime.HasPendingBarriers())) {
+        runtime.FlushBarriers();
+        needs_barrier = false;
+    }
+
+    MarkPass(pipeline, state, will_begin_pass);
+    if (occlusion) {
+        occlusion->SetPassScale(target_scale[0] * target_scale[1]);
+    }
+    if (will_begin_pass) {
+        scheduler.BeginRendering(state, 0);
+        if (begin_memo.valid) {
+            begin_memo.cmd_epoch = scheduler.DescriptorStateEpoch();
+        }
+    }
+
+    bound_graphics_pipeline = vk::Pipeline{};
+    scheduler.GetDynamicState().Invalidate();
+
+    const vk::CommandBuffer sec_cmd = meta->sec_cmd;
+    mt_direct_recorder->ExecuteSecondaryBuffers({&sec_cmd, 1}, worker_id, cmd_seq, occ_block_id);
+    meta->MarkConsumed(cmd_seq);
+
+    BB_SECTION(Kick);
+    ResetBindings(false);
+    scheduler.KickRecording();
+}
 
 bool Rasterizer::TryCullMicroShadowDraw(const GraphicsPipeline* pipeline,
                                         bool is_indexed) noexcept {
@@ -852,9 +1452,10 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
 
     // Block 10: Smart Unified Scene Occlusion Culling (Micro-Shadow Culling now runs on Stage A).
     s32 occ_probe_entry_idx = -1;
-    {
-        auto& culler = GetSceneCuller();
+    if (scene_occlusion_culler) {
+        auto& culler = *scene_occlusion_culler;
         culler.EnsureInit(instance);
+        const u32 frame_tag = culler.ActiveFrameTag();
         const auto& vs_stage = pipeline->GetStage(Shader::SwStage::Vertex);
         const u64 vs_hash = vs_stage.pgm_hash;
         const u32 num_indices = regs.num_indices;
@@ -965,9 +1566,9 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
                         }
                     }
                     if (cb_size == 864) {
-                        if (!culler.cam_updated_in_frame && cb_ptr) {
+                        if (cb_ptr) {
                             culler.UpdateCameraFromSceneConstants(
-                                reinterpret_cast<const float*>(cb_ptr));
+                                reinterpret_cast<const float*>(cb_ptr), frame_tag);
                         }
                     } else if (cb_size == 416 && !is_inst_gbuf_vs) {
                         if (cb_ptr) {
@@ -998,7 +1599,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
             }
 
             if (!has_transient_vb && !is_skeleton && palette_ptr && palette_size >= 48) {
-                ++culler.stat_gbuf_candidates;
+                culler.stat_gbuf_candidates.fetch_add(1, std::memory_order_relaxed);
                 const u32 mat_byte_off =
                     (has_model_cb &&
                      u64(model_base_matrix_idx) * 48ull + 48ull <= u64(palette_size))
@@ -1031,32 +1632,35 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
                 if (draw_key == 0) {
                     draw_key = 1;
                 }
-                const u16 e_idx = culler.FindOrInsertEntry(draw_key);
+                const u16 e_idx = culler.FindOrInsertEntry(draw_key, frame_tag);
                 if (e_idx != 0xFFFFu) {
                     auto& e = culler.entries[e_idx];
-                    if (e.last_seen_frame == culler.cur_frame) {
-                        e.multi_occ = true;
-                        e.zero_streak = 0;
-                        e.skip_until_frame = 0;
+                    const u32 prev_seen =
+                        e.last_seen_frame.exchange(frame_tag, std::memory_order_acq_rel);
+                    if (prev_seen == frame_tag) {
+                        e.multi_occ.store(1u, std::memory_order_relaxed);
+                        e.zero_streak.store(0u, std::memory_order_relaxed);
+                        e.skip_until_frame.store(0u, std::memory_order_relaxed);
                     } else {
-                        if (e.last_seen_frame != 0 &&
-                            e.last_seen_frame + 16 < culler.cur_frame) {
-                            e.zero_streak = 0;
-                            e.skip_until_frame = 0;
-                            e.multi_occ = false;
+                        if (prev_seen != 0 && prev_seen + 16u < frame_tag) {
+                            e.zero_streak.store(0u, std::memory_order_relaxed);
+                            e.skip_until_frame.store(0u, std::memory_order_relaxed);
+                            e.multi_occ.store(0u, std::memory_order_relaxed);
                         }
-                        e.last_seen_frame = culler.cur_frame;
-                        if (gbuf_ord > 12 && !e.multi_occ && !culler.fast_camera_turn) {
-                            if (e.zero_streak >= 3 && !e.probe_in_flight &&
-                                culler.cur_frame < e.skip_until_frame) {
-                                ++culler.stat_gbuf_skipped;
+                        if (gbuf_ord > 12 && e.multi_occ.load(std::memory_order_relaxed) == 0u &&
+                            !culler.fast_camera_turn.load(std::memory_order_relaxed)) {
+                            const u16 zs = e.zero_streak.load(std::memory_order_relaxed);
+                            const u8 p_if = e.probe_in_flight.load(std::memory_order_acquire);
+                            if (zs >= 3u && p_if == 0u &&
+                                frame_tag < e.skip_until_frame.load(std::memory_order_relaxed)) {
+                                culler.stat_gbuf_skipped.fetch_add(1, std::memory_order_relaxed);
                                 BbStats::draws.fetch_sub(1, std::memory_order_relaxed);
                                 return;
                             }
-                            const u32 probe_mask = culler.camera_moving ? 1u : 3u;
-                            if (!e.probe_in_flight && !DynCheck::Enabled() &&
-                                (e.zero_streak > 0 ||
-                                 ((culler.cur_frame + u32(e_idx)) & probe_mask) == 0u)) {
+                            const u32 probe_mask =
+                                culler.camera_moving.load(std::memory_order_relaxed) ? 1u : 3u;
+                            if (p_if == 0u && !DynCheck::Enabled() &&
+                                (zs > 0u || ((frame_tag + u32(e_idx)) & probe_mask) == 0u)) {
                                 occ_probe_entry_idx = static_cast<s32>(e_idx);
                             }
                         }
@@ -1180,7 +1784,9 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
         !g_mid_frame_flushed.load(std::memory_order_relaxed) && !cpu_decode_bound &&
         cur_draw_in_frame >= mid_flush_draws && will_begin_pass) {
         g_mid_frame_flushed.store(true, std::memory_order_relaxed);
-        GetSceneCuller().SealCurrentSlice(scheduler.CurrentTick());
+        if (scene_occlusion_culler) {
+            scene_occlusion_culler->SealCurrentSlice(scheduler.CurrentTick());
+        }
         SubmitInfo info{};
         scheduler.Flush(info);
     }
@@ -1365,12 +1971,12 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
         bound_graphics_pipeline = handle;
         bound_graphics_epoch = cur_epoch;
         const s32 hw_occ_query_slot =
-            (is_indexed && occ_probe_entry_idx >= 0)
-                ? GetSceneCuller().AllocateQuery(static_cast<u16>(occ_probe_entry_idx))
+            (is_indexed && occ_probe_entry_idx >= 0 && scene_occlusion_culler)
+                ? scene_occlusion_culler->AllocateQuery(static_cast<u16>(occ_probe_entry_idx))
                 : -1;
         if (is_indexed) {
             if (hw_occ_query_slot >= 0) {
-                const vk::QueryPool occ_pool = *GetSceneCuller().pool;
+                const vk::QueryPool occ_pool = *scene_occlusion_culler->pool;
                 const u32 q_slot = static_cast<u32>(hw_occ_query_slot);
                 scheduler.Record([handle, need_bind_pipeline, occ_pool, q_slot, num_indices,
                                   num_instances, first_vertex,
@@ -1399,7 +2005,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
             }
         } else {
             if (hw_occ_query_slot >= 0) {
-                const vk::QueryPool occ_pool = *GetSceneCuller().pool;
+                const vk::QueryPool occ_pool = *scene_occlusion_culler->pool;
                 const u32 q_slot = static_cast<u32>(hw_occ_query_slot);
                 scheduler.Record([handle, need_bind_pipeline, occ_pool, q_slot, num_indices,
                                   num_instances, first_vertex,
@@ -3057,7 +3663,7 @@ void Rasterizer::MarkPass(const GraphicsPipeline* pipeline, const RenderState& s
         ui_pass_started || (upscaler && upscaler->InUiPhase()));
     if (will_begin) {
         GpuProfiler::HudSetNextPassCat(&scheduler, subcat);
-    } else {
+    } else if (!state.secondary_contents) {
         GpuProfiler::HudOnSubPassChange(&scheduler, subcat);
     }
     if (!profiler) {
@@ -3104,7 +3710,9 @@ void Rasterizer::NoteFrameStart() {
     g_draws_in_frame.store(0, std::memory_order_relaxed);
     g_mid_frame_flushed.store(false, std::memory_order_relaxed);
     g_frame_first_draw_ns.store(0, std::memory_order_relaxed);
-    GetSceneCuller().OnFrameStart(instance, scheduler, camera_motion.get());
+    if (scene_occlusion_culler) {
+        scene_occlusion_culler->OnFrameStart(instance, scheduler, camera_motion.get());
+    }
     InvalidateGdsMirror();
     if (HasPendingHleCopies()) {
         FlushPendingHleCopies(*this);

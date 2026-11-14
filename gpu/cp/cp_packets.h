@@ -461,6 +461,7 @@ enum class Op : u32 {
     InitDefaultHardwareState = 32u,
     SetVgtControl = 33u,
     DrawBundle = 34u,
+    ExecuteSecondaryCmds = 35u,
 };
 struct CopyRegion {
     u64 dst_va;
@@ -604,6 +605,12 @@ struct DispatchIndirectArgs {
     u32 reserved;
 };
 static_assert(sizeof(DispatchIndirectArgs) == 16);
+struct ExecuteSecondaryArgs {
+    u32 worker_and_draws;
+    u32 occ_and_flags;
+    u64 cmd_seq;
+};
+static_assert(sizeof(ExecuteSecondaryArgs) == 16);
 } // namespace DirectVk
 
 template <typename Write, typename Irq>

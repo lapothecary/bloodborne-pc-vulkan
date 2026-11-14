@@ -314,6 +314,13 @@ int32_t CopyToStagingAndEnqueue_A(
 
     uint8_t* buf_core = buf_bytes + 0x18;
     std::memcpy(staging_dst, src_data, copy_bytes);
+    if (*reinterpret_cast<const uint32_t*>(ctx_bytes + 0xb510) == 0u) {
+        gx_direct_vk::NoteImmediateBufferShadow(
+            *reinterpret_cast<const uint64_t*>(buf_core + 0x08),
+            reinterpret_cast<uint64_t>(staging_dst),
+            copy_bytes,
+            gx_direct_vk::kCopyFlagKnownCpuSource);
+    }
 
     const uint16_t q_slot = queue->fast_slot_lut_idx;
     uint64_t* found_entry = nullptr;
@@ -1191,6 +1198,10 @@ int32_t MapDynamicBuffer_B_Impl(
         reinterpret_cast<HeapFreeFn>(heap_vtbl[4])(dyn_heap, &fence_ptr, old_node);
         *reinterpret_cast<GpuRangeNode**>(found_entry + 0x10) = node;
         *out_mapped_ptr = node->start_va;
+        if (*reinterpret_cast<const uint32_t*>(outer_ctx + 0xb510) == 0u) {
+            gx_direct_vk::NoteImmediateBufferShadow(
+                target_va, node->start_va, byte_size, gx_direct_vk::kCopyFlagLiveStagingPtr);
+        }
         return 0;
     }
 
@@ -1241,9 +1252,14 @@ int32_t MapDynamicBuffer_B_Impl(
     *reinterpret_cast<uint32_t*>(new_entry + 0x00) = byte_size;
     const uint32_t buf_flags = *reinterpret_cast<uint32_t*>(target_buf + 0x24);
     *reinterpret_cast<uint32_t*>(new_entry + 0x04) = (~(buf_flags >> 11)) & 1u;
-    *reinterpret_cast<uint64_t*>(new_entry + 0x08) = reinterpret_cast<GetBufGpuVaFn>(GX_VMA(0x0216e1b0ULL))(target_buf);
+    const uint64_t new_target_va = reinterpret_cast<GetBufGpuVaFn>(GX_VMA(0x0216e1b0ULL))(target_buf);
+    *reinterpret_cast<uint64_t*>(new_entry + 0x08) = new_target_va;
     *reinterpret_cast<GpuRangeNode**>(new_entry + 0x10) = node;
     *out_mapped_ptr = node->start_va;
+    if (*reinterpret_cast<const uint32_t*>(outer_ctx + 0xb510) == 0u) {
+        gx_direct_vk::NoteImmediateBufferShadow(
+            new_target_va, node->start_va, byte_size, gx_direct_vk::kCopyFlagLiveStagingPtr);
+    }
     return 0;
 }
 
