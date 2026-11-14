@@ -31,6 +31,7 @@
 #include "render/rasterizer.h"
 #include "render/scheduler.h"
 #include "render/vk_frame_capture.h"
+#include "render/vk_indirect_guard.h"
 #include "render/vk_obj_vel_cull.h"
 #include "render/vk_vsm_shadow_memo.h"
 #include "shim/bbport_toggles.h"
@@ -783,9 +784,12 @@ struct VkMtDirectRecorder::WorkerCompileScratch {
         bool has_camera_cb{false};
         bool inherits_occlusion_query{false};
         u8 num_sampled_rt_refs{0};
+        u8 num_uav_indirect_refs{0};
         u8 motion_slot{0xFFu};
         std::array<MtCompletedPassMeta::SampledRtRef, MtCompletedPassMeta::kMaxSampledRts>
             sampled_rt_refs{};
+        std::array<MtCompletedPassMeta::UavIndirectRef, MtCompletedPassMeta::kMaxUavIndirectRefs>
+            uav_indirect_refs{};
     };
 
     alignas(16) std::array<u8, 32768> cb_temp{};
@@ -1598,6 +1602,7 @@ enum class MtPktKind : u8 {
     Draw,
     CopyBatch,
     FillBuf,
+    DmaMemWrite,
     TargetRawOp,
     SyncRetain,
     PostSyncRetain,
@@ -1716,6 +1721,8 @@ void MtMaybeLogUnsafePsoSample(u8 reason, u64 vs_hash, u64 ps_hash) noexcept {
         return "special";
     case 6u:
         return "sbuf";
+    case 7u:
+        return "indirect";
     default:
         return "other";
     }
@@ -1991,7 +1998,9 @@ struct MtDecodedPkt {
     MtPktKind kind{MtPktKind::Invalid};
     u32 pkt_words{0};
     bool is_indexed{false};
+    bool is_indirect{false};
     u32 start_index{0};
+    VAddr indirect_args_va{0};
 };
 
 [[nodiscard]] MtDecodedPkt DecodeAndApplyMtPacket(
@@ -2197,6 +2206,25 @@ struct MtDecodedPkt {
             out.kind = MtPktKind::Draw;
             out.is_indexed = (draw_kind != 1u);
             out.start_index = (draw_kind == 0u) ? body[body_words - 2u] : 0u;
+            return out;
+        }
+
+        case BbCp::DirectVk::Op::DrawIndirect: {
+            if (body_words != 6u) {
+                return {};
+            }
+            BbCp::DirectVk::DrawIndirectArgs args{};
+            std::memcpy(&args, body + 2u, sizeof(args));
+            const VAddr base_va = static_cast<VAddr>((args.args_va & 0xFFFFFFFFFFULL) & ~7ULL);
+            const VAddr eff_va = base_va + args.byte_offset;
+            if (base_va == 0ULL || (eff_va & 3ULL) != 0ULL) {
+                return {};
+            }
+            out.kind = MtPktKind::Draw;
+            out.is_indirect = true;
+            out.is_indexed = (args.is_indexed != 0u);
+            out.start_index = 0u;
+            out.indirect_args_va = eff_va;
             return out;
         }
 
@@ -2505,9 +2533,58 @@ struct MtDecodedPkt {
         out.start_index = 0u;
         return out;
 
+    case BbCp::Op::DmaData: {
+        if (body_words != 6u) {
+            return {};
+        }
+        const auto dma = BbCp::DmaData::From(body);
+        if (dma.DstLow() == 0x3022Cu) {
+            out.kind = MtPktKind::NoOp;
+            return out;
+        }
+        if (dma.DstRegister()) {
+            return {};
+        }
+        if (dma.Dst() == BbCp::DmaData::Gds &&
+            (dma.Src() == BbCp::DmaData::Immediate || dma.SrcIsMemory())) {
+            out.kind = MtPktKind::SyncRetain;
+            return out;
+        }
+        if (dma.DstIsMemory() &&
+            (dma.Src() == BbCp::DmaData::Immediate || dma.Src() == BbCp::DmaData::Gds ||
+             dma.SrcIsMemory()) &&
+            dma.DstAddress() != 0ULL && dma.Bytes() != 0u) {
+            out.kind = MtPktKind::DmaMemWrite;
+            return out;
+        }
+        return {};
+    }
+
     default:
         return {};
     }
+}
+
+[[nodiscard]] bool IsAttachmentlessDummyIndirectDraw(const Gcn::Regs& regs,
+                                                     const GraphicsPipeline* pso,
+                                                     const Shader::Info* vs_st,
+                                                     const Shader::Info* ps_st) noexcept {
+    if (!pso || !vs_st || ps_st != nullptr || vs_st->pgm_hash != 0x89cda9e4ull || vs_st->uses_dma) {
+        return false;
+    }
+    const auto& key = pso->GetGraphicsKey();
+    if (regs.color_control.mode != Gcn::ColorControl::OperationMode::Disable) {
+        for (u32 cb = 0; cb < Gcn::NUM_COLOR_BUFFERS; ++cb) {
+            if (regs.color_buffers[cb] && regs.color_target_mask.GetMask(cb) &&
+                (key.mrt_mask & (1u << cb)) != 0u) {
+                return false;
+            }
+        }
+    }
+    const bool has_ds =
+        (regs.depth_control.depth_enable && regs.depth_buffer.DepthValid()) ||
+        (regs.depth_control.stencil_enable && regs.depth_buffer.StencilValid());
+    return !has_ds;
 }
 
 [[nodiscard]] bool IsPipelineMtSafe(const GraphicsPipeline* pso,
@@ -2681,10 +2758,15 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
 
     bool seen_draw = false;
     bool force_new_subpass = false;
+    u32 draw_pkt_ordinal = 0;
     u32 candidate_draws = 0;
     bool list_any_gbuffer = false;
     bool list_is_core_geom = false;
     static constexpr u32 kMaxSubPassesPerList = 128u;
+    static const bool force_indirect_guard = [] {
+        const char* env = std::getenv("BB_FORCE_INDIRECT_GUARD");
+        return env && env[0] == '1';
+    }();
 
     const auto calc_scene_color_submode = [](bool is_scene_color,
                                              const Gcn::Regs& regs) noexcept -> u8 {
@@ -2737,6 +2819,7 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
                 [[fallthrough]];
             case MtPktKind::CopyBatch:
             case MtPktKind::FillBuf:
+            case MtPktKind::DmaMemWrite:
             case MtPktKind::SyncRetain:
             case MtPktKind::PostSyncRetain:
                 scratch.stream_items.push_back(
@@ -2747,21 +2830,24 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
                 break;
 
             case MtPktKind::Draw: {
+                const u32 cur_draw_pkt_ord = draw_pkt_ordinal++;
                 if (sregs.stage_enable.raw != u32(Gcn::ShaderStageEnable::VgtStages::Vs) ||
                     sregs.vgt_strmout_config.raw != 0u ||
                     sregs.depth_render_control.depth_clear_enable ||
                     sregs.depth_render_control.stencil_clear_enable ||
                     sregs.depth_render_control.depth_copy ||
                     sregs.depth_render_control.stencil_copy ||
-                    sregs.depth_render_control.resummarize_enable) {
+                    sregs.depth_render_control.resummarize_enable ||
+                    (dp.is_indirect && force_indirect_guard && IndirectGuard::DrawEnabled())) {
                     MtNoteBail(MtBailReason::Pkt, cur_guest_frame);
                     return false;
                 }
                 PipelineCache::MtPsoFailKind pso_fail = PipelineCache::MtPsoFailKind::None;
                 const GraphicsPipeline* pso =
                     rasterizer.GetPipelineCache().SelectGraphicsPipelineMt(
-                        sregs, w.pso_state, {}, false, /*allow_compile_fallback=*/false,
-                        &pso_fail);
+                        sregs, w.pso_state,
+                        dp.is_indirect ? DrawIndirectParams{0u, 0u} : DrawIndirectParams{},
+                        dp.is_indirect, /*allow_compile_fallback=*/false, &pso_fail);
                 if (!pso) {
                     MtNotePsoBail(pso_fail, /*unsafe_pso=*/false, cur_guest_frame);
                     return false;
@@ -2776,6 +2862,10 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
                     MtNotePsoBail(pso_fail, /*unsafe_pso=*/true, cur_guest_frame);
                     return false;
                 }
+                if (dp.is_indirect &&
+                    IsAttachmentlessDummyIndirectDraw(sregs, pso, vs_st, ps_st)) {
+                    break;
+                }
                 if (mode == 1 && IsStageACoalescerShader(vs_hash, ps_hash)) {
                     MtNoteBail(MtBailReason::Other, cur_guest_frame, MtOtherKind::Skip);
                     return false;
@@ -2783,6 +2873,13 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
                 if (mode != 1 && (vs_hash == 0x000000008747a367ULL ||
                                   (vs_hash == 0x000000000b0acf50ULL &&
                                    ps_hash == 0x000000000f61fd27ULL))) {
+                    MtNoteBail(MtBailReason::Other, cur_guest_frame, MtOtherKind::Skip);
+                    return false;
+                }
+                // Keep 2D full-screen post-FX passes without depth/stencil (`GXFullscreenTriangle`,
+                // e.g. SSAO `ps=0xcbbca5dc`, LDR tonemap/copy) on Stage A/B.
+                if (vs_hash == 0x000000000b0acf50ULL && !sregs.depth_control.depth_enable &&
+                    !(sregs.depth_control.stencil_enable && sregs.depth_buffer.StencilValid())) {
                     MtNoteBail(MtBailReason::Other, cur_guest_frame, MtOtherKind::Skip);
                     return false;
                 }
@@ -2858,7 +2955,7 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
                     list_any_gbuffer |= ts.is_gbuffer;
 
                     WorkerCompileScratch::SubPassPlan plan{};
-                    plan.first_draw_ordinal = candidate_draws;
+                    plan.first_draw_ordinal = cur_draw_pkt_ord;
                     plan.first_pso = pso;
                     plan.target_summary = ts;
                     std::memcpy(plan.cb.data(), sregs.color_buffers, sizeof(plan.cb));
@@ -2957,8 +3054,11 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
     bool cur_inherits_occ = false;
     u8 cur_motion_slot = 0xFFu;
     u8 cur_num_sampled_rts = 0u;
+    u8 cur_num_uav_indirect_refs = 0u;
     std::array<MtCompletedPassMeta::SampledRtRef, MtCompletedPassMeta::kMaxSampledRts>
         cur_sampled_rts{};
+    std::array<MtCompletedPassMeta::UavIndirectRef, MtCompletedPassMeta::kMaxUavIndirectRefs>
+        cur_uav_indirect_refs{};
 
     auto open_subpass = [&](u32 sp_idx) -> bool {
         const auto& plan = scratch.subpass_plans[sp_idx];
@@ -2998,6 +3098,7 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
         cur_inherits_occ = false;
         cur_motion_slot = 0xFFu;
         cur_num_sampled_rts = 0u;
+        cur_num_uav_indirect_refs = 0u;
         return true;
     };
 
@@ -3024,8 +3125,10 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
         sp.is_gbuffer = plan.target_summary.is_gbuffer;
         sp.inherits_occlusion_query = cur_inherits_occ;
         sp.num_sampled_rt_refs = cur_num_sampled_rts;
+        sp.num_uav_indirect_refs = cur_num_uav_indirect_refs;
         sp.motion_slot = cur_motion_slot;
         sp.sampled_rt_refs = cur_sampled_rts;
+        sp.uav_indirect_refs = cur_uav_indirect_refs;
         scratch.sealed_subpasses.push_back(sp);
         for (u32 cb = 0; cb < Gcn::NUM_COLOR_BUFFERS; ++cb) {
             if (plan.cb[cb]) {
@@ -3515,6 +3618,11 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
                 scratch.chunk_gpu_writes.push_back(
                     {fargs.dst_va, fargs.byte_size, ++local_copy_gen});
                 scratch.NoteTargetWrite(fargs.dst_va, fargs.byte_size);
+            } else if (dp.kind == MtPktKind::DmaMemWrite) {
+                const auto dma = BbCp::DmaData::From(cur + 1u);
+                scratch.chunk_gpu_writes.push_back(
+                    {dma.DstAddress(), dma.Bytes(), ++local_copy_gen});
+                scratch.NoteTargetWrite(dma.DstAddress(), dma.Bytes());
             } else if (dp.kind == MtPktKind::TargetRawOp) {
                 const auto raw_vk_op = BbCp::DirectVk::Op(cur[2] & 0xFFFFu);
                 if (raw_vk_op == BbCp::DirectVk::Op::CopyTextureRegion) {
@@ -3547,16 +3655,22 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
                     prev_ib_off = ~0ULL;
                 }
                 ++draw_ordinal;
+                if (!w.is_recording || cur_subpass_idx >= planned_subpasses) {
+                    cur += dp.pkt_words;
+                    rem -= dp.pkt_words;
+                    continue;
+                }
 
                 const auto& cur_plan = scratch.subpass_plans[cur_subpass_idx];
                 const auto& cur_ts = cur_plan.target_summary;
                 const u32 num_instances = rregs.num_instances.NumInstances();
-                if (rregs.num_indices != 0u && num_instances != 0u) {
+                if (dp.is_indirect || (rregs.num_indices != 0u && num_instances != 0u)) {
                     PipelineCache::MtPsoFailKind p2_fail = PipelineCache::MtPsoFailKind::None;
                     const GraphicsPipeline* pso =
                         rasterizer.GetPipelineCache().SelectGraphicsPipelineMt(
-                            rregs, w.pso_state, {}, false, /*allow_compile_fallback=*/false,
-                            &p2_fail);
+                            rregs, w.pso_state,
+                            dp.is_indirect ? DrawIndirectParams{0u, 0u} : DrawIndirectParams{},
+                            dp.is_indirect, /*allow_compile_fallback=*/false, &p2_fail);
                     if (!pso) {
                         return abort_pass(MtBailReason::Pso, p2_fail, false);
                     }
@@ -3565,6 +3679,12 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
                     const auto* ps_stage = pso->GetStages()[u32(Shader::SwStage::Fragment)];
                     if (!vs_stage) {
                         return abort_pass(MtBailReason::Pso, p2_fail, true);
+                    }
+                    if (dp.is_indirect &&
+                        IsAttachmentlessDummyIndirectDraw(rregs, pso, vs_stage, ps_stage)) {
+                        cur += dp.pkt_words;
+                        rem -= dp.pkt_words;
+                        continue;
                     }
 
                     // Flatten VS & PS user-data into worker heap scratch (+0 B TLS / stack).
@@ -3586,7 +3706,8 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
                     const VAddr ps_pgm_base = rregs.ps_program.Address<VAddr>();
 
                     // 1. MicroShadow clutter culler
-                    if (Rasterizer::TryCullMicroShadowDrawMt(rregs, pso, dp.is_indexed,
+                    if (!dp.is_indirect &&
+                        Rasterizer::TryCullMicroShadowDrawMt(rregs, pso, dp.is_indexed,
                                                              shadow_cull_state,
                                                              &w.local_stats.shadow_skipped)) {
                         cur += dp.pkt_words;
@@ -3595,7 +3716,7 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
                     }
 
                     // 2. Object-Velocity stationary mesh culler (Pass 0x2e)
-                    if (pso->GetGraphicsKey().mrt_mask == 0x1u && ps_stage &&
+                    if (!dp.is_indirect && pso->GetGraphicsKey().mrt_mask == 0x1u && ps_stage &&
                         ObjectVelocityCuller::IsObjectVelocityPs(ps_stage->pgm_hash)) {
                         if (ObjectVelocityCuller::TryCullDrawMt(
                                 rregs, pso, scratch.vs_flat_ud.data(), vs_pgm_base, dp.is_indexed,
@@ -3621,7 +3742,7 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
 
                     // 3. Scene Occlusion Culler (G-Buffer 6/7-MRT)
                     Rasterizer::MtOcclusionDecision occ_decision{};
-                    if (cur_ts.is_gbuffer) {
+                    if (!dp.is_indirect && cur_ts.is_gbuffer) {
                         occ_decision = rasterizer.EvaluateGBufferOcclusionMt(
                             rregs, pso, scratch.vs_flat_ud.data(), vs_pgm_base, dp.is_indexed,
                             dp.start_index, vsharps, occ_block_id, resolve_cb_for_occ, &cb_ctx,
@@ -3736,13 +3857,124 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
                     vk::Buffer ib_buf{};
                     u64 ib_off = 0;
                     if (dp.is_indexed) {
+                        if (ib_bytes == 0ULL) {
+                            MtMaybeLogBailBufSample(2u, 1u, false, ib_addr, ib_bytes,
+                                                    vs_stage->pgm_hash);
+                            return abort_pass(MtBailReason::Buf);
+                        }
+                        const u64 ib_min_span = dp.is_indirect ? u64(idx_sz) : ib_bytes;
                         u64 ib_tot = 0;
                         u8 ib_step = 0u;
-                        if (!resolve_gpu_stream_range(ib_addr, ib_bytes, ib_bytes, ib_buf, ib_off,
-                                                      ib_tot, false, &ib_step)) {
+                        if (!resolve_gpu_stream_range(ib_addr, ib_bytes, ib_min_span, ib_buf,
+                                                      ib_off, ib_tot, false, &ib_step)) {
                             MtMaybeLogBailBufSample(2u, ib_step, false, ib_addr, ib_bytes,
                                                     vs_stage->pgm_hash);
                             return abort_pass(MtBailReason::Buf);
+                        }
+                    }
+
+                    // Resolve Indirect Arguments Buffer if DrawIndirect
+                    vk::Buffer ind_buf{};
+                    u64 ind_off = 0ULL;
+                    if (dp.is_indirect) {
+                        const VAddr ind_va = dp.indirect_args_va;
+                        const u64 ind_bytes = dp.is_indexed ? 20ULL : 16ULL;
+                        const bool guard_on = IndirectGuard::DrawEnabled();
+                        if (guard_on && force_indirect_guard) {
+                            return abort_pass(MtBailReason::Pkt);
+                        }
+                        bool resolved_ind = false;
+                        u8 ind_step = 0u;
+                        if (!guard_on) {
+                            u64 ind_tot = 0ULL;
+                            resolved_ind = resolve_gpu_stream_range(
+                                ind_va, ind_bytes, ind_bytes, ind_buf, ind_off, ind_tot, false,
+                                &ind_step);
+                        }
+                        if (!resolved_ind) {
+                            const bool ind_in_transient =
+                                (ind_va >= cue_base && ind_va < cue_end) ||
+                                VideoCore::DirectBuffers::IsTransientAuxCpuRing(ind_va, 1ULL);
+                            if (!ind_in_transient) {
+                                const auto res_ind = ResolveBuffer(worker_id, ind_va, ind_bytes);
+                                if (res_ind && res_ind.clamped_size >= ind_bytes) {
+                                    bool shadowed_by_cpu_copy = false;
+                                    const u64 gw_gen =
+                                        scratch.MaxGpuWriteGenOverlapping(ind_va, ind_bytes);
+                                    for (size_t ci = scratch.chunk_copies.size(); ci-- > 0;) {
+                                        const auto& cp = scratch.chunk_copies[ci];
+                                        if (cp.gen < gw_gen) {
+                                            break;
+                                        }
+                                        if (ind_va < cp.dst_va + cp.byte_size &&
+                                            cp.dst_va < ind_va + ind_bytes) {
+                                            shadowed_by_cpu_copy = true;
+                                            break;
+                                        }
+                                    }
+                                    if (!shadowed_by_cpu_copy) {
+                                        if (!res_ind.is_gpu_written &&
+                                            !WasCoarseRangeModifiedRecently(ind_va, ind_bytes,
+                                                                            cur_guest_frame) &&
+                                            !rasterizer.IsRegionGpuModifiedForMt(ind_va,
+                                                                                 ind_bytes)) {
+                                            ind_buf = vk::Buffer{res_ind.handle};
+                                            ind_off = res_ind.offset;
+                                            resolved_ind = true;
+                                        } else if (res_ind.vram_handle != VK_NULL_HANDLE) {
+                                            ind_buf = vk::Buffer{res_ind.vram_handle};
+                                            ind_off = res_ind.vram_offset;
+                                            resolved_ind = true;
+                                            if (res_ind.is_uav_or_ext_gpu ||
+                                                rasterizer.IsRegionGpuModifiedForMt(ind_va,
+                                                                                    ind_bytes) ||
+                                                gw_gen != 0ULL) {
+                                                bool dup_ind = false;
+                                                for (u8 ui = 0; ui < cur_num_uav_indirect_refs;
+                                                     ++ui) {
+                                                    const auto& ex = cur_uav_indirect_refs[ui];
+                                                    if (ex.addr == ind_va &&
+                                                        ex.byte_size >=
+                                                            static_cast<u32>(ind_bytes)) {
+                                                        dup_ind = true;
+                                                        break;
+                                                    }
+                                                }
+                                                if (!dup_ind) {
+                                                    if (cur_num_uav_indirect_refs >=
+                                                        MtCompletedPassMeta::kMaxUavIndirectRefs) {
+                                                        MtMaybeLogBailBufSample(
+                                                            7u, 12u, false, ind_va, ind_bytes,
+                                                            vs_stage->pgm_hash);
+                                                        return abort_pass(MtBailReason::Buf);
+                                                    }
+                                                    cur_uav_indirect_refs
+                                                        [cur_num_uav_indirect_refs++] =
+                                                            MtCompletedPassMeta::UavIndirectRef{
+                                                                .addr = ind_va,
+                                                                .byte_size =
+                                                                    static_cast<u32>(ind_bytes),
+                                                            };
+                                                }
+                                            }
+                                        } else {
+                                            ind_step = 7u;
+                                        }
+                                    } else {
+                                        u64 ind_tot = 0ULL;
+                                        resolved_ind = resolve_gpu_stream_range(
+                                            ind_va, ind_bytes, ind_bytes, ind_buf, ind_off,
+                                            ind_tot, false, &ind_step);
+                                    }
+                                } else {
+                                    ind_step = 9u;
+                                }
+                            }
+                            if (!resolved_ind) {
+                                MtMaybeLogBailBufSample(7u, ind_step, false, ind_va, ind_bytes,
+                                                        vs_stage->pgm_hash);
+                                return abort_pass(MtBailReason::Buf);
+                            }
                         }
                     }
 
@@ -3763,7 +3995,8 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
                         push_data.buf_offsets[39] = fx_mask;
                     }
 
-                    if (pso->GetGraphicsKey().motion_vectors != 0u && !guest_vbs.empty()) {
+                    if (!dp.is_indirect && pso->GetGraphicsKey().motion_vectors != 0u &&
+                        !guest_vbs.empty()) {
                         if (auto* obj_motion = rasterizer.GetObjectMotion();
                             obj_motion && obj_motion->Enabled()) {
                             const u64 motion_geometry = XXH3_64bits(
@@ -4186,7 +4419,7 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
                     // Dynamic State Commit (with upscaler target_scale & jitter_eligible check)
                     const bool jitter_eligible =
                         cur_ts.is_scene_depth && vs_stage->pgm_hash != 0x000000008747a367ULL &&
-                        (rregs.num_indices > 6u || num_instances > 1u);
+                        (dp.is_indirect || rregs.num_indices > 6u || num_instances > 1u);
                     const std::array<float, 2> cur_draw_jitter =
                         jitter_eligible ? cur_ts.frame_jitter : std::array<float, 2>{0.0f, 0.0f};
 
@@ -4211,7 +4444,13 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
                             [cmd = w.active_cmdbuf](auto&& fn) { fn(cmd); });
                     }
 
-                    if (occ_decision.query_slot >= 0 && occ_decision.pool) {
+                    if (dp.is_indirect) {
+                        if (dp.is_indexed) {
+                            w.active_cmdbuf.drawIndexedIndirect(ind_buf, ind_off, 1u, 20u);
+                        } else {
+                            w.active_cmdbuf.drawIndirect(ind_buf, ind_off, 1u, 16u);
+                        }
+                    } else if (occ_decision.query_slot >= 0 && occ_decision.pool) {
                         const auto q_slot = static_cast<u32>(occ_decision.query_slot);
                         w.active_cmdbuf.beginQuery(occ_decision.pool, q_slot, {});
                         if (dp.is_indexed) {
@@ -4296,14 +4535,19 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
         pub_meta.first_pso = sp.first_pso;
         pub_meta.sec_cmd = sp.sec_cmd;
         pub_meta.recorded_draws = sp.recorded_draws;
+        pub_meta.guest_frame = cur_guest_frame;
         pub_meta.occ_block_id = sp_occ_id;
         pub_meta.is_gbuffer = sp.is_gbuffer;
         pub_meta.has_camera_cb = sp.is_gbuffer && has_camera_cb;
         pub_meta.inherits_occlusion_query = sp.inherits_occlusion_query;
         pub_meta.num_sampled_rt_refs = sp.num_sampled_rt_refs;
+        pub_meta.num_uav_indirect_refs = sp.num_uav_indirect_refs;
         pub_meta.motion_slot = sp.motion_slot;
         if (sp.num_sampled_rt_refs != 0u) {
             pub_meta.sampled_rt_refs = sp.sampled_rt_refs;
+        }
+        if (sp.num_uav_indirect_refs != 0u) {
+            pub_meta.uav_indirect_refs = sp.uav_indirect_refs;
         }
         if (pub_meta.has_camera_cb) {
             pub_meta.camera_cb_floats = camera_cb_floats;

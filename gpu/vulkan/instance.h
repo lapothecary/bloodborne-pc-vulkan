@@ -244,6 +244,9 @@ public:
     bool IsDynamicColorWriteMaskSupported() const {
         return ext.dynamic_state_3 && dynamic_color_write_mask;
     }
+    bool IsDynamicRenderingUnusedAttachmentsSupported() const noexcept {
+        return ext.unused_attachments && dynamic_rendering_unused_attachments;
+    }
     bool IsVertexInputDynamicState() const {
         return ext.vertex_input_dynamic_state;
     }
@@ -368,9 +371,9 @@ private:
     /// Extensions enabled on the device.
     struct Extensions {
         bool maintenance_5, maintenance_8, buffer_marker, feedback_loop, depth_range_unrestricted,
-            dynamic_state_3, custom_border_color, depth_clip_control, depth_clip_enable,
-            vertex_input_dynamic_state, list_restart, explicit_vertex_parameter, barycentric,
-            provoking_vertex, stencil_export, image_load_store_lod, amd_gcn_shader,
+            dynamic_state_3, unused_attachments, custom_border_color, depth_clip_control,
+            depth_clip_enable, vertex_input_dynamic_state, list_restart, explicit_vertex_parameter,
+            barycentric, provoking_vertex, stencil_export, image_load_store_lod, amd_gcn_shader,
             trinary_minmax, nv_mixed_samples, amd_mixed_samples, atomic_float, atomic_float2,
             workgroup_layout, view_2d_of_3d, image_view_min_lod, memory_budget, memory_fd,
             dma_buf, memory_host, compute_derivatives, mixed_float_dot, cooperative_matrix,
@@ -400,6 +403,7 @@ private:
     Extensions ext{};
     // Features of extensions the renderer checks one by one.
     bool dynamic_color_write_mask = false;
+    bool dynamic_rendering_unused_attachments = false;
     bool list_restart = false;
     bool patch_list_restart = false;
     bool atomic_float_buffer_minmax = false;

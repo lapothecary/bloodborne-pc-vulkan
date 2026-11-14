@@ -563,6 +563,7 @@ bool TemporalUpscaler::OnFrameStart() {
     mt_redirected_sampled_id.store(
         (display_redirect && !display_in_place) ? ui_color.index : 0u,
         std::memory_order_relaxed);
+    mt_ui_color_id.store(0u, std::memory_order_relaxed);
     ui_phase = false;
     ui_in_place = false;
     ui_read_barrier = false;
@@ -1966,6 +1967,7 @@ void TemporalUpscaler::RunUiOnly(VideoCore::ImageId color_id, VideoCore::ImageId
         ui_height = target_height;
         ui_color = color_id;
         ui_depth = depth_id;
+        mt_ui_color_id.store(color_id.index, std::memory_order_relaxed);
         return;
     }
 
@@ -2066,6 +2068,7 @@ void TemporalUpscaler::RunUiOnly(VideoCore::ImageId color_id, VideoCore::ImageId
     done_this_frame = ui_phase = true;
     ui_color = color_id;
     ui_depth = depth_id;
+    mt_ui_color_id.store(color_id.index, std::memory_order_relaxed);
 }
 
 void TemporalUpscaler::EnsureLiveInputResources(u32 w, u32 h, vk::Format color_fmt,
@@ -2500,6 +2503,7 @@ void TemporalUpscaler::RunScaled() {
             hudless_taken = false;
             ui_color = ldr_target;
             ui_depth = camera_motion.Depth();
+            mt_ui_color_id.store(ldr_target.index, std::memory_order_relaxed);
         }
         return;
     }
@@ -2588,6 +2592,7 @@ void TemporalUpscaler::RunScaled() {
         hudless_taken = false;
         ui_color = ldr_target;
         ui_depth = camera_motion.Depth();
+        mt_ui_color_id.store(ldr_target.index, std::memory_order_relaxed);
     }
 }
 

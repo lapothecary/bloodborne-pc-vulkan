@@ -178,6 +178,7 @@ void Instance::CreateDevice() {
         vk::PhysicalDeviceVulkan12Features, vk::PhysicalDeviceVulkan13Features,
         vk::PhysicalDeviceRobustness2FeaturesEXT,
         vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT,
+        vk::PhysicalDeviceDynamicRenderingUnusedAttachmentsFeaturesEXT,
         vk::PhysicalDevicePrimitiveTopologyListRestartFeaturesEXT,
         vk::PhysicalDeviceShaderAtomicFloat2FeaturesEXT,
         vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR,
@@ -227,6 +228,11 @@ void Instance::CreateDevice() {
     ext.dynamic_state_3 = enable(VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME);
     dynamic_color_write_mask = query.get<vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT>()
                                    .extendedDynamicState3ColorWriteMask;
+    dynamic_rendering_unused_attachments =
+        query.get<vk::PhysicalDeviceDynamicRenderingUnusedAttachmentsFeaturesEXT>()
+            .dynamicRenderingUnusedAttachments;
+    ext.unused_attachments = dynamic_rendering_unused_attachments &&
+                             enable(VK_EXT_DYNAMIC_RENDERING_UNUSED_ATTACHMENTS_EXTENSION_NAME);
     ext.custom_border_color = enable(VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME);
     ext.depth_clip_control = enable(VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME);
     ext.depth_clip_enable = enable(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
@@ -389,6 +395,8 @@ void Instance::CreateDevice() {
         .customBorderColors = true, .customBorderColorWithoutFormat = true};
     vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT dynamic3{
         .extendedDynamicState3ColorWriteMask = dynamic_color_write_mask};
+    vk::PhysicalDeviceDynamicRenderingUnusedAttachmentsFeaturesEXT unused_attachments{
+        .dynamicRenderingUnusedAttachments = true};
     vk::PhysicalDeviceDepthClipControlFeaturesEXT clip_control{.depthClipControl = true};
     vk::PhysicalDeviceDepthClipEnableFeaturesEXT clip_enable{.depthClipEnable = true};
     vk::PhysicalDeviceVertexInputDynamicStateFeaturesEXT vertex_input{
@@ -445,6 +453,7 @@ void Instance::CreateDevice() {
     };
     link_if(ext.custom_border_color, border);
     link_if(ext.dynamic_state_3, dynamic3);
+    link_if(ext.unused_attachments, unused_attachments);
     link_if(ext.depth_clip_control, clip_control);
     link_if(ext.depth_clip_enable, clip_enable);
     link_if(ext.vertex_input_dynamic_state, vertex_input);

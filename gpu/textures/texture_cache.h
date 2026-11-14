@@ -203,7 +203,8 @@ public:
     }
     /// N2.1: Marks a GPU-DMA uploaded asset VkImage as DirectImmutable (disarming any page traps,
     /// registering direct_assets_by_addr, and enabling O(1) lock-free IsUpToDate).
-    void MarkDirectImmutableAsset(ImageId image_id);
+    void MarkDirectImmutableAsset(ImageId image_id,
+                                  const ImageViewInfo* ensure_sampled_view = nullptr);
     /// Phase 4.3e: Permanently demotes an image from DirectImmutable (stripping flag, erasing
     /// direct_assets_by_addr, and bumping ImmutableRoEpoch once) when written as RT/Storage/Copy.
     void DemoteDirectImmutable(ImageId image_id);

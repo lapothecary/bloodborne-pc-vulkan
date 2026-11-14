@@ -550,45 +550,78 @@ bool Rasterizer::InspectMtPassTargets(
         key.motion_vectors != 0u ? (key.mrt_mask & ~(1u << Shader::MotionVectors::Output))
                                  : key.mrt_mask;
     const u32 num_guest_cb = std::bit_width(guest_mrt_mask);
+    const auto* vs_stage = first_pso->GetStages()[u32(Shader::SwStage::Vertex)];
+    const u64 vs_hash = vs_stage ? vs_stage->pgm_hash : 0ULL;
 
-    // Ensure `PrepareRenderState`'s `want_depth` agrees with `GraphicsPipelineKey`'s depth/stencil
-    // formats so `VkCommandBufferInheritanceRenderingInfo` and `VkRenderingInfo` match 100%.
+    // Ensure `PrepareRenderState`'s `want_depth` agrees with `GraphicsPipelineKey` (or
+    // `VK_EXT_dynamic_rendering_unused_attachments` when a color-only pass leaves a stale
+    // `regs.depth_buffer` bound while `depth_enable == 0 && stencil_enable == 0`).
     const bool has_bound_ds = regs.depth_buffer.DepthValid() || regs.depth_buffer.StencilValid();
     const bool want_depth =
         (regs.depth_control.depth_enable && regs.depth_buffer.DepthValid()) ||
         (regs.depth_control.stencil_enable && regs.depth_buffer.StencilValid());
-    if (has_bound_ds != want_depth) {
+    if (want_depth && !has_bound_ds) {
         return fail(4, regs.depth_buffer.DepthAddress());
     }
-    if (has_bound_ds && regs.depth_buffer.DepthAddress() == 0 &&
+    if (!want_depth && has_bound_ds) {
+        const bool key_ds_empty =
+            key.z_format == Gcn::DepthBuffer::ZFormat::Invalid &&
+            key.stencil_format == Gcn::DepthBuffer::StencilFormat::Invalid;
+        const bool unused_ds_ok =
+            instance.IsDynamicRenderingUnusedAttachmentsSupported() &&
+            key.depth_samples == key.num_samples;
+        if (!key_ds_empty && !unused_ds_ok) {
+            return fail(4, regs.depth_buffer.DepthAddress());
+        }
+    }
+    if (want_depth && regs.depth_buffer.DepthAddress() == 0 &&
         regs.depth_buffer.StencilAddress() == 0) {
         return fail(4);
     }
 
-    // Keep Scaleform stencil-only masks (`mrt_mask == 0 && WritesStencil()`) on Stage A/B so
-    // `TemporalUpscaler::RedirectDepth` and `VfxUiBatcher` stay single-threaded.
-    if (guest_mrt_mask == 0u && (!want_depth || regs.WritesStencil())) {
+    const bool color_disabled =
+        regs.color_control.mode == Gcn::ColorControl::OperationMode::Disable;
+    u32 active_guest_cb_mask = 0u;
+    if (!color_disabled) {
+        for (u32 cb = 0; cb < num_guest_cb; ++cb) {
+            if ((guest_mrt_mask & (1u << cb)) != 0u && regs.color_buffers[cb] &&
+                regs.color_target_mask.GetMask(cb) != 0u) {
+                active_guest_cb_mask |= (1u << cb);
+            }
+        }
+    }
+
+    // Keep Scaleform stencil-only masks (`active_guest_cb_mask == 0 && WritesStencil()`) on
+    // Stage A/B so `TemporalUpscaler::RedirectDepth` and `VfxUiBatcher` stay single-threaded.
+    if (active_guest_cb_mask == 0u && !has_motion_mv && (!want_depth || regs.WritesStencil())) {
         return fail(5, regs.depth_buffer.DepthAddress());
     }
 
-    const bool color_disabled =
-        regs.color_control.mode == Gcn::ColorControl::OperationMode::Disable;
     for (u32 cb = 0; cb < num_guest_cb; ++cb) {
         if ((guest_mrt_mask & (1u << cb)) == 0u) {
             continue;
         }
-        if (color_disabled || !regs.color_buffers[cb] ||
-            regs.color_target_mask.GetMask(cb) == 0u || regs.color_buffers[cb].Address() == 0) {
-            return fail(6, regs.color_buffers[cb].Address());
+        if ((active_guest_cb_mask & (1u << cb)) == 0u) {
+            // Unbound/masked shader MRT slot (e.g. CSM/Spot foliage alpha-test shadow depth):
+            // `RefreshGraphicsKey` sets `key.color_buffers[cb] = FormatInvalid` (`eUndefined`),
+            // matching Stage B's null `pColorAttachments[cb].imageView`.
+            const auto& kcb = key.color_buffers[cb];
+            if (kcb.data_format != Gcn::DataFormat::FormatInvalid &&
+                !instance.IsDynamicRenderingUnusedAttachmentsSupported()) {
+                return fail(6, regs.color_buffers[cb].Address());
+            }
+            continue;
         }
-        if (FrameCapture::IsDisplayBuffer(regs.color_buffers[cb].Address())) {
+        if (regs.color_buffers[cb].Address() == 0 ||
+            FrameCapture::IsDisplayBuffer(regs.color_buffers[cb].Address())) {
             return fail(6, regs.color_buffers[cb].Address());
         }
     }
 
     if (instance.IsMixedDepthSamplesSupported() && key.num_color_attachments > 0u) {
         for (u32 cb = 0; cb < key.num_color_attachments; ++cb) {
-            if ((key.mrt_mask & (1u << cb)) != 0u && key.color_samples[cb] != key.depth_samples) {
+            if ((active_guest_cb_mask & (1u << cb)) != 0u &&
+                key.color_samples[cb] != key.depth_samples) {
                 return fail(7, regs.color_buffers[cb].Address());
             }
         }
@@ -599,6 +632,10 @@ bool Rasterizer::InspectMtPassTargets(
                                     vk::FormatFeatureFlagBits2::eDepthStencilAttachment);
     out.num_color_attachments = key.num_color_attachments;
     for (u32 i = 0; i < key.num_color_attachments; ++i) {
+        if (i < num_guest_cb && (active_guest_cb_mask & (1u << i)) == 0u) {
+            out.color_formats[i] = vk::Format::eUndefined;
+            continue;
+        }
         const auto& color = key.color_buffers[i];
         out.color_formats[i] = instance.GetSupportedFormat(
             GcnToVk::SurfaceFormat(color.data_format, color.num_format),
@@ -611,14 +648,25 @@ bool Rasterizer::InspectMtPassTargets(
         out.has_motion_attachment = true;
     }
 
-    // Keep single-target LDR 8-bit passes (UI / Scaleform / SMAA / Tonemap LDR) on Stage A/B so
-    // `TemporalUpscaler::RedirectColor` and `VfxUiBatcher` never collide with secondary buffers.
-    if (std::popcount(guest_mrt_mask) == 1) {
-        const u32 only_cb = static_cast<u32>(std::countr_zero(guest_mrt_mask));
+    // Keep 2D / UI / Scaleform / SMAA / Tonemap LDR single-target 8-bit passes on Stage A/B so
+    // `TemporalUpscaler::RedirectColor` and `VfxUiBatcher` never collide with secondary buffers,
+    // while allowing 3D depth-tested passes such as `Object-Velocity` (`1280x720 R8G8B8A8Unorm`).
+    bool single_8bit_3d_cand = false;
+    u32 single_8bit_cb = 0u;
+    if (std::popcount(active_guest_cb_mask) == 1) {
+        const u32 only_cb = static_cast<u32>(std::countr_zero(active_guest_cb_mask));
         const vk::Format fmt = out.color_formats[only_cb];
         if (fmt == vk::Format::eR8G8B8A8Unorm || fmt == vk::Format::eR8G8B8A8Srgb ||
             fmt == vk::Format::eB8G8R8A8Unorm || fmt == vk::Format::eB8G8R8A8Srgb) {
-            return fail(8, regs.color_buffers[only_cb].Address());
+            const bool is_3d_depth_pass =
+                want_depth && regs.depth_control.depth_enable && !regs.WritesStencil() &&
+                !regs.IsClipDisabled() && vs_hash != 0x000000000b0acf50ULL &&
+                vs_hash != 0x0000000034e8a281ULL;
+            if (!is_3d_depth_pass) {
+                return fail(8, regs.color_buffers[only_cb].Address());
+            }
+            single_8bit_3d_cand = true;
+            single_8bit_cb = only_cb;
         }
     }
 
@@ -636,7 +684,7 @@ bool Rasterizer::InspectMtPassTargets(
 
     VideoCore::ImageInfo cb0_info{};
     for (u32 cb = 0; cb < num_guest_cb; ++cb) {
-        if ((guest_mrt_mask & (1u << cb)) == 0u) {
+        if ((active_guest_cb_mask & (1u << cb)) == 0u) {
             continue;
         }
         VideoCore::TextureCache::ImageDesc desc{regs.color_buffers[cb], cb_extents[cb]};
@@ -660,6 +708,9 @@ bool Rasterizer::InspectMtPassTargets(
             out.diag_h = info.size.height;
             out.diag_guest_size = info.guest_size;
             return fail(10, desc.info.guest_address);
+        }
+        if (single_8bit_3d_cand && cb == single_8bit_cb && upscaler && upscaler->IsUiColorMt(id)) {
+            return fail(8, desc.info.guest_address);
         }
         out.cb_ids[cb] = id;
         if (cb == 0u) {
@@ -708,18 +759,21 @@ bool Rasterizer::InspectMtPassTargets(
 
     // On reduced presets, a depth-only pass targeting full-size `scene_depth` before G-Buffer
     // (`scene_started == false`) would stay native on Stage B; defer only that edge case.
-    if (reduced_cfg && guest_mrt_mask == 0u && db_eligible_scene) {
+    if (reduced_cfg && active_guest_cb_mask == 0u && db_eligible_scene) {
         return fail(12, regs.depth_buffer.DepthAddress());
     }
 
     out.depth_format =
-        key.z_format != Gcn::DepthBuffer::ZFormat::Invalid ? depth_format : vk::Format::eUndefined;
-    out.stencil_format = key.stencil_format != Gcn::DepthBuffer::StencilFormat::Invalid
-                             ? depth_format
-                             : vk::Format::eUndefined;
+        (want_depth && key.z_format != Gcn::DepthBuffer::ZFormat::Invalid)
+            ? depth_format
+            : vk::Format::eUndefined;
+    out.stencil_format =
+        (want_depth && key.stencil_format != Gcn::DepthBuffer::StencilFormat::Invalid)
+            ? depth_format
+            : vk::Format::eUndefined;
     out.rasterization_samples = GcnToVk::NumSamples(
         key.num_samples, instance.GetColorSampleCounts() & instance.GetDepthSampleCounts());
-    out.is_gbuffer = (std::popcount(guest_mrt_mask) >= 5 && want_depth);
+    out.is_gbuffer = (std::popcount(active_guest_cb_mask) >= 5 && want_depth);
     const VAddr db_addr = want_depth ? regs.depth_buffer.DepthAddress() : VAddr{0};
     if (out.is_gbuffer && db_addr != 0) {
         mt_scene_depth_addr.store(db_addr, std::memory_order_relaxed);
@@ -730,10 +784,13 @@ bool Rasterizer::InspectMtPassTargets(
     }
     out.is_scene_depth =
         want_depth && (out.is_gbuffer || (db_addr != 0 && db_addr == known_scene_db));
+    if (single_8bit_3d_cand && out.is_scene_depth) {
+        return fail(8, regs.color_buffers[single_8bit_cb].Address());
+    }
     out.depth_write_or_stencil_write =
         want_depth && (bool(regs.depth_control.depth_write_enable) || regs.WritesStencil());
     out.is_scene_color =
-        out.is_scene_depth && out.cb_ids[0] && std::popcount(guest_mrt_mask) <= 2 &&
+        out.is_scene_depth && out.cb_ids[0] && std::popcount(active_guest_cb_mask) <= 2 &&
         cb0_info.pixel_format == vk::Format::eR16G16B16A16Sfloat &&
         cb0_info.size.width == db_info.size.width && cb0_info.size.height == db_info.size.height;
 

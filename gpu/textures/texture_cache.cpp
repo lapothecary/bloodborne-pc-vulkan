@@ -1163,7 +1163,8 @@ bool TextureCache::TryResolveSceneSrvViewMt(
     return true;
 }
 
-void TextureCache::MarkDirectImmutableAsset(ImageId image_id) {
+void TextureCache::MarkDirectImmutableAsset(ImageId image_id,
+                                            const ImageViewInfo* ensure_sampled_view) {
     if (!image_id || !slot_images.is_allocated(image_id)) {
         return;
     }
@@ -1174,7 +1175,10 @@ void TextureCache::MarkDirectImmutableAsset(ImageId image_id) {
         constexpr u32 kReady =
             u32(ImageFlagBits::Registered) | u32(ImageFlagBits::DirectImmutable);
         if ((flags & kReady) == kReady && (flags & u32(ImageFlagBits::GpuModified)) == 0u &&
-            !fast_img.MaybePromptIcon() && fast_img.track_addr == fast_img.guest_begin &&
+            !fast_img.MaybePromptIcon() &&
+            (!ensure_sampled_view ||
+             (fast_img.backing && !fast_img.backing->image_view_ids.empty())) &&
+            fast_img.track_addr == fast_img.guest_begin &&
             fast_img.track_addr_end == fast_img.guest_end) {
             return;
         }
@@ -1186,6 +1190,9 @@ void TextureCache::MarkDirectImmutableAsset(ImageId image_id) {
     Image& image = slot_images[image_id];
     if (False(image.flags & ImageFlagBits::Registered)) {
         return;
+    }
+    if (ensure_sampled_view && image.backing) {
+        (void)image.FindView(*ensure_sampled_view, false);
     }
     if (False(image.flags & ImageFlagBits::DirectImmutable)) {
         UntrackImage(image_id);

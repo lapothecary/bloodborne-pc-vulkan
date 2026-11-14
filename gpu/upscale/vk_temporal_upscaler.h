@@ -115,6 +115,10 @@ public:
         const u32 idx = mt_redirected_sampled_id.load(std::memory_order_relaxed);
         return idx != 0u && image.index == idx;
     }
+    [[nodiscard]] bool IsUiColorMt(VideoCore::ImageId image) const noexcept {
+        const u32 idx = mt_ui_color_id.load(std::memory_order_relaxed);
+        return idx != 0u && image.index == idx;
+    }
 
     // Scaled presets.
 
@@ -387,6 +391,7 @@ private:
     std::atomic<u64> mt_jitter_state{0};
     std::atomic<u32> mt_scene_mip_bias_bits{0};
     std::atomic<u32> mt_redirected_sampled_id{0};
+    std::atomic<u32> mt_ui_color_id{0};
     u32 stage_b_flips_retired = 0;
     bool flip_frame_started = false;
 };

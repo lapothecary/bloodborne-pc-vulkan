@@ -1425,7 +1425,11 @@ void Rasterizer::DirectUploadTextureSubresource(const DirectUploadTextureArgs& a
         dst_img.info.resources.levels == 1 && dst_img.info.resources.layers == 1 &&
         args.offset_x == 0 && args.offset_y == 0 && z_off == 0 &&
         ext_w == dst_mip_w && ext_h == dst_mip_h && ext_d == dst_mip_d;
-    if (!full_single_subres && True(dst_img.flags & VideoCore::ImageFlagBits::Dirty)) {
+    if (is_immutable_asset) {
+        // Guest `dst_va` of a DirectImmutable asset was never populated with CPU-tiled texels
+        // (it holds zeroes); never run a CPU untile/upload pass from `dst_va` over the VkImage.
+        dst_img.flags &= ~VideoCore::ImageFlagBits::Dirty;
+    } else if (!full_single_subres && True(dst_img.flags & VideoCore::ImageFlagBits::Dirty)) {
         texture_cache.UpdateImage(dst_id);
     }
 
@@ -1489,20 +1493,20 @@ void Rasterizer::DirectUploadTextureSubresource(const DirectUploadTextureArgs& a
     if (is_immutable_asset) {
         dst_img.flags &= ~VideoCore::ImageFlagBits::Dirty;
         dst_img.gpu_write_tick = scheduler.CurrentTick();
-        const bool is_final_subres =
-            (mip + 1u == info.resources.levels) &&
-            (layer + 1u == info.resources.layers) &&
-            (args.offset_x + ext_w >= dst_mip_w) &&
-            (args.offset_y + ext_h >= dst_mip_h) &&
-            (z_off + ext_d >= dst_mip_d);
-        if (is_final_subres) {
-            constexpr auto ShaderStages = vk::PipelineStageFlagBits2::eAllGraphics |
-                                          vk::PipelineStageFlagBits2::eComputeShader;
-            if (runtime.Transit(&dst_img, vk::ImageLayout::eShaderReadOnlyOptimal, ShaderStages,
-                                vk::AccessFlagBits2::eShaderRead)) {
-                runtime.FlushImageBarriers();
-            }
-            texture_cache.MarkDirectImmutableAsset(dst_id);
+        // Unconditionally settle the whole image into eShaderReadOnlyOptimal (`subresource_states`
+        // collapsed to empty) and mark DirectImmutable on every mip/layer upload, regardless of
+        // whether mips stream in reverse order (`levels-1 -> 0`) or stop at a partial mip chain.
+        constexpr auto ShaderStages = vk::PipelineStageFlagBits2::eAllGraphics |
+                                      vk::PipelineStageFlagBits2::eComputeShader;
+        if (runtime.Transit(&dst_img, vk::ImageLayout::eShaderReadOnlyOptimal, ShaderStages,
+                            vk::AccessFlagBits2::eShaderRead)) {
+            runtime.FlushImageBarriers();
+        }
+        const Shader::ImageResource sampled_res{};
+        const VideoCore::TextureCache::ImageDesc sampled_desc{gcn_img, sampled_res};
+        texture_cache.MarkDirectImmutableAsset(dst_id, &sampled_desc.view_info);
+        if (VideoCore::False(dst_img.flags & VideoCore::ImageFlagBits::DirectImmutable)) {
+            dst_img.flags |= VideoCore::ImageFlagBits::GpuModified;
         }
         return;
     }

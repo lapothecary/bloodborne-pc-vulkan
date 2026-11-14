@@ -287,13 +287,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
             } else {
                 ++texture_set_hits;
             }
-            if (!bind_helper.Available()) {
-                BbStats::native_tex_hits.store(
-                    BbStats::native_tex_hits.load(std::memory_order_relaxed) + stage_img_cnt,
-                    std::memory_order_relaxed);
-            } else {
-                BbStats::native_tex_hits.fetch_add(stage_img_cnt, std::memory_order_relaxed);
-            }
+            BbStats::native_tex_hits.fetch_add(stage_img_cnt, std::memory_order_relaxed);
             for (u32 i = 0; i < stage_img_cnt; ++i) {
                 set_writes[write_index++] = vk::WriteDescriptorSet{
                     .dstBinding = binding.unified++,
@@ -769,24 +763,11 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
             }
         }
     }
-    if (!on_helper && !bind_helper.Available()) {
-        if (local_native_hits != 0) {
-            BbStats::native_tex_hits.store(
-                BbStats::native_tex_hits.load(std::memory_order_relaxed) + local_native_hits,
-                std::memory_order_relaxed);
-        }
-        if (local_native_misses != 0) {
-            BbStats::native_tex_misses.store(
-                BbStats::native_tex_misses.load(std::memory_order_relaxed) + local_native_misses,
-                std::memory_order_relaxed);
-        }
-    } else {
-        if (local_native_hits != 0) {
-            BbStats::native_tex_hits.fetch_add(local_native_hits, std::memory_order_relaxed);
-        }
-        if (local_native_misses != 0) {
-            BbStats::native_tex_misses.fetch_add(local_native_misses, std::memory_order_relaxed);
-        }
+    if (local_native_hits != 0) {
+        BbStats::native_tex_hits.fetch_add(local_native_hits, std::memory_order_relaxed);
+    }
+    if (local_native_misses != 0) {
+        BbStats::native_tex_misses.fetch_add(local_native_misses, std::memory_order_relaxed);
     }
 
     if (set_ok && image_bindings.size() == stage.images.size()) {
@@ -1033,24 +1014,11 @@ void Rasterizer::BindSamplers(const Shader::Info& stage, const PreparedStage* pr
         };
     }
 
-    if (!bind_helper.Available()) {
-        if (local_native_hits != 0) {
-            BbStats::native_tex_hits.store(
-                BbStats::native_tex_hits.load(std::memory_order_relaxed) + local_native_hits,
-                std::memory_order_relaxed);
-        }
-        if (local_native_misses != 0) {
-            BbStats::native_tex_misses.store(
-                BbStats::native_tex_misses.load(std::memory_order_relaxed) + local_native_misses,
-                std::memory_order_relaxed);
-        }
-    } else {
-        if (local_native_hits != 0) {
-            BbStats::native_tex_hits.fetch_add(local_native_hits, std::memory_order_relaxed);
-        }
-        if (local_native_misses != 0) {
-            BbStats::native_tex_misses.fetch_add(local_native_misses, std::memory_order_relaxed);
-        }
+    if (local_native_hits != 0) {
+        BbStats::native_tex_hits.fetch_add(local_native_hits, std::memory_order_relaxed);
+    }
+    if (local_native_misses != 0) {
+        BbStats::native_tex_misses.fetch_add(local_native_misses, std::memory_order_relaxed);
     }
 }
 
@@ -1146,26 +1114,12 @@ bool Rasterizer::BindTexturesFromSet(const Shader::Info& stage, const u64* image
         ++texture_set_hits;
         const u32 valid_entries = set.valid_entries;
         const u32 set_nat = std::min<u32>(set.native_count, valid_entries);
-        if (!bind_helper.Available()) {
-            if (set_nat != 0) {
-                BbStats::native_tex_hits.store(
-                    BbStats::native_tex_hits.load(std::memory_order_relaxed) + set_nat,
-                    std::memory_order_relaxed);
-            }
-            if (valid_entries > set_nat) {
-                BbStats::native_tex_misses.store(
-                    BbStats::native_tex_misses.load(std::memory_order_relaxed) +
-                        (valid_entries - set_nat),
-                    std::memory_order_relaxed);
-            }
-        } else {
-            if (set_nat != 0) {
-                BbStats::native_tex_hits.fetch_add(set_nat, std::memory_order_relaxed);
-            }
-            if (valid_entries > set_nat) {
-                BbStats::native_tex_misses.fetch_add(valid_entries - set_nat,
-                                                     std::memory_order_relaxed);
-            }
+        if (set_nat != 0) {
+            BbStats::native_tex_hits.fetch_add(set_nat, std::memory_order_relaxed);
+        }
+        if (valid_entries > set_nat) {
+            BbStats::native_tex_misses.fetch_add(valid_entries - set_nat,
+                                                 std::memory_order_relaxed);
         }
         slot = nullptr;
     };
@@ -1394,6 +1348,11 @@ Rasterizer::MtResolvedSrv Rasterizer::ResolveSceneSrvViewMt(
         return out;
     }
 
+    const u32 raw_dw7 = reinterpret_cast<const u32*>(&raw_sharp)[7];
+    const bool has_srv_uid =
+        ((raw_dw7 >> 24) == VideoCore::DirectTextures::kSrvTagMagic) &&
+        ((raw_dw7 & 0xFFFFu) != 0u) &&
+        ((raw_dw7 & 0xFFFFu) < VideoCore::DirectTextures::kMaxNativeSrvs);
     Gcn::Image clean_sharp = raw_sharp;
     u8 dummy_gen8 = 0;
     (void)VideoCore::DirectTextures::UnpackAndCleanSrv(clean_sharp, dummy_gen8);
@@ -1447,9 +1406,11 @@ Rasterizer::MtResolvedSrv Rasterizer::ResolveSceneSrvViewMt(
         return out;
     }
 
-    if (!needs_transit && out_hits) {
-        ++(*out_hits);
-    } else if (needs_transit && out_misses) {
+    if (has_srv_uid) {
+        if (out_hits) {
+            ++(*out_hits);
+        }
+    } else if (out_misses) {
         ++(*out_misses);
     }
     out.view = view;
@@ -1534,30 +1495,35 @@ vk::Sampler Rasterizer::ResolveSamplerMt(const Gcn::Sampler& raw_ssharp, bool is
 
     const vk::Sampler resolved =
         texture_cache.GetSamplerMt(clean_sharp, bc_base, is_depth, is_depth ? 0.0f : lod_bias);
-    if (smp_uid != 0u && mt_sampler_publish && resolved) {
-        auto& mp = mt_sampler_publish[smp_uid];
-        u32 exp = mp.seq.load(std::memory_order_relaxed) & ~1u;
-        if (mp.seq.compare_exchange_strong(exp, exp + 1u, std::memory_order_acquire,
-                                           std::memory_order_relaxed)) {
-            const bool same_cfg =
-                (exp != 0u && mp.tagged_words == raw_words && mp.evict_gen == cur_evict_gen &&
-                 mp.forced_aniso == forced_aniso && mp.forced_aniso_off == u8(aniso_off) &&
-                 mp.bc_base_addr == bc_base.base_addr &&
-                 (is_depth || mp.bias_bits == color_bias_bits));
-            if (!same_cfg) {
-                mp.handles = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+    if (smp_uid != 0u && resolved) {
+        if (out_hits) {
+            ++(*out_hits);
+        }
+        if (mt_sampler_publish) {
+            auto& mp = mt_sampler_publish[smp_uid];
+            u32 exp = mp.seq.load(std::memory_order_relaxed) & ~1u;
+            if (mp.seq.compare_exchange_strong(exp, exp + 1u, std::memory_order_acquire,
+                                               std::memory_order_relaxed)) {
+                const bool same_cfg =
+                    (exp != 0u && mp.tagged_words == raw_words && mp.evict_gen == cur_evict_gen &&
+                     mp.forced_aniso == forced_aniso && mp.forced_aniso_off == u8(aniso_off) &&
+                     mp.bc_base_addr == bc_base.base_addr &&
+                     (is_depth || mp.bias_bits == color_bias_bits));
+                if (!same_cfg) {
+                    mp.handles = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+                }
+                mp.tagged_words = raw_words;
+                if (!is_depth || !same_cfg) {
+                    mp.bias_bits = color_bias_bits;
+                }
+                mp.bc_base_addr = bc_base.base_addr;
+                mp.evict_gen = cur_evict_gen;
+                mp.forced_aniso = forced_aniso;
+                mp.forced_aniso_off = u8(aniso_off);
+                mp.handles[slot_idx] = static_cast<VkSampler>(resolved);
+                std::atomic_thread_fence(std::memory_order_release);
+                mp.seq.store(exp + 2u, std::memory_order_release);
             }
-            mp.tagged_words = raw_words;
-            if (!is_depth || !same_cfg) {
-                mp.bias_bits = color_bias_bits;
-            }
-            mp.bc_base_addr = bc_base.base_addr;
-            mp.evict_gen = cur_evict_gen;
-            mp.forced_aniso = forced_aniso;
-            mp.forced_aniso_off = u8(aniso_off);
-            mp.handles[slot_idx] = static_cast<VkSampler>(resolved);
-            std::atomic_thread_fence(std::memory_order_release);
-            mp.seq.store(exp + 2u, std::memory_order_release);
         }
     }
     return resolved;

@@ -40,7 +40,7 @@ inline u64 SteadyNowNs() noexcept {
 struct SceneOcclusionCuller {
     static constexpr u32 NumSlices = 8;
     static constexpr u32 SliceQueries = 512;
-    static constexpr u32 MtQueryBlocks = 64;
+    static constexpr u32 MtQueryBlocks = 128;
     static constexpr u32 MtQueriesPerBlock = 256;
     static constexpr u32 TableBuckets = 1024;
     static constexpr u32 BucketWays = 4;
@@ -74,19 +74,21 @@ struct SceneOcclusionCuller {
     vk::UniqueQueryPool mt_pool;
     bool initialized = false;
     bool enabled = true;
-    bool mt_occ_cull = false;
+    bool mt_occ_cull = true;
     bool micro_shadow_cull = true;
     std::atomic<u32> cur_frame{1};
     u32 cur_slice = 0;
     u32 gbuf_draws_in_frame = 0;
     u32 log_frame_counter = 0;
-    std::atomic<u32> mt_gbuf_frame{0};
-    std::atomic<u32> mt_gbuf_draws_in_frame{0};
+    std::atomic<u64> mt_gbuf_frame_and_count{0};
     std::atomic<u32> mt_block_hint{0};
     u32 mt_last_collect_frame = 0;
     std::atomic<bool> camera_moving{false};
     std::atomic<bool> fast_camera_turn{false};
     std::atomic<u32> cam_updated_frame{0};
+    std::array<std::atomic<float>, 3> pub_cam_pos{};
+    std::array<std::atomic<float>, 3> pub_cam_fwd{};
+    std::atomic<bool> pub_cam_valid{false};
     std::mutex cam_mutex;
     bool has_prev_cam = false;
     std::array<float, 3> prev_cam_pos{};
@@ -116,7 +118,7 @@ struct SceneOcclusionCuller {
             enabled = (e[0] != '0');
         }
         if (const char* e = std::getenv("BB_MT_OCC_CULL")) {
-            mt_occ_cull = (e[0] == '1');
+            mt_occ_cull = (e[0] != '0');
         }
         if (const char* e = std::getenv("BB_MICRO_SHADOW_CULL")) {
             micro_shadow_cull = (e[0] != '0');
@@ -151,6 +153,19 @@ struct SceneOcclusionCuller {
     [[nodiscard]] u32 ActiveFrameTag() const noexcept {
         const u32 gf = BbStats::guest_frame_number.load(std::memory_order_relaxed);
         return (gf != 0u) ? gf : cur_frame.load(std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] u32 NextMtGBufOrdinal(u32 frame_tag) noexcept {
+        u64 cur = mt_gbuf_frame_and_count.load(std::memory_order_relaxed);
+        for (;;) {
+            const auto cur_f = static_cast<u32>(cur >> 32u);
+            const u32 next_c = (cur_f == frame_tag) ? (static_cast<u32>(cur) + 1u) : 1u;
+            const u64 desired = (static_cast<u64>(frame_tag) << 32u) | next_c;
+            if (mt_gbuf_frame_and_count.compare_exchange_weak(
+                    cur, desired, std::memory_order_relaxed, std::memory_order_relaxed)) {
+                return next_c;
+            }
+        }
     }
 
     void ApplyQuerySamplesToEntries(const u16* idx_arr, const u64* samples, u32 count,
@@ -289,13 +304,22 @@ struct SceneOcclusionCuller {
         prev_cam_pos = {pos[0], pos[1], pos[2]};
         prev_cam_fwd = {fwd[0], fwd[1], fwd[2]};
         has_prev_cam = true;
+        pub_cam_pos[0].store(pos[0], std::memory_order_relaxed);
+        pub_cam_pos[1].store(pos[1], std::memory_order_relaxed);
+        pub_cam_pos[2].store(pos[2], std::memory_order_relaxed);
+        pub_cam_fwd[0].store(fwd[0], std::memory_order_relaxed);
+        pub_cam_fwd[1].store(fwd[1], std::memory_order_relaxed);
+        pub_cam_fwd[2].store(fwd[2], std::memory_order_relaxed);
+        pub_cam_valid.store(true, std::memory_order_release);
         camera_moving.store(mov, std::memory_order_relaxed);
         fast_camera_turn.store(fast_turn, std::memory_order_relaxed);
         cam_updated_frame.store(frame_tag, std::memory_order_release);
     }
 
     void UpdateCameraFromSceneConstants(const float* data, u32 frame_tag) noexcept {
-        if (!data || cam_updated_frame.load(std::memory_order_acquire) == frame_tag) {
+        const u32 cur_cam_f = cam_updated_frame.load(std::memory_order_acquire);
+        if (!data || frame_tag == 0u ||
+            (cur_cam_f != 0u && static_cast<s32>(frame_tag - cur_cam_f) <= 0)) {
             return;
         }
         if (data[0] != 3000.0f || data[4] < 64.0f || data[5] < 64.0f ||
@@ -309,7 +333,8 @@ struct SceneOcclusionCuller {
             return;
         }
         std::scoped_lock lk{cam_mutex};
-        if (cam_updated_frame.load(std::memory_order_relaxed) == frame_tag) {
+        const u32 locked_cam_f = cam_updated_frame.load(std::memory_order_relaxed);
+        if (locked_cam_f != 0u && static_cast<s32>(frame_tag - locked_cam_f) <= 0) {
             return;
         }
         ApplyCameraPoseLocked(pos, fwd, frame_tag);
@@ -363,7 +388,8 @@ struct SceneOcclusionCuller {
         }
     }
 
-    u16 FindOrInsertEntry(u64 key, u32 frame_tag) noexcept {
+    u16 FindOrInsertEntry(u64 key, u32 frame_tag, bool& out_inserted) noexcept {
+        out_inserted = false;
         const u32 bucket = static_cast<u32>((key ^ (key >> 33)) & (TableBuckets - 1));
         const u16 base = static_cast<u16>(bucket * BucketWays);
         for (u16 w = 0; w < BucketWays; ++w) {
@@ -378,13 +404,14 @@ struct SceneOcclusionCuller {
             }
             u64 old_key = cand.key.load(std::memory_order_relaxed);
             const u32 old_seen = cand.last_seen_frame.load(std::memory_order_relaxed);
-            if (old_key == 0 || old_seen + 4u < frame_tag) {
+            if (old_key == 0 || (old_seen != 0u && static_cast<s32>(frame_tag - old_seen) > 4)) {
                 if (cand.key.compare_exchange_strong(old_key, key, std::memory_order_acq_rel,
                                                      std::memory_order_relaxed)) {
-                    cand.last_seen_frame.store(0, std::memory_order_relaxed);
                     cand.skip_until_frame.store(0, std::memory_order_relaxed);
                     cand.zero_streak.store(0, std::memory_order_relaxed);
                     cand.multi_occ.store(0, std::memory_order_relaxed);
+                    cand.last_seen_frame.store(frame_tag, std::memory_order_release);
+                    out_inserted = true;
                     return base + w;
                 }
                 if (old_key == key) {
@@ -507,6 +534,11 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
         std::make_unique<MtSrvPublishEntry[]>(VideoCore::DirectTextures::kMaxNativeSrvs);
     mt_sampler_publish =
         std::make_unique<MtSamplerPublishEntry[]>(VideoCore::DirectTextures::kMaxNativeSamplers);
+    scene_occlusion_culler = std::make_unique<SceneOcclusionCuller>();
+    if (!EmulatorSettings.IsNullGPU()) {
+        object_vel_culler = std::make_unique<ObjectVelocityCuller>();
+        scene_occlusion_culler->EnsureInit(instance);
+    }
     mt_direct_recorder = std::make_unique<VkMtDirectRecorder>(instance, scheduler, *this);
     draw_prep = std::make_unique<DrawPreparation>(pipeline_cache);
     // A program (or fetch shader) that does not look like one yet: the game may have copied it
@@ -540,11 +572,6 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     VideoCore::DirectBuffers::SetActiveCaches(&buffer_cache, &texture_cache);
 
     GpuProfiler::Init(instance, scheduler);
-    scene_occlusion_culler = std::make_unique<SceneOcclusionCuller>();
-    if (!EmulatorSettings.IsNullGPU()) {
-        object_vel_culler = std::make_unique<ObjectVelocityCuller>();
-        scene_occlusion_culler->EnsureInit(instance);
-    }
     if (DrawPipeWanted()) {
         constant_ring = std::make_unique<ConstantRing>(instance, scheduler);
         light_tile_batcher = std::make_unique<LightTileBatcher>();
@@ -911,14 +938,7 @@ Rasterizer::MtOcclusionDecision Rasterizer::EvaluateGBufferOcclusionMt(
     }
 
     const u32 frame_tag = culler.ActiveFrameTag();
-    u32 prev_gf = culler.mt_gbuf_frame.load(std::memory_order_relaxed);
-    if (prev_gf != frame_tag &&
-        culler.mt_gbuf_frame.compare_exchange_strong(prev_gf, frame_tag, std::memory_order_acq_rel,
-                                                     std::memory_order_relaxed)) {
-        culler.mt_gbuf_draws_in_frame.store(0u, std::memory_order_relaxed);
-    }
-    const u32 gbuf_ord =
-        culler.mt_gbuf_draws_in_frame.fetch_add(1u, std::memory_order_relaxed) + 1u;
+    const u32 gbuf_ord = culler.NextMtGBufOrdinal(frame_tag);
 
     VAddr cue_base = 0;
     VAddr cue_end = 0;
@@ -948,6 +968,9 @@ Rasterizer::MtOcclusionDecision Rasterizer::EvaluateGBufferOcclusionMt(
     u32 inst_cb_size = 0;
     const u8* palette_ptr = nullptr;
     u32 palette_size = 0;
+    bool worker_has_cam = false;
+    float worker_cam_pos[3]{};
+    float worker_cam_fwd[3]{};
 
     for (u32 b_idx = 0; b_idx < vs_stage.buffers.size(); ++b_idx) {
         const auto& res = vs_stage.buffers[b_idx];
@@ -969,11 +992,25 @@ Rasterizer::MtOcclusionDecision Rasterizer::EvaluateGBufferOcclusionMt(
         if (!resolve_cb(resolve_ctx, sharp, cb_ptr, cb_size) || !cb_ptr) {
             continue;
         }
-        if (req_sz == 864u && cb_size >= 864u && sharp.GetStride() == 16u &&
-            reinterpret_cast<const float*>(cb_ptr)[0] == 3000.0f) {
-            culler.UpdateCameraFromSceneConstants(reinterpret_cast<const float*>(cb_ptr),
-                                                  frame_tag);
-        } else if (req_sz == 416u && !is_inst_gbuf_vs && cb_size >= 84u) {
+        if (req_sz == 864u && cb_size >= 864u && sharp.GetStride() == 16u) {
+            const float* cf = reinterpret_cast<const float*>(cb_ptr);
+            if (cf[0] == 3000.0f && cf[4] >= 64.0f && cf[5] >= 64.0f &&
+                std::abs(cf[1] * cf[0] - 1.0f) <= 1e-3f && std::isfinite(cf[183]) &&
+                std::isfinite(cf[187]) && std::isfinite(cf[191]) && std::isfinite(cf[182]) &&
+                std::isfinite(cf[186]) && std::isfinite(cf[190])) {
+                worker_cam_pos[0] = cf[183];
+                worker_cam_pos[1] = cf[187];
+                worker_cam_pos[2] = cf[191];
+                worker_cam_fwd[0] = cf[182];
+                worker_cam_fwd[1] = cf[186];
+                worker_cam_fwd[2] = cf[190];
+                worker_has_cam = true;
+            }
+            if (cf[0] == 3000.0f) {
+                continue;
+            }
+        }
+        if (req_sz == 416u && !is_inst_gbuf_vs && cb_size >= 84u) {
             std::memcpy(&model_base_matrix_idx, cb_ptr + 80u, sizeof(u32));
             has_model_cb = true;
         } else if (is_inst_gbuf_vs && req_sz >= 208u && req_sz <= 32768u &&
@@ -1034,27 +1071,52 @@ Rasterizer::MtOcclusionDecision Rasterizer::EvaluateGBufferOcclusionMt(
         draw_key = 1ull;
     }
 
-    const u16 e_idx = culler.FindOrInsertEntry(draw_key, frame_tag);
+    bool inserted = false;
+    const u16 e_idx = culler.FindOrInsertEntry(draw_key, frame_tag, inserted);
     if (e_idx == 0xFFFFu) {
         return decision;
     }
 
     auto& e = culler.entries[e_idx];
-    const u32 prev_seen = e.last_seen_frame.exchange(frame_tag, std::memory_order_acq_rel);
-    if (prev_seen == frame_tag) {
-        e.multi_occ.store(1u, std::memory_order_relaxed);
-        e.zero_streak.store(0u, std::memory_order_relaxed);
-        e.skip_until_frame.store(0u, std::memory_order_relaxed);
-        return decision;
-    }
-    if (prev_seen != 0u && prev_seen + 16u < frame_tag) {
-        e.zero_streak.store(0u, std::memory_order_relaxed);
-        e.skip_until_frame.store(0u, std::memory_order_relaxed);
-        e.multi_occ.store(0u, std::memory_order_relaxed);
+    if (!inserted) {
+        const u32 prev_seen = e.last_seen_frame.exchange(frame_tag, std::memory_order_acq_rel);
+        if (prev_seen == frame_tag) {
+            e.multi_occ.store(1u, std::memory_order_relaxed);
+            e.zero_streak.store(0u, std::memory_order_relaxed);
+            e.skip_until_frame.store(0u, std::memory_order_relaxed);
+            return decision;
+        }
+        if (prev_seen != 0u && static_cast<s32>(frame_tag - prev_seen) > 16) {
+            e.zero_streak.store(0u, std::memory_order_relaxed);
+            e.skip_until_frame.store(0u, std::memory_order_relaxed);
+            e.multi_occ.store(0u, std::memory_order_relaxed);
+        }
     }
 
-    if (gbuf_ord > 12u && e.multi_occ.load(std::memory_order_relaxed) == 0u &&
-        !culler.fast_camera_turn.load(std::memory_order_relaxed)) {
+    bool local_fast_turn = culler.fast_camera_turn.load(std::memory_order_relaxed);
+    bool local_cam_moving = culler.camera_moving.load(std::memory_order_relaxed);
+    if (worker_has_cam && culler.pub_cam_valid.load(std::memory_order_acquire)) {
+        const float p0 = culler.pub_cam_pos[0].load(std::memory_order_relaxed);
+        const float p1 = culler.pub_cam_pos[1].load(std::memory_order_relaxed);
+        const float p2 = culler.pub_cam_pos[2].load(std::memory_order_relaxed);
+        const float f0 = culler.pub_cam_fwd[0].load(std::memory_order_relaxed);
+        const float f1 = culler.pub_cam_fwd[1].load(std::memory_order_relaxed);
+        const float f2 = culler.pub_cam_fwd[2].load(std::memory_order_relaxed);
+        const float cos_ang =
+            worker_cam_fwd[0] * f0 + worker_cam_fwd[1] * f1 + worker_cam_fwd[2] * f2;
+        const float dx = worker_cam_pos[0] - p0;
+        const float dy = worker_cam_pos[1] - p1;
+        const float dz = worker_cam_pos[2] - p2;
+        const float dist_sq = dx * dx + dy * dy + dz * dz;
+        if (cos_ang < 0.9990f || dist_sq > 0.0100f) {
+            local_fast_turn = true;
+            local_cam_moving = true;
+        } else if (cos_ang < 0.99995f || dist_sq > 0.0002f) {
+            local_cam_moving = true;
+        }
+    }
+
+    if (gbuf_ord > 12u && e.multi_occ.load(std::memory_order_relaxed) == 0u && !local_fast_turn) {
         const u16 zs = e.zero_streak.load(std::memory_order_relaxed);
         const u8 p_if = e.probe_in_flight.load(std::memory_order_acquire);
         if (zs >= 3u && p_if == 0u &&
@@ -1065,7 +1127,7 @@ Rasterizer::MtOcclusionDecision Rasterizer::EvaluateGBufferOcclusionMt(
             }
             return decision;
         }
-        const u32 probe_mask = culler.camera_moving.load(std::memory_order_relaxed) ? 1u : 3u;
+        const u32 probe_mask = local_cam_moving ? 1u : 3u;
         if (p_if == 0u && !Breadcrumbs::Enabled() && !DynCheck::Enabled() &&
             (zs > 0u || ((frame_tag + u32(e_idx)) & probe_mask) == 0u)) {
             const s32 q_slot = culler.AllocateMtQuery(mt_query_block_id, e_idx);
@@ -1186,6 +1248,19 @@ void Rasterizer::ExecuteSecondaryCmdBuf(u32 worker_id, u64 cmd_seq, u32 recorded
             needs_barrier |= runtime.Transit(img, layout, ShaderStages, read_access, ref.range);
         }
     }
+    std::array<std::tuple<const VideoCore::Buffer*, u64, u64>,
+               MtCompletedPassMeta::kMaxUavIndirectRefs>
+        resolved_uav_indirects{};
+    u32 num_resolved_uav_indirects = 0u;
+    for (u32 i = 0; i < meta->num_uav_indirect_refs; ++i) {
+        const auto& iref = meta->uav_indirect_refs[i];
+        u64 req_bytes = iref.byte_size;
+        auto [ibuf, ibase] = direct_buffers.TryResolveReadClamped(iref.addr, req_bytes);
+        if (ibuf && req_bytes > 0) {
+            needs_barrier |= runtime.IsBufferAccessed(ibuf, ibase, req_bytes);
+            resolved_uav_indirects[num_resolved_uav_indirects++] = {ibuf, ibase, req_bytes};
+        }
+    }
     if (needs_barrier) {
         runtime.FlushBarriers();
         needs_barrier = false;
@@ -1198,8 +1273,10 @@ void Rasterizer::ExecuteSecondaryCmdBuf(u32 worker_id, u64 cmd_seq, u32 recorded
             camera_motion->OnConstants(meta->camera_cb_floats.data());
         }
         if (scene_occlusion_culler) {
+            const u32 cam_ftag = meta->guest_frame != 0u ? meta->guest_frame
+                                                         : scene_occlusion_culler->ActiveFrameTag();
             scene_occlusion_culler->UpdateCameraFromSceneConstants(
-                meta->camera_cb_floats.data(), scene_occlusion_culler->ActiveFrameTag());
+                meta->camera_cb_floats.data(), cam_ftag);
         }
     }
 
@@ -1237,6 +1314,11 @@ void Rasterizer::ExecuteSecondaryCmdBuf(u32 worker_id, u64 cmd_seq, u32 recorded
 
     const vk::CommandBuffer sec_cmd = meta->sec_cmd;
     mt_direct_recorder->ExecuteSecondaryBuffers({&sec_cmd, 1}, worker_id, cmd_seq, occ_block_id);
+    for (u32 i = 0; i < num_resolved_uav_indirects; ++i) {
+        const auto [ibuf, ibase, isz] = resolved_uav_indirects[i];
+        runtime.AccessBuffer(ibuf, ibase, isz, vk::PipelineStageFlagBits2::eDrawIndirect,
+                             vk::AccessFlagBits2::eIndirectCommandRead);
+    }
     if (meta->motion_slot < 4u && object_motion) {
         object_motion->NoteSlotSubmittedOnStageB(meta->motion_slot);
     }
@@ -1699,21 +1781,27 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
                 if (draw_key == 0) {
                     draw_key = 1;
                 }
-                const u16 e_idx = culler.FindOrInsertEntry(draw_key, frame_tag);
+                bool inserted = false;
+                const u16 e_idx = culler.FindOrInsertEntry(draw_key, frame_tag, inserted);
                 if (e_idx != 0xFFFFu) {
                     auto& e = culler.entries[e_idx];
-                    const u32 prev_seen =
-                        e.last_seen_frame.exchange(frame_tag, std::memory_order_acq_rel);
-                    if (prev_seen == frame_tag) {
-                        e.multi_occ.store(1u, std::memory_order_relaxed);
-                        e.zero_streak.store(0u, std::memory_order_relaxed);
-                        e.skip_until_frame.store(0u, std::memory_order_relaxed);
-                    } else {
-                        if (prev_seen != 0 && prev_seen + 16u < frame_tag) {
+                    bool is_dup_in_frame = false;
+                    if (!inserted) {
+                        const u32 prev_seen =
+                            e.last_seen_frame.exchange(frame_tag, std::memory_order_acq_rel);
+                        if (prev_seen == frame_tag) {
+                            e.multi_occ.store(1u, std::memory_order_relaxed);
+                            e.zero_streak.store(0u, std::memory_order_relaxed);
+                            e.skip_until_frame.store(0u, std::memory_order_relaxed);
+                            is_dup_in_frame = true;
+                        } else if (prev_seen != 0 &&
+                                   static_cast<s32>(frame_tag - prev_seen) > 16) {
                             e.zero_streak.store(0u, std::memory_order_relaxed);
                             e.skip_until_frame.store(0u, std::memory_order_relaxed);
                             e.multi_occ.store(0u, std::memory_order_relaxed);
                         }
+                    }
+                    if (!is_dup_in_frame) {
                         if (gbuf_ord > 12 && e.multi_occ.load(std::memory_order_relaxed) == 0u &&
                             !culler.fast_camera_turn.load(std::memory_order_relaxed)) {
                             const u16 zs = e.zero_streak.load(std::memory_order_relaxed);

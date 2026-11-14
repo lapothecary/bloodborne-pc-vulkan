@@ -65,7 +65,12 @@ struct alignas(64) MtCompletedPassMeta {
         u64 uid{0};
         VideoCore::SubresourceRange range{};
     };
+    struct UavIndirectRef {
+        VAddr addr{0};
+        u32 byte_size{0};
+    };
     static constexpr u32 kMaxSampledRts = 64;
+    static constexpr u32 kMaxUavIndirectRefs = 8;
 
     std::atomic<u64> published_seq{0};
     std::atomic<u64> consumed_seq{0};
@@ -81,12 +86,15 @@ struct alignas(64) MtCompletedPassMeta {
     u16 db_uid{0};
     u16 occ_block_id{0xFFFFu};
     u32 recorded_draws{0};
+    u32 guest_frame{0};
     bool is_gbuffer{false};
     bool has_camera_cb{false};
     bool inherits_occlusion_query{false};
     u8 num_sampled_rt_refs{0};
+    u8 num_uav_indirect_refs{0};
     u8 motion_slot{0xFFu};
     std::array<SampledRtRef, kMaxSampledRts> sampled_rt_refs{};
+    std::array<UavIndirectRef, kMaxUavIndirectRefs> uav_indirect_refs{};
     std::array<float, 216> camera_cb_floats{};
 
     // Final register/extent/UID delta of a compiled deferred command list, synchronized to
