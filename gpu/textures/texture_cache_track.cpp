@@ -405,7 +405,7 @@ void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
     std::scoped_lock lock{mutex};
     // Only fully overwritten images starting at `address` can be refreshed wholesale.
     // A partial overwrite must preserve the image's other GPU-only texels.
-    ForEachImageInRegion(address, 1, [&](ImageId, Image& image) {
+    ForEachImageInRegion(address, 1, [&](ImageId id, Image& image) {
         static const bool log = std::getenv("BB_IMAGE_SYNC_LOG") != nullptr;
         if (log) {
             static std::atomic<u32> printed{0};
@@ -420,6 +420,9 @@ void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
         }
         if (image.info.guest_address != address || image.info.guest_size > max_size) {
             return;
+        }
+        if (True(image.flags & ImageFlagBits::DirectImmutable)) {
+            DemoteDirectImmutableLocked(id, image);
         }
         WatchImage(image, "GPU write (marked for refresh)");
         image.flags |= ImageFlagBits::GpuDirty; // uploaded again from memory on next use

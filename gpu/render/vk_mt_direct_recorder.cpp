@@ -1636,6 +1636,7 @@ std::array<std::atomic<u32>, 16> g_mt_seen_bail_ops{};
 std::array<std::atomic<u64>, 8> g_mt_seen_unsafe_pso{};
 std::array<std::atomic<u64>, 8> g_mt_seen_bail_buf{};
 std::array<std::array<std::atomic<u64>, 4>, 6> g_mt_seen_bail_target_by_site{};
+std::atomic<u32> g_mt_window_bail_target_count{0};
 std::atomic<u64> g_mt_prev_window_compiled{0};
 
 [[nodiscard]] bool MtTryClaimDiagKey(std::span<std::atomic<u64>> table, u64 raw_key) noexcept {
@@ -1755,11 +1756,17 @@ void MtMaybeLogBailBufSample(u8 site, u8 step, bool is_fmt, VAddr addr, u64 sz,
 void MtMaybeLogBailTargetSample(u8 site, VAddr addr, u32 fmt_or_mrt, u64 vs_hash, u64 ps_hash,
                                 u8 substep = 0u, u32 flags = 0u, u32 w = 0u, u32 h = 0u,
                                 u32 guest_size = 0u) noexcept {
+    if (g_mt_window_bail_target_count.load(std::memory_order_relaxed) >= 4u) {
+        return;
+    }
     const size_t bucket = std::min<size_t>(site, g_mt_seen_bail_target_by_site.size() - 1u);
     const u64 key = (static_cast<u64>(site) << 56u) | (static_cast<u64>(substep) << 48u) |
                     (static_cast<u64>(fmt_or_mrt & 0xFFu) << 40u) |
                     (((addr >> 8u) ^ vs_hash ^ ps_hash) & 0xFFFFFFFFFFULL);
     if (!MtTryClaimDiagKey(g_mt_seen_bail_target_by_site[bucket], key)) {
+        return;
+    }
+    if (g_mt_window_bail_target_count.fetch_add(1u, std::memory_order_relaxed) >= 4u) {
         return;
     }
     std::printf("[BB-MT] bail_target sample: site=%u(%s) sub=%u addr=0x%llx info=0x%x flags=0x%x "
@@ -1822,14 +1829,13 @@ void MtReportTelemetryIfDue(u32 cur_guest_frame) noexcept {
     }
     const u64 seen = g_mt_lists_seen.exchange(0ULL, std::memory_order_relaxed);
     const u64 comp = g_mt_lists_compiled.exchange(0ULL, std::memory_order_relaxed);
-    const u64 prev_comp = g_mt_prev_window_compiled.exchange(comp, std::memory_order_relaxed);
-    if (prev_comp > 0ULL && comp * 2ULL < prev_comp) {
-        for (auto& bucket : g_mt_seen_bail_target_by_site) {
-            for (auto& slot : bucket) {
-                slot.store(0ULL, std::memory_order_relaxed);
-            }
+    (void)g_mt_prev_window_compiled.exchange(comp, std::memory_order_relaxed);
+    for (auto& bucket : g_mt_seen_bail_target_by_site) {
+        for (auto& slot : bucket) {
+            slot.store(0ULL, std::memory_order_relaxed);
         }
     }
+    g_mt_window_bail_target_count.store(0u, std::memory_order_relaxed);
     const u64 draws = g_mt_draws_recorded.exchange(0ULL, std::memory_order_relaxed);
     const u64 b_pkt = g_mt_bail_pkt.exchange(0ULL, std::memory_order_relaxed);
     const u64 b_pso = g_mt_bail_pso.exchange(0ULL, std::memory_order_relaxed);

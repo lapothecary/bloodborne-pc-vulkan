@@ -180,6 +180,10 @@ bool Rasterizer::IsComputeImageCopy(const Pipeline* pipeline, bool dry_run) {
     if (dry_run) {
         return false;
     }
+    const auto dst_id = desc0.is_written ? image0_id : image1_id;
+    if (VideoCore::True(dst.flags & VideoCore::ImageFlagBits::DirectImmutable)) {
+        texture_cache.DemoteDirectImmutable(dst_id);
+    }
     runtime.CopyColorAndDepth(&src, &dst);
     dst.gpu_write_tick = scheduler.CurrentTick();
     // Before: the shader ran (5 times a frame over the light shafts), writing 2.3 MiB into the
@@ -350,6 +354,9 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
                 return fmt::format("hle clear cs {:016x} ({}x{})", info.pgm_hash, mip_w, mip_h);
             });
         }
+        if (VideoCore::True(image.flags & VideoCore::ImageFlagBits::DirectImmutable)) {
+            texture_cache.DemoteDirectImmutable(image_id);
+        }
         runtime.ClearImage(&image, desc.view_info.range, clear);
         image.gpu_write_tick = scheduler.CurrentTick();
         return true;
@@ -441,6 +448,9 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
                                           .extent = {.levels = 1, .layers = 1}}
             : VideoCore::SubresourceRange{.base = {.level = 0, .layer = 0},
                                           .extent = image.info.resources};
+    if (VideoCore::True(image.flags & VideoCore::ImageFlagBits::DirectImmutable)) {
+        texture_cache.DemoteDirectImmutable(image_id);
+    }
     runtime.ClearImage(&image, range, clear);
     image.gpu_write_tick = scheduler.CurrentTick();
     return true;

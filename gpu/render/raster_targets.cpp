@@ -1335,8 +1335,13 @@ void Rasterizer::Resolve() {
     const auto& regs = Regs();
     VideoCore::TextureCache::ImageDesc src_desc{regs.color_buffers[0], CbExtent(0)};
     VideoCore::TextureCache::ImageDesc dst_desc{regs.color_buffers[1], CbExtent(1)};
-    auto& src = texture_cache.GetImage(texture_cache.FindImage(src_desc, true));
-    auto& dst = texture_cache.GetImage(texture_cache.FindImage(dst_desc, true));
+    const auto src_id = texture_cache.FindImage(src_desc, true);
+    const auto dst_id = texture_cache.FindImage(dst_desc, true);
+    auto& src = texture_cache.GetImage(src_id);
+    auto& dst = texture_cache.GetImage(dst_id);
+    if (VideoCore::True(dst.flags & VideoCore::ImageFlagBits::DirectImmutable)) {
+        texture_cache.DemoteDirectImmutable(dst_id);
+    }
     const VAddr src_address = regs.color_buffers[0].Address();
     const VAddr dst_address = regs.color_buffers[1].Address();
     ScopeMarker("Resolve:MRT0={:#x}:MRT1={:#x}", fmt::make_format_args(src_address, dst_address),

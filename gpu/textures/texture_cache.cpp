@@ -389,6 +389,7 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& info
             }
             // Copied into the larger image once there is one.
             if (merged_id) {
+                DemoteDirectImmutableLocked(merged_id, slot_images[merged_id]);
                 runtime.CopyMip(&cached, &slot_images[merged_id], mip, slice);
                 FreeImage(cache_id);
             }
@@ -557,7 +558,9 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc, Vi
     if (!memo || BbToggle::Disabled(BbToggle::TextureViewMemo)) {
         return image.FindView(desc.view_info);
     }
-    if (memo->image_id == image_id && memo->backing == image.backing && memo->view_id) {
+    if (memo->image_id == image_id && memo->backing == image.backing && memo->view_id &&
+        slot_image_views.is_allocated(memo->view_id) &&
+        slot_image_views[memo->view_id].info == desc.view_info) {
         return slot_image_views[memo->view_id];
     }
     ImageView& view = image.FindView(desc.view_info);
@@ -601,7 +604,9 @@ ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& des
     if (!memo || BbToggle::Disabled(BbToggle::TextureViewMemo)) {
         return image.FindView(desc.view_info, false);
     }
-    if (memo->image_id == image_id && memo->backing == image.backing && memo->view_id) {
+    if (memo->image_id == image_id && memo->backing == image.backing && memo->view_id &&
+        slot_image_views.is_allocated(memo->view_id) &&
+        slot_image_views[memo->view_id].info == desc.view_info) {
         return slot_image_views[memo->view_id];
     }
     ImageView& view = image.FindView(desc.view_info, false);
@@ -639,6 +644,7 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
     // V3.1: Cache stencil_id + stencil_uid on the depth image so we avoid scanning 900+ pages
     // of the 2560x1440 stencil buffer via ForEachImageInRegion on every depth pass.
     if (desc.info.stencil_addr != 0) {
+        std::scoped_lock lock{mutex};
         ImageId stencil_id{};
         if (image.stencil_id && slot_images.is_allocated(image.stencil_id)) {
             const Image& cached_st = slot_images[image.stencil_id];
@@ -672,7 +678,9 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
     if (!memo || BbToggle::Disabled(BbToggle::TextureViewMemo)) {
         return image.FindView(desc.view_info, false);
     }
-    if (memo->image_id == image_id && memo->backing == image.backing && memo->view_id) {
+    if (memo->image_id == image_id && memo->backing == image.backing && memo->view_id &&
+        slot_image_views.is_allocated(memo->view_id) &&
+        slot_image_views[memo->view_id].info == desc.view_info) {
         return slot_image_views[memo->view_id];
     }
     ImageView& view = image.FindView(desc.view_info, false);
@@ -810,7 +818,8 @@ vk::ImageView TextureCache::TryResolveDirectImmutableViewMt(const Gcn::Image& cl
         ImageFlagBits::Dirty | ImageFlagBits::GpuModified | ImageFlagBits::SharedHotPage;
     if ((img.flags & Required) != Required || True(img.flags & BadFlags) ||
         img.info.props.is_depth || img.scene_proxy || img.prompt_icon || img.prompt_atlas ||
-        img.MaybePromptIcon() || img.binding.needs_rebind || !img.backing ||
+        img.MaybePromptIcon() || img.binding.needs_rebind || img.binding.force_general ||
+        img.binding.is_target || !img.backing ||
         !img.backing->subresource_states.empty() ||
         img.backing->state.layout != vk::ImageLayout::eShaderReadOnlyOptimal ||
         img.backing->state.access_mask != vk::AccessFlagBits2::eShaderRead ||
@@ -859,8 +868,19 @@ ImageId TextureCache::TryFindExistingImageLocked(ImageDesc& desc) const {
     };
 
     ImageIds overlapping;
-    const_cast<TextureCache*>(this)->ForEachImageInRegion(
-        info.guest_address, info.guest_size, [&](ImageId id, Image&) { overlapping.push_back(id); });
+    registry.ForEachPage(info.guest_address, info.guest_size, [&](const ImageRegistry::Ids& ids) {
+        for (const ImageId id : ids) {
+            const Image& cand = slot_images[id];
+            if (cand.info.pixel_format == vk::Format::eUndefined ||
+                !cand.Overlaps(info.guest_address, info.guest_size)) {
+                continue;
+            }
+            if (std::ranges::find(overlapping, id) == overlapping.end()) {
+                overlapping.push_back(id);
+            }
+        }
+        return false;
+    });
     if (overlapping.empty()) {
         return {};
     }
@@ -944,6 +964,14 @@ ImageId TextureCache::TryFindExistingImageLocked(ImageDesc& desc) const {
                 continue;
             }
 
+            if (const s32 mip = old.MipOf(merged); mip >= 0) {
+                if (const s32 slice = old.SliceOf(merged, mip); slice >= 0) {
+                    return {};
+                }
+            }
+            if (image_id) {
+                continue;
+            }
             if (!stale) {
                 return {};
             }
@@ -1004,7 +1032,13 @@ bool TextureCache::TryInspectTargetMt(ImageDesc& desc, ImageId& out_id, ImageInf
         }
         return false;
     }
-    if (!img.TryFindExistingViewMt(desc.view_info)) {
+    const bool samples_ok = (img.backing->num_samples > 1) == (desc.info.num_samples > 1);
+    const bool format_ok =
+        desc.info.props.is_depth
+            ? (img.info.props.is_depth && img.info.num_bits == desc.info.num_bits &&
+               img.info.props.has_stencil == desc.info.props.has_stencil)
+            : IsVulkanFormatCompatible(img.info.pixel_format, desc.view_info.format);
+    if (!samples_ok || !format_ok) {
         if (out_diag) {
             out_diag->substep = 4;
         }
@@ -1084,12 +1118,12 @@ bool TextureCache::TryResolveSceneSrvViewMt(
     if (img.prompt_icon || img.prompt_atlas || img.MaybePromptIcon()) {
         return fail(5);
     }
-    if (img.binding.needs_rebind || !img.backing) {
+    if (img.binding.needs_rebind || img.binding.force_general || !img.backing) {
         return fail(6);
     }
     if (True(img.flags & ImageFlagBits::SharedHotPage)) {
         if (True(img.flags & ImageFlagBits::GpuModified) || img.hash == 0 ||
-            img.info.guest_size == 0) {
+            img.info.guest_size == 0 || img.info.guest_size > kSharedHotPageMaxBytes) {
             return fail(7);
         }
         const u64 cur_gc = atomic_gc_tick.load(std::memory_order_relaxed);
@@ -1114,6 +1148,7 @@ bool TextureCache::TryResolveSceneSrvViewMt(
 
     const bool already_settled_ro =
         !img.info.props.is_depth && !img.scene_proxy &&
+        !img.binding.is_target && !img.binding.force_general &&
         !True(img.flags & ImageFlagBits::GpuModified) && img.backing->subresource_states.empty() &&
         img.backing->state.layout == vk::ImageLayout::eShaderReadOnlyOptimal &&
         img.backing->state.access_mask == vk::AccessFlagBits2::eShaderRead;
@@ -1177,6 +1212,7 @@ void TextureCache::DemoteDirectImmutableLocked(ImageId image_id, Image& image) n
     }
     UntrackImage(image_id);
     image.flags &= ~ImageFlagBits::DirectImmutable;
+    image.flags |= ImageFlagBits::GpuModified;
     if (const auto it = direct_assets_by_addr.find(image.info.guest_address);
         it != direct_assets_by_addr.end() && (!image_id || it->second == image_id)) {
         direct_assets_by_addr.erase(it);

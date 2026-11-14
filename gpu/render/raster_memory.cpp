@@ -323,6 +323,9 @@ void Rasterizer::ExecuteDirectCopyBuffers(std::span<const DirectCopyRegion> regi
                 !VideoCore::DirectBuffers::OverlapsNativeOwnedRange(r0.dst_va, r0.byte_size)) {
                 auto& src_img = texture_cache.GetImage(m.src_id);
                 auto& dst_img = texture_cache.GetImage(m.dst_id);
+                if (VideoCore::True(dst_img.flags & VideoCore::ImageFlagBits::DirectImmutable)) {
+                    texture_cache.DemoteDirectImmutable(m.dst_id);
+                }
                 runtime.CopyColorAndDepth(&src_img, &dst_img);
                 dst_img.gpu_write_tick = scheduler.CurrentTick();
                 return;
@@ -693,6 +696,9 @@ void Rasterizer::ExecuteDirectCopyBuffers(std::span<const DirectCopyRegion> regi
                     reg.byte_size - image_size <= max_img_tail &&
                     src_img.info.num_bits == dst_img.info.num_bits) {
                     flush_resolved();
+                    if (VideoCore::True(dst_img.flags & VideoCore::ImageFlagBits::DirectImmutable)) {
+                        texture_cache.DemoteDirectImmutable(dst_img_id);
+                    }
                     runtime.CopyColorAndDepth(&src_img, &dst_img);
                     dst_img.gpu_write_tick = scheduler.CurrentTick();
                     bool copied_tail_buf = false;
@@ -850,6 +856,9 @@ void Rasterizer::DirectFillBuffer(VAddr dst, u32 num_bytes, u32 value) {
                         : VideoCore::SubresourceRange{
                               .base = {.level = 0, .layer = 0},
                               .extent = image.info.resources};
+                if (VideoCore::True(image.flags & VideoCore::ImageFlagBits::DirectImmutable)) {
+                    texture_cache.DemoteDirectImmutable(image_id);
+                }
                 runtime.ClearImage(&image, range, clear);
                 image.gpu_write_tick = scheduler.CurrentTick();
                 return;
@@ -959,6 +968,9 @@ void Rasterizer::DirectClearColorImage(const DirectClearColorArgs& args) {
                     : VideoCore::SubresourceRange{
                           .base = {.level = 0, .layer = 0},
                           .extent = image.info.resources};
+            if (VideoCore::True(image.flags & VideoCore::ImageFlagBits::DirectImmutable)) {
+                texture_cache.DemoteDirectImmutable(image_id);
+            }
             runtime.ClearImage(&image, range, clear);
             image.gpu_write_tick = scheduler.CurrentTick();
             return;
@@ -985,6 +997,9 @@ void Rasterizer::DirectClearColorImage(const DirectClearColorArgs& args) {
                     .base = {.level = mip, .layer = layer},
                     .extent = {.levels = 1, .layers = 1},
                 };
+                if (VideoCore::True(image.flags & VideoCore::ImageFlagBits::DirectImmutable)) {
+                    texture_cache.DemoteDirectImmutable(resolved_id);
+                }
                 runtime.ClearImage(&image, range, clear);
                 image.gpu_write_tick = scheduler.CurrentTick();
                 return;
@@ -1112,6 +1127,9 @@ void Rasterizer::FlushPendingTextureRegionCopies() {
             src_img.info.num_samples != dst_img.info.num_samples ||
             src_img.info.num_bits != dst_img.info.num_bits) {
             continue;
+        }
+        if (VideoCore::True(dst_img.flags & VideoCore::ImageFlagBits::DirectImmutable)) {
+            texture_cache.DemoteDirectImmutable(dst_id);
         }
 
         const u32 src_mip = std::min(src_view_range.base.level, src_img.info.resources.levels - 1);
@@ -1325,6 +1343,9 @@ void Rasterizer::DirectResolveColor(const DirectResolveColorArgs& args) {
         for (u32 s = src_cb.view.slice_start; s <= src_cb.view.slice_max; ++s) {
             texture_cache.TouchMeta(src_cb.CmaskAddress(), s, false);
         }
+        if (VideoCore::True(src.flags & VideoCore::ImageFlagBits::DirectImmutable)) {
+            texture_cache.DemoteDirectImmutable(src_id);
+        }
         runtime.ClearImage(&src, src_desc.view_info.range,
                            GcnToVk::ColorBufferClearValue(src_cb));
     }
@@ -1334,6 +1355,9 @@ void Rasterizer::DirectResolveColor(const DirectResolveColorArgs& args) {
         }
     }
 
+    if (VideoCore::True(dst.flags & VideoCore::ImageFlagBits::DirectImmutable)) {
+        texture_cache.DemoteDirectImmutable(dst_id);
+    }
     runtime.ResolveImage(&src, &dst, src_desc.view_info.range, dst_desc.view_info.range);
     dst.gpu_write_tick = scheduler.CurrentTick();
 }
@@ -1425,42 +1449,67 @@ void Rasterizer::DirectUploadTextureSubresource(const DirectUploadTextureArgs& a
         .imageOffset = {s32(args.offset_x), s32(args.offset_y), s32(z_off)},
         .imageExtent = {ext_w, ext_h, ext_d},
     };
+    if (!is_immutable_asset &&
+        VideoCore::True(dst_img.flags & VideoCore::ImageFlagBits::DirectImmutable)) {
+        texture_cache.DemoteDirectImmutable(dst_id);
+    }
+
     runtime.CopyBufferToImageSubresource(&dst_img, staging.buffer, dst_range, copy);
+
+    // Always seed the page-watch hash and mip hashes of the backing guest region (including for
+    // DirectImmutable assets whose guest dst_va is filled with 0x00) so a neighboring write on
+    // the same page or a later DemoteDirectImmutable never re-uploads zeroes over the VkImage.
+    const auto& info = dst_img.info;
+    if (info.guest_address != 0 && info.guest_size != 0) {
+        const u64 h = VideoCore::TextureCache::ComputeSmallOrSampleHash(info);
+        dst_img.hash = h != 0 ? h : 1ULL;
+        if (dst_img.mip_hashes.size() < info.resources.levels) {
+            const size_t prev_sz = dst_img.mip_hashes.size();
+            dst_img.mip_hashes.resize(info.resources.levels, 0);
+            for (size_t l = prev_sz; l < info.resources.levels && l < info.mips_layout.size();
+                 ++l) {
+                const auto& lay = info.mips_layout[l];
+                if (lay.offset + lay.size <= info.guest_size) {
+                    const u64 lh = XXH3_64bits(
+                        std::bit_cast<const u8*>(info.guest_address) + lay.offset, lay.size);
+                    dst_img.mip_hashes[l] = lh != 0 ? lh : 1ULL;
+                }
+            }
+        }
+        if (mip < info.mips_layout.size() && mip < dst_img.mip_hashes.size()) {
+            const auto& layout = info.mips_layout[mip];
+            if (layout.offset + layout.size <= info.guest_size) {
+                const u64 mh = XXH3_64bits(
+                    std::bit_cast<const u8*>(info.guest_address) + layout.offset, layout.size);
+                dst_img.mip_hashes[mip] = mh != 0 ? mh : 1ULL;
+            }
+        }
+    }
 
     if (is_immutable_asset) {
         dst_img.flags &= ~VideoCore::ImageFlagBits::Dirty;
         dst_img.gpu_write_tick = scheduler.CurrentTick();
-        texture_cache.MarkDirectImmutableAsset(dst_id);
+        const bool is_final_subres =
+            (mip + 1u == info.resources.levels) &&
+            (layer + 1u == info.resources.layers) &&
+            (args.offset_x + ext_w >= dst_mip_w) &&
+            (args.offset_y + ext_h >= dst_mip_h) &&
+            (z_off + ext_d >= dst_mip_d);
+        if (is_final_subres) {
+            constexpr auto ShaderStages = vk::PipelineStageFlagBits2::eAllGraphics |
+                                          vk::PipelineStageFlagBits2::eComputeShader;
+            if (runtime.Transit(&dst_img, vk::ImageLayout::eShaderReadOnlyOptimal, ShaderStages,
+                                vk::AccessFlagBits2::eShaderRead)) {
+                runtime.FlushImageBarriers();
+            }
+            texture_cache.MarkDirectImmutableAsset(dst_id);
+        }
         return;
     }
 
     dst_img.flags =
         (dst_img.flags | VideoCore::ImageFlagBits::GpuModified) & ~VideoCore::ImageFlagBits::Dirty;
     dst_img.gpu_write_tick = scheduler.CurrentTick();
-
-    // Seed the 8x8 page-watch hash and mip hash of the backing guest region so a subsequent
-    // MaybeCpuDirty write elsewhere in the same page never re-uploads zeroed guest tiled memory
-    // over the GPU-uploaded VkImage.
-    const auto& info = dst_img.info;
-    if (info.guest_address != 0 && info.guest_size != 0) {
-        const u32 w8 = std::min(info.size.width, 8u);
-        const u32 h8 = std::min(info.size.height, 8u);
-        const u32 bytes8 = (info.props.is_block ? (w8 + 3) / 4 : w8) *
-                           (info.props.is_block ? (h8 + 3) / 4 : h8) * (info.num_bits / 8);
-        if (bytes8 <= info.guest_size) {
-            dst_img.hash = XXH3_64bits(std::bit_cast<const u8*>(info.guest_address), bytes8);
-        }
-        if (dst_img.mip_hashes.size() < info.resources.levels) {
-            dst_img.mip_hashes.resize(info.resources.levels, 0);
-        }
-        if (mip < info.mips_layout.size() && mip < dst_img.mip_hashes.size()) {
-            const auto& layout = info.mips_layout[mip];
-            if (layout.offset + layout.size <= info.guest_size) {
-                dst_img.mip_hashes[mip] = XXH3_64bits(
-                    std::bit_cast<const u8*>(info.guest_address) + layout.offset, layout.size);
-            }
-        }
-    }
 }
 
 void Rasterizer::DirectClearDepthStencil(const DirectClearDepthStencilArgs& args) {
