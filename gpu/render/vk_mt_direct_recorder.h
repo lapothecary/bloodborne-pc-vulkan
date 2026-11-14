@@ -172,7 +172,7 @@ public:
     static constexpr u32 kMaxWorkers = 16;
     static constexpr u32 kFrameSlices = 4;
     static constexpr u32 kCompletedMetaSlots = 1024;
-    static constexpr u64 kWorkerConstantRingBytes = 4ULL << 20; // 4 MiB per worker
+    static constexpr u64 kWorkerConstantRingBytes = 16ULL << 20; // 16 MiB per worker
 
     VkMtDirectRecorder(const Instance& instance, Scheduler& scheduler, Rasterizer& rasterizer);
     ~VkMtDirectRecorder();

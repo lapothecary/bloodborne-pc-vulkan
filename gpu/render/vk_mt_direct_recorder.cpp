@@ -47,6 +47,8 @@ class VkMtDirectRecorder::MtGuestCopyShadowCache {
 public:
     static constexpr size_t kNumShards = 16;
     static constexpr u32 kMaxShadowBytes = 32768u;
+    static constexpr u32 kMaxHugeLiveBytes = 16u << 20u; // 16 MiB live staging ring window
+    static constexpr size_t kHugeLiveSlots = 64u;
     static constexpr u32 kCoarseShift = 18u;        // 256 KiB coarse granule
     static constexpr size_t kCoarseBuckets = 262144u; // covers 64 GiB guest VA
 
@@ -70,6 +72,15 @@ public:
         u64 upload_gen{0};
         u32 inv_e0{0};
         u32 inv_e1{0};
+    };
+
+    struct HugeLiveSlot {
+        VAddr dst_va{0};
+        VAddr live_src_va{0};
+        u32 byte_size{0};
+        u32 inv_bias{0};
+        u64 upload_gen{0};
+        u64 epoch_sum{0};
     };
 
     struct alignas(64) Shard {
@@ -103,6 +114,20 @@ public:
     [[nodiscard]] u32 InvEpochAt(VAddr va) const noexcept {
         return coarse_inv_epoch[static_cast<size_t>((va >> kCoarseShift) & (kCoarseBuckets - 1u))]
             .load(std::memory_order_acquire);
+    }
+
+    [[nodiscard]] u64 EpochSumRange(VAddr dst_va, u32 byte_size) const noexcept {
+        if (!dst_va || byte_size == 0u) {
+            return 0ULL;
+        }
+        const u64 p0 = dst_va >> kCoarseShift;
+        const u64 p1 = (dst_va + byte_size - 1ULL) >> kCoarseShift;
+        u64 sum = 0ULL;
+        for (u64 p = p0; p <= p1; ++p) {
+            sum += coarse_inv_epoch[static_cast<size_t>(p & (kCoarseBuckets - 1u))].load(
+                std::memory_order_acquire);
+        }
+        return sum;
     }
 
     void MarkCoarseDirtyAndInvalidate(VAddr dst_va, u64 byte_size, u32 guest_frame) noexcept {
@@ -158,9 +183,36 @@ public:
             }
             const bool cpu_src = (r.reserved == gx_direct_vk::kCopyFlagKnownCpuSource);
             const bool live_src = (r.reserved == gx_direct_vk::kCopyFlagLiveStagingPtr);
-            if ((!cpu_src && !live_src) || r.byte_size < 4u || r.byte_size > kMaxShadowBytes ||
+            if ((!cpu_src && !live_src) || r.byte_size < 4u || r.byte_size > kMaxHugeLiveBytes ||
                 !r.src_va || (mem && mem->ClampRangeSize(r.src_va, r.byte_size) != r.byte_size)) {
                 MarkCoarseDirtyAndInvalidate(r.dst_va, r.byte_size, guest_frame);
+                continue;
+            }
+            if (r.byte_size > kMaxShadowBytes) {
+                const u64 gen = upload_gen.fetch_add(1ULL, std::memory_order_relaxed) + 1ULL;
+                const u32 bias = global_inv_bias.load(std::memory_order_acquire);
+                const u64 esum = EpochSumRange(r.dst_va, r.byte_size);
+                std::unique_lock hlk{huge_rw_mutex};
+                size_t victim = huge_cursor & (kHugeLiveSlots - 1u);
+                bool reused = false;
+                for (size_t i = 0; i < kHugeLiveSlots; ++i) {
+                    if (huge_live[i].dst_va == r.dst_va && huge_live[i].byte_size == r.byte_size) {
+                        victim = i;
+                        reused = true;
+                        break;
+                    }
+                }
+                if (!reused) {
+                    ++huge_cursor;
+                }
+                huge_live[victim] = HugeLiveSlot{
+                    .dst_va = r.dst_va,
+                    .live_src_va = r.src_va,
+                    .byte_size = r.byte_size,
+                    .inv_bias = bias,
+                    .upload_gen = gen,
+                    .epoch_sum = esum,
+                };
                 continue;
             }
 
@@ -317,11 +369,61 @@ public:
         if (!found && blk_cur > 0ULL) {
             probe_block(blk_cur - 1ULL);
         }
+        if (huge_cursor != 0u) {
+            std::shared_lock hlk{huge_rw_mutex};
+            for (const auto& hm : huge_live) {
+                if (hm.dst_va == 0ULL || addr < hm.dst_va) {
+                    continue;
+                }
+                const u64 off = addr - hm.dst_va;
+                if (off >= hm.byte_size || (hm.byte_size - off) < min_bytes) {
+                    continue;
+                }
+                if (hm.upload_gen <= best_meta.upload_gen) {
+                    continue;
+                }
+                if (hm.inv_bias != bias || EpochSumRange(hm.dst_va, hm.byte_size) != hm.epoch_sum) {
+                    continue;
+                }
+                const u32 avail = static_cast<u32>(std::min<u64>(hm.byte_size - off, dst_cap));
+                const VAddr src_at = hm.live_src_va + off;
+                if (mem && mem->ClampRangeSize(src_at, avail) != avail) {
+                    continue;
+                }
+                std::memcpy(dst, reinterpret_cast<const void*>(src_at), avail);
+                best_meta.upload_gen = hm.upload_gen;
+                out_copied = avail;
+                out_gen = hm.upload_gen;
+                found = true;
+            }
+        }
         return found;
+    }
+
+    [[nodiscard]] bool HasValidHugeLiveCover(VAddr addr, u64 min_bytes) const noexcept {
+        if (!addr || min_bytes == 0ULL || huge_cursor == 0u) {
+            return false;
+        }
+        const u32 bias = global_inv_bias.load(std::memory_order_acquire);
+        std::shared_lock hlk{huge_rw_mutex};
+        for (const auto& hm : huge_live) {
+            if (hm.dst_va == 0ULL || addr < hm.dst_va) {
+                continue;
+            }
+            const u64 off = addr - hm.dst_va;
+            if (off < hm.byte_size && (hm.byte_size - off) >= min_bytes &&
+                hm.inv_bias == bias && EpochSumRange(hm.dst_va, hm.byte_size) == hm.epoch_sum) {
+                return true;
+            }
+        }
+        return false;
     }
 
 private:
     std::array<Shard, kNumShards> shards{};
+    mutable std::shared_mutex huge_rw_mutex;
+    std::array<HugeLiveSlot, kHugeLiveSlots> huge_live{};
+    u32 huge_cursor{0};
     std::vector<std::atomic<u32>> coarse_inv_epoch;
     std::vector<std::atomic<u32>> coarse_dirty_frame;
     std::atomic<u32> global_inv_bias{0};
@@ -653,8 +755,8 @@ struct VkMtDirectRecorder::WorkerCompileScratch {
     };
 
     alignas(16) std::array<u8, 32768> cb_temp{};
-    alignas(16) std::array<u32, 256> vs_flat_ud{};
-    alignas(16) std::array<u32, 256> ps_flat_ud{};
+    alignas(16) std::array<u32, 512> vs_flat_ud{};
+    alignas(16) std::array<u32, 512> ps_flat_ud{};
     std::bitset<Gcn::Regs::NumRegs> replay_exact_words{};
     std::vector<ChunkCopySlice> chunk_copies;
     std::vector<ChunkGpuWriteSlice> chunk_gpu_writes;
@@ -1473,6 +1575,12 @@ enum class MtBailReason : u8 {
     Other,
 };
 
+enum class MtOtherKind : u8 {
+    Empty = 0,
+    Skip = 1,
+    Misc = 2,
+};
+
 std::atomic<u64> g_mt_lists_seen{0};
 std::atomic<u64> g_mt_lists_compiled{0};
 std::atomic<u64> g_mt_draws_recorded{0};
@@ -1484,8 +1592,145 @@ std::atomic<u64> g_mt_bail_pso_unsafe{0};
 std::atomic<u64> g_mt_bail_target{0};
 std::atomic<u64> g_mt_bail_buf{0};
 std::atomic<u64> g_mt_bail_other{0};
+std::atomic<u64> g_mt_bail_other_empty{0};
+std::atomic<u64> g_mt_bail_other_skip{0};
+std::atomic<u64> g_mt_bail_other_misc{0};
 std::atomic<u32> g_mt_last_report_frame{0};
 std::array<std::atomic<u32>, 16> g_mt_seen_bail_ops{};
+std::array<std::atomic<u64>, 8> g_mt_seen_unsafe_pso{};
+std::array<std::atomic<u64>, 8> g_mt_seen_bail_buf{};
+std::array<std::atomic<u64>, 8> g_mt_seen_bail_target{};
+
+[[nodiscard]] bool MtTryClaimDiagKey(std::span<std::atomic<u64>> table, u64 raw_key) noexcept {
+    const u64 key = raw_key | (1ULL << 63u);
+    for (auto& slot : table) {
+        u64 cur_val = slot.load(std::memory_order_relaxed);
+        if (cur_val == key) {
+            return false;
+        }
+        if (cur_val == 0ULL) {
+            if (slot.compare_exchange_strong(cur_val, key, std::memory_order_acq_rel,
+                                             std::memory_order_relaxed)) {
+                return true;
+            }
+            if (cur_val == key) {
+                return false;
+            }
+        }
+    }
+    return false;
+}
+
+[[nodiscard]] const char* MtUnsafePsoReasonName(u8 r) noexcept {
+    switch (r) {
+    case 1u:
+        return "no_push_desc";
+    case 2u:
+        return "non_vs_ps_stage";
+    case 3u:
+        return "uses_dma";
+    case 4u:
+        return "paged_buf";
+    case 5u:
+        return "storage_img";
+    case 6u:
+        return "has_fmask";
+    case 7u:
+        return "flat_ud_gt_512";
+    case 8u:
+        return "written_buf";
+    case 9u:
+        return "special_buf";
+    case 10u:
+        return "written_img";
+    case 11u:
+        return "mip_fallback";
+    case 12u:
+        return "null_vs_stage";
+    default:
+        return "unknown";
+    }
+}
+
+void MtMaybeLogUnsafePsoSample(u8 reason, u64 vs_hash, u64 ps_hash) noexcept {
+    const u64 key = (static_cast<u64>(reason) << 56u) |
+                    ((vs_hash ^ (ps_hash * 0x9E3779B97F4A7C15ULL)) & 0x00FFFFFFFFFFFFFFULL);
+    if (!MtTryClaimDiagKey(g_mt_seen_unsafe_pso, key)) {
+        return;
+    }
+    std::printf("[BB-MT] unsafe_pso sample: reason=%u(%s) vs=0x%016llx ps=0x%016llx\n",
+                static_cast<unsigned>(reason), MtUnsafePsoReasonName(reason),
+                static_cast<unsigned long long>(vs_hash), static_cast<unsigned long long>(ps_hash));
+    std::fflush(stdout);
+}
+
+[[nodiscard]] const char* MtBailBufSiteName(u8 site) noexcept {
+    switch (site) {
+    case 1u:
+        return "vb";
+    case 2u:
+        return "ib";
+    case 3u:
+        return "flatbuf";
+    case 4u:
+        return "clip_planes";
+    case 5u:
+        return "special";
+    case 6u:
+        return "sbuf";
+    default:
+        return "other";
+    }
+}
+
+void MtMaybeLogBailBufSample(u8 site, u8 step, bool is_fmt, VAddr addr, u64 sz,
+                             u64 vs_hash) noexcept {
+    const u64 key = (static_cast<u64>(site) << 56u) | (static_cast<u64>(step) << 48u) |
+                    (static_cast<u64>(is_fmt ? 1u : 0u) << 47u) | ((addr >> 20u) & 0x7FFFULL) |
+                    ((vs_hash & 0xFFFFFFFFULL) << 15u);
+    if (!MtTryClaimDiagKey(g_mt_seen_bail_buf, key)) {
+        return;
+    }
+    std::printf("[BB-MT] bail_buf sample: site=%u(%s) step=%u fmt=%u addr=0x%llx sz=0x%llx "
+                "vs=0x%016llx\n",
+                static_cast<unsigned>(site), MtBailBufSiteName(site), static_cast<unsigned>(step),
+                is_fmt ? 1u : 0u, static_cast<unsigned long long>(addr),
+                static_cast<unsigned long long>(sz), static_cast<unsigned long long>(vs_hash));
+    std::fflush(stdout);
+}
+
+[[nodiscard]] const char* MtBailTargetSiteName(u8 site) noexcept {
+    switch (site) {
+    case 1u:
+        return "max_subpasses";
+    case 2u:
+        return "inspect_targets";
+    case 3u:
+        return "resolve_srv_null";
+    case 4u:
+        return "written_no_id";
+    case 5u:
+        return "sampled_rt_cap";
+    default:
+        return "other";
+    }
+}
+
+void MtMaybeLogBailTargetSample(u8 site, VAddr addr, u32 fmt_or_mrt, u64 vs_hash,
+                                u64 ps_hash) noexcept {
+    const u64 key = (static_cast<u64>(site) << 56u) |
+                    (static_cast<u64>(fmt_or_mrt & 0xFFFFu) << 40u) |
+                    (((vs_hash ^ ps_hash) & 0xFFFFFFFFFFULL));
+    if (!MtTryClaimDiagKey(g_mt_seen_bail_target, key)) {
+        return;
+    }
+    std::printf("[BB-MT] bail_target sample: site=%u(%s) addr=0x%llx info=0x%x vs=0x%016llx "
+                "ps=0x%016llx\n",
+                static_cast<unsigned>(site), MtBailTargetSiteName(site),
+                static_cast<unsigned long long>(addr), fmt_or_mrt,
+                static_cast<unsigned long long>(vs_hash), static_cast<unsigned long long>(ps_hash));
+    std::fflush(stdout);
+}
 
 void MtMaybeLogBadPktSample(const u32* cur, u32 rem) noexcept {
     if (!cur || rem == 0u) {
@@ -1547,18 +1792,26 @@ void MtReportTelemetryIfDue(u32 cur_guest_frame) noexcept {
     const u64 b_tgt = g_mt_bail_target.exchange(0ULL, std::memory_order_relaxed);
     const u64 b_buf = g_mt_bail_buf.exchange(0ULL, std::memory_order_relaxed);
     const u64 b_oth = g_mt_bail_other.exchange(0ULL, std::memory_order_relaxed);
+    const u64 b_oth_emp = g_mt_bail_other_empty.exchange(0ULL, std::memory_order_relaxed);
+    const u64 b_oth_skp = g_mt_bail_other_skip.exchange(0ULL, std::memory_order_relaxed);
+    const u64 b_oth_msc = g_mt_bail_other_misc.exchange(0ULL, std::memory_order_relaxed);
     std::printf("[BB-MT] 600f: compiled %llu/%llu lists (mt_draws=%llu, bail: pkt=%llu, "
-                "pso=%llu(sig=%llu,spec=%llu,unsafe=%llu), target=%llu, buf=%llu, other=%llu)\n",
+                "pso=%llu(sig=%llu,spec=%llu,unsafe=%llu), target=%llu, buf=%llu, "
+                "other=%llu(empty=%llu,skip=%llu,misc=%llu))\n",
                 static_cast<unsigned long long>(comp), static_cast<unsigned long long>(seen),
                 static_cast<unsigned long long>(draws), static_cast<unsigned long long>(b_pkt),
                 static_cast<unsigned long long>(b_pso), static_cast<unsigned long long>(b_pso_sig),
                 static_cast<unsigned long long>(b_pso_spec),
                 static_cast<unsigned long long>(b_pso_uns), static_cast<unsigned long long>(b_tgt),
-                static_cast<unsigned long long>(b_buf), static_cast<unsigned long long>(b_oth));
+                static_cast<unsigned long long>(b_buf), static_cast<unsigned long long>(b_oth),
+                static_cast<unsigned long long>(b_oth_emp),
+                static_cast<unsigned long long>(b_oth_skp),
+                static_cast<unsigned long long>(b_oth_msc));
     std::fflush(stdout);
 }
 
-void MtNoteBail(MtBailReason reason, u32 cur_guest_frame) noexcept {
+void MtNoteBail(MtBailReason reason, u32 cur_guest_frame,
+                MtOtherKind other_kind = MtOtherKind::Misc) noexcept {
     switch (reason) {
     case MtBailReason::Pkt:
         g_mt_bail_pkt.fetch_add(1ULL, std::memory_order_relaxed);
@@ -1574,6 +1827,13 @@ void MtNoteBail(MtBailReason reason, u32 cur_guest_frame) noexcept {
         break;
     case MtBailReason::Other:
         g_mt_bail_other.fetch_add(1ULL, std::memory_order_relaxed);
+        if (other_kind == MtOtherKind::Empty) {
+            g_mt_bail_other_empty.fetch_add(1ULL, std::memory_order_relaxed);
+        } else if (other_kind == MtOtherKind::Skip) {
+            g_mt_bail_other_skip.fetch_add(1ULL, std::memory_order_relaxed);
+        } else {
+            g_mt_bail_other_misc.fetch_add(1ULL, std::memory_order_relaxed);
+        }
         break;
     }
     MtReportTelemetryIfDue(cur_guest_frame);
@@ -1643,6 +1903,14 @@ void MtNotePsoBail(PipelineCache::MtPsoFailKind fail_kind, bool unsafe_pso,
         std::memcpy(&args, cur + 3u, sizeof(args));
         return args.copy_d == 1u && IsMtVsmImageSharp(args.srv_tsharp) &&
                IsMtVsmImageSharp(args.uav_tsharp);
+    }
+    case BbCp::DirectVk::Op::UploadTextureSubresource: {
+        if (pkt_words != 27u) {
+            return false;
+        }
+        BbCp::DirectVk::UploadTextureArgs args{};
+        std::memcpy(&args, cur + 3u, sizeof(args));
+        return IsMtVsmImageSharp(args.real_tsharp);
     }
     default:
         return false;
@@ -1866,12 +2134,11 @@ struct MtDecodedPkt {
             if (count == 0u || count > 32u || body_words != 2u + count * 6u) {
                 return {};
             }
+            (void)mem;
             for (u32 i = 0; i < count; ++i) {
                 BbCp::DirectVk::CopyRegion reg{};
                 std::memcpy(&reg, body + 2u + i * 6u, sizeof(reg));
-                if (reg.reserved != gx_direct_vk::kCopyFlagKnownCpuSource || !reg.src_va ||
-                    !reg.dst_va || reg.byte_size == 0u || reg.byte_size > 262144u ||
-                    (mem && mem->ClampRangeSize(reg.src_va, reg.byte_size) != reg.byte_size)) {
+                if (!reg.dst_va || reg.byte_size == 0u) {
                     return {};
                 }
             }
@@ -1903,6 +2170,13 @@ struct MtDecodedPkt {
 
         case BbCp::DirectVk::Op::CopyTextureRegion:
             if (body_words != 34u) {
+                return {};
+            }
+            out.kind = MtPktKind::TargetRawOp;
+            return out;
+
+        case BbCp::DirectVk::Op::UploadTextureSubresource:
+            if (body_words != 26u) {
                 return {};
             }
             out.kind = MtPktKind::TargetRawOp;
@@ -2165,36 +2439,59 @@ struct MtDecodedPkt {
     }
 }
 
-[[nodiscard]] bool IsPipelineMtSafe(const GraphicsPipeline* pso) noexcept {
-    if (!pso || !pso->UsesPushDescriptors()) {
+[[nodiscard]] bool IsPipelineMtSafe(const GraphicsPipeline* pso,
+                                    u8* out_unsafe_reason = nullptr) noexcept {
+    auto reject = [&](u8 r) noexcept -> bool {
+        if (out_unsafe_reason) {
+            *out_unsafe_reason = r;
+        }
         return false;
+    };
+    if (!pso || !pso->UsesPushDescriptors()) {
+        return reject(1u);
+    }
+    if (!pso->GetStages()[u32(Shader::SwStage::Vertex)]) {
+        return reject(12u);
     }
     for (const auto* st : pso->GetStages()) {
         if (!st) {
             continue;
         }
         if (st->sw_stage != Shader::SwStage::Vertex && st->sw_stage != Shader::SwStage::Fragment) {
-            return false;
+            return reject(2u);
         }
-        if (st->uses_dma || st->uses_paged_buffers || st->has_storage_images ||
-            !st->fmasks.empty() || st->srt_info.flattened_bufsize_dw > 256u) {
-            return false;
+        if (st->uses_dma) {
+            return reject(3u);
+        }
+        if (st->uses_paged_buffers) {
+            return reject(4u);
+        }
+        if (st->has_storage_images) {
+            return reject(5u);
+        }
+        if (!st->fmasks.empty()) {
+            return reject(6u);
+        }
+        if (st->srt_info.flattened_bufsize_dw > 512u) {
+            return reject(7u);
         }
         for (const auto& b : st->buffers) {
-            if (b.is_written || b.is_formatted) {
-                return false;
+            if (b.is_written) {
+                return reject(8u);
             }
             if (b.IsSpecial() && b.buffer_type != Shader::BufferType::Flatbuf &&
                 b.buffer_type != Shader::BufferType::ClipPlanes &&
                 b.buffer_type != Shader::BufferType::BdaPagetable &&
                 b.buffer_type != Shader::BufferType::FaultBuffer) {
-                return false;
+                return reject(9u);
             }
         }
         for (const auto& img : st->images) {
-            if (img.is_written ||
-                img.mip_fallback_mode != Shader::MipStorageFallbackMode::None) {
-                return false;
+            if (img.is_written) {
+                return reject(10u);
+            }
+            if (img.mip_fallback_mode != Shader::MipStorageFallbackMode::None) {
+                return reject(11u);
             }
         }
     }
@@ -2363,7 +2660,7 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
 
             case MtPktKind::TargetRawOp:
                 if (IsVsmTargetRawPacket(cur, dp.pkt_words)) {
-                    MtNoteBail(MtBailReason::Other, cur_guest_frame);
+                    MtNoteBail(MtBailReason::Other, cur_guest_frame, MtOtherKind::Skip);
                     return false;
                 }
                 [[fallthrough]];
@@ -2398,23 +2695,24 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
                     MtNotePsoBail(pso_fail, /*unsafe_pso=*/false, cur_guest_frame);
                     return false;
                 }
-                if (!IsPipelineMtSafe(pso)) {
-                    MtNotePsoBail(pso_fail, /*unsafe_pso=*/true, cur_guest_frame);
-                    return false;
-                }
-
                 const auto* vs_st = pso->GetStages()[u32(Shader::SwStage::Vertex)];
                 const auto* ps_st = pso->GetStages()[u32(Shader::SwStage::Fragment)];
                 const u64 vs_hash = vs_st ? vs_st->pgm_hash : 0ULL;
                 const u64 ps_hash = ps_st ? ps_st->pgm_hash : 0ULL;
+                u8 unsafe_reason = 0u;
+                if (!IsPipelineMtSafe(pso, &unsafe_reason)) {
+                    MtMaybeLogUnsafePsoSample(unsafe_reason, vs_hash, ps_hash);
+                    MtNotePsoBail(pso_fail, /*unsafe_pso=*/true, cur_guest_frame);
+                    return false;
+                }
                 if (mode == 1 && IsStageACoalescerShader(vs_hash, ps_hash)) {
-                    MtNoteBail(MtBailReason::Other, cur_guest_frame);
+                    MtNoteBail(MtBailReason::Other, cur_guest_frame, MtOtherKind::Skip);
                     return false;
                 }
                 if (mode != 1 && (vs_hash == 0x000000008747a367ULL ||
                                   (vs_hash == 0x000000000b0acf50ULL &&
                                    ps_hash == 0x000000000f61fd27ULL))) {
-                    MtNoteBail(MtBailReason::Other, cur_guest_frame);
+                    MtNoteBail(MtBailReason::Other, cur_guest_frame, MtOtherKind::Skip);
                     return false;
                 }
 
@@ -2448,12 +2746,19 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
 
                 if (need_new_subpass) {
                     if (scratch.subpass_plans.size() >= kMaxSubPassesPerList) {
+                        MtMaybeLogBailTargetSample(1u, 0ULL, kMaxSubPassesPerList, vs_hash,
+                                                   ps_hash);
                         MtNoteBail(MtBailReason::Target, cur_guest_frame);
                         return false;
                     }
                     Rasterizer::MtPassTargetSummary ts{};
                     if (!rasterizer.InspectMtPassTargets(sregs, pso, scan_cb_extent, scan_db_extent,
                                                          ts)) {
+                        const VAddr diag_taddr = sregs.color_buffers[0]
+                                                     ? sregs.color_buffers[0].Address()
+                                                     : sregs.depth_buffer.DepthAddress();
+                        MtMaybeLogBailTargetSample(2u, diag_taddr, pso->GetGraphicsKey().mrt_mask,
+                                                   vs_hash, ps_hash);
                         MtNoteBail(MtBailReason::Target, cur_guest_frame);
                         return false;
                     }
@@ -2466,7 +2771,7 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
                     if (guest_mrt == 0x1u && ts.color_formats[0] == vk::Format::eR16G16Sfloat &&
                         !ObjectVelocityCuller::IsObjectVelocityPs(ps_hash) &&
                         sregs.depth_control.depth_enable && !sregs.blend_control[0].enable) {
-                        MtNoteBail(MtBailReason::Other, cur_guest_frame);
+                        MtNoteBail(MtBailReason::Other, cur_guest_frame, MtOtherKind::Skip);
                         return false;
                     }
 
@@ -2516,7 +2821,8 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
 
     const u32 min_draws = list_is_core_geom ? 1u : 2u;
     if (!seen_draw || scratch.subpass_plans.empty() || candidate_draws < min_draws) {
-        MtNoteBail(MtBailReason::Other, cur_guest_frame);
+        MtNoteBail(MtBailReason::Other, cur_guest_frame,
+                   seen_draw ? MtOtherKind::Skip : MtOtherKind::Empty);
         return false;
     }
 
@@ -2888,11 +3194,21 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
     };
 
     auto resolve_gpu_stream_range = [&](VAddr addr, u64 req_size, u64 min_span,
-                                        vk::Buffer& out_buf, u64& out_off,
-                                        u64& out_total_bytes) -> bool {
-        if (!addr || req_size == 0ULL) {
+                                        vk::Buffer& out_buf, u64& out_off, u64& out_total_bytes,
+                                        bool is_formatted = false,
+                                        u8* out_fail_step = nullptr) -> bool {
+        auto fail = [&](u8 step) noexcept -> bool {
+            if (out_fail_step) {
+                *out_fail_step = step;
+            }
             return false;
+        };
+        if (!addr || req_size == 0ULL) {
+            return fail(1u);
         }
+        const bool in_transient =
+            (addr >= cue_base && addr < cue_end) ||
+            VideoCore::DirectBuffers::IsTransientAuxCpuRing(addr, 1ULL);
         const u64 gw_gen = scratch.MaxGpuWriteGenOverlapping(addr, req_size);
         for (size_t i = scratch.chunk_copies.size(); i-- > 0;) {
             const auto& cp = scratch.chunk_copies[i];
@@ -2903,37 +3219,49 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
                 const u64 off = addr - cp.dst_va;
                 const u64 avail = cp.byte_size - off;
                 if (avail < min_span || (gw_gen != 0ULL && avail < req_size)) {
-                    return false;
+                    return fail(2u);
                 }
-                const u32 up_sz = static_cast<u32>(std::min<u64>(req_size, avail));
-                if (!upload_or_memo_const(addr, up_sz, cp.gen,
-                                          reinterpret_cast<const void*>(cp.src_va + off), out_buf,
-                                          out_off)) {
-                    return false;
+                const u64 up_sz64 = std::min<u64>(req_size, avail);
+                if (up_sz64 <= 262144ULL) {
+                    const u32 up_sz = static_cast<u32>(up_sz64);
+                    if (!upload_or_memo_const(addr, up_sz, cp.gen,
+                                              reinterpret_cast<const void*>(cp.src_va + off),
+                                              out_buf, out_off)) {
+                        return fail(2u);
+                    }
+                    out_total_bytes = out_off + up_sz;
+                    return true;
                 }
-                out_total_bytes = out_off + up_sz;
-                return true;
+                if (!in_transient) {
+                    const auto resolved = ResolveBuffer(worker_id, addr, req_size);
+                    if (resolved && resolved.vram_handle != VK_NULL_HANDLE &&
+                        resolved.clamped_size >= min_span) {
+                        out_buf = vk::Buffer{resolved.vram_handle};
+                        out_off = resolved.vram_offset;
+                        out_total_bytes = resolved.vram_offset + resolved.clamped_size;
+                        return true;
+                    }
+                }
+                return fail(4u);
             }
             if (cp.dst_va > addr && cp.dst_va < addr + req_size) {
-                return false; // Straddles start of an in-list staged copy region
+                return fail(3u); // Straddles start of an in-list staged copy region
             }
         }
 
-        const bool in_transient =
-            (addr >= cue_base && addr < cue_end) ||
-            VideoCore::DirectBuffers::IsTransientAuxCpuRing(addr, 1ULL);
         if (gw_gen != 0ULL) {
             if (!in_transient) {
                 const auto resolved = ResolveBuffer(worker_id, addr, req_size);
-                if (resolved && resolved.is_direct_vram && resolved.clamped_size >= min_span &&
+                if (resolved && resolved.vram_handle != VK_NULL_HANDLE &&
+                    resolved.clamped_size >= min_span &&
                     scratch.FullGpuWriteCovers(addr, resolved.clamped_size, gw_gen)) {
-                    out_buf = vk::Buffer{resolved.handle};
-                    out_off = resolved.offset;
-                    out_total_bytes = resolved.offset + resolved.clamped_size;
+                    out_buf = vk::Buffer{resolved.vram_handle};
+                    out_off = resolved.vram_offset;
+                    out_total_bytes = resolved.vram_offset + resolved.clamped_size;
                     return true;
                 }
             }
-            return false;
+            return fail(5u);
         }
 
         if (!in_transient && req_size <= scratch.cb_temp.size()) {
@@ -2944,7 +3272,7 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
                                     static_cast<u32>(req_size), copied, s_gen)) {
                 if (!upload_or_memo_const(addr, copied, s_gen, scratch.cb_temp.data(), out_buf,
                                           out_off)) {
-                    return false;
+                    return fail(6u);
                 }
                 out_total_bytes = out_off + copied;
                 return true;
@@ -2953,16 +3281,30 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
 
         if (!in_transient) {
             const auto resolved = ResolveBuffer(worker_id, addr, req_size);
-            if (resolved && !resolved.is_gpu_written && resolved.clamped_size >= min_span) {
-                if (WasCoarseRangeModifiedRecently(addr, resolved.clamped_size, cur_guest_frame) ||
-                    rasterizer.IsRegionGpuModifiedForMt(addr, resolved.clamped_size)) {
-                    return false;
+            if (resolved && resolved.clamped_size >= min_span) {
+                if (!resolved.is_gpu_written) {
+                    if (WasCoarseRangeModifiedRecently(addr, resolved.clamped_size,
+                                                       cur_guest_frame) ||
+                        rasterizer.IsRegionGpuModifiedForMt(addr, resolved.clamped_size)) {
+                        return fail(7u);
+                    }
+                    out_buf = vk::Buffer{resolved.handle};
+                    out_off = resolved.offset;
+                    out_total_bytes = resolved.offset + resolved.clamped_size;
+                    return true;
                 }
-                out_buf = vk::Buffer{resolved.handle};
-                out_off = resolved.offset;
-                out_total_bytes = resolved.offset + resolved.clamped_size;
-                return true;
+                if (resolved.vram_handle != VK_NULL_HANDLE && guest_copy_shadow &&
+                    guest_copy_shadow->HasValidHugeLiveCover(addr, min_span)) {
+                    out_buf = vk::Buffer{resolved.vram_handle};
+                    out_off = resolved.vram_offset;
+                    out_total_bytes = resolved.vram_offset + resolved.clamped_size;
+                    return true;
+                }
             }
+        }
+
+        if (!in_transient && is_formatted) {
+            return fail(8u); // Never touch non-DirectBuffers raw guest RAM for formatted loads
         }
 
         if (req_size <= 65536ULL && !VideoCore::DirectBuffers::OverlapsNativeOwnedRange(addr, req_size) &&
@@ -2973,13 +3315,13 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
                 const u64 memo_tag = in_transient ? (0x4000000000000000ULL | addr) : 0ULL;
                 if (!upload_or_memo_const(addr, static_cast<u32>(clamped), memo_tag,
                                           reinterpret_cast<const void*>(addr), out_buf, out_off)) {
-                    return false;
+                    return fail(9u);
                 }
                 out_total_bytes = out_off + clamped;
                 return true;
             }
         }
-        return false;
+        return fail(9u);
     };
 
     auto resolve_cpu_index_ptr = [&](VAddr ib_addr, u64 ib_bytes) noexcept -> const void* {
@@ -3069,8 +3411,20 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
                 for (u32 i = 0; i < count; ++i) {
                     BbCp::DirectVk::CopyRegion reg{};
                     std::memcpy(&reg, body + 2u + i * 6u, sizeof(reg));
-                    scratch.chunk_copies.push_back(
-                        {reg.dst_va, reg.src_va, reg.byte_size, ++local_copy_gen});
+                    const bool is_cpu_flag =
+                        (reg.reserved == gx_direct_vk::kCopyFlagKnownCpuSource ||
+                         reg.reserved == gx_direct_vk::kCopyFlagLiveStagingPtr);
+                    const bool cpu_readable =
+                        is_cpu_flag && reg.src_va != 0ULL && reg.byte_size <= (4u << 20u) &&
+                        (!mem || mem->ClampRangeSize(reg.src_va, reg.byte_size) == reg.byte_size);
+                    const u64 cur_gen = ++local_copy_gen;
+                    if (cpu_readable) {
+                        scratch.chunk_copies.push_back(
+                            {reg.dst_va, reg.src_va, reg.byte_size, cur_gen});
+                    } else {
+                        scratch.chunk_gpu_writes.push_back({reg.dst_va, reg.byte_size, cur_gen});
+                        scratch.NoteTargetWrite(reg.dst_va, reg.byte_size);
+                    }
                 }
             } else if (dp.kind == MtPktKind::FillBuf) {
                 BbCp::DirectVk::FillArgs fargs{};
@@ -3084,6 +3438,10 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
                     BbCp::DirectVk::CopyTextureRegionArgs cargs{};
                     std::memcpy(&cargs, cur + 3u, sizeof(cargs));
                     scratch.NoteTargetWrite(cargs.dst_va, cargs.dst_byte_size);
+                } else if (raw_vk_op == BbCp::DirectVk::Op::UploadTextureSubresource) {
+                    BbCp::DirectVk::UploadTextureArgs uargs{};
+                    std::memcpy(&uargs, cur + 3u, sizeof(uargs));
+                    scratch.NoteTargetWrite(uargs.dst_va, uargs.dst_byte_size);
                 } else {
                     VAddr raw_dst_va = 0;
                     u32 raw_dst_sz = 0;
@@ -3272,8 +3630,12 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
                                                   std::max<u64>(1ULL, gb.GetStride()));
                             }
                         }
+                        u8 vb_step = 0u;
                         if (!resolve_gpu_stream_range(rng.begin, rng.end - rng.begin, min_span,
-                                                      rng.handle, rng.offset, rng.total_bytes)) {
+                                                      rng.handle, rng.offset, rng.total_bytes,
+                                                      false, &vb_step)) {
+                            MtMaybeLogBailBufSample(1u, vb_step, false, rng.begin,
+                                                    rng.end - rng.begin, vs_stage->pgm_hash);
                             return abort_pass(MtBailReason::Buf);
                         }
                     }
@@ -3292,8 +3654,11 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
                     u64 ib_off = 0;
                     if (dp.is_indexed) {
                         u64 ib_tot = 0;
+                        u8 ib_step = 0u;
                         if (!resolve_gpu_stream_range(ib_addr, ib_bytes, ib_bytes, ib_buf, ib_off,
-                                                      ib_tot)) {
+                                                      ib_tot, false, &ib_step)) {
+                            MtMaybeLogBailBufSample(2u, ib_step, false, ib_addr, ib_bytes,
+                                                    vs_stage->pgm_hash);
                             return abort_pass(MtBailReason::Buf);
                         }
                     }
@@ -3417,6 +3782,8 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
                                     const auto alloc = AllocateWorkerConstants(
                                         worker_id, fsz, storage_align, flat_ud);
                                     if (!alloc) {
+                                        MtMaybeLogBailBufSample(3u, 0u, false, 0ULL, fsz,
+                                                                stage->pgm_hash);
                                         return abort_pass(MtBailReason::Buf);
                                     }
                                     bi = vk::DescriptorBufferInfo{alloc.buffer, alloc.offset, fsz};
@@ -3439,6 +3806,9 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
                                             worker_id, sizeof(planes), storage_align,
                                             planes.data());
                                         if (!alloc) {
+                                            MtMaybeLogBailBufSample(4u, 0u, false, 0ULL,
+                                                                    sizeof(planes),
+                                                                    stage->pgm_hash);
                                             return abort_pass(MtBailReason::Buf);
                                         }
                                         bi = vk::DescriptorBufferInfo{alloc.buffer, alloc.offset,
@@ -3450,6 +3820,8 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
                                     const auto* tbl =
                                         rasterizer.GetBufferCache().GetBdaPageTableBuffer();
                                     if (!tbl) {
+                                        MtMaybeLogBailBufSample(5u, 1u, false, 0ULL, 0ULL,
+                                                                stage->pgm_hash);
                                         return abort_pass(MtBailReason::Buf);
                                     }
                                     bi = vk::DescriptorBufferInfo{tbl->Handle(), 0,
@@ -3459,6 +3831,8 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
                                 case Shader::BufferType::FaultBuffer: {
                                     const auto* flt = rasterizer.GetBufferCache().GetFaultBuffer();
                                     if (!flt) {
+                                        MtMaybeLogBailBufSample(5u, 2u, false, 0ULL, 0ULL,
+                                                                stage->pgm_hash);
                                         return abort_pass(MtBailReason::Buf);
                                     }
                                     bi = vk::DescriptorBufferInfo{flt->Handle(), 0,
@@ -3466,6 +3840,8 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
                                     break;
                                 }
                                 default:
+                                    MtMaybeLogBailBufSample(5u, 3u, false, 0ULL, 0ULL,
+                                                            stage->pgm_hash);
                                     return abort_pass(MtBailReason::Buf);
                                 }
                             } else {
@@ -3487,17 +3863,28 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
                                     vk::Buffer r_buf{};
                                     u64 r_off = 0;
                                     u64 r_tot = 0;
+                                    u8 sb_step = 0u;
                                     if (!resolve_gpu_stream_range(b_addr, b_size, 1ULL, r_buf,
-                                                                  r_off, r_tot)) {
+                                                                  r_off, r_tot, desc.is_formatted,
+                                                                  &sb_step)) {
+                                        MtMaybeLogBailBufSample(6u, sb_step, desc.is_formatted,
+                                                                b_addr, b_size, stage->pgm_hash);
                                         return abort_pass(MtBailReason::Buf);
                                     }
                                     const u64 aligned_off = Common::AlignDown(r_off, storage_align);
                                     const auto adjust = static_cast<u32>(r_off - aligned_off);
+                                    if ((adjust & 3u) != 0u) {
+                                        MtMaybeLogBailBufSample(6u, 10u, desc.is_formatted, b_addr,
+                                                                b_size, stage->pgm_hash);
+                                        return abort_pass(MtBailReason::Buf);
+                                    }
                                     const u64 avail_range =
                                         (r_tot > aligned_off) ? (r_tot - aligned_off) : 0ULL;
                                     const u64 bind_range =
                                         std::min<u64>(b_size + adjust, avail_range);
                                     if (bind_range == 0ULL) {
+                                        MtMaybeLogBailBufSample(6u, 11u, desc.is_formatted, b_addr,
+                                                                b_size, stage->pgm_hash);
                                         return abort_pass(MtBailReason::Buf);
                                     }
                                     push_data.AddOffset(binding.buffer, adjust);
@@ -3530,11 +3917,17 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
                             } else {
                                 const auto srv = ResolveSceneSrv(worker_id, tsharp, img, cur_ts);
                                 if (!srv.view) {
+                                    MtMaybeLogBailTargetSample(
+                                        3u, tsharp.Address(), u32(tsharp.GetDataFmt()),
+                                        vs_stage->pgm_hash, ps_stage ? ps_stage->pgm_hash : 0ULL);
                                     return abort_pass(MtBailReason::Target);
                                 }
                                 const bool written_in_list =
                                     scratch.OverlapsTargetWrite(tsharp.Address());
                                 if (written_in_list && !srv.id) {
+                                    MtMaybeLogBailTargetSample(
+                                        4u, tsharp.Address(), u32(tsharp.GetDataFmt()),
+                                        vs_stage->pgm_hash, ps_stage ? ps_stage->pgm_hash : 0ULL);
                                     return abort_pass(MtBailReason::Target);
                                 }
                                 if (srv.needs_stage_b_transit || (written_in_list && bool(srv.id))) {
@@ -3550,6 +3943,10 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
                                     if (!dup) {
                                         if (cur_num_sampled_rts >=
                                             MtCompletedPassMeta::kMaxSampledRts) {
+                                            MtMaybeLogBailTargetSample(
+                                                5u, tsharp.Address(), cur_num_sampled_rts,
+                                                vs_stage->pgm_hash,
+                                                ps_stage ? ps_stage->pgm_hash : 0ULL);
                                             return abort_pass(MtBailReason::Target);
                                         }
                                         cur_sampled_rts[cur_num_sampled_rts++] =

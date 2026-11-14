@@ -1105,8 +1105,14 @@ void Rasterizer::ExecuteSecondaryCmdBuf(u32 worker_id, u64 cmd_seq, u32 recorded
     }
     meta->ApplyToRegs(*mt_stage_b_regs);
 
+    if (!pending_buf_copies.empty()) [[unlikely]] {
+        FlushPendingBufferCopies();
+    }
     if (direct_buffers.HasPendingWritebacks()) {
         direct_buffers.FlushPendingWritebacks();
+        needs_barrier = true;
+    }
+    if (runtime.HasPendingBarriers()) {
         needs_barrier = true;
     }
 

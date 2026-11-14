@@ -134,7 +134,9 @@ void SetExactNativeBufferOwned(VAddr addr, bool is_native_owned) noexcept;
 /// Phase 4.1: Value-returned lock-free buffer binding resolved for multi-threaded workers.
 struct MtResolvedBuffer {
     VkBuffer handle{VK_NULL_HANDLE};
+    VkBuffer vram_handle{VK_NULL_HANDLE};
     u64 offset{0};
+    u64 vram_offset{0};
     u64 clamped_size{0};
     bool is_static_immutable{false};
     bool is_gpu_written{false};
@@ -156,6 +158,7 @@ struct MtReadMru {
         u64 raw_size{0};
         u64 alloc_size{0};
         VkBuffer vk_handle{VK_NULL_HANDLE};
+        VkBuffer vram_handle{VK_NULL_HANDLE};
         u64 base_offset{0};
         u64 gen{0};
         bool is_static_immutable{false};
