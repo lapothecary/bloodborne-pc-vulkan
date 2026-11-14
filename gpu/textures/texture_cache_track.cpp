@@ -312,6 +312,7 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
         if (image.Overlaps(addr, size)) {
             // The write is into the image: dirty, and its pages free for the guest.
             image.flags |= ImageFlagBits::CpuDirty;
+            image.prompt_icon_checked = false;
             BbMem::FaultSites::NoteImage(begin, image.info.guest_size, image.info.size.width,
                                          image.info.size.height, u32(image.info.pixel_format),
                                          u32(image.info.tile_mode));
@@ -362,6 +363,7 @@ bool TextureCache::DisarmWatchedRange(VAddr addr, size_t size, bool mark_dirty) 
         const VAddr end = begin + image.info.guest_size;
         if (image.Overlaps(addr, size)) {
             image.flags |= ImageFlagBits::CpuDirty;
+            image.prompt_icon_checked = false;
             if (False(image.flags & ImageFlagBits::SharedHotPage) && image.IsTracked()) {
                 UntrackImage(image_id);
             }
@@ -421,6 +423,7 @@ void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
         }
         WatchImage(image, "GPU write (marked for refresh)");
         image.flags |= ImageFlagBits::GpuDirty; // uploaded again from memory on next use
+        image.prompt_icon_checked = false;
     });
 }
 

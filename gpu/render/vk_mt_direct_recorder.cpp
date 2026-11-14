@@ -1639,6 +1639,7 @@ std::array<std::atomic<u32>, 16> g_mt_seen_bail_ops{};
 std::array<std::atomic<u64>, 8> g_mt_seen_unsafe_pso{};
 std::array<std::atomic<u64>, 8> g_mt_seen_bail_buf{};
 std::array<std::array<std::atomic<u64>, 4>, 6> g_mt_seen_bail_target_by_site{};
+std::atomic<u64> g_mt_prev_window_compiled{0};
 
 [[nodiscard]] bool MtTryClaimDiagKey(std::span<std::atomic<u64>> table, u64 raw_key) noexcept {
     const u64 key = raw_key | (1ULL << 63u);
@@ -1754,20 +1755,22 @@ void MtMaybeLogBailBufSample(u8 site, u8 step, bool is_fmt, VAddr addr, u64 sz,
     }
 }
 
-void MtMaybeLogBailTargetSample(u8 site, VAddr addr, u32 fmt_or_mrt, u64 vs_hash,
-                                u64 ps_hash) noexcept {
+void MtMaybeLogBailTargetSample(u8 site, VAddr addr, u32 fmt_or_mrt, u64 vs_hash, u64 ps_hash,
+                                u8 substep = 0u, u32 flags = 0u, u32 w = 0u, u32 h = 0u,
+                                u32 guest_size = 0u) noexcept {
     const size_t bucket = std::min<size_t>(site, g_mt_seen_bail_target_by_site.size() - 1u);
-    const u64 key = (static_cast<u64>(site) << 56u) |
-                    (static_cast<u64>(fmt_or_mrt & 0xFFFFu) << 40u) |
+    const u64 key = (static_cast<u64>(site) << 56u) | (static_cast<u64>(substep) << 48u) |
+                    (static_cast<u64>(fmt_or_mrt & 0xFFu) << 40u) |
                     (((addr >> 8u) ^ vs_hash ^ ps_hash) & 0xFFFFFFFFFFULL);
     if (!MtTryClaimDiagKey(g_mt_seen_bail_target_by_site[bucket], key)) {
         return;
     }
-    std::printf("[BB-MT] bail_target sample: site=%u(%s) addr=0x%llx info=0x%x vs=0x%016llx "
-                "ps=0x%016llx\n",
+    std::printf("[BB-MT] bail_target sample: site=%u(%s) sub=%u addr=0x%llx info=0x%x flags=0x%x "
+                "%ux%u gsz=0x%x vs=0x%016llx ps=0x%016llx\n",
                 static_cast<unsigned>(site), MtBailTargetSiteName(site),
-                static_cast<unsigned long long>(addr), fmt_or_mrt,
-                static_cast<unsigned long long>(vs_hash), static_cast<unsigned long long>(ps_hash));
+                static_cast<unsigned>(substep), static_cast<unsigned long long>(addr), fmt_or_mrt,
+                flags, w, h, guest_size, static_cast<unsigned long long>(vs_hash),
+                static_cast<unsigned long long>(ps_hash));
     std::fflush(stdout);
 }
 
@@ -1822,6 +1825,14 @@ void MtReportTelemetryIfDue(u32 cur_guest_frame) noexcept {
     }
     const u64 seen = g_mt_lists_seen.exchange(0ULL, std::memory_order_relaxed);
     const u64 comp = g_mt_lists_compiled.exchange(0ULL, std::memory_order_relaxed);
+    const u64 prev_comp = g_mt_prev_window_compiled.exchange(comp, std::memory_order_relaxed);
+    if (prev_comp > 0ULL && comp * 2ULL < prev_comp) {
+        for (auto& bucket : g_mt_seen_bail_target_by_site) {
+            for (auto& slot : bucket) {
+                slot.store(0ULL, std::memory_order_relaxed);
+            }
+        }
+    }
     const u64 draws = g_mt_draws_recorded.exchange(0ULL, std::memory_order_relaxed);
     const u64 b_pkt = g_mt_bail_pkt.exchange(0ULL, std::memory_order_relaxed);
     const u64 b_pso = g_mt_bail_pso.exchange(0ULL, std::memory_order_relaxed);
@@ -2811,11 +2822,14 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
                     Rasterizer::MtPassTargetSummary ts{};
                     if (!rasterizer.InspectMtPassTargets(sregs, pso, scan_cb_extent, scan_db_extent,
                                                          ts)) {
-                        const VAddr diag_taddr = sregs.color_buffers[0]
-                                                     ? sregs.color_buffers[0].Address()
-                                                     : sregs.depth_buffer.DepthAddress();
+                        const VAddr diag_taddr =
+                            ts.diag_addr != 0
+                                ? ts.diag_addr
+                                : (sregs.color_buffers[0] ? sregs.color_buffers[0].Address()
+                                                          : sregs.depth_buffer.DepthAddress());
                         MtMaybeLogBailTargetSample(2u, diag_taddr, pso->GetGraphicsKey().mrt_mask,
-                                                   vs_hash, ps_hash);
+                                                   vs_hash, ps_hash, ts.bail_substep, ts.diag_flags,
+                                                   ts.diag_w, ts.diag_h, ts.diag_guest_size);
                         MtNoteBail(MtBailReason::Target, cur_guest_frame);
                         return false;
                     }
@@ -3921,13 +3935,22 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
                                 if (b_addr == 0 || b_size == 0) {
                                     bi = vk::DescriptorBufferInfo{VK_NULL_HANDLE, 0, VK_WHOLE_SIZE};
                                 } else {
-                                    if (b_size == 864ULL && cur_ts.is_gbuffer && !has_camera_cb) {
+                                    if (is_vs && b_size == 864ULL && vsharp.GetStride() == 16u &&
+                                        cur_ts.is_gbuffer && !has_camera_cb) {
                                         const u8* cam_ptr = nullptr;
                                         u32 cam_sz = 0;
                                         if (resolve_cb_for_occ(&cb_ctx, vsharp, cam_ptr, cam_sz) &&
                                             cam_ptr && cam_sz >= 864u) {
-                                            std::memcpy(camera_cb_floats.data(), cam_ptr, 864u);
-                                            has_camera_cb = true;
+                                            const float* cf =
+                                                reinterpret_cast<const float*>(cam_ptr);
+                                            if (cf[0] == 3000.0f && cf[4] >= 64.0f &&
+                                                cf[5] >= 64.0f &&
+                                                std::abs(cf[1] * cf[0] - 1.0f) <= 1e-3f &&
+                                                std::isfinite(cf[183]) && std::isfinite(cf[187]) &&
+                                                std::isfinite(cf[191])) {
+                                                std::memcpy(camera_cb_floats.data(), cam_ptr, 864u);
+                                                has_camera_cb = true;
+                                            }
                                         }
                                     }
                                     vk::Buffer r_buf{};
@@ -3989,7 +4012,9 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
                                 if (!srv.view) {
                                     MtMaybeLogBailTargetSample(
                                         3u, tsharp.Address(), u32(tsharp.GetDataFmt()),
-                                        vs_stage->pgm_hash, ps_stage ? ps_stage->pgm_hash : 0ULL);
+                                        vs_stage->pgm_hash, ps_stage ? ps_stage->pgm_hash : 0ULL,
+                                        srv.bail_substep, srv.diag_flags, srv.diag_w, srv.diag_h,
+                                        srv.diag_guest_size);
                                     return abort_pass(MtBailReason::Target);
                                 }
                                 const bool written_in_list =

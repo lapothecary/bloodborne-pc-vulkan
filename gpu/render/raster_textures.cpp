@@ -643,9 +643,10 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
             // bbport: one of the game's key guide icons, drawn by the port for the device in use
             // (vk_button_prompts.h). Not remembered in the texture set: the device may change.
             // A copy the GPU made (DMA) is recognised here, by its bytes in memory.
-            if (image.MaybePromptIcon() && prompts->Active()) {
+            if (image.MaybePromptIcon()) {
                 image.prompt_icon =
                     u8(BbPrompts::IconOf(reinterpret_cast<const void*>(image.info.guest_address), 1024));
+                image.prompt_icon_checked = true;
             }
             if (image.prompt_atlas && !is_storage && prompts->Active()) {
                 if (const vk::ImageView atlas = prompts->AtlasView(runtime, image, desc.view_info)) {
@@ -1237,9 +1238,10 @@ bool Rasterizer::BindTexturesFromSet(const Shader::Info& stage, const u64* image
         }
         auto& image = texture_cache.GetImageUntouched(entry.id);
         // A key guide icon the GPU copied in, recognised by its bytes (then not from the set).
-        if (prompts_on && image.MaybePromptIcon()) {
+        if (image.MaybePromptIcon()) {
             image.prompt_icon =
                 u8(BbPrompts::IconOf(reinterpret_cast<const void*>(image.info.guest_address), 1024));
+            image.prompt_icon_checked = true;
         }
         // Proxy entries need a current proxy; native entries of a proxied image go through
         // BindTextures, which may sample the proxy instead.
@@ -1388,7 +1390,8 @@ Rasterizer::MtResolvedSrv Rasterizer::ResolveSceneSrvViewMt(
         if (out_misses) {
             ++(*out_misses);
         }
-        return {};
+        out.bail_substep = 1u;
+        return out;
     }
 
     Gcn::Image clean_sharp = raw_sharp;
@@ -1401,34 +1404,47 @@ Rasterizer::MtResolvedSrv Rasterizer::ResolveSceneSrvViewMt(
     vk::ImageLayout layout = vk::ImageLayout::eUndefined;
     VideoCore::SubresourceRange range{};
     bool needs_transit = false;
+    VideoCore::TextureCache::MtRejectDiag rdiag{};
     if (!texture_cache.TryResolveSceneSrvViewMt(clean_sharp, res, pass_targets.reduced_scene_active,
                                                 scene_targets.get(), id, uid, view, layout, range,
-                                                needs_transit) ||
+                                                needs_transit, &rdiag) ||
         !view || !id) {
         if (out_misses) {
             ++(*out_misses);
         }
-        return {};
+        out.bail_substep = rdiag.substep != 0u ? rdiag.substep : 10u;
+        out.diag_flags = rdiag.flags;
+        out.diag_w = rdiag.width;
+        out.diag_h = rdiag.height;
+        out.diag_guest_size = rdiag.guest_size;
+        return out;
     }
+    out.diag_flags = rdiag.flags;
+    out.diag_w = rdiag.width;
+    out.diag_h = rdiag.height;
+    out.diag_guest_size = rdiag.guest_size;
     if (upscaler && upscaler->RedirectsSampledMt(id)) {
         if (out_misses) {
             ++(*out_misses);
         }
-        return {};
+        out.bail_substep = 11u;
+        return out;
     }
     for (const auto cb_id : pass_targets.cb_ids) {
         if (cb_id == id) {
             if (out_misses) {
                 ++(*out_misses);
             }
-            return {};
+            out.bail_substep = 12u;
+            return out;
         }
     }
     if (pass_targets.db_id == id && pass_targets.depth_write_or_stencil_write) {
         if (out_misses) {
             ++(*out_misses);
         }
-        return {};
+        out.bail_substep = 13u;
+        return out;
     }
 
     if (!needs_transit && out_hits) {

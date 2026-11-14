@@ -136,17 +136,26 @@ public:
         ImageId* out_id = nullptr);
     /// Phase 4.2b/4.3: Read-only thread-safe inspection of an existing render/depth target image
     /// and view on `GXWorker:1..5` without mutating cache state.
+    struct MtRejectDiag {
+        u8 substep{0};
+        u32 flags{0};
+        u32 width{0};
+        u32 height{0};
+        u32 guest_size{0};
+    };
+
     [[nodiscard]] bool TryInspectTargetMt(ImageDesc& desc, ImageId& out_id, ImageInfo& out_info,
                                           u32& out_backing_samples, vk::Format& out_backing_fmt,
                                           vk::ImageAspectFlags& out_aspect_mask,
-                                          bool& out_has_scene_proxy);
+                                          bool& out_has_scene_proxy,
+                                          MtRejectDiag* out_diag = nullptr);
     /// Phase 4.2b/4.3: Read-only thread-safe resolution of any clean existing SRV (including
     /// dynamic shadow/depth/HDR scene RTs and non-tagged textures) on `GXWorker:1..5`.
     [[nodiscard]] bool TryResolveSceneSrvViewMt(
         const Gcn::Image& clean_sharp, const Shader::ImageResource& res, bool reduced_scene_active,
         const Vulkan::SceneTargets* scene_targets, ImageId& out_id, u64& out_uid,
         vk::ImageView& out_view, vk::ImageLayout& out_layout, SubresourceRange& out_range,
-        bool& out_needs_stage_b_transit);
+        bool& out_needs_stage_b_transit, MtRejectDiag* out_diag = nullptr);
 
     Image* TryGetImage(ImageId id, u64 uid) {
         if (!slot_images.is_allocated(id)) {
@@ -195,6 +204,10 @@ public:
     /// N2.1: Marks a GPU-DMA uploaded asset VkImage as DirectImmutable (disarming any page traps,
     /// registering direct_assets_by_addr, and enabling O(1) lock-free IsUpToDate).
     void MarkDirectImmutableAsset(ImageId image_id);
+    /// Phase 4.3e: Permanently demotes an image from DirectImmutable (stripping flag, erasing
+    /// direct_assets_by_addr, and bumping ImmutableRoEpoch once) when written as RT/Storage/Copy.
+    void DemoteDirectImmutable(ImageId image_id);
+    void DemoteDirectImmutableLocked(ImageId image_id, Image& image) noexcept;
     /// A memoized lookup found the image: its access tick (FindImage's), the LRU touch comes
     /// with UpdateImage.
     void MarkFound(ImageId image_id) {

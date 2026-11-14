@@ -209,6 +209,20 @@ float CameraMotion::Near() const noexcept {
     return -current.proj[3] / current.proj[2];
 }
 
+bool CameraMotion::CurrentInvViewPosAndZ(float pos[3], float z_axis[3]) const noexcept {
+    if (!current.valid) {
+        return false;
+    }
+    pos[0] = current.inv_view[3];
+    pos[1] = current.inv_view[7];
+    pos[2] = current.inv_view[11];
+    z_axis[0] = current.inv_view[2];
+    z_axis[1] = current.inv_view[6];
+    z_axis[2] = current.inv_view[10];
+    return std::isfinite(pos[0]) && std::isfinite(pos[1]) && std::isfinite(pos[2]) &&
+           std::isfinite(z_axis[0]) && std::isfinite(z_axis[1]) && std::isfinite(z_axis[2]);
+}
+
 void CameraMotion::PrintState(int frame) const {
     const auto print = [](const char* name, const float* v, int n) {
         std::printf(" %s", name);

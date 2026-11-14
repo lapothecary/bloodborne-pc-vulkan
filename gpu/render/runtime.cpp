@@ -86,8 +86,12 @@ u32 BufferImageCopySize(const vk::BufferImageCopy& copy, vk::Format format) {
 
 /// The written image now holds what the source holds (or new GPU data) and no stale upload.
 void MarkCopied(VideoCore::Image* dst, VideoCore::ImageFlagBits modified) {
-    if (bool(modified) && VideoCore::True(dst->flags & VideoCore::ImageFlagBits::DirectImmutable)) {
-        VideoCore::DirectTextures::BumpImmutableRoEpoch();
+    if (bool(modified)) {
+        if (VideoCore::True(dst->flags & VideoCore::ImageFlagBits::DirectImmutable)) {
+            dst->flags &= ~VideoCore::ImageFlagBits::DirectImmutable;
+            VideoCore::DirectTextures::BumpImmutableRoEpoch();
+        }
+        dst->prompt_icon_checked = false;
     }
     dst->flags |= modified;
     dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
@@ -300,6 +304,7 @@ bool Runtime::Transit(VideoCore::Image* image, vk::ImageLayout dst_layout,
         VideoCore::True(image->flags & VideoCore::ImageFlagBits::DirectImmutable) &&
         (dst_layout != vk::ImageLayout::eShaderReadOnlyOptimal ||
          dst_access != vk::AccessFlagBits2::eShaderRead || range.has_value())) {
+        image->flags &= ~VideoCore::ImageFlagBits::DirectImmutable;
         VideoCore::DirectTextures::BumpImmutableRoEpoch();
     }
     return image_barriers.size() != before;

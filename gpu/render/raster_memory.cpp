@@ -1427,14 +1427,16 @@ void Rasterizer::DirectUploadTextureSubresource(const DirectUploadTextureArgs& a
     };
     runtime.CopyBufferToImageSubresource(&dst_img, staging.buffer, dst_range, copy);
 
-    dst_img.flags =
-        (dst_img.flags | VideoCore::ImageFlagBits::GpuModified) & ~VideoCore::ImageFlagBits::Dirty;
-    dst_img.gpu_write_tick = scheduler.CurrentTick();
-
     if (is_immutable_asset) {
+        dst_img.flags &= ~VideoCore::ImageFlagBits::Dirty;
+        dst_img.gpu_write_tick = scheduler.CurrentTick();
         texture_cache.MarkDirectImmutableAsset(dst_id);
         return;
     }
+
+    dst_img.flags =
+        (dst_img.flags | VideoCore::ImageFlagBits::GpuModified) & ~VideoCore::ImageFlagBits::Dirty;
+    dst_img.gpu_write_tick = scheduler.CurrentTick();
 
     // Seed the 8x8 page-watch hash and mip hash of the backing guest region so a subsequent
     // MaybeCpuDirty write elsewhere in the same page never re-uploads zeroed guest tiled memory

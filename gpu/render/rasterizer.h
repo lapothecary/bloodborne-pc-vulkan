@@ -141,6 +141,12 @@ public:
         bool is_scene_color{false};
         bool depth_write_or_stencil_write{false};
         bool has_motion_attachment{false};
+        u8 bail_substep{0};
+        VAddr diag_addr{0};
+        u32 diag_flags{0};
+        u32 diag_w{0};
+        u32 diag_h{0};
+        u32 diag_guest_size{0};
     };
 
     struct MtResolvedSrv {
@@ -150,6 +156,11 @@ public:
         u64 uid{0};
         VideoCore::SubresourceRange range{};
         bool needs_stage_b_transit{false};
+        u8 bail_substep{0};
+        u32 diag_flags{0};
+        u32 diag_w{0};
+        u32 diag_h{0};
+        u32 diag_guest_size{0};
     };
 
     using MtResolveCbBytesFn = bool (*)(void* ctx, const Gcn::Buffer& sharp, const u8*& out_ptr,

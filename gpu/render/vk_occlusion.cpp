@@ -102,7 +102,7 @@ OcclusionQueries::~OcclusionQueries() {
     scheduler.SetCarriedScope(nullptr);
 }
 
-void OcclusionQueries::BeginSegment(bool inside_render_pass) {
+void OcclusionQueries::BeginSegment(bool inside_render_pass, bool use_pass_scale) {
     if (begun == reset_until) {
         if (inside_render_pass) {
             ++starved; // no reset can be recorded in a render pass: these samples go uncounted
@@ -112,7 +112,7 @@ void OcclusionQueries::BeginSegment(bool inside_render_pass) {
     }
     const u32 slot = static_cast<u32>(begun % NumSlots);
     const bool precise = instance.IsOcclusionQueryPrecise();
-    slot_scale[slot] = inside_render_pass ? pass_scale : 256;
+    slot_scale[slot] = (inside_render_pass || use_pass_scale) ? pass_scale : 256;
     scheduler.Record([pool = *pool, slot, precise](vk::CommandBuffer cmdbuf) {
         cmdbuf.beginQuery(pool, slot,
                           precise ? vk::QueryControlFlagBits::ePrecise : vk::QueryControlFlags{});
@@ -292,10 +292,10 @@ void OcclusionQueries::Suspend(bool inside_render_pass) {
     }
 }
 
-void OcclusionQueries::Resume(bool inside_render_pass) {
+void OcclusionQueries::Resume(bool inside_render_pass, bool use_pass_scale) {
     std::scoped_lock lk{mutex};
     if (started && !active) {
-        BeginSegment(inside_render_pass);
+        BeginSegment(inside_render_pass, use_pass_scale);
     }
 }
 
@@ -358,6 +358,9 @@ bool OcclusionQueries::TryClearOnCpu(VAddr base_addr, u32 pairs,
 }
 
 void OcclusionQueries::Event(VAddr address, u32 pairs) {
+    if (scheduler.IsRendering() && scheduler.GetRenderState().secondary_contents != 0u) {
+        scheduler.EndRendering();
+    }
     std::scoped_lock lk{mutex};
     if (!started) {
         // The first event: from here on a segment is always active (slots reset outside a

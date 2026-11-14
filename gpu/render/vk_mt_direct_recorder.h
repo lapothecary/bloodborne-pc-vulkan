@@ -65,7 +65,7 @@ struct alignas(64) MtCompletedPassMeta {
         u64 uid{0};
         VideoCore::SubresourceRange range{};
     };
-    static constexpr u32 kMaxSampledRts = 16;
+    static constexpr u32 kMaxSampledRts = 64;
 
     std::atomic<u64> published_seq{0};
     std::atomic<u64> consumed_seq{0};

@@ -321,9 +321,8 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
                 bound_images.emplace_back(id);
                 texture_cache.MarkFound(id);
                 auto& img = texture_cache.GetImage(id);
-                if (!img.binding.is_target &&
-                    VideoCore::True(img.flags & VideoCore::ImageFlagBits::DirectImmutable)) {
-                    VideoCore::DirectTextures::BumpImmutableRoEpoch();
+                if (VideoCore::True(img.flags & VideoCore::ImageFlagBits::DirectImmutable)) {
+                    texture_cache.DemoteDirectImmutable(id);
                 }
                 img.binding.is_target = 1u;
             }
@@ -334,9 +333,8 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
             bound_images.emplace_back(id);
             texture_cache.MarkFound(id);
             auto& img = texture_cache.GetImage(id);
-            if (!img.binding.is_target &&
-                VideoCore::True(img.flags & VideoCore::ImageFlagBits::DirectImmutable)) {
-                VideoCore::DirectTextures::BumpImmutableRoEpoch();
+            if (VideoCore::True(img.flags & VideoCore::ImageFlagBits::DirectImmutable)) {
+                texture_cache.DemoteDirectImmutable(id);
             }
             img.binding.is_target = 1u;
         }
@@ -367,9 +365,8 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
             image_id = bound_images.emplace_back(resolved);
             texture_cache.MarkFound(image_id);
             auto& image = texture_cache.GetImage(image_id);
-            if (!image.binding.is_target &&
-                VideoCore::True(image.flags & VideoCore::ImageFlagBits::DirectImmutable)) {
-                VideoCore::DirectTextures::BumpImmutableRoEpoch();
+            if (VideoCore::True(image.flags & VideoCore::ImageFlagBits::DirectImmutable)) {
+                texture_cache.DemoteDirectImmutable(image_id);
             }
             image.binding.is_target = 1u;
             prepared_pass.cb_buf[cb] = col_buf;
@@ -403,9 +400,8 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
             image_id = bound_images.emplace_back(resolved);
             texture_cache.MarkFound(image_id);
             auto& image = texture_cache.GetImage(image_id);
-            if (!image.binding.is_target &&
-                VideoCore::True(image.flags & VideoCore::ImageFlagBits::DirectImmutable)) {
-                VideoCore::DirectTextures::BumpImmutableRoEpoch();
+            if (VideoCore::True(image.flags & VideoCore::ImageFlagBits::DirectImmutable)) {
+                texture_cache.DemoteDirectImmutable(image_id);
             }
             image.binding.is_target = 1u;
             prepared_pass.depth_buf = regs.depth_buffer;
@@ -522,26 +518,33 @@ bool Rasterizer::InspectMtPassTargets(
     std::span<const Gcn::CbDbExtent, Gcn::NUM_COLOR_BUFFERS> cb_extents, Gcn::CbDbExtent db_extent,
     MtPassTargetSummary& out) noexcept {
     out = {};
+    const auto fail = [&](u8 sub, VAddr addr = 0) noexcept {
+        out.bail_substep = sub;
+        if (addr != 0) {
+            out.diag_addr = addr;
+        }
+        return false;
+    };
     if (!first_pso || host_markers_enabled || guest_markers_enabled || FrameCapture::Active() ||
         Breadcrumbs::Enabled() || DynCheck::Enabled() ||
         (camera_motion && camera_motion->DebugOverlay())) {
-        return false;
+        return fail(1);
     }
     if (DrawPassOf(regs).pass != DrawPass::Draw || regs.color_control.degamma_enable ||
         regs.depth_render_control.depth_clear_enable ||
         regs.depth_render_control.stencil_clear_enable) {
-        return false;
+        return fail(2);
     }
 
     const auto& key = first_pso->GetGraphicsKey();
     if (key.num_color_attachments > Gcn::NUM_COLOR_BUFFERS) {
-        return false;
+        return fail(3);
     }
     const bool has_motion_mv =
         key.motion_vectors != 0u && ((upscaler && upscaler->Enabled()) ||
                                      (camera_motion && camera_motion->DebugOverlay()));
     if (key.motion_vectors != 0u && !has_motion_mv) {
-        return false;
+        return fail(3);
     }
     const u32 guest_mrt_mask =
         key.motion_vectors != 0u ? (key.mrt_mask & ~(1u << Shader::MotionVectors::Output))
@@ -555,17 +558,17 @@ bool Rasterizer::InspectMtPassTargets(
         (regs.depth_control.depth_enable && regs.depth_buffer.DepthValid()) ||
         (regs.depth_control.stencil_enable && regs.depth_buffer.StencilValid());
     if (has_bound_ds != want_depth) {
-        return false;
+        return fail(4, regs.depth_buffer.DepthAddress());
     }
     if (has_bound_ds && regs.depth_buffer.DepthAddress() == 0 &&
         regs.depth_buffer.StencilAddress() == 0) {
-        return false;
+        return fail(4);
     }
 
     // Keep Scaleform stencil-only masks (`mrt_mask == 0 && WritesStencil()`) on Stage A/B so
     // `TemporalUpscaler::RedirectDepth` and `VfxUiBatcher` stay single-threaded.
     if (guest_mrt_mask == 0u && (!want_depth || regs.WritesStencil())) {
-        return false;
+        return fail(5, regs.depth_buffer.DepthAddress());
     }
 
     const bool color_disabled =
@@ -576,17 +579,17 @@ bool Rasterizer::InspectMtPassTargets(
         }
         if (color_disabled || !regs.color_buffers[cb] ||
             regs.color_target_mask.GetMask(cb) == 0u || regs.color_buffers[cb].Address() == 0) {
-            return false;
+            return fail(6, regs.color_buffers[cb].Address());
         }
         if (FrameCapture::IsDisplayBuffer(regs.color_buffers[cb].Address())) {
-            return false;
+            return fail(6, regs.color_buffers[cb].Address());
         }
     }
 
     if (instance.IsMixedDepthSamplesSupported() && key.num_color_attachments > 0u) {
         for (u32 cb = 0; cb < key.num_color_attachments; ++cb) {
             if ((key.mrt_mask & (1u << cb)) != 0u && key.color_samples[cb] != key.depth_samples) {
-                return false;
+                return fail(7, regs.color_buffers[cb].Address());
             }
         }
     }
@@ -615,7 +618,7 @@ bool Rasterizer::InspectMtPassTargets(
         const vk::Format fmt = out.color_formats[only_cb];
         if (fmt == vk::Format::eR8G8B8A8Unorm || fmt == vk::Format::eR8G8B8A8Srgb ||
             fmt == vk::Format::eB8G8R8A8Unorm || fmt == vk::Format::eB8G8R8A8Srgb) {
-            return false;
+            return fail(8, regs.color_buffers[only_cb].Address());
         }
     }
 
@@ -643,12 +646,20 @@ bool Rasterizer::InspectMtPassTargets(
         vk::Format backing_fmt = vk::Format::eUndefined;
         vk::ImageAspectFlags aspect{};
         bool has_proxy = false;
+        VideoCore::TextureCache::MtRejectDiag rdiag{};
         if (!texture_cache.TryInspectTargetMt(desc, id, info, backing_samples, backing_fmt, aspect,
-                                              has_proxy)) {
-            return false;
+                                              has_proxy, &rdiag)) {
+            out.diag_flags = rdiag.flags;
+            out.diag_w = rdiag.width;
+            out.diag_h = rdiag.height;
+            out.diag_guest_size = rdiag.guest_size;
+            return fail(static_cast<u8>(90u + rdiag.substep), desc.info.guest_address);
         }
         if (backing_samples != key.color_samples[cb]) {
-            return false;
+            out.diag_w = info.size.width;
+            out.diag_h = info.size.height;
+            out.diag_guest_size = info.guest_size;
+            return fail(10, desc.info.guest_address);
         }
         out.cb_ids[cb] = id;
         if (cb == 0u) {
@@ -674,9 +685,14 @@ bool Rasterizer::InspectMtPassTargets(
         vk::Format backing_fmt = vk::Format::eUndefined;
         vk::ImageAspectFlags aspect{};
         bool has_proxy = false;
+        VideoCore::TextureCache::MtRejectDiag rdiag{};
         if (!texture_cache.TryInspectTargetMt(desc, id, db_info, backing_samples, backing_fmt,
-                                              aspect, has_proxy)) {
-            return false;
+                                              aspect, has_proxy, &rdiag)) {
+            out.diag_flags = rdiag.flags;
+            out.diag_w = rdiag.width;
+            out.diag_h = rdiag.height;
+            out.diag_guest_size = rdiag.guest_size;
+            return fail(static_cast<u8>(110u + rdiag.substep), desc.info.guest_address);
         }
         out.db_id = id;
         if (scene_targets) {
@@ -693,7 +709,7 @@ bool Rasterizer::InspectMtPassTargets(
     // On reduced presets, a depth-only pass targeting full-size `scene_depth` before G-Buffer
     // (`scene_started == false`) would stay native on Stage B; defer only that edge case.
     if (reduced_cfg && guest_mrt_mask == 0u && db_eligible_scene) {
-        return false;
+        return fail(12, regs.depth_buffer.DepthAddress());
     }
 
     out.depth_format =
@@ -710,7 +726,7 @@ bool Rasterizer::InspectMtPassTargets(
     }
     const VAddr known_scene_db = mt_scene_depth_addr.load(std::memory_order_relaxed);
     if (upscaler && upscaler->Enabled() && want_depth && !out.is_gbuffer && known_scene_db == 0) {
-        return false;
+        return fail(13, db_addr);
     }
     out.is_scene_depth =
         want_depth && (out.is_gbuffer || (db_addr != 0 && db_addr == known_scene_db));

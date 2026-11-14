@@ -85,6 +85,10 @@ public:
     /// A bound constant buffer of 864 bytes: checks the scene constant signature.
     void OnConstants(const float* data);
 
+    /// Raw world position (`inv_view` col 3) and raw view Z axis (`inv_view` col 2) of `current`
+    /// camera, matching `SceneOcclusionCuller::UpdateCameraFromSceneConstants` convention.
+    bool CurrentInvViewPosAndZ(float pos[3], float z_axis[3]) const noexcept;
+
     /// The G-buffer pass (5+ color targets): its depth is the scene depth.
     /// `x_sign`/`y_sign`: signs of the G-buffer pass's viewport x/y scale (window = ndc * scale +
     /// offset). The motion shaders take ndc as +y down the screen, so the projection's scales are

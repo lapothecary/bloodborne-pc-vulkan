@@ -263,24 +263,7 @@ struct SceneOcclusionCuller {
         }
     }
 
-    void UpdateCameraFromSceneConstants(const float* data, u32 frame_tag) noexcept {
-        if (!data || cam_updated_frame.load(std::memory_order_acquire) == frame_tag) {
-            return;
-        }
-        if (data[0] != 3000.0f || data[4] < 64.0f || data[5] < 64.0f ||
-            std::abs(data[1] * data[0] - 1.0f) > 1e-3f) {
-            return;
-        }
-        const float pos[3] = {data[183], data[187], data[191]};
-        const float fwd[3] = {data[182], data[186], data[190]};
-        if (!std::isfinite(pos[0]) || !std::isfinite(pos[1]) || !std::isfinite(pos[2]) ||
-            !std::isfinite(fwd[0]) || !std::isfinite(fwd[1]) || !std::isfinite(fwd[2])) {
-            return;
-        }
-        std::scoped_lock lk{cam_mutex};
-        if (cam_updated_frame.load(std::memory_order_relaxed) == frame_tag) {
-            return;
-        }
+    void ApplyCameraPoseLocked(const float pos[3], const float fwd[3], u32 frame_tag) noexcept {
         bool mov = false;
         bool fast_turn = false;
         if (has_prev_cam) {
@@ -311,8 +294,29 @@ struct SceneOcclusionCuller {
         cam_updated_frame.store(frame_tag, std::memory_order_release);
     }
 
+    void UpdateCameraFromSceneConstants(const float* data, u32 frame_tag) noexcept {
+        if (!data || cam_updated_frame.load(std::memory_order_acquire) == frame_tag) {
+            return;
+        }
+        if (data[0] != 3000.0f || data[4] < 64.0f || data[5] < 64.0f ||
+            std::abs(data[1] * data[0] - 1.0f) > 1e-3f) {
+            return;
+        }
+        const float pos[3] = {data[183], data[187], data[191]};
+        const float fwd[3] = {data[182], data[186], data[190]};
+        if (!std::isfinite(pos[0]) || !std::isfinite(pos[1]) || !std::isfinite(pos[2]) ||
+            !std::isfinite(fwd[0]) || !std::isfinite(fwd[1]) || !std::isfinite(fwd[2])) {
+            return;
+        }
+        std::scoped_lock lk{cam_mutex};
+        if (cam_updated_frame.load(std::memory_order_relaxed) == frame_tag) {
+            return;
+        }
+        ApplyCameraPoseLocked(pos, fwd, frame_tag);
+    }
+
     void OnFrameStart(const Instance& instance, Scheduler& scheduler,
-                      const CameraMotion* /*cam*/) noexcept {
+                      const CameraMotion* cam) noexcept {
         EnsureInit(instance);
         gbuf_draws_in_frame = 0;
         if (!pool) {
@@ -325,8 +329,16 @@ struct SceneOcclusionCuller {
         cur_frame.store(next_f, std::memory_order_relaxed);
         const u32 last_cam_f = cam_updated_frame.load(std::memory_order_acquire);
         if (next_f > last_cam_f + 1u) {
-            camera_moving.store(false, std::memory_order_relaxed);
-            fast_camera_turn.store(false, std::memory_order_relaxed);
+            float pos[3]{}, fwd[3]{};
+            if (cam && cam->CurrentInvViewPosAndZ(pos, fwd)) {
+                std::scoped_lock lk{cam_mutex};
+                if (next_f > cam_updated_frame.load(std::memory_order_relaxed) + 1u) {
+                    ApplyCameraPoseLocked(pos, fwd, prev_f != 0u ? prev_f : next_f);
+                }
+            } else {
+                camera_moving.store(false, std::memory_order_relaxed);
+                fast_camera_turn.store(false, std::memory_order_relaxed);
+            }
         }
 
         CollectRetiredSlices(instance.GetDevice(), scheduler);
@@ -957,7 +969,8 @@ Rasterizer::MtOcclusionDecision Rasterizer::EvaluateGBufferOcclusionMt(
         if (!resolve_cb(resolve_ctx, sharp, cb_ptr, cb_size) || !cb_ptr) {
             continue;
         }
-        if (req_sz == 864u && cb_size >= 864u) {
+        if (req_sz == 864u && cb_size >= 864u && sharp.GetStride() == 16u &&
+            reinterpret_cast<const float*>(cb_ptr)[0] == 3000.0f) {
             culler.UpdateCameraFromSceneConstants(reinterpret_cast<const float*>(cb_ptr),
                                                   frame_tag);
         } else if (req_sz == 416u && !is_inst_gbuf_vs && cb_size >= 84u) {
@@ -1528,6 +1541,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
         if (culler.enabled && culler.pool && begin_memo.valid &&
             !regs.depth_render_control.depth_clear_enable &&
             !regs.depth_render_control.stencil_clear_enable &&
+            !guest_occlusion_seen.load(std::memory_order_relaxed) &&
             (!occlusion || occlusion->Events() == 0) && is_gbuf_cull_cand) {
             const u32 gbuf_ord = ++culler.gbuf_draws_in_frame;
             if (gbuf_ord == 1) {
@@ -1619,11 +1633,10 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
                             cb_ptr = reinterpret_cast<const u8*>(sharp.base_address);
                         }
                     }
-                    if (cb_size == 864) {
-                        if (cb_ptr) {
-                            culler.UpdateCameraFromSceneConstants(
-                                reinterpret_cast<const float*>(cb_ptr), frame_tag);
-                        }
+                    if (cb_size == 864 && cb_ptr &&
+                        reinterpret_cast<const float*>(cb_ptr)[0] == 3000.0f) {
+                        culler.UpdateCameraFromSceneConstants(
+                            reinterpret_cast<const float*>(cb_ptr), frame_tag);
                     } else if (cb_size == 416 && !is_inst_gbuf_vs) {
                         if (cb_ptr) {
                             std::memcpy(&model_base_matrix_idx, cb_ptr + 80, sizeof(u32));

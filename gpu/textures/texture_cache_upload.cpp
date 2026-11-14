@@ -181,6 +181,7 @@ void TextureCache::RefreshImage(Image& image) {
         info.props.is_block && info.guest_size >= 1024) {
         image.prompt_icon =
             u8(BbPrompts::IconOf(std::bit_cast<const u8*>(info.guest_address), 1024));
+        image.prompt_icon_checked = true;
     }
     // The HUD's atlases with key guide icons packed in: the port may sample a copy with its own.
     // All 1-mip block-compressed 2D textures also track upload count for UI Super-Resolution cache.

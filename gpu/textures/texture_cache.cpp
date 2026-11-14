@@ -4,6 +4,7 @@
 
 #include <xxhash.h>
 
+#include "bbport_button_prompts.h"
 #include "common/assert.h"
 #include "common/hash.h"
 #include "core/emulator_settings.h"
@@ -128,36 +129,41 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
 
     // V3.2: O(1) lookup for pre-uploaded .tpf/.gnf asset textures without walking ImageRegistry pages.
     if (const auto it = direct_assets_by_addr.find(info.guest_address);
-        it != direct_assets_by_addr.end() && slot_images.is_allocated(it->second)) {
-        const ImageId cand_id = it->second;
-        Image& cand = slot_images[cand_id];
-        const ImageInfo& cached = cand.info;
-        if (True(cand.flags & ImageFlagBits::Registered) &&
-            cached.guest_address == info.guest_address &&
-            cached.guest_size == info.guest_size && cached.size == info.size &&
-            cached.resources == info.resources &&
-            cached.props.is_depth == info.props.is_depth &&
-            IsVulkanFormatCompatible(cached.pixel_format, info.pixel_format) &&
-            (cached.type == info.type || info.size == Extent3D{1, 1, 1}) &&
-            (!exact_fmt || cached.pixel_format == info.pixel_format)) {
-            cand.tick_accessed_last = CurrentTick();
-            TouchImage(cand);
-            found = FoundImage{
-                .address = info.guest_address,
-                .size = info.guest_size,
-                .extent = info.size,
-                .format = info.pixel_format,
-                .type = info.type,
-                .exact_fmt = exact_fmt,
-                .binding = desc.type,
-                .levels = info.resources.levels,
-                .layers = info.resources.layers,
-                .generation = registry_generation.load(std::memory_order_relaxed),
-                .image_id = cand_id,
-                .view_mip = -1,
-                .view_slice = -1,
-            };
-            return cand_id;
+        it != direct_assets_by_addr.end()) {
+        if (!slot_images.is_allocated(it->second) ||
+            False(slot_images[it->second].flags & ImageFlagBits::DirectImmutable)) {
+            direct_assets_by_addr.erase(it);
+        } else {
+            const ImageId cand_id = it->second;
+            Image& cand = slot_images[cand_id];
+            const ImageInfo& cached = cand.info;
+            if (True(cand.flags & ImageFlagBits::Registered) &&
+                cached.guest_address == info.guest_address &&
+                cached.guest_size == info.guest_size && cached.size == info.size &&
+                cached.resources == info.resources &&
+                cached.props.is_depth == info.props.is_depth &&
+                IsVulkanFormatCompatible(cached.pixel_format, info.pixel_format) &&
+                (cached.type == info.type || info.size == Extent3D{1, 1, 1}) &&
+                (!exact_fmt || cached.pixel_format == info.pixel_format)) {
+                cand.tick_accessed_last = CurrentTick();
+                TouchImage(cand);
+                found = FoundImage{
+                    .address = info.guest_address,
+                    .size = info.guest_size,
+                    .extent = info.size,
+                    .format = info.pixel_format,
+                    .type = info.type,
+                    .exact_fmt = exact_fmt,
+                    .binding = desc.type,
+                    .levels = info.resources.levels,
+                    .layers = info.resources.layers,
+                    .generation = registry_generation.load(std::memory_order_relaxed),
+                    .image_id = cand_id,
+                    .view_mip = -1,
+                    .view_slice = -1,
+                };
+                return cand_id;
+            }
         }
     }
 
@@ -372,15 +378,11 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& info
             if (cached.binding.is_target) {
                 // A part of it bound as a render target: rebound to the larger image.
                 cached.binding.needs_rebind = 1;
-                if (True(cached.flags & ImageFlagBits::DirectImmutable)) {
-                    DirectTextures::BumpImmutableRoEpoch();
-                }
+                DemoteDirectImmutableLocked(cache_id, cached);
                 if (merged_id) {
                     auto& merged_img = GetImage(merged_id);
                     merged_img.binding.is_target = 1;
-                    if (True(merged_img.flags & ImageFlagBits::DirectImmutable)) {
-                        DirectTextures::BumpImmutableRoEpoch();
-                    }
+                    DemoteDirectImmutableLocked(merged_id, merged_img);
                 }
                 FreeImage(cache_id);
                 return {merged_id, -1, -1};
@@ -403,9 +405,7 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
     runtime.CopyImage(&source, &image);
     if (source.binding.is_bound || source.binding.is_target) {
         source.binding.needs_rebind = 1;
-        if (True(source.flags & ImageFlagBits::DirectImmutable)) {
-            DirectTextures::BumpImmutableRoEpoch();
-        }
+        DemoteDirectImmutableLocked(image_id, source);
     }
     FreeImage(image_id);
     TrackImage(new_id);
@@ -541,9 +541,10 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc, Vi
             image.flags &= ~ImageFlagBits::SharedHotPage;
         }
         if (True(image.flags & ImageFlagBits::DirectImmutable)) {
-            DirectTextures::BumpImmutableRoEpoch();
+            DemoteDirectImmutable(image_id);
         }
         image.flags |= ImageFlagBits::GpuModified;
+        image.prompt_icon_checked = false;
         image.gpu_write_tick = CurrentTick();
         if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8) &&
             image.info.guest_address != 0) {
@@ -578,9 +579,10 @@ ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& des
         image.flags &= ~ImageFlagBits::SharedHotPage;
     }
     if (True(image.flags & ImageFlagBits::DirectImmutable)) {
-        DirectTextures::BumpImmutableRoEpoch();
+        DemoteDirectImmutable(image_id);
     }
     image.flags |= ImageFlagBits::GpuModified;
+    image.prompt_icon_checked = false;
     image.gpu_write_tick = CurrentTick();
     if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8)) {
         QueueDownload(image_id);
@@ -621,9 +623,10 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
         image.flags &= ~ImageFlagBits::SharedHotPage;
     }
     if (True(image.flags & ImageFlagBits::DirectImmutable)) {
-        DirectTextures::BumpImmutableRoEpoch();
+        DemoteDirectImmutable(image_id);
     }
     image.flags |= ImageFlagBits::GpuModified;
+    image.prompt_icon_checked = false;
     image.gpu_write_tick = CurrentTick();
     image.usage.depth_target = 1;
     UpdateImage(image_id);
@@ -794,16 +797,21 @@ vk::ImageView TextureCache::TryResolveDirectImmutableViewMt(const Gcn::Image& cl
     }
     const ImageId id = it->second;
     if (!id || !slot_images.is_allocated(id)) {
+        direct_assets_by_addr.erase(it);
         return {};
     }
     const Image& img = slot_images[id];
+    if (False(img.flags & ImageFlagBits::DirectImmutable)) {
+        direct_assets_by_addr.erase(it);
+        return {};
+    }
     constexpr auto Required = ImageFlagBits::Registered | ImageFlagBits::DirectImmutable;
     constexpr auto BadFlags =
         ImageFlagBits::Dirty | ImageFlagBits::GpuModified | ImageFlagBits::SharedHotPage;
     if ((img.flags & Required) != Required || True(img.flags & BadFlags) ||
         img.info.props.is_depth || img.scene_proxy || img.prompt_icon || img.prompt_atlas ||
-        img.MaybePromptIcon() || img.binding.needs_rebind || img.binding.is_target ||
-        !img.backing || !img.backing->subresource_states.empty() ||
+        img.MaybePromptIcon() || img.binding.needs_rebind || !img.backing ||
+        !img.backing->subresource_states.empty() ||
         img.backing->state.layout != vk::ImageLayout::eShaderReadOnlyOptimal ||
         img.backing->state.access_mask != vk::AccessFlagBits2::eShaderRead ||
         img.info.pixel_format != desc.info.pixel_format ||
@@ -957,22 +965,49 @@ ImageId TextureCache::TryFindExistingImageLocked(ImageDesc& desc) const {
 bool TextureCache::TryInspectTargetMt(ImageDesc& desc, ImageId& out_id, ImageInfo& out_info,
                                       u32& out_backing_samples, vk::Format& out_backing_fmt,
                                       vk::ImageAspectFlags& out_aspect_mask,
-                                      bool& out_has_scene_proxy) {
+                                      bool& out_has_scene_proxy, MtRejectDiag* out_diag) {
     out_id = {};
+    if (out_diag) {
+        *out_diag = {
+            .substep = 0,
+            .flags = 0,
+            .width = desc.info.size.width,
+            .height = desc.info.size.height,
+            .guest_size = desc.info.guest_size,
+        };
+    }
     if (desc.info.guest_address == 0 || desc.info.guest_size == 0) {
+        if (out_diag) {
+            out_diag->substep = 1;
+        }
         return false;
     }
     std::scoped_lock lock{mutex};
     const ImageId id = TryFindExistingImageLocked(desc);
     if (!id || !slot_images.is_allocated(id)) {
+        if (out_diag) {
+            out_diag->substep = 2;
+        }
         return false;
     }
     const Image& img = slot_images[id];
+    if (out_diag) {
+        out_diag->flags = u32(img.flags);
+        out_diag->width = img.info.size.width;
+        out_diag->height = img.info.size.height;
+        out_diag->guest_size = img.info.guest_size;
+    }
     if (!True(img.flags & ImageFlagBits::Registered) || True(img.flags & ImageFlagBits::Dirty) ||
         img.binding.needs_rebind || !img.backing) {
+        if (out_diag) {
+            out_diag->substep = 3;
+        }
         return false;
     }
     if (!img.TryFindExistingViewMt(desc.view_info)) {
+        if (out_diag) {
+            out_diag->substep = 4;
+        }
         return false;
     }
     NoteMtImageAccess(img);
@@ -989,54 +1024,78 @@ bool TextureCache::TryResolveSceneSrvViewMt(
     const Gcn::Image& clean_sharp, const Shader::ImageResource& res, bool reduced_scene_active,
     const Vulkan::SceneTargets* scene_targets, ImageId& out_id, u64& out_uid,
     vk::ImageView& out_view, vk::ImageLayout& out_layout, SubresourceRange& out_range,
-    bool& out_needs_stage_b_transit) {
+    bool& out_needs_stage_b_transit, MtRejectDiag* out_diag) {
     out_id = {};
     out_uid = 0;
     out_view = vk::ImageView{};
     out_layout = vk::ImageLayout::eUndefined;
     out_needs_stage_b_transit = false;
+    if (out_diag) {
+        *out_diag = {};
+    }
+    const auto fail = [&](u8 sub) noexcept {
+        if (out_diag) {
+            out_diag->substep = sub;
+        }
+        return false;
+    };
 
     if (!clean_sharp.Valid() || clean_sharp.Address() == 0 || clean_sharp.IsMsaa() ||
         res.is_written || res.mip_fallback_mode != Shader::MipStorageFallbackMode::None) {
-        return false;
+        return fail(2);
     }
     const auto valid_swizzle = [](u64 sel) noexcept {
         return sel <= u64(Gcn::CompSwizzle::Alpha) && sel != 2 && sel != 3;
     };
     if (!valid_swizzle(clean_sharp.dst_sel_x) || !valid_swizzle(clean_sharp.dst_sel_y) ||
         !valid_swizzle(clean_sharp.dst_sel_z) || !valid_swizzle(clean_sharp.dst_sel_w)) {
-        return false;
+        return fail(2);
     }
     if (Vulkan::GcnToVk::TrySurfaceFormat(clean_sharp.GetDataFmt(), clean_sharp.GetNumberFmt()) ==
         vk::Format::eUndefined) {
-        return false;
+        return fail(2);
     }
 
     ImageDesc desc{clean_sharp, res};
+    if (out_diag) {
+        out_diag->width = desc.info.size.width;
+        out_diag->height = desc.info.size.height;
+        out_diag->guest_size = desc.info.guest_size;
+    }
     if (desc.info.guest_address == 0 || desc.info.guest_size == 0) {
-        return false;
+        return fail(2);
     }
 
     std::scoped_lock lock{mutex};
     const ImageId id = TryFindExistingImageLocked(desc);
     if (!id || !slot_images.is_allocated(id)) {
-        return false;
+        return fail(3);
     }
     Image& img = slot_images[id];
-    if (!True(img.flags & ImageFlagBits::Registered) || True(img.flags & ImageFlagBits::Dirty) ||
-        img.prompt_icon || img.prompt_atlas || img.MaybePromptIcon() ||
-        img.binding.needs_rebind || img.binding.force_general || !img.backing) {
-        return false;
+    if (out_diag) {
+        out_diag->flags = u32(img.flags);
+        out_diag->width = img.info.size.width;
+        out_diag->height = img.info.size.height;
+        out_diag->guest_size = img.info.guest_size;
+    }
+    if (!True(img.flags & ImageFlagBits::Registered) || True(img.flags & ImageFlagBits::Dirty)) {
+        return fail(4);
+    }
+    if (img.prompt_icon || img.prompt_atlas || img.MaybePromptIcon()) {
+        return fail(5);
+    }
+    if (img.binding.needs_rebind || !img.backing) {
+        return fail(6);
     }
     if (True(img.flags & ImageFlagBits::SharedHotPage)) {
         if (True(img.flags & ImageFlagBits::GpuModified) || img.hash == 0 ||
-            img.info.guest_size == 0 || img.info.guest_size > kSharedHotPageMaxBytes) {
-            return false;
+            img.info.guest_size == 0) {
+            return fail(7);
         }
         const u64 cur_gc = atomic_gc_tick.load(std::memory_order_relaxed);
         if (img.hot_check_tick != cur_gc) {
             if (ComputeSmallOrSampleHash(img.info) != img.hash) {
-                return false;
+                return fail(8);
             }
             img.hot_check_tick = cur_gc;
         }
@@ -1045,16 +1104,16 @@ bool TextureCache::TryResolveSceneSrvViewMt(
         (img.scene_proxy ||
          scene_targets->EligibleInfoMt(img.info, img.backing->num_samples,
                                        img.backing->image.image_ci.format, img.aspect_mask))) {
-        return false;
+        return fail(9);
     }
     const vk::ImageView view = img.TryFindExistingViewMt(desc.view_info);
     if (!view) {
-        return false;
+        return fail(10);
     }
     NoteMtImageAccess(img);
 
     const bool already_settled_ro =
-        !img.info.props.is_depth && !img.scene_proxy && !img.binding.is_target &&
+        !img.info.props.is_depth && !img.scene_proxy &&
         !True(img.flags & ImageFlagBits::GpuModified) && img.backing->subresource_states.empty() &&
         img.backing->state.layout == vk::ImageLayout::eShaderReadOnlyOptimal &&
         img.backing->state.access_mask == vk::AccessFlagBits2::eShaderRead;
@@ -1079,7 +1138,8 @@ void TextureCache::MarkDirectImmutableAsset(ImageId image_id) {
             __atomic_load_n(reinterpret_cast<const u32*>(&fast_img.flags), __ATOMIC_ACQUIRE);
         constexpr u32 kReady =
             u32(ImageFlagBits::Registered) | u32(ImageFlagBits::DirectImmutable);
-        if ((flags & kReady) == kReady && fast_img.track_addr == fast_img.guest_begin &&
+        if ((flags & kReady) == kReady && (flags & u32(ImageFlagBits::GpuModified)) == 0u &&
+            !fast_img.MaybePromptIcon() && fast_img.track_addr == fast_img.guest_begin &&
             fast_img.track_addr_end == fast_img.guest_end) {
             return;
         }
@@ -1096,14 +1156,43 @@ void TextureCache::MarkDirectImmutableAsset(ImageId image_id) {
         UntrackImage(image_id);
         image.flags |= ImageFlagBits::DirectImmutable;
     }
-    image.flags &=
-        ~(ImageFlagBits::Dirty | ImageFlagBits::MaybeCpuDirty | ImageFlagBits::SharedHotPage);
+    image.flags &= ~(ImageFlagBits::Dirty | ImageFlagBits::MaybeCpuDirty |
+                     ImageFlagBits::SharedHotPage | ImageFlagBits::GpuModified);
+    if (image.MaybePromptIcon() && image.info.guest_address != 0) {
+        image.prompt_icon =
+            u8(BbPrompts::IconOf(std::bit_cast<const u8*>(image.info.guest_address), 1024));
+        image.prompt_icon_checked = true;
+    }
     if (image.info.guest_address != 0 && image.info.guest_size != 0) {
         direct_assets_by_addr[image.info.guest_address] = image_id;
         buffer_cache.NotePreciseUpload(image.info.guest_address, image.info.guest_size);
     }
     TrackImage(image_id);
     TouchImage(image);
+}
+
+void TextureCache::DemoteDirectImmutableLocked(ImageId image_id, Image& image) noexcept {
+    if (False(image.flags & ImageFlagBits::DirectImmutable)) {
+        return;
+    }
+    UntrackImage(image_id);
+    image.flags &= ~ImageFlagBits::DirectImmutable;
+    if (const auto it = direct_assets_by_addr.find(image.info.guest_address);
+        it != direct_assets_by_addr.end() && (!image_id || it->second == image_id)) {
+        direct_assets_by_addr.erase(it);
+    }
+    DirectTextures::BumpImmutableRoEpoch();
+}
+
+void TextureCache::DemoteDirectImmutable(ImageId image_id) {
+    if (!image_id) {
+        return;
+    }
+    std::scoped_lock lock{mutex};
+    if (!slot_images.is_allocated(image_id)) {
+        return;
+    }
+    DemoteDirectImmutableLocked(image_id, slot_images[image_id]);
 }
 
 void TextureCache::ProcessDirectTextureEvents(Core::MemoryManager* memory) {
@@ -1131,8 +1220,7 @@ void TextureCache::ProcessDirectTextureEvents(Core::MemoryManager* memory) {
                                      if (!img.binding.is_bound && !img.binding.is_target) {
                                          stale.push_back(id);
                                      } else {
-                                         UntrackImage(id);
-                                         img.flags &= ~ImageFlagBits::DirectImmutable;
+                                         DemoteDirectImmutableLocked(id, img);
                                      }
                                  });
             for (const ImageId id : stale) {
@@ -1176,8 +1264,7 @@ void TextureCache::ProcessDirectTextureEvents(Core::MemoryManager* memory) {
             if (!img.binding.is_bound && !img.binding.is_target) {
                 overlapping.push_back(id);
             } else {
-                UntrackImage(id);
-                img.flags &= ~ImageFlagBits::DirectImmutable;
+                DemoteDirectImmutableLocked(id, img);
             }
         });
         for (const ImageId id : overlapping) {
@@ -1188,14 +1275,8 @@ void TextureCache::ProcessDirectTextureEvents(Core::MemoryManager* memory) {
 
         const ImageId image_id = InsertImage(desc.info);
         Image& image = slot_images[image_id];
-        if (ev.is_immutable) {
-            image.flags |= ImageFlagBits::DirectImmutable;
-        }
         image.usage.texture = 1u;
         image.tick_accessed_last = CurrentTick();
-        direct_assets_by_addr[desc.info.guest_address] = image_id;
-        TrackImage(image_id);
-        TouchImage(image);
         RefreshImage(image);
 
         constexpr auto ShaderStages = vk::PipelineStageFlagBits2::eAllGraphics |
@@ -1205,6 +1286,13 @@ void TextureCache::ProcessDirectTextureEvents(Core::MemoryManager* memory) {
             needs_barrier_flush = true;
         }
         (void)image.FindView(desc.view_info);
+
+        if (ev.is_immutable) {
+            image.flags |= ImageFlagBits::DirectImmutable;
+            direct_assets_by_addr[desc.info.guest_address] = image_id;
+        }
+        TrackImage(image_id);
+        TouchImage(image);
 
         uploaded_bytes_since_flush += desc.info.guest_size;
         if (uploaded_bytes_since_flush >= (32ull << 20)) {

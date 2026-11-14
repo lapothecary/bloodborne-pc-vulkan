@@ -263,14 +263,17 @@ void Scheduler::BeginRendering(const RenderState& state, u8 color_dont_care_mask
         .pDepthAttachment = ds.has_depth ? &pass.depth : nullptr,
         .pStencilAttachment = ds.has_stencil ? &pass.stencil : nullptr,
     };
+    if (state.secondary_contents == 1u) {
+        CarryResume(false, true);
+    }
     if (workers.empty()) {
         EnsureSubmissionProfileOpen();
         pass.Begin(current_cmdbuf);
     } else {
         Record([pass](vk::CommandBuffer cmdbuf) mutable { pass.Begin(cmdbuf); });
     }
-    if (state.secondary_contents != 2u) {
-        CarryResume(true);
+    if (state.secondary_contents == 0u) {
+        CarryResume(true, true);
     }
 }
 
@@ -292,11 +295,15 @@ void Scheduler::EndRendering() {
     if (trace) {
         pass_end_caller = __builtin_return_address(0);
     }
-    if (render_state.secondary_contents != 2u) {
+    const u8 sec_contents = render_state.secondary_contents;
+    if (sec_contents == 0u) {
         CarrySuspend(true);
     }
     is_rendering = false;
     Record([](vk::CommandBuffer cmdbuf) { cmdbuf.endRendering(); });
+    if (sec_contents == 1u) {
+        CarrySuspend(false);
+    }
     CarryResume(false);
     if (has_end_rendering_work) {
         has_end_rendering_work = false;
@@ -574,12 +581,14 @@ void Scheduler::MaybeSplit() {
         return;
     }
     if (is_rendering) {
-        if (render_state.secondary_contents != 2u) {
+        const u8 sec_contents = render_state.secondary_contents;
+        if (sec_contents == 0u) {
             CarrySuspend(true);
         }
         Record([](vk::CommandBuffer cmdbuf) { cmdbuf.endRendering(); });
         is_rendering = false;
         resume_rendering = true;
+        CarrySuspend(false);
     } else {
         CarrySuspend(false);
     }
@@ -733,12 +742,14 @@ void Scheduler::EnterDirectMode() {
     if (own_segment && async_submit && current_segment + 2 < MaxSegments &&
         !BbToggle::Disabled(BbToggle::ThreadedRecording)) {
         if (is_rendering) {
-            if (render_state.secondary_contents != 2u) {
+            const u8 sec_contents = render_state.secondary_contents;
+            if (sec_contents == 0u) {
                 CarrySuspend(true);
             }
             Record([](vk::CommandBuffer cmdbuf) { cmdbuf.endRendering(); });
             is_rendering = false;
             resume_rendering = true;
+            CarrySuspend(false);
         } else {
             CarrySuspend(false);
         }
@@ -777,12 +788,14 @@ void Scheduler::EnterDirectMode() {
 
 void Scheduler::LeaveDirectSegment() {
     if (is_rendering) {
-        if (render_state.secondary_contents != 2u) {
+        const u8 sec_contents = render_state.secondary_contents;
+        if (sec_contents == 0u) {
             CarrySuspend(true);
         }
         current_cmdbuf.endRendering();
         is_rendering = false;
         resume_rendering = true;
+        CarrySuspend(false);
     } else {
         CarrySuspend(false);
     }

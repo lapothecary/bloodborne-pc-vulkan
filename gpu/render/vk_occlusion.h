@@ -75,7 +75,7 @@ public:
     void SetPassScale(float area_scale);
 
     void Suspend(bool inside_render_pass) override;
-    void Resume(bool inside_render_pass) override;
+    void Resume(bool inside_render_pass, bool use_pass_scale = false) override;
 
 private:
     static constexpr u32 NumSlots = 4096;
@@ -99,7 +99,7 @@ private:
     void NoteResolved(VAddr address, u64 id, u64 tick);
     void PrintReadTrace();
 
-    void BeginSegment(bool inside_render_pass);
+    void BeginSegment(bool inside_render_pass, bool use_pass_scale = false);
     void EndSegment();
     /// Outside a render pass: the ended segments added up, the pending events written.
     void Resolve();

@@ -345,7 +345,7 @@ public:
     /// the recording side, as Record.
     struct CarriedScope {
         virtual void Suspend(bool inside_render_pass) = 0;
-        virtual void Resume(bool inside_render_pass) = 0;
+        virtual void Resume(bool inside_render_pass, bool use_pass_scale = false) = 0;
     protected:
         ~CarriedScope() = default;
     };
@@ -767,9 +767,9 @@ private:
             carried_scope->Suspend(inside_render_pass);
         }
     }
-    void CarryResume(bool inside_render_pass) {
+    void CarryResume(bool inside_render_pass, bool use_pass_scale = false) {
         if (carried_scope) {
-            carried_scope->Resume(inside_render_pass);
+            carried_scope->Resume(inside_render_pass, use_pass_scale);
         }
     }
     std::unique_ptr<CommandPool> direct_pool; ///< used by the producer thread only
