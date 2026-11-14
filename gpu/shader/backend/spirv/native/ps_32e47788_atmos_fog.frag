@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Block 5, Step 5.4 (Sub-Batch 2): Native Vulkan 1.3 GLSL replacement for ps 0x0000000032e47788
 // (2560x1440 R16G16B16A16Sfloat fullscreen atmospheric radial + height fog composite).
-#version 450
+#version 460
+#extension GL_EXT_samplerless_texture_functions : require
+layout(early_fragment_tests) in;
 
 layout(location = 0) in vec2 fs_in_ndc;
 layout(location = 1) in vec2 fs_in_uv;
@@ -49,17 +51,25 @@ void main() {
     const uint d1 = ((b0 >> 8u) & 0xFFu) >> 2u;
 
     const vec2 uv = fs_in_uv;
-    const float s0_a = texture(sampler2D(fs_img0, fs_samp0), uv).w;
-    const float depth = texture(sampler2D(fs_img1, fs_samp0), uv).x;
-    const float out_a = texture(sampler2D(fs_img2, fs_samp0), uv).w;
-    const vec3 col3 = texture(sampler2D(fs_img3, fs_samp0), uv).rgb;
-    const vec3 col4 = texture(sampler2D(fs_img4, fs_samp0), uv).rgb;
-    const vec3 col5 = texture(sampler2D(fs_img5, fs_samp0), uv).rgb;
+    const float s0_a  = textureLod(sampler2D(fs_img0, fs_samp0), uv, 0.0).w;
+    const float out_a = textureLod(sampler2D(fs_img2, fs_samp0), uv, 0.0).w;
+    const vec3 col3   = textureLod(sampler2D(fs_img3, fs_samp0), uv, 0.0).rgb;
+    const vec3 col4   = textureLod(sampler2D(fs_img4, fs_samp0), uv, 0.0).rgb;
+    const vec3 col5   = textureLod(sampler2D(fs_img5, fs_samp0), uv, 0.0).rgb;
+    const vec3 sum_rgb = col5 + (col3 + col4);
 
     const uint idx6 = uint(int(255.0 * s0_a)) * 6u;
-    const uint o1 = (idx6 + 1u) * 4u + d0;
     const uint o2 = (idx6 + 2u) * 4u + d0;
     const uint o3 = (idx6 + 3u) * 4u + d0;
+    const float f188 = ssbo_1.data[o2 + 0u];
+    const float f210 = ssbo_1.data[o3 + 0u];
+    if (f188 <= 0.0 && f210 <= 0.0) {
+        frag_color0 = vec4(sum_rgb, out_a);
+        return;
+    }
+
+    const float depth = textureLod(sampler2D(fs_img1, fs_samp0), uv, 0.0).x;
+    const uint o1 = (idx6 + 1u) * 4u + d0;
     const uint o4 = (idx6 + 4u) * 4u + d0;
 
     const float nx = fs_in_ndc.x;
@@ -71,34 +81,38 @@ void main() {
     const float py = fma(s2f(d1 + 4u), nx, fma(s2f(d1 + 5u), ny, fma(s2f(d1 + 6u), depth, s2f(d1 + 7u)))) * inv_w;
     const float px = fma(s2f(d1 + 0u), nx, fma(s2f(d1 + 1u), ny, fma(s2f(d1 + 2u), depth, s2f(d1 + 3u)))) * inv_w;
 
-    const float vx = fma(s2f(d1 + 40u), px, fma(s2f(d1 + 41u), py, s2f(d1 + 42u) * pz));
-    const float vy = fma(s2f(d1 + 32u), px, fma(s2f(d1 + 33u), py, s2f(d1 + 34u) * pz));
-    const float vz = fma(s2f(d1 + 36u), px, fma(s2f(d1 + 37u), py, s2f(d1 + 38u) * pz));
-
-    const vec3 sum_rgb = col5 + (col3 + col4);
-    const float dist_xy = sqrt(vy * vy + vx * vx);
     const float luma = fma(sum_rgb.z, 0.114480004, fma(sum_rgb.x, 0.298909992, 0.586610019 * sum_rgb.y));
     const float luma_m1 = luma - 1.0;
 
-    const float f188 = ssbo_1.data[o2 + 0u];
-    const float f191 = ssbo_1.data[o2 + 1u];
-    const float f194 = ssbo_1.data[o2 + 2u];
-    const float fog_rad = clamp(f188 - f188 * exp2((dist_xy - f191) * (-f194)), 0.0, 1.0);
+    vec3 mix1 = sum_rgb;
+    if (f188 > 0.0) {
+        const float vx = fma(s2f(d1 + 40u), px, fma(s2f(d1 + 41u), py, s2f(d1 + 42u) * pz));
+        const float vy = fma(s2f(d1 + 32u), px, fma(s2f(d1 + 33u), py, s2f(d1 + 34u) * pz));
+        const float dist_xy = sqrt(vy * vy + vx * vx);
+        const float f191 = ssbo_1.data[o2 + 1u];
+        const float f194 = ssbo_1.data[o2 + 2u];
+        const float fog_rad = clamp(f188 - f188 * exp2((dist_xy - f191) * (-f194)), 0.0, 1.0);
+        if (fog_rad > 0.0) {
+            const float scale1 = fma(ssbo_1.data[o1 + 3u], luma_m1, 1.0);
+            const vec3 fcol1 = vec3(ssbo_1.data[o1 + 0u], ssbo_1.data[o1 + 1u], ssbo_1.data[o1 + 2u]);
+            mix1 = fma(vec3(fog_rad), fcol1 * scale1 - sum_rgb, sum_rgb);
+        }
+    }
 
-    const float scale1 = fma(ssbo_1.data[o1 + 3u], luma_m1, 1.0);
-    const vec3 fcol1 = vec3(ssbo_1.data[o1 + 0u], ssbo_1.data[o1 + 1u], ssbo_1.data[o1 + 2u]);
-    const vec3 mix1 = fma(vec3(fog_rad), fcol1 * scale1 - sum_rgb, sum_rgb);
-
-    const float f210 = ssbo_1.data[o3 + 0u];
-    const float f213 = ssbo_1.data[o3 + 1u];
-    const float f216 = ssbo_1.data[o3 + 2u];
-    const float f219 = ssbo_1.data[o3 + 3u];
-    const float h_factor = clamp(f216 * ((vz + f219) - f213), 0.0, 1.0);
-    const float fog_h = clamp(f210 * h_factor, 0.0, 1.0);
-
-    const float scale2 = fma(ssbo_1.data[o4 + 3u], luma_m1, 1.0);
-    const vec3 fcol2 = vec3(ssbo_1.data[o4 + 0u], ssbo_1.data[o4 + 1u], ssbo_1.data[o4 + 2u]);
-    const vec3 mix2 = fma(vec3(fog_h), fcol2 * scale2 - mix1, mix1);
+    vec3 mix2 = mix1;
+    if (f210 > 0.0) {
+        const float vz = fma(s2f(d1 + 36u), px, fma(s2f(d1 + 37u), py, s2f(d1 + 38u) * pz));
+        const float f213 = ssbo_1.data[o3 + 1u];
+        const float f216 = ssbo_1.data[o3 + 2u];
+        const float f219 = ssbo_1.data[o3 + 3u];
+        const float h_factor = clamp(f216 * ((vz + f219) - f213), 0.0, 1.0);
+        const float fog_h = clamp(f210 * h_factor, 0.0, 1.0);
+        if (fog_h > 0.0) {
+            const float scale2 = fma(ssbo_1.data[o4 + 3u], luma_m1, 1.0);
+            const vec3 fcol2 = vec3(ssbo_1.data[o4 + 0u], ssbo_1.data[o4 + 1u], ssbo_1.data[o4 + 2u]);
+            mix2 = fma(vec3(fog_h), fcol2 * scale2 - mix1, mix1);
+        }
+    }
 
     frag_color0 = vec4(mix2, out_a);
 }

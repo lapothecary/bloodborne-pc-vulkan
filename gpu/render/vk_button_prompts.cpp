@@ -386,7 +386,7 @@ vk::ImageView ButtonPrompts::AtlasView(Runtime& runtime, VideoCore::Image& image
                             vk::PipelineStageFlagBits2::eAllGraphics,
                         vk::AccessFlagBits2::eShaderRead);
         runtime.FlushBarriers();
-        scheduler.BumpDescriptorStateEpoch();
+        scheduler.BumpPushConstantsEpoch();
 
         const UpscalePush push{
             .src_w = s32(width),
@@ -552,7 +552,7 @@ vk::ImageView ButtonPrompts::UiView(Runtime& runtime, VideoCore::Image& image,
                             vk::PipelineStageFlagBits2::eAllGraphics,
                         vk::AccessFlagBits2::eShaderRead);
         runtime.FlushBarriers();
-        scheduler.BumpDescriptorStateEpoch();
+        scheduler.BumpPushConstantsEpoch();
 
         const UpscalePush push{
             .src_w = s32(width),

@@ -1227,6 +1227,7 @@ void Manager::RetireOverlapping(VAddr addr, u64 size, bool clear_global_owned) {
     }
     if (erased_any) {
         ++erase_generation;
+        ++map_erase_generation;
     }
 }
 
@@ -1318,7 +1319,7 @@ std::pair<const Buffer*, u64> Manager::TryResolveReadClamped(
     const size_t h1 = (h0 + 1u) & (kMruSlots - 1);
     for (const size_t idx : {h0, h1}) {
         const auto& slot = mru[idx];
-        if (slot.erase_gen == erase_generation && slot.entry && addr >= slot.base_addr &&
+        if (slot.erase_gen == map_erase_generation && slot.entry && addr >= slot.base_addr &&
             addr < slot.base_addr + slot.alloc_size) {
             if (const auto res = resolve_entry(slot.base_addr, *slot.entry); res.first) {
                 return res;
@@ -1376,7 +1377,7 @@ const u8* Manager::TryGetCpuMirrorPtr(VAddr addr, u64 size) noexcept {
     const size_t h1 = (h0 + 1u) & (kMruSlots - 1);
     for (const size_t idx : {h0, h1}) {
         const auto& slot = mru[idx];
-        if (slot.erase_gen == erase_generation && slot.entry && addr >= slot.base_addr &&
+        if (slot.erase_gen == map_erase_generation && slot.entry && addr >= slot.base_addr &&
             addr < slot.base_addr + slot.alloc_size) {
             return resolve_mirror(slot.base_addr, *slot.entry);
         }
@@ -1429,7 +1430,7 @@ std::pair<const Buffer*, u64> Manager::TryResolveWrite(VAddr addr, u64 size, boo
     const size_t h1 = (h0 + 1u) & (kMruSlots - 1);
     for (const size_t idx : {h0, h1}) {
         const auto& slot = mru[idx];
-        if (slot.erase_gen == erase_generation && slot.entry && addr >= slot.base_addr &&
+        if (slot.erase_gen == map_erase_generation && slot.entry && addr >= slot.base_addr &&
             addr + size <= slot.base_addr + slot.alloc_size) {
             hit_entry = slot.entry;
             hit_base = slot.base_addr;
@@ -1517,25 +1518,35 @@ void Manager::StageNativeCpuCopyBatch(std::span<const NativeCopyRegion> regions,
     static constexpr u64 kMaxCpuShadowBytes = 512ULL << 10; // 512 KiB CPU shadow cap
 
     struct StagedSlice {
-        u32 region_idx{0};
-        bool fast_memcpy{false};
-        bool full_overwrite{false};
-        bool use_shadow{false};
-        bool emit_to_stream{true};
-        Entry* entry{nullptr};
-        VAddr base_va{0};
-        VAddr src_va{0};
-        u32 dst_in_buf_off{0};
-        u32 copy_bytes{0};
-        u32 slice_span{0};
-        u32 rel_offset{0};
+        u32 region_idx;
+        bool fast_memcpy;
+        bool full_overwrite;
+        bool use_shadow;
+        bool emit_to_stream;
+        Entry* entry;
+        VAddr base_va;
+        VAddr src_va;
+        u32 dst_in_buf_off;
+        u32 copy_bytes;
+        u32 slice_span;
+        u32 rel_offset;
+    };
+
+    struct HostCopySlice {
+        VAddr src_va;
+        u32 rel_offset;
+        u32 dst_in_buf_off;
+        u32 copy_bytes;
+        u32 slice_span;
+        u8 fast_memcpy;
     };
 
     const u64 align = std::max<u64>(
         16ULL, std::max<u64>(instance.UniformMinAlignment(), instance.StorageMinAlignment()));
     auto& sbuf = buf_cache.GetStreamBuffer();
 
-    std::array<StagedSlice, 32> staged{};
+    constexpr u32 kMaxStagedSlices = 256u;
+    std::array<StagedSlice, kMaxStagedSlices> staged;
     u32 staged_count = 0;
     u64 total_bytes = 0;
     bool any_shadow_slice = false;
@@ -1565,23 +1576,33 @@ void Manager::StageNativeCpuCopyBatch(std::span<const NativeCopyRegion> regions,
             u8* const base_dst = sbuf.mapped_data.data() + base_off;
             Buffer* const sbuf_ptr = &sbuf;
             Core::MemoryManager* const mem = memory;
-            const auto chunk_slices = staged;
-            const u32 chunk_count = staged_count;
             const u64 chunk_bytes = total_bytes;
-            std::array<std::pair<u64, u64>, 32> host_ranges{};
+            const u32 chunk_count = staged_count;
+            std::array<HostCopySlice, kMaxStagedSlices> copy_slices;
+            std::array<std::pair<u64, u64>, kMaxStagedSlices> host_ranges;
             for (u32 k = 0; k < chunk_count; ++k) {
-                host_ranges[k] = {chunk_slices[k].src_va, chunk_slices[k].copy_bytes};
+                const auto& src_s = staged[k];
+                copy_slices[k] = HostCopySlice{
+                    .src_va = src_s.src_va,
+                    .rel_offset = src_s.rel_offset,
+                    .dst_in_buf_off = src_s.dst_in_buf_off,
+                    .copy_bytes = src_s.copy_bytes,
+                    .slice_span = src_s.slice_span,
+                    .fast_memcpy = static_cast<u8>(src_s.fast_memcpy),
+                };
+                host_ranges[k] = {src_s.src_va, src_s.copy_bytes};
             }
-            scheduler.RecordHostCopy(
-                [chunk_slices, chunk_count, base_dst, base_off, chunk_bytes, sbuf_ptr, mem] {
-                    for (u32 k = 0; k < chunk_count; ++k) {
-                        const auto& s = chunk_slices[k];
+            scheduler.RecordHostCopyWithData(
+                std::span<const HostCopySlice>{copy_slices.data(), chunk_count},
+                [base_dst, base_off, chunk_bytes, sbuf_ptr,
+                 mem](std::span<const HostCopySlice> slices) {
+                    for (const auto& s : slices) {
                         u8* dst = base_dst + s.rel_offset;
                         if (s.dst_in_buf_off != 0) {
                             std::memset(dst, 0, s.dst_in_buf_off);
                         }
                         u8* copy_dst = dst + s.dst_in_buf_off;
-                        if (s.fast_memcpy) {
+                        if (s.fast_memcpy != 0u) {
                             std::memcpy(copy_dst, reinterpret_cast<const void*>(s.src_va),
                                         s.copy_bytes);
                         } else {
@@ -1707,7 +1728,7 @@ void Manager::StageNativeCpuCopyBatch(std::span<const NativeCopyRegion> regions,
         const size_t mh1 = (mh0 + 1u) & (kMruSlots - 1);
         for (const size_t midx : {mh0, mh1}) {
             const auto& slot = mru[midx];
-            if (slot.erase_gen == erase_generation && slot.entry &&
+            if (slot.erase_gen == map_erase_generation && slot.entry &&
                 reg.dst_va >= slot.base_addr &&
                 reg.dst_va + reg.byte_size <= slot.base_addr + slot.alloc_size) {
                 base_va = slot.base_addr;
@@ -1807,7 +1828,7 @@ void Manager::StageNativeCpuCopyBatch(std::span<const NativeCopyRegion> regions,
 
         const bool use_shadow = can_use_shadow && (full_overwrite || shadow_partial_ok);
         StagedSlice* coalesced_prev = nullptr;
-        if (use_shadow && staged_count < 32) {
+        if (use_shadow && staged_count < kMaxStagedSlices) {
             for (u32 m = staged_count; m > 0; --m) {
                 if (staged[m - 1].base_va == base_va && staged[m - 1].use_shadow &&
                     staged[m - 1].emit_to_stream) {
@@ -1823,7 +1844,7 @@ void Manager::StageNativeCpuCopyBatch(std::span<const NativeCopyRegion> regions,
             rel_off = coalesced_prev->rel_offset;
         } else {
             rel_off = Common::AlignUp<u64>(total_bytes, align);
-            if (staged_count == 32 || rel_off + slice_span > (4ULL << 20)) {
+            if (staged_count == kMaxStagedSlices || rel_off + slice_span > (4ULL << 20)) {
                 if (!commit_chunk()) {
                     return;
                 }

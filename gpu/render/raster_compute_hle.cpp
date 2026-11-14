@@ -5,6 +5,7 @@
 // images live in their own Vulkan memory, not in the buffers the shader would write).
 
 #include "render/raster_internal.h"
+#include "textures/direct_textures.h"
 
 namespace Vulkan {
 
@@ -79,37 +80,41 @@ bool Rasterizer::IsComputeImageCopy(const Pipeline* pipeline, bool dry_run) {
         return false;
     }
     static const bool copy_log = std::getenv("BB_IMAGE_COPY_LOG") != nullptr;
-    constexpr u64 MaxTail = 4_MB;
+    const u64 lookup_max_tail = std::max<u64>(4_MB, buf0.GetSize() / 3);
     auto image0_id = texture_cache.FindImageFromRange(buf0.base_address, buf0.GetSize(),
-                                                      !desc0.is_written, MaxTail);
+                                                      !desc0.is_written, lookup_max_tail);
     auto image1_id = texture_cache.FindImageFromRange(buf1.base_address, buf1.GetSize(),
-                                                      !desc1.is_written, MaxTail);
+                                                      !desc1.is_written, lookup_max_tail);
     if (image0_id && !image1_id && !desc0.is_written && desc1.is_written && !dry_run) {
         const auto& src_img = texture_cache.GetImage(image0_id);
+        const u64 max_img_tail = std::max<u64>(4_MB, src_img.info.guest_size / 2);
         if (buf0.GetSize() >= src_img.info.guest_size &&
-            buf0.GetSize() - src_img.info.guest_size <= MaxTail &&
-            !src_img.info.props.is_depth) {
+            buf0.GetSize() - src_img.info.guest_size <= max_img_tail) {
             VideoCore::TextureCache::ImageDesc dst_desc{};
             dst_desc.info = src_img.info;
             dst_desc.info.guest_address = buf1.base_address;
             dst_desc.info.meta_info = {};
             dst_desc.info.stencil_addr = 0;
             dst_desc.info.stencil_size = 0;
-            dst_desc.type = VideoCore::TextureCache::BindingType::RenderTarget;
+            dst_desc.type = src_img.info.props.is_depth
+                                ? VideoCore::TextureCache::BindingType::DepthTarget
+                                : VideoCore::TextureCache::BindingType::RenderTarget;
             image1_id = texture_cache.FindImage(dst_desc, true);
         }
     } else if (image1_id && !image0_id && !desc1.is_written && desc0.is_written && !dry_run) {
         const auto& src_img = texture_cache.GetImage(image1_id);
+        const u64 max_img_tail = std::max<u64>(4_MB, src_img.info.guest_size / 2);
         if (buf1.GetSize() >= src_img.info.guest_size &&
-            buf1.GetSize() - src_img.info.guest_size <= MaxTail &&
-            !src_img.info.props.is_depth) {
+            buf1.GetSize() - src_img.info.guest_size <= max_img_tail) {
             VideoCore::TextureCache::ImageDesc dst_desc{};
             dst_desc.info = src_img.info;
             dst_desc.info.guest_address = buf0.base_address;
             dst_desc.info.meta_info = {};
             dst_desc.info.stencil_addr = 0;
             dst_desc.info.stencil_size = 0;
-            dst_desc.type = VideoCore::TextureCache::BindingType::RenderTarget;
+            dst_desc.type = src_img.info.props.is_depth
+                                ? VideoCore::TextureCache::BindingType::DepthTarget
+                                : VideoCore::TextureCache::BindingType::RenderTarget;
             image0_id = texture_cache.FindImage(dst_desc, true);
         }
     }
@@ -135,8 +140,9 @@ bool Rasterizer::IsComputeImageCopy(const Pipeline* pipeline, bool dry_run) {
     // The buffers may run past the images (padding up to the next one: the light shafts' 960x540
     // targets are copied as 0x241800 bytes of 0x240000): those bytes are copied as a buffer.
     const u64 image_size = image0.info.guest_size;
+    const u64 max_img_tail = std::max<u64>(4_MB, image_size / 2);
     if (image_size != image1.info.guest_size || image0.info.pitch != image1.info.pitch ||
-        buf0.GetSize() < image_size || buf0.GetSize() - image_size > MaxTail ||
+        buf0.GetSize() < image_size || buf0.GetSize() - image_size > max_img_tail ||
         image0.info.num_bits != image1.info.num_bits) {
         if (copy_log && BbStats::gpu_frames.load(std::memory_order_relaxed) >= 30) {
             static std::atomic<u32> rej2{0};
@@ -182,7 +188,9 @@ bool Rasterizer::IsComputeImageCopy(const Pipeline* pipeline, bool dry_run) {
     if (const u64 tail = buf0.GetSize() - image_size) {
         const VAddr src_tail = src.info.guest_address + image_size;
         const VAddr dst_tail = dst.info.guest_address + image_size;
-        if (texture_cache.FindImageFromRange(dst_tail, tail, false)) {
+        const auto tail_img_id = texture_cache.FindImageFromRange(dst_tail, tail, false);
+        if (tail_img_id &&
+            texture_cache.GetImage(tail_img_id).info.pixel_format != vk::Format::eUndefined) {
             const auto [src_buffer, src_offset] =
                 buffer_cache.ObtainBuffer(src_tail, u32(tail), false);
             const auto [dst_buffer, dst_offset] =
@@ -220,10 +228,135 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
     if (!pipeline->IsCompute()) {
         return RejectClear(1, 0);
     }
-    // A raw vec4 read and a formatted buffer over one layer of a color image written, 128
-    // elements per workgroup: a clear of that image to the vec4.
     const auto& cs = CsRegs();
     const auto& info = pipeline->GetStage(Shader::SwStage::Compute);
+    // Phase 2.3: Yebis 2 8x8x1 2D UAV Image Clear (`cs 0x000000009a9cf8a9`):
+    // Replaces 3.68M-8.29M OpImageWrite invocations + eGeneral DCC decompression with a single
+    // hardware DCC Fast-Clear (`vkCmdClearColorImage`). Note: `upscaler->OnDispatch(cs.pgm_hash)`
+    // in `DispatchRecord` runs before `BindResources`, so temporal upscaling trigger order is
+    // 100% preserved.
+    if (info.pgm_hash == 0x000000009a9cf8a9ULL) {
+        if (cs.num_thread_x.full != 8 || cs.num_thread_y.full != 8 || cs.num_thread_z.full != 1 ||
+            (cs.start_x | cs.start_y | cs.start_z) != 0 || cs.dim_z != 1 ||
+            ShaderBufferCount(info) != 1 || info.images.size() != 1 || !info.samplers.empty()) {
+            return false;
+        }
+        const auto& value_desc = info.buffers[0];
+        const auto& image_res = info.images[0];
+        if (value_desc.IsSpecial() || value_desc.is_formatted || value_desc.is_written ||
+            !image_res.is_written || image_res.is_depth ||
+            image_res.mip_fallback_mode == Shader::MipStorageFallbackMode::DynamicIndex) {
+            return false;
+        }
+        const PreparedStage* prepared = FindPreparedStage(info);
+        const float* color_ptr = nullptr;
+        for (u32 i = 0; i < num_ring_stages; ++i) {
+            if (ring_stages[i].info == &info) {
+                for (u32 k = 0; k < ring_stages[i].count; ++k) {
+                    const auto& rb = ring_stages[i].bindings[k];
+                    if (rb.index == 0 && rb.offset < RingNotCopied && rb.size >= 16) {
+                        const u8* ring_data = rb.ring == 0
+                                                  ? constant_ring->Data(rb.offset)
+                                                  : worker_rings[rb.ring - 1]->Data(rb.offset);
+                        color_ptr = reinterpret_cast<const float*>(ring_data);
+                        break;
+                    }
+                }
+                break;
+            }
+        }
+        if (!color_ptr) {
+            const Gcn::Buffer vsharp =
+                prepared ? prepared->buffer_sharps[0] : value_desc.GetSharp(info);
+            if (vsharp.base_address == 0 || vsharp.GetSize() < 16 ||
+                memory->ClampRangeSize(vsharp.base_address, 16) < 16 ||
+                buffer_cache.IsRegionGpuModified(vsharp.base_address, 16) ||
+                buffer_cache.OverlapsInPassShadow(vsharp.base_address, 16) ||
+                (HasPendingHleCopies() &&
+                 PendingHleCopiesConflict(vsharp.base_address, 16, false))) {
+                return false;
+            }
+            color_ptr = reinterpret_cast<const float*>(vsharp.base_address);
+        }
+
+        Gcn::Image tsharp = prepared ? prepared->image_sharps[0] : image_res.GetSharp(info);
+        u8 srv_gen8 = 0u;
+        const u16 srv_uid = VideoCore::DirectTextures::UnpackAndCleanSrv(tsharp, srv_gen8);
+        const auto data_fmt = tsharp.GetDataFmt();
+        const auto num_fmt = tsharp.GetNumberFmt();
+        if (tsharp.Address() == 0 || data_fmt == Gcn::DataFormat::FormatInvalid ||
+            !memory->IsValidGpuMapping(tsharp.Address(), 0) || !IsKnownFormat(data_fmt, num_fmt) ||
+            tsharp.GetNumberConversion() != Gcn::NumberConversion::None ||
+            Gcn::GetNumberClass(num_fmt) != Gcn::NumberClass::Float) {
+            return false;
+        }
+        ++bind_epoch;
+        auto& desc_entry = ResolveImageDescEntry(
+            tsharp, srv_uid, srv_gen8, image_res,
+            prepared ? &prepared->image_hashes[0] : nullptr);
+        VideoCore::TextureCache::ImageDesc desc = desc_entry.desc;
+        if (image_res.mip_fallback_mode == Shader::MipStorageFallbackMode::ConstantIndex) {
+            desc.view_info.range.base.level += image_res.constant_mip_index;
+            desc.view_info.range.extent.levels = 1;
+        }
+        if (desc.view_info.range.extent.levels != 1 || desc.view_info.range.extent.layers != 1) {
+            return false;
+        }
+        const VideoCore::ImageId image_id = texture_cache.FindImage(desc);
+        if (!image_id) {
+            return false;
+        }
+        auto& image = texture_cache.GetImage(image_id);
+        if (image.info.props.is_depth || image.info.size.depth != 1 || image.info.num_samples > 1) {
+            return false;
+        }
+        const u32 mip_w = std::max(1u, image.info.size.width >> desc.view_info.range.base.level);
+        const u32 mip_h = std::max(1u, image.info.size.height >> desc.view_info.range.base.level);
+        if (u64(cs.dim_x) * 8ULL < mip_w || u64(cs.dim_y) * 8ULL < mip_h) {
+            return false;
+        }
+
+        const std::array<float, 4> raw_rgba{color_ptr[0], color_ptr[1], color_ptr[2], color_ptr[3]};
+        std::array<float, 4> swz_rgba = tsharp.DstSelect().Inverse().Apply(raw_rgba);
+        const vk::Format view_fmt = desc.view_info.format;
+        const vk::Format img_fmt = image.info.pixel_format;
+        if (view_fmt != img_fmt) {
+            const bool is_zero_or_one =
+                (swz_rgba[0] == 0.0f || swz_rgba[0] == 1.0f) &&
+                (swz_rgba[1] == 0.0f || swz_rgba[1] == 1.0f) &&
+                (swz_rgba[2] == 0.0f || swz_rgba[2] == 1.0f) &&
+                (swz_rgba[3] == 0.0f || swz_rgba[3] == 1.0f);
+            if ((view_fmt == vk::Format::eR8G8B8A8Unorm && img_fmt == vk::Format::eB8G8R8A8Unorm) ||
+                (view_fmt == vk::Format::eB8G8R8A8Unorm && img_fmt == vk::Format::eR8G8B8A8Unorm)) {
+                std::swap(swz_rgba[0], swz_rgba[2]);
+            } else if (is_zero_or_one && view_fmt == vk::Format::eR8G8B8A8Unorm &&
+                       img_fmt == vk::Format::eR8G8B8A8Srgb) {
+                // 0.0 and 1.0 encode identically in linear UNORM and sRGB.
+            } else if (is_zero_or_one &&
+                       ((view_fmt == vk::Format::eR8G8B8A8Unorm &&
+                         img_fmt == vk::Format::eB8G8R8A8Srgb) ||
+                        (view_fmt == vk::Format::eB8G8R8A8Unorm &&
+                         img_fmt == vk::Format::eR8G8B8A8Srgb))) {
+                std::swap(swz_rgba[0], swz_rgba[2]);
+            } else {
+                return false;
+            }
+        }
+
+        const vk::ClearValue clear{.color = {.float32 = swz_rgba}};
+        GpuProfiler::HudMarkPass(&scheduler, BbStats::GpuSub_Post_BloomGlare);
+        if (auto* profiler = GpuProfiler::Get()) {
+            profiler->Mark(info.pgm_hash ^ 0xD15Aull, [&] {
+                return fmt::format("hle clear cs {:016x} ({}x{})", info.pgm_hash, mip_w, mip_h);
+            });
+        }
+        runtime.ClearImage(&image, desc.view_info.range, clear);
+        image.gpu_write_tick = scheduler.CurrentTick();
+        return true;
+    }
+
+    // A raw vec4 read and a formatted buffer over one layer of a color image written, 128
+    // elements per workgroup: a clear of that image to the vec4.
     if (!IsTwoBufferShader(cs, info)) {
         return RejectClear(2, cs.dim_x);
     }

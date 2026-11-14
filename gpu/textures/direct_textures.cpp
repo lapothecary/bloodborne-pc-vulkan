@@ -16,6 +16,7 @@ namespace {
 std::atomic<TextureCache*> g_active_cache{nullptr};
 std::atomic<u32> g_pending_count{0};
 std::atomic<u32> g_pending_registers{0};
+std::atomic<u32> g_immutable_ro_epoch{1};
 std::mutex g_queue_mutex;
 std::vector<Event> g_queue;
 
@@ -253,6 +254,18 @@ u16 UnpackAndCleanSrv(Gcn::Image& tsharp, u8& out_gen8) noexcept {
     }
     out_gen8 = tag_gen;
     return static_cast<u16>(uid);
+}
+
+u16 ImmutableRoEpoch16() noexcept {
+    const u16 ep = static_cast<u16>(g_immutable_ro_epoch.load(std::memory_order_acquire) & 0xFFFFu);
+    return ep != 0u ? ep : 1u;
+}
+
+void BumpImmutableRoEpoch() noexcept {
+    u32 next = g_immutable_ro_epoch.fetch_add(1u, std::memory_order_acq_rel) + 1u;
+    if ((next & 0xFFFFu) == 0u) [[unlikely]] {
+        g_immutable_ro_epoch.fetch_add(1u, std::memory_order_acq_rel);
+    }
 }
 
 } // namespace VideoCore::DirectTextures

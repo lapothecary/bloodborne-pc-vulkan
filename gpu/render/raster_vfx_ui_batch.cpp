@@ -524,8 +524,9 @@ bool VfxUiBatcher::IsBatchSafeTask(Rasterizer::OrderedTask task, const void* dat
     if (task != &BbCp::Tasks::DirectVkCopyBatchTask || !data || size < sizeof(u32)) {
         return false;
     }
-    u32 count = 0;
-    std::memcpy(&count, data, sizeof(u32));
+    u32 op_word = 0;
+    std::memcpy(&op_word, data, sizeof(u32));
+    const u32 count = op_word >> 16;
     if (count == 0u || count > 32u ||
         size < sizeof(u32) + count * sizeof(Rasterizer::DirectCopyRegion)) {
         return false;

@@ -2700,6 +2700,7 @@ void sub_21d5f80(void* self, void* renderCmdCtx, void* filterParam) {
         sub_108f330(static_cast<uint8_t*>(g_ActiveYebisGpuCtx_56c3cb8) + 0x2c8, 2, 1, 1, gnmVbUv);
 
         auto* yGpuVs = static_cast<uint8_t*>(g_ActiveYebisGpuCtx_56c3cb8);
+        const auto yebis_bundle_mark = gx_direct_vk::CaptureDrawBundleBookmark(yGpuVs);
         auto* vsBin  = *reinterpret_cast<uint8_t**>(vsWrap + 0x100);
         if (vsBin != nullptr && *reinterpret_cast<uint8_t**>(yGpuVs + 0xe610) != vsBin) {
             sub_1091bc0(yGpuVs + 0x5508, vsBin + 0x028, vsBin[0x03]);
@@ -2738,8 +2739,8 @@ void sub_21d5f80(void* self, void* renderCmdCtx, void* filterParam) {
         if (gx_direct_vk::EnabledV2Sub(gx_direct_vk::kV2Sub_YebisDrawDispatch)) {
             auto* yDrawCtx = static_cast<uint8_t*>(g_ActiveYebisGpuCtx_56c3cb8);
             sub_108ca70(yDrawCtx + 0x2c8, yDrawCtx, yDrawCtx + 0x080);
-            gx_direct_vk::EmitDrawIndexAddr(
-                yDrawCtx, reinterpret_cast<uint64_t>(quadIbAddr), 6u, 4u, 0u);
+            gx_direct_vk::EmitDrawIndexAddrBundled(
+                yDrawCtx, yebis_bundle_mark, reinterpret_cast<uint64_t>(quadIbAddr), 6u, 4u, 0u);
             sub_108ca80(yDrawCtx + 0x2c8, yDrawCtx, yDrawCtx + 0x080);
         } else {
             sub_1073fe0(g_ActiveYebisGpuCtx_56c3cb8, 4);

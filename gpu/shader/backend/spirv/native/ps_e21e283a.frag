@@ -2,6 +2,8 @@
 #extension GL_EXT_samplerless_texture_functions : require
 // ps_e21e283a — Clean vectorized G-Buffer foliage/cloth shader (opaque two-sided + detail + Fresnel)
 
+layout(early_fragment_tests) in;
+
 layout(location = 0) in vec4 fs_in_attr0_p;
 layout(location = 1) in vec4 fs_in_attr1_p;
 layout(location = 2) in vec4 fs_in_attr2_p;
@@ -49,6 +51,7 @@ float s5f(uint i) { return uintBitsToFloat(ssbo_5.data[i]); }
 
 float safe_rsq(float x) { return (x > 0.0) ? inversesqrt(max(x, 1.17549435e-38)) : 0.0; }
 vec3 safe_norm(vec3 v) { return v * safe_rsq(dot(v, v)); }
+float schlick5(float x) { float x2 = x * x; return x2 * x2 * x; }
 float s1_row_dot(uint off, vec4 v) {
     return s1f(off) * v.x + (s1f(off + 1u) * v.y + (s1f(off + 2u) * v.z + s1f(off + 3u) * v.w));
 }
@@ -82,13 +85,11 @@ void main() {
     uint d4 = (bo0.y >> 2u) & 0x3Fu;
 
     bool is_front = gl_FrontFacing;
+    vec2 uv0 = fs_in_attr3_p.xy;
+    vec2 uv1 = fs_in_attr3_p.zw;
 
-    vec4 tex0 = texture(sampler2D(fs_img0, fs_samp0), fs_in_attr3_p.zw);
-    vec4 tex1 = texture(sampler2D(fs_img1, fs_samp1), xform_uv(d1 + 12u, fs_in_attr3_p.xy));
-    vec4 tex2 = texture(sampler2D(fs_img2, fs_samp2), xform_uv(d1 + 8u, fs_in_attr3_p.xy));
-    vec4 tex3 = texture(sampler2D(fs_img3, fs_samp2), fs_in_attr3_p.zw);
-    vec4 tex4 = texture(sampler2D(fs_img4, fs_samp2), xform_uv(d1 + 4u, fs_in_attr3_p.xy));
-
+    // Stage 1: Normal map -> TBN -> N
+    vec4 tex1 = texture(sampler2D(fs_img1, fs_samp1), xform_uv(d1 + 12u, uv0));
     vec3 n_unit = safe_norm(fs_in_attr0_p.xyz);
     vec3 N_vert = is_front ? n_unit : -n_unit;
     vec3 T_vert = safe_norm(fs_in_attr1_p.xyz);
@@ -99,6 +100,7 @@ void main() {
     float nz = sqrt(1.0 - clamp(nx * nx + ny * ny, 0.0, 1.0));
     vec3 N = safe_norm(B_vert * nx + (T_vert * ny + N_vert * nz));
 
+    // Stage 2: View, Detail, Gloss & Cubemaps
     float inv_proj_w = 1.0 / s1_row_dot(d0 + 32u, fs_in_attr4_p);
     vec3 V = safe_norm(vec3(
         -s1_row_dot(d0 + 20u, fs_in_attr4_p) * inv_proj_w + s1f(d0 + 183u),
@@ -107,29 +109,36 @@ void main() {
     ));
     float NdotV = dot(N, V);
     vec3 R = -V + N * (NdotV * 2.0);
+    float horizon = clamp(dot(R, N_vert) + 1.0, 0.0, 1.0);
+
+    vec4 tex0 = texture(sampler2D(fs_img0, fs_samp0), uv1);
+    float tex2_x = texture(sampler2D(fs_img2, fs_samp2), xform_uv(d1 + 8u, uv0)).x;
+    vec2 tex3_xy = texture(sampler2D(fs_img3, fs_samp2), uv1).xy;
 
     float det_w = s3f(d2 + 24u);
     float gloss_scale = s3f(d2 + 8u) * 0.00390625;
-    float gloss = (det_w * ((tex0.w * tex2.x + tex3.x) - tex2.x) + tex2.x) * gloss_scale;
+    float gloss = (det_w * ((tex0.w * tex2_x + tex3_xy.x) - tex2_x) + tex2_x) * gloss_scale;
     float mip_lod = min(6.0, 6.5 - gloss * 6.5);
     vec3 c_uv = cube_uv(is_front ? R : vec3(R.x, abs(R.y), R.z));
-    vec4 env0 = textureLod(sampler2DArray(fs_img5, fs_samp3), c_uv, mip_lod);
-    vec4 env1 = textureLod(sampler2DArray(fs_img6, fs_samp3), c_uv, mip_lod);
-    vec4 tex7 = texture(sampler2D(fs_img7, fs_samp0), xform_uv(d1, fs_in_attr3_p.xy));
-
-    bool mono_spec = (tex4.z == 0.0) && (tex4.y == 0.0);
-    vec3 spec_tex = vec3(tex4.x, mono_spec ? tex4.x : tex4.y, mono_spec ? tex4.x : tex4.z);
-    vec3 spec = det_w * ((tex0.w * spec_tex + tex3.y * tex3.y) - spec_tex) + spec_tex;
-    float fres = clamp((1.0 + NdotV) * (1.0 + NdotV), 0.0, 1.0) * exp2(5.0 * log2(1.0 - clamp(NdotV, 0.0, 1.0)));
-    vec3 spec_fres = (fres - fres * spec) * (gloss * gloss) + spec;
+    vec3 env0 = textureLod(sampler2DArray(fs_img5, fs_samp3), c_uv, mip_lod).rgb;
+    vec3 env1 = textureLod(sampler2DArray(fs_img6, fs_samp3), c_uv, mip_lod).rgb;
 
     uint inst_off = uint(fs_in_attr0_p.w * 1.00001526) * 13u;
     uint sh_base = (inst_off + 8u) * 4u + d3;
     float e_w0 = ssbo_4.data[sh_base];
     float e_w1 = ssbo_4.data[sh_base + 1u];
     float e_w2 = ssbo_4.data[sh_base + 2u];
-    float horizon = clamp(dot(R, N_vert) + 1.0, 0.0, 1.0);
-    vec3 env_blend = (e_w0 * (-e_w1 * env1.xyz + e_w2 * env0.xyz) + e_w1 * env1.xyz) * (horizon * horizon);
+    vec3 env_blend = (e_w0 * (-e_w1 * env1 + e_w2 * env0) + e_w1 * env1) * (horizon * horizon);
+
+    // Stage 3: Specular + Albedo -> 6-MRT export
+    vec3 tex4_rgb = texture(sampler2D(fs_img4, fs_samp2), xform_uv(d1 + 4u, uv0)).rgb;
+    vec4 tex7 = texture(sampler2D(fs_img7, fs_samp0), xform_uv(d1, uv0));
+
+    bool mono_spec = (tex4_rgb.z == 0.0) && (tex4_rgb.y == 0.0);
+    vec3 spec_tex = mono_spec ? vec3(tex4_rgb.x) : tex4_rgb;
+    vec3 spec = det_w * ((tex0.w * spec_tex + tex3_xy.y * tex3_xy.y) - spec_tex) + spec_tex;
+    float fres = clamp((1.0 + NdotV) * (1.0 + NdotV), 0.0, 1.0) * schlick5(1.0 - clamp(NdotV, 0.0, 1.0));
+    vec3 spec_fres = (fres - fres * spec) * (gloss * gloss) + spec;
     vec3 env_tint = vec3(s3f(d2 + 4u), s3f(d2 + 5u), s3f(d2 + 6u)) * s5f(d4 + 12u);
 
     vec3 sh_rgb = vec3(eval_sh(sh_base + 4u, N), eval_sh(sh_base + 8u, N), eval_sh(sh_base + 12u, N));

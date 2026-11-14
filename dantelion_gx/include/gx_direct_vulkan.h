@@ -692,6 +692,8 @@ enum class Op : uint32_t {
     BindLsShader             = 31u,
     InitDefaultHardwareState = 32u,
     SetVgtControl            = 33u,
+    // Phase 3 Step 3.3: Fused DirectVk state + draw super-packet
+    DrawBundle               = 34u,
 };
 
 // Tag stored in `CopyRegion::reserved` / `CopyRecord::reserved` when the C++20 engine itself
@@ -1272,6 +1274,254 @@ inline bool DirectRingEnabled() noexcept {
         return !(env && env[0] == '0');
     }();
     return enabled;
+}
+
+inline bool DrawBundleEnabled() noexcept {
+    static const bool enabled = []() -> bool {
+        const char* env = std::getenv("BB_DRAW_BUNDLE");
+        return env && env[0] == '1';
+    }();
+    return enabled && DirectRingEnabled() && EnabledV2();
+}
+
+enum class DrawBundleKind : uint32_t {
+    Indexed   = 0u,
+    Auto      = 1u,
+    IndexAddr = 2u,
+};
+
+struct DrawBundleBookmark {
+    uintptr_t begin_ptr = 0u;
+    uint32_t* mark_ptr = nullptr;
+};
+
+inline DrawBundleBookmark CaptureDrawBundleBookmark(const void* dcb_raw) noexcept {
+    if (!dcb_raw || !DrawBundleEnabled()) {
+        return {};
+    }
+    const auto* dcb = static_cast<const uint8_t*>(dcb_raw);
+    return DrawBundleBookmark{
+        *reinterpret_cast<const uintptr_t*>(dcb + 0x00),
+        *reinterpret_cast<uint32_t* const*>(dcb + 0x10),
+    };
+}
+
+inline bool IsBundleableStatePacket(const uint32_t* p, uint32_t hdr, uint32_t bw) noexcept {
+    // Must be an unpredicated Type-3 Op::Nop (0x10) DirectVk packet with <= 255 payload words.
+    if ((hdr & 0xC000FF01u) != 0xC0001000u || bw < 2u || (bw - 2u) > 255u ||
+        p[1] != kNopPayloadTag) {
+        return false;
+    }
+    const uint32_t op_word = p[2];
+    if ((op_word & 0xFF00u) != 0u) {
+        return false;
+    }
+    switch (static_cast<Op>(op_word & 0xFFu)) {
+    case Op::SetIndexState:
+        return bw == 6u;
+    case Op::SetStageUserData:
+        // Graphics SH bank only (< 0x200u); CS stage (0x240u) updates cs_state separately.
+        return bw >= 3u && (p[3] & 0xFFFFu) < 0x200u;
+    case Op::SetContextRegsPacked:
+        return bw >= 4u;
+    case Op::BindVsShader:
+        return bw == 9u;
+    case Op::BindPsShader:
+        return bw == 14u || bw == 2u;
+    case Op::BindEsShader:
+        return bw == 6u;
+    case Op::BindGsShader:
+        return bw == 9u;
+    case Op::BindHsShader:
+        return bw == 10u;
+    case Op::BindLsShader:
+        return bw == 6u;
+    case Op::SetVgtControl:
+        return bw == 2u;
+    default:
+        return false;
+    }
+}
+
+// Coalesces the contiguous suffix of pure DirectVk graphics state packets in `[mark .. cmd_ptr)`
+// together with the draw arguments into a single in-place `Op::DrawBundle` packet, shrinking the
+// DCB footprint by `2 * sub_count` dwords and eliminating 8-12 separate Stage-A packet dispatches.
+inline bool EmitDrawBundleRaw(
+    void* dcb_raw,
+    const DrawBundleBookmark& mark,
+    DrawBundleKind kind,
+    const uint32_t draw_words[4]) noexcept
+{
+    if (!dcb_raw) {
+        return false;
+    }
+    const uint32_t standalone_words = (kind == DrawBundleKind::Auto) ? 6u : 7u;
+    if (mark.mark_ptr == nullptr) [[likely]] {
+        uint32_t* const pkt = ReserveDcbDwords(dcb_raw, standalone_words);
+        if (!pkt) {
+            return false;
+        }
+        const uint32_t body_dw = standalone_words - 1u;
+        const Op standalone_op = (kind == DrawBundleKind::Indexed) ? Op::DrawIndexed
+                               : (kind == DrawBundleKind::Auto)    ? Op::DrawAuto
+                                                                   : Op::DrawIndexAddr;
+        pkt[0] = MakeNopHeader(body_dw) | GetDcbPredicationBit(dcb_raw);
+        pkt[1] = kNopPayloadTag;
+        pkt[2] = static_cast<uint32_t>(standalone_op);
+        std::memcpy(&pkt[3], draw_words, (body_dw - 2u) * sizeof(uint32_t));
+        return true;
+    }
+    auto* dcb = static_cast<uint8_t*>(dcb_raw);
+    const uintptr_t cur_begin = *reinterpret_cast<const uintptr_t*>(dcb + 0x00);
+    uint32_t* const old_cmd_ptr = *reinterpret_cast<uint32_t* const*>(dcb + 0x10);
+    uint32_t* bundle_start = nullptr;
+    uint32_t sub_count = 0u;
+    if (cur_begin == mark.begin_ptr && mark.mark_ptr < old_cmd_ptr) {
+        bundle_start = mark.mark_ptr;
+        uint32_t* p = mark.mark_ptr;
+        bool walk_ok = true;
+        while (p < old_cmd_ptr) {
+            const uint32_t hdr = p[0];
+            const uint32_t pkt_type = hdr >> 30;
+            if (pkt_type == 2u) {
+                ++p;
+                bundle_start = p;
+                sub_count = 0u;
+                continue;
+            }
+            if (pkt_type != 3u) {
+                walk_ok = false;
+                break;
+            }
+            const uint32_t bw = ((hdr >> 16) & 0x3FFFu) + 1u;
+            uint32_t* const next_p = p + 1u + bw;
+            if (next_p > old_cmd_ptr) {
+                walk_ok = false;
+                break;
+            }
+            if (IsBundleableStatePacket(p, hdr, bw) && sub_count < 4095u) {
+                ++sub_count;
+            } else {
+                bundle_start = next_p;
+                sub_count = 0u;
+            }
+            p = next_p;
+        }
+        if (!walk_ok || p != old_cmd_ptr) {
+            sub_count = 0u;
+        } else if (sub_count > 0u) {
+            const ptrdiff_t state_dwords = old_cmd_ptr - bundle_start;
+            if (state_dwords <= 0 || static_cast<size_t>(state_dwords) + 7u > 0x3FFFu) {
+                sub_count = 0u;
+            }
+        }
+    }
+
+    uint32_t* const reserved_pkt = ReserveDcbDwords(dcb_raw, standalone_words);
+    if (!reserved_pkt) {
+        return false;
+    }
+
+    if (sub_count == 0u || *reinterpret_cast<const uintptr_t*>(dcb + 0x00) != cur_begin ||
+        reserved_pkt != old_cmd_ptr) {
+        const uint32_t body_dw = standalone_words - 1u;
+        const Op standalone_op = (kind == DrawBundleKind::Indexed) ? Op::DrawIndexed
+                               : (kind == DrawBundleKind::Auto)    ? Op::DrawAuto
+                                                                   : Op::DrawIndexAddr;
+        reserved_pkt[0] = MakeNopHeader(body_dw) | GetDcbPredicationBit(dcb_raw);
+        reserved_pkt[1] = kNopPayloadTag;
+        reserved_pkt[2] = static_cast<uint32_t>(standalone_op);
+        std::memcpy(&reserved_pkt[3], draw_words, (body_dw - 2u) * sizeof(uint32_t));
+        return true;
+    }
+
+    uint32_t* dst = bundle_start + 3u;
+    uint32_t* src = bundle_start;
+    uint32_t cur_hdr = src[0];
+    for (uint32_t i = 0u; i < sub_count; ++i) {
+        const uint32_t bw = ((cur_hdr >> 16) & 0x3FFFu) + 1u;
+        const uint32_t payload_words = bw - 2u;
+        uint32_t* const next_src = src + 1u + bw;
+        const uint32_t next_hdr = (i + 1u < sub_count) ? next_src[0] : 0u;
+        const uint32_t sub_hdr = (src[2] & 0xFFFF00FFu) | (payload_words << 8);
+        if (i == 0u) {
+            if (payload_words != 0u) {
+                std::memmove(dst + 1u, src + 3u, payload_words * sizeof(uint32_t));
+            }
+            dst[0] = sub_hdr;
+        } else {
+            dst[0] = sub_hdr;
+            if (payload_words != 0u) {
+                std::memmove(dst + 1u, src + 3u, payload_words * sizeof(uint32_t));
+            }
+        }
+        dst += 1u + payload_words;
+        src = next_src;
+        cur_hdr = next_hdr;
+    }
+
+    std::memcpy(dst, draw_words, 4u * sizeof(uint32_t));
+    dst += 4u;
+
+    const uint32_t bundle_body_words = static_cast<uint32_t>((dst - bundle_start) - 1);
+    bundle_start[0] = MakeNopHeader(bundle_body_words) | GetDcbPredicationBit(dcb_raw);
+    bundle_start[1] = kNopPayloadTag;
+    bundle_start[2] = static_cast<uint32_t>(Op::DrawBundle) |
+                      (static_cast<uint32_t>(kind) << 16) |
+                      (sub_count << 20);
+    *reinterpret_cast<uint32_t**>(dcb + 0x10) = dst;
+    return true;
+}
+
+inline bool EmitDrawIndexedBundled(
+    void* dcb_raw,
+    const DrawBundleBookmark& mark,
+    uint32_t index_count,
+    uint32_t instance_count,
+    uint32_t start_index,
+    int32_t base_vertex) noexcept
+{
+    const uint32_t draw_words[4] = {
+        index_count,
+        instance_count,
+        start_index,
+        static_cast<uint32_t>(base_vertex),
+    };
+    return EmitDrawBundleRaw(dcb_raw, mark, DrawBundleKind::Indexed, draw_words);
+}
+
+inline bool EmitDrawAutoBundled(
+    void* dcb_raw,
+    const DrawBundleBookmark& mark,
+    uint32_t vertex_count,
+    uint32_t instance_count,
+    int32_t start_vertex) noexcept
+{
+    const uint32_t draw_words[4] = {
+        vertex_count,
+        instance_count,
+        static_cast<uint32_t>(start_vertex),
+        0u,
+    };
+    return EmitDrawBundleRaw(dcb_raw, mark, DrawBundleKind::Auto, draw_words);
+}
+
+inline bool EmitDrawIndexAddrBundled(
+    void* dcb_raw,
+    const DrawBundleBookmark& mark,
+    uint64_t ib_va,
+    uint32_t index_count,
+    uint32_t prim_type,
+    uint32_t index_size) noexcept
+{
+    const uint32_t flags = (prim_type & 0x3Fu) | 0x100u | 0x200u | ((index_size & 0xFFu) << 16);
+    const uint32_t draw_words[4] = {
+        static_cast<uint32_t>(ib_va),
+        static_cast<uint32_t>(ib_va >> 32),
+        index_count,
+        flags,
+    };
+    return EmitDrawBundleRaw(dcb_raw, mark, DrawBundleKind::IndexAddr, draw_words);
 }
 
 // 1-to-1 C++20 replacement for 0x1076030 (DrawCommandBuffer::setActiveShaderStages)

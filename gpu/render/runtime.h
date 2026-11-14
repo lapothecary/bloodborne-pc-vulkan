@@ -111,6 +111,11 @@ public:
     void ClearDepthStencilImage(VideoCore::Image* dst, const VideoCore::SubresourceRange& range,
                                 vk::ImageAspectFlags aspect,
                                 const vk::ClearDepthStencilValue& value);
+    void ClearDepthStencilQuadrants(VideoCore::Image* dst, vk::ImageView depth_view,
+                                    const VideoCore::SubresourceRange& range,
+                                    vk::ImageAspectFlags aspect,
+                                    const vk::ClearDepthStencilValue& value,
+                                    u32 quadrant_mask);
 
     /// Switches `image` to its backing with `num_samples` (made on first use), copying the
     /// contents over when `copy_backing`.

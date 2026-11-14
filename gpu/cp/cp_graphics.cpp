@@ -218,6 +218,11 @@ CommandProcessor::Status CommandProcessor::RunGraphics(Work& work) {
             cblock.Reset();
         }
         if (direct_ring && !work.waiting_at) {
+            const bool has_rast = (rasterizer != nullptr);
+            const bool need_checksum = has_rast && rasterizer->GetDrawPreparation().Enabled();
+            RegDirty* const dirty_ptr =
+                (has_rast && rasterizer->UseDrawPipe()) ? &pipe_dirty : nullptr;
+            const bool host_markers = has_rast && rasterizer->HostMarkersEnabled();
             while (level.at < level.end) {
                 const u32 hdr = *level.at;
                 if ((hdr & 0xC000FF00u) != 0xC0001000u) {
@@ -229,6 +234,99 @@ CommandProcessor::Status CommandProcessor::RunGraphics(Work& work) {
                 }
                 level.prev_at = level.at;
                 level.prev_header = hdr;
+                if (bw >= 2u && level.at[1] == NopPayload::DirectVulkan && has_rast &&
+                    !host_markers) [[likely]] {
+                    const u32 op_word = level.at[2];
+                    const auto vk_op = DirectVk::Op(op_word & 0xFFFFu);
+                    switch (vk_op) {
+                    case DirectVk::Op::SetStageUserData:
+                        if (bw < 3u || (level.at[3] & 0xFFFFu) >= ComputeShOffset) {
+                            break;
+                        }
+                        [[fallthrough]];
+                    case DirectVk::Op::SetIndexState:
+                    case DirectVk::Op::SetContextRegsPacked:
+                    case DirectVk::Op::BindVsShader:
+                    case DirectVk::Op::BindPsShader:
+                    case DirectVk::Op::BindEsShader:
+                    case DirectVk::Op::BindGsShader:
+                    case DirectVk::Op::BindHsShader:
+                    case DirectVk::Op::BindLsShader:
+                    case DirectVk::Op::SetVgtControl:
+                        if (ApplyGraphicsRegisterPacket(regs, level.at, gfx_reg_checksum, dirty_ptr,
+                                                        need_checksum, &pso_sig_epoch,
+                                                        &dyn_reg_epoch)) [[likely]] {
+                            level.at += 1u + bw;
+                            continue;
+                        }
+                        break;
+                    case DirectVk::Op::DrawIndexed:
+                        if (bw == 6u) [[likely]] {
+                            ApplyGraphicsRegisterPacket(regs, level.at, gfx_reg_checksum, dirty_ptr,
+                                                        need_checksum, &pso_sig_epoch,
+                                                        &dyn_reg_epoch);
+                            const auto* prepared = level.prepared
+                                                       ? rasterizer->GetDrawPreparation().NextDraw()
+                                                       : nullptr;
+                            if (!PredicationSkips(hdr)) [[likely]] {
+                                rasterizer->Draw(true, level.at[5], prepared);
+                            }
+                            level.at += 7u;
+                            continue;
+                        }
+                        break;
+                    case DirectVk::Op::DrawAuto:
+                        if (bw == 5u) [[likely]] {
+                            ApplyGraphicsRegisterPacket(regs, level.at, gfx_reg_checksum, dirty_ptr,
+                                                        need_checksum, &pso_sig_epoch,
+                                                        &dyn_reg_epoch);
+                            const auto* prepared = level.prepared
+                                                       ? rasterizer->GetDrawPreparation().NextDraw()
+                                                       : nullptr;
+                            if (!PredicationSkips(hdr)) [[likely]] {
+                                rasterizer->Draw(false, 0u, prepared);
+                            }
+                            level.at += 6u;
+                            continue;
+                        }
+                        break;
+                    case DirectVk::Op::DrawIndexAddr:
+                        if (bw == 6u) [[likely]] {
+                            ApplyGraphicsRegisterPacket(regs, level.at, gfx_reg_checksum, dirty_ptr,
+                                                        need_checksum, &pso_sig_epoch,
+                                                        &dyn_reg_epoch);
+                            const auto* prepared = level.prepared
+                                                       ? rasterizer->GetDrawPreparation().NextDraw()
+                                                       : nullptr;
+                            if (!PredicationSkips(hdr)) [[likely]] {
+                                rasterizer->Draw(true, 0u, prepared);
+                            }
+                            level.at += 7u;
+                            continue;
+                        }
+                        break;
+                    case DirectVk::Op::DrawBundle:
+                        if (bw >= 7u) [[likely]] {
+                            ApplyGraphicsRegisterPacket(regs, level.at, gfx_reg_checksum, dirty_ptr,
+                                                        need_checksum, &pso_sig_epoch,
+                                                        &dyn_reg_epoch);
+                            const auto* prepared = level.prepared
+                                                       ? rasterizer->GetDrawPreparation().NextDraw()
+                                                       : nullptr;
+                            if (!PredicationSkips(hdr)) [[likely]] {
+                                const u32 draw_kind = (op_word >> 16) & 0xFu;
+                                const bool is_indexed = (draw_kind != 1u);
+                                const u32 start_idx = (draw_kind == 0u) ? level.at[bw - 1u] : 0u;
+                                rasterizer->Draw(is_indexed, start_idx, prepared);
+                            }
+                            level.at += 1u + bw;
+                            continue;
+                        }
+                        break;
+                    default:
+                        break;
+                    }
+                }
                 const Step step = Graphics(work, level, level.at, bw);
                 if (step == Step::Next) [[likely]] {
                     level.at += 1u + bw;
@@ -478,6 +576,26 @@ CommandProcessor::Step CommandProcessor::Graphics(Work& work, Level& level, cons
                     }
                     break;
                 }
+                case DirectVk::Op::DrawBundle: {
+                    if (rasterizer && body_words >= 7u) {
+                        const u32 draw_kind = (op_word >> 16) & 0xFu;
+                        const bool is_indexed = (draw_kind != 1u);
+                        const u32 start_idx = (draw_kind == 0u) ? body[body_words - 2u] : 0u;
+                        const auto* prepared =
+                            level.prepared ? rasterizer->GetDrawPreparation().NextDraw() : nullptr;
+                        if (!PredicationSkips(header)) {
+                            if (rasterizer->HostMarkersEnabled()) [[unlikely]] {
+                                const void* at = packet;
+                                rasterizer->ScopeMarker(
+                                    "gfx:{}:DirectDrawBundle", fmt::make_format_args(at),
+                                    [&] { rasterizer->Draw(is_indexed, start_idx, prepared); });
+                            } else {
+                                rasterizer->Draw(is_indexed, start_idx, prepared);
+                            }
+                        }
+                    }
+                    break;
+                }
                 case DirectVk::Op::DrawIndexed: {
                     if (rasterizer && body_words == 6u) {
                         DirectVk::DrawIndexedArgs args{};
@@ -705,7 +823,7 @@ CommandProcessor::Step CommandProcessor::Graphics(Work& work, Level& level, cons
                     if (rasterizer && body_words == 20u) {
                         DirectVk::DecompressDepthArgs args{};
                         std::memcpy(&args, body + 2u, sizeof(args));
-                        if (args.slice_count) {
+                        if (args.slice_count && args.htile_data_base != 0u) {
                             if (args.dst_va && args.dst_byte_size) {
                                 rasterizer->InvalidateVsmTargetRange(args.dst_va,
                                                                      args.dst_byte_size);
@@ -725,7 +843,10 @@ CommandProcessor::Step CommandProcessor::Graphics(Work& work, Level& level, cons
                     if (rasterizer && body_words == 18u) {
                         DirectVk::EliminateFastClearArgs args{};
                         std::memcpy(&args, body + 2u, sizeof(args));
-                        if (args.slice_count) {
+                        Gcn::ColorBuffer col_buf{};
+                        std::memcpy(&col_buf, args.cb_regs, sizeof(args.cb_regs));
+                        if (args.slice_count && col_buf && col_buf.info.fast_clear &&
+                            col_buf.CmaskAddress() != 0u) {
                             if (args.dst_va && args.dst_byte_size) {
                                 rasterizer->InvalidateVsmTargetRange(args.dst_va,
                                                                      args.dst_byte_size);

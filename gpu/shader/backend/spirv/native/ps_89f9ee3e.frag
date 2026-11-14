@@ -2,6 +2,7 @@
 #extension GL_EXT_samplerless_texture_functions : require
 #extension GL_EXT_demote_to_helper_invocation : require
 
+layout(early_fragment_tests) in;
 layout(location = 0) in vec4 fs_in_attr0_p;
 layout(location = 1) in vec4 fs_in_attr1_p;
 layout(location = 0) out vec4 frag_color0;
@@ -49,35 +50,44 @@ mat2x3 eval_point_light(
     vec3 L_vec = -pos_v + load_s2_v3(base + 0u);
     float d2 = dot(L_vec, L_vec);
     vec3 L_dir = L_vec * safe_rsq(d2);
-    float inv_r2 = s2f(base + 3u);
-    vec3 d_col = load_s2_v3(base + 4u);
-    float l_exp = s2f(base + 7u);
-    vec3 s_col = load_s2_v3(base + 8u);
-    float rim_scale = s2f(base + 12u);
-    float rim_pow = s2f(base + 13u);
-
-    float atten_d = max(0.0, (1.0 / d2) - inv_r2);
-    float atten_s = 1.0 - clamp(inv_r2 * d2, 0.0, 1.0);
     float NdotL = dot(N, L_dir);
+    if (NdotL <= 0.0 && trans == 0.0) {
+        return mat2x3(vec3(0.0), vec3(0.0));
+    }
+
+    float inv_r2 = s2f(base + 3u);
+    float atten_d = max(0.0, (1.0 / d2) - inv_r2);
     float NdotL_c = clamp(NdotL, 0.0, 1.0);
+    vec3 d_col = load_s2_v3(base + 4u);
 
     vec3 diff;
     if (trans == 0.0) {
         diff = atten_d * (d_col * NdotL_c);
     } else {
+        float rim_scale = s2f(base + 12u);
+        float rim_pow = s2f(base + 13u);
         float LdotNegV_c = clamp(dot(L_dir, neg_V), 0.0, 1.0);
-        float back_pow = exp2((rim_pow * 32.0) * log2(LdotNegV_c));
+        float back_pow = (LdotNegV_c > 0.0) ? exp2((rim_pow * 32.0) * log2(LdotNegV_c)) : 0.0;
         float wrap = atten_d * (max(0.0, trans + NdotL) / trans_denom) + trans * (atten_d * (back_pow * (rim_scale * rim_base)));
         diff = d_col * wrap;
     }
 
-    vec3 H_raw = -neg_V + L_dir;
-    vec3 H = H_raw * safe_rsq(dot(H_raw, H_raw));
-    float spec_exp = max(1.0, (l_exp * exp_g) / (exp_g_scaled + l_exp));
-    float spec_pow = exp2(spec_exp * log2(clamp(dot(H, N), 0.0, 1.0)));
-    float nl_pow = exp2(0.0999755859 * log2(NdotL_c));
-    float spec_norm = 0.125 * spec_exp + 0.25;
-    vec3 spec = spec_norm * (atten_s * ((s_col * spec_pow) * nl_pow));
+    vec3 spec = vec3(0.0);
+    if (NdotL_c > 0.0) {
+        vec3 H_raw = -neg_V + L_dir;
+        vec3 H = H_raw * safe_rsq(dot(H_raw, H_raw));
+        float nh = clamp(dot(H, N), 0.0, 1.0);
+        if (nh > 0.0) {
+            float l_exp = s2f(base + 7u);
+            vec3 s_col = load_s2_v3(base + 8u);
+            float atten_s = 1.0 - clamp(inv_r2 * d2, 0.0, 1.0);
+            float spec_exp = max(1.0, (l_exp * exp_g) / (exp_g_scaled + l_exp));
+            float spec_pow = exp2(spec_exp * log2(nh));
+            float nl_pow = exp2(0.0999755859 * log2(NdotL_c));
+            float spec_norm = 0.125 * spec_exp + 0.25;
+            spec = spec_norm * (atten_s * ((s_col * spec_pow) * nl_pow));
+        }
+    }
 
     return mat2x3(diff, spec);
 }
@@ -88,7 +98,13 @@ void main() {
     uint d1 = bitfieldExtract(bo0, 8, 8) >> 2u;
 
     vec2 uv = fs_in_attr1_p.xy;
-    vec4 t_depth = texture(sampler2D(fs_img0, fs_samp0), uv);
+    vec4 t_depth = textureLod(sampler2D(fs_img0, fs_samp0), uv, 0.0);
+    if (t_depth.x >= 0.999999) {
+        frag_color0 = vec4(0.0, 0.0, 0.0, 1.0);
+        frag_color1 = vec4(0.0, 0.0, 0.0, 1.0);
+        demote;
+        return;
+    }
     uint tile_v4 = uint(fs_in_attr1_p.z + 0.5);
     if (tile_v4 > 0u) {
         uint thdr = d1 + ((tile_v4 - 1u) << 2u);
@@ -109,23 +125,23 @@ void main() {
     );
 
     vec3 neg_pos = clip_xyz * (-1.0 / w_denom);
-    bool any_inside = false;
+    uint active_mask = 0u;
     for (uint i = 0u; i < 3u; ++i) {
         uint b = d1 + i * 16u;
         vec3 dv = neg_pos + load_s2_v3(b);
-        if (dot(dv, dv) * s2f(b + 3u) < 1.0) any_inside = true;
+        if (dot(dv, dv) * s2f(b + 3u) < 1.0) active_mask |= (1u << i);
     }
-    if (!any_inside) {
+    if (active_mask == 0u) {
         frag_color0 = vec4(0.0, 0.0, 0.0, 1.0);
         frag_color1 = vec4(0.0, 0.0, 0.0, 1.0);
         demote;
         return;
     }
 
-    vec4 t_norm = texture(sampler2D(fs_img1, fs_samp0), uv);
-    vec4 t_mat  = texture(sampler2D(fs_img2, fs_samp0), uv);
-    vec4 t_spec = texture(sampler2D(fs_img3, fs_samp0), uv);
-    vec4 t_mask = texture(sampler2D(fs_img4, fs_samp1), uv);
+    vec4 t_norm = textureLod(sampler2D(fs_img1, fs_samp0), uv, 0.0);
+    vec4 t_mat  = textureLod(sampler2D(fs_img2, fs_samp0), uv, 0.0);
+    vec4 t_spec = textureLod(sampler2D(fs_img3, fs_samp0), uv, 0.0);
+    vec4 t_mask = textureLod(sampler2D(fs_img4, fs_samp1), uv, 0.0);
 
     vec3 pos_v = clip_xyz * (1.0 / w_denom);
     vec3 n_raw = fma(vec3(2.0), t_norm.xyz, vec3(-1.0));
@@ -147,7 +163,8 @@ void main() {
 
     vec3 acc_diff = vec3(0.0);
     vec3 acc_spec = vec3(0.0);
-    for (uint i = 0u; i < 3u; ++i) {
+    for (uint m = active_mask; m != 0u; m &= (m - 1u)) {
+        uint i = uint(findLSB(m));
         mat2x3 l = eval_point_light(d1 + i * 16u, pos_v, N, neg_V, exp_g, exp_g_scaled, trans, trans_denom, rim_base);
         acc_diff += l[0];
         acc_spec += l[1];

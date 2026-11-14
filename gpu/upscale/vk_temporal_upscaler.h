@@ -88,6 +88,7 @@ public:
     /// draw's render state (Rasterizer::BeginRendering).
     [[nodiscard]] u64 RedirectState() const noexcept {
         return u64(ui_phase) | u64(display_redirect) << 1 | u64(done_this_frame) << 2 |
+               u64(ui_in_place) << 3 | u64(display_in_place) << 4 |
                u64(ui_color.index) << 8 | u64(ui_depth.index) << 36;
     }
 
@@ -128,7 +129,7 @@ public:
                          vk::ImageView& view, vk::ImageLayout& layout);
     /// Whether RedirectSampled would replace `image` (it may record a barrier then).
     [[nodiscard]] bool RedirectsSampled(VideoCore::ImageId image) const {
-        return display_redirect && image == ui_color;
+        return display_redirect && !display_in_place && image == ui_color;
     }
 
     /// Presenter: the output-size display buffer standing in for the guest one at `address`.
@@ -256,9 +257,11 @@ private:
     VideoCore::ImageId ldr_target{};
     VideoCore::ImageId ui_color{}, ui_depth{};
     bool ui_phase = false;         ///< from the upscale to the next display pass
+    bool ui_in_place = false;      ///< native-size guest target: scale UI viewport in-place without ui_image blit
     const bool ui_trace_on = std::getenv("BB_UI_TRACE") != nullptr; ///< diagnostics
     std::string ui_trace;
     bool display_redirect = false; ///< the display pass of an upscaled frame
+    bool display_in_place = false; ///< display pass samples guest ui_color directly into host display.image
     bool ui_read_barrier = false;
     VideoCore::HostImage ui_image;
     VideoCore::HostImage ui_depth_image;

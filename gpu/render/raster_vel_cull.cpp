@@ -61,7 +61,13 @@ std::atomic<u64> g_silhouette_mask_until_ns{0};
     return h == 0x000000008bc6ea32ULL || h == 0x000000002b6c1d92ULL;
 }
 
-constexpr u64 kHavokClothObjectVelVsHash = 0x00000000b11756c0ULL;
+// `0x068c5209` (`1,752 B`) is an instruction-for-instruction GCN twin of `0xb11756c0` (`434/438`
+// identical dwords; differs only in final UV export attribute for alpha-tested cloth garments).
+// Both are 3-palette dynamic Havok cloth shaders (`s[20:23]`, `s[24:27]`, `s[28:31]`) and must
+// never be culled so simulated cape/coat vertices retain exact motion vectors.
+[[nodiscard]] constexpr bool IsHavokClothObjectVelVsHash(u64 h) noexcept {
+    return h == 0x00000000b11756c0ULL || h == 0x00000000068c5209ULL;
+}
 
 // Ordered SSE2 comparison (`_mm_cmple_ps`):
 // - Early-exits on the first 16-byte lane whose `|cur - prev| > eps` (~2 cycles on moving root bone).
@@ -475,8 +481,8 @@ bool ObjectVelocityCuller::TryCullDraw(Rasterizer& rasterizer, const GraphicsPip
 
     const auto& vs = pipeline->GetStage(Shader::SwStage::Vertex);
     const u64 vs_hash = vs.pgm_hash;
-    if (vs_hash == kHavokClothObjectVelVsHash) {
-        // Player's dynamic Havok cloth/coat (`0.9 draws/frame`): intentionally never culled.
+    if (IsHavokClothObjectVelVsHash(vs_hash)) {
+        // Player's dynamic Havok cloth/coat (`~0.9 draws/frame`): intentionally never culled.
         ++stat_cloth_kept;
         return false;
     }

@@ -33,6 +33,12 @@ void main() {
     uint b1 = bitfieldExtract(push_data.buf_offsets0.x, 8, 8) >> 2;
 
     float d = texture(sampler2D(fs_img0, fs_samp0), fs_in_attr1.xy).r;
+    if (d >= 0.999999) {
+        float f255   = fract(d * 255.0);
+        float f65025 = fract(d * 65025.0);
+        frag_color0 = vec4(f65025, f255 - f65025 * 0.00392156886, d - f255 * 0.00392156886, 1.0);
+        return;
+    }
     float in_x = fs_in_attr0.x;
     float in_y = fs_in_attr0.y;
 
@@ -54,7 +60,20 @@ void main() {
                    uintBitsToFloat(ssbo_1.data[b0 + 15u]));
 
     float inv_w = 1.0 / (r3.x * in_x + (r3.y * in_y + (r3.z * d + r3.w)));
+    float vx = (r0.x * in_x + (r0.y * in_y + (r0.z * d + r0.w))) * inv_w;
+    float vy = (r1.x * in_x + (r1.y * in_y + (r1.z * d + r1.w))) * inv_w;
     float vz = (r2.x * in_x + (r2.y * in_y + (r2.z * d + r2.w))) * inv_w;
+    float dist = sqrt(vx * vx + (vy * vy + vz * vz));
+
+    float fade_end   = uintBitsToFloat(ssbo_2.data[b1 + 72u]);
+    float fade_scale = uintBitsToFloat(ssbo_2.data[b1 + 73u]);
+    float fade = clamp((fade_end - dist) * fade_scale, 0.0, 1.0);
+    if (fade <= 0.0) {
+        float f255   = fract(d * 255.0);
+        float f65025 = fract(d * 65025.0);
+        frag_color0 = vec4(f65025, f255 - f65025 * 0.00392156886, d - f255 * 0.00392156886, 1.0);
+        return;
+    }
 
     float split0 = uintBitsToFloat(ssbo_1.data[b0 + 80u]);
     float split1 = uintBitsToFloat(ssbo_1.data[b0 + 81u]);
@@ -86,29 +105,69 @@ void main() {
 
     float inv_sw = 1.0 / sw;
     float dref = sz * inv_sw;
-    float da = sw * uintBitsToFloat(ssbo_2.data[b1 + 74u]);
-    float db = sw * uintBitsToFloat(ssbo_2.data[b1 + 75u]);
+    float k74 = uintBitsToFloat(ssbo_2.data[b1 + 74u]);
+    float k75 = uintBitsToFloat(ssbo_2.data[b1 + 75u]);
+    float da = sw * k74;
+    float db = sw * k75;
+    float uv_pad = abs(k74) + abs(k75) + (1.5 / 4096.0);
+    float u_c = sx * inv_sw;
+    float v_c = sy * inv_sw;
 
-    float s0 = textureLod(sampler2DShadow(fs_img1, fs_samp1), vec3((sx + db) * inv_sw, (sy - da) * inv_sw, dref), 0.0);
-    float s1 = textureLod(sampler2DShadow(fs_img1, fs_samp1), vec3((sx + da) * inv_sw, (sy + db) * inv_sw, dref), 0.0);
-    float s2 = textureLod(sampler2DShadow(fs_img1, fs_samp1), vec3((sx - da) * inv_sw, (sy - db) * inv_sw, dref), 0.0);
-    float s3 = textureLod(sampler2DShadow(fs_img1, fs_samp1), vec3((sx - db) * inv_sw, (sy + da) * inv_sw, dref), 0.0);
+    // 2x2 CSM quadrant seam guard for temporally cadenced far cascades (Cascade 2 & 3):
+    // Q2 = [0.0, 0.5] x [0.5, 1.0], Q3 = [0.5, 1.0] x [0.5, 1.0].
+    if (cascade == 2u &&
+        (u_c < uv_pad || u_c > (0.5 - uv_pad) ||
+         v_c < (0.5 + uv_pad) || v_c > (1.0 - uv_pad))) {
+        cascade = 3u;
+        c_base = b0 + ((3u << 2u) + 4u) * 4u;
+        sm0 = vec4(uintBitsToFloat(ssbo_1.data[c_base + 0u]),
+                   uintBitsToFloat(ssbo_1.data[c_base + 1u]),
+                   uintBitsToFloat(ssbo_1.data[c_base + 2u]),
+                   uintBitsToFloat(ssbo_1.data[c_base + 3u]));
+        sm1 = vec4(uintBitsToFloat(ssbo_1.data[c_base + 4u]),
+                   uintBitsToFloat(ssbo_1.data[c_base + 5u]),
+                   uintBitsToFloat(ssbo_1.data[c_base + 6u]),
+                   uintBitsToFloat(ssbo_1.data[c_base + 7u]));
+        sm2 = vec4(uintBitsToFloat(ssbo_1.data[c_base + 8u]),
+                   uintBitsToFloat(ssbo_1.data[c_base + 9u]),
+                   uintBitsToFloat(ssbo_1.data[c_base + 10u]),
+                   uintBitsToFloat(ssbo_1.data[c_base + 11u]));
+        sm3 = vec4(uintBitsToFloat(ssbo_1.data[c_base + 12u]),
+                   uintBitsToFloat(ssbo_1.data[c_base + 13u]),
+                   uintBitsToFloat(ssbo_1.data[c_base + 14u]),
+                   uintBitsToFloat(ssbo_1.data[c_base + 15u]));
+        sx = sm0.x * in_x + (sm0.y * in_y + (sm0.z * d + sm0.w));
+        sy = sm1.x * in_x + (sm1.y * in_y + (sm1.z * d + sm1.w));
+        sz = sm2.x * in_x + (sm2.y * in_y + (sm2.z * d + sm2.w));
+        sw = sm3.x * in_x + (sm3.y * in_y + (sm3.z * d + sm3.w));
+        inv_sw = 1.0 / sw;
+        dref = sz * inv_sw;
+        da = sw * k74;
+        db = sw * k75;
+        u_c = sx * inv_sw;
+        v_c = sy * inv_sw;
+    }
 
-    float vx = (r0.x * in_x + (r0.y * in_y + (r0.z * d + r0.w))) * inv_w;
-    float vy = (r1.x * in_x + (r1.y * in_y + (r1.z * d + r1.w))) * inv_w;
-    float dist = sqrt(vx * vx + (vy * vy + vz * vz));
+    bool c3_outside = (cascade == 3u) &&
+                      (u_c < (0.5 + uv_pad) || u_c > (1.0 - uv_pad) ||
+                       v_c < (0.5 + uv_pad) || v_c > (1.0 - uv_pad) ||
+                       dref <= 0.0 || dref >= 1.0);
 
-    float fade_end   = uintBitsToFloat(ssbo_2.data[b1 + 72u]);
-    float fade_scale = uintBitsToFloat(ssbo_2.data[b1 + 73u]);
-    float fade = clamp((fade_end - dist) * fade_scale, 0.0, 1.0);
-    float pcf_avg = (s0 + s1 + s2 + s3) * 0.25;
+    float pcf_avg = 1.0;
+    if (!c3_outside) {
+        float s0 = textureLod(sampler2DShadow(fs_img1, fs_samp1), vec3((sx + db) * inv_sw, (sy - da) * inv_sw, dref), 0.0);
+        float s1 = textureLod(sampler2DShadow(fs_img1, fs_samp1), vec3((sx + da) * inv_sw, (sy + db) * inv_sw, dref), 0.0);
+        float s2 = textureLod(sampler2DShadow(fs_img1, fs_samp1), vec3((sx - da) * inv_sw, (sy - db) * inv_sw, dref), 0.0);
+        float s3 = textureLod(sampler2DShadow(fs_img1, fs_samp1), vec3((sx - db) * inv_sw, (sy + da) * inv_sw, dref), 0.0);
+        pcf_avg = (s0 + s1 + s2 + s3) * 0.25;
+    }
 
     const bool enhanced_shadows = ((push_data.buf_offsets2.y >> 24u) & 0x02u) != 0u;
     if (enhanced_shadows && d < 0.9999) {
         const float ign = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
         const float base_ang = ign * 6.28318530718;
         const float rad_step = length(vec2(da, db));
-        if (rad_step > 0.0) {
+        if (!c3_outside && rad_step > 0.0) {
             float vogel_sum = pcf_avg * 4.0;
             for (uint i = 0u; i < 8u; ++i) {
                 float r = sqrt((float(i) + 0.5) * 0.125) * rad_step;

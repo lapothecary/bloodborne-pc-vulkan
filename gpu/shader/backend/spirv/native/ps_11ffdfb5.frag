@@ -1,4 +1,5 @@
 #version 460
+#extension GL_EXT_samplerless_texture_functions : require
 // Native GLSL replacement for 0x11ffdfb5 (12-Tap Bilateral Depth-Aware Blur Pass)
 
 layout(push_constant) uniform AuxData {
@@ -32,12 +33,14 @@ void main() {
     uint b0 = bitfieldExtract(push_data.buf_offsets0.x, 0, 8) >> 2;
     vec2 uv = fs_in_attr0.xy;
 
-    vec4 s0 = texture(sampler2D(fs_img0, fs_samp0), uv);
-    float z_a = uintBitsToFloat(ssbo_1.data[b0 + 0]);
-    float z_b = -uintBitsToFloat(ssbo_1.data[b0 + 1]);
+    vec4 s0 = textureLod(sampler2D(fs_img0, fs_samp0), uv, 0.0);
+    float d0_p = unpack_depth(s0.rgb);
+    if (d0_p >= 0.99999) {
+        frag_color0 = s0;
+        return;
+    }
 
-    float z0 = z_b / (z_a - unpack_depth(s0.rgb));
-    float inv_z0_sq = 144.269501 / (z0 * z0);
+    float z_a = uintBitsToFloat(ssbo_1.data[b0 + 0u]);
 
     float w_sum = 1.0;
     float val_sum = s0.a;
@@ -48,10 +51,10 @@ void main() {
                            uintBitsToFloat(ssbo_1.data[base + 1u]));
         float kw = uintBitsToFloat(ssbo_1.data[base + 2u]);
 
-        vec4 sk = texture(sampler2D(fs_img0, fs_samp0), uv + off_uv);
-        float zk = z_b / (z_a - unpack_depth(sk.rgb));
-        float dz = z0 - zk;
-        float wk = kw * exp2((-dz * dz) * inv_z0_sq);
+        vec4 sk = textureLod(sampler2D(fs_img0, fs_samp0), uv + off_uv, 0.0);
+        float dk_p = unpack_depth(sk.rgb);
+        float rel_dz = (d0_p - dk_p) / (z_a - dk_p);
+        float wk = kw * exp2((-rel_dz * rel_dz) * 144.269501);
 
         w_sum += wk;
         val_sum += sk.a * wk;

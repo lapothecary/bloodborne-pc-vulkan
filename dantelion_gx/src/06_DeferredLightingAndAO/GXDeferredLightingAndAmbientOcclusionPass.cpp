@@ -4,6 +4,7 @@
 #include <cmath>
 #include <immintrin.h>
 
+#include "gx_csm_shadow_layout.h"
 #include "gx_direct_vulkan.h"
 #include "gx_motion_activity.h"
 
@@ -59,6 +60,152 @@ static inline void resetInlineDLWString(uint8_t* base, size_t strOffset, size_t 
         *reinterpret_cast<uint64_t*>(base + strOffset + 0x10) = 0;
         *reinterpret_cast<uint16_t*>(base + strOffset) = 0;
     }
+}
+
+struct CsmCadenceSlot {
+    const void* csmMgr;
+    const void* depthTarget;
+    uint32_t    atlasW;
+    uint32_t    atlasH;
+    float       camRow0[3];
+    float       camRow2[3];
+    float       camPos[3];
+    float       fovY;
+    float       lightDir[3];
+    float       splits[4];
+    uint32_t    phase;
+    bool        valid;
+};
+
+constinit CsmCadenceSlot g_csm_cadence_slots[4] = {};
+
+static inline uint32_t getCsmCadenceMode() noexcept {
+    static uint8_t s_init = 0u;
+    static uint32_t s_mode = 1u;
+    if (__atomic_load_n(&s_init, __ATOMIC_ACQUIRE) == 0u) {
+        uint32_t m = 1u;
+        if (const char* env = std::getenv("BB_CSM_CADENCE")) {
+            if (env[0] != '\0') {
+                const unsigned long parsed = std::strtoul(env, nullptr, 0);
+                m = (parsed <= 3UL) ? static_cast<uint32_t>(parsed) : 1u;
+            }
+        }
+        s_mode = m;
+        __atomic_store_n(&s_init, 1u, __ATOMIC_RELEASE);
+    }
+    return s_mode;
+}
+
+static inline float normalizedCos3(const float a[3], const float b[3]) noexcept {
+    const float dot = a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    const float la  = a[0] * a[0] + a[1] * a[1] + a[2] * a[2];
+    const float lb  = b[0] * b[0] + b[1] * b[1] + b[2] * b[2];
+    const float denomSq = la * lb;
+    if (!(denomSq > 1e-12f)) {
+        return -1.0f;
+    }
+    return dot / std::sqrt(denomSq);
+}
+
+static uint32_t selectCsmCascadeUpdateMask(
+    const gx_csm::GXCsmManagerLayout* csm,
+    const gx_csm::GXCsmCameraParams* cam,
+    const float lightDir[4],
+    uint32_t oldAtlasW,
+    uint32_t oldAtlasH,
+    const void* pCsmDepthTarget) noexcept
+{
+    const uint32_t mode = getCsmCadenceMode();
+    if (mode == 0u ||
+        !gx_direct_vk::EnabledV1Sub(gx_direct_vk::kV1Sub_ClearDepthDraw) ||
+        csm == nullptr || cam == nullptr || pCsmDepthTarget == nullptr ||
+        csm->atlasWidth == 0u || csm->atlasHeight == 0u) {
+        return 0x0Fu;
+    }
+
+    CsmCadenceSlot* slot = nullptr;
+    for (auto& s : g_csm_cadence_slots) {
+        if (s.csmMgr == csm) {
+            slot = &s;
+            break;
+        }
+    }
+    if (slot == nullptr) {
+        for (auto& s : g_csm_cadence_slots) {
+            if (s.csmMgr == nullptr) {
+                s.csmMgr = csm;
+                slot = &s;
+                break;
+            }
+        }
+    }
+    if (slot == nullptr) {
+        slot = &g_csm_cadence_slots[0];
+        *slot = {};
+        slot->csmMgr = csm;
+    }
+
+    const float curSplits[4] = {csm->splitNear, csm->split0, csm->split1, csm->split2};
+    const float dx = cam->camToWorld[3][0] - slot->camPos[0];
+    const float dy = cam->camToWorld[3][1] - slot->camPos[1];
+    const float dz = cam->camToWorld[3][2] - slot->camPos[2];
+    const float posDistSq = dx * dx + dy * dy + dz * dz;
+    const float cosR0 = normalizedCos3(cam->camToWorld[0], slot->camRow0);
+    const float cosR2 = normalizedCos3(cam->camToWorld[2], slot->camRow2);
+    const float rotCos = (cosR0 < cosR2) ? cosR0 : cosR2;
+    const float lightCos = normalizedCos3(lightDir, slot->lightDir);
+
+    bool forceAll = !slot->valid ||
+                    oldAtlasW != csm->atlasWidth ||
+                    oldAtlasH != csm->atlasHeight ||
+                    slot->atlasW != csm->atlasWidth ||
+                    slot->atlasH != csm->atlasHeight ||
+                    slot->depthTarget != pCsmDepthTarget ||
+                    rotCos < 0.9980f ||
+                    posDistSq > (0.75f * 0.75f) ||
+                    std::fabs(cam->fovY - slot->fovY) > 1e-3f ||
+                    lightCos < 0.99990f;
+    if (!forceAll) {
+        for (uint32_t i = 0; i < 4; ++i) {
+            if (std::fabs(curSplits[i] - slot->splits[i]) > 0.05f) {
+                forceAll = true;
+                break;
+            }
+        }
+    }
+
+    uint32_t updateMask = 0x0Fu;
+    if (forceAll) {
+        slot->phase = 0u;
+    } else {
+        const uint32_t p = slot->phase++;
+        const bool activeMotion = (rotCos < 0.99975f) || (posDistSq > 0.04f);
+        if (mode == 2u || activeMotion) {
+            updateMask = ((p & 1u) == 0u) ? 0x07u : 0x0Bu;
+        } else if (mode == 3u) {
+            static constexpr uint8_t kCadence4[4] = {0x07u, 0x03u, 0x0Bu, 0x03u};
+            updateMask = kCadence4[p & 3u];
+        } else {
+            static constexpr uint8_t kCadence3[3] = {0x07u, 0x0Bu, 0x03u};
+            updateMask = kCadence3[p % 3u];
+        }
+    }
+
+    slot->depthTarget = pCsmDepthTarget;
+    slot->atlasW = csm->atlasWidth;
+    slot->atlasH = csm->atlasHeight;
+    for (uint32_t k = 0; k < 3; ++k) {
+        slot->camRow0[k] = cam->camToWorld[0][k];
+        slot->camRow2[k] = cam->camToWorld[2][k];
+        slot->camPos[k]  = cam->camToWorld[3][k];
+        slot->lightDir[k] = lightDir[k];
+    }
+    slot->fovY = cam->fovY;
+    for (uint32_t i = 0; i < 4; ++i) {
+        slot->splits[i] = curSplits[i];
+    }
+    slot->valid = true;
+    return updateMask;
 }
 
 } // namespace
@@ -1493,6 +1640,9 @@ void sub_229cb70(void* pSelf, void* pRenderDevHolder, const void* pCamera,
     }
 
     void* pCsmMgr = viewBytes + 0x1320;
+    auto* csm = reinterpret_cast<gx_csm::GXCsmManagerLayout*>(pCsmMgr);
+    const uint32_t oldAtlasW = csm->atlasWidth;
+    const uint32_t oldAtlasH = csm->atlasHeight;
     sub_eac210(pCsmMgr, pShadowCfg);
 
     if (*reinterpret_cast<uint64_t*>(viewBytes + 0x1430) != 0 &&
@@ -1512,8 +1662,33 @@ void sub_229cb70(void* pSelf, void* pRenderDevHolder, const void* pCamera,
             return;
         }
 
+        const void* pCsmDepthTarget = nullptr;
+        if (csm->projectors[0] != nullptr && csm->projectors[0]->pDepthTexture != nullptr) {
+            extern void* gx_csm_get_dsv_by_mip(void*, uint32_t)
+                __asm__("_ZN10Bloodborne2GX47GXDepthStencilResource_GetDepthStencilViewByMipEPNS0_22GXDepthStencilResourceEj");
+            void* pDsv = gx_csm_get_dsv_by_mip(csm->projectors[0]->pDepthTexture, 0u);
+            if (pDsv != nullptr) {
+                pCsmDepthTarget = static_cast<const uint8_t*>(pDsv) + 0x10;
+            }
+        }
+        alignas(16) float lightDirArr[4];
+        _mm_store_ps(lightDirArr, lightDir);
+        const uint32_t csmUpdateMask = selectCsmCascadeUpdateMask(
+            csm,
+            reinterpret_cast<const gx_csm::GXCsmCameraParams*>(camBytes),
+            lightDirArr,
+            oldAtlasW,
+            oldAtlasH,
+            pCsmDepthTarget);
+        if (pCsmDepthTarget != nullptr) {
+            bb_gx_set_csm_quadrant_clear(pCsmDepthTarget, csmUpdateMask);
+        }
+
         std::memset(passCtx, 0, sizeof(passCtx));
         for (uint32_t cascadeIdx = 0; cascadeIdx < 4; ++cascadeIdx) {
+            if ((csmUpdateMask & (1u << cascadeIdx)) == 0u) {
+                continue;
+            }
             std::memcpy(cascadeCam, camBytes, 0x84);
             sub_eac540(pCsmMgr, cascadeCam, camBytes, &lightDir, cascadeIdx);
 

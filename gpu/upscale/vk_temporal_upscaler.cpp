@@ -490,9 +490,12 @@ bool TemporalUpscaler::OnFrameStart() {
         }
         ui_trace.clear();
     }
-    // The display pass of an upscaled frame reads the upscaled UI image.
+    // The display pass of an upscaled frame reads the upscaled UI image (or the guest's
+    // already-output-sized ui_color directly when UI ran in-place).
     display_redirect = ui_phase;
+    display_in_place = ui_phase && ui_in_place;
     ui_phase = false;
+    ui_in_place = false;
     ui_read_barrier = false;
     done_this_frame = false;
     smaa_done = false;
@@ -1672,6 +1675,10 @@ void TemporalUpscaler::OnDraw(u64 vs_hash, VideoCore::ImageId color,
         const auto& ui_target = texture_cache.GetImage(ui_color);
         if (depth_image.info.size.width == ui_target.info.size.width &&
             depth_image.info.size.height == ui_target.info.size.height) {
+            if (ui_in_place) {
+                ui_depth = depth;
+                return;
+            }
             EnsureUiResources(ui_width, ui_height, ui_format, depth_image.info.pixel_format);
             PrepareUiDepth(depth);
             ui_depth = depth;
@@ -1684,6 +1691,14 @@ void TemporalUpscaler::OnDraw(u64 vs_hash, VideoCore::ImageId color,
     if (ui_phase) {
         // A UI movie can start without stencil and enable it for later text/masks.
         if (color == ui_color && depth && depth != ui_depth) {
+            if (ui_in_place) {
+                const auto& depth_image = texture_cache.GetImage(depth);
+                if (depth_image.info.size.width == ui_width &&
+                    depth_image.info.size.height == ui_height) {
+                    ui_depth = depth;
+                }
+                return;
+            }
             EnsureUiResources(ui_width, ui_height, ui_format,
                               texture_cache.GetImage(depth).info.pixel_format);
             PrepareUiDepth(depth);
@@ -1851,13 +1866,38 @@ void TemporalUpscaler::PrepareUiDepth(VideoCore::ImageId depth_id) {
 }
 
 void TemporalUpscaler::RunUiOnly(VideoCore::ImageId color_id, VideoCore::ImageId depth_id) {
+    const auto& color = texture_cache.GetImage(color_id);
+    const bool smaa_active = color_id == ldr_target && SmaaWanted();
+    const bool proxy_scene = camera_motion.Depth() && scene_targets.Reduced() &&
+                             scene_targets.EligibleScene(color);
+    const auto edges = UiComposition::ScreenEdges(target_width, target_height);
+    const bool screen_only = !camera_motion.Depth() && (edges[0] < 1.0f || edges[1] < 1.0f);
+    const bool fg_wanted = frame_generation && frame_generation->Wanted();
+    const bool depth_matches =
+        !depth_id || (texture_cache.GetImage(depth_id).info.size.width == target_width &&
+                      texture_cache.GetImage(depth_id).info.size.height == target_height);
+
+    // Zero-copy in-place UI composition when upscaler is Off and the guest scene target is
+    // already at full output resolution (e.g. 2560x1440->2560x1440 or 3840x2160->3840x2160):
+    // skips ui_image/ui_depth_image allocations, PrepareUiDepth, and the redundant full-screen
+    // 1:1 color blit while still scaling Scaleform's 1920x1080 viewport/scissor to output size.
+    if (color.info.size.width == target_width && color.info.size.height == target_height &&
+        depth_matches && !smaa_active && !proxy_scene && !screen_only && !fg_wanted) {
+        GpuProfiler::HudMarkPass(&scheduler, BbStats::GpuSub_Ui_ScaleformHud);
+        reset = true;
+        done_this_frame = ui_phase = ui_in_place = true;
+        ui_width = target_width;
+        ui_height = target_height;
+        ui_color = color_id;
+        ui_depth = depth_id;
+        return;
+    }
+
     if (auto* profiler = GpuProfiler::Get()) {
         profiler->Mark(0xF5A1'0000ull, [] { return std::string{"upscaler RunUiOnly"}; });
     }
-    const auto& color = texture_cache.GetImage(color_id);
     const auto depth_format = depth_id ? texture_cache.GetImage(depth_id).info.pixel_format
                                       : vk::Format::eD32SfloatS8Uint;
-    const bool smaa_active = color_id == ldr_target && SmaaWanted();
     GpuProfiler::HudMarkPass(&scheduler,
                              smaa_active ? BbStats::GpuSub_Aa_Upscaler : BbStats::GpuSub_Ui_ScaleformHud);
     EnsureUiResources(target_width, target_height, color.info.pixel_format, depth_format);
@@ -1867,8 +1907,6 @@ void TemporalUpscaler::RunUiOnly(VideoCore::ImageId color_id, VideoCore::ImageId
     vk::Image source = color.GetImage();
     auto source_layout = vk::ImageLayout::eTransferSrcOptimal;
     u32 source_width = color.info.size.width, source_height = color.info.size.height;
-    const bool proxy_scene = camera_motion.Depth() && scene_targets.Reduced() &&
-                             scene_targets.EligibleScene(color);
     const vk::Image smoothed = smaa_active ? RunSmaa(color_id, proxy_scene) : vk::Image{};
     if (smaa_active) {
         GpuProfiler::HudMarkPass(&scheduler, BbStats::GpuSub_Ui_ScaleformHud);
@@ -1898,8 +1936,6 @@ void TemporalUpscaler::RunUiOnly(VideoCore::ImageId color_id, VideoCore::ImageId
     // Without a scene (the title, loading screens) on an output of another aspect ratio, the
     // frame past the game's 16:9 screen is black: the game's movies fill their whole (wider) view
     // with their background colour there, as they fill the screen at 16:9.
-    const auto edges = UiComposition::ScreenEdges(target_width, target_height);
-    const bool screen_only = !camera_motion.Depth() && (edges[0] < 1.0f || edges[1] < 1.0f);
     const auto part = [](u32 size, float edge, bool high) {
         return s32(std::lround(float(size) * (high ? 1.0f + edge : 1.0f - edge) * 0.5f));
     };
@@ -2505,6 +2541,10 @@ vk::ImageView TemporalUpscaler::Mirror(vk::Image image, std::vector<MirrorView>&
 bool TemporalUpscaler::RedirectColor(VideoCore::ImageId color,
                                      const VideoCore::ImageViewInfo& view_info, Target& target) {
     if (ui_phase && color == ui_color) {
+        if (ui_in_place) {
+            target = {vk::ImageView{}, vk::ImageLayout::eUndefined, ui_width, ui_height, true};
+            return true;
+        }
         // The first draw over the finished scene (after the game's full-screen post processing,
         // compute shaders): what is there now is the frame without its UI.
         if (!hudless_taken) {
@@ -2581,6 +2621,10 @@ bool TemporalUpscaler::RedirectDepth(VideoCore::ImageId depth, Target& target) {
     if (!ui_phase || depth != ui_depth) {
         return false;
     }
+    if (ui_in_place) {
+        target = {vk::ImageView{}, vk::ImageLayout::eUndefined, ui_width, ui_height, true};
+        return true;
+    }
     target = {*ui_depth_view, vk::ImageLayout::eGeneral, ui_width, ui_height, true};
     return true;
 }
@@ -2592,7 +2636,7 @@ bool TemporalUpscaler::IsUiColorAddress(VAddr address) const {
 bool TemporalUpscaler::RedirectSampled(VideoCore::ImageId image,
                                        const VideoCore::ImageViewInfo& info, vk::ImageView& view,
                                        vk::ImageLayout& layout) {
-    if (!display_redirect || image != ui_color) {
+    if (!display_redirect || display_in_place || image != ui_color) {
         return false;
     }
     if (!ui_read_barrier) {
@@ -2681,7 +2725,7 @@ void TemporalUpscaler::OnDisplayPassStart(VAddr address) {
             }
         }
     }
-    if (frame_generation && ui_phase && ui_image) {
+    if (frame_generation && ui_phase && !ui_in_place && ui_image) {
         frame_generation->Interpolate(vk::Image(ui_image), address);
     }
 }

@@ -35,7 +35,8 @@ bool IsDirectDrawPacket(const u32* packet) {
         const auto vk_op = BbCp::DirectVk::Op(packet[2] & 0xFFFFu);
         return vk_op == BbCp::DirectVk::Op::DrawIndexed ||
                vk_op == BbCp::DirectVk::Op::DrawIndexAddr ||
-               vk_op == BbCp::DirectVk::Op::DrawAuto;
+               vk_op == BbCp::DirectVk::Op::DrawAuto ||
+               vk_op == BbCp::DirectVk::Op::DrawBundle;
     }
     return false;
 }

@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "render/runtime.h"
 
-#include <bit>
 #include <algorithm>
+#include <array>
+#include <bit>
 
 #include <boost/container/small_vector.hpp>
 #include <vulkan/vulkan_format_traits.hpp>
@@ -11,6 +12,7 @@
 #include "render/gcn_to_vk.h"
 #include "render/vk_gpu_profiler.h"
 #include "textures/blitter.h"
+#include "textures/direct_textures.h"
 #include "upscale/vk_scene_resolution.h"
 #include "vulkan/instance.h"
 #include "render/scheduler.h"
@@ -84,6 +86,9 @@ u32 BufferImageCopySize(const vk::BufferImageCopy& copy, vk::Format format) {
 
 /// The written image now holds what the source holds (or new GPU data) and no stale upload.
 void MarkCopied(VideoCore::Image* dst, VideoCore::ImageFlagBits modified) {
+    if (bool(modified) && VideoCore::True(dst->flags & VideoCore::ImageFlagBits::DirectImmutable)) {
+        VideoCore::DirectTextures::BumpImmutableRoEpoch();
+    }
     dst->flags |= modified;
     dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
 }
@@ -291,6 +296,12 @@ bool Runtime::Transit(VideoCore::Image* image, vk::ImageLayout dst_layout,
     }
     const size_t before = image_barriers.size();
     image->GetBarriers(image_barriers, dst_layout, dst_access, dst_stage, range);
+    if (image_barriers.size() != before &&
+        VideoCore::True(image->flags & VideoCore::ImageFlagBits::DirectImmutable) &&
+        (dst_layout != vk::ImageLayout::eShaderReadOnlyOptimal ||
+         dst_access != vk::AccessFlagBits2::eShaderRead || range.has_value())) {
+        VideoCore::DirectTextures::BumpImmutableRoEpoch();
+    }
     return image_barriers.size() != before;
 }
 
@@ -532,8 +543,15 @@ void Runtime::CopyImage(VideoCore::Image* src, VideoCore::Image* dst) {
 
     const auto src_type = DimensionOf(src->info.type);
     const auto dst_type = DimensionOf(dst->info.type);
-    const vk::ImageAspectFlags src_aspect = src->aspect_mask & ~vk::ImageAspectFlagBits::eStencil;
-    const vk::ImageAspectFlags dst_aspect = dst->aspect_mask & ~vk::ImageAspectFlagBits::eStencil;
+    const bool copy_stencil = src->info.pixel_format == dst->info.pixel_format &&
+                              bool(src->aspect_mask & dst->aspect_mask &
+                                   vk::ImageAspectFlagBits::eStencil);
+    const vk::ImageAspectFlags src_aspect =
+        copy_stencil ? (src->aspect_mask & dst->aspect_mask)
+                     : (src->aspect_mask & ~vk::ImageAspectFlagBits::eStencil);
+    const vk::ImageAspectFlags dst_aspect =
+        copy_stencil ? (src->aspect_mask & dst->aspect_mask)
+                     : (dst->aspect_mask & ~vk::ImageAspectFlagBits::eStencil);
     const u32 depth =
         dst->info.type == Gcn::ImageType::Color3D ? dst->info.size.depth : src->info.size.depth;
     const u32 levels = std::min(src->info.resources.levels, dst->info.resources.levels);
@@ -803,6 +821,127 @@ void Runtime::ClearDepthStencilImage(VideoCore::Image* dst,
                                              range.base.layer, range.extent.layers};
     scheduler.Record([image = dst->GetImage(), value, vk_range](vk::CommandBuffer cmdbuf) {
         cmdbuf.clearDepthStencilImage(image, Layout::eTransferDstOptimal, value, vk_range);
+    });
+    MarkCopied(dst, VideoCore::ImageFlagBits::GpuModified);
+}
+
+void Runtime::ClearDepthStencilQuadrants(VideoCore::Image* dst, vk::ImageView depth_view,
+                                         const VideoCore::SubresourceRange& range,
+                                         vk::ImageAspectFlags aspect,
+                                         const vk::ClearDepthStencilValue& value,
+                                         u32 quadrant_mask) {
+    aspect &= dst->aspect_mask;
+    quadrant_mask &= 0xFu;
+    if (!aspect || !depth_view || quadrant_mask == 0u) {
+        return;
+    }
+    if (quadrant_mask == 0xFu) {
+        ClearDepthStencilImage(dst, range, aspect, value);
+        return;
+    }
+
+    const u32 w = dst->info.size.width;
+    const u32 h = dst->info.size.height;
+    const u32 hw = w >> 1;
+    const u32 hh = h >> 1;
+    const u32 rw = w - hw;
+    const u32 rh = h - hh;
+    if (hw == 0u || hh == 0u || range.extent.layers == 0u) {
+        ClearDepthStencilImage(dst, range, aspect, value);
+        return;
+    }
+
+    std::array<vk::ClearRect, 2> rects{};
+    u32 rect_count = 0u;
+    const u32 top_mask = quadrant_mask & 0x3u;
+    if (top_mask == 0x3u) {
+        rects[rect_count++] = vk::ClearRect{
+            .rect = {.offset = {0, 0}, .extent = {w, hh}},
+            .baseArrayLayer = 0u,
+            .layerCount = range.extent.layers,
+        };
+    } else if (top_mask == 0x1u) {
+        rects[rect_count++] = vk::ClearRect{
+            .rect = {.offset = {0, 0}, .extent = {hw, hh}},
+            .baseArrayLayer = 0u,
+            .layerCount = range.extent.layers,
+        };
+    } else if (top_mask == 0x2u) {
+        rects[rect_count++] = vk::ClearRect{
+            .rect = {.offset = {static_cast<s32>(hw), 0}, .extent = {rw, hh}},
+            .baseArrayLayer = 0u,
+            .layerCount = range.extent.layers,
+        };
+    }
+
+    const u32 bot_mask = (quadrant_mask >> 2) & 0x3u;
+    if (bot_mask == 0x3u) {
+        rects[rect_count++] = vk::ClearRect{
+            .rect = {.offset = {0, static_cast<s32>(hh)}, .extent = {w, rh}},
+            .baseArrayLayer = 0u,
+            .layerCount = range.extent.layers,
+        };
+    } else if (bot_mask == 0x1u) {
+        rects[rect_count++] = vk::ClearRect{
+            .rect = {.offset = {0, static_cast<s32>(hh)}, .extent = {hw, rh}},
+            .baseArrayLayer = 0u,
+            .layerCount = range.extent.layers,
+        };
+    } else if (bot_mask == 0x2u) {
+        rects[rect_count++] = vk::ClearRect{
+            .rect = {.offset = {static_cast<s32>(hw), static_cast<s32>(hh)}, .extent = {rw, rh}},
+            .baseArrayLayer = 0u,
+            .layerCount = range.extent.layers,
+        };
+    }
+
+    scheduler.EndRendering();
+    const bool has_stencil = dst->info.props.has_stencil;
+    const auto layout = has_stencil ? Layout::eDepthStencilAttachmentOptimal
+                                    : Layout::eDepthAttachmentOptimal;
+    if (Transit(dst, layout, Stage::eEarlyFragmentTests | Stage::eLateFragmentTests,
+                AccessBit::eDepthStencilAttachmentWrite | AccessBit::eDepthStencilAttachmentRead,
+                range)) {
+        FlushImageBarriers();
+    }
+
+    const vk::ClearValue clear_val{.depthStencil = value};
+    scheduler.Record([depth_view, layout, aspect, clear_val, rects, rect_count, w, h,
+                      layers = range.extent.layers, has_stencil](vk::CommandBuffer cmdbuf) {
+        const vk::RenderingAttachmentInfo att_info{
+            .imageView = depth_view,
+            .imageLayout = layout,
+            .loadOp = vk::AttachmentLoadOp::eLoad,
+            .storeOp = vk::AttachmentStoreOp::eStore,
+        };
+        const vk::RenderingInfo rendering_info{
+            .renderArea = {.offset = {0, 0}, .extent = {w, h}},
+            .layerCount = layers,
+            .pDepthAttachment = &att_info,
+            .pStencilAttachment = has_stencil ? &att_info : nullptr,
+        };
+        const vk::ClearAttachment clear_att{
+            .aspectMask = aspect,
+            .colorAttachment = 0u,
+            .clearValue = clear_val,
+        };
+        cmdbuf.beginRendering(rendering_info);
+        cmdbuf.clearAttachments(clear_att,
+                                std::span<const vk::ClearRect>(rects.data(), rect_count));
+        cmdbuf.endRendering();
+
+        const vk::MemoryBarrier2 post_barrier{
+            .srcStageMask = Stage::eEarlyFragmentTests | Stage::eLateFragmentTests,
+            .srcAccessMask = AccessBit::eDepthStencilAttachmentWrite,
+            .dstStageMask = Stage::eEarlyFragmentTests | Stage::eLateFragmentTests,
+            .dstAccessMask = AccessBit::eDepthStencilAttachmentRead |
+                             AccessBit::eDepthStencilAttachmentWrite,
+        };
+        cmdbuf.pipelineBarrier2({
+            .dependencyFlags = vk::DependencyFlagBits::eByRegion,
+            .memoryBarrierCount = 1u,
+            .pMemoryBarriers = &post_barrier,
+        });
     });
     MarkCopied(dst, VideoCore::ImageFlagBits::GpuModified);
 }

@@ -312,6 +312,8 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     // Before the rasterizer is bound: Liverpool enqueues buffers only once it sees it.
     native_srv_cache =
         std::make_unique<ImageDescCacheEntry[]>(VideoCore::DirectTextures::kMaxNativeSrvs);
+    native_srv_fast_cache =
+        std::make_unique<NativeSrvFastEntry[]>(VideoCore::DirectTextures::kMaxNativeSrvs);
     native_sampler_cache =
         std::make_unique<NativeSamplerStageBEntry[]>(VideoCore::DirectTextures::kMaxNativeSamplers);
     draw_prep = std::make_unique<DrawPreparation>(pipeline_cache);
@@ -571,6 +573,63 @@ std::pair<u32, u32> GetDrawOffsets(
 }
 } // namespace
 
+bool Rasterizer::TryCullMicroShadowDraw(const GraphicsPipeline* pipeline,
+                                        bool is_indexed) noexcept {
+    static const bool enabled = [] {
+        const char* e = std::getenv("BB_MICRO_SHADOW_CULL");
+        return !e || e[0] != '0';
+    }();
+    if (!enabled || !is_indexed || !pipeline) {
+        return false;
+    }
+    const auto& vs_stage = pipeline->GetStage(Shader::SwStage::Vertex);
+    if (vs_stage.pgm_hash != 0x167daba6ull) {
+        return false;
+    }
+    const u32 cur_frame = BbStats::frame_number.load(std::memory_order_relaxed);
+    if (stage_a_shadow_frame != cur_frame) {
+        stage_a_shadow_frame = cur_frame;
+        stage_a_shadow_cb_addr = 0;
+        stage_a_shadow_db_addr = 0;
+        stage_a_shadow_face_draw_idx = 0;
+    }
+    const auto& regs = liverpool->regs;
+    const float vp_w = std::abs(regs.viewports[0].xscale) * 2.0f;
+    const float vp_h = std::abs(regs.viewports[0].yscale) * 2.0f;
+    const s32 sc_w =
+        s32(regs.screen_scissor.bottom_right_x) - s32(regs.screen_scissor.top_left_x);
+    const s32 sc_h =
+        s32(regs.screen_scissor.bottom_right_y) - s32(regs.screen_scissor.top_left_y);
+    const bool is_32 = (vp_w > 0.0f && vp_w <= 33.0f && vp_h > 0.0f && vp_h <= 33.0f) ||
+                       (sc_w > 0 && sc_w <= 32 && sc_h > 0 && sc_h <= 32);
+    const bool is_64 = !is_32 &&
+                       ((vp_w > 0.0f && vp_w <= 65.0f && vp_h > 0.0f && vp_h <= 65.0f) ||
+                        (sc_w > 0 && sc_w <= 64 && sc_h > 0 && sc_h <= 64));
+    if (!is_32 && !is_64) {
+        return false;
+    }
+    const VAddr cb_addr =
+        regs.color_buffers[0]
+            ? (regs.color_buffers[0].Address() ^
+               (u64(regs.color_buffers[0].view.slice_start) << 40))
+            : 0;
+    const VAddr db_addr = regs.depth_buffer.DepthAddress();
+    if (regs.depth_render_control.depth_clear_enable || cb_addr != stage_a_shadow_cb_addr ||
+        db_addr != stage_a_shadow_db_addr) {
+        stage_a_shadow_cb_addr = cb_addr;
+        stage_a_shadow_db_addr = db_addr;
+        stage_a_shadow_face_draw_idx = 0;
+        return false;
+    }
+    ++stage_a_shadow_face_draw_idx;
+    if ((is_32 && stage_a_shadow_face_draw_idx >= 1u) ||
+        (is_64 && stage_a_shadow_face_draw_idx >= 2u)) {
+        BbStats::draws.fetch_sub(1, std::memory_order_relaxed);
+        return true;
+    }
+    return false;
+}
+
 void Rasterizer::Draw(bool is_indexed, u32 index_offset, const PreparedDraw* prepared) {
     BB_SECTION(ADraw);
     BbStats::draws.fetch_add(1, std::memory_order_relaxed);
@@ -614,6 +673,9 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const PreparedDraw* pre
             vfx_ui_batcher->CurrentPipeline() != pipeline) {
             vfx_ui_batcher->Flush(*this);
         }
+        if (OnStageA() && TryCullMicroShadowDraw(pipeline, is_indexed)) {
+            return;
+        }
         if (vsm_shadow_memo &&
             vsm_shadow_memo->TryHandleDraw(*this, pipeline, used_prepared, is_indexed,
                                            index_offset)) {
@@ -636,9 +698,13 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const PreparedDraw* pre
         PostDraw(pipeline, used_prepared, is_indexed, index_offset);
         return;
     }
-    if (object_vel_culler && OnStageA() && FilterDrawPasses() &&
-        object_vel_culler->TryCullDraw(*this, pipeline, is_indexed)) {
-        return;
+    if (OnStageA() && FilterDrawPasses()) {
+        if (TryCullMicroShadowDraw(pipeline, is_indexed)) {
+            return;
+        }
+        if (object_vel_culler && object_vel_culler->TryCullDraw(*this, pipeline, is_indexed)) {
+            return;
+        }
     }
     const auto* fast_vs = pipeline_cache.PeekFastVsharps(pipeline);
     packet_vsharps = fast_vs ? std::span<const Gcn::Buffer>{fast_vs->data(), fast_vs->size()}
@@ -777,7 +843,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
         return;
     }
 
-    // Block 10: Smart Unified Scene Occlusion & Micro-Shadow Culling.
+    // Block 10: Smart Unified Scene Occlusion Culling (Micro-Shadow Culling now runs on Stage A).
     s32 occ_probe_entry_idx = -1;
     {
         auto& culler = GetSceneCuller();
@@ -787,48 +853,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
         const u32 num_indices = regs.num_indices;
         const u32 num_instances = regs.num_instances.NumInstances();
 
-        // 1. Micro-Shadow Clutter Culling (32x32 and 64x64 blurred VSM cubemap shadow faces):
-        // vs 0x167daba6 bakes instance IDs into vs_in_attr1.w and submits 1..4 merged draws per
-        // cubemap face. Always keep Draw #0 (room shell + depth clear) of each face, and skip
-        // secondary clutter batches in 32x32 (draw >= 1) and 64x64 (draw >= 2) before VSM blur.
-        if (is_indexed && culler.micro_shadow_cull && vs_hash == 0x167daba6ull) {
-            const float vp_w = std::abs(regs.viewports[0].xscale) * 2.0f;
-            const float vp_h = std::abs(regs.viewports[0].yscale) * 2.0f;
-            const s32 sc_w =
-                s32(regs.screen_scissor.bottom_right_x) - s32(regs.screen_scissor.top_left_x);
-            const s32 sc_h =
-                s32(regs.screen_scissor.bottom_right_y) - s32(regs.screen_scissor.top_left_y);
-            const bool is_32 = (vp_w > 0.0f && vp_w <= 33.0f && vp_h > 0.0f && vp_h <= 33.0f) ||
-                               (sc_w > 0 && sc_w <= 32 && sc_h > 0 && sc_h <= 32);
-            const bool is_64 = !is_32 &&
-                               ((vp_w > 0.0f && vp_w <= 65.0f && vp_h > 0.0f && vp_h <= 65.0f) ||
-                                (sc_w > 0 && sc_w <= 64 && sc_h > 0 && sc_h <= 64));
-            if (is_32 || is_64) {
-                const VAddr cb_addr =
-                    regs.color_buffers[0]
-                        ? (regs.color_buffers[0].Address() ^
-                           (u64(regs.color_buffers[0].view.slice_start) << 40))
-                        : 0;
-                const VAddr db_addr = regs.depth_buffer.DepthAddress();
-                if (regs.depth_render_control.depth_clear_enable ||
-                    cb_addr != culler.last_shadow_cb_addr ||
-                    db_addr != culler.last_shadow_db_addr) {
-                    culler.last_shadow_cb_addr = cb_addr;
-                    culler.last_shadow_db_addr = db_addr;
-                    culler.shadow_face_draw_idx = 0;
-                } else {
-                    ++culler.shadow_face_draw_idx;
-                    if ((is_32 && culler.shadow_face_draw_idx >= 1) ||
-                        (is_64 && culler.shadow_face_draw_idx >= 2)) {
-                        ++culler.stat_shadow_skipped;
-                        BbStats::draws.fetch_sub(1, std::memory_order_relaxed);
-                        return;
-                    }
-                }
-            }
-        }
-
-        // 2. Hardware Temporal Occlusion Culling for All 6-MRT G-Buffer World & Cutout Batches
+        // Hardware Temporal Occlusion Culling for All 6-MRT G-Buffer World & Cutout Batches
         //    Note: 2D screen-space deferred light tiles (vs 0x8747a367) are culled per-pixel on the
         //    GPU via early_fragment_tests + 3D sphere demote in the fragment shaders (0-frame
         //    latency, 100% artifact-free), NOT by skipping 2D tile draws on the CPU.
@@ -2815,6 +2840,7 @@ void Rasterizer::DispatchIndirectRecord(const ComputePipeline* pipeline, VAddr a
 u64 Rasterizer::Flush() {
     BB_SECTION(Flush);
     DrainDrawPipe();
+    FlushPendingBufferCopies();
     if (HasPendingHleCopies()) {
         FlushPendingHleCopies(*this);
     }
@@ -2842,6 +2868,7 @@ bool Rasterizer::HasPendingWork() {
 
 void Rasterizer::Finish() {
     DrainDrawPipe();
+    FlushPendingBufferCopies();
     if (HasPendingHleCopies()) {
         FlushPendingHleCopies(*this);
     }
@@ -2860,6 +2887,7 @@ void Rasterizer::ProcessDirectTextureEvents() {
 
 void Rasterizer::OnSubmit() {
     DrainDrawPipe();
+    FlushPendingBufferCopies();
     buffer_cache.NoteTransientSubmitBoundary();
     if (buffer_cache.HasPendingInPassShadows()) {
         buffer_cache.FlushInPassShadows();

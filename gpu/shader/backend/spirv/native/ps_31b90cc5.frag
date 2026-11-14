@@ -44,22 +44,43 @@ float safe_rsq(float x) {
     return (x > 0.0) ? inversesqrt(max(x, 1.17549435e-38)) : 0.0;
 }
 
+float schlick5(float cos_theta) {
+    float t = 1.0 - clamp(cos_theta, 0.0, 1.0);
+    float t2 = t * t;
+    return t2 * t2 * t;
+}
+
+float pow32_clamped(float x) {
+    float p = clamp(x, 0.0, 1.0);
+    p *= p;
+    p *= p;
+    p *= p;
+    p *= p;
+    return p * p;
+}
+
 void main() {
+    vec2 uv = fs_in_attr1_p.xy;
+    float depth = textureLod(sampler2D(fs_img1, fs_samp0), uv, 0.0).x;
+    if (depth >= 0.999999) {
+        frag_color1 = vec4(0.0, 0.0, 0.0, 1.0);
+        frag_color0 = vec4(0.0, 0.0, 0.0, 1.0);
+        return;
+    }
+
     uint u0 = push_data.buf_offsets0.x;
     uint d0 = bitfieldExtract(u0, 0, 8) >> 2u;
     uint d1 = bitfieldExtract(u0, 8, 8) >> 2u;
 
-    vec2 uv = fs_in_attr1_p.xy;
-    vec4 tex_nrm   = texture(sampler2D(fs_img0, fs_samp0), uv);
-    vec4 tex_depth = texture(sampler2D(fs_img1, fs_samp0), uv);
-    vec4 tex_spec  = texture(sampler2D(fs_img2, fs_samp0), uv);
-    vec4 tex_mat   = texture(sampler2D(fs_img3, fs_samp0), uv);
-    vec4 tex_sh    = texture(sampler2D(fs_img4, fs_samp1), uv);
+    vec4 tex_nrm  = textureLod(sampler2D(fs_img0, fs_samp0), uv, 0.0);
+    vec4 tex_spec = textureLod(sampler2D(fs_img2, fs_samp0), uv, 0.0);
+    vec4 tex_mat  = textureLod(sampler2D(fs_img3, fs_samp0), uv, 0.0);
+    vec4 tex_sh   = textureLod(sampler2D(fs_img4, fs_samp1), uv, 0.0);
 
     vec3 N_unorm = fma(vec3(2.0), tex_nrm.xyz, vec3(-1.0));
     vec3 N = N_unorm * safe_rsq(dot(N_unorm, N_unorm));
 
-    vec4 clip_p = vec4(fs_in_attr0_p.xy, tex_depth.x, 1.0);
+    vec4 clip_p = vec4(fs_in_attr0_p.xy, depth, 1.0);
     float inv_w = 1.0 / dot(load_s1_v4(d0 + 12u), clip_p);
     vec3 pos_v = vec3(
         dot(load_s1_v4(d0 + 0u), clip_p),
@@ -67,14 +88,10 @@ void main() {
         dot(load_s1_v4(d0 + 8u), clip_p)
     ) * inv_w;
 
-    vec4 r0 = load_s1_v4(d0 + 32u);
-    vec4 r1 = load_s1_v4(d0 + 36u);
-    vec4 r2 = load_s1_v4(d0 + 40u);
-    vec3 view_vec = vec3(
-        r0.w - (dot(r0.xyz, pos_v) + r0.w),
-        r1.w - (dot(r1.xyz, pos_v) + r1.w),
-        r2.w - (dot(r2.xyz, pos_v) + r2.w)
-    );
+    vec3 r0 = vec3(s1f(d0 + 32u), s1f(d0 + 33u), s1f(d0 + 34u));
+    vec3 r1 = vec3(s1f(d0 + 36u), s1f(d0 + 37u), s1f(d0 + 38u));
+    vec3 r2 = vec3(s1f(d0 + 40u), s1f(d0 + 41u), s1f(d0 + 42u));
+    vec3 view_vec = -vec3(dot(r0, pos_v), dot(r1, pos_v), dot(r2, pos_v));
     vec3 V = view_vec * safe_rsq(dot(view_vec, view_vec));
 
     uint lset_idx = uint(int(255.0 * tex_spec.w));
@@ -85,8 +102,6 @@ void main() {
     vec4 L1 = load_s2_v4((lbase + 1u) * 4u + d1);
     vec3 D0 = load_s2_v4((lbase + 4u) * 4u + d1).xyz;
     vec3 D1 = load_s2_v4((lbase + 5u) * 4u + d1).xyz;
-    vec3 S0 = load_s2_v4((lbase + 8u) * 4u + d1).xyz;
-    vec3 S1 = load_s2_v4((lbase + 9u) * 4u + d1).xyz;
     vec4 sh_w = load_s2_v4((lbase + 17u) * 4u + d1);
 
     float sh0 = fma(sh_w.x, -1.0 + tex_sh.x, 1.0);
@@ -96,73 +111,102 @@ void main() {
 
     vec3 spec_sq = tex_spec.xyz * tex_spec.xyz;
     float trans = 10.0 * tex_mat.y;
-    bool has_trans = (trans > 0.0);
-
-    float rim = max(0.0, 1.0 + dot(V, N));
-    float rim_term = 0.25 * (rim * rim);
+    float ndotl0_raw = dot(L0.xyz, N);
+    float ndotl1_raw = dot(L1.xyz, N);
 
     vec3 diff_acc;
-    if (has_trans) {
+    if (trans > 0.0) {
+        float rim = max(0.0, 1.0 + dot(V, N));
+        float rim_term = 0.25 * (rim * rim);
         float inv_wrap = 1.0 / fma(2.0, trans, 1.0);
-        float w0 = max(0.0, trans + dot(L0.xyz, N)) * inv_wrap;
-        float w1 = max(0.0, trans + dot(L1.xyz, N)) * inv_wrap;
+        float w0 = max(0.0, trans + ndotl0_raw) * inv_wrap;
+        float w1 = max(0.0, trans + ndotl1_raw) * inv_wrap;
         vec3 base_d = (tex_sh.z * (D0 * w0)) * sh0 + sh1 * (D1 * w1);
-        float b0 = exp2(32.0 * log2(clamp(dot(L0.xyz, -V), 0.0, 1.0))) * rim_term;
-        float b1 = exp2(32.0 * log2(clamp(dot(L1.xyz, -V), 0.0, 1.0))) * rim_term;
+        float b0 = pow32_clamped(dot(L0.xyz, -V)) * rim_term;
+        float b1 = pow32_clamped(dot(L1.xyz, -V)) * rim_term;
         diff_acc = ((trans * (D1 * b1)) * sh1) + (((trans * (D0 * b0)) * sh0) + base_d);
     } else {
-        float nl0 = clamp(dot(L0.xyz, N), 0.0, 1.0);
-        float nl1 = clamp(dot(L1.xyz, N), 0.0, 1.0);
+        float nl0 = clamp(ndotl0_raw, 0.0, 1.0);
+        float nl1 = clamp(ndotl1_raw, 0.0, 1.0);
         diff_acc = (sh0 * (tex_sh.z * D0)) * ((-spec_sq * nl0) + nl0)
                  + (D1 * sh1) * ((-spec_sq * nl1) + nl1);
     }
 
-    vec3 H0 = (V + L0.xyz) * safe_rsq(dot(V + L0.xyz, V + L0.xyz));
-    vec3 H1 = (V + L1.xyz) * safe_rsq(dot(V + L1.xyz, V + L1.xyz));
-    float exp_g = exp2(13.0 * tex_mat.x);
-    float exp_g_s = exp_g * 0.0100021362;
-
-    float sp_e0 = max(1.0, (L0.w * exp_g) * (1.0 / (exp_g_s + L0.w)));
-    float sp_e1 = max(1.0, (L1.w * exp_g) * (1.0 / (exp_g_s + L1.w)));
-    float bl0 = exp2(sp_e0 * log2(clamp(dot(H0, N), 0.0, 1.0)));
-    float bl1 = exp2(sp_e1 * log2(clamp(dot(H1, N), 0.0, 1.0)));
-    float fr0 = exp2(5.0 * log2(1.0 - clamp(dot(V, H0), 0.0, 1.0)));
-    float fr1 = exp2(5.0 * log2(1.0 - clamp(dot(V, H1), 0.0, 1.0)));
-    float h_fade0 = clamp(dot(N, L0.xyz) * 16.0, 0.0, 1.0);
-    float h_fade1 = clamp(dot(N, L1.xyz) * 16.0, 0.0, 1.0);
-
-    vec3 spec_acc = (h_fade0 * (bl0 * (sh0 * (tex_sh.z * (S0 * (sp_e0 * 0.125 + 0.25)))))) * ((-fr0 * spec_sq) + (spec_sq + fr0))
-                  + ((-fr1 * spec_sq) + (spec_sq + fr1)) * (h_fade1 * (bl1 * (sh1 * (S1 * (0.125 * sp_e1 + 0.25)))));
-
+    float h_fade0 = clamp(ndotl0_raw * 16.0, 0.0, 1.0);
+    float h_fade1 = clamp(ndotl1_raw * 16.0, 0.0, 1.0);
     uint mask_base = (lbase + 16u) * 4u + d1;
-    if (0u < floatBitsToUint(ssbo_2.data[mask_base])) {
+    bool has_l2 = (0u < floatBitsToUint(ssbo_2.data[mask_base]));
+    bool has_l3 = (0u < floatBitsToUint(ssbo_2.data[mask_base + 1u]));
+
+    float exp_g = 1.0;
+    float exp_g_s = 0.0100021362;
+    if ((h_fade0 > 0.0 && sh0 > 0.0) || (h_fade1 > 0.0 && sh1 > 0.0) || has_l2 || has_l3) {
+        exp_g = exp2(13.0 * tex_mat.x);
+        exp_g_s = exp_g * 0.0100021362;
+    }
+
+    vec3 spec_acc = vec3(0.0);
+    if (h_fade0 > 0.0 && sh0 > 0.0 && tex_sh.z > 0.0) {
+        vec3 H0 = (V + L0.xyz) * safe_rsq(dot(V + L0.xyz, V + L0.xyz));
+        float nh0 = clamp(dot(H0, N), 0.0, 1.0);
+        if (nh0 > 0.0) {
+            vec3 S0 = load_s2_v4((lbase + 8u) * 4u + d1).xyz;
+            float sp_e0 = max(1.0, (L0.w * exp_g) * (1.0 / (exp_g_s + L0.w)));
+            float bl0 = exp2(sp_e0 * log2(nh0));
+            float fr0 = schlick5(dot(V, H0));
+            spec_acc += (h_fade0 * (bl0 * (sh0 * (tex_sh.z * (S0 * (sp_e0 * 0.125 + 0.25)))))) * ((-fr0 * spec_sq) + (spec_sq + fr0));
+        }
+    }
+    if (h_fade1 > 0.0 && sh1 > 0.0) {
+        vec3 H1 = (V + L1.xyz) * safe_rsq(dot(V + L1.xyz, V + L1.xyz));
+        float nh1 = clamp(dot(H1, N), 0.0, 1.0);
+        if (nh1 > 0.0) {
+            vec3 S1 = load_s2_v4((lbase + 9u) * 4u + d1).xyz;
+            float sp_e1 = max(1.0, (L1.w * exp_g) * (1.0 / (exp_g_s + L1.w)));
+            float bl1 = exp2(sp_e1 * log2(nh1));
+            float fr1 = schlick5(dot(V, H1));
+            spec_acc += ((-fr1 * spec_sq) + (spec_sq + fr1)) * (h_fade1 * (bl1 * (sh1 * (S1 * (0.125 * sp_e1 + 0.25)))));
+        }
+    }
+
+    if (has_l2) {
         vec4 L2 = load_s2_v4((lbase + 2u) * 4u + d1);
         vec3 D2 = load_s2_v4((lbase + 6u) * 4u + d1).xyz;
-        vec3 S2 = load_s2_v4((lbase + 10u) * 4u + d1).xyz;
         float hemi2 = fma(0.5, dot(L2.xyz, N), 0.5);
         float nl2 = clamp(hemi2 * hemi2, 0.0, 1.0);
         diff_acc += (sh2 * D2) * ((-spec_sq * nl2) + nl2);
 
-        vec3 H2 = (V + L2.xyz) * safe_rsq(dot(V + L2.xyz, V + L2.xyz));
-        float sp_e2 = max(1.0, ( exp_g * L2.w) * (1.0 / (exp_g_s + L2.w)));
-        float bl2 = exp2(sp_e2 * log2(clamp(dot(H2, N), 0.0, 1.0)));
-        float fr2 = exp2(5.0 * log2(1.0 - clamp(dot(V, H2), 0.0, 1.0)));
-        spec_acc += (bl2 * (sh2 * (S2 * (0.125 * sp_e2 + 0.25)))) * ((-fr2 * spec_sq) + (spec_sq + fr2));
+        if (sh2 > 0.0) {
+            vec3 H2 = (V + L2.xyz) * safe_rsq(dot(V + L2.xyz, V + L2.xyz));
+            float nh2 = clamp(dot(H2, N), 0.0, 1.0);
+            if (nh2 > 0.0) {
+                vec3 S2 = load_s2_v4((lbase + 10u) * 4u + d1).xyz;
+                float sp_e2 = max(1.0, (exp_g * L2.w) * (1.0 / (exp_g_s + L2.w)));
+                float bl2 = exp2(sp_e2 * log2(nh2));
+                float fr2 = schlick5(dot(V, H2));
+                spec_acc += (bl2 * (sh2 * (S2 * (0.125 * sp_e2 + 0.25)))) * ((-fr2 * spec_sq) + (spec_sq + fr2));
+            }
+        }
     }
 
-    if (0u < floatBitsToUint(ssbo_2.data[mask_base + 1u])) {
+    if (has_l3) {
         vec4 L3 = load_s2_v4((lbase + 3u) * 4u + d1);
         vec3 D3 = load_s2_v4((lbase + 7u) * 4u + d1).xyz;
-        vec3 S3 = load_s2_v4((lbase + 11u) * 4u + d1).xyz;
         float hemi3 = fma(0.5, dot(L3.xyz, N), 0.5);
         float nl3 = clamp(hemi3 * hemi3, 0.0, 1.0);
         diff_acc += (sh3 * D3) * ((-spec_sq * nl3) + nl3);
 
-        vec3 H3 = (V + L3.xyz) * safe_rsq(dot(V + L3.xyz, V + L3.xyz));
-        float sp_e3 = max(1.0, (exp_g * L3.w) * (1.0 / (exp_g_s + L3.w)));
-        float bl3 = exp2(sp_e3 * log2(clamp(dot(H3, N), 0.0, 1.0)));
-        float fr3 = exp2(5.0 * log2(1.0 - clamp(dot(V, H3), 0.0, 1.0)));
-        spec_acc += (bl3 * (sh3 * (S3 * (0.125 * sp_e3 + 0.25)))) * ((-fr3 * spec_sq) + (spec_sq + fr3));
+        if (sh3 > 0.0) {
+            vec3 H3 = (V + L3.xyz) * safe_rsq(dot(V + L3.xyz, V + L3.xyz));
+            float nh3 = clamp(dot(H3, N), 0.0, 1.0);
+            if (nh3 > 0.0) {
+                vec3 S3 = load_s2_v4((lbase + 11u) * 4u + d1).xyz;
+                float sp_e3 = max(1.0, (exp_g * L3.w) * (1.0 / (exp_g_s + L3.w)));
+                float bl3 = exp2(sp_e3 * log2(nh3));
+                float fr3 = schlick5(dot(V, H3));
+                spec_acc += (bl3 * (sh3 * (S3 * (0.125 * sp_e3 + 0.25)))) * ((-fr3 * spec_sq) + (spec_sq + fr3));
+            }
+        }
     }
 
     frag_color1 = vec4(spec_acc, 1.0);

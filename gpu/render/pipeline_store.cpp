@@ -42,6 +42,81 @@ std::string BinaryName(u64 pgm_hash, size_t perm_idx) {
     return fmt::format("{:#018x}_{}", pgm_hash, perm_idx);
 }
 
+bool IsOpt33Phase2ShaderHash(u64 pgm_hash) noexcept {
+    switch (pgm_hash) {
+    // Phase 2.1a: Fullscreen Deferred PBR, Deferred AO & Light Composite
+    case 0x00000000d92266b9ULL:
+    case 0x0000000031b90cc5ULL:
+    case 0x000000003fe9e964ULL:
+    case 0x0000000032e47788ULL:
+    // Phase 2.2: Screen-Space Shadow Bilateral Blur
+    case 0x0000000011ffdfb5ULL:
+    // Phase 2.1b: VSM Point-Light (1..4) & Spot-Light (1..4) Deferred PBR
+    case 0x00000000e96447c3ULL:
+    case 0x00000000a22c7f71ULL:
+    case 0x000000006b42fc89ULL:
+    case 0x000000000ef50047ULL:
+    case 0x00000000bae5454eULL:
+    case 0x00000000896e7242ULL:
+    case 0x0000000002cd8f9bULL:
+    case 0x000000008ea5be99ULL:
+    // Phase 2.1b: Point-Light Blinn-H (1..12) & Phong-R (1..12) Deferred PBR
+    case 0x00000000370174f7ULL:
+    case 0x00000000600f86b0ULL:
+    case 0x0000000089f9ee3eULL:
+    case 0x00000000149432ffULL:
+    case 0x000000005de04266ULL:
+    case 0x000000005d7150daULL:
+    case 0x000000008d5387d9ULL:
+    case 0x00000000f81596cdULL:
+    case 0x000000000b2ace4cULL:
+    case 0x00000000201cb43dULL:
+    case 0x000000005f76eb3dULL:
+    case 0x00000000799bfa32ULL:
+    case 0x000000007cc2c044ULL:
+    case 0x00000000186d69d5ULL:
+    case 0x00000000d22cbfd1ULL:
+    case 0x000000003105494cULL:
+    case 0x00000000d75fe2ffULL:
+    case 0x0000000007d07cf3ULL:
+    case 0x00000000f2531727ULL:
+    case 0x00000000c6edb19aULL:
+    case 0x00000000b59b4c4eULL:
+    case 0x00000000505ebdbeULL:
+    case 0x0000000022b357f3ULL:
+    case 0x000000009f9ef267ULL:
+    // Phase 2.3: Yebis 2 Post-FX (UAV Image Clear, DoF/Glare Downsample & Bokeh, Tonemap, Gamma)
+    case 0x000000009a9cf8a9ULL:
+    case 0x00000000265a6d2dULL:
+    case 0x00000000a2c4f30aULL:
+    case 0x00000000ff902740ULL:
+    case 0x00000000e80526ccULL:
+    case 0x0000000038d65b32ULL:
+    case 0x000000005e67d866ULL:
+    case 0x000000005c02eaf8ULL:
+    // Phase 2.4: G-Buffer 6-MRT (Skinned 4-bone VS, 6 Alpha-Cutout PS, 9 Opaque PS)
+    case 0x000000003deaa573ULL:
+    case 0x000000001c3953c6ULL:
+    case 0x0000000070bb42afULL:
+    case 0x00000000998b035eULL:
+    case 0x000000002140da2bULL:
+    case 0x00000000a89e01e9ULL:
+    case 0x00000000dbeccd9cULL:
+    case 0x00000000bb10e440ULL:
+    case 0x00000000e21e283aULL:
+    case 0x000000008aba0ecdULL:
+    case 0x00000000ca7226ecULL:
+    case 0x00000000e54449c7ULL:
+    case 0x0000000050287a64ULL:
+    case 0x0000000052738b8aULL:
+    case 0x00000000dbb222ebULL:
+    case 0x000000009e3394c8ULL:
+        return true;
+    default:
+        return false;
+    }
+}
+
 std::string OptBinaryName(u64 pgm_hash, size_t perm_idx) {
     const bool hw_interp = Shader::Backend::SPIRV::HwInterpEnabled();
     const bool fast_fp = Shader::Backend::SPIRV::FastFpEnabled();
@@ -51,7 +126,12 @@ std::string OptBinaryName(u64 pgm_hash, size_t perm_idx) {
     if (hw_interp) {
         if (fast_fp) {
             prefix = native_sh
-                         ? ((pgm_hash == 0x0000000024042a9bULL || ltb_patched) ? "opt32" : "opt31")
+                         ? (IsOpt33Phase2ShaderHash(pgm_hash)
+                                ? "opt33"
+                                : ((pgm_hash == 0x0000000024042a9bULL ||
+                                    pgm_hash == 0x00000000f55643deULL || ltb_patched)
+                                       ? "opt32"
+                                       : "opt31"))
                          : (ltb_patched ? "opt6_ltb2" : "opt6_nonat");
         } else {
             prefix = ltb_patched ? "opt3_ltb2" : "opt3_strict";
@@ -73,7 +153,7 @@ const char* DriverCacheBlobName() noexcept {
     const bool native_sh = Shader::Backend::SPIRV::NativeShadersEnabled();
     if (hw_interp) {
         if (fast_fp) {
-            return native_sh ? "vk_driver_cache_opt31" : "vk_driver_cache_opt6_nonat";
+            return native_sh ? "vk_driver_cache_opt34" : "vk_driver_cache_opt6_nonat";
         }
         return "vk_driver_cache_opt3_strict";
     }

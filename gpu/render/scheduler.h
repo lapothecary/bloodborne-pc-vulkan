@@ -176,7 +176,7 @@ public:
         }
         // The caller may bind its own pipeline / push descriptors on the raw command buffer
         // (blitter, depth resolve): the next draw must rebind its graphics pipeline and descriptors.
-        ++descriptor_state_epoch;
+        BumpDescriptorStateEpoch();
         EnsureSubmissionProfileOpen();
         return current_cmdbuf;
     }
@@ -318,6 +318,17 @@ public:
         return {dst, data.size()};
     }
 
+    /// Phase 3.1: Uninitialized chunk allocation after a single outer `ReserveRecordData(...)`
+    /// so `Pipeline::BindResources` can emit delta descriptor writes in one pass with zero
+    /// intermediate scratch copies.
+    template <typename T>
+    T* AllocateRecordDataUnchecked(size_t count) noexcept {
+        if (!IsRecordingDeferred() || count == 0) {
+            return nullptr;
+        }
+        return static_cast<T*>(CurrentChunk().Allocate(count * sizeof(T), alignof(T)));
+    }
+
     /// Hands recorded commands to the recording threads. Called at points where no caller holds
     /// the raw command buffer; small batches are kept. Without `force` (the end of a draw or
     /// dispatch: nothing but the dynamic state and the render pass carries over to the next
@@ -369,6 +380,63 @@ public:
         });
     }
 
+    /// Phase 3.4: Zero-heap-allocation `RecordHostCopy` storing variable-length slice metadata
+    /// directly inside `OrderedChunk()` alongside the deferred command closure.
+    template <typename T, typename Func>
+    void RecordHostCopyWithData(std::span<const T> data, Func&& copy) {
+        ProducerScope producer{*this, "RecordOrdered"};
+        const u64 seq = ++host_copies_issued;
+        if (OrderedInline()) {
+            copy(data);
+            host_copies_done.store(seq, std::memory_order_release);
+            return;
+        }
+        if (BbToggle::Disabled(BbToggle::ThreadedRecording)) {
+            EnterDirectMode();
+            copy(data);
+            host_copies_done.store(seq, std::memory_order_release);
+            return;
+        }
+        std::span<const T> chunk_span{};
+        const size_t bytes = data.size_bytes();
+        if (bytes != 0) {
+            ASSERT(bytes + alignof(T) + 512 <= RecordChunk::Capacity);
+            if (RecordChunk::Capacity - OrderedChunk().Size() < bytes + alignof(T) + 512) {
+                if (!OrderedChunk().Empty()) {
+                    auto full = AcquireChunk();
+                    ordered_chunk.swap(full);
+                    ordered_full.push_back(std::move(full));
+                }
+            }
+            auto* dst = static_cast<T*>(OrderedChunk().Allocate(bytes, alignof(T)));
+            ASSERT(dst != nullptr);
+            std::memcpy(dst, data.data(), bytes);
+            chunk_span = {dst, data.size()};
+        }
+        auto command = [copy, chunk_span, this, seq](vk::CommandBuffer) mutable {
+            copy(chunk_span);
+            host_copies_done.store(seq, std::memory_order_release);
+        };
+        if (!OrderedChunk().Push(std::move(command))) {
+            auto full = AcquireChunk();
+            ordered_chunk.swap(full);
+            ordered_full.push_back(std::move(full));
+            if (bytes != 0) {
+                auto* dst2 = static_cast<T*>(OrderedChunk().Allocate(bytes, alignof(T)));
+                ASSERT(dst2 != nullptr);
+                std::memcpy(dst2, chunk_span.data(), bytes);
+                chunk_span = {dst2, data.size()};
+            }
+            auto retry_cmd = [copy = std::forward<Func>(copy), chunk_span, this,
+                              seq](vk::CommandBuffer) mutable {
+                copy(chunk_span);
+                host_copies_done.store(seq, std::memory_order_release);
+            };
+            const bool pushed = OrderedChunk().Push(std::move(retry_cmd));
+            ASSERT(pushed);
+        }
+    }
+
     /// Runs `signal` once the guest memory copies issued so far are done, without
     /// waiting here: the recording thread reaches it after the copies queued before it and hands
     /// it to the copy threads' completion (BbCopy::AfterCopies).
@@ -414,13 +482,29 @@ public:
         return is_rendering;
     }
 
-    /// N2.2: Monotonic epoch incremented on every command buffer / segment / RenderPass / compute
-    /// boundary so Pipeline::BindResources can safely delta-push descriptors and push constants.
+    /// N2.2 / Phase 3.1: Granular state epochs so compute dispatches (which share only the
+    /// 128-byte push-constant bank and leave `eGraphics` pipelines, push descriptors, vertex/index
+    /// bindings, and dynamic state intact per Vulkan 1.3 §14.2.2) only invalidate push constants.
     [[nodiscard]] u64 DescriptorStateEpoch() const noexcept {
         return descriptor_state_epoch;
     }
+    [[nodiscard]] u64 GraphicsDescriptorEpoch() const noexcept {
+        return graphics_desc_epoch;
+    }
+    [[nodiscard]] u64 PushConstantsEpoch() const noexcept {
+        return push_constants_epoch;
+    }
     void BumpDescriptorStateEpoch() noexcept {
         ++descriptor_state_epoch;
+        ++graphics_desc_epoch;
+        ++push_constants_epoch;
+    }
+    void BumpGraphicsDescriptorEpoch() noexcept {
+        ++graphics_desc_epoch;
+        ++push_constants_epoch;
+    }
+    void BumpPushConstantsEpoch() noexcept {
+        ++push_constants_epoch;
     }
 
     [[nodiscard]] bool HasPendingWork() const noexcept {
@@ -629,6 +713,8 @@ private:
     RenderState render_state;
     bool is_rendering = false;
     u64 descriptor_state_epoch = 1;
+    u64 graphics_desc_epoch = 1;
+    u64 push_constants_epoch = 1;
     // Threaded recording. Commands go into chunks of the current segment; segments are
     // recorded in parallel, each into its own command buffer, and a submission runs their
     // command buffers in order. Guest memory copies and fence signals go into ordered chunks,

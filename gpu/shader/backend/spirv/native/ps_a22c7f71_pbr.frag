@@ -104,7 +104,13 @@ void main() {
     uint d1 = bitfieldExtract(push_data.buf_offsets0.x, 8, 8) >> 2u;
 
     vec2 uv = fs_in_attr1_p.xy;
-    float depth = texture(sampler2D(fs_img1, fs_samp0), uv).x;
+    float depth = textureLod(sampler2D(fs_img1, fs_samp0), uv, 0.0).x;
+    if (depth >= 0.999999) {
+        frag_color0 = vec4(0.0, 0.0, 0.0, 1.0);
+        frag_color1 = vec4(0.0, 0.0, 0.0, 1.0);
+        demote;
+        return;
+    }
     uint tile_v4 = uint(fs_in_attr1_p.z + 0.5);
     if (tile_v4 > 0u) {
         uint thdr = d1 + ((tile_v4 - 1u) << 2u);
@@ -139,7 +145,7 @@ void main() {
         return;
     }
 
-    vec4 t_norm = texture(sampler2D(fs_img0, fs_samp0), uv);
+    vec4 t_norm = textureLod(sampler2D(fs_img0, fs_samp0), uv, 0.0);
     vec3 n_raw = fma(vec3(2.0), t_norm.xyz, vec3(-1.0));
     vec3 n_ts = n_raw * safe_rsq(dot(n_raw, n_raw));
     vec3 N = vec3(
@@ -153,22 +159,28 @@ void main() {
     float rim = max(0.0, 1.0 + dot(-V_dir, N));
     float rim_factor = 0.25 * (rim * rim);
 
-    float ao = texture(sampler2D(fs_img2, fs_samp1), uv).x;
-    vec3 albedo = texture(sampler2D(fs_img3, fs_samp0), uv).xyz;
+    float ao = textureLod(sampler2D(fs_img2, fs_samp1), uv, 0.0).x;
+    vec3 albedo = textureLod(sampler2D(fs_img3, fs_samp0), uv, 0.0).xyz;
     vec3 albedo2 = albedo * albedo;
-    vec4 t_mat = texture(sampler2D(fs_img4, fs_samp0), uv);
-
-    vec4 sm0 = in0 ? texture(sampler2DArray(fs_img5, fs_samp1), cube_uv_face(s2_v3(d1 + 20u) - pos)) : vec4(1.0);
-    vec4 sm1 = in1 ? texture(sampler2DArray(fs_img6, fs_samp1), cube_uv_face(s2_v3(d1 + 44u) - pos)) : vec4(1.0);
+    vec4 t_mat = textureLod(sampler2D(fs_img4, fs_samp0), uv, 0.0);
 
     float exp_13 = exp2(13.0 * t_mat.x);
     float trans = 10.0 * t_mat.y;
 
-    mat2x3 r0 = eval_vsm_point_light(d1 + 0u,  L_vec0, d2_0, sm0, pos, N, V_dir, R_v, exp_13, trans, rim_factor);
-    mat2x3 r1 = eval_vsm_point_light(d1 + 24u, L_vec1, d2_1, sm1, pos, N, V_dir, R_v, exp_13, trans, rim_factor);
-
-    vec3 diff_acc = r0[0] + r1[0];
-    vec3 spec_acc = r0[1] + r1[1];
+    vec3 diff_acc = vec3(0.0);
+    vec3 spec_acc = vec3(0.0);
+    if (in0) {
+        vec4 sm0 = textureLod(sampler2DArray(fs_img5, fs_samp1), cube_uv_face(s2_v3(d1 + 20u) - pos), 0.0);
+        mat2x3 r0 = eval_vsm_point_light(d1 + 0u, L_vec0, d2_0, sm0, pos, N, V_dir, R_v, exp_13, trans, rim_factor);
+        diff_acc += r0[0];
+        spec_acc += r0[1];
+    }
+    if (in1) {
+        vec4 sm1 = textureLod(sampler2DArray(fs_img6, fs_samp1), cube_uv_face(s2_v3(d1 + 44u) - pos), 0.0);
+        mat2x3 r1 = eval_vsm_point_light(d1 + 24u, L_vec1, d2_1, sm1, pos, N, V_dir, R_v, exp_13, trans, rim_factor);
+        diff_acc += r1[0];
+        spec_acc += r1[1];
+    }
 
     frag_color1 = vec4(albedo2 * (ao * spec_acc), 1.0);
     frag_color0 = vec4(ao * (diff_acc - (albedo2 * diff_acc) * 0.5), 1.0);

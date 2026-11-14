@@ -63,5 +63,10 @@ u16 RegisterNativeSampler(void* ssharp_4dw) noexcept;
 u16 RegisterNativeSrv(void* tsharp_8dw, u32 resource_id, bool is_immutable) noexcept;
 [[nodiscard]] u16 UnpackAndCleanSrv(Gcn::Image& tsharp, u8& out_gen8) noexcept;
 
+// Phase 3.1: Non-zero 16-bit epoch bumped only when a DirectImmutable image is unregistered or
+// transitions out of its settled read-only ShaderReadOnlyOptimal state.
+[[nodiscard]] u16 ImmutableRoEpoch16() noexcept;
+void BumpImmutableRoEpoch() noexcept;
+
 } // namespace DirectTextures
 } // namespace VideoCore

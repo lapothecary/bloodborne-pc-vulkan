@@ -1,5 +1,6 @@
 #version 460
 #extension GL_EXT_samplerless_texture_functions : require
+#extension GL_EXT_demote_to_helper_invocation : require
 // Native Vulkan 1.3 GLSL PS 0x0000000070bb42af (G-Buffer 6-MRT detail-blend + cubemap SH foliage)
 
 layout(location = 0) in vec4 fs_in_attr0_p;
@@ -53,6 +54,7 @@ layout(set = 0, binding = 17) uniform sampler fs_samp3;
 
 float safe_rsq(float x) { return (x > 0.0) ? inversesqrt(max(x, 1.17549435e-38)) : 0.0; }
 vec3 safe_norm(vec3 v) { return v * safe_rsq(dot(v, v)); }
+float schlick5(float x) { float x2 = x * x; return x2 * x2 * x; }
 float s1f(uint i) { return uintBitsToFloat(ssbo_1.data[i]); }
 float s2f(uint i) { return uintBitsToFloat(ssbo_2.data[i]); }
 float s4f(uint i) { return uintBitsToFloat(ssbo_4.data[i]); }
@@ -78,38 +80,51 @@ void main() {
     const uint d2 = bitfieldExtract(bo0, 16, 8) >> 2u, d3 = bitfieldExtract(bo0, 24, 8) >> 2u;
     const uint d4 = bitfieldExtract(bo1, 0, 8) >> 2u;
 
-    const vec3 n_in = fs_in_attr0_p.xyz;
-    const bool is_front = gl_FrontFacing;
-    const vec3 N_vert = (is_front ? 1.0 : -1.0) * safe_norm(n_in);
-
-    const vec4 clip_in = fs_in_attr4_p;
-    const vec2 screen_uv = fma(vec2(0.5, -0.5) * clip_in.xy, vec2(1.0 / clip_in.w), vec2(0.5));
-    const float dither_a = texture(sampler2D(fs_img0, fs_samp0), 0.25 * vec2(s1f(d0 + 4u), s1f(d0 + 5u)) * screen_uv).w - 0.5;
-
     const vec2 uv0 = fs_in_attr3_p.xy, uv1 = fs_in_attr3_p.zw;
-    const vec4 det_alb = texture(sampler2D(fs_img1, fs_samp1), uv1);
     const vec4 base_tex = texture(sampler2D(fs_img2, fs_samp1), xform_uv(d1 + 0u, uv0));
     const uint mat_row = uint(fs_in_attr0_p.w * 1.00001526) * 13u;
     const float alpha_raw = base_tex.w * fs_in_attr2_p.w;
     const float out_alpha = alpha_raw * ssbo_3.data[d2 + (mat_row + 7u) * 4u + 3u];
-    if (s4f(d3 + 20u) > (s4f(d3 + 21u) * dither_a + alpha_raw) || out_alpha == 0.0) {
-        discard;
+    const float alpha_ref = s4f(d3 + 20u);
+    const float dither_scale = s4f(d3 + 21u);
+    const vec4 clip_in = fs_in_attr4_p;
+    float alpha_cmp = alpha_raw;
+    if (dither_scale != 0.0) {
+        const vec2 screen_uv = fma(vec2(0.5, -0.5) * clip_in.xy, vec2(1.0 / clip_in.w), vec2(0.5));
+        const float dither_a = texture(sampler2D(fs_img0, fs_samp0), 0.25 * vec2(s1f(d0 + 4u), s1f(d0 + 5u)) * screen_uv).w - 0.5;
+        alpha_cmp += dither_scale * dither_a;
+    }
+    const bool alpha_fail = (out_alpha == 0.0) || (alpha_ref > alpha_cmp);
+    if (alpha_fail) {
+        demote;
+    }
+    const float keep = (alpha_fail || helperInvocationEXT()) ? 0.0 : 1.0;
+    const float row_alive = float((keep + abs(dFdxFine(keep))) > 0.0);
+    if ((row_alive + abs(dFdyFine(row_alive))) == 0.0) {
+        return;
     }
 
-    const vec3 wpos = vec3(s1_row_dot(d0 + 20u, clip_in), s1_row_dot(d0 + 24u, clip_in), s1_row_dot(d0 + 28u, clip_in));
-    const vec3 V_raw = (-wpos) * (1.0 / s1_row_dot(d0 + 32u, clip_in)) + vec3(s1f(d0 + 183u), s1f(d0 + 187u), s1f(d0 + 191u));
-    const vec3 V = safe_norm(V_raw);
-
+    const vec4 det_alb = texture(sampler2D(fs_img1, fs_samp1), uv1);
     const vec4 nrm_tex = texture(sampler2D(fs_img3, fs_samp2), xform_uv(d1 + 12u, uv0));
     const float gloss_base = texture(sampler2D(fs_img4, fs_samp3), xform_uv(d1 + 8u, uv0)).x;
     const vec2 det_gs = texture(sampler2D(fs_img5, fs_samp3), uv1).xy;
     const vec3 spec_tex = texture(sampler2D(fs_img6, fs_samp3), xform_uv(d1 + 4u, uv0)).rgb;
+    if (keep == 0.0) {
+        return;
+    }
 
+    const vec3 n_in = fs_in_attr0_p.xyz;
+    const bool is_front = gl_FrontFacing;
+    const vec3 N_vert = (is_front ? 1.0 : -1.0) * safe_norm(n_in);
     const vec3 T = safe_norm(fs_in_attr1_p.xyz);
     const vec3 B = safe_norm(cross(n_in, fs_in_attr1_p.xyz) * fs_in_attr1_p.w);
     const float nx = fma(2.0, nrm_tex.x, -1.0) * fma(2.0, nrm_tex.w, -1.0);
     const float ny = fma(2.0, nrm_tex.y, -1.0);
     const vec3 N = safe_norm(B * nx + (T * ny + N_vert * sqrt(1.0 - clamp(nx * nx + ny * ny, 0.0, 1.0))));
+
+    const vec3 wpos = vec3(s1_row_dot(d0 + 20u, clip_in), s1_row_dot(d0 + 24u, clip_in), s1_row_dot(d0 + 28u, clip_in));
+    const vec3 V_raw = (-wpos) * (1.0 / s1_row_dot(d0 + 32u, clip_in)) + vec3(s1f(d0 + 183u), s1f(d0 + 187u), s1f(d0 + 191u));
+    const vec3 V = safe_norm(V_raw);
 
     const float NdotV = dot(N, V);
     const vec3 R = -V + N * (2.0 * NdotV);
@@ -133,7 +148,7 @@ void main() {
     const vec3 env_col = (sh_8.x * (sh_8.z * env0 - sh_8.y * env1) + sh_8.y * env1) * (r_occ * r_occ);
     const vec3 F0_base = (spec_tex.z == 0.0 && spec_tex.y == 0.0) ? vec3(spec_tex.x) : spec_tex;
     const vec3 F0 = det_w * ((det_alb.w * F0_base + vec3(det_gs.y * det_gs.y)) - F0_base) + F0_base;
-    const float fresnel = clamp((1.0 + NdotV) * (1.0 + NdotV), 0.0, 1.0) * exp2(5.0 * log2(1.0 - clamp(NdotV, 0.0, 1.0)));
+    const float fresnel = clamp((1.0 + NdotV) * (1.0 + NdotV), 0.0, 1.0) * schlick5(1.0 - clamp(NdotV, 0.0, 1.0));
     const vec3 out_spec = (((fresnel - fresnel * F0) * (gloss * gloss) + F0) * env_col) * (vec3(s4f(d3 + 4u), s4f(d3 + 5u), s4f(d3 + 6u)) * s5f(d4 + 12u));
 
     const vec3 alb_mix = det_w * ((det_alb.w * base_tex.rgb + det_alb.rgb) - base_tex.rgb) + base_tex.rgb;

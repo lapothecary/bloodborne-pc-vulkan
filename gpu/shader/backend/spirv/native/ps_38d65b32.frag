@@ -38,9 +38,9 @@ void main() {
     const ivec2 coord = ivec2(int(floor(gl_FragCoord.x * sx)), int(floor(gl_FragCoord.y * sy)));
     const vec4 src = texelFetch(fs_img0, coord, 0);
 
-    const float lut_r = texture(sampler1DArray(fs_img1, fs_samp0), vec2(src.x, 0.0)).x;
-    const float lut_g = texture(sampler1DArray(fs_img1, fs_samp0), vec2(src.y, 1.0)).x;
-    const float lut_b = texture(sampler1DArray(fs_img1, fs_samp0), vec2(src.z, 2.0)).x;
+    const float lut_r = textureLod(sampler1DArray(fs_img1, fs_samp0), vec2(src.x, 0.0), 0.0).x;
+    const float lut_g = textureLod(sampler1DArray(fs_img1, fs_samp0), vec2(src.y, 1.0), 0.0).x;
+    const float lut_b = textureLod(sampler1DArray(fs_img1, fs_samp0), vec2(src.z, 2.0), 0.0).x;
 
     frag_color0 = vec4(lut_b, lut_g, lut_r, src.w);
 }

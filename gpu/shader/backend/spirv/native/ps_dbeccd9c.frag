@@ -1,5 +1,6 @@
 #version 460
 #extension GL_EXT_samplerless_texture_functions : require
+#extension GL_EXT_demote_to_helper_invocation : require
 // Native Vulkan 1.3 GLSL PS 0x00000000dbeccd9c (G-Buffer unbaked cutout 6-MRT foliage)
 
 layout(location = 0) in vec4 fs_in_attr0_p;
@@ -57,24 +58,31 @@ void main() {
     const uint d2 = bitfieldExtract(bo0, 16, 8) >> 2u;
     const uint d3 = bitfieldExtract(bo0, 24, 8) >> 2u;
 
-    const vec3 n_in = fs_in_attr0_p.xyz;
-    const float n_len2 = dot(n_in, n_in);
-    const bool is_front = gl_FrontFacing;
-    const vec3 N_world = (is_front ? 1.0 : -1.0) * (n_in * safe_rsq(n_len2));
-
-    const vec2 screen_uv = fma(vec2(0.5, -0.5) * fs_in_attr2_p.xy, vec2(1.0 / fs_in_attr2_p.w), vec2(0.5));
-    const vec2 dither_uv = 0.25 * vec2(s1f(d0 + 4u), s1f(d0 + 5u)) * screen_uv;
-    const float dither_a = texture(sampler2D(fs_img0, fs_samp0), dither_uv).w - 0.5;
-
     const vec2 uv = fs_in_attr3_p.xy * vec2(s2f(d1 + 0u), s2f(d1 + 1u)) + vec2(s2f(d1 + 2u), s2f(d1 + 3u));
     const vec4 base_tex = texture(sampler2D(fs_img1, fs_samp1), uv);
 
     const uint mat_row = uint(fs_in_attr0_p.w * 1.00001526) * 13u;
     const float alpha_raw = base_tex.w * fs_in_attr1_p.w;
     const float out_alpha = alpha_raw * ssbo_3.data[d2 + (mat_row + 7u) * 4u + 3u];
-    if (s4f(d3 + 20u) > (s4f(d3 + 21u) * dither_a + alpha_raw) || out_alpha == 0.0) {
-        discard;
+    const float alpha_ref = s4f(d3 + 20u);
+    const float dither_scale = s4f(d3 + 21u);
+    float alpha_cmp = alpha_raw;
+    if (dither_scale != 0.0) {
+        const vec2 screen_uv = fma(vec2(0.5, -0.5) * fs_in_attr2_p.xy, vec2(1.0 / fs_in_attr2_p.w), vec2(0.5));
+        const vec2 dither_uv = 0.25 * vec2(s1f(d0 + 4u), s1f(d0 + 5u)) * screen_uv;
+        alpha_cmp += dither_scale * (texture(sampler2D(fs_img0, fs_samp0), dither_uv).w - 0.5);
     }
+    const bool alpha_fail = (out_alpha == 0.0) || (alpha_ref > alpha_cmp);
+    if (alpha_fail) {
+        demote;
+    }
+    if (alpha_fail || helperInvocationEXT()) {
+        return;
+    }
+
+    const vec3 n_in = fs_in_attr0_p.xyz;
+    const bool is_front = gl_FrontFacing;
+    const vec3 N_world = (is_front ? 1.0 : -1.0) * (n_in * safe_rsq(dot(n_in, n_in)));
 
     const vec4 sh_r = load_s3_v4(d2 + (mat_row + 9u) * 4u);
     const vec4 sh_g = load_s3_v4(d2 + (mat_row + 10u) * 4u);

@@ -220,6 +220,72 @@ void Rasterizer::DirectCopyBuffers(std::span<const DirectCopyRegion> regions) {
     if (regions.empty()) {
         return;
     }
+    constexpr size_t kMaxCoalescedBufCopies = 256u;
+    if (DrawPipe::OnStageB()) {
+        if (pending_buf_copies.capacity() < kMaxCoalescedBufCopies) [[unlikely]] {
+            pending_buf_copies.reserve(kMaxCoalescedBufCopies);
+        }
+        if (pending_buf_copies.empty() && !NextPipePacketIsBufferCopyBatch()) {
+            ExecuteDirectCopyBuffers(regions);
+            return;
+        }
+        pending_buf_copies.insert(pending_buf_copies.end(), regions.begin(), regions.end());
+        if (pending_buf_copies.size() < kMaxCoalescedBufCopies &&
+            NextPipePacketIsBufferCopyBatch()) {
+            return;
+        }
+        FlushPendingBufferCopies();
+        return;
+    }
+    if (!pending_buf_copies.empty()) [[unlikely]] {
+        FlushPendingBufferCopies();
+    }
+    ExecuteDirectCopyBuffers(regions);
+}
+
+void Rasterizer::FlushPendingBufferCopies() {
+    if (pending_buf_copies.empty()) {
+        return;
+    }
+    // Deduplicate superseded full-range destination overwrites across coalesced batches
+    // (e.g. dynamic constant buffers overwritten multiple times across culled draws before any
+    // surviving draw or intermediate GPU read consumes the earlier version).
+    const size_t n = pending_buf_copies.size();
+    if (n > 1) {
+        const auto overlaps = [](u64 a, u64 a_sz, u64 b, u64 b_sz) noexcept {
+            return a < (b + b_sz) && b < (a + a_sz);
+        };
+        for (size_t i = 0; i + 1 < n; ++i) {
+            auto& cur = pending_buf_copies[i];
+            if (!cur.dst_va || cur.byte_size == 0u) {
+                continue;
+            }
+            const u64 cur_end = cur.dst_va + cur.byte_size;
+            for (size_t j = i + 1; j < n; ++j) {
+                const auto& nxt = pending_buf_copies[j];
+                if (nxt.byte_size == 0u) {
+                    continue;
+                }
+                if (nxt.src_va && overlaps(cur.dst_va, cur.byte_size, nxt.src_va, nxt.byte_size)) {
+                    break; // intermediate copy reads from cur.dst_va: must preserve cur!
+                }
+                if (nxt.dst_va && nxt.dst_va <= cur.dst_va &&
+                    (nxt.dst_va + nxt.byte_size) >= cur_end) {
+                    cur.byte_size = 0u;
+                    break;
+                }
+            }
+        }
+    }
+    ExecuteDirectCopyBuffers(
+        std::span<const DirectCopyRegion>{pending_buf_copies.data(), pending_buf_copies.size()});
+    pending_buf_copies.clear();
+}
+
+void Rasterizer::ExecuteDirectCopyBuffers(std::span<const DirectCopyRegion> regions) {
+    if (regions.empty()) {
+        return;
+    }
     for (const auto& reg : regions) {
         if (reg.byte_size != 0 && reg.dst_va != 0) {
             InvalidateGdsMirrorRange(reg.dst_va, reg.byte_size);
@@ -530,10 +596,11 @@ void Rasterizer::DirectCopyBuffers(std::span<const DirectCopyRegion> regions) {
         }
 
         const s32 transient_idx = transient_index_by_reg[idx];
+        const u64 lookup_max_tail = std::max<u64>(4_MB, reg.byte_size / 3);
         if (n1_native_bufs && !VideoCore::GuestInPlace() &&
             !VideoCore::BufferCache::LayerActive() &&
             (reg.byte_size < 4096 ||
-             !texture_cache.FindImageFromRange(reg.src_va, reg.byte_size, true, 4_MB))) {
+             !texture_cache.FindImageFromRange(reg.src_va, reg.byte_size, true, lookup_max_tail))) {
             const auto [nat_dst, nat_dst_off] =
                 direct_buffers.TryResolveWrite(reg.dst_va, reg.byte_size, /*full_overwrite=*/true,
                                                /*track_access=*/true, &texture_cache);
@@ -589,26 +656,29 @@ void Rasterizer::DirectCopyBuffers(std::span<const DirectCopyRegion> regions) {
             continue;
         }
 
-        // Direct VkImage -> VkImage copy when the game copies render-target / proxy texture
+        // Direct VkImage -> VkImage copy when the game copies render-target / depth / proxy texture
         // memory through its 1D compute buffer copy helpers (0x26b2d30 / 0x26b2670).
+        // Scale tail allowance with resource size so 4K/8K D32SfloatS8Uint depth copies (where
+        // S8 stencil + HTILE tail is ~8.9 MiB at 3840x2160) stay on the zero-upload VkImage path.
         if (reg.byte_size >= 4096) {
-            constexpr u64 MaxTail = 4_MB;
             auto src_img_id =
-                texture_cache.FindImageFromRange(reg.src_va, reg.byte_size, true, MaxTail);
+                texture_cache.FindImageFromRange(reg.src_va, reg.byte_size, true, lookup_max_tail);
             auto dst_img_id =
-                texture_cache.FindImageFromRange(reg.dst_va, reg.byte_size, false, MaxTail);
+                texture_cache.FindImageFromRange(reg.dst_va, reg.byte_size, false, lookup_max_tail);
             if (src_img_id && !dst_img_id) {
                 const auto& src_img = texture_cache.GetImage(src_img_id);
+                const u64 max_img_tail = std::max<u64>(4_MB, src_img.info.guest_size / 2);
                 if (reg.byte_size >= src_img.info.guest_size &&
-                    reg.byte_size - src_img.info.guest_size <= MaxTail &&
-                    !src_img.info.props.is_depth) {
+                    reg.byte_size - src_img.info.guest_size <= max_img_tail) {
                     VideoCore::TextureCache::ImageDesc dst_desc{};
                     dst_desc.info = src_img.info;
                     dst_desc.info.guest_address = reg.dst_va;
                     dst_desc.info.meta_info = {};
                     dst_desc.info.stencil_addr = 0;
                     dst_desc.info.stencil_size = 0;
-                    dst_desc.type = VideoCore::TextureCache::BindingType::RenderTarget;
+                    dst_desc.type = src_img.info.props.is_depth
+                                        ? VideoCore::TextureCache::BindingType::DepthTarget
+                                        : VideoCore::TextureCache::BindingType::RenderTarget;
                     dst_img_id = texture_cache.FindImage(dst_desc, true);
                 }
             }
@@ -616,17 +686,23 @@ void Rasterizer::DirectCopyBuffers(std::span<const DirectCopyRegion> regions) {
                 auto& src_img = texture_cache.GetImage(src_img_id);
                 auto& dst_img = texture_cache.GetImage(dst_img_id);
                 const u64 image_size = src_img.info.guest_size;
+                const u64 max_img_tail = std::max<u64>(4_MB, image_size / 2);
                 if (image_size == dst_img.info.guest_size &&
                     src_img.info.pitch == dst_img.info.pitch && reg.byte_size >= image_size &&
-                    reg.byte_size - image_size <= MaxTail &&
+                    reg.byte_size - image_size <= max_img_tail &&
                     src_img.info.num_bits == dst_img.info.num_bits) {
                     flush_resolved();
                     runtime.CopyColorAndDepth(&src_img, &dst_img);
                     dst_img.gpu_write_tick = scheduler.CurrentTick();
+                    bool copied_tail_buf = false;
                     if (const u64 tail = reg.byte_size - image_size) {
                         const VAddr src_tail = src_img.info.guest_address + image_size;
                         const VAddr dst_tail = dst_img.info.guest_address + image_size;
-                        if (texture_cache.FindImageFromRange(dst_tail, tail, false)) {
+                        const auto tail_img_id =
+                            texture_cache.FindImageFromRange(dst_tail, tail, false);
+                        if (tail_img_id &&
+                            texture_cache.GetImage(tail_img_id).info.pixel_format !=
+                                vk::Format::eUndefined) {
                             const auto [tail_src_buf, tail_src_off] =
                                 buffer_cache.ObtainBuffer(src_tail, u32(tail), false);
                             const auto [tail_dst_buf, tail_dst_off] =
@@ -634,10 +710,12 @@ void Rasterizer::DirectCopyBuffers(std::span<const DirectCopyRegion> regions) {
                             const vk::BufferCopy tcopy{tail_src_off, tail_dst_off, tail};
                             runtime.CopyBuffer(tail_src_buf, tail_dst_buf, std::span{&tcopy, 1});
                             texture_cache.InvalidateMemoryFromGPU(dst_tail, tail);
+                            copied_tail_buf = true;
                         }
-                    } else if (reg.reserved != gx_direct_vk::kCopyFlagKnownCpuSource &&
-                               !VideoCore::DirectBuffers::OverlapsNativeOwnedRange(reg.dst_va,
-                                                                                   reg.byte_size)) {
+                    }
+                    if (!copied_tail_buf && reg.reserved != gx_direct_vk::kCopyFlagKnownCpuSource &&
+                        !VideoCore::DirectBuffers::OverlapsNativeOwnedRange(reg.dst_va,
+                                                                            reg.byte_size)) {
                         const size_t slot = static_cast<size_t>(
                             (((reg.src_va >> 12) * 0x9E3779B97F4A7C15ULL) ^
                              ((reg.dst_va >> 12) * 0xBF58476D1CE4E5B9ULL)) &
@@ -1418,7 +1496,7 @@ void Rasterizer::DirectClearDepthStencil(const DirectClearDepthStencilArgs& args
     if (!image_id) {
         return;
     }
-    (void)texture_cache.FindDepthTarget(image_id, desc);
+    const auto& view = texture_cache.FindDepthTarget(image_id, desc);
     auto& image = texture_cache.GetImage(image_id);
 
     vk::ImageAspectFlags aspect{};
@@ -1448,8 +1526,15 @@ void Rasterizer::DirectClearDepthStencil(const DirectClearDepthStencilArgs& args
         .extent = {.levels = 1, .layers = max_layer - args.first_slice},
     };
     const u32 stencil_val = args.stencil_and_flags & 0xFFu;
-    runtime.ClearDepthStencilImage(&image, range, aspect,
-                                   vk::ClearDepthStencilValue{args.depth_clear, stencil_val});
+    const u32 quad_mask = (args.stencil_and_flags >> 16) & 0xFu;
+    if (quad_mask != 0u && quad_mask != 0xFu) {
+        runtime.ClearDepthStencilQuadrants(
+            &image, *view.image_view, range, aspect,
+            vk::ClearDepthStencilValue{args.depth_clear, stencil_val}, quad_mask);
+    } else {
+        runtime.ClearDepthStencilImage(&image, range, aspect,
+                                       vk::ClearDepthStencilValue{args.depth_clear, stencil_val});
+    }
     image.gpu_write_tick = scheduler.CurrentTick();
 }
 

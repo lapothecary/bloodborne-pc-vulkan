@@ -24,7 +24,53 @@
 #include <cstdint>
 #include <cstddef>
 #include "gx_direct_vulkan.h"
+#include "gx_csm_shadow_layout.h"
 #include <cstring>
+
+namespace {
+
+struct CsmQuadrantClearSlot {
+    const void* depth_target;
+    uint32_t    quadrant_mask;
+    uint32_t    pad;
+};
+
+constinit CsmQuadrantClearSlot g_csm_quadrant_clear_slots[4] = {};
+
+} // namespace
+
+extern "C" void bb_gx_set_csm_quadrant_clear(const void* depth_target, uint32_t quadrant_mask) noexcept {
+    if (!depth_target) {
+        return;
+    }
+    const uint32_t masked = quadrant_mask & 0xFu;
+    int empty_idx = -1;
+    for (int i = 0; i < 4; ++i) {
+        const void* cur = __atomic_load_n(&g_csm_quadrant_clear_slots[i].depth_target, __ATOMIC_ACQUIRE);
+        if (cur == depth_target) {
+            __atomic_store_n(&g_csm_quadrant_clear_slots[i].quadrant_mask, masked, __ATOMIC_RELEASE);
+            return;
+        }
+        if (cur == nullptr && empty_idx < 0) {
+            empty_idx = i;
+        }
+    }
+    const int slot = (empty_idx >= 0) ? empty_idx : 0;
+    __atomic_store_n(&g_csm_quadrant_clear_slots[slot].quadrant_mask, masked, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_csm_quadrant_clear_slots[slot].depth_target, depth_target, __ATOMIC_RELEASE);
+}
+
+extern "C" uint32_t bb_gx_consume_csm_quadrant_clear(const void* depth_target) noexcept {
+    if (!depth_target) {
+        return 0u;
+    }
+    for (int i = 0; i < 4; ++i) {
+        if (__atomic_load_n(&g_csm_quadrant_clear_slots[i].depth_target, __ATOMIC_ACQUIRE) == depth_target) {
+            return __atomic_exchange_n(&g_csm_quadrant_clear_slots[i].quadrant_mask, 0u, __ATOMIC_ACQ_REL);
+        }
+    }
+    return 0u;
+}
 
 namespace Bloodborne::CoreGraphics2::Gnm {
 
@@ -1204,6 +1250,7 @@ void CGGpuBlitAndClearPassesGnm_ResolveMsaaColorTarget(
     *reinterpret_cast<uint32_t*>(gnmx_ctx_wrapper + 0xb5a4) = prim_ctl;
     *reinterpret_cast<uint64_t*>(gnmx_ctx_wrapper + 0xb6f0) = ffff_58;
 
+    const auto blit_bundle_mark = gx_direct_vk::CaptureDrawBundleBookmark(gnmx_ctx);
     const void* vs_hdr = reinterpret_cast<const void*>(GX_VMA(0x546c530ULL));
     const void* ps_hdr = reinterpret_cast<const void*>(GX_VMA(0x546c778ULL));
     GX_CALL(void, 0x26ce1e0ULL, (void*, void*, const void*, const void*), binder, gnmx_ctx, vs_hdr, ps_hdr);
@@ -1215,7 +1262,7 @@ void CGGpuBlitAndClearPassesGnm_ResolveMsaaColorTarget(
     }
     GX_CALL(void, 0x26ce5e0ULL, (void*, void*, const void*, const void*), binder, gnmx_ctx, vs_hdr, ps_hdr);
     if (gx_direct_vk::DirectRingEnabled()) {
-        gx_direct_vk::EmitDrawAuto(gnmx_ctx, 3u, 1u, 0);
+        gx_direct_vk::EmitDrawAutoBundled(gnmx_ctx, blit_bundle_mark, 3u, 1u, 0);
     } else {
         GX_CALL(void, 0x1075370ULL, (void*, uint32_t), gnmx_ctx, 1u);
         GX_CALL(void, 0x10741b0ULL, (void*, uint32_t), gnmx_ctx, 3u);
@@ -1392,7 +1439,12 @@ void CGGpuBlitAndClearPassesGnm_ClearDepthStencilTarget(
     bool clear_z = (clear_flags & 1u) != 0u;
     bool clear_s = ((clear_flags & 2u) != 0u) && (GX_CALL(uint32_t, 0x10727a0ULL, (const void*), depth_target) != 0u);
 
-    if (GX_CALL(bool, 0x1072730ULL, (const void*), depth_target)) {
+    const uint32_t csm_quad_mask = clear_z ? (bb_gx_consume_csm_quadrant_clear(depth_target) & 0xFu) : 0u;
+    const bool partial_csm_clear =
+        (csm_quad_mask != 0u && csm_quad_mask != 0xFu) &&
+        gx_direct_vk::EnabledV1Sub(gx_direct_vk::kV1Sub_ClearDepthDraw);
+
+    if (!partial_csm_clear && GX_CALL(bool, 0x1072730ULL, (const void*), depth_target)) {
         const bool htile_stencil = GX_CALL(bool, 0x1072750ULL, (const void*), depth_target);
         const float htile_scale = *reinterpret_cast<const float*>(gnmx_ctx_wrapper + 0xb650) *
                                   (*reinterpret_cast<const float*>(GX_VMA(0x486fa44ULL)));
@@ -1511,7 +1563,8 @@ void CGGpuBlitAndClearPassesGnm_ClearDepthStencilTarget(
         cargs.depth_clear = depth_clear_value;
         cargs.stencil_and_flags = static_cast<uint32_t>(stencil_clear_value) |
                                   (clear_z ? 0x100u : 0u) |
-                                  (clear_s ? 0x200u : 0u);
+                                  (clear_s ? 0x200u : 0u) |
+                                  (partial_csm_clear ? (csm_quad_mask << 16) : 0u);
         GX_CALL(void, 0x26b9850ULL, (void*, void*), sync_tracker, gnmx_ctx);
         if (gx_direct_vk::EmitClearDepthStencil(gnmx_ctx, cargs)) {
             const uint32_t s_base256 = GX_CALL(uint32_t, 0x1072770ULL, (const void*), depth_target);

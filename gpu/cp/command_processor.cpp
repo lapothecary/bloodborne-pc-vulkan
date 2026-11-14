@@ -61,12 +61,615 @@ using Vulkan::DrawPipe;
 constexpr u32 ComputeShOffset = 0x200; ///< COMPUTE_* in the SH bank
 constexpr u32 ComputeWords = sizeof(ComputeProgram) / 4;
 
-bool InComputeRange(u32 sh_offset) {
+[[gnu::always_inline]] inline bool InComputeRange(u32 sh_offset) noexcept {
     return sh_offset >= ComputeShOffset && sh_offset <= ComputeShOffset + ComputeWords;
 }
 
-u32 BodyWords(u32 header) {
+[[gnu::always_inline]] inline u32 BodyWords(u32 header) noexcept {
     return ((header >> 16) & 0x3FFF) + 1;
+}
+
+[[gnu::always_inline]] inline void BumpPsoAndDyn(u64* pso_sig_epoch, u64* dyn_reg_epoch) noexcept {
+    if (pso_sig_epoch) {
+        ++(*pso_sig_epoch);
+    }
+    if (dyn_reg_epoch) {
+        ++(*dyn_reg_epoch);
+    }
+}
+
+[[gnu::always_inline]] inline constexpr bool ContextSpanAffectsPsoSig(u32 ctx_off,
+                                                                      u32 count) noexcept {
+    if (count == 0u) {
+        return false;
+    }
+    const u32 end = ctx_off + count - 1u;
+    return (ctx_off <= 0x003u && end >= 0x003u) || (ctx_off <= 0x017u && end >= 0x010u) ||
+           (ctx_off <= 0x08Fu && end >= 0x08Eu) || (ctx_off <= 0x1C5u && end >= 0x191u) ||
+           (ctx_off <= 0x1E7u && end >= 0x1E0u) || (ctx_off <= 0x207u && end >= 0x202u) ||
+           (ctx_off <= 0x2A9u && end >= 0x286u) || (ctx_off <= 0x2DEu && end >= 0x2ABu) ||
+           (ctx_off <= 0x2EAu && end >= 0x2E4u) || (ctx_off <= 0x2F8u && end >= 0x2F8u) ||
+           (ctx_off <= 0x38Fu && end >= 0x318u);
+}
+
+[[gnu::always_inline]] inline void MarkReg(Gcn::RegDirty* dirty, u32 index, u32 count) noexcept {
+    if (dirty) {
+        dirty->Mark(index, count);
+    }
+}
+
+[[gnu::always_inline]] inline void MarkShReg(Gcn::RegDirty* dirty, bool track_all, u32 index,
+                                             u32 count) noexcept {
+    if (track_all) [[unlikely]] {
+        dirty->Mark(index, count);
+    }
+}
+
+[[gnu::always_inline]] inline void WriteReg(Gcn::Regs& regs, Gcn::RegDirty* dirty, bool track_all,
+                                            u32 index, u32 value) noexcept {
+    if (regs.reg_array[index] != value) {
+        regs.reg_array[index] = value;
+        MarkReg(dirty, index, 1u);
+    } else if (track_all) [[unlikely]] {
+        MarkReg(dirty, index, 1u);
+    }
+}
+
+[[gnu::always_inline]] inline bool SetBankRegs(Gcn::Regs& regs, Gcn::RegDirty* dirty,
+                                               bool track_all, const u32* body, u32 body_words,
+                                               u32 bank) noexcept {
+    const u32 index = bank + (body[0] & 0xFFFFu);
+    const u32 count = body_words - 1u;
+    const u32* src = body + 1u;
+    bool any_changed = false;
+    for (u32 i = 0; i < count; ++i) {
+        if (regs.reg_array[index + i] != src[i]) {
+            regs.reg_array[index + i] = src[i];
+            any_changed = true;
+        }
+    }
+    if (bank == Bank::Sh) {
+        MarkShReg(dirty, track_all, index, count);
+    } else if (any_changed || track_all) {
+        MarkReg(dirty, index, count);
+    }
+    return any_changed;
+}
+
+[[gnu::always_inline]] inline bool ApplyDirectStateSubOp(Gcn::Regs& regs, Gcn::RegDirty* dirty,
+                                                         bool track_all, DirectVk::Op sub_op,
+                                                         u32 sub_op_word, const u32* pay,
+                                                         u32 pay_words, bool& pso_chg,
+                                                         bool& dyn_chg) noexcept {
+    switch (sub_op) {
+    case DirectVk::Op::SetIndexState: {
+        if (pay_words != 4u) {
+            return false;
+        }
+        DirectVk::SetIndexStateArgs a{};
+        std::memcpy(&a, pay, sizeof(a));
+        if (a.index_and_flags & 0x100u) {
+            const u32 new_prim = a.prim_type & 0x3Fu;
+            if (regs.reg_array[Reg::VgtPrimitiveType] != new_prim) {
+                pso_chg = true;
+                dyn_chg = true;
+            }
+            WriteReg(regs, dirty, track_all, Reg::VgtPrimitiveType, new_prim);
+        }
+        if (a.index_and_flags & 0x200u) {
+            WriteReg(regs, dirty, track_all, Reg::VgtDmaBase, u32(a.ib_va) & ~1u);
+            WriteReg(regs, dirty, track_all, Reg::VgtDmaBaseHi,
+                     (regs.reg_array[Reg::VgtDmaBaseHi] & ~0xFFu) | (u32(a.ib_va >> 32) & 0xFFu));
+        }
+        if (a.index_and_flags & 0x400u) {
+            WriteReg(regs, dirty, track_all, Reg::VgtDmaIndexType, a.index_and_flags & 0xFFu);
+        }
+        return true;
+    }
+    case DirectVk::Op::SetStageUserData: {
+        if (pay_words < 1u) {
+            return false;
+        }
+        const u32 sh_offset = pay[0] & 0xFFFFu;
+        if (InComputeRange(sh_offset)) {
+            return false;
+        }
+        u32 mask = pay[0] >> 16;
+        const u32 count = pay_words - 1u;
+        if (static_cast<u32>(std::popcount(mask)) != count) {
+            return false;
+        }
+        if ((mask & (mask + 1u)) == 0u) [[likely]] {
+            std::memcpy(&regs.reg_array[Bank::Sh + sh_offset], pay + 1u, count * sizeof(u32));
+            MarkShReg(dirty, track_all, Bank::Sh + sh_offset, count);
+        } else {
+            u32 src = 1u;
+            while (mask != 0u) {
+                const u32 bit = static_cast<u32>(std::countr_zero(mask));
+                mask &= (mask - 1u);
+                regs.reg_array[Bank::Sh + sh_offset + bit] = pay[src++];
+            }
+            MarkShReg(dirty, track_all, Bank::Sh + sh_offset, 16u);
+        }
+        if ((sh_offset & 0x3Fu) < 0x0Cu) [[unlikely]] {
+            pso_chg = true;
+        }
+        return true;
+    }
+    case DirectVk::Op::SetContextRegsPacked: {
+        if (pay_words < 2u) {
+            return false;
+        }
+        const u32 num_spans = sub_op_word >> 16;
+        u32 idx = 0u;
+        bool any_changed = false;
+        bool span_pso_changed = false;
+        for (u32 s = 0u; s < num_spans; ++s) {
+            if (idx >= pay_words) {
+                return false;
+            }
+            const u32 span_hdr = pay[idx++];
+            const u32 ctx_off = span_hdr & 0xFFFFu;
+            const u32 count = span_hdr >> 16;
+            if (count == 0u || idx + count > pay_words ||
+                Bank::Context + ctx_off + count > std::size(regs.reg_array)) {
+                return false;
+            }
+            const u32 dst_reg = Bank::Context + ctx_off;
+            bool span_changed = false;
+            for (u32 i = 0; i < count; ++i) {
+                if (regs.reg_array[dst_reg + i] != pay[idx + i]) {
+                    regs.reg_array[dst_reg + i] = pay[idx + i];
+                    span_changed = true;
+                }
+            }
+            if (span_changed) {
+                any_changed = true;
+                if (!span_pso_changed && ContextSpanAffectsPsoSig(ctx_off, count)) {
+                    span_pso_changed = true;
+                }
+            }
+            if (span_changed || track_all) {
+                MarkReg(dirty, dst_reg, count);
+            }
+            idx += count;
+        }
+        if (idx != pay_words) {
+            return false;
+        }
+        if (any_changed) {
+            dyn_chg = true;
+            if (span_pso_changed) {
+                pso_chg = true;
+            }
+        }
+        return true;
+    }
+    case DirectVk::Op::BindVsShader: {
+        if (pay_words != 7u) {
+            return false;
+        }
+        const bool only_sh = ((sub_op_word >> 18) & 1u) != 0u;
+        bool changed = (regs.reg_array[Bank::Sh + 0x48u] != pay[0]) ||
+                       (regs.reg_array[Bank::Sh + 0x49u] != pay[1]) ||
+                       (regs.reg_array[Bank::Sh + 0x4Au] != pay[2]) ||
+                       (regs.reg_array[Bank::Sh + 0x4Bu] != pay[3]);
+        std::memcpy(&regs.reg_array[Bank::Sh + 0x48u], pay, 4u * sizeof(u32));
+        MarkShReg(dirty, track_all, Bank::Sh + 0x48u, 4u);
+        if (!only_sh) {
+            const bool c54 = (regs.reg_array[Bank::Context + 0x1B1u] != pay[4]);
+            const bool c56 = (regs.reg_array[Bank::Context + 0x1C3u] != pay[5]);
+            const bool c64 = (regs.reg_array[Bank::Context + 0x207u] != pay[6]);
+            changed |= c54 || c56 || c64;
+            regs.reg_array[Bank::Context + 0x1B1u] = pay[4];
+            regs.reg_array[Bank::Context + 0x1C3u] = pay[5];
+            regs.reg_array[Bank::Context + 0x207u] = pay[6];
+            if (dirty) {
+                if (!track_all) [[likely]] {
+                    dirty->stage_b_mask[0] |=
+                        (c54 ? (1ULL << 54) : 0ULL) | (c56 ? (1ULL << 56) : 0ULL);
+                    if (c64) {
+                        dirty->stage_b_mask[1] |= (1ULL << 0);
+                        dyn_chg = true;
+                    }
+                } else {
+                    MarkReg(dirty, Bank::Context + 0x1B1u, 1u);
+                    MarkReg(dirty, Bank::Context + 0x1C3u, 1u);
+                    MarkReg(dirty, Bank::Context + 0x207u, 1u);
+                }
+            } else if (c64) {
+                dyn_chg = true;
+            }
+        }
+        if (changed) {
+            pso_chg = true;
+        }
+        return true;
+    }
+    case DirectVk::Op::BindPsShader: {
+        const bool valid = ((sub_op_word >> 16) & 1u) != 0u;
+        const bool sdk350 = ((sub_op_word >> 17) & 1u) != 0u;
+        const bool only_sh = ((sub_op_word >> 18) & 1u) != 0u;
+        if (valid && pay_words == 12u) {
+            bool changed = (regs.reg_array[Bank::Sh + 0x08u] != pay[0]) ||
+                           (regs.reg_array[Bank::Sh + 0x09u] != pay[1]) ||
+                           (regs.reg_array[Bank::Sh + 0x0Au] != pay[2]) ||
+                           (regs.reg_array[Bank::Sh + 0x0Bu] != pay[3]);
+            std::memcpy(&regs.reg_array[Bank::Sh + 0x08u], pay, 4u * sizeof(u32));
+            MarkShReg(dirty, track_all, Bank::Sh + 0x08u, 4u);
+            if (!only_sh) {
+                const bool c56 = (regs.reg_array[Bank::Context + 0x1C4u] != pay[4]) ||
+                                 (regs.reg_array[Bank::Context + 0x1C5u] != pay[5]);
+                const bool c54 = (regs.reg_array[Bank::Context + 0x1B3u] != pay[6]) ||
+                                 (regs.reg_array[Bank::Context + 0x1B4u] != pay[7]) ||
+                                 (regs.reg_array[Bank::Context + 0x1B6u] != pay[8]);
+                const bool c55 = (regs.reg_array[Bank::Context + 0x1B8u] != pay[9]);
+                const bool c64 = (regs.reg_array[Bank::Context + 0x203u] != pay[10]);
+                const bool c17 = (regs.reg_array[Bank::Context + 0x08Fu] != pay[11]);
+                changed |= c56 || c54 || c55 || c64 || c17;
+                regs.reg_array[Bank::Context + 0x1C4u] = pay[4];
+                regs.reg_array[Bank::Context + 0x1C5u] = pay[5];
+                regs.reg_array[Bank::Context + 0x1B3u] = pay[6];
+                regs.reg_array[Bank::Context + 0x1B4u] = pay[7];
+                regs.reg_array[Bank::Context + 0x1B6u] = pay[8];
+                regs.reg_array[Bank::Context + 0x1B8u] = pay[9];
+                regs.reg_array[Bank::Context + 0x203u] = pay[10];
+                regs.reg_array[Bank::Context + 0x08Fu] = pay[11];
+                if (dirty) {
+                    if (!track_all) [[likely]] {
+                        dirty->stage_b_mask[0] |= (c17 ? (1ULL << 17) : 0ULL) |
+                                                  (c54 ? (1ULL << 54) : 0ULL) |
+                                                  (c55 ? (1ULL << 55) : 0ULL) |
+                                                  (c56 ? (1ULL << 56) : 0ULL);
+                        if (c64) {
+                            dirty->stage_b_mask[1] |= (1ULL << 0);
+                        }
+                    } else {
+                        MarkReg(dirty, Bank::Context + 0x1C4u, 2u);
+                        MarkReg(dirty, Bank::Context + 0x1B3u, 2u);
+                        MarkReg(dirty, Bank::Context + 0x1B6u, 1u);
+                        MarkReg(dirty, Bank::Context + 0x1B8u, 1u);
+                        MarkReg(dirty, Bank::Context + 0x203u, 1u);
+                        MarkReg(dirty, Bank::Context + 0x08Fu, 1u);
+                    }
+                }
+            }
+            if (changed) {
+                pso_chg = true;
+            }
+            return true;
+        }
+        if (!valid && pay_words == 0u) {
+            regs.reg_array[Bank::Sh + 0x08u] = 0u;
+            regs.reg_array[Bank::Sh + 0x09u] = 0u;
+            MarkShReg(dirty, track_all, Bank::Sh + 0x08u, 2u);
+            if (!only_sh) {
+                WriteReg(regs, dirty, track_all, Bank::Context + 0x203u, 0u);
+            }
+            if (sdk350) {
+                WriteReg(regs, dirty, track_all, Bank::Context + 0x08Fu, 0xFu);
+            }
+            pso_chg = true;
+            return true;
+        }
+        return false;
+    }
+    case DirectVk::Op::BindEsShader:
+        if (pay_words != 4u) {
+            return false;
+        }
+        std::memcpy(&regs.reg_array[Bank::Sh + 0xC8u], pay, 4u * sizeof(u32));
+        MarkShReg(dirty, track_all, Bank::Sh + 0xC8u, 4u);
+        pso_chg = true;
+        dyn_chg = true;
+        return true;
+    case DirectVk::Op::BindGsShader: {
+        if (pay_words != 7u) {
+            return false;
+        }
+        const bool only_sh = ((sub_op_word >> 18) & 1u) != 0u;
+        std::memcpy(&regs.reg_array[Bank::Sh + 0x88u], pay, 4u * sizeof(u32));
+        MarkShReg(dirty, track_all, Bank::Sh + 0x88u, 4u);
+        if (!only_sh) {
+            WriteReg(regs, dirty, track_all, Bank::Context + 0x2E5u, pay[4]);
+            WriteReg(regs, dirty, track_all, Bank::Context + 0x29Bu, pay[5]);
+            WriteReg(regs, dirty, track_all, Bank::Context + 0x2E4u, pay[6]);
+        }
+        pso_chg = true;
+        dyn_chg = true;
+        return true;
+    }
+    case DirectVk::Op::BindHsShader: {
+        if (pay_words != 8u) {
+            return false;
+        }
+        const bool only_sh = ((sub_op_word >> 18) & 1u) != 0u;
+        std::memcpy(&regs.reg_array[Bank::Sh + 0x108u], pay, 4u * sizeof(u32));
+        MarkShReg(dirty, track_all, Bank::Sh + 0x108u, 4u);
+        if (!only_sh) {
+            WriteReg(regs, dirty, track_all, Bank::Context + 0x286u, pay[5]);
+            WriteReg(regs, dirty, track_all, Bank::Context + 0x287u, pay[6]);
+            WriteReg(regs, dirty, track_all, Bank::Context + 0x2DBu, pay[4]);
+            WriteReg(regs, dirty, track_all, Bank::Context + 0x2D6u, pay[7]);
+        }
+        pso_chg = true;
+        dyn_chg = true;
+        return true;
+    }
+    case DirectVk::Op::BindLsShader:
+        if (pay_words != 4u) {
+            return false;
+        }
+        std::memcpy(&regs.reg_array[Bank::Sh + 0x148u], pay, 4u * sizeof(u32));
+        MarkShReg(dirty, track_all, Bank::Sh + 0x148u, 4u);
+        pso_chg = true;
+        dyn_chg = true;
+        return true;
+    case DirectVk::Op::SetVgtControl: {
+        if (pay_words != 0u) {
+            return false;
+        }
+        const u32 prim_group_sz_minus_1 = (sub_op_word >> 16) & 0xFFu;
+        const u32 partial_vs_wave_mode = (sub_op_word >> 24) & 1u;
+        WriteReg(regs, dirty, track_all, Bank::Context + 0x2AAu,
+                 (partial_vs_wave_mode << 16) | prim_group_sz_minus_1);
+        return true;
+    }
+    default:
+        return false;
+    }
+}
+
+[[gnu::always_inline]] inline void ApplyDirectDrawIndexedWords(Gcn::Regs& regs,
+                                                               Gcn::RegDirty* dirty, bool track_all,
+                                                               const u32* dw) noexcept {
+    DirectVk::DrawIndexedArgs a{};
+    std::memcpy(&a, dw, sizeof(a));
+    const u32 base_vtx = static_cast<u32>(a.base_vertex);
+    const bool chg_idx_off = (regs.reg_array[Reg::VgtIndxOffset] != base_vtx);
+    const bool chg_inst = (regs.reg_array[Reg::VgtNumInstances] != a.instance_count);
+    const bool chg_max = (regs.reg_array[Reg::VgtDmaMaxSize] != a.index_count);
+    const bool chg_num = (regs.reg_array[Reg::VgtNumIndices] != a.index_count);
+    const bool chg_init = (regs.reg_array[Reg::VgtDrawInitiator] != 0u);
+    regs.reg_array[Reg::VgtIndxOffset] = base_vtx;
+    regs.reg_array[Reg::VgtNumInstances] = a.instance_count;
+    regs.reg_array[Reg::VgtDmaMaxSize] = a.index_count;
+    regs.reg_array[Reg::VgtNumIndices] = a.index_count;
+    regs.reg_array[Reg::VgtDrawInitiator] = 0u;
+    if (dirty) {
+        if (!track_all) [[likely]] {
+            dirty->stage_b_mask[0] |=
+                (chg_idx_off ? (1ULL << 32) : 0ULL) | (chg_init ? (1ULL << 63) : 0ULL);
+            dirty->stage_b_mask[1] |=
+                (chg_max ? (1ULL << (83 - 64)) : 0ULL) |
+                ((chg_inst || chg_num) ? (1ULL << (116 - 64)) : 0ULL);
+        } else {
+            MarkReg(dirty, Reg::VgtIndxOffset, 1u);
+            MarkReg(dirty, Reg::VgtNumInstances, 1u);
+            MarkReg(dirty, Reg::VgtDmaMaxSize, 1u);
+            MarkReg(dirty, Reg::VgtNumIndices, 1u);
+            MarkReg(dirty, Reg::VgtDrawInitiator, 1u);
+        }
+    }
+}
+
+[[gnu::always_inline]] inline void ApplyDirectDrawIndexAddrWords(
+    Gcn::Regs& regs, Gcn::RegDirty* dirty, bool track_all, const u32* dw, bool& pso_chg,
+    bool& dyn_chg) noexcept {
+    DirectVk::DrawIndexAddrArgs a{};
+    std::memcpy(&a, dw, sizeof(a));
+    if (a.prim_and_size & 0x100u) {
+        const u32 new_prim = a.prim_and_size & 0x3Fu;
+        if (regs.reg_array[Reg::VgtPrimitiveType] != new_prim) {
+            pso_chg = true;
+            dyn_chg = true;
+        }
+        WriteReg(regs, dirty, track_all, Reg::VgtPrimitiveType, new_prim);
+    }
+    if (a.prim_and_size & 0x200u) {
+        WriteReg(regs, dirty, track_all, Reg::VgtDmaIndexType, (a.prim_and_size >> 16) & 0xFFu);
+    }
+    WriteReg(regs, dirty, track_all, Reg::VgtDmaMaxSize, a.index_count);
+    WriteReg(regs, dirty, track_all, Reg::VgtDmaBase, u32(a.ib_va) & ~1u);
+    WriteReg(regs, dirty, track_all, Reg::VgtDmaBaseHi,
+             (regs.reg_array[Reg::VgtDmaBaseHi] & ~0xFFu) | (u32(a.ib_va >> 32) & 0xFFu));
+    WriteReg(regs, dirty, track_all, Reg::VgtNumIndices, a.index_count);
+    WriteReg(regs, dirty, track_all, Reg::VgtDrawInitiator, 0u);
+}
+
+[[gnu::always_inline]] inline void ApplyDirectDrawAutoWords(Gcn::Regs& regs, Gcn::RegDirty* dirty,
+                                                            bool track_all,
+                                                            const u32* dw) noexcept {
+    DirectVk::DrawAutoArgs a{};
+    std::memcpy(&a, dw, sizeof(a));
+    WriteReg(regs, dirty, track_all, Reg::VgtIndxOffset, static_cast<u32>(a.start_vertex));
+    WriteReg(regs, dirty, track_all, Reg::VgtNumInstances, a.instance_count);
+    WriteReg(regs, dirty, track_all, Reg::VgtNumIndices, a.vertex_count);
+    WriteReg(regs, dirty, track_all, Reg::VgtDrawInitiator, 2u);
+}
+
+[[gnu::noinline]] bool ApplyInitDefaultHardwareState(Gcn::Regs& regs, Gcn::RegDirty* dirty,
+                                                     bool track_all, u32 op_word,
+                                                     u64* pso_sig_epoch,
+                                                     u64* dyn_reg_epoch) noexcept {
+    const u32 gen = (op_word >> 16) & 0xFFu;
+    if (gen > 5u) {
+        return false;
+    }
+    regs.SetDefaults();
+    if (dirty) {
+        dirty->Clear();
+        dirty->reset = true;
+    }
+    BumpPsoAndDyn(pso_sig_epoch, dyn_reg_epoch);
+    if (gen == 4u) {
+        WriteReg(regs, dirty, track_all, Reg::VgtNumInstances, 1u);
+        WriteReg(regs, dirty, track_all, Bank::Context + 0x102u, 0u);
+        WriteReg(regs, dirty, track_all, Bank::Context + 0x202u, 0xCC0010u);
+        return true;
+    }
+    WriteReg(regs, dirty, track_all, Bank::Context + 0x2F9u, 0x2Du);
+    WriteReg(regs, dirty, track_all, Bank::Context + 0x282u, 8u);
+    WriteReg(regs, dirty, track_all, Bank::Context + 0x280u, 0x80008u);
+    WriteReg(regs, dirty, track_all, Bank::Context + 0x281u, 0xFFFF0000u);
+    WriteReg(regs, dirty, track_all, Bank::Context + 0x204u, 0u);
+    WriteReg(regs, dirty, track_all, Bank::Context + 0x206u, 0x43Fu);
+    WriteReg(regs, dirty, track_all, Bank::Context + 0x083u, 0xFFFFu);
+    WriteReg(regs, dirty, track_all, Bank::Context + 0x317u, 0x10u);
+    WriteReg(regs, dirty, track_all, Bank::Context + 0x2FAu, 0x3F800000u);
+    WriteReg(regs, dirty, track_all, Bank::Context + 0x2FCu, 0x3F800000u);
+    WriteReg(regs, dirty, track_all, Bank::Context + 0x2FBu, 0x3F800000u);
+    WriteReg(regs, dirty, track_all, Bank::Context + 0x2FDu, 0x3F800000u);
+    WriteReg(regs, dirty, track_all, Bank::Context + 0x202u, 0xCC0010u);
+    WriteReg(regs, dirty, track_all, Bank::Context + 0x30Eu, 0xFFFFFFFFu);
+    WriteReg(regs, dirty, track_all, Bank::Context + 0x30Fu, 0xFFFFFFFFu);
+    WriteReg(regs, dirty, track_all, Reg::VgtNumInstances, 1u);
+    if (gen <= 1u) {
+        regs.reg_array[Bank::Sh + 0x007u] = 0x1FFu;
+        regs.reg_array[Bank::Sh + 0x046u] = 0x1FFu;
+        regs.reg_array[Bank::Sh + 0x087u] = 0x1FFu;
+        regs.reg_array[Bank::Sh + 0x0C7u] = 0x1FFu;
+        regs.reg_array[Bank::Sh + 0x107u] = 0u;
+        regs.reg_array[Bank::Sh + 0x147u] = 0x1FFu;
+        MarkShReg(dirty, track_all, Bank::Sh + 0x007u, 1u);
+        MarkShReg(dirty, track_all, Bank::Sh + 0x046u, 1u);
+        MarkShReg(dirty, track_all, Bank::Sh + 0x087u, 1u);
+        MarkShReg(dirty, track_all, Bank::Sh + 0x0C7u, 1u);
+        MarkShReg(dirty, track_all, Bank::Sh + 0x107u, 1u);
+        MarkShReg(dirty, track_all, Bank::Sh + 0x147u, 1u);
+    } else if (gen <= 3u) {
+        regs.reg_array[Bank::Sh + 0x007u] = 0x1701FFu;
+        regs.reg_array[Bank::Sh + 0x046u] = 0x1701FDu;
+        regs.reg_array[Bank::Sh + 0x087u] = 0x1701FFu;
+        regs.reg_array[Bank::Sh + 0x0C7u] = 0x1701FDu;
+        regs.reg_array[Bank::Sh + 0x107u] = 0x17u;
+        regs.reg_array[Bank::Sh + 0x147u] = 0x1701FDu;
+        regs.reg_array[Bank::Sh + 0x047u] = 0x1Cu;
+        MarkShReg(dirty, track_all, Bank::Sh + 0x007u, 1u);
+        MarkShReg(dirty, track_all, Bank::Sh + 0x046u, 2u);
+        MarkShReg(dirty, track_all, Bank::Sh + 0x087u, 1u);
+        MarkShReg(dirty, track_all, Bank::Sh + 0x0C7u, 1u);
+        MarkShReg(dirty, track_all, Bank::Sh + 0x107u, 1u);
+        MarkShReg(dirty, track_all, Bank::Sh + 0x147u, 1u);
+    }
+    WriteReg(regs, dirty, track_all, Bank::Context + 0x1B1u, 2u);
+    WriteReg(regs, dirty, track_all, Bank::Context + 0x101u, 0u);
+    WriteReg(regs, dirty, track_all, Bank::Context + 0x100u, 0xFFFFFFFFu);
+    WriteReg(regs, dirty, track_all, Bank::Context + 0x103u, 0u);
+    WriteReg(regs, dirty, track_all, Bank::Context + 0x284u, 0u);
+    WriteReg(regs, dirty, track_all, Bank::Context + 0x290u, 0u);
+    WriteReg(regs, dirty, track_all, Bank::Context + 0x2AEu, 0u);
+    if (gen == 3u || gen == 5u) {
+        WriteReg(regs, dirty, track_all, Bank::Context + 0x102u, 0u);
+    }
+    WriteReg(regs, dirty, track_all, Bank::Context + 0x292u, 0u);
+    WriteReg(regs, dirty, track_all, Bank::Context + 0x293u, (gen == 0u) ? 0x6000000u : 0x6020000u);
+    WriteReg(regs, dirty, track_all, Bank::Context + 0x2F8u, 0u);
+    WriteReg(regs, dirty, track_all, Bank::Context + 0x2DEu, 0x1E9u);
+    WriteReg(regs, dirty, track_all, Bank::Context + 0x295u, 0x100u);
+    WriteReg(regs, dirty, track_all, Bank::Context + 0x296u, 0x100u);
+    WriteReg(regs, dirty, track_all, Bank::Context + 0x297u, 4u);
+    if (gen <= 3u) {
+        WriteReg(regs, dirty, track_all, Bank::Uconfig + 0x200u, 0xE0000000u);
+    }
+    if (gen == 3u || gen == 5u) {
+        WriteReg(regs, dirty, track_all, Bank::Context + 0x2AAu, 0xFFu);
+    }
+    BumpPsoAndDyn(pso_sig_epoch, dyn_reg_epoch);
+    return true;
+}
+
+[[gnu::noinline]] bool ApplyDrawBundlePacket(Regs& regs, RegDirty* dirty, bool track_all,
+                                             u32 op_word, const u32* body, u32 body_words,
+                                             u64* pso_sig_epoch, u64* dyn_reg_epoch) noexcept {
+    if (body_words < 7u) {
+        return false;
+    }
+    const u32 draw_kind = (op_word >> 16) & 0xFu;
+    const u32 sub_count = op_word >> 20;
+    const u32 state_end = body_words - 4u;
+    u32 cursor = 2u;
+    bool pso_chg = false;
+    bool dyn_chg = false;
+    for (u32 i = 0u; i < sub_count; ++i) {
+        if (cursor >= state_end) {
+            return false;
+        }
+        const u32 sub_hdr = body[cursor++];
+        const auto sub_op = DirectVk::Op(sub_hdr & 0xFFu);
+        const u32 pay_words = (sub_hdr >> 8) & 0xFFu;
+        const u32 sub_op_word = sub_hdr & 0xFFFF00FFu;
+        if (cursor + pay_words > state_end) {
+            return false;
+        }
+        if (!ApplyDirectStateSubOp(regs, dirty, track_all, sub_op, sub_op_word, body + cursor,
+                                   pay_words, pso_chg, dyn_chg)) {
+            return false;
+        }
+        cursor += pay_words;
+    }
+    if (cursor != state_end) {
+        return false;
+    }
+    const u32* draw_words = body + state_end;
+    if (draw_kind == 0u) {
+        ApplyDirectDrawIndexedWords(regs, dirty, track_all, draw_words);
+    } else if (draw_kind == 1u) {
+        ApplyDirectDrawAutoWords(regs, dirty, track_all, draw_words);
+    } else if (draw_kind == 2u) {
+        ApplyDirectDrawIndexAddrWords(regs, dirty, track_all, draw_words, pso_chg, dyn_chg);
+    } else {
+        return false;
+    }
+    if (pso_chg && pso_sig_epoch) {
+        ++(*pso_sig_epoch);
+    }
+    if (dyn_chg && dyn_reg_epoch) {
+        ++(*dyn_reg_epoch);
+    }
+    return true;
+}
+
+[[gnu::noinline]] bool ApplySetRenderTargetPacket(Regs& regs, RegDirty* dirty, bool track_all,
+                                                  DirectVk::Op vk_op, u32 op_word, const u32* body,
+                                                  u32 body_words, u64* pso_sig_epoch,
+                                                  u64* dyn_reg_epoch) noexcept {
+    if (vk_op == DirectVk::Op::SetRenderTarget) {
+        const u32 slot = (op_word >> 16) & 0x7u;
+        const bool valid = ((op_word >> 19) & 1u) != 0u;
+        if (valid && body_words == 14u) {
+            const u32 dst_reg = Bank::Context + 0x318u + slot * 0x0Fu;
+            std::memcpy(&regs.reg_array[dst_reg], body + 2u, 11u * sizeof(u32));
+            MarkReg(dirty, dst_reg, 11u);
+            BumpPsoAndDyn(pso_sig_epoch, dyn_reg_epoch);
+            return true;
+        }
+        if (!valid && body_words == 2u) {
+            WriteReg(regs, dirty, track_all, Bank::Context + 0x31Cu + slot * 0x0Fu, 0u);
+            BumpPsoAndDyn(pso_sig_epoch, dyn_reg_epoch);
+            return true;
+        }
+        return false;
+    }
+    const bool valid = ((op_word >> 16) & 1u) != 0u;
+    if (valid && body_words == 15u) {
+        const u32* dt = body + 2u;
+        std::memcpy(&regs.reg_array[Bank::Context + 0x010u], dt, 8u * sizeof(u32));
+        MarkReg(dirty, Bank::Context + 0x010u, 8u);
+        WriteReg(regs, dirty, track_all, Bank::Context + 0x00Fu, dt[11]);
+        WriteReg(regs, dirty, track_all, Bank::Context + 0x002u, dt[8]);
+        WriteReg(regs, dirty, track_all, Bank::Context + 0x005u, dt[9]);
+        WriteReg(regs, dirty, track_all, Bank::Context + 0x2AFu, dt[10]);
+        BumpPsoAndDyn(pso_sig_epoch, dyn_reg_epoch);
+        return true;
+    }
+    if (!valid && body_words == 2u) {
+        WriteReg(regs, dirty, track_all, Bank::Context + 0x010u, 0u);
+        WriteReg(regs, dirty, track_all, Bank::Context + 0x011u, 0u);
+        BumpPsoAndDyn(pso_sig_epoch, dyn_reg_epoch);
+        return true;
+    }
+    return false;
 }
 
 } // namespace
@@ -89,63 +692,7 @@ bool CommandProcessor::ApplyGraphicsRegisterPacket(Regs& regs, const u32* packet
     const u32* body = packet + 1;
     const bool track_all = dirty && dirty->track_all_blocks;
     bool handled_completely = false;
-    const auto bump_pso_and_dyn = [&]() noexcept {
-        if (pso_sig_epoch) {
-            ++(*pso_sig_epoch);
-        }
-        if (dyn_reg_epoch) {
-            ++(*dyn_reg_epoch);
-        }
-    };
-    const auto context_span_affects_pso_sig = [](u32 ctx_off, u32 count) constexpr noexcept -> bool {
-        if (count == 0u) {
-            return false;
-        }
-        const u32 end = ctx_off + count - 1u;
-        const auto overlaps = [&](u32 lo, u32 hi) constexpr noexcept {
-            return ctx_off <= hi && end >= lo;
-        };
-        return overlaps(0x003u, 0x003u) || overlaps(0x010u, 0x017u) || overlaps(0x08Eu, 0x08Fu) ||
-               overlaps(0x191u, 0x1C5u) || overlaps(0x1E0u, 0x1E7u) || overlaps(0x202u, 0x207u) ||
-               overlaps(0x286u, 0x2A9u) || overlaps(0x2ABu, 0x2DEu) || overlaps(0x2E4u, 0x2EAu) ||
-               overlaps(0x2F8u, 0x2F8u) || overlaps(0x318u, 0x38Fu);
-    };
-    const auto mark = [&](u32 index, u32 count) {
-        if (dirty) {
-            dirty->Mark(index, count);
-        }
-    };
-    const auto mark_sh = [&](u32 index, u32 count) {
-        if (track_all) [[unlikely]] {
-            dirty->Mark(index, count);
-        }
-    };
-    const auto set = [&](u32 bank) -> bool {
-        const u32 index = bank + (body[0] & 0xFFFFu);
-        const u32 count = body_words - 1u;
-        const u32* src = body + 1u;
-        bool any_changed = false;
-        for (u32 i = 0; i < count; ++i) {
-            if (regs.reg_array[index + i] != src[i]) {
-                regs.reg_array[index + i] = src[i];
-                any_changed = true;
-            }
-        }
-        if (bank == Bank::Sh) {
-            mark_sh(index, count);
-        } else if (any_changed || track_all) {
-            mark(index, count);
-        }
-        return any_changed;
-    };
-    const auto write = [&](u32 index, u32 value) {
-        if (regs.reg_array[index] != value) {
-            regs.reg_array[index] = value;
-            mark(index, 1);
-        } else if (track_all) [[unlikely]] {
-            mark(index, 1);
-        }
-    };
+
     switch (Header{header}.Opcode()) {
     case Op::ClearState:
         regs.SetDefaults();
@@ -153,11 +700,11 @@ bool CommandProcessor::ApplyGraphicsRegisterPacket(Regs& regs, const u32* packet
             dirty->Clear();
             dirty->reset = true;
         }
-        bump_pso_and_dyn();
+        BumpPsoAndDyn(pso_sig_epoch, dyn_reg_epoch);
         break;
     case Op::SetConfigReg:
-        if (set(Bank::Config)) {
-            bump_pso_and_dyn();
+        if (SetBankRegs(regs, dirty, track_all, body, body_words, Bank::Config)) {
+            BumpPsoAndDyn(pso_sig_epoch, dyn_reg_epoch);
         }
         handled_completely = true;
         break;
@@ -174,13 +721,13 @@ bool CommandProcessor::ApplyGraphicsRegisterPacket(Regs& regs, const u32* packet
             }
         }
         if (any_changed || track_all) {
-            mark(dst_reg, count);
+            MarkReg(dirty, dst_reg, count);
         }
         if (any_changed) {
             if (dyn_reg_epoch) {
                 ++(*dyn_reg_epoch);
             }
-            if (pso_sig_epoch && context_span_affects_pso_sig(ctx_off, count)) {
+            if (pso_sig_epoch && ContextSpanAffectsPsoSig(ctx_off, count)) {
                 ++(*pso_sig_epoch);
             }
         }
@@ -202,7 +749,7 @@ bool CommandProcessor::ApplyGraphicsRegisterPacket(Regs& regs, const u32* packet
                 any_changed = true;
             }
         }
-        mark_sh(dst_reg, count);
+        MarkShReg(dirty, track_all, dst_reg, count);
         if (any_changed && pso_sig_epoch && (sh_off & 0x3Fu) < 0x0Cu) {
             ++(*pso_sig_epoch);
         }
@@ -210,511 +757,137 @@ bool CommandProcessor::ApplyGraphicsRegisterPacket(Regs& regs, const u32* packet
         break;
     }
     case Op::SetUconfigReg:
-        if (set(Bank::Uconfig)) {
-            bump_pso_and_dyn();
+        if (SetBankRegs(regs, dirty, track_all, body, body_words, Bank::Uconfig)) {
+            BumpPsoAndDyn(pso_sig_epoch, dyn_reg_epoch);
         }
         handled_completely = true;
         break;
     case Op::IndexType:
-        write(Reg::VgtDmaIndexType, body[0]);
+        WriteReg(regs, dirty, track_all, Reg::VgtDmaIndexType, body[0]);
         handled_completely = true;
         break;
     case Op::DrawIndex2:
-        // max size, base low, base high, index count, draw initiator
-        write(Reg::VgtDmaMaxSize, body[0]);
-        write(Reg::VgtDmaBase, body[1]);
-        write(Reg::VgtDmaBaseHi, (regs.reg_array[Reg::VgtDmaBaseHi] & ~0xFFu) | (body[2] & 0xFF));
-        write(Reg::VgtNumIndices, body[3]);
-        write(Reg::VgtDrawInitiator, body[4]);
+        WriteReg(regs, dirty, track_all, Reg::VgtDmaMaxSize, body[0]);
+        WriteReg(regs, dirty, track_all, Reg::VgtDmaBase, body[1]);
+        WriteReg(regs, dirty, track_all, Reg::VgtDmaBaseHi,
+                 (regs.reg_array[Reg::VgtDmaBaseHi] & ~0xFFu) | (body[2] & 0xFFu));
+        WriteReg(regs, dirty, track_all, Reg::VgtNumIndices, body[3]);
+        WriteReg(regs, dirty, track_all, Reg::VgtDrawInitiator, body[4]);
         break;
     case Op::DrawIndexOffset2:
-        // max size, index offset, index count, draw initiator
-        write(Reg::VgtDmaMaxSize, body[0]);
-        write(Reg::VgtNumIndices, body[2]);
-        write(Reg::VgtDrawInitiator, body[3]);
+        WriteReg(regs, dirty, track_all, Reg::VgtDmaMaxSize, body[0]);
+        WriteReg(regs, dirty, track_all, Reg::VgtNumIndices, body[2]);
+        WriteReg(regs, dirty, track_all, Reg::VgtDrawInitiator, body[3]);
         break;
     case Op::DrawIndexAuto:
-        write(Reg::VgtNumIndices, body[0]);
-        write(Reg::VgtDrawInitiator, body[1]);
+        WriteReg(regs, dirty, track_all, Reg::VgtNumIndices, body[0]);
+        WriteReg(regs, dirty, track_all, Reg::VgtDrawInitiator, body[1]);
         break;
     case Op::NumInstances:
-        write(Reg::VgtNumInstances, body[0]);
+        WriteReg(regs, dirty, track_all, Reg::VgtNumInstances, body[0]);
         handled_completely = true;
         break;
     case Op::IndexBase:
-        write(Reg::VgtDmaBase, body[0]);
-        write(Reg::VgtDmaBaseHi, (regs.reg_array[Reg::VgtDmaBaseHi] & ~0xFFu) | (body[1] & 0xFF));
+        WriteReg(regs, dirty, track_all, Reg::VgtDmaBase, body[0]);
+        WriteReg(regs, dirty, track_all, Reg::VgtDmaBaseHi,
+                 (regs.reg_array[Reg::VgtDmaBaseHi] & ~0xFFu) | (body[1] & 0xFFu));
         handled_completely = true;
         break;
     case Op::IndexBufferSize:
-        write(Reg::VgtNumIndices, body[0]);
+        WriteReg(regs, dirty, track_all, Reg::VgtNumIndices, body[0]);
         handled_completely = true;
         break;
     case Op::EventWrite:
-        // A streamout flush: the offsets are updated at once (no streamout here).
         if ((body[0] & 0x3F) != EventWrite::SoVgtStreamoutFlush) {
             return false;
         }
-        write(Reg::CpStrmoutCntl, regs.reg_array[Reg::CpStrmoutCntl] | 1);
-        bump_pso_and_dyn();
+        WriteReg(regs, dirty, track_all, Reg::CpStrmoutCntl,
+                 regs.reg_array[Reg::CpStrmoutCntl] | 1u);
+        BumpPsoAndDyn(pso_sig_epoch, dyn_reg_epoch);
         break;
     case Op::Nop: {
         if (body_words < 2 || body[0] != NopPayload::DirectVulkan) {
             return false;
         }
-        const auto vk_op = DirectVk::Op(body[1] & 0xFFFFu);
-        if (vk_op == DirectVk::Op::SetIndexState && body_words == 6u) {
-            DirectVk::SetIndexStateArgs a{};
-            std::memcpy(&a, body + 2u, sizeof(a));
-            if (a.index_and_flags & 0x100u) {
-                const u32 new_prim = a.prim_type & 0x3Fu;
-                if (regs.reg_array[Reg::VgtPrimitiveType] != new_prim) {
-                    bump_pso_and_dyn();
-                }
-                write(Reg::VgtPrimitiveType, new_prim);
-            }
-            if (a.index_and_flags & 0x200u) {
-                write(Reg::VgtDmaBase, u32(a.ib_va) & ~1u);
-                write(Reg::VgtDmaBaseHi,
-                      (regs.reg_array[Reg::VgtDmaBaseHi] & ~0xFFu) | (u32(a.ib_va >> 32) & 0xFFu));
-            }
-            if (a.index_and_flags & 0x400u) {
-                write(Reg::VgtDmaIndexType, a.index_and_flags & 0xFFu);
-            }
-            handled_completely = true;
-            break;
-        }
-        if (vk_op == DirectVk::Op::DrawIndexed && body_words == 6u) {
-            DirectVk::DrawIndexedArgs a{};
-            std::memcpy(&a, body + 2u, sizeof(a));
-            const u32 base_vtx = static_cast<u32>(a.base_vertex);
-            const bool chg_idx_off = (regs.reg_array[Reg::VgtIndxOffset] != base_vtx);
-            const bool chg_inst = (regs.reg_array[Reg::VgtNumInstances] != a.instance_count);
-            const bool chg_max = (regs.reg_array[Reg::VgtDmaMaxSize] != a.index_count);
-            const bool chg_num = (regs.reg_array[Reg::VgtNumIndices] != a.index_count);
-            const bool chg_init = (regs.reg_array[Reg::VgtDrawInitiator] != 0u);
-            regs.reg_array[Reg::VgtIndxOffset] = base_vtx;
-            regs.reg_array[Reg::VgtNumInstances] = a.instance_count;
-            regs.reg_array[Reg::VgtDmaMaxSize] = a.index_count;
-            regs.reg_array[Reg::VgtNumIndices] = a.index_count;
-            regs.reg_array[Reg::VgtDrawInitiator] = 0u;
-            if (dirty) {
-                if (!track_all) [[likely]] {
-                    dirty->stage_b_mask[0] |=
-                        (chg_idx_off ? (1ULL << 32) : 0ULL) | (chg_init ? (1ULL << 63) : 0ULL);
-                    dirty->stage_b_mask[1] |=
-                        (chg_max ? (1ULL << (83 - 64)) : 0ULL) |
-                        ((chg_inst || chg_num) ? (1ULL << (116 - 64)) : 0ULL);
-                } else {
-                    mark(Reg::VgtIndxOffset, 1u);
-                    mark(Reg::VgtNumInstances, 1u);
-                    mark(Reg::VgtDmaMaxSize, 1u);
-                    mark(Reg::VgtNumIndices, 1u);
-                    mark(Reg::VgtDrawInitiator, 1u);
-                }
-            }
-            break;
-        }
-        if (vk_op == DirectVk::Op::DrawIndexAddr && body_words == 6u) {
-            DirectVk::DrawIndexAddrArgs a{};
-            std::memcpy(&a, body + 2u, sizeof(a));
-            if (a.prim_and_size & 0x100u) {
-                const u32 new_prim = a.prim_and_size & 0x3Fu;
-                if (regs.reg_array[Reg::VgtPrimitiveType] != new_prim) {
-                    bump_pso_and_dyn();
-                }
-                write(Reg::VgtPrimitiveType, new_prim);
-            }
-            if (a.prim_and_size & 0x200u) {
-                write(Reg::VgtDmaIndexType, (a.prim_and_size >> 16) & 0xFFu);
-            }
-            write(Reg::VgtDmaMaxSize, a.index_count);
-            write(Reg::VgtDmaBase, u32(a.ib_va) & ~1u);
-            write(Reg::VgtDmaBaseHi,
-                  (regs.reg_array[Reg::VgtDmaBaseHi] & ~0xFFu) | (u32(a.ib_va >> 32) & 0xFFu));
-            write(Reg::VgtNumIndices, a.index_count);
-            write(Reg::VgtDrawInitiator, 0u);
-            break;
-        }
-        if (vk_op == DirectVk::Op::DrawAuto && body_words == 5u) {
-            DirectVk::DrawAutoArgs a{};
-            std::memcpy(&a, body + 2u, sizeof(a));
-            write(Reg::VgtIndxOffset, static_cast<u32>(a.start_vertex));
-            write(Reg::VgtNumInstances, a.instance_count);
-            write(Reg::VgtNumIndices, a.vertex_count);
-            write(Reg::VgtDrawInitiator, 2u);
-            break;
-        }
-        if (vk_op == DirectVk::Op::SetStageUserData && body_words >= 3u) {
-            const u32 sh_offset = body[2] & 0xFFFFu;
-            if (InComputeRange(sh_offset)) {
+        const u32 op_word = body[1];
+        const auto vk_op = DirectVk::Op(op_word & 0xFFFFu);
+        switch (vk_op) {
+        case DirectVk::Op::SetIndexState:
+        case DirectVk::Op::SetStageUserData:
+        case DirectVk::Op::SetContextRegsPacked:
+        case DirectVk::Op::BindVsShader:
+        case DirectVk::Op::BindPsShader:
+        case DirectVk::Op::BindEsShader:
+        case DirectVk::Op::BindGsShader:
+        case DirectVk::Op::BindHsShader:
+        case DirectVk::Op::BindLsShader:
+        case DirectVk::Op::SetVgtControl: {
+            bool pso_chg = false;
+            bool dyn_chg = false;
+            if (!ApplyDirectStateSubOp(regs, dirty, track_all, vk_op, op_word, body + 2u,
+                                       body_words - 2u, pso_chg, dyn_chg)) {
                 return false;
             }
-            u32 mask = body[2] >> 16;
-            const u32 count = body_words - 3u;
-            if (static_cast<u32>(std::popcount(mask)) != count) {
-                return false;
-            }
-            if ((mask & (mask + 1u)) == 0u) [[likely]] {
-                std::memcpy(&regs.reg_array[Bank::Sh + sh_offset], body + 3u, count * sizeof(u32));
-                mark_sh(Bank::Sh + sh_offset, count);
-            } else {
-                u32 src = 3u;
-                while (mask != 0u) {
-                    const u32 bit = static_cast<u32>(std::countr_zero(mask));
-                    mask &= (mask - 1u);
-                    regs.reg_array[Bank::Sh + sh_offset + bit] = body[src++];
-                }
-                mark_sh(Bank::Sh + sh_offset, 16u);
-            }
-            if (pso_sig_epoch && (sh_offset & 0x3Fu) < 0x0Cu) [[unlikely]] {
+            if (pso_chg && pso_sig_epoch) {
                 ++(*pso_sig_epoch);
             }
-            handled_completely = true;
-            break;
-        }
-        if (vk_op == DirectVk::Op::SetContextRegsPacked && body_words >= 4u) {
-            const u32 num_spans = body[1] >> 16;
-            u32 idx = 2u;
-            bool any_changed = false;
-            bool pso_changed = false;
-            for (u32 s = 0u; s < num_spans; ++s) {
-                if (idx >= body_words) {
-                    return false;
-                }
-                const u32 span_hdr = body[idx++];
-                const u32 ctx_off = span_hdr & 0xFFFFu;
-                const u32 count = span_hdr >> 16;
-                if (count == 0u || idx + count > body_words ||
-                    Bank::Context + ctx_off + count > std::size(regs.reg_array)) {
-                    return false;
-                }
-                const u32 dst_reg = Bank::Context + ctx_off;
-                bool span_changed = false;
-                for (u32 i = 0; i < count; ++i) {
-                    if (regs.reg_array[dst_reg + i] != body[idx + i]) {
-                        regs.reg_array[dst_reg + i] = body[idx + i];
-                        span_changed = true;
-                    }
-                }
-                if (span_changed) {
-                    any_changed = true;
-                    if (!pso_changed && context_span_affects_pso_sig(ctx_off, count)) {
-                        pso_changed = true;
-                    }
-                }
-                if (span_changed || track_all) {
-                    mark(dst_reg, count);
-                }
-                idx += count;
-            }
-            if (idx != body_words) {
-                return false;
-            }
-            if (any_changed) {
-                if (dyn_reg_epoch) {
-                    ++(*dyn_reg_epoch);
-                }
-                if (pso_changed && pso_sig_epoch) {
-                    ++(*pso_sig_epoch);
-                }
-            }
-            handled_completely = true;
-            break;
-        }
-        if (vk_op == DirectVk::Op::SetRenderTarget) {
-            const u32 slot = (body[1] >> 16) & 0x7u;
-            const bool valid = ((body[1] >> 19) & 1u) != 0u;
-            if (valid && body_words == 14u) {
-                const u32 dst_reg = Bank::Context + 0x318u + slot * 0x0Fu;
-                std::memcpy(&regs.reg_array[dst_reg], body + 2u, 11u * sizeof(u32));
-                mark(dst_reg, 11u);
-                bump_pso_and_dyn();
-                break;
-            }
-            if (!valid && body_words == 2u) {
-                write(Bank::Context + 0x31Cu + slot * 0x0Fu, 0u);
-                bump_pso_and_dyn();
-                break;
-            }
-            return false;
-        }
-        if (vk_op == DirectVk::Op::SetDepthRenderTarget) {
-            const bool valid = ((body[1] >> 16) & 1u) != 0u;
-            if (valid && body_words == 15u) {
-                const u32* dt = body + 2u;
-                std::memcpy(&regs.reg_array[Bank::Context + 0x010u], dt, 8u * sizeof(u32));
-                mark(Bank::Context + 0x010u, 8u);
-                write(Bank::Context + 0x00Fu, dt[11]);
-                write(Bank::Context + 0x002u, dt[8]);
-                write(Bank::Context + 0x005u, dt[9]);
-                write(Bank::Context + 0x2AFu, dt[10]);
-                bump_pso_and_dyn();
-                break;
-            }
-            if (!valid && body_words == 2u) {
-                write(Bank::Context + 0x010u, 0u);
-                write(Bank::Context + 0x011u, 0u);
-                bump_pso_and_dyn();
-                break;
-            }
-            return false;
-        }
-        if (vk_op == DirectVk::Op::BindVsShader && body_words == 9u) {
-            const bool only_sh = ((body[1] >> 18) & 1u) != 0u;
-            const u32* vs = body + 2u;
-            bool changed = (regs.reg_array[Bank::Sh + 0x48u] != vs[0]) ||
-                           (regs.reg_array[Bank::Sh + 0x49u] != vs[1]) ||
-                           (regs.reg_array[Bank::Sh + 0x4Au] != vs[2]) ||
-                           (regs.reg_array[Bank::Sh + 0x4Bu] != vs[3]);
-            std::memcpy(&regs.reg_array[Bank::Sh + 0x48u], vs, 4u * sizeof(u32));
-            mark_sh(Bank::Sh + 0x48u, 4u);
-            if (!only_sh) {
-                const bool c54 = (regs.reg_array[Bank::Context + 0x1B1u] != body[6]);
-                const bool c56 = (regs.reg_array[Bank::Context + 0x1C3u] != body[7]);
-                const bool c64 = (regs.reg_array[Bank::Context + 0x207u] != body[8]);
-                changed |= c54 || c56 || c64;
-                regs.reg_array[Bank::Context + 0x1B1u] = body[6];
-                regs.reg_array[Bank::Context + 0x1C3u] = body[7];
-                regs.reg_array[Bank::Context + 0x207u] = body[8];
-                if (dirty) {
-                    if (!track_all) [[likely]] {
-                        dirty->stage_b_mask[0] |=
-                            (c54 ? (1ULL << 54) : 0ULL) | (c56 ? (1ULL << 56) : 0ULL);
-                        if (c64) {
-                            dirty->stage_b_mask[1] |= (1ULL << 0);
-                            if (dyn_reg_epoch) {
-                                ++(*dyn_reg_epoch);
-                            }
-                        }
-                    } else {
-                        mark(Bank::Context + 0x1B1u, 1u);
-                        mark(Bank::Context + 0x1C3u, 1u);
-                        mark(Bank::Context + 0x207u, 1u);
-                    }
-                }
-            }
-            if (changed && pso_sig_epoch) {
-                ++(*pso_sig_epoch);
-            }
-            handled_completely = true;
-            break;
-        }
-        if (vk_op == DirectVk::Op::BindPsShader) {
-            const bool valid = ((body[1] >> 16) & 1u) != 0u;
-            const bool sdk350 = ((body[1] >> 17) & 1u) != 0u;
-            const bool only_sh = ((body[1] >> 18) & 1u) != 0u;
-            if (valid && body_words == 14u) {
-                const u32* ps = body + 2u;
-                bool changed = (regs.reg_array[Bank::Sh + 0x08u] != ps[0]) ||
-                               (regs.reg_array[Bank::Sh + 0x09u] != ps[1]) ||
-                               (regs.reg_array[Bank::Sh + 0x0Au] != ps[2]) ||
-                               (regs.reg_array[Bank::Sh + 0x0Bu] != ps[3]);
-                std::memcpy(&regs.reg_array[Bank::Sh + 0x08u], ps, 4u * sizeof(u32));
-                mark_sh(Bank::Sh + 0x08u, 4u);
-                if (!only_sh) {
-                    const bool c56 = (regs.reg_array[Bank::Context + 0x1C4u] != ps[4]) ||
-                                     (regs.reg_array[Bank::Context + 0x1C5u] != ps[5]);
-                    const bool c54 = (regs.reg_array[Bank::Context + 0x1B3u] != ps[6]) ||
-                                     (regs.reg_array[Bank::Context + 0x1B4u] != ps[7]) ||
-                                     (regs.reg_array[Bank::Context + 0x1B6u] != ps[8]);
-                    const bool c55 = (regs.reg_array[Bank::Context + 0x1B8u] != ps[9]);
-                    const bool c64 = (regs.reg_array[Bank::Context + 0x203u] != ps[10]);
-                    const bool c17 = (regs.reg_array[Bank::Context + 0x08Fu] != ps[11]);
-                    changed |= c56 || c54 || c55 || c64 || c17;
-                    regs.reg_array[Bank::Context + 0x1C4u] = ps[4];
-                    regs.reg_array[Bank::Context + 0x1C5u] = ps[5];
-                    regs.reg_array[Bank::Context + 0x1B3u] = ps[6];
-                    regs.reg_array[Bank::Context + 0x1B4u] = ps[7];
-                    regs.reg_array[Bank::Context + 0x1B6u] = ps[8];
-                    regs.reg_array[Bank::Context + 0x1B8u] = ps[9];
-                    regs.reg_array[Bank::Context + 0x203u] = ps[10];
-                    regs.reg_array[Bank::Context + 0x08Fu] = ps[11];
-                    if (dirty) {
-                        if (!track_all) [[likely]] {
-                            dirty->stage_b_mask[0] |= (c17 ? (1ULL << 17) : 0ULL) |
-                                                      (c54 ? (1ULL << 54) : 0ULL) |
-                                                      (c55 ? (1ULL << 55) : 0ULL) |
-                                                      (c56 ? (1ULL << 56) : 0ULL);
-                            if (c64) {
-                                dirty->stage_b_mask[1] |= (1ULL << 0);
-                            }
-                        } else {
-                            mark(Bank::Context + 0x1C4u, 2u);
-                            mark(Bank::Context + 0x1B3u, 2u);
-                            mark(Bank::Context + 0x1B6u, 1u);
-                            mark(Bank::Context + 0x1B8u, 1u);
-                            mark(Bank::Context + 0x203u, 1u);
-                            mark(Bank::Context + 0x08Fu, 1u);
-                        }
-                    }
-                }
-                if (changed && pso_sig_epoch) {
-                    ++(*pso_sig_epoch);
-                }
-                handled_completely = true;
-                break;
-            }
-            if (!valid && body_words == 2u) {
-                regs.reg_array[Bank::Sh + 0x08u] = 0u;
-                regs.reg_array[Bank::Sh + 0x09u] = 0u;
-                mark_sh(Bank::Sh + 0x08u, 2u);
-                if (!only_sh) {
-                    write(Bank::Context + 0x203u, 0u);
-                }
-                if (sdk350) {
-                    write(Bank::Context + 0x08Fu, 0xFu);
-                }
-                if (pso_sig_epoch) {
-                    ++(*pso_sig_epoch);
-                }
-                handled_completely = true;
-                break;
-            }
-            return false;
-        }
-        if (vk_op == DirectVk::Op::BindEsShader && body_words == 6u) {
-            std::memcpy(&regs.reg_array[Bank::Sh + 0xC8u], body + 2u, 4u * sizeof(u32));
-            mark_sh(Bank::Sh + 0xC8u, 4u);
-            bump_pso_and_dyn();
-            handled_completely = true;
-            break;
-        }
-        if (vk_op == DirectVk::Op::BindGsShader && body_words == 9u) {
-            const bool only_sh = ((body[1] >> 18) & 1u) != 0u;
-            std::memcpy(&regs.reg_array[Bank::Sh + 0x88u], body + 2u, 4u * sizeof(u32));
-            mark_sh(Bank::Sh + 0x88u, 4u);
-            if (!only_sh) {
-                write(Bank::Context + 0x2E5u, body[6]);
-                write(Bank::Context + 0x29Bu, body[7]);
-                write(Bank::Context + 0x2E4u, body[8]);
-            }
-            bump_pso_and_dyn();
-            handled_completely = true;
-            break;
-        }
-        if (vk_op == DirectVk::Op::BindHsShader && body_words == 10u) {
-            const bool only_sh = ((body[1] >> 18) & 1u) != 0u;
-            std::memcpy(&regs.reg_array[Bank::Sh + 0x108u], body + 2u, 4u * sizeof(u32));
-            mark_sh(Bank::Sh + 0x108u, 4u);
-            if (!only_sh) {
-                write(Bank::Context + 0x286u, body[7]);
-                write(Bank::Context + 0x287u, body[8]);
-                write(Bank::Context + 0x2DBu, body[6]);
-                write(Bank::Context + 0x2D6u, body[9]);
-            }
-            bump_pso_and_dyn();
-            handled_completely = true;
-            break;
-        }
-        if (vk_op == DirectVk::Op::BindLsShader && body_words == 6u) {
-            std::memcpy(&regs.reg_array[Bank::Sh + 0x148u], body + 2u, 4u * sizeof(u32));
-            mark_sh(Bank::Sh + 0x148u, 4u);
-            bump_pso_and_dyn();
-            handled_completely = true;
-            break;
-        }
-        if (vk_op == DirectVk::Op::SetVgtControl && body_words == 2u) {
-            const u32 prim_group_sz_minus_1 = (body[1] >> 16) & 0xFFu;
-            const u32 partial_vs_wave_mode = (body[1] >> 24) & 1u;
-            write(Bank::Context + 0x2AAu, (partial_vs_wave_mode << 16) | prim_group_sz_minus_1);
-            handled_completely = true;
-            break;
-        }
-        if (vk_op == DirectVk::Op::InitDefaultHardwareState && body_words == 2u) {
-            const u32 gen = (body[1] >> 16) & 0xFFu;
-            if (gen > 5u) {
-                return false;
-            }
-            regs.SetDefaults();
-            if (dirty) {
-                dirty->Clear();
-                dirty->reset = true;
-            }
-            bump_pso_and_dyn();
-            if (gen == 4u) {
-                write(Reg::VgtNumInstances, 1u);
-                write(Bank::Context + 0x102u, 0u);
-                write(Bank::Context + 0x202u, 0xCC0010u);
-                break;
-            }
-            write(Bank::Context + 0x2F9u, 0x2Du);
-            write(Bank::Context + 0x282u, 8u);
-            write(Bank::Context + 0x280u, 0x80008u);
-            write(Bank::Context + 0x281u, 0xFFFF0000u);
-            write(Bank::Context + 0x204u, 0u);
-            write(Bank::Context + 0x206u, 0x43Fu);
-            write(Bank::Context + 0x083u, 0xFFFFu);
-            write(Bank::Context + 0x317u, 0x10u);
-            write(Bank::Context + 0x2FAu, 0x3F800000u);
-            write(Bank::Context + 0x2FCu, 0x3F800000u);
-            write(Bank::Context + 0x2FBu, 0x3F800000u);
-            write(Bank::Context + 0x2FDu, 0x3F800000u);
-            write(Bank::Context + 0x202u, 0xCC0010u);
-            write(Bank::Context + 0x30Eu, 0xFFFFFFFFu);
-            write(Bank::Context + 0x30Fu, 0xFFFFFFFFu);
-            write(Reg::VgtNumInstances, 1u);
-            if (gen <= 1u) {
-                regs.reg_array[Bank::Sh + 0x007u] = 0x1FFu;
-                regs.reg_array[Bank::Sh + 0x046u] = 0x1FFu;
-                regs.reg_array[Bank::Sh + 0x087u] = 0x1FFu;
-                regs.reg_array[Bank::Sh + 0x0C7u] = 0x1FFu;
-                regs.reg_array[Bank::Sh + 0x107u] = 0u;
-                regs.reg_array[Bank::Sh + 0x147u] = 0x1FFu;
-                mark_sh(Bank::Sh + 0x007u, 1u);
-                mark_sh(Bank::Sh + 0x046u, 1u);
-                mark_sh(Bank::Sh + 0x087u, 1u);
-                mark_sh(Bank::Sh + 0x0C7u, 1u);
-                mark_sh(Bank::Sh + 0x107u, 1u);
-                mark_sh(Bank::Sh + 0x147u, 1u);
-            } else if (gen <= 3u) {
-                regs.reg_array[Bank::Sh + 0x007u] = 0x1701FFu;
-                regs.reg_array[Bank::Sh + 0x046u] = 0x1701FDu;
-                regs.reg_array[Bank::Sh + 0x087u] = 0x1701FFu;
-                regs.reg_array[Bank::Sh + 0x0C7u] = 0x1701FDu;
-                regs.reg_array[Bank::Sh + 0x107u] = 0x17u;
-                regs.reg_array[Bank::Sh + 0x147u] = 0x1701FDu;
-                regs.reg_array[Bank::Sh + 0x047u] = 0x1Cu;
-                mark_sh(Bank::Sh + 0x007u, 1u);
-                mark_sh(Bank::Sh + 0x046u, 2u);
-                mark_sh(Bank::Sh + 0x087u, 1u);
-                mark_sh(Bank::Sh + 0x0C7u, 1u);
-                mark_sh(Bank::Sh + 0x107u, 1u);
-                mark_sh(Bank::Sh + 0x147u, 1u);
-            }
-            write(Bank::Context + 0x1B1u, 2u);
-            write(Bank::Context + 0x101u, 0u);
-            write(Bank::Context + 0x100u, 0xFFFFFFFFu);
-            write(Bank::Context + 0x103u, 0u);
-            write(Bank::Context + 0x284u, 0u);
-            write(Bank::Context + 0x290u, 0u);
-            write(Bank::Context + 0x2AEu, 0u);
-            if (gen == 3u || gen == 5u) {
-                write(Bank::Context + 0x102u, 0u);
-            }
-            write(Bank::Context + 0x292u, 0u);
-            write(Bank::Context + 0x293u, (gen == 0u) ? 0x6000000u : 0x6020000u);
-            write(Bank::Context + 0x2F8u, 0u);
-            write(Bank::Context + 0x2DEu, 0x1E9u);
-            write(Bank::Context + 0x295u, 0x100u);
-            write(Bank::Context + 0x296u, 0x100u);
-            write(Bank::Context + 0x297u, 4u);
-            if (gen <= 3u) {
-                write(Bank::Uconfig + 0x200u, 0xE0000000u);
-            }
-            if (gen == 3u || gen == 5u) {
-                write(Bank::Context + 0x2AAu, 0xFFu);
-            }
-            if (pso_sig_epoch) {
-                ++(*pso_sig_epoch);
-            }
-            if (dyn_reg_epoch) {
+            if (dyn_chg && dyn_reg_epoch) {
                 ++(*dyn_reg_epoch);
             }
             handled_completely = true;
             break;
         }
-        return false;
+        case DirectVk::Op::DrawIndexed:
+            if (body_words != 6u) {
+                return false;
+            }
+            ApplyDirectDrawIndexedWords(regs, dirty, track_all, body + 2u);
+            break;
+        case DirectVk::Op::DrawIndexAddr: {
+            if (body_words != 6u) {
+                return false;
+            }
+            bool pso_chg = false;
+            bool dyn_chg = false;
+            ApplyDirectDrawIndexAddrWords(regs, dirty, track_all, body + 2u, pso_chg, dyn_chg);
+            if (pso_chg && pso_sig_epoch) {
+                ++(*pso_sig_epoch);
+            }
+            if (dyn_chg && dyn_reg_epoch) {
+                ++(*dyn_reg_epoch);
+            }
+            break;
+        }
+        case DirectVk::Op::DrawAuto:
+            if (body_words != 5u) {
+                return false;
+            }
+            ApplyDirectDrawAutoWords(regs, dirty, track_all, body + 2u);
+            break;
+        case DirectVk::Op::DrawBundle:
+            if (!ApplyDrawBundlePacket(regs, dirty, track_all, op_word, body, body_words,
+                                       pso_sig_epoch, dyn_reg_epoch)) [[unlikely]] {
+                return false;
+            }
+            break;
+        case DirectVk::Op::SetRenderTarget:
+        case DirectVk::Op::SetDepthRenderTarget:
+            if (!ApplySetRenderTargetPacket(regs, dirty, track_all, vk_op, op_word, body,
+                                            body_words, pso_sig_epoch, dyn_reg_epoch)) {
+                return false;
+            }
+            break;
+        case DirectVk::Op::InitDefaultHardwareState:
+            if (body_words != 2u || !ApplyInitDefaultHardwareState(regs, dirty, track_all, op_word,
+                                                                   pso_sig_epoch, dyn_reg_epoch)) {
+                return false;
+            }
+            handled_completely = true;
+            break;
+        default:
+            return false;
+        }
+        break;
     }
     default:
         return false;

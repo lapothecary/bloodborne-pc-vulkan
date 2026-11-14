@@ -207,6 +207,9 @@ public:
         u32 stencil_and_flags;
     };
     void DirectCopyBuffers(std::span<const DirectCopyRegion> regions);
+    void FlushPendingBufferCopies();
+    void ExecuteDirectCopyBuffers(std::span<const DirectCopyRegion> regions);
+    [[nodiscard]] bool NextPipePacketIsBufferCopyBatch() const noexcept;
     void DirectFillBuffer(VAddr dst, u32 num_bytes, u32 value);
     void DirectClearColorImage(const DirectClearColorArgs& args);
     void DirectCopyTextureRegion(const DirectCopyTextureRegionArgs& args);
@@ -661,7 +664,8 @@ private:
         u64 generation = ~0ull;
         u64 scene_generation = 0; ///< SceneTargets::Generation of the proxy views
         u64 last_use = 0;
-        u32 count = 0;
+        u16 imm_epoch16 = 0;
+        u8 count = 0;
         u8 native_count = 0;
         u8 valid_entries = 0;
         bool all_direct_immutable = false;
@@ -709,6 +713,13 @@ private:
     std::unique_ptr<std::array<StageBVertexMemoEntry, StageBVertexMemoEntry::TableSize>>
         stage_b_vertex_memo;
     boost::container::small_vector<DirectCopyTextureRegionArgs, 16> pending_tex_copies;
+    std::vector<DirectCopyRegion> pending_buf_copies;
+    VAddr stage_a_shadow_cb_addr = 0;
+    VAddr stage_a_shadow_db_addr = 0;
+    u32 stage_a_shadow_face_draw_idx = 0;
+    u32 stage_a_shadow_frame = ~0u;
+    [[nodiscard]] bool TryCullMicroShadowDraw(const GraphicsPipeline* pipeline,
+                                              bool is_indexed) noexcept;
     vk::Pipeline bound_graphics_pipeline{};
     u64 bound_graphics_epoch = 0;
     /// The prepared sharps of `stage` in the current prepared draw, if they fit it.
@@ -822,6 +833,20 @@ private:
     std::array<ImageDescCacheEntry, 4096> image_desc_cache{};
     /// N2.1: Direct O(1) 65,536-slot Stage-B SRV/UAV cache indexed by T#.dw[7] uid16 (0 hash evictions).
     std::unique_ptr<ImageDescCacheEntry[]> native_srv_cache;
+    /// Phase 3.4: Compact 32-byte ready VkImageView mirror for settled DirectImmutable read-only
+    /// SRVs indexed by T#.dw[7] uid16, matched via 64-bit qw0 + 32-bit dw7_tag (0 32B memcmp).
+    struct alignas(32) NativeSrvFastEntry {
+        u64 qw0 = 0;
+        vk::ImageView view{};
+        u32 dw7_tag = 0;
+        VideoCore::ImageId id{};
+        u16 imm_epoch16 = 0;
+        u8 res_flags = 0xFFu;
+        u8 valid = 0u;
+        u32 pad = 0;
+    };
+    static_assert(sizeof(NativeSrvFastEntry) == 32);
+    std::unique_ptr<NativeSrvFastEntry[]> native_srv_fast_cache;
     /// N2.1: Direct O(1) 4,096-slot Stage-B VkSampler cache indexed by S#.dw[3] uid12 (0 mutex/XXH3).
     struct NativeSamplerStageBEntry {
         Gcn::Sampler tagged_sharp{};
@@ -832,6 +857,7 @@ private:
         bool forced_aniso_off = false;
         std::array<u64, 3> touched_ticks{~0ULL, ~0ULL, ~0ULL}; // [0]=gfx_color, [1]=cs_color, [2]=depth
         std::array<vk::Sampler, 3> handles{};
+        std::array<vk::DescriptorImageInfo, 3> desc_infos{};
     };
     std::unique_ptr<NativeSamplerStageBEntry[]> native_sampler_cache;
     u64 desc_use_counter = 0;

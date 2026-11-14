@@ -371,8 +371,15 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& info
             if (cached.binding.is_target) {
                 // A part of it bound as a render target: rebound to the larger image.
                 cached.binding.needs_rebind = 1;
+                if (True(cached.flags & ImageFlagBits::DirectImmutable)) {
+                    DirectTextures::BumpImmutableRoEpoch();
+                }
                 if (merged_id) {
-                    GetImage(merged_id).binding.is_target = 1;
+                    auto& merged_img = GetImage(merged_id);
+                    merged_img.binding.is_target = 1;
+                    if (True(merged_img.flags & ImageFlagBits::DirectImmutable)) {
+                        DirectTextures::BumpImmutableRoEpoch();
+                    }
                 }
                 FreeImage(cache_id);
                 return {merged_id, -1, -1};
@@ -395,6 +402,9 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
     runtime.CopyImage(&source, &image);
     if (source.binding.is_bound || source.binding.is_target) {
         source.binding.needs_rebind = 1;
+        if (True(source.flags & ImageFlagBits::DirectImmutable)) {
+            DirectTextures::BumpImmutableRoEpoch();
+        }
     }
     FreeImage(image_id);
     TrackImage(new_id);
@@ -525,6 +535,9 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc, Vi
             UntrackImage(image_id);
             image.flags &= ~ImageFlagBits::SharedHotPage;
         }
+        if (True(image.flags & ImageFlagBits::DirectImmutable)) {
+            DirectTextures::BumpImmutableRoEpoch();
+        }
         image.flags |= ImageFlagBits::GpuModified;
         image.gpu_write_tick = CurrentTick();
         if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8) &&
@@ -558,6 +571,9 @@ ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& des
         std::scoped_lock lock{mutex};
         UntrackImage(image_id);
         image.flags &= ~ImageFlagBits::SharedHotPage;
+    }
+    if (True(image.flags & ImageFlagBits::DirectImmutable)) {
+        DirectTextures::BumpImmutableRoEpoch();
     }
     image.flags |= ImageFlagBits::GpuModified;
     image.gpu_write_tick = CurrentTick();
@@ -598,6 +614,9 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
         std::scoped_lock lock{mutex};
         UntrackImage(image_id);
         image.flags &= ~ImageFlagBits::SharedHotPage;
+    }
+    if (True(image.flags & ImageFlagBits::DirectImmutable)) {
+        DirectTextures::BumpImmutableRoEpoch();
     }
     image.flags |= ImageFlagBits::GpuModified;
     image.gpu_write_tick = CurrentTick();

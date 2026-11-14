@@ -1172,6 +1172,11 @@ void GXGnmCommandContext_DrawIndexedInstanced(
     void* gfxCtx = ctxBase + 0x10;
     void* srBinder = ctxBase + 0x50;
 
+    if (gx_direct_vk::DrawBundleEnabled()) [[unlikely]] {
+        CGGfxContextGnm_FlushPendingStagingUploads(gfxCtx);
+    }
+    const auto bundle_mark = gx_direct_vk::CaptureDrawBundleBookmark(gfxCtx);
+
     CGOutputMergerCacheGnm_FlushBlendAndDepthStencilState(ctxBase + 0xB558, ctxBase, stateContext);
     CGIndexBufferCacheGnm_BindToGfxContext(ctxBase + 0xB518, ctxBase, stateContext, 1);
     CGRasterizerCacheGnm_FlushToGfxContext(ctxBase + 0xB528, ctxBase, stateContext);
@@ -1179,8 +1184,8 @@ void GXGnmCommandContext_DrawIndexedInstanced(
     CGShaderResourceBinderGnm_SyncAndBindGraphicsPipeline(srBinder, ctxBase, stateContext);
 
     if (gx_direct_vk::EnabledV2Sub(gx_direct_vk::kV2Sub_DrawDirect)) {
-        gx_direct_vk::EmitDrawIndexed(gfxCtx, indexCountPerInstance, instanceCount,
-                                      startIndexLocation, baseVertexLocation);
+        gx_direct_vk::EmitDrawIndexedBundled(gfxCtx, bundle_mark, indexCountPerInstance,
+                                             instanceCount, startIndexLocation, baseVertexLocation);
     } else {
         sub_1074040(gfxCtx, baseVertexLocation);
         sub_1075370(gfxCtx, instanceCount);
@@ -1204,6 +1209,11 @@ void GXGnmCommandContext_DrawInstanced(
     void* gfxCtx = ctxBase + 0x10;
     void* srBinder = ctxBase + 0x50;
 
+    if (gx_direct_vk::DrawBundleEnabled()) [[unlikely]] {
+        CGGfxContextGnm_FlushPendingStagingUploads(gfxCtx);
+    }
+    const auto bundle_mark = gx_direct_vk::CaptureDrawBundleBookmark(gfxCtx);
+
     CGOutputMergerCacheGnm_FlushBlendAndDepthStencilState(ctxBase + 0xB558, ctxBase, stateContext);
     CGIndexBufferCacheGnm_BindToGfxContext(ctxBase + 0xB518, ctxBase, stateContext, 0);
     CGRasterizerCacheGnm_FlushToGfxContext(ctxBase + 0xB528, ctxBase, stateContext);
@@ -1211,8 +1221,9 @@ void GXGnmCommandContext_DrawInstanced(
     CGShaderResourceBinderGnm_SyncAndBindGraphicsPipeline(srBinder, ctxBase, stateContext);
 
     if (gx_direct_vk::EnabledV2Sub(gx_direct_vk::kV2Sub_DrawDirect)) {
-        gx_direct_vk::EmitDrawAuto(gfxCtx, vertexCountPerInstance, instanceCount,
-                                   static_cast<std::int32_t>(startVertexLocation));
+        gx_direct_vk::EmitDrawAutoBundled(gfxCtx, bundle_mark, vertexCountPerInstance,
+                                          instanceCount,
+                                          static_cast<std::int32_t>(startVertexLocation));
     } else {
         sub_1074040(gfxCtx, static_cast<std::int32_t>(startVertexLocation));
         sub_1075370(gfxCtx, instanceCount);
@@ -1236,6 +1247,11 @@ void GXGnmCommandContext_DrawIndexed(
     void* gfxCtx = ctxBase + 0x10;
     void* srBinder = ctxBase + 0x50;
 
+    if (gx_direct_vk::DrawBundleEnabled()) [[unlikely]] {
+        CGGfxContextGnm_FlushPendingStagingUploads(gfxCtx);
+    }
+    const auto bundle_mark = gx_direct_vk::CaptureDrawBundleBookmark(gfxCtx);
+
     CGOutputMergerCacheGnm_FlushBlendAndDepthStencilState(ctxBase + 0xB558, ctxBase, stateContext);
     CGIndexBufferCacheGnm_BindToGfxContext(ctxBase + 0xB518, ctxBase, stateContext, 1);
     CGRasterizerCacheGnm_FlushToGfxContext(ctxBase + 0xB528, ctxBase, stateContext);
@@ -1243,8 +1259,8 @@ void GXGnmCommandContext_DrawIndexed(
     CGShaderResourceBinderGnm_SyncAndBindGraphicsPipeline(srBinder, ctxBase, stateContext);
 
     if (gx_direct_vk::EnabledV2Sub(gx_direct_vk::kV2Sub_DrawDirect)) {
-        gx_direct_vk::EmitDrawIndexed(gfxCtx, indexCount, 1u, startIndexLocation,
-                                      baseVertexLocation);
+        gx_direct_vk::EmitDrawIndexedBundled(gfxCtx, bundle_mark, indexCount, 1u,
+                                             startIndexLocation, baseVertexLocation);
     } else {
         sub_1074040(gfxCtx, baseVertexLocation);
         sub_1075370(gfxCtx, 1);
@@ -1267,6 +1283,11 @@ void GXGnmCommandContext_Draw(
     void* gfxCtx = ctxBase + 0x10;
     void* srBinder = ctxBase + 0x50;
 
+    if (gx_direct_vk::DrawBundleEnabled()) [[unlikely]] {
+        CGGfxContextGnm_FlushPendingStagingUploads(gfxCtx);
+    }
+    const auto bundle_mark = gx_direct_vk::CaptureDrawBundleBookmark(gfxCtx);
+
     CGOutputMergerCacheGnm_FlushBlendAndDepthStencilState(ctxBase + 0xB558, ctxBase, stateContext);
     CGIndexBufferCacheGnm_BindToGfxContext(ctxBase + 0xB518, ctxBase, stateContext, 0);
     CGRasterizerCacheGnm_FlushToGfxContext(ctxBase + 0xB528, ctxBase, stateContext);
@@ -1274,8 +1295,8 @@ void GXGnmCommandContext_Draw(
     CGShaderResourceBinderGnm_SyncAndBindGraphicsPipeline(srBinder, ctxBase, stateContext);
 
     if (gx_direct_vk::EnabledV2Sub(gx_direct_vk::kV2Sub_DrawDirect)) {
-        gx_direct_vk::EmitDrawAuto(gfxCtx, vertexCount, 1u,
-                                   static_cast<std::int32_t>(startVertexLocation));
+        gx_direct_vk::EmitDrawAutoBundled(gfxCtx, bundle_mark, vertexCount, 1u,
+                                          static_cast<std::int32_t>(startVertexLocation));
     } else {
         sub_1074040(gfxCtx, static_cast<std::int32_t>(startVertexLocation));
         sub_1075370(gfxCtx, 1);

@@ -1,5 +1,6 @@
 #version 460
 #extension GL_EXT_samplerless_texture_functions : require
+#extension GL_EXT_demote_to_helper_invocation : require
 // ps_2140da2b — Clean vectorized G-Buffer foliage shader (two-sided canopy + detail + tint)
 
 layout(location = 0) in vec4 fs_in_attr0_p;
@@ -97,27 +98,39 @@ void main() {
     uint d4 = (bo0.y >> 2u) & 0x3Fu;
     uint d5 = (bo0.y >> 10u) & 0x3Fu;
 
-    bool is_front = gl_FrontFacing;
-
-    float inv_w = 1.0 / fs_in_attr4_p.w;
-    vec2 screen_uv = vec2(0.25 * (s1f(d0 + 4u) * fma(0.5 * fs_in_attr4_p.x, inv_w, 0.5)),
-                          0.25 * (s1f(d0 + 5u) * fma(-0.5 * fs_in_attr4_p.y, inv_w, 0.5)));
-    vec4 tex0 = texture(sampler2D(fs_img0, fs_samp0), screen_uv);
-    vec4 tex1 = texture(sampler2D(fs_img1, fs_samp1), fs_in_attr3_p.zw);
     vec4 tex2 = texture(sampler2D(fs_img2, fs_samp1), xform_uv(d1, fs_in_attr3_p.xy));
-
     uint inst_off = uint(fs_in_attr0_p.w * 1.00001526) * 13u;
     float alpha_raw = tex2.w * fs_in_attr2_p.w;
     float alpha_val = alpha_raw * ssbo_3.data[(inst_off + 7u) * 4u + 3u + d2];
-    if (s4f(d3 + 20u) > s4f(d3 + 21u) * (-0.5 + tex0.w) + alpha_raw || alpha_val == 0.0) {
-        discard;
+    float alpha_ref = s4f(d3 + 20u);
+    float dither_scale = s4f(d3 + 21u);
+    float alpha_cmp = alpha_raw;
+    if (dither_scale != 0.0) {
+        float inv_w = 1.0 / fs_in_attr4_p.w;
+        vec2 screen_uv = vec2(0.25 * (s1f(d0 + 4u) * fma(0.5 * fs_in_attr4_p.x, inv_w, 0.5)),
+                              0.25 * (s1f(d0 + 5u) * fma(-0.5 * fs_in_attr4_p.y, inv_w, 0.5)));
+        alpha_cmp += dither_scale * (texture(sampler2D(fs_img0, fs_samp0), screen_uv).w - 0.5);
+    }
+    bool alpha_fail = (alpha_val == 0.0) || (alpha_ref > alpha_cmp);
+    if (alpha_fail) {
+        demote;
+    }
+    float keep = (alpha_fail || helperInvocationEXT()) ? 0.0 : 1.0;
+    float row_alive = float((keep + abs(dFdxFine(keep))) > 0.0);
+    if ((row_alive + abs(dFdyFine(row_alive))) == 0.0) {
+        return;
     }
 
+    vec4 tex1 = texture(sampler2D(fs_img1, fs_samp1), fs_in_attr3_p.zw);
     vec4 tex3 = texture(sampler2D(fs_img3, fs_samp2), xform_uv(d1 + 12u, fs_in_attr3_p.xy));
-    vec4 tex4 = texture(sampler2D(fs_img4, fs_samp3), xform_uv(d1 + 8u, fs_in_attr3_p.xy));
-    vec4 tex5 = texture(sampler2D(fs_img5, fs_samp3), fs_in_attr3_p.zw);
-    vec4 tex6 = texture(sampler2D(fs_img6, fs_samp3), xform_uv(d1 + 4u, fs_in_attr3_p.xy));
+    float tex4_x = texture(sampler2D(fs_img4, fs_samp3), xform_uv(d1 + 8u, fs_in_attr3_p.xy)).x;
+    vec2 tex5_xy = texture(sampler2D(fs_img5, fs_samp3), fs_in_attr3_p.zw).xy;
+    vec3 tex6_rgb = texture(sampler2D(fs_img6, fs_samp3), xform_uv(d1 + 4u, fs_in_attr3_p.xy)).rgb;
+    if (keep == 0.0) {
+        return;
+    }
 
+    bool is_front = gl_FrontFacing;
     vec3 n_unit = safe_norm(fs_in_attr0_p.xyz);
     vec3 N_vert = is_front ? n_unit : -n_unit;
     vec3 T_vert = safe_norm(fs_in_attr1_p.xyz);
@@ -138,22 +151,22 @@ void main() {
 
     float det_w = s4f(d3 + 24u);
     float gloss_scale = s4f(d3 + 8u) * 0.00390625;
-    float gloss = (det_w * ((tex1.w * tex4.x + tex5.x) - tex4.x) + tex4.x) * gloss_scale;
+    float gloss = (det_w * ((tex1.w * tex4_x + tex5_xy.x) - tex4_x) + tex4_x) * gloss_scale;
     float mip_lod = min(6.0, 6.5 - gloss * 6.5);
     vec3 c_uv = cube_uv(is_front ? R : vec3(R.x, abs(R.y), R.z));
-    vec4 env0 = textureLod(sampler2DArray(fs_img7, fs_samp0), c_uv, mip_lod);
-    vec4 env1 = textureLod(sampler2DArray(fs_img8, fs_samp0), c_uv, mip_lod);
+    vec3 env0 = textureLod(sampler2DArray(fs_img7, fs_samp0), c_uv, mip_lod).rgb;
+    vec3 env1 = textureLod(sampler2DArray(fs_img8, fs_samp0), c_uv, mip_lod).rgb;
 
-    bool mono_spec = (tex6.z == 0.0) && (tex6.y == 0.0);
-    vec3 spec_tex = vec3(tex6.x, mono_spec ? tex6.x : tex6.y, mono_spec ? tex6.x : tex6.z);
-    vec3 spec = det_w * ((tex1.w * spec_tex + tex5.y * tex5.y) - spec_tex) + spec_tex;
+    bool mono_spec = (tex6_rgb.z == 0.0) && (tex6_rgb.y == 0.0);
+    vec3 spec_tex = mono_spec ? vec3(tex6_rgb.x) : tex6_rgb;
+    vec3 spec = det_w * ((tex1.w * spec_tex + tex5_xy.y * tex5_xy.y) - spec_tex) + spec_tex;
 
     uint sh_base = (inst_off + 8u) * 4u + d2;
     float e_w0 = ssbo_3.data[sh_base];
     float e_w1 = ssbo_3.data[sh_base + 1u];
     float e_w2 = ssbo_3.data[sh_base + 2u];
     float horizon = clamp(dot(R, N_vert) + 1.0, 0.0, 1.0);
-    vec3 env_blend = (e_w0 * (-e_w1 * env1.xyz + e_w2 * env0.xyz) + e_w1 * env1.xyz) * (horizon * horizon);
+    vec3 env_blend = (e_w0 * (-e_w1 * env1 + e_w2 * env0) + e_w1 * env1) * (horizon * horizon);
     vec3 env_tint = vec3(s4f(d3 + 4u), s4f(d3 + 5u), s4f(d3 + 6u)) * s5f(d4 + 12u);
 
     vec3 sh_rgb = vec3(eval_sh(sh_base + 4u, N), eval_sh(sh_base + 8u, N), eval_sh(sh_base + 12u, N));

@@ -36,7 +36,7 @@ layout(set = 0, binding = 8) uniform sampler fs_samp3;
 void main() {
     uint b0 = bitfieldExtract(push_data.buf_offsets0.x, 0, 8) >> 2;
 
-    vec3 tex0 = texture(sampler2D(fs_img0, fs_samp0), fs_in_attr2.xy).rgb;
+    vec3 tex0 = textureLod(sampler2D(fs_img0, fs_samp0), fs_in_attr2.xy, 0.0).rgb;
     vec4 tex1 = textureLod(sampler2D(fs_img1, fs_samp1), fs_in_attr0.xy, 0.0);
     vec3 tex2 = textureLod(sampler2D(fs_img2, fs_samp2), fs_in_attr1.xy, 0.0).rgb;
     float tex3 = textureLod(sampler2D(fs_img3, fs_samp3), fs_in_attr3.xy, 0.0).r;
@@ -51,9 +51,9 @@ void main() {
     float c755 = uintBitsToFloat(ssbo_1.data[b0 + 755]);
     float c756 = uintBitsToFloat(ssbo_1.data[b0 + 756]);
 
-    vec3 a0 = c0 * c752 + c753;
+    vec3 a0 = fma(c0, vec3(c752), vec3(c753));
     float avg0 = (a0.z + (a0.y + a0.x)) * 0.333333343;
-    vec3 sat0 = ((a0 - avg0) * c756 + avg0) * c754 + c755;
+    vec3 sat0 = fma(fma(a0 - avg0, vec3(c756), vec3(avg0)), vec3(c754), vec3(c755));
 
     float c616 = uintBitsToFloat(ssbo_1.data[b0 + 616]);
     float c617 = uintBitsToFloat(ssbo_1.data[b0 + 617]);
@@ -61,10 +61,10 @@ void main() {
     float c833 = uintBitsToFloat(ssbo_1.data[b0 + 833]);
 
     vec3 hdr = max(vec3(6.10351562e-05), sat0 * (c1 * c616));
-    vec3 ex = exp2((-hdr * c832) * 1.44269502);
+    vec3 ex = exp2((-1.44269502 * c832) * hdr);
     vec3 one_minus_ex = 1.0 - ex;
-    vec3 mod_ex = 1.0 - ex * c833;
-    vec3 curve = clamp(mod_ex * (one_minus_ex * mod_ex), 0.0, 1.0);
+    vec3 mod_ex = fma(ex, vec3(-c833), vec3(1.0));
+    vec3 curve = clamp((mod_ex * mod_ex) * one_minus_ex, 0.0, 1.0);
 
     float c744 = uintBitsToFloat(ssbo_1.data[b0 + 744]);
     float c745 = uintBitsToFloat(ssbo_1.data[b0 + 745]);
@@ -72,13 +72,14 @@ void main() {
     float c747 = uintBitsToFloat(ssbo_1.data[b0 + 747]);
     float c748 = uintBitsToFloat(ssbo_1.data[b0 + 748]);
 
-    vec3 a1 = c0 * c744 + c745;
+    vec3 a1 = fma(c0, vec3(c744), vec3(c745));
     float avg1 = (a1.z + (a1.y + a1.x)) * 0.333333343;
-    vec3 sat1 = clamp((a1 - avg1) * c748 + avg1, 0.0, 1.0) * c746 + c747;
+    vec3 sat1 = fma(clamp(fma(a1 - avg1, vec3(c748), vec3(avg1)), 0.0, 1.0), vec3(c746), vec3(c747));
 
-    vec3 bloom = clamp((c2 * sat0 + sat1) * c617, 0.0, 1.0);
-    vec3 screen = (curve + bloom) - curve * bloom;
+    vec3 bloom = clamp(fma(c2, sat0, sat1) * c617, 0.0, 1.0);
+    vec3 screen = fma(-curve, bloom, curve + bloom);
 
+    vec4 screen4 = vec4(screen.zyx, 1.0);
     vec4 m0 = vec4(uintBitsToFloat(ssbo_1.data[b0 + 840]),
                    uintBitsToFloat(ssbo_1.data[b0 + 841]),
                    uintBitsToFloat(ssbo_1.data[b0 + 842]),
@@ -92,22 +93,18 @@ void main() {
                    uintBitsToFloat(ssbo_1.data[b0 + 850]),
                    uintBitsToFloat(ssbo_1.data[b0 + 851]));
 
-    float g0 = m0.x * screen.z + (m0.y * screen.y + (m0.z * screen.x + m0.w));
-    float g1 = m1.x * screen.z + (m1.y * screen.y + (m1.z * screen.x + m1.w));
-    float g2 = m2.x * screen.z + (m2.y * screen.y + (m2.z * screen.x + m2.w));
-
-    vec3 graded = clamp(vec3(g0, g1, g2) + 2.38418579e-07, 0.0, 1.0);
+    vec3 graded = clamp(vec3(dot(m0, screen4), dot(m1, screen4), dot(m2, screen4)) + 2.38418579e-07, 0.0, 1.0);
     float inv_gamma = uintBitsToFloat(ssbo_1.data[b0 + 808]);
     float dither_scale = uintBitsToFloat(ssbo_1.data[b0 + 809]);
     float dither_bias = uintBitsToFloat(ssbo_1.data[b0 + 810]);
 
-    vec3 gamma_out = exp2(log2(graded) * inv_gamma) + (tex3 * dither_scale) + dither_bias;
+    vec3 gamma_out = exp2(log2(graded) * inv_gamma) + fma(tex3, dither_scale, dither_bias);
 
     vec4 aw = vec4(uintBitsToFloat(ssbo_1.data[b0 + 620]),
                    uintBitsToFloat(ssbo_1.data[b0 + 621]),
                    uintBitsToFloat(ssbo_1.data[b0 + 622]),
                    uintBitsToFloat(ssbo_1.data[b0 + 623]));
-    float out_a = clamp(tex1.r * aw.x + (tex1.g * aw.y + (tex1.b * aw.z + tex1.a * aw.w)), 0.0, 1.0);
+    float out_a = clamp(dot(tex1, aw), 0.0, 1.0);
 
     frag_color0 = vec4(gamma_out.zyx, out_a);
 }

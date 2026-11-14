@@ -235,10 +235,10 @@ private:
     void InsertMru(VAddr query_addr, VAddr base_addr, u64 alloc_size, Entry* entry) noexcept {
         const size_t h0 = MruHash(query_addr);
         const size_t h1 = (h0 + 1u) & (kMruSlots - 1);
-        if (mru[h0].base_addr != base_addr || mru[h0].erase_gen != erase_generation) {
+        if (mru[h0].base_addr != base_addr || mru[h0].erase_gen != map_erase_generation) {
             mru[h1] = mru[h0];
         }
-        mru[h0] = MruSlot{base_addr, alloc_size, erase_generation, entry};
+        mru[h0] = MruSlot{base_addr, alloc_size, map_erase_generation, entry};
     }
 
     void SetBitmapRange(VAddr start, VAddr end) noexcept;
@@ -264,6 +264,7 @@ private:
     std::vector<u64> bitmap_64k;
     std::vector<MruSlot> mru;
     u64 erase_generation{1};
+    u64 map_erase_generation{1};
     u32 mru_hand{0};
 };
 

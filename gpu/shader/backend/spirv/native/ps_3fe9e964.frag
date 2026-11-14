@@ -50,22 +50,28 @@ float safe_rsq(float x) {
 }
 
 void main() {
+    vec2 uv = fs_in_attr1_p.xy;
+    float depth = textureLod(sampler2D(fs_img1, fs_samp0), uv, 0.0).x;
+    if (depth >= 0.999999) {
+        frag_color1 = vec4(0.0, 0.0, 0.0, 1.0);
+        frag_color0 = vec4(0.0, 0.0, 0.0, 1.0);
+        return;
+    }
+
     uint u0 = push_data.buf_offsets0.x;
     uint d0 = bitfieldExtract(u0, 0, 8) >> 2u;
     uint d1 = bitfieldExtract(u0, 8, 8) >> 2u;
 
-    vec2 uv = fs_in_attr1_p.xy;
-    vec4 tex_gloss = texture(sampler2D(fs_img0, fs_samp0), uv);
-    vec4 tex_depth = texture(sampler2D(fs_img1, fs_samp0), uv);
-    vec4 tex_nrm   = texture(sampler2D(fs_img2, fs_samp1), uv);
-    vec4 tex_spec  = texture(sampler2D(fs_img3, fs_samp0), uv);
-    vec4 tex_ao    = texture(sampler2D(fs_img4, fs_samp2), uv);
-    vec4 tex_env   = texture(sampler2D(fs_img5, fs_samp0), uv);
+    vec4 tex_gloss = textureLod(sampler2D(fs_img0, fs_samp0), uv, 0.0);
+    vec4 tex_nrm   = textureLod(sampler2D(fs_img2, fs_samp1), uv, 0.0);
+    vec4 tex_spec  = textureLod(sampler2D(fs_img3, fs_samp0), uv, 0.0);
+    vec4 tex_ao    = textureLod(sampler2D(fs_img4, fs_samp2), uv, 0.0);
+    vec4 tex_env   = textureLod(sampler2D(fs_img5, fs_samp0), uv, 0.0);
     float ssr_mip  = min(5.0, 6.5 - tex_gloss.x * 6.5);
     vec4 tex_ssr   = textureLod(sampler2D(fs_img6, fs_samp3), uv, ssr_mip);
-    vec4 tex_diff  = texture(sampler2D(fs_img7, fs_samp0), uv);
+    vec4 tex_diff  = textureLod(sampler2D(fs_img7, fs_samp0), uv, 0.0);
 
-    vec4 clip_p = vec4(fs_in_attr0_p.xy, tex_depth.x, 1.0);
+    vec4 clip_p = vec4(fs_in_attr0_p.xy, depth, 1.0);
     float inv_w = 1.0 / dot(load_s1_v4(d0 + 12u), clip_p);
     vec3 pos_v = vec3(
         dot(load_s1_v4(d0 + 0u), clip_p),
@@ -77,28 +83,31 @@ void main() {
     vec3 N_unorm = fma(vec3(2.0), tex_nrm.xyz, vec3(-1.0));
     vec3 N = N_unorm * safe_rsq(dot(N_unorm, N_unorm));
     vec3 V_world = vec3(
-        dot(load_s1_v4(d0 + 32u).xyz, V),
-        dot(load_s1_v4(d0 + 36u).xyz, V),
-        dot(load_s1_v4(d0 + 40u).xyz, V)
+        dot(vec3(s1f(d0 + 32u), s1f(d0 + 33u), s1f(d0 + 34u)), V),
+        dot(vec3(s1f(d0 + 36u), s1f(d0 + 37u), s1f(d0 + 38u)), V),
+        dot(vec3(s1f(d0 + 40u), s1f(d0 + 41u), s1f(d0 + 42u)), V)
     );
     float NdotV = clamp(dot(V_world, N), 0.0, 1.0);
-    float fresnel = exp2(5.0 * log2(1.0 - NdotV));
+    float om_nv = 1.0 - NdotV;
+    float om_nv2 = om_nv * om_nv;
+    float fresnel = om_nv2 * om_nv2 * om_nv;
 
     vec3 ao_w = vec3(s2f(d1 + 76u), s2f(d1 + 77u), s2f(d1 + 78u));
-    vec3 ao_factor = (tex_ao.x * tex_ao.y) * fma(vec3(tex_env.w), -1.0 + (tex_ao.w * ao_w + (1.0 - ao_w)), vec3(1.0));
+    float raw_ao_prod = tex_ao.x * tex_ao.y;
+    vec3 ao_factor = raw_ao_prod * fma(vec3(tex_env.w), -1.0 + (tex_ao.w * ao_w + (1.0 - ao_w)), vec3(1.0));
 
     vec3 spec_sq = tex_spec.xyz * tex_spec.xyz;
     float gloss_sq = tex_gloss.x * tex_gloss.x;
     vec3 spec_fresnel = spec_sq + ((-spec_sq * fresnel + fresnel) * gloss_sq);
+    vec3 env_ssr = tex_ssr.w * (spec_fresnel * tex_ssr.xyz - tex_env.xyz) + tex_env.xyz;
     vec3 spec_ao_factor = ao_factor;
-    if (((push_data.buf_offsets2.y >> 24u) & 0x01u) != 0u) {
+    if (dot(env_ssr, env_ssr) > 0.0 && raw_ao_prod > 0.0 && ((push_data.buf_offsets2.y >> 24u) & 0x01u) != 0u) {
         // Lagarde / Frostbite Specular Micro-Occlusion: suppresses glowing grazing specular inside crevices
-        float raw_ao = clamp(tex_ao.x * tex_ao.y, 0.0, 1.0);
-        float spec_ao = clamp(pow(NdotV + raw_ao, exp2(-16.0 * (1.0 - tex_gloss.x) - 1.0)) - 1.0 + raw_ao, 0.0, 1.0);
+        float raw_ao = clamp(raw_ao_prod, 0.0, 1.0);
+        float spec_ao = clamp(exp2(log2(max(NdotV + raw_ao, 1e-6)) * exp2(fma(16.0, tex_gloss.x, -17.0))) - 1.0 + raw_ao, 0.0, 1.0);
         spec_ao_factor *= mix(1.0, spec_ao / max(raw_ao, 1e-4), 0.85);
     }
-    vec3 spec_out = spec_ao_factor * (tex_ssr.w * (spec_fresnel * tex_ssr.xyz - tex_env.xyz) + tex_env.xyz);
 
-    frag_color1 = vec4(spec_out, 1.0);
+    frag_color1 = vec4(spec_ao_factor * env_ssr, 1.0);
     frag_color0 = vec4(tex_diff.xyz * ao_factor, 1.0);
 }

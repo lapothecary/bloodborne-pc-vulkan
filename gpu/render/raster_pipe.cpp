@@ -198,6 +198,9 @@ bool Rasterizer::TryInterceptVsmClearColor(const DirectClearColorArgs& args) {
 }
 
 bool Rasterizer::TryInterceptVsmClearDepth(const DirectClearDepthStencilArgs& args) {
+    if (((args.stencil_and_flags >> 16) & 0xFu) != 0u) {
+        return false;
+    }
     if (!vsm_shadow_memo || !UseDrawPipe() || !OnStageA()) {
         return false;
     }
@@ -1608,6 +1611,22 @@ std::array<void*, TaskKinds> task_kinds{};
 std::array<u64, TaskKinds> task_cycles{}, task_counts{};
 } // namespace
 
+bool Rasterizer::NextPipePacketIsBufferCopyBatch() const noexcept {
+    if (!DrawPipe::OnStageB() || !draw_pipe) {
+        return false;
+    }
+    u32 next_sz = 0;
+    const u8* next_pkt = draw_pipe->PeekNext(next_sz);
+    if (!next_pkt || next_sz < sizeof(TaskPacket)) {
+        return false;
+    }
+    if (*reinterpret_cast<const PacketKind*>(next_pkt) != PacketKind::Task) {
+        return false;
+    }
+    const auto& task = *reinterpret_cast<const TaskPacket*>(next_pkt);
+    return task.task == &BbCp::Tasks::DirectVkCopyBatchTask;
+}
+
 bool Rasterizer::NextPipePacketIsTextureRegionCopy() const noexcept {
     if (!DrawPipe::OnStageB() || !draw_pipe) {
         return false;
@@ -1645,6 +1664,10 @@ void Rasterizer::RunDrawPacket(void* context, const u8* data, u32 size) {
         BB_SECTION(Task);
         self.buffer_cache.NewPacket();
         const auto& task = *reinterpret_cast<const TaskPacket*>(data);
+        if (!self.pending_buf_copies.empty() &&
+            task.task != &BbCp::Tasks::DirectVkCopyBatchTask) [[unlikely]] {
+            self.FlushPendingBufferCopies();
+        }
         if (!self.pending_tex_copies.empty() &&
             task.task != &BbCp::Tasks::DirectVkCopyTextureRegionTask) [[unlikely]] {
             self.FlushPendingTextureRegionCopies();
@@ -1665,6 +1688,9 @@ void Rasterizer::RunDrawPacket(void* context, const u8* data, u32 size) {
         }
         task.task(self, data + sizeof(TaskPacket));
         return;
+    }
+    if (!self.pending_buf_copies.empty()) [[unlikely]] {
+        self.FlushPendingBufferCopies();
     }
     if (!self.pending_tex_copies.empty()) [[unlikely]] {
         self.FlushPendingTextureRegionCopies();

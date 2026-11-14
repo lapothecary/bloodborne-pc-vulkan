@@ -124,6 +124,12 @@
 #include "bbgpu/shaders/ps_52738b8a_frag.h"
 #include "bbgpu/shaders/ps_dbb222eb_frag.h"
 #include "bbgpu/shaders/ps_9e3394c8_frag.h"
+#include "bbgpu/shaders/cs_9a9cf8a9_comp.h"
+#include "bbgpu/shaders/ps_265a6d2d_frag.h"
+#include "bbgpu/shaders/ps_a2c4f30a_frag.h"
+#include "bbgpu/shaders/ps_ff902740_frag.h"
+#include "bbgpu/shaders/ps_e80526cc_frag.h"
+#include "bbgpu/shaders/vs_3deaa573_vert.h"
 
 namespace Shader::Backend::SPIRV {
 
@@ -154,7 +160,9 @@ constexpr u32 kOpAccessChain = 65u;
 constexpr u32 kOpInBoundsAccessChain = 66u;
 constexpr u32 kOpImageTexelPointer = 67u;
 constexpr u32 kOpDecorate = 71u;
+constexpr u32 kOpVectorShuffle = 79u;
 constexpr u32 kOpCopyObject = 83u;
+constexpr u32 kOpImageWrite = 99u;
 
 // Storage classes
 constexpr u32 kStorageClassUniformConstant = 0u;
@@ -190,7 +198,7 @@ struct NativeShaderCandidate {
     const char* label;
 };
 
-constexpr std::array<NativeShaderCandidate, 113> kNativeRegistry{{
+constexpr std::array<NativeShaderCandidate, 119> kNativeRegistry{{
     {0x000000000f61fd27ull, PS_0F61FD27_VSM_BLUR_FRAG, "ps_0f61fd27_vsm_blur"},
     {0x000000001ae03d75ull, PS_1AE03D75_VSM_MOMENT_CLDIST_FRAG, "ps_1ae03d75_vsm_moment_cldist"},
     {0x000000001ae03d75ull, PS_1AE03D75_VSM_MOMENT_NOCLIP_FRAG, "ps_1ae03d75_vsm_moment_noclip"},
@@ -304,6 +312,12 @@ constexpr std::array<NativeShaderCandidate, 113> kNativeRegistry{{
     {0x000000009e3394c8ull, PS_9E3394C8_FRAG, "ps_9e3394c8_gbuf6_foliage"},
     {0x000000008747a367ull, VS_8747A367_VERT, "vs_8747a367_light_acc"},
     {0x0000000024042a9bull, VS_24042A9B_VERT, "vs_24042a9b_scaleform_texgen"},
+    {0x000000009a9cf8a9ull, CS_9A9CF8A9_COMP, "cs_9a9cf8a9_yebis_clear"},
+    {0x00000000265a6d2dull, PS_265A6D2D_FRAG, "ps_265a6d2d_yebis_tap2"},
+    {0x00000000a2c4f30aull, PS_A2C4F30A_FRAG, "ps_a2c4f30a_yebis_dof_comp"},
+    {0x00000000ff902740ull, PS_FF902740_FRAG, "ps_ff902740_yebis_coc"},
+    {0x00000000e80526ccull, PS_E80526CC_FRAG, "ps_e80526cc_yebis_tap7"},
+    {0x000000003deaa573ull, VS_3DEAA573_VERT, "vs_3deaa573_gbuf_skin4"},
 }};
 
 struct DescSlot {
@@ -607,8 +621,8 @@ u32 NativeShadersMaxIdx() noexcept {
 
 namespace {
 
-s32 ExtractVs8747BufSlot(std::span<const u32> spv) {
-    if (spv.size() < 5 || spv[0] != kSpirvMagic) {
+s32 ExtractFirstConsecutiveBufSlot(std::span<const u32> spv, size_t expected_count) {
+    if (expected_count == 0u || spv.size() < 5 || spv[0] != kSpirvMagic) {
         return -1;
     }
     const u32 bound = spv[3];
@@ -618,7 +632,8 @@ s32 ExtractVs8747BufSlot(std::span<const u32> spv) {
     std::vector<u8> is_u32_type(bound, 0u);
     std::vector<u32> const_u32_val(bound, 0xFFFFFFFFu);
     u32 push_data_id = 0xFFFFFFFFu;
-    s32 buf_slot = -1;
+    std::array<u32, 8> slots{};
+    size_t slot_count = 0u;
     bool in_func = false;
 
     for (size_t pos = 5; pos < spv.size();) {
@@ -644,7 +659,10 @@ s32 ExtractVs8747BufSlot(std::span<const u32> spv) {
                         ++p;
                     }
                     if (val < 40u && std::strcmp(s + p, "_off") == 0) {
-                        buf_slot = static_cast<s32>(val);
+                        if (slot_count >= slots.size()) {
+                            return -1;
+                        }
+                        slots[slot_count++] = val;
                     }
                 }
             } else if (op == kOpTypeInt && wc == 4 && w[1] < bound && w[2] == 32u) {
@@ -668,7 +686,15 @@ s32 ExtractVs8747BufSlot(std::span<const u32> spv) {
         }
         pos += wc;
     }
-    return buf_slot;
+    if (slot_count != expected_count || slots[0] + expected_count > 40u) {
+        return -1;
+    }
+    for (size_t i = 1u; i < expected_count; ++i) {
+        if (slots[i] != slots[0] + static_cast<u32>(i)) {
+            return -1;
+        }
+    }
+    return static_cast<s32>(slots[0]);
 }
 
 bool SpecializeConstantId0(std::vector<u32>& spv, u32 value) {
@@ -793,10 +819,63 @@ bool TryReplaceWithNativeShader(u64 pgm_hash, const std::vector<u32>& ref_spv,
     if (pgm_hash == 0x000000004b766f62ull && ref_sig.bgra_export) {
         return false;
     }
-    s32 vs_8747_buf_slot = -1;
-    if (pgm_hash == 0x000000008747a367ull || pgm_hash == 0x0000000024042a9bull) {
-        vs_8747_buf_slot = ExtractVs8747BufSlot(ref_spv);
-        if (vs_8747_buf_slot < 0) {
+    s32 vs_first_buf_slot = -1;
+    if (pgm_hash == 0x000000008747a367ull || pgm_hash == 0x0000000024042a9bull ||
+        pgm_hash == 0x000000003deaa573ull) {
+        const size_t expected_bufs = (pgm_hash == 0x000000003deaa573ull) ? 4u : 1u;
+        vs_first_buf_slot = ExtractFirstConsecutiveBufSlot(ref_spv, expected_bufs);
+        if (vs_first_buf_slot < 0) {
+            return false;
+        }
+    }
+    s32 cs_9a9_swz_mode = -1;
+    if (pgm_hash == 0x000000009a9cf8a9ull) {
+        const u32 bound = (ref_spv.size() >= 5 && ref_spv[0] == kSpirvMagic) ? ref_spv[3] : 0u;
+        if (bound == 0u || bound > 2'000'000u) {
+            return false;
+        }
+        struct Shuffle4 {
+            u8 valid = 0u;
+            u32 c0 = 0u, c1 = 0u, c2 = 0u, c3 = 0u;
+        };
+        std::vector<Shuffle4> shuffles(bound);
+        bool in_fn = false;
+        for (size_t pos = 5; pos < ref_spv.size();) {
+            const u32 wc = ref_spv[pos] >> 16;
+            const u32 op = ref_spv[pos] & 0xFFFFu;
+            if (wc == 0u || pos + wc > ref_spv.size()) {
+                return false;
+            }
+            const u32* w = &ref_spv[pos];
+            if (op == kOpFunction) {
+                in_fn = true;
+            } else if (in_fn) {
+                if (op == kOpVectorShuffle && wc == 9u && w[2] < bound) {
+                    shuffles[w[2]] = {1u, w[5], w[6], w[7], w[8]};
+                } else if (op == kOpImageWrite && wc >= 4u && w[3] < bound) {
+                    const auto& sh = shuffles[w[3]];
+                    if (!sh.valid) {
+                        return false;
+                    }
+                    s32 cur = -1;
+                    if (sh.c0 == 4u && sh.c1 == 5u && sh.c2 == 6u && sh.c3 == 7u) {
+                        cur = 0; // RGBA
+                    } else if (sh.c0 == 6u && sh.c1 == 5u && sh.c2 == 4u && sh.c3 == 7u) {
+                        cur = 1; // BGRA
+                    } else if (sh.c0 == 4u && sh.c1 == 5u && sh.c2 == 6u && sh.c3 == 0u) {
+                        cur = 2; // RGB0 (B10G11R11)
+                    } else {
+                        return false;
+                    }
+                    if (cs_9a9_swz_mode >= 0 && cs_9a9_swz_mode != cur) {
+                        return false;
+                    }
+                    cs_9a9_swz_mode = cur;
+                }
+            }
+            pos += wc;
+        }
+        if (cs_9a9_swz_mode < 0) {
             return false;
         }
     }
@@ -880,8 +959,13 @@ bool TryReplaceWithNativeShader(u64 pgm_hash, const std::vector<u32>& ref_spv,
                 pos += wc;
             }
         }
-        if ((pgm_hash == 0x000000008747a367ull || pgm_hash == 0x0000000024042a9bull) &&
-            !SpecializeConstantId0(out_spv, static_cast<u32>(vs_8747_buf_slot))) {
+        if ((pgm_hash == 0x000000008747a367ull || pgm_hash == 0x0000000024042a9bull ||
+             pgm_hash == 0x000000003deaa573ull) &&
+            !SpecializeConstantId0(out_spv, static_cast<u32>(vs_first_buf_slot))) {
+            return false;
+        }
+        if (pgm_hash == 0x000000009a9cf8a9ull &&
+            !SpecializeConstantId0(out_spv, static_cast<u32>(cs_9a9_swz_mode))) {
             return false;
         }
         return true;

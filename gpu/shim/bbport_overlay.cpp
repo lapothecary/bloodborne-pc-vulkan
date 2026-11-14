@@ -2577,7 +2577,7 @@ void FpsCounter() {
                 h.a_total_ms, h.avg_a_total_ms, h.bottleneck_kind == 2);
         const bool stage_b_active = (h.b_total_ms >= 0.02f || h.avg_b_total_ms >= 0.02f);
         if (xray) {
-            row_cpu_sub("  2a. PM4 Decode & FastPSO", h.a_decode_pso_ms, h.avg_a_decode_pso_ms);
+            row_cpu_sub("  2a. Cmd Stream, Cull & FastPSO", h.a_decode_pso_ms, h.avg_a_decode_pso_ms);
             row_cpu_sub("  2b. Buffers, Vtx/Idx & Ring", h.a_buf_ring_ms, h.avg_a_buf_ring_ms);
             if (!stage_b_active || h.a_tex_desc_ms >= 0.015f || h.avg_a_tex_desc_ms >= 0.015f) {
                 row_cpu_sub("  2c. Textures & PushDesc", h.a_tex_desc_ms, h.avg_a_tex_desc_ms);

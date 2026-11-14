@@ -12,6 +12,7 @@
 #include "memory/fault_sites.h"
 #include "memory/page_watch.h"
 #include "render/scheduler.h"
+#include "textures/direct_textures.h"
 
 namespace VideoCore {
 
@@ -40,6 +41,9 @@ void TextureCache::RegisterImage(ImageId image_id) {
 void TextureCache::UnregisterImage(ImageId image_id) {
     Image& image = slot_images[image_id];
     ASSERT_MSG(True(image.flags & ImageFlagBits::Registered), "image not registered");
+    if (True(image.flags & ImageFlagBits::DirectImmutable)) {
+        DirectTextures::BumpImmutableRoEpoch();
+    }
     image.flags &= ~ImageFlagBits::Registered;
     if (const auto it = direct_assets_by_addr.find(image.info.guest_address);
         it != direct_assets_by_addr.end() && it->second == image_id) {

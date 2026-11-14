@@ -264,7 +264,7 @@ struct RegDirty {
         return 0xC240u + (bit - 115u) * StageBChunkWords;
     }
 
-    static constexpr void SetStageBBitRange(u64 (&m)[2], u32 lo, u32 hi) noexcept {
+    [[gnu::always_inline]] static constexpr void SetStageBBitRange(u64 (&m)[2], u32 lo, u32 hi) noexcept {
         if (lo < 64u) {
             const u32 h0 = std::min(hi, 63u);
             const u64 ones = (h0 - lo == 63u) ? ~0ULL : ((1ULL << (h0 - lo + 1u)) - 1ULL);
@@ -278,7 +278,7 @@ struct RegDirty {
         }
     }
 
-    void Mark(u32 word, u32 count) {
+    [[gnu::always_inline]] void Mark(u32 word, u32 count) noexcept {
         if (count == 0 || word >= Regs::NumRegs) {
             return;
         }

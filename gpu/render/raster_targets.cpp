@@ -4,6 +4,7 @@
 
 #include "render/direct_targets.h"
 #include "render/raster_internal.h"
+#include "textures/direct_textures.h"
 
 namespace Vulkan {
 
@@ -319,7 +320,12 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
             if (const auto id = cb_descs[cb].first) {
                 bound_images.emplace_back(id);
                 texture_cache.MarkFound(id);
-                texture_cache.GetImage(id).binding.is_target = 1u;
+                auto& img = texture_cache.GetImage(id);
+                if (!img.binding.is_target &&
+                    VideoCore::True(img.flags & VideoCore::ImageFlagBits::DirectImmutable)) {
+                    VideoCore::DirectTextures::BumpImmutableRoEpoch();
+                }
+                img.binding.is_target = 1u;
             }
         }
         if (want_depth) {
@@ -327,7 +333,12 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
             const auto id = db_desc.first;
             bound_images.emplace_back(id);
             texture_cache.MarkFound(id);
-            texture_cache.GetImage(id).binding.is_target = 1u;
+            auto& img = texture_cache.GetImage(id);
+            if (!img.binding.is_target &&
+                VideoCore::True(img.flags & VideoCore::ImageFlagBits::DirectImmutable)) {
+                VideoCore::DirectTextures::BumpImmutableRoEpoch();
+            }
+            img.binding.is_target = 1u;
         }
     } else {
         for (s32 cb = 0; cb < num_cb; ++cb) {
@@ -355,6 +366,10 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
             }
             image_id = bound_images.emplace_back(resolved);
             auto& image = texture_cache.GetImage(image_id);
+            if (!image.binding.is_target &&
+                VideoCore::True(image.flags & VideoCore::ImageFlagBits::DirectImmutable)) {
+                VideoCore::DirectTextures::BumpImmutableRoEpoch();
+            }
             image.binding.is_target = 1u;
             prepared_pass.cb_buf[cb] = col_buf;
             prepared_pass.cb_extent[cb] = hint;
@@ -386,6 +401,10 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
             }
             image_id = bound_images.emplace_back(resolved);
             auto& image = texture_cache.GetImage(image_id);
+            if (!image.binding.is_target &&
+                VideoCore::True(image.flags & VideoCore::ImageFlagBits::DirectImmutable)) {
+                VideoCore::DirectTextures::BumpImmutableRoEpoch();
+            }
             image.binding.is_target = 1u;
             prepared_pass.depth_buf = regs.depth_buffer;
             prepared_pass.depth_view_raw = std::bit_cast<u32>(regs.depth_view);
@@ -742,8 +761,10 @@ void Rasterizer::BindColorAttachments(RenderState& state, const GraphicsPipeline
             if (redirect.color) {
                 redirect.guest_extent = {image->info.size.width, image->info.size.height};
                 redirect.original_color = {attachment.image_view, attachment.image_layout};
-                attachment.image_view = redirect.target.view;
-                attachment.image_layout = redirect.target.layout;
+                if (redirect.target.view) {
+                    attachment.image_view = redirect.target.view;
+                    attachment.image_layout = redirect.target.layout;
+                }
             }
         }
     }
@@ -858,8 +879,10 @@ void Rasterizer::BindDepthAttachment(RenderState& state, bool reduced, TargetRed
         redirect.depth = upscaler->RedirectDepth(image_id, depth_target);
         if (redirect.depth) {
             redirect.guest_extent = {image.info.size.width, image.info.size.height};
-            attachment.image_view = depth_target.view;
-            attachment.image_layout = depth_target.layout;
+            if (depth_target.view) {
+                attachment.image_view = depth_target.view;
+                attachment.image_layout = depth_target.layout;
+            }
             redirect.target = depth_target;
         }
     }
@@ -902,7 +925,7 @@ void Rasterizer::ApplyTargetRedirect(RenderState& state, const TargetRedirect& r
             state.color_attachments[0].image_view = redirect.original_color.first;
             state.color_attachments[0].image_layout = redirect.original_color.second;
         }
-        if (redirect.depth) {
+        if (redirect.depth && redirect.target.view) {
             auto& depth_image = texture_cache.GetImage(db_desc.first);
             state.depth_stencil_attachment.image_view =
                 *texture_cache.FindDepthTarget(db_desc.first, db_desc.second).image_view;

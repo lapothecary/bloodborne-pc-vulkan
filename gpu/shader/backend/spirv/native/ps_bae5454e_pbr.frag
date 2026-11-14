@@ -53,7 +53,13 @@ void main() {
     uint d1 = bitfieldExtract(push_data.buf_offsets0.x, 8, 8) >> 2u;
 
     vec2 uv = fs_in_attr1_p.xy;
-    float depth = texture(sampler2D(fs_img0, fs_samp0), uv).x;
+    float depth = textureLod(sampler2D(fs_img0, fs_samp0), uv, 0.0).x;
+    if (depth >= 0.999999) {
+        frag_color0 = vec4(0.0, 0.0, 0.0, 1.0);
+        frag_color1 = vec4(0.0, 0.0, 0.0, 1.0);
+        demote;
+        return;
+    }
     uint tile_v4 = uint(fs_in_attr1_p.z + 0.5);
     if (tile_v4 > 0u) {
         uint thdr = d1 + ((tile_v4 - 1u) << 2u);
@@ -86,10 +92,10 @@ void main() {
         return;
     }
 
-    vec4 t_norm = texture(sampler2D(fs_img1, fs_samp0), uv);
-    vec4 t_mat  = texture(sampler2D(fs_img2, fs_samp0), uv);
-    vec4 t_alb  = texture(sampler2D(fs_img3, fs_samp0), uv);
-    float ao    = texture(sampler2D(fs_img4, fs_samp1), uv).x;
+    vec4 t_norm = textureLod(sampler2D(fs_img1, fs_samp0), uv, 0.0);
+    vec4 t_mat  = textureLod(sampler2D(fs_img2, fs_samp0), uv, 0.0);
+    vec4 t_alb  = textureLod(sampler2D(fs_img3, fs_samp0), uv, 0.0);
+    float ao    = textureLod(sampler2D(fs_img4, fs_samp1), uv, 0.0).x;
 
     vec3 n_raw = fma(vec3(2.0), t_norm.xyz, vec3(-1.0));
     vec3 n_ts = n_raw * safe_rsq(dot(n_raw, n_raw));

@@ -286,7 +286,7 @@ void CameraMotion::RecordMotion(vk::ImageView depth_view, vk::ImageView motion_v
         cmdbuf.pushConstants(layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
         cmdbuf.dispatch((width + 7) / 8, (height + 7) / 8, 1);
     });
-    scheduler.BumpDescriptorStateEpoch();
+    scheduler.BumpPushConstantsEpoch();
 }
 
 void CameraMotion::OnConstants(const float* data) {

@@ -74,31 +74,42 @@ struct TrackedDescSlot {
 
 struct GfxPushStateTracker {
     const Scheduler* scheduler{nullptr};
-    u64 epoch{0};
+    u64 desc_epoch{0};
+    u64 push_epoch{0};
     vk::PipelineLayout layout{};
     u64 valid_mask{0};
     bool has_push_data{false};
     Shader::PushData push_data{};
     std::array<TrackedDescSlot, kMaxTrackedBindings> slots{};
 
-    void OnDraw(const Scheduler* sched, u64 ep, vk::PipelineLayout lay) noexcept {
-        if (scheduler != sched || epoch != ep) {
+    void OnDraw(const Scheduler* sched, u64 d_ep, u64 p_ep, vk::PipelineLayout lay) noexcept {
+        if (scheduler != sched) {
             scheduler = sched;
-            epoch = ep;
+            desc_epoch = d_ep;
+            push_epoch = p_ep;
             layout = lay;
             valid_mask = 0;
             has_push_data = false;
             return;
         }
-        if (layout != lay) {
+        if (desc_epoch != d_ep) {
+            desc_epoch = d_ep;
             layout = lay;
             valid_mask = 0;
+        } else if (layout != lay) {
+            layout = lay;
+            valid_mask = 0;
+        }
+        if (push_epoch != p_ep) {
+            push_epoch = p_ep;
+            has_push_data = false;
         }
     }
 
     void InvalidateAll() noexcept {
         scheduler = nullptr;
-        epoch = 0;
+        desc_epoch = 0;
+        push_epoch = 0;
         layout = vk::PipelineLayout{};
         valid_mask = 0;
         has_push_data = false;
@@ -170,7 +181,32 @@ void Pipeline::CreateLayouts(vk::ShaderStageFlags push_stages, const char* kind,
             add(vk::DescriptorType::eSampler, 1);
         }
     }
-    uses_push_descriptors = binding < instance.MaxPushDescriptors();
+    const u32 max_push = instance.MaxPushDescriptors();
+    // Phase 3.1: Canonicalize trailing VS eStorageBuffer bindings up to 10 VS slots (strictly
+    // below `max_push` so `uses_push_descriptors` never regresses) when Vertex is the final active
+    // graphics stage and uses only SSBOs. This unifies VkPipelineLayout across static (2 buf),
+    // instanced (3 buf), 4-bone skinned (6 buf), and 8-bone skinned (10 buf) world/shadow meshes
+    // sharing the same PS signature, preserving push descriptors across PSO switches (Vulkan 1.3 §14.2.7).
+    if (!is_compute && !stages[u32(Shader::SwStage::Geometry)]) {
+        if (const Shader::Info* vs = stages[u32(Shader::SwStage::Vertex)];
+            vs && vs->images.empty() && vs->samplers.empty() && !vs->buffers.empty()) {
+            constexpr u32 kCanonicalVsBuffers = 10u;
+            const u32 vs_bufs = static_cast<u32>(vs->buffers.size());
+            if (vs_bufs < kCanonicalVsBuffers && binding + 1u < max_push) {
+                const u32 room = (max_push - 1u) - binding;
+                const u32 pad = std::min<u32>(kCanonicalVsBuffers - vs_bufs, room);
+                for (u32 p = 0; p < pad; ++p) {
+                    bindings.push_back({
+                        .binding = binding++,
+                        .descriptorType = vk::DescriptorType::eStorageBuffer,
+                        .descriptorCount = 1u,
+                        .stageFlags = AllGraphicsStageBits,
+                    });
+                }
+            }
+        }
+    }
+    uses_push_descriptors = binding < max_push;
     const auto device = instance.GetDevice();
 
     SharedLayoutKey key{
@@ -267,20 +303,13 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, const Shader::PushDat
                                  uses_push_descriptors && scheduler.IsRendering() &&
                                  scheduler.IsRecordingDeferred();
     if (can_delta_track) {
-        struct GfxPushTlsScratch {
-            GfxPushStateTracker tracker{};
-            boost::container::small_vector<vk::WriteDescriptorSet, 64> delta_writes;
-            boost::container::small_vector<vk::DescriptorImageInfo, 48> delta_images;
-            boost::container::small_vector<vk::DescriptorBufferInfo, 32> delta_buffers;
-            boost::container::small_vector<u32, 64> info_indices;
-        };
-        static thread_local std::unique_ptr<GfxPushTlsScratch> tls_scratch;
-        if (!tls_scratch) [[unlikely]] {
-            tls_scratch = std::make_unique<GfxPushTlsScratch>();
+        static thread_local std::unique_ptr<GfxPushStateTracker> tls_tracker;
+        if (!tls_tracker) [[unlikely]] {
+            tls_tracker = std::make_unique<GfxPushStateTracker>();
         }
-        auto& tracker = tls_scratch->tracker;
-        const u64 epoch = scheduler.DescriptorStateEpoch();
-        tracker.OnDraw(&scheduler, epoch, layout);
+        auto& tracker = *tls_tracker;
+        tracker.OnDraw(&scheduler, scheduler.GraphicsDescriptorEpoch(),
+                       scheduler.PushConstantsEpoch(), layout);
         const bool need_push_constants =
             !tracker.has_push_data ||
             (std::memcmp(&tracker.push_data, &push_data, sizeof(push_data)) != 0);
@@ -307,24 +336,54 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, const Shader::PushDat
                          within(write.pBufferInfo, write.descriptorCount, buffer_infos));
              }));
         if (bulk) {
-            auto& delta_writes = tls_scratch->delta_writes;
-            auto& delta_images = tls_scratch->delta_images;
-            auto& delta_buffers = tls_scratch->delta_buffers;
-            auto& info_indices = tls_scratch->info_indices;
-            delta_writes.clear();
-            delta_images.clear();
-            delta_buffers.clear();
-            info_indices.clear();
+            // Phase 3.1: Single-pass delta emission straight into `Scheduler::CurrentChunk()`
+            // allocated lazily only when at least one descriptor slot actually changed.
+            vk::WriteDescriptorSet* out_writes = nullptr;
+            vk::DescriptorImageInfo* out_images = nullptr;
+            vk::DescriptorBufferInfo* out_buffers = nullptr;
+            u32 write_cnt = 0;
+            u32 img_cnt = 0;
+            u32 buf_cnt = 0;
+
+            const size_t n_writes = set_writes.size();
+            const auto ensure_chunk_alloc = [&](size_t first_idx) {
+                if (out_writes) [[likely]] {
+                    return;
+                }
+                u32 max_w = 0;
+                u32 max_img = 0;
+                u32 max_buf = 0;
+                for (size_t k = first_idx; k < n_writes; ++k) {
+                    const auto& w = set_writes[k];
+                    ++max_w;
+                    if (w.pImageInfo) {
+                        max_img += w.descriptorCount;
+                    } else if (w.pBufferInfo) {
+                        max_buf += w.descriptorCount;
+                    }
+                }
+                scheduler.ReserveRecordData(
+                    max_w * sizeof(vk::WriteDescriptorSet) +
+                    max_img * sizeof(vk::DescriptorImageInfo) +
+                    max_buf * sizeof(vk::DescriptorBufferInfo) +
+                    sizeof(Shader::PushData) + 256);
+                out_writes = scheduler.AllocateRecordDataUnchecked<vk::WriteDescriptorSet>(max_w);
+                out_images =
+                    scheduler.AllocateRecordDataUnchecked<vk::DescriptorImageInfo>(max_img);
+                out_buffers =
+                    scheduler.AllocateRecordDataUnchecked<vk::DescriptorBufferInfo>(max_buf);
+            };
 
             u64 total_slots = 0;
             u64 saved_slots = 0;
-            for (const auto& write : set_writes) {
+            for (size_t wi = 0; wi < n_writes; ++wi) {
+                const auto& write = set_writes[wi];
                 total_slots += write.descriptorCount;
                 const bool single_img = (write.pImageInfo != nullptr && !write.pBufferInfo);
                 const bool single_buf = (write.pBufferInfo != nullptr && !write.pImageInfo);
                 if (write.descriptorCount == 1 && write.dstArrayElement == 0 &&
                     !write.pTexelBufferView && write.dstBinding < kMaxTrackedBindings &&
-                    (single_img || single_buf)) {
+                    (single_img || single_buf)) [[likely]] {
                     const u64 slot_bit = 1ULL << write.dstBinding;
                     const bool slot_valid = (tracker.valid_mask & slot_bit) != 0;
                     auto& slot = tracker.slots[write.dstBinding];
@@ -344,10 +403,11 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, const Shader::PushDat
                         slot.sampler = s_h;
                         slot.image_view = v_h;
                         slot.image_layout = img.imageLayout;
-                        const u32 idx = static_cast<u32>(delta_images.size());
-                        delta_images.push_back(img);
-                        delta_writes.push_back(write);
-                        info_indices.push_back(idx);
+                        ensure_chunk_alloc(wi);
+                        out_images[img_cnt] = img;
+                        auto& dst_w = out_writes[write_cnt++];
+                        dst_w = write;
+                        dst_w.pImageInfo = &out_images[img_cnt++];
                     } else {
                         const auto& buf = *write.pBufferInfo;
                         const VkBuffer b_h = static_cast<VkBuffer>(buf.buffer);
@@ -363,10 +423,11 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, const Shader::PushDat
                         slot.buffer = b_h;
                         slot.offset = buf.offset;
                         slot.range = buf.range;
-                        const u32 idx = static_cast<u32>(delta_buffers.size());
-                        delta_buffers.push_back(buf);
-                        delta_writes.push_back(write);
-                        info_indices.push_back(idx);
+                        ensure_chunk_alloc(wi);
+                        out_buffers[buf_cnt] = buf;
+                        auto& dst_w = out_writes[write_cnt++];
+                        dst_w = write;
+                        dst_w.pBufferInfo = &out_buffers[buf_cnt++];
                     }
                 } else {
                     for (u32 b = 0; b < write.descriptorCount; ++b) {
@@ -376,17 +437,21 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, const Shader::PushDat
                         }
                     }
                     if (write.pImageInfo) {
-                        const u32 idx = static_cast<u32>(delta_images.size());
-                        delta_images.insert(delta_images.end(), write.pImageInfo,
-                                            write.pImageInfo + write.descriptorCount);
-                        delta_writes.push_back(write);
-                        info_indices.push_back(idx);
+                        ensure_chunk_alloc(wi);
+                        std::memcpy(&out_images[img_cnt], write.pImageInfo,
+                                    write.descriptorCount * sizeof(vk::DescriptorImageInfo));
+                        auto& dst_w = out_writes[write_cnt++];
+                        dst_w = write;
+                        dst_w.pImageInfo = &out_images[img_cnt];
+                        img_cnt += write.descriptorCount;
                     } else if (write.pBufferInfo) {
-                        const u32 idx = static_cast<u32>(delta_buffers.size());
-                        delta_buffers.insert(delta_buffers.end(), write.pBufferInfo,
-                                             write.pBufferInfo + write.descriptorCount);
-                        delta_writes.push_back(write);
-                        info_indices.push_back(idx);
+                        ensure_chunk_alloc(wi);
+                        std::memcpy(&out_buffers[buf_cnt], write.pBufferInfo,
+                                    write.descriptorCount * sizeof(vk::DescriptorBufferInfo));
+                        auto& dst_w = out_writes[write_cnt++];
+                        dst_w = write;
+                        dst_w.pBufferInfo = &out_buffers[buf_cnt];
+                        buf_cnt += write.descriptorCount;
                     }
                 }
             }
@@ -400,7 +465,7 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, const Shader::PushDat
                     BbStats::desc_push_saved.load(std::memory_order_relaxed) + saved_slots,
                     std::memory_order_relaxed);
             }
-            if (delta_writes.empty()) {
+            if (write_cnt == 0) {
                 if (need_push_constants) {
                     scheduler.Record([layout, stage_flags, push_data](vk::CommandBuffer cmdbuf) {
                         cmdbuf.pushConstants(layout, stage_flags, 0u, sizeof(push_data),
@@ -410,28 +475,7 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, const Shader::PushDat
                 return;
             }
 
-            const std::span<const vk::DescriptorImageInfo> d_img_span{delta_images.data(),
-                                                                      delta_images.size()};
-            const std::span<const vk::DescriptorBufferInfo> d_buf_span{delta_buffers.data(),
-                                                                       delta_buffers.size()};
-            scheduler.ReserveRecordData(delta_writes.size() * sizeof(vk::WriteDescriptorSet) +
-                                        d_img_span.size_bytes() + d_buf_span.size_bytes() +
-                                        sizeof(Shader::PushData) + 256);
-            const auto writes = scheduler.RecordData(
-                std::span<const vk::WriteDescriptorSet>{delta_writes.data(), delta_writes.size()});
-            const auto images = scheduler.RecordData(d_img_span);
-            const auto buffers = scheduler.RecordData(d_buf_span);
-            auto mut_writes =
-                std::span{const_cast<vk::WriteDescriptorSet*>(writes.data()), writes.size()};
-            for (size_t i = 0; i < mut_writes.size(); ++i) {
-                auto& w = mut_writes[i];
-                if (w.pImageInfo) {
-                    w.pImageInfo = images.data() + info_indices[i];
-                }
-                if (w.pBufferInfo) {
-                    w.pBufferInfo = buffers.data() + info_indices[i];
-                }
-            }
+            const std::span<const vk::WriteDescriptorSet> writes{out_writes, write_cnt};
             if (need_push_constants) {
                 scheduler.Record([bind_point, layout, stage_flags, push_data,
                                   writes](vk::CommandBuffer cmdbuf) {
@@ -448,7 +492,13 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, const Shader::PushDat
         tracker.InvalidateAll();
     }
 
-    scheduler.BumpDescriptorStateEpoch();
+    if (IsCompute()) {
+        scheduler.BumpPushConstantsEpoch();
+    } else if (!uses_push_descriptors) {
+        scheduler.BumpGraphicsDescriptorEpoch();
+    } else {
+        scheduler.BumpDescriptorStateEpoch();
+    }
     if (set_writes.empty()) {
         scheduler.Record([layout, stage_flags, push_data](vk::CommandBuffer cmdbuf) {
             cmdbuf.pushConstants(layout, stage_flags, 0u, sizeof(push_data), &push_data);

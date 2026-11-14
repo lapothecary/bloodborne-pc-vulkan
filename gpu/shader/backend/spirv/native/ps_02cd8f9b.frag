@@ -2,6 +2,7 @@
 #extension GL_EXT_demote_to_helper_invocation : require
 #extension GL_EXT_samplerless_texture_functions : require
 
+layout(early_fragment_tests) in;
 layout(location = 0) in vec4 fs_in_attr0_p;
 layout(location = 1) in vec4 fs_in_attr1_p;
 layout(location = 0) out vec4 frag_color0;
@@ -106,13 +107,28 @@ mat2x3 eval_spot_light(
     return mat2x3(diff, spec);
 }
 
+bool spot_in_cone(uint base, vec4 pos4) {
+    float pz = dot(load_s2_v4(base + 24u), pos4);
+    if (0.0 >= pz) return false;
+    float px = dot(load_s2_v4(base + 16u), pos4);
+    float py = dot(load_s2_v4(base + 20u), pos4);
+    float pw = dot(load_s2_v4(base + 28u), pos4);
+    return (px * px + py * py) < (pw * pw);
+}
+
 void main() {
     uint bo0 = push_data.buf_offsets0.x;
     uint d0 = bitfieldExtract(bo0, 0, 8) >> 2u;
     uint d1 = bitfieldExtract(bo0, 8, 8) >> 2u;
 
     vec2 uv = fs_in_attr1_p.xy;
-    vec4 t_depth = texture(sampler2D(fs_img0, fs_samp0), uv);
+    vec4 t_depth = textureLod(sampler2D(fs_img0, fs_samp0), uv, 0.0);
+    if (t_depth.x >= 0.999999) {
+        frag_color0 = vec4(0.0, 0.0, 0.0, 1.0);
+        frag_color1 = vec4(0.0, 0.0, 0.0, 1.0);
+        demote;
+        return;
+    }
     uint tile_v4 = uint(fs_in_attr1_p.z + 0.5);
     if (tile_v4 > 0u) {
         uint thdr = d1 + ((tile_v4 - 1u) << 2u);
@@ -124,10 +140,6 @@ void main() {
         }
         d1 = thdr + 4u;
     }
-    vec4 t_norm  = texture(sampler2D(fs_img1, fs_samp0), uv);
-    vec4 t_mat   = texture(sampler2D(fs_img2, fs_samp0), uv);
-    vec4 t_spec  = texture(sampler2D(fs_img3, fs_samp0), uv);
-    vec4 t_mask  = texture(sampler2D(fs_img4, fs_samp1), uv);
 
     vec4 clip_p = vec4(fs_in_attr0_p.xy, t_depth.x, 1.0);
     float inv_w = 1.0 / dot(load_s1_v4(d0 + 12u), clip_p);
@@ -136,6 +148,22 @@ void main() {
         dot(load_s1_v4(d0 + 4u), clip_p),
         dot(load_s1_v4(d0 + 8u), clip_p)
     ) * inv_w;
+
+    vec4 pos4 = vec4(pos_v, 1.0);
+    bool in0 = spot_in_cone(d1 + 0u,  pos4);
+    bool in1 = spot_in_cone(d1 + 32u, pos4);
+    bool in2 = spot_in_cone(d1 + 64u, pos4);
+    if (!in0 && !in1 && !in2) {
+        frag_color0 = vec4(0.0, 0.0, 0.0, 1.0);
+        frag_color1 = vec4(0.0, 0.0, 0.0, 1.0);
+        demote;
+        return;
+    }
+
+    vec4 t_norm  = textureLod(sampler2D(fs_img1, fs_samp0), uv, 0.0);
+    vec4 t_mat   = textureLod(sampler2D(fs_img2, fs_samp0), uv, 0.0);
+    vec4 t_spec  = textureLod(sampler2D(fs_img3, fs_samp0), uv, 0.0);
+    vec4 t_mask  = textureLod(sampler2D(fs_img4, fs_samp1), uv, 0.0);
 
     vec3 n_raw = fma(vec3(2.0), t_norm.xyz, vec3(-1.0));
     vec3 n_ts = n_raw * safe_rsq(dot(n_raw, n_raw));
@@ -154,11 +182,23 @@ void main() {
     float trans = 10.0 * t_mat.y;
     float trans_denom = fma(2.0, trans, 1.0);
 
-    mat2x3 l0 = eval_spot_light(d1 + 0u,  pos_v, N, neg_V, R_v, exp_g, trans, trans_denom, rim_base);
-    mat2x3 l1 = eval_spot_light(d1 + 32u, pos_v, N, neg_V, R_v, exp_g, trans, trans_denom, rim_base);
-    mat2x3 l2 = eval_spot_light(d1 + 64u, pos_v, N, neg_V, R_v, exp_g, trans, trans_denom, rim_base);
-    vec3 acc_diff = l0[0] + l1[0] + l2[0];
-    vec3 acc_spec = l0[1] + l1[1] + l2[1];
+    vec3 acc_diff = vec3(0.0);
+    vec3 acc_spec = vec3(0.0);
+    if (in0) {
+        mat2x3 l0 = eval_spot_light(d1 + 0u, pos_v, N, neg_V, R_v, exp_g, trans, trans_denom, rim_base);
+        acc_diff += l0[0];
+        acc_spec += l0[1];
+    }
+    if (in1) {
+        mat2x3 l1 = eval_spot_light(d1 + 32u, pos_v, N, neg_V, R_v, exp_g, trans, trans_denom, rim_base);
+        acc_diff += l1[0];
+        acc_spec += l1[1];
+    }
+    if (in2) {
+        mat2x3 l2 = eval_spot_light(d1 + 64u, pos_v, N, neg_V, R_v, exp_g, trans, trans_denom, rim_base);
+        acc_diff += l2[0];
+        acc_spec += l2[1];
+    }
 
     vec3 f0 = t_spec.xyz * t_spec.xyz;
     frag_color1 = vec4(f0 * (t_mask.x * acc_spec), 1.0);
