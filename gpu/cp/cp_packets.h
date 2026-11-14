@@ -245,6 +245,27 @@ struct WaitRegMem : Body<WaitRegMem, 6> {
     u32 Mask() const {
         return w[4];
     }
+    static constexpr bool Compare(u32 fn, u32 value, u32 ref, u32 mask) noexcept {
+        const u32 masked = value & mask;
+        switch (fn) {
+        case 0:
+            return true;
+        case 1:
+            return masked < ref;
+        case 2:
+            return masked <= ref;
+        case 3:
+            return masked == ref;
+        case 4:
+            return masked != ref;
+        case 5:
+            return masked >= ref;
+        case 6:
+            return masked > ref;
+        default:
+            return true;
+        }
+    }
     bool TestValue(u32 value) const;
     /// Against memory or the register file.
     bool Test(const u32* registers) const {

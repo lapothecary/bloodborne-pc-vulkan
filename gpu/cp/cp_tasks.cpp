@@ -35,26 +35,9 @@ u64 GpuPerfCounter() {
 }
 
 bool WaitRegMem::TestValue(u32 value) const {
-    const u32 masked = value & Mask();
-    const u32 ref = Reference();
-    switch (Function()) {
-    case 0:
-        return true;
-    case 1:
-        return masked < ref;
-    case 2:
-        return masked <= ref;
-    case 3:
-        return masked == ref;
-    case 4:
-        return masked != ref;
-    case 5:
-        return masked >= ref;
-    case 6:
-        return masked > ref;
-    default:
-        UNREACHABLE_MSG("WAIT_REG_MEM function {}", Function());
-    }
+    const u32 fn = Function();
+    ASSERT_MSG(fn <= 6u, "WAIT_REG_MEM function {}", fn);
+    return Compare(fn, value, Reference(), Mask());
 }
 
 namespace Tasks {

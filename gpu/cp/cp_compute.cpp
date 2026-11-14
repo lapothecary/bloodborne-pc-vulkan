@@ -9,6 +9,7 @@
 #include <fmt/format.h>
 
 #include "bbport_free_check.h"
+#include "bbport_sections.h"
 #include "bbport_toggles.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -134,6 +135,7 @@ bool Pipelined(Op op, const u32* body) {
 } // namespace
 
 CommandProcessor::Status CommandProcessor::RunCompute(Work& work) {
+    work.wait_hint = {};
     auto& ring = asc_queues[Common::SlotId{work.queue - 1}];
     Walk& walk = work.walk;
     if (!work.started) {
@@ -408,6 +410,8 @@ CommandProcessor::Step CommandProcessor::Compute(Work& work, Level& level, const
     }
     case Op::Rewind:
         if (rasterizer && !(*reinterpret_cast<const volatile u32*>(body) >> 31)) {
+            BbSections::PauseADecodeScope pause_decode;
+            work.wait_hint = {WaitKind::RewindBit31, 0u, reinterpret_cast<VAddr>(body), 0u, 0u};
             return Step::Wait;
         }
         break;
@@ -495,16 +499,21 @@ CommandProcessor::Step CommandProcessor::Compute(Work& work, Level& level, const
             }
             break;
         }
-        while (!semaphore.Signaled()) {
-            // A signal still on the recording thread (or waiting for unsubmitted work).
-            if (rasterizer && !rasterizer->DrawPipeIdle()) {
-                rasterizer->DrainDrawPipe(Vulkan::DrawPipe::ReasonCompute);
-                continue;
+        {
+            BbSections::PauseADecodeScope pause_decode;
+            while (!semaphore.Signaled()) {
+                // A signal still on the recording thread (or waiting for unsubmitted work).
+                if (rasterizer && !rasterizer->DrawPipeIdle()) {
+                    rasterizer->DrainDrawPipe(Vulkan::DrawPipe::ReasonCompute);
+                    continue;
+                }
+                if (rasterizer && rasterizer->HasUnsubmittedSignals()) {
+                    rasterizer->Flush();
+                }
+                work.wait_hint = {WaitKind::Semaphore64, 0u,
+                                  reinterpret_cast<VAddr>(semaphore.Address()), 0u, 0u};
+                return Step::Wait;
             }
-            if (rasterizer && rasterizer->HasUnsubmittedSignals()) {
-                rasterizer->Flush();
-            }
-            return Step::Wait;
         }
         semaphore.Take();
         break;
@@ -517,16 +526,23 @@ CommandProcessor::Step CommandProcessor::Compute(Work& work, Level& level, const
                        PendingFenceValue(wait.Address(), value) && wait.TestValue(value)) {
             break;
         }
-        while (!wait.Test(regs.reg_array.data())) {
-            if (rasterizer && !rasterizer->DrawPipeIdle()) {
-                rasterizer->DrainDrawPipe(Vulkan::DrawPipe::ReasonCompute);
-                continue;
+        {
+            BbSections::PauseADecodeScope pause_decode;
+            while (!wait.Test(regs.reg_array.data())) {
+                if (rasterizer && !rasterizer->DrawPipeIdle()) {
+                    rasterizer->DrainDrawPipe(Vulkan::DrawPipe::ReasonCompute);
+                    continue;
+                }
+                // BB_HONEST_LABELS: the value may come from a fence waiting for work not submitted.
+                if (rasterizer && rasterizer->HasUnsubmittedSignals()) {
+                    rasterizer->Flush();
+                }
+                if (wait.Memory()) {
+                    work.wait_hint = {WaitKind::RegMem32, u8(wait.Function()), wait.Address(),
+                                      wait.Reference(), wait.Mask()};
+                }
+                return Step::Wait;
             }
-            // BB_HONEST_LABELS: the value may come from a fence waiting for work not submitted.
-            if (rasterizer && rasterizer->HasUnsubmittedSignals()) {
-                rasterizer->Flush();
-            }
-            return Step::Wait;
         }
         break;
     }

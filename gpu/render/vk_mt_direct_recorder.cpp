@@ -1695,7 +1695,18 @@ std::atomic<u64> g_mt_prev_window_compiled{0};
     }
 }
 
+[[nodiscard]] bool MtStatsEnabled() noexcept {
+    static const bool enabled = [] {
+        const char* env = std::getenv("BB_MT_STATS");
+        return env && env[0] == '1';
+    }();
+    return enabled;
+}
+
 void MtMaybeLogUnsafePsoSample(u8 reason, u64 vs_hash, u64 ps_hash) noexcept {
+    if (!MtStatsEnabled()) [[likely]] {
+        return;
+    }
     const u64 key = (static_cast<u64>(reason) << 56u) |
                     ((vs_hash ^ (ps_hash * 0x9E3779B97F4A7C15ULL)) & 0x00FFFFFFFFFFFFFFULL);
     if (!MtTryClaimDiagKey(g_mt_seen_unsafe_pso, key)) {
@@ -1730,6 +1741,9 @@ void MtMaybeLogUnsafePsoSample(u8 reason, u64 vs_hash, u64 ps_hash) noexcept {
 
 void MtMaybeLogBailBufSample(u8 site, u8 step, bool is_fmt, VAddr addr, u64 sz,
                              u64 vs_hash) noexcept {
+    if (!MtStatsEnabled()) [[likely]] {
+        return;
+    }
     const u64 key = (static_cast<u64>(site) << 56u) | (static_cast<u64>(step) << 48u) |
                     (static_cast<u64>(is_fmt ? 1u : 0u) << 47u) | ((addr >> 4u) & 0x7FFFFFFFFFFFULL);
     if (!MtTryClaimDiagKey(g_mt_seen_bail_buf, key)) {
@@ -1763,6 +1777,9 @@ void MtMaybeLogBailBufSample(u8 site, u8 step, bool is_fmt, VAddr addr, u64 sz,
 void MtMaybeLogBailTargetSample(u8 site, VAddr addr, u32 fmt_or_mrt, u64 vs_hash, u64 ps_hash,
                                 u8 substep = 0u, u32 flags = 0u, u32 w = 0u, u32 h = 0u,
                                 u32 guest_size = 0u) noexcept {
+    if (!MtStatsEnabled()) [[likely]] {
+        return;
+    }
     if (g_mt_window_bail_target_count.load(std::memory_order_relaxed) >= 4u) {
         return;
     }
@@ -1786,6 +1803,9 @@ void MtMaybeLogBailTargetSample(u8 site, VAddr addr, u32 fmt_or_mrt, u64 vs_hash
 }
 
 void MtMaybeLogBadPktSample(const u32* cur, u32 rem) noexcept {
+    if (!MtStatsEnabled()) [[likely]] {
+        return;
+    }
     if (!cur || rem == 0u) {
         return;
     }
@@ -1820,6 +1840,9 @@ void MtMaybeLogBadPktSample(const u32* cur, u32 rem) noexcept {
 }
 
 void MtReportTelemetryIfDue(u32 cur_guest_frame) noexcept {
+    if (!MtStatsEnabled()) [[likely]] {
+        return;
+    }
     u32 last = g_mt_last_report_frame.load(std::memory_order_relaxed);
     if (last == 0u) {
         if (g_mt_last_report_frame.compare_exchange_strong(last, cur_guest_frame,
@@ -1872,6 +1895,9 @@ void MtReportTelemetryIfDue(u32 cur_guest_frame) noexcept {
 
 void MtNoteBail(MtBailReason reason, u32 cur_guest_frame,
                 MtOtherKind other_kind = MtOtherKind::Misc) noexcept {
+    if (!MtStatsEnabled()) [[likely]] {
+        return;
+    }
     switch (reason) {
     case MtBailReason::Pkt:
         g_mt_bail_pkt.fetch_add(1ULL, std::memory_order_relaxed);
@@ -1901,6 +1927,9 @@ void MtNoteBail(MtBailReason reason, u32 cur_guest_frame,
 
 void MtNotePsoBail(PipelineCache::MtPsoFailKind fail_kind, bool unsafe_pso,
                    u32 cur_guest_frame) noexcept {
+    if (!MtStatsEnabled()) [[likely]] {
+        return;
+    }
     g_mt_bail_pso.fetch_add(1ULL, std::memory_order_relaxed);
     if (unsafe_pso) {
         g_mt_bail_pso_unsafe.fetch_add(1ULL, std::memory_order_relaxed);
@@ -2729,7 +2758,9 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
     }
 
     const u32 cur_guest_frame = BbStats::guest_frame_number.load(std::memory_order_relaxed);
-    g_mt_lists_seen.fetch_add(1ULL, std::memory_order_relaxed);
+    if (MtStatsEnabled()) [[unlikely]] {
+        g_mt_lists_seen.fetch_add(1ULL, std::memory_order_relaxed);
+    }
 
     // -------------------------------------------------------------------------
     // Phase 1: Pure read-only pre-scan (validates eligibility, warm PSOs, and
@@ -4638,9 +4669,11 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
         *reinterpret_cast<u32**>(slices[s].slot_raw + 0x10) = slices[s].begin_ptr + written;
     }
 
-    g_mt_lists_compiled.fetch_add(1ULL, std::memory_order_relaxed);
-    g_mt_draws_recorded.fetch_add(total_recorded_draws, std::memory_order_relaxed);
-    MtReportTelemetryIfDue(cur_guest_frame);
+    if (MtStatsEnabled()) [[unlikely]] {
+        g_mt_lists_compiled.fetch_add(1ULL, std::memory_order_relaxed);
+        g_mt_draws_recorded.fetch_add(total_recorded_draws, std::memory_order_relaxed);
+        MtReportTelemetryIfDue(cur_guest_frame);
+    }
     return true;
 }
 

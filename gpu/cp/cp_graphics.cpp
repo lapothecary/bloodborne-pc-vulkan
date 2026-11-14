@@ -79,6 +79,8 @@ bool Pipelined(Op op) {
     case Op::EventWrite:     // occlusion results only, no rasterizer state
     case Op::EventWriteEop:  // in order on the recording thread
     case Op::EventWriteEos:
+    case Op::Rewind:         // CPU command-buffer gate; no rasterizer state
+    case Op::MemSemaphore:   // pipelined via RunInOrder or drained when unmet
     case Op::WaitRegMem:     // waits for the recording thread only while unmet
     case Op::DispatchDirect: // handed over like draws
     case Op::DrawIndirect:
@@ -197,6 +199,7 @@ void CommandProcessor::EndGraphics(Work& work) {
 // ---- The walk --------------------------------------------------------------------------------
 
 CommandProcessor::Status CommandProcessor::RunGraphics(Work& work) {
+    work.wait_hint = {};
     if (!work.started) {
         BeginGraphics(work);
     }
@@ -351,6 +354,7 @@ CommandProcessor::Status CommandProcessor::RunGraphics(Work& work) {
             // it is read again for a few milliseconds before it counts as bad. A buffer that stays
             // bad is reported as before, with the time it was waited.
             {
+                BbSections::PauseADecodeScope pause_decode;
                 static const long wait_us = [] {
                     const char* env = std::getenv("BB_PM4_WAIT_US");
                     return env ? std::atol(env) : 20000L;
@@ -1287,21 +1291,30 @@ CommandProcessor::Step CommandProcessor::Graphics(Work& work, Level& level, cons
                 rasterizer->RunInOrder(&Tasks::MemSemaphoreSignalTask, &semaphore,
                                        sizeof(semaphore), BbToggle::PipelinedTasks, false);
             } else {
+                if (rasterizer) {
+                    rasterizer->DrainDrawPipe(u32(op));
+                    rasterizer->WaitDeferredSignals();
+                }
                 semaphore.Signal();
             }
             break;
         }
-        while (!semaphore.Signaled()) {
-            // A signal in stream order may wait for work still in the draw pipe or not submitted
-            // yet; this thread would spin on it forever.
-            if (rasterizer && !rasterizer->DrawPipeIdle()) {
-                rasterizer->DrainDrawPipe(u32(op));
-                continue;
+        {
+            BbSections::PauseADecodeScope pause_decode;
+            while (!semaphore.Signaled()) {
+                // A signal in stream order may wait for work still in the draw pipe or not
+                // submitted yet; this thread would spin on it forever.
+                if (rasterizer && !rasterizer->DrawPipeIdle()) {
+                    rasterizer->DrainDrawPipe(u32(op));
+                    continue;
+                }
+                if (rasterizer && rasterizer->HasUnsubmittedSignals()) {
+                    rasterizer->Flush();
+                }
+                work.wait_hint = {WaitKind::Semaphore64, 0u,
+                                  reinterpret_cast<VAddr>(semaphore.Address()), 0u, 0u};
+                return wait();
             }
-            if (rasterizer && rasterizer->HasUnsubmittedSignals()) {
-                rasterizer->Flush();
-            }
-            return wait();
         }
         semaphore.Take();
         break;
@@ -1309,6 +1322,8 @@ CommandProcessor::Step CommandProcessor::Graphics(Work& work, Level& level, cons
     case Op::Rewind:
         // Valid once the game has written the packets after it.
         if (rasterizer && !(*reinterpret_cast<const volatile u32*>(body) >> 31)) {
+            BbSections::PauseADecodeScope pause_decode;
+            work.wait_hint = {WaitKind::RewindBit31, 0u, reinterpret_cast<VAddr>(body), 0u, 0u};
             return wait();
         }
         break;
@@ -1519,6 +1534,10 @@ bool CommandProcessor::WaitRegMemGraphics(Work& work, const u32* body, bool retr
             // BB_HONEST_LABELS: a fence from another queue may wait for work not submitted yet.
             if (rasterizer && rasterizer->HasUnsubmittedSignals()) {
                 rasterizer->Flush();
+            }
+            if (wait.Memory()) {
+                work.wait_hint = {WaitKind::RegMem32, u8(wait.Function()), wait.Address(),
+                                  wait.Reference(), wait.Mask()};
             }
             return false;
         }

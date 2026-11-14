@@ -199,6 +199,35 @@ private:
         }
     };
     using SubmittedCopy = Diagnostics::SubmittedCopy;
+    enum class WaitKind : u8 {
+        None = 0,
+        RewindBit31, ///< `(*word32 >> 31) != 0`
+        RegMem32,    ///< `WaitRegMem::Compare(fn, *word32, ref, mask)`
+        Semaphore64, ///< `__atomic_load_n(word64, __ATOMIC_ACQUIRE) > 0`
+    };
+    struct WaitHint {
+        WaitKind kind = WaitKind::None;
+        u8 function = 0;
+        VAddr address = 0;
+        u32 reference = 0;
+        u32 mask = 0;
+
+        [[nodiscard]] bool IsReady() const noexcept {
+            switch (kind) {
+            case WaitKind::RewindBit31:
+                return (*reinterpret_cast<const volatile u32*>(address) >> 31) != 0u;
+            case WaitKind::RegMem32:
+                return WaitRegMem::Compare(function,
+                                           *reinterpret_cast<const volatile u32*>(address),
+                                           reference, mask);
+            case WaitKind::Semaphore64:
+                return __atomic_load_n(reinterpret_cast<const u64*>(address), __ATOMIC_ACQUIRE) >
+                       0u;
+            default:
+                return true;
+            }
+        }
+    };
     /// One submission of any queue.
     struct Work {
         std::span<const u32> dcb; ///< graphics: the draw buffer; compute: the ring part
@@ -212,6 +241,7 @@ private:
         std::shared_ptr<SubmittedCopy> copy;
         /// The packet that waited, tried again next time (its registers are applied already).
         const u32* waiting_at = nullptr;
+        WaitHint wait_hint{};
         std::chrono::steady_clock::time_point wait_start{};
         bool wait_met_at_once = false;
         /// Compute: a packet completed from the ring's end and start, and the dwords of the
@@ -229,9 +259,10 @@ private:
     enum class Status { Done, Wait };
     enum class Step { Next, Moved, Wait };
 
-    struct Queue {
+    struct alignas(64) Queue {
         std::mutex mutex;
         std::deque<std::unique_ptr<Work>> works;
+        std::atomic<u32> pending_works{0};
         ComputeProgram cs_state{};
     };
 
@@ -280,7 +311,7 @@ private:
     const bool guest_markers_enabled;
 
     std::array<Queue, NumTotalQueues> queues{};
-    u32 num_mapped_queues{1}; ///< graphics, and compute up to the highest queue used
+    std::atomic<u32> num_mapped_queues{1}; ///< graphics, and compute up to the highest queue used
     int current_queue = -1;
 
     VAddr indirect_args_addr{};

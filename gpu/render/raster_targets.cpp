@@ -4,6 +4,7 @@
 
 #include "render/direct_targets.h"
 #include "render/raster_internal.h"
+#include "render/vk_obj_vel_cull.h"
 #include "textures/direct_textures.h"
 
 namespace Vulkan {
@@ -551,7 +552,9 @@ bool Rasterizer::InspectMtPassTargets(
                                  : key.mrt_mask;
     const u32 num_guest_cb = std::bit_width(guest_mrt_mask);
     const auto* vs_stage = first_pso->GetStages()[u32(Shader::SwStage::Vertex)];
+    const auto* ps_stage = first_pso->GetStages()[u32(Shader::SwStage::Fragment)];
     const u64 vs_hash = vs_stage ? vs_stage->pgm_hash : 0ULL;
+    const u64 ps_hash = ps_stage ? ps_stage->pgm_hash : 0ULL;
 
     // Ensure `PrepareRenderState`'s `want_depth` agrees with `GraphicsPipelineKey` (or
     // `VK_EXT_dynamic_rendering_unused_attachments` when a color-only pass leaves a stale
@@ -658,8 +661,13 @@ bool Rasterizer::InspectMtPassTargets(
         const vk::Format fmt = out.color_formats[only_cb];
         if (fmt == vk::Format::eR8G8B8A8Unorm || fmt == vk::Format::eR8G8B8A8Srgb ||
             fmt == vk::Format::eB8G8R8A8Unorm || fmt == vk::Format::eB8G8R8A8Srgb) {
+            // Note: FLVER materials in `Pass 0x2e` (`Object-Velocity`, `1280x720 R8G8B8A8Unorm`)
+            // may leave stencil write enabled on the disposable `1280x720 D32SfloatS8Uint`
+            // scratch depth (`[r15+0xd20]`), which `VkMtDirectRecorder` already tracks via
+            // `writes_stencil` and `stencilAttachmentFormat`.
             const bool is_3d_depth_pass =
-                want_depth && regs.depth_control.depth_enable && !regs.WritesStencil() &&
+                want_depth && regs.depth_control.depth_enable &&
+                (!regs.WritesStencil() || ObjectVelocityCuller::IsObjectVelocityPs(ps_hash)) &&
                 !regs.IsClipDisabled() && vs_hash != 0x000000000b0acf50ULL &&
                 vs_hash != 0x0000000034e8a281ULL;
             if (!is_3d_depth_pass) {

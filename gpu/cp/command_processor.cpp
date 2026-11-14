@@ -1135,7 +1135,8 @@ void CommandProcessor::ReportStall(const char* why) {
                           num_commands.load());
     }
     // What each queue is at (read beside the command thread: a snapshot, maybe torn).
-    for (u32 q = 0; q < num_mapped_queues && q < NumTotalQueues; ++q) {
+    const u32 mapped_queues = num_mapped_queues.load(std::memory_order_acquire);
+    for (u32 q = 0; q < mapped_queues && q < NumTotalQueues; ++q) {
         Queue& queue = queues[q];
         std::scoped_lock lock{queue.mutex};
         if (q != GfxQueueId && asc_queues.is_allocated(Common::SlotId{q - 1})) {
@@ -1235,10 +1236,15 @@ void CommandProcessor::Run(std::stop_token stop) {
         }
         // The queues in turn: each one's front submission runs until it is done or waits.
         current_queue = -1;
+        u32 wait_round_queues = 0;
         while (num_submits || num_commands) {
             RunCommands();
-            current_queue = int((current_queue + 1) % num_mapped_queues);
+            const u32 mapped = num_mapped_queues.load(std::memory_order_acquire);
+            current_queue = int(u32(current_queue + 1) % mapped);
             Queue& queue = queues[current_queue];
+            if (queue.pending_works.load(std::memory_order_acquire) == 0u) {
+                continue;
+            }
             Work* work;
             {
                 std::scoped_lock lock{queue.mutex};
@@ -1276,14 +1282,66 @@ void CommandProcessor::Run(std::stop_token stop) {
                 status = current_queue == GfxQueueId ? RunGraphics(*work) : RunCompute(*work);
             }
             if (status == Status::Wait) {
-                _mm_pause(); // the other queues' turn
+                const auto other_queue_ready = [&]() noexcept {
+                    const u32 m = num_mapped_queues.load(std::memory_order_acquire);
+                    for (u32 q = 0; q < m; ++q) {
+                        if (q != u32(current_queue) &&
+                            queues[q].pending_works.load(std::memory_order_acquire) != 0u) {
+                            return true;
+                        }
+                    }
+                    return false;
+                };
+                const WaitHint hint = work->wait_hint;
+                if (!other_queue_ready() && hint.kind != WaitKind::None) {
+                    if (!hint.IsReady()) {
+                        const auto wait_begin = std::chrono::steady_clock::now();
+                        u32 pause_batch = 8u;
+                        for (u32 burst = 0; burst < 256u; ++burst) {
+                            for (u32 i = 0; i < pause_batch; ++i) {
+                                _mm_pause();
+                            }
+                            if (hint.IsReady() ||
+                                num_commands.load(std::memory_order_relaxed) != 0u ||
+                                other_queue_ready() || stop.stop_requested()) {
+                                break;
+                            }
+                            if (pause_batch < 128u) {
+                                pause_batch <<= 1u;
+                            }
+                        }
+                        const auto waited_ns = u64(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - wait_begin)
+                                .count());
+                        BbStats::gpu_idle_ns.fetch_add(waited_ns, std::memory_order_relaxed);
+                    }
+                    wait_round_queues = 0;
+                    continue;
+                }
+                if (++wait_round_queues >= mapped) {
+                    wait_round_queues = 0;
+                    const auto wait_begin = std::chrono::steady_clock::now();
+                    for (u32 i = 0; i < 32u; ++i) {
+                        _mm_pause();
+                    }
+                    const auto waited_ns = u64(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - wait_begin)
+                            .count());
+                    BbStats::gpu_idle_ns.fetch_add(waited_ns, std::memory_order_relaxed);
+                } else {
+                    _mm_pause(); // the other queues' turn
+                }
                 continue;
             }
+            wait_round_queues = 0;
             BbTimeline::Note(BbTimeline::DecodeEnd, u64(current_queue), decoded_total + 1);
             bool frame_end;
             {
                 std::scoped_lock lock{queue.mutex};
                 queue.works.pop_front();
+                queue.pending_works.fetch_sub(1u, std::memory_order_release);
                 last_decoded = nullptr;
                 const u32 remaining = --num_submits;
                 std::scoped_lock submit_lock{submit_mutex};
@@ -1575,6 +1633,7 @@ void CommandProcessor::SubmitGfx(std::span<const u32> dcb, std::span<const u32> 
         BbFreeCheck::NoteSubmit(work->seq, work->copy ? work->copy->guest_dcb : dcb.data(),
                                 dcb.size_bytes());
         queue.works.push_back(std::move(work));
+        queue.pending_works.fetch_add(1u, std::memory_order_release);
     }
     std::scoped_lock lock{submit_mutex};
     ++num_submits;
@@ -1594,9 +1653,13 @@ void CommandProcessor::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
     {
         std::scoped_lock lock{queue.mutex};
         queue.works.push_back(std::move(work));
+        queue.pending_works.fetch_add(1u, std::memory_order_release);
     }
     std::scoped_lock lock{submit_mutex};
-    num_mapped_queues = std::max(num_mapped_queues, gnm_vqid + 1);
+    const u32 min_mapped = gnm_vqid + 1u;
+    if (min_mapped > num_mapped_queues.load(std::memory_order_relaxed)) {
+        num_mapped_queues.store(min_mapped, std::memory_order_release);
+    }
     ++num_submits;
     ++submissions_total;
     work_retired = false;
