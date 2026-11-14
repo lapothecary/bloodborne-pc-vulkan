@@ -12,6 +12,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <memory>
 #include <mutex>
@@ -97,6 +98,22 @@ public:
     /// the upscale (post and UI are not jittered).
     [[nodiscard]] std::array<float, 2> Jitter() const noexcept {
         return done_this_frame ? std::array<float, 2>{} : jitter;
+    }
+
+    /// Phase 4.2b: Guest-thread / Stage-B flip epoch hooks so `GXWorker:1..5` compute the exact
+    /// Halton sub-pixel jitter phase for the guest frame being built even when `SubmitsAhead=2`
+    /// overlaps guest frame `K+1` with Stage B's `DisplayPass` of frame `K`.
+    static void NoteGuestFlipSubmittedForMt() noexcept;
+    [[nodiscard]] static u32 GuestFlipsSubmittedForMt() noexcept;
+    [[nodiscard]] static u32 StageBFlipsRetiredForMt() noexcept;
+    void OnStageBFlipRetiredForMt() noexcept;
+    [[nodiscard]] std::array<float, 2> MtJitterForGuestFrame() const noexcept;
+    [[nodiscard]] float SceneMipBiasMt() const noexcept {
+        return std::bit_cast<float>(mt_scene_mip_bias_bits.load(std::memory_order_relaxed));
+    }
+    [[nodiscard]] bool RedirectsSampledMt(VideoCore::ImageId image) const noexcept {
+        const u32 idx = mt_redirected_sampled_id.load(std::memory_order_relaxed);
+        return idx != 0u && image.index == idx;
     }
 
     // Scaled presets.
@@ -366,6 +383,12 @@ private:
     vk::Format live_color_fmt = vk::Format::eUndefined;
     vk::Format live_depth_fmt = vk::Format::eUndefined;
     void EnsureLiveInputResources(u32 w, u32 h, vk::Format color_fmt, vk::Format depth_fmt);
+
+    std::atomic<u64> mt_jitter_state{0};
+    std::atomic<u32> mt_scene_mip_bias_bits{0};
+    std::atomic<u32> mt_redirected_sampled_id{0};
+    u32 stage_b_flips_retired = 0;
+    bool flip_frame_started = false;
 };
 
 } // namespace Vulkan

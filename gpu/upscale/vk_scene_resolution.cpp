@@ -25,6 +25,8 @@ SceneTargets::SceneTargets(const Instance& i, Scheduler& s, Runtime& r, Lookup g
     const char* force = std::getenv("BB_SCENE_STENCIL_BITS");
     force_stencil_bits = force && force[0] == '1';
     CreateResampleResources();
+    atomic_size_packed.store(PackMtSize(size), std::memory_order_relaxed);
+    atomic_base_packed.store(PackMtSize(base_size), std::memory_order_relaxed);
 }
 SceneTargets::~SceneTargets() {
     scheduler.Finish();
@@ -34,17 +36,22 @@ vk::FormatFeatureFlags SceneTargets::Features(vk::Format format) const {
     // Called for every attachment of every draw: the driver query was ~5% of the GPU thread.
     // Core formats index a flat table; extension formats (large enum values) use the map.
     const auto index = u32(format);
-    if (index < format_table.size() && format_known[index]) return format_table[index];
-    if (index >= format_table.size()) {
-        if (const auto it = format_features.find(format); it != format_features.end()) {
-            return it->second;
+    if (index < format_table.size() && format_known[index].load(std::memory_order_acquire)) {
+        return format_table[index];
+    }
+    std::scoped_lock lk{features_mutex};
+    if (index < format_table.size()) {
+        if (format_known[index].load(std::memory_order_relaxed)) {
+            return format_table[index];
         }
+    } else if (const auto it = format_features.find(format); it != format_features.end()) {
+        return it->second;
     }
     const auto features =
         instance.GetPhysicalDevice().getFormatProperties(format).optimalTilingFeatures;
     if (index < format_table.size()) {
         format_table[index] = features;
-        format_known[index] = true;
+        format_known[index].store(true, std::memory_order_release);
     } else {
         format_features.emplace(format, features);
     }
@@ -102,6 +109,47 @@ SceneResolution::Size SceneTargets::ProxySize(const VideoCore::Image& image, u32
     const u32 div = std::max(1u, SizeDivisor(image.info, size, base_size));
     return {std::max(1u, size.width / div >> level), std::max(1u, size.height / div >> level)};
 }
+bool SceneTargets::EligibleInfoMt(const VideoCore::ImageInfo& i, u32 backing_samples,
+                                  vk::Format backing_fmt,
+                                  vk::ImageAspectFlags aspect_mask) const noexcept {
+    const auto cur_size = SizeMt();
+    const auto cur_base = BaseSizeMt();
+    const u32 div = SizeDivisor(i, cur_size, cur_base);
+    if (!div || i.size.depth != 1 || i.resources.layers != 1 || i.num_samples != 1 ||
+        i.props.is_block || backing_samples != 1 || backing_fmt == vk::Format::eUndefined) {
+        return false;
+    }
+    if (i.resources.levels != 1) {
+        return div == 2 && i.resources.levels <= 16 && !i.props.is_depth && Blittable(backing_fmt);
+    }
+    if (Blittable(backing_fmt)) {
+        return true;
+    }
+    if (!i.props.is_depth) {
+        return false;
+    }
+    const auto features = Features(backing_fmt);
+    const auto required = vk::FormatFeatureFlagBits::eSampledImage |
+                          vk::FormatFeatureFlagBits::eDepthStencilAttachment;
+    return (features & required) == required &&
+           (!(aspect_mask & vk::ImageAspectFlagBits::eStencil) ||
+            instance.IsShaderStencilExportSupported() || force_stencil_bits);
+}
+bool SceneTargets::EligibleSceneInfoMt(const VideoCore::ImageInfo& i, u32 backing_samples,
+                                       vk::Format backing_fmt,
+                                       vk::ImageAspectFlags aspect_mask) const noexcept {
+    const auto cur_base = BaseSizeMt();
+    return i.size.width == cur_base.width && i.size.height == cur_base.height &&
+           EligibleInfoMt(i, backing_samples, backing_fmt, aspect_mask);
+}
+SceneResolution::Size SceneTargets::ProxySizeInfoMt(const VideoCore::ImageInfo& i,
+                                                    u32 level) const noexcept {
+    const auto cur_size = SizeMt();
+    const auto cur_base = BaseSizeMt();
+    const u32 div = std::max(1u, SizeDivisor(i, cur_size, cur_base));
+    return {std::max(1u, cur_size.width / div >> level),
+            std::max(1u, cur_size.height / div >> level)};
+}
 bool SceneTargets::SetSize(SceneResolution::Size next) {
     if (next == size) return false;
     ResolveAll();
@@ -111,6 +159,7 @@ bool SceneTargets::SetSize(SceneResolution::Size next) {
     ++generation;
     recent = {};
     size = next;
+    atomic_size_packed.store(PackMtSize(next), std::memory_order_release);
     std::printf("Scene resolution: raster %ux%u, half-resolution targets %ux%u, UI 1920x1080 "
                 "(live)\n", size.width, size.height, size.width / 2, size.height / 2);
     return true;

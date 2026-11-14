@@ -17,6 +17,7 @@
 
 #include <boost/container/static_vector.hpp>
 #include <fmt/format.h>
+#include <xxhash.h>
 
 #include "bbport_settings.h"
 #include "buffers/buffer_cache.h"
@@ -34,6 +35,8 @@
 #include "shim/bbport_toggles.h"
 #include "textures/direct_textures.h"
 #include "textures/texture_cache.h"
+#include "upscale/vk_object_motion.h"
+#include "upscale/vk_temporal_upscaler.h"
 #include "vulkan/instance.h"
 #include "../../dantelion_gx/include/gx_direct_vulkan.h"
 
@@ -560,18 +563,91 @@ struct VkMtDirectRecorder::WorkerCompileScratch {
         u64 offset{0};
     };
 
+    struct RetainedPkt {
+        const u32* ptr{nullptr};
+        u32 words{0};
+    };
+
+    struct StagedPkt {
+        u32 offset{0};
+        u32 words{0};
+    };
+
+    struct SubPassPlan {
+        u32 first_draw_ordinal{0};
+        const GraphicsPipeline* first_pso{nullptr};
+        Rasterizer::MtPassTargetSummary target_summary{};
+        std::array<Gcn::ColorBuffer, Gcn::NUM_COLOR_BUFFERS> cb{};
+        Gcn::DepthBuffer db{};
+        u32 db_view{0};
+        u32 htile{0};
+        std::array<Gcn::CbDbExtent, Gcn::NUM_COLOR_BUFFERS> cb_extent{};
+        Gcn::CbDbExtent db_extent{};
+        std::array<u16, Gcn::NUM_COLOR_BUFFERS> cb_uid{};
+        u16 db_uid{0};
+        std::array<u32, 0x0180> sh_gfx_regs{};
+        std::array<u32, 0x0400> context_regs{};
+        std::array<u32, 0x0008> uconfig_so_regs{};
+        std::array<u32, 0x0018> uconfig_vgt_regs{};
+        bool writes_depth{false};
+        bool writes_stencil{false};
+        u8 scene_color_submode{0};
+
+        void CaptureRegs(const Gcn::Regs& src) noexcept {
+            std::memcpy(sh_gfx_regs.data(), &src.reg_array[0x2C00],
+                        sh_gfx_regs.size() * sizeof(u32));
+            std::memcpy(context_regs.data(), &src.reg_array[0xA000],
+                        context_regs.size() * sizeof(u32));
+            std::memcpy(uconfig_so_regs.data(), &src.reg_array[0xC038],
+                        uconfig_so_regs.size() * sizeof(u32));
+            std::memcpy(uconfig_vgt_regs.data(), &src.reg_array[0xC240],
+                        uconfig_vgt_regs.size() * sizeof(u32));
+        }
+    };
+
+    struct SealedSubPass {
+        vk::CommandBuffer sec_cmd{};
+        u32 pool_idx{0};
+        u64 end_ring_pos{0};
+        const GraphicsPipeline* first_pso{nullptr};
+        std::array<Gcn::CbDbExtent, Gcn::NUM_COLOR_BUFFERS> cb_extent{};
+        Gcn::CbDbExtent db_extent{};
+        std::array<u16, Gcn::NUM_COLOR_BUFFERS> cb_uid{};
+        u16 db_uid{0};
+        std::array<u32, 0x0180> sh_gfx_regs{};
+        std::array<u32, 0x0400> context_regs{};
+        std::array<u32, 0x0008> uconfig_so_regs{};
+        std::array<u32, 0x0018> uconfig_vgt_regs{};
+        u32 recorded_draws{0};
+        bool is_gbuffer{false};
+        bool has_camera_cb{false};
+        u8 num_sampled_rt_refs{0};
+        u8 motion_slot{0xFFu};
+        std::array<MtCompletedPassMeta::SampledRtRef, MtCompletedPassMeta::kMaxSampledRts>
+            sampled_rt_refs{};
+    };
+
     alignas(16) std::array<u8, 32768> cb_temp{};
     alignas(16) std::array<u32, 256> vs_flat_ud{};
     alignas(16) std::array<u32, 256> ps_flat_ud{};
-    MtCompletedPassMeta scan_pass_meta{};
     std::vector<ChunkCopySlice> chunk_copies;
+    std::vector<RetainedPkt> pre_pkts;
+    std::vector<RetainedPkt> post_pkts;
+    std::vector<StagedPkt> staged_pkts;
+    std::vector<SubPassPlan> subpass_plans;
+    std::vector<SealedSubPass> sealed_subpasses;
     std::vector<u32> emit_words;
     std::array<UploadedConstMemo, 32> const_memo{};
     u32 const_memo_cursor{0};
 
     WorkerCompileScratch() {
-        chunk_copies.reserve(64);
-        emit_words.reserve(512);
+        chunk_copies.reserve(128);
+        pre_pkts.reserve(256);
+        post_pkts.reserve(128);
+        staged_pkts.reserve(512);
+        subpass_plans.reserve(64);
+        sealed_subpasses.reserve(64);
+        emit_words.reserve(1024);
     }
 
     void ResetConstMemo() noexcept {
@@ -589,7 +665,7 @@ VkMtDirectRecorder::VkMtDirectRecorder(const Instance& instance_, Scheduler& sch
         for (u32 w = 0; w < 6u; ++w) {
             EnsureWorkerInitialized(w);
         }
-        std::printf("[bb_vulkan] Phase 4.2 VkMtDirectRecorder active (BB_MT_DIRECT_VK=%d, "
+        std::printf("[bb_vulkan] Phase 4.2b/4.3 VkMtDirectRecorder active (BB_MT_DIRECT_VK=%d, "
                     "prewarmed 6/%u heap worker slots x %u pools, +0 B PT_TLS)\n",
                     mode, kMaxWorkers, kFrameSlices);
     }
@@ -838,6 +914,16 @@ vk::ImageView VkMtDirectRecorder::ResolveSrv(u32 worker_id, const Gcn::Image& ra
         (worker_id < kMaxWorkers) ? worker_ptrs[worker_id].load(std::memory_order_acquire) : nullptr;
     return rasterizer.ResolveSrvViewMt(
         raw_sharp, res, w ? &w->local_stats.native_tex_hits : nullptr,
+        w ? &w->local_stats.native_tex_misses : nullptr);
+}
+
+Rasterizer::MtResolvedSrv VkMtDirectRecorder::ResolveSceneSrv(
+    u32 worker_id, const Gcn::Image& raw_sharp, const Shader::ImageResource& res,
+    const Rasterizer::MtPassTargetSummary& pass_targets) {
+    WorkerSlot* w =
+        (worker_id < kMaxWorkers) ? worker_ptrs[worker_id].load(std::memory_order_acquire) : nullptr;
+    return rasterizer.ResolveSceneSrvViewMt(
+        raw_sharp, res, pass_targets, w ? &w->local_stats.native_tex_hits : nullptr,
         w ? &w->local_stats.native_tex_misses : nullptr);
 }
 
@@ -1128,10 +1214,12 @@ void UpdateWorkerColorBlendingState(DynamicState& dyn_state, const Gcn::Regs& re
 
 void UpdateWorkerDynamicStateFull(DynamicState& dyn_state, const Instance& instance,
                                   const Gcn::Regs& regs, const GraphicsPipeline* pipeline,
-                                  bool is_indexed) {
-    // 1. Viewports & Scissors (1:1 native scale, zero jitter — upscaler-enabled frames bail out)
+                                  bool is_indexed, const std::array<float, 2>& target_scale,
+                                  const std::array<float, 2>& draw_jitter) {
+    // 1. Viewports & Scissors (with upscaler target_scale & scene-depth Halton jitter)
     const Gcn::Scissor combined = MtCombinedScissor(regs);
     const auto& ctl = regs.viewport_control;
+    const bool scaled = target_scale[0] != 1.0f || target_scale[1] != 1.0f;
     boost::container::static_vector<vk::Viewport, Gcn::NUM_VIEWPORTS> viewports;
     boost::container::static_vector<vk::Rect2D, Gcn::NUM_VIEWPORTS> scissors;
     for (u32 i = 0; i < Gcn::NUM_VIEWPORTS; ++i) {
@@ -1150,10 +1238,10 @@ void UpdateWorkerDynamicStateFull(DynamicState& dyn_state, const Instance& insta
             const float xscale = ctl.xscale_enable ? vp.xscale : 1.f;
             const float yoffset = ctl.yoffset_enable ? vp.yoffset : 0.f;
             const float yscale = ctl.yscale_enable ? vp.yscale : 1.f;
-            viewport.x = xoffset - xscale;
-            viewport.y = yoffset - yscale;
-            viewport.width = xscale * 2.0f;
-            viewport.height = yscale * 2.0f;
+            viewport.x = (xoffset - xscale) * target_scale[0] + draw_jitter[0];
+            viewport.y = (yoffset - yscale) * target_scale[1] + draw_jitter[1];
+            viewport.width = xscale * 2.0f * target_scale[0];
+            viewport.height = yscale * 2.0f * target_scale[1];
         }
         viewports.push_back(viewport);
 
@@ -1167,10 +1255,22 @@ void UpdateWorkerDynamicStateFull(DynamicState& dyn_state, const Instance& insta
             scissor.bottom_right_y =
                 std::min(Gcn::Scissor::Clamp(scissor.bottom_right_y), own.bottom_right_y);
         }
-        scissors.push_back({
-            .offset = {scissor.top_left_x, scissor.top_left_y},
-            .extent = {scissor.GetWidth(), scissor.GetHeight()},
-        });
+        if (scaled) {
+            const auto scale = [](s32 v, float f) { return s32(std::lround(float(v) * f)); };
+            const s32 x0 = scale(scissor.top_left_x, target_scale[0]);
+            const s32 y0 = scale(scissor.top_left_y, target_scale[1]);
+            const s32 x1 = scale(scissor.top_left_x + s32(scissor.GetWidth()), target_scale[0]);
+            const s32 y1 = scale(scissor.top_left_y + s32(scissor.GetHeight()), target_scale[1]);
+            scissors.push_back({
+                .offset = {x0, y0},
+                .extent = {u32(std::max(x1 - x0, 0)), u32(std::max(y1 - y0, 0))},
+            });
+        } else {
+            scissors.push_back({
+                .offset = {scissor.top_left_x, scissor.top_left_y},
+                .extent = {scissor.GetWidth(), scissor.GetHeight()},
+            });
+        }
     }
     if (viewports.empty()) {
         viewports.push_back(
@@ -1271,7 +1371,97 @@ enum class MtPktKind : u8 {
     Draw,
     CopyBatch,
     SyncRetain,
+    PostSyncRetain,
 };
+
+enum class MtBailReason : u8 {
+    Pkt = 0,
+    Pso,
+    Target,
+    Buf,
+    Other,
+};
+
+std::atomic<u64> g_mt_lists_seen{0};
+std::atomic<u64> g_mt_lists_compiled{0};
+std::atomic<u64> g_mt_draws_recorded{0};
+std::atomic<u64> g_mt_bail_pkt{0};
+std::atomic<u64> g_mt_bail_pso{0};
+std::atomic<u64> g_mt_bail_target{0};
+std::atomic<u64> g_mt_bail_buf{0};
+std::atomic<u64> g_mt_bail_other{0};
+std::atomic<u32> g_mt_last_report_frame{0};
+std::atomic<u32> g_mt_bad_pkt_samples{0};
+
+void MtReportTelemetryIfDue(u32 cur_guest_frame) noexcept {
+    u32 last = g_mt_last_report_frame.load(std::memory_order_relaxed);
+    if (last == 0u) {
+        if (g_mt_last_report_frame.compare_exchange_strong(last, cur_guest_frame,
+                                                           std::memory_order_relaxed)) {
+            return;
+        }
+    }
+    if (static_cast<s32>(cur_guest_frame - last) < 600) {
+        return;
+    }
+    if (!g_mt_last_report_frame.compare_exchange_strong(last, cur_guest_frame,
+                                                        std::memory_order_acq_rel)) {
+        return;
+    }
+    const u64 seen = g_mt_lists_seen.exchange(0ULL, std::memory_order_relaxed);
+    const u64 comp = g_mt_lists_compiled.exchange(0ULL, std::memory_order_relaxed);
+    const u64 draws = g_mt_draws_recorded.exchange(0ULL, std::memory_order_relaxed);
+    const u64 b_pkt = g_mt_bail_pkt.exchange(0ULL, std::memory_order_relaxed);
+    const u64 b_pso = g_mt_bail_pso.exchange(0ULL, std::memory_order_relaxed);
+    const u64 b_tgt = g_mt_bail_target.exchange(0ULL, std::memory_order_relaxed);
+    const u64 b_buf = g_mt_bail_buf.exchange(0ULL, std::memory_order_relaxed);
+    const u64 b_oth = g_mt_bail_other.exchange(0ULL, std::memory_order_relaxed);
+    std::printf("[BB-MT] 600f: compiled %llu/%llu lists (mt_draws=%llu, bail: pkt=%llu, "
+                "pso=%llu, target=%llu, buf=%llu, other=%llu)\n",
+                static_cast<unsigned long long>(comp), static_cast<unsigned long long>(seen),
+                static_cast<unsigned long long>(draws), static_cast<unsigned long long>(b_pkt),
+                static_cast<unsigned long long>(b_pso), static_cast<unsigned long long>(b_tgt),
+                static_cast<unsigned long long>(b_buf), static_cast<unsigned long long>(b_oth));
+    std::fflush(stdout);
+}
+
+void MtNoteBail(MtBailReason reason, u32 cur_guest_frame) noexcept {
+    switch (reason) {
+    case MtBailReason::Pkt:
+        g_mt_bail_pkt.fetch_add(1ULL, std::memory_order_relaxed);
+        break;
+    case MtBailReason::Pso:
+        g_mt_bail_pso.fetch_add(1ULL, std::memory_order_relaxed);
+        break;
+    case MtBailReason::Target:
+        g_mt_bail_target.fetch_add(1ULL, std::memory_order_relaxed);
+        break;
+    case MtBailReason::Buf:
+        g_mt_bail_buf.fetch_add(1ULL, std::memory_order_relaxed);
+        break;
+    case MtBailReason::Other:
+        g_mt_bail_other.fetch_add(1ULL, std::memory_order_relaxed);
+        break;
+    }
+    MtReportTelemetryIfDue(cur_guest_frame);
+}
+
+[[nodiscard]] constexpr bool IsStageACoalescerShader(u64 vs_hash, u64 ps_hash) noexcept {
+    // Keep Stage A specialized batchers (`LightTileBatcher`, `VsmShadowMemo` blur, `VfxUiBatcher`)
+    // on Stage A where draw coalescing / shadow-face elision reduces GPU draw overhead.
+    if (vs_hash == 0x000000008747a367ULL) { // LightTileBatcher
+        return true;
+    }
+    if (vs_hash == 0x000000000b0acf50ULL && ps_hash == 0x000000000f61fd27ULL) { // VSM blur
+        return true;
+    }
+    if (vs_hash == 0x0000000024042a9bULL || vs_hash == 0x00000000e94b5b06ULL ||
+        vs_hash == 0x00000000a400228bULL || vs_hash == 0x000000004cd21a0fULL ||
+        vs_hash == 0x0000000041ae600fULL) { // VfxUiBatcher (Scaleform + GXFfx quad/tess)
+        return true;
+    }
+    return false;
+}
 
 struct MtDecodedPkt {
     MtPktKind kind{MtPktKind::Invalid};
@@ -1450,7 +1640,7 @@ struct MtDecodedPkt {
                 BbCp::DirectVk::CopyRegion reg{};
                 std::memcpy(&reg, body + 2u + i * 6u, sizeof(reg));
                 if (reg.reserved != gx_direct_vk::kCopyFlagKnownCpuSource || !reg.src_va ||
-                    !reg.dst_va || reg.byte_size == 0u ||
+                    !reg.dst_va || reg.byte_size == 0u || reg.byte_size > 262144u ||
                     (mem && mem->ClampRangeSize(reg.src_va, reg.byte_size) != reg.byte_size)) {
                     return {};
                 }
@@ -1471,7 +1661,7 @@ struct MtDecodedPkt {
             if (count == 0u || count > 32u || body_words != 2u + count * 2u) {
                 return {};
             }
-            out.kind = MtPktKind::SyncRetain;
+            out.kind = MtPktKind::PostSyncRetain;
             return out;
         }
 
@@ -1480,7 +1670,7 @@ struct MtDecodedPkt {
             if (count == 0u || count > 32u || body_words != 3u + count * 2u) {
                 return {};
             }
-            out.kind = MtPktKind::SyncRetain;
+            out.kind = MtPktKind::PostSyncRetain;
             return out;
         }
 
@@ -1493,8 +1683,58 @@ struct MtDecodedPkt {
     case BbCp::Op::ContextControl:
     case BbCp::Op::AcquireMem:
     case BbCp::Op::PfpSyncMe:
+    case BbCp::Op::SurfaceSync:
+    case BbCp::Op::PreambleCntl:
+    case BbCp::Op::IncrementCeCounter:
+    case BbCp::Op::IncrementDeCounter:
+    case BbCp::Op::WaitOnCeCounter:
+    case BbCp::Op::WaitOnDeCounterDiff:
         out.kind = MtPktKind::NoOp;
         return out;
+
+    case BbCp::Op::SetPredication:
+        if (body_words >= 2u &&
+            BbCp::SetPredication::From(body).Operation() == BbCp::SetPredication::Clear) {
+            out.kind = MtPktKind::NoOp;
+            return out;
+        }
+        return {};
+
+    case BbCp::Op::WaitRegMem:
+        if (body_words >= 6u && !BbCp::WaitRegMem::From(body).Memory()) {
+            out.kind = MtPktKind::NoOp;
+            return out;
+        }
+        return {};
+
+    case BbCp::Op::EventWrite: {
+        const auto ev = BbCp::EventWrite::From(body, body_words);
+        if (ev.Type() == BbCp::EventWrite::SoVgtStreamoutFlush) {
+            return {};
+        }
+        if (ev.Index() == BbCp::EventWrite::IndexZpassDone &&
+            (ev.Type() == BbCp::EventWrite::ZpassDone ||
+             ev.Type() == BbCp::EventWrite::PixelPipeStatDump)) {
+            return {};
+        }
+        out.kind = MtPktKind::NoOp;
+        return out;
+    }
+
+    case BbCp::Op::EventWriteEop:
+        if (body_words == 5u) {
+            out.kind = MtPktKind::PostSyncRetain;
+            return out;
+        }
+        return {};
+
+    case BbCp::Op::EventWriteEos:
+        if (body_words == 4u &&
+            BbCp::EventWriteEos::From(body).Command() == BbCp::EventWriteEos::SignalFence) {
+            out.kind = MtPktKind::PostSyncRetain;
+            return out;
+        }
+        return {};
 
     case BbCp::Op::ClearState:
         regs.SetDefaults();
@@ -1646,7 +1886,7 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
         return false;
     }
 
-    std::array<DcbSlice, 32> slices{};
+    std::array<DcbSlice, 64> slices{};
     u32 num_slices = 0;
     u32 total_dwords = 0;
     while (block) {
@@ -1670,7 +1910,7 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
             if (words == 0u) {
                 continue;
             }
-            if (num_slices >= slices.size() || total_dwords + words > 262144u) {
+            if (num_slices >= slices.size() || total_dwords + words > 524288u) {
                 return false;
             }
             slices[num_slices++] = DcbSlice{slot, begin_ptr, words};
@@ -1678,16 +1918,27 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
         }
         block = next_block;
     }
-    if (num_slices == 0u || total_dwords < 16u) {
+    if (num_slices == 0u || total_dwords < 8u) {
         return false;
     }
 
+    const u32 cur_guest_frame = BbStats::guest_frame_number.load(std::memory_order_relaxed);
+    g_mt_lists_seen.fetch_add(1ULL, std::memory_order_relaxed);
+
     // -------------------------------------------------------------------------
     // Phase 1: Pure read-only pre-scan (validates eligibility, warm PSOs, and
-    // target layout with ZERO mutation of `cmd_list_impl` or Vulkan state).
+    // multi-subpass target layouts with ZERO mutation of `cmd_list_impl`).
+    // `GXGnmCommandContext_BeginCommandList` (`0x216aca0`) resets caches from the
+    // default hardware state without emitting `Op::InitDefaultHardwareState`
+    // into `cmdListImpl`, so `sregs.SetDefaults()` IS the valid initial state.
     // -------------------------------------------------------------------------
     auto* mem = rasterizer.GetMemoryManager();
     auto& scratch = *w.compile_scratch;
+    scratch.pre_pkts.clear();
+    scratch.post_pkts.clear();
+    scratch.subpass_plans.clear();
+    scratch.sealed_subpasses.clear();
+
     Gcn::Regs& sregs = *w.scan_regs;
     sregs.SetDefaults();
     w.pso_state.ResetForPass();
@@ -1699,32 +1950,27 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
     u64 scan_pso_epoch = 0ULL;
     u64 scan_dyn_epoch = 0ULL;
 
-    struct RetainedPkt {
-        const u32* ptr{nullptr};
-        u32 words{0};
-    };
-    std::array<RetainedPkt, 64> pre_pkts{};
-    std::array<RetainedPkt, 64> post_pkts{};
-    u32 num_pre_pkts = 0;
-    u32 num_post_pkts = 0;
-
-    bool has_hw_init = false;
     bool seen_draw = false;
-    bool seen_post_draw_sync = false;
     u32 candidate_draws = 0;
+    bool list_any_gbuffer = false;
+    bool list_is_core_geom = false;
+    static constexpr u32 kMaxSubPassesPerList = 128u;
 
-    const GraphicsPipeline* first_pso = nullptr;
-    Rasterizer::MtPassTargetSummary target_summary{};
-    std::array<Gcn::ColorBuffer, Gcn::NUM_COLOR_BUFFERS> first_cb{};
-    Gcn::DepthBuffer first_db{};
-    u32 first_db_view = 0u;
-    u32 first_htile = 0u;
-    bool first_writes_depth = false;
-    bool first_writes_stencil = false;
-    std::array<Gcn::CbDbExtent, Gcn::NUM_COLOR_BUFFERS> first_cb_extent{};
-    Gcn::CbDbExtent first_db_extent{};
-    std::array<u16, Gcn::NUM_COLOR_BUFFERS> first_cb_uid{};
-    u16 first_db_uid = 0u;
+    const auto calc_scene_color_submode = [](bool is_scene_color,
+                                             const Gcn::Regs& regs) noexcept -> u8 {
+        if (!is_scene_color) {
+            return 0u;
+        }
+        const u32 num_inst = regs.num_instances.NumInstances();
+        if (regs.num_indices > 0u && regs.num_indices <= 6u && num_inst <= 1u) {
+            return 2u; // Fullscreen composite quad -> NoteComposite on Stage B
+        }
+        if (regs.blend_control[0].enable && !regs.color_buffers[0].info.blend_bypass &&
+            !regs.depth_control.depth_write_enable) {
+            return 1u; // Blended 3D transparent draw -> NoteTransparentPass on Stage B
+        }
+        return 0u;
+    };
 
     for (u32 s = 0; s < num_slices; ++s) {
         const u32* cur = slices[s].begin_ptr;
@@ -1734,6 +1980,14 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
                 cur, rem, sregs, scan_cb_extent, scan_db_extent, scan_cb_uid, scan_db_uid,
                 scan_pso_epoch, scan_dyn_epoch, mem, false);
             if (dp.kind == MtPktKind::Invalid || dp.pkt_words == 0u || dp.pkt_words > rem) {
+                if (g_mt_bad_pkt_samples.fetch_add(1u, std::memory_order_relaxed) < 8u) {
+                    const u32 hdr = cur[0];
+                    const u32 b0 = rem > 1u ? cur[1] : 0u;
+                    const u32 b1 = rem > 2u ? cur[2] : 0u;
+                    std::printf("[BB-MT] bail_pkt sample: hdr=0x%08x op=0x%02x b0=0x%08x b1=0x%08x\n",
+                                hdr, (hdr >> 8u) & 0xFFu, b0, b1);
+                }
+                MtNoteBail(MtBailReason::Pkt, cur_guest_frame);
                 return false;
             }
 
@@ -1743,35 +1997,34 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
                 break;
 
             case MtPktKind::InitHwState:
-                if (!seen_draw && !has_hw_init) {
-                    if (num_pre_pkts >= pre_pkts.size()) {
-                        return false;
-                    }
-                    pre_pkts[num_pre_pkts++] = RetainedPkt{cur, dp.pkt_words};
+                if (seen_draw) {
+                    MtNoteBail(MtBailReason::Pkt, cur_guest_frame);
+                    return false;
                 }
-                has_hw_init = true;
+                scratch.pre_pkts.push_back({cur, dp.pkt_words});
                 break;
 
             case MtPktKind::CopyBatch:
+                // Execute staging DMA uploads on Stage B BEFORE ExecuteSecondaryCmds, while
+                // Phase 2 mirrors them in stream order into `scratch.chunk_copies` -> worker ring.
+                scratch.pre_pkts.push_back({cur, dp.pkt_words});
+                break;
+
             case MtPktKind::SyncRetain:
                 if (!seen_draw) {
-                    if (num_pre_pkts >= pre_pkts.size()) {
-                        return false;
-                    }
-                    pre_pkts[num_pre_pkts++] = RetainedPkt{cur, dp.pkt_words};
+                    scratch.pre_pkts.push_back({cur, dp.pkt_words});
                 } else {
-                    if (num_post_pkts >= post_pkts.size()) {
-                        return false;
-                    }
-                    post_pkts[num_post_pkts++] = RetainedPkt{cur, dp.pkt_words};
-                    seen_post_draw_sync = true;
+                    scratch.post_pkts.push_back({cur, dp.pkt_words});
                 }
                 break;
 
+            case MtPktKind::PostSyncRetain:
+                // Chunk-boundary ReleaseLabelsBatch / ReleaseU32LabelsBatch / EOP / EOS fences
+                // run AFTER all secondary command buffers of this list without blocking draws.
+                scratch.post_pkts.push_back({cur, dp.pkt_words});
+                break;
+
             case MtPktKind::Draw: {
-                if (!has_hw_init || seen_post_draw_sync) {
-                    return false;
-                }
                 if (sregs.stage_enable.raw != u32(Gcn::ShaderStageEnable::VgtStages::Vs) ||
                     sregs.vgt_strmout_config.raw != 0u ||
                     sregs.depth_render_control.depth_clear_enable ||
@@ -1779,63 +2032,117 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
                     sregs.depth_render_control.depth_copy ||
                     sregs.depth_render_control.stencil_copy ||
                     sregs.depth_render_control.resummarize_enable) {
+                    MtNoteBail(MtBailReason::Pkt, cur_guest_frame);
                     return false;
                 }
                 const GraphicsPipeline* pso =
                     rasterizer.GetPipelineCache().SelectGraphicsPipelineMt(
                         sregs, w.pso_state, {}, false, /*allow_compile_fallback=*/false);
                 if (!IsPipelineMtSafe(pso)) {
+                    MtNoteBail(MtBailReason::Pso, cur_guest_frame);
                     return false;
                 }
 
-                if (!seen_draw) {
-                    const u32 mrt = pso->GetGraphicsKey().mrt_mask;
-                    const auto* ps_st = pso->GetStages()[u32(Shader::SwStage::Fragment)];
-                    const bool is_gbuf = (mrt == 0x3Fu);
-                    const bool is_depth_shadow = (mrt == 0x0u);
-                    const bool is_obj_vel =
-                        (mrt == 0x1u && ps_st &&
-                         ObjectVelocityCuller::IsObjectVelocityPs(ps_st->pgm_hash));
-                    if (mode == 1 && !is_gbuf && !is_depth_shadow && !is_obj_vel) {
+                const auto* vs_st = pso->GetStages()[u32(Shader::SwStage::Vertex)];
+                const auto* ps_st = pso->GetStages()[u32(Shader::SwStage::Fragment)];
+                const u64 vs_hash = vs_st ? vs_st->pgm_hash : 0ULL;
+                const u64 ps_hash = ps_st ? ps_st->pgm_hash : 0ULL;
+                if (mode == 1 && IsStageACoalescerShader(vs_hash, ps_hash)) {
+                    MtNoteBail(MtBailReason::Other, cur_guest_frame);
+                    return false;
+                }
+                if (mode != 1 && (vs_hash == 0x000000008747a367ULL ||
+                                  (vs_hash == 0x000000000b0acf50ULL &&
+                                   ps_hash == 0x000000000f61fd27ULL))) {
+                    MtNoteBail(MtBailReason::Other, cur_guest_frame);
+                    return false;
+                }
+
+                const bool cur_writes_depth = bool(sregs.depth_control.depth_enable &&
+                                                   sregs.depth_control.depth_write_enable);
+                const bool cur_writes_stencil = sregs.WritesStencil();
+                const u32 cur_db_view = std::bit_cast<u32>(sregs.depth_view);
+                const u32 cur_htile = sregs.reg_array[0xA005];
+
+                bool need_new_subpass = !seen_draw;
+                if (seen_draw) {
+                    const auto& prev_sp = scratch.subpass_plans.back();
+                    const u8 next_sc_submode =
+                        calc_scene_color_submode(prev_sp.target_summary.is_scene_color, sregs);
+                    const bool sc_transition =
+                        (prev_sp.scene_color_submode == 0u && next_sc_submode == 1u) ||
+                        (prev_sp.scene_color_submode != 2u && next_sc_submode == 2u) ||
+                        (prev_sp.scene_color_submode == 2u && next_sc_submode != 2u);
+                    if (pso->GetGraphicsKey().mrt_mask != prev_sp.first_pso->GetGraphicsKey().mrt_mask ||
+                        pso->GetGraphicsKey().motion_vectors !=
+                            prev_sp.first_pso->GetGraphicsKey().motion_vectors ||
+                        std::memcmp(sregs.color_buffers, prev_sp.cb.data(),
+                                    sizeof(prev_sp.cb)) != 0 ||
+                        std::memcmp(&sregs.depth_buffer, &prev_sp.db, sizeof(prev_sp.db)) != 0 ||
+                        cur_db_view != prev_sp.db_view || cur_htile != prev_sp.htile ||
+                        cur_writes_depth != prev_sp.writes_depth ||
+                        cur_writes_stencil != prev_sp.writes_stencil || sc_transition) {
+                        need_new_subpass = true;
+                    }
+                }
+
+                if (need_new_subpass) {
+                    if (scratch.subpass_plans.size() >= kMaxSubPassesPerList) {
+                        MtNoteBail(MtBailReason::Target, cur_guest_frame);
                         return false;
                     }
-                    if (!rasterizer.InspectMtPassTargets(sregs, pso, target_summary)) {
+                    Rasterizer::MtPassTargetSummary ts{};
+                    if (!rasterizer.InspectMtPassTargets(sregs, pso, scan_cb_extent, scan_db_extent,
+                                                         ts)) {
+                        MtNoteBail(MtBailReason::Target, cur_guest_frame);
                         return false;
                     }
-                    first_pso = pso;
-                    std::memcpy(first_cb.data(), sregs.color_buffers, sizeof(first_cb));
-                    first_db = sregs.depth_buffer;
-                    first_db_view = std::bit_cast<u32>(sregs.depth_view);
-                    first_htile = sregs.reg_array[0xA005];
-                    first_writes_depth = bool(sregs.depth_control.depth_enable &&
-                                              sregs.depth_control.depth_write_enable);
-                    first_writes_stencil = sregs.WritesStencil();
-                    first_cb_extent = scan_cb_extent;
-                    first_db_extent = scan_db_extent;
-                    first_cb_uid = scan_cb_uid;
-                    first_db_uid = scan_db_uid;
-                    scratch.scan_pass_meta.CaptureFromRegs(sregs);
+                    const u32 guest_mrt =
+                        pso->GetGraphicsKey().motion_vectors
+                            ? (pso->GetGraphicsKey().mrt_mask & ~(1u << Shader::MotionVectors::Output))
+                            : pso->GetGraphicsKey().mrt_mask;
+                    // Keep 3D VSM moment shadow faces (`R16G16Sfloat` + Depth, non-ObjectVelocity)
+                    // on Stage A so `VsmShadowMemo` can elide unchanged local shadow faces.
+                    if (guest_mrt == 0x1u && ts.color_formats[0] == vk::Format::eR16G16Sfloat &&
+                        !ObjectVelocityCuller::IsObjectVelocityPs(ps_hash) &&
+                        sregs.depth_control.depth_enable && !sregs.blend_control[0].enable) {
+                        MtNoteBail(MtBailReason::Other, cur_guest_frame);
+                        return false;
+                    }
+
+                    if (!seen_draw) {
+                        list_is_core_geom =
+                            ts.is_gbuffer || guest_mrt == 0x0u ||
+                            (guest_mrt == 0x1u &&
+                             ObjectVelocityCuller::IsObjectVelocityPs(ps_hash));
+                    }
+                    list_any_gbuffer |= ts.is_gbuffer;
+
+                    WorkerCompileScratch::SubPassPlan plan{};
+                    plan.first_draw_ordinal = candidate_draws;
+                    plan.first_pso = pso;
+                    plan.target_summary = ts;
+                    std::memcpy(plan.cb.data(), sregs.color_buffers, sizeof(plan.cb));
+                    plan.db = sregs.depth_buffer;
+                    plan.db_view = cur_db_view;
+                    plan.htile = cur_htile;
+                    plan.cb_extent = scan_cb_extent;
+                    plan.db_extent = scan_db_extent;
+                    plan.cb_uid = scan_cb_uid;
+                    plan.db_uid = scan_db_uid;
+                    plan.writes_depth = cur_writes_depth;
+                    plan.writes_stencil = cur_writes_stencil;
+                    plan.scene_color_submode = calc_scene_color_submode(ts.is_scene_color, sregs);
+                    plan.CaptureRegs(sregs);
+                    scratch.subpass_plans.push_back(plan);
                     seen_draw = true;
-                } else {
-                    const bool cur_writes_depth = bool(sregs.depth_control.depth_enable &&
-                                                       sregs.depth_control.depth_write_enable);
-                    if (pso->GetGraphicsKey().mrt_mask != first_pso->GetGraphicsKey().mrt_mask ||
-                        std::memcmp(sregs.color_buffers, first_cb.data(), sizeof(first_cb)) != 0 ||
-                        std::memcmp(&sregs.depth_buffer, &first_db, sizeof(first_db)) != 0 ||
-                        std::bit_cast<u32>(sregs.depth_view) != first_db_view ||
-                        sregs.reg_array[0xA005] != first_htile ||
-                        (cur_writes_depth && !first_writes_depth) ||
-                        (sregs.WritesStencil() && !first_writes_stencil) ||
-                        sregs.depth_render_control.depth_clear_enable ||
-                        sregs.depth_render_control.stencil_clear_enable) {
-                        return false;
-                    }
                 }
                 ++candidate_draws;
                 break;
             }
 
             default:
+                MtNoteBail(MtBailReason::Pkt, cur_guest_frame);
                 return false;
             }
 
@@ -1844,7 +2151,15 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
         }
     }
 
-    if (!seen_draw || !first_pso || candidate_draws < 4u) {
+    const u32 min_draws = list_is_core_geom ? 1u : 2u;
+    if (!seen_draw || scratch.subpass_plans.empty() || candidate_draws < min_draws) {
+        MtNoteBail(MtBailReason::Other, cur_guest_frame);
+        return false;
+    }
+
+    const u32 planned_subpasses = static_cast<u32>(scratch.subpass_plans.size());
+    if (planned_subpasses >= kCompletedMetaSlots) {
+        MtNoteBail(MtBailReason::Other, cur_guest_frame);
         return false;
     }
 
@@ -1863,48 +2178,149 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
             }
             return false;
         };
-        for (u32 i = 0; i < num_pre_pkts; ++i) {
-            if (!can_place(pre_pkts[i].words)) {
+        for (const auto& pk : scratch.pre_pkts) {
+            if (!can_place(pk.words)) {
+                MtNoteBail(MtBailReason::Other, cur_guest_frame);
                 return false;
             }
         }
-        if (!can_place(7u)) { // Op::ExecuteSecondaryCmds = 7 dwords
-            return false;
+        for (u32 sp_i = 0; sp_i < planned_subpasses; ++sp_i) {
+            if (!can_place(7u)) { // Op::ExecuteSecondaryCmds = 7 dwords per subpass
+                MtNoteBail(MtBailReason::Other, cur_guest_frame);
+                return false;
+            }
         }
-        for (u32 i = 0; i < num_post_pkts; ++i) {
-            if (!can_place(post_pkts[i].words)) {
+        for (const auto& pk : scratch.post_pkts) {
+            if (!can_place(pk.words)) {
+                MtNoteBail(MtBailReason::Other, cur_guest_frame);
                 return false;
             }
         }
     }
 
-    const u64 peek_seq = w.cmd_seq_gen + 1ULL;
-    MtCompletedPassMeta& meta_slot = w.completed_meta[peek_seq & (kCompletedMetaSlots - 1u)];
-    if (meta_slot.published_seq.load(std::memory_order_acquire) !=
-        meta_slot.consumed_seq.load(std::memory_order_acquire)) {
-        return false;
+    for (u32 sp_i = 0; sp_i < planned_subpasses; ++sp_i) {
+        const u64 peek_seq = w.cmd_seq_gen + 1ULL + sp_i;
+        MtCompletedPassMeta& meta_slot = w.completed_meta[peek_seq & (kCompletedMetaSlots - 1u)];
+        if (meta_slot.published_seq.load(std::memory_order_acquire) !=
+            meta_slot.consumed_seq.load(std::memory_order_acquire)) {
+            MtNoteBail(MtBailReason::Other, cur_guest_frame);
+            return false;
+        }
     }
 
     // -------------------------------------------------------------------------
     // Phase 2: Parallel Secondary VkCommandBuffer Recording on GXWorker.
+    // Transactional rollback: `cmd_seq_gen`, `pools[].last_cmd_seq`, and
+    // `BbStats` are NOT mutated until ALL subpasses finish in Phase 3.
     // -------------------------------------------------------------------------
-    MtPassInheritanceDesc inh_desc{};
-    inh_desc.num_color_attachments = target_summary.num_color_attachments;
-    inh_desc.color_formats = target_summary.color_formats;
-    inh_desc.depth_format = target_summary.depth_format;
-    inh_desc.stencil_format = target_summary.stencil_format;
-    inh_desc.rasterization_samples = target_summary.rasterization_samples;
+    const u64 orig_ring_pos = w.constant_ring ? w.constant_ring->position : 0ULL;
+    w.local_stats.Reset();
 
-    if (!BeginWorkerPass(worker_id, inh_desc)) {
-        return false;
-    }
-
-    const u32 cur_guest_frame = BbStats::guest_frame_number.load(std::memory_order_relaxed);
     u16 occ_block_id = 0xFFFFu;
-    if (target_summary.is_gbuffer) {
+    if (list_any_gbuffer) {
         occ_block_id = rasterizer.AcquireMtOcclusionQueryBlock(cur_guest_frame);
         w.active_occ_block_id = occ_block_id;
     }
+
+    u32 cur_subpass_idx = ~0u;
+    u8 cur_motion_slot = 0xFFu;
+    u8 cur_num_sampled_rts = 0u;
+    std::array<MtCompletedPassMeta::SampledRtRef, MtCompletedPassMeta::kMaxSampledRts>
+        cur_sampled_rts{};
+
+    auto open_subpass = [&](u32 sp_idx) -> bool {
+        const auto& plan = scratch.subpass_plans[sp_idx];
+        const auto& ts = plan.target_summary;
+        const vk::CommandBuffer cmdbuf = w.AcquireSecondaryBuffer(instance, scheduler);
+        const u32 color_cnt =
+            std::min<u32>(ts.num_color_attachments, static_cast<u32>(ts.color_formats.size()));
+        const vk::CommandBufferInheritanceRenderingInfo rendering_inh{
+            .viewMask = 0u,
+            .colorAttachmentCount = color_cnt,
+            .pColorAttachmentFormats = color_cnt ? ts.color_formats.data() : nullptr,
+            .depthAttachmentFormat = ts.depth_format,
+            .stencilAttachmentFormat = ts.stencil_format,
+            .rasterizationSamples = ts.rasterization_samples,
+        };
+        const vk::CommandBufferInheritanceInfo inh_info{
+            .pNext = &rendering_inh,
+        };
+        const vk::CommandBufferBeginInfo begin_info{
+            .flags = vk::CommandBufferUsageFlagBits::eRenderPassContinue |
+                     vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
+            .pInheritanceInfo = &inh_info,
+        };
+        if (cmdbuf.begin(&begin_info) != vk::Result::eSuccess) {
+            return false;
+        }
+        w.active_cmdbuf = cmdbuf;
+        w.is_recording = true;
+        w.recorded_draws = 0u;
+        ++w.desc_epoch_counter;
+        w.bound_pipeline = vk::Pipeline{};
+        w.push_tracker.InvalidateAll();
+        w.dyn_state.Invalidate();
+        cur_subpass_idx = sp_idx;
+        cur_motion_slot = 0xFFu;
+        cur_num_sampled_rts = 0u;
+        return true;
+    };
+
+    auto seal_active_subpass = [&]() noexcept {
+        if (!w.is_recording || !w.active_cmdbuf || cur_subpass_idx >= planned_subpasses) {
+            return;
+        }
+        (void)w.active_cmdbuf.end();
+        const auto& plan = scratch.subpass_plans[cur_subpass_idx];
+        WorkerCompileScratch::SealedSubPass sp{};
+        sp.sec_cmd = w.active_cmdbuf;
+        sp.pool_idx = w.active_pool_idx;
+        sp.end_ring_pos = w.constant_ring ? w.constant_ring->position : 0ULL;
+        sp.first_pso = plan.first_pso;
+        sp.cb_extent = plan.cb_extent;
+        sp.db_extent = plan.db_extent;
+        sp.cb_uid = plan.cb_uid;
+        sp.db_uid = plan.db_uid;
+        sp.sh_gfx_regs = plan.sh_gfx_regs;
+        sp.context_regs = plan.context_regs;
+        sp.uconfig_so_regs = plan.uconfig_so_regs;
+        sp.uconfig_vgt_regs = plan.uconfig_vgt_regs;
+        sp.recorded_draws = w.recorded_draws;
+        sp.is_gbuffer = plan.target_summary.is_gbuffer;
+        sp.num_sampled_rt_refs = cur_num_sampled_rts;
+        sp.motion_slot = cur_motion_slot;
+        sp.sampled_rt_refs = cur_sampled_rts;
+        scratch.sealed_subpasses.push_back(sp);
+
+        w.active_cmdbuf = vk::CommandBuffer{};
+        w.is_recording = false;
+        w.recorded_draws = 0u;
+        w.bound_pipeline = vk::Pipeline{};
+        w.push_tracker.InvalidateAll();
+    };
+
+    auto abort_pass = [&](MtBailReason reason) noexcept -> bool {
+        if (w.is_recording && w.active_cmdbuf) {
+            (void)w.active_cmdbuf.end();
+        }
+        if (w.constant_ring) {
+            w.constant_ring->position = orig_ring_pos;
+        }
+        if (occ_block_id != 0xFFFFu) {
+            rasterizer.AbortMtOcclusionQueryBlock(occ_block_id);
+            w.active_occ_block_id = 0xFFFFu;
+            occ_block_id = 0xFFFFu;
+        }
+        w.local_stats.Reset();
+        w.active_cmdbuf = vk::CommandBuffer{};
+        w.is_recording = false;
+        w.recorded_draws = 0u;
+        w.bound_pipeline = vk::Pipeline{};
+        w.push_tracker.InvalidateAll();
+        scratch.sealed_subpasses.clear();
+        MtNoteBail(reason, cur_guest_frame);
+        return false;
+    };
 
     VAddr cue_base = 0;
     VAddr cue_end = 0;
@@ -1920,6 +2336,11 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
         if (settings.true_black_hdr.load(std::memory_order_relaxed))  m |= 0x08u;
         return m;
     }();
+    static const bool all_motion = [] {
+        const char* value = std::getenv("BB_OBJECT_MOTION_ALL");
+        return value && value[0] == '1';
+    }();
+    const u32 guest_flip_epoch = TemporalUpscaler::GuestFlipsSubmittedForMt();
 
     scratch.chunk_copies.clear();
     scratch.ResetConstMemo();
@@ -2107,6 +2528,9 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
                 out_total_bytes = out_off + up_sz;
                 return true;
             }
+            if (cp.dst_va > addr && cp.dst_va < addr + req_size) {
+                return false; // Straddles start of an in-list staged copy region
+            }
         }
 
         const bool in_transient =
@@ -2158,6 +2582,30 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
         return false;
     };
 
+    auto resolve_cpu_index_ptr = [&](VAddr ib_addr, u64 ib_bytes) noexcept -> const void* {
+        if (!ib_addr || ib_bytes == 0ULL) {
+            return nullptr;
+        }
+        for (size_t i = scratch.chunk_copies.size(); i-- > 0;) {
+            const auto& cp = scratch.chunk_copies[i];
+            if (ib_addr >= cp.dst_va && ib_addr < cp.dst_va + cp.byte_size) {
+                const u64 off = ib_addr - cp.dst_va;
+                return (cp.byte_size - off >= ib_bytes)
+                           ? reinterpret_cast<const void*>(cp.src_va + off)
+                           : nullptr;
+            }
+            if (cp.dst_va > ib_addr && cp.dst_va < ib_addr + ib_bytes) {
+                return nullptr;
+            }
+        }
+        if (WasCoarseRangeModifiedRecently(ib_addr, ib_bytes, cur_guest_frame) ||
+            rasterizer.IsRegionGpuModifiedForMt(ib_addr, ib_bytes) ||
+            (mem && mem->ClampRangeSize(ib_addr, ib_bytes) != ib_bytes)) {
+            return nullptr;
+        }
+        return reinterpret_cast<const void*>(ib_addr);
+    };
+
     Gcn::Regs& rregs = *w.replay_regs;
     rregs.SetDefaults();
     w.pso_state.ResetForPass();
@@ -2175,6 +2623,7 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
     bool has_prev_dyn = false;
     u64 prev_dyn_epoch = 0ULL;
     bool prev_dyn_indexed = false;
+    std::array<float, 2> prev_dyn_jitter{0.0f, 0.0f};
 
     VertexInputs<vk::VertexInputBindingDescription2EXT> prev_vb_bindings;
     VertexInputs<vk::VertexInputAttributeDescription2EXT> prev_vb_attrs;
@@ -2186,10 +2635,8 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
     u64 prev_ib_off = ~0ULL;
     bool prev_ib_16 = false;
 
-    auto abort_pass = [&]() noexcept -> bool {
-        AbortWorkerPass(worker_id);
-        return false;
-    };
+    u32 next_plan_idx = 0u;
+    u32 draw_ordinal = 0u;
 
     for (u32 s = 0; s < num_slices; ++s) {
         const u32* cur = slices[s].begin_ptr;
@@ -2199,7 +2646,7 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
                 cur, rem, rregs, replay_cb_extent, replay_db_extent, replay_cb_uid, replay_db_uid,
                 replay_pso_epoch, replay_dyn_epoch, mem, false);
             if (dp.kind == MtPktKind::Invalid || dp.pkt_words == 0u) {
-                return abort_pass();
+                return abort_pass(MtBailReason::Pkt);
             }
 
             if (dp.kind == MtPktKind::CopyBatch) {
@@ -2212,19 +2659,36 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
                         {reg.dst_va, reg.src_va, reg.byte_size, ++local_copy_gen});
                 }
             } else if (dp.kind == MtPktKind::Draw) {
+                if (next_plan_idx < planned_subpasses &&
+                    draw_ordinal == scratch.subpass_plans[next_plan_idx].first_draw_ordinal) {
+                    seal_active_subpass();
+                    if (!open_subpass(next_plan_idx++)) {
+                        return abort_pass(MtBailReason::Other);
+                    }
+                    has_prev_dyn = false;
+                    has_prev_vb_state = false;
+                    prev_vb_bufs.clear();
+                    prev_vb_offs.clear();
+                    prev_ib_buf = vk::Buffer{};
+                    prev_ib_off = ~0ULL;
+                }
+                ++draw_ordinal;
+
+                const auto& cur_plan = scratch.subpass_plans[cur_subpass_idx];
+                const auto& cur_ts = cur_plan.target_summary;
                 const u32 num_instances = rregs.num_instances.NumInstances();
                 if (rregs.num_indices != 0u && num_instances != 0u) {
                     const GraphicsPipeline* pso =
                         rasterizer.GetPipelineCache().SelectGraphicsPipelineMt(
                             rregs, w.pso_state, {}, false, /*allow_compile_fallback=*/false);
                     if (!pso) {
-                        return abort_pass();
+                        return abort_pass(MtBailReason::Pso);
                     }
 
                     const auto* vs_stage = pso->GetStages()[u32(Shader::SwStage::Vertex)];
                     const auto* ps_stage = pso->GetStages()[u32(Shader::SwStage::Fragment)];
                     if (!vs_stage) {
-                        return abort_pass();
+                        return abort_pass(MtBailReason::Pso);
                     }
 
                     // Flatten VS & PS user-data into worker heap scratch (+0 B TLS / stack).
@@ -2279,9 +2743,9 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
                         }
                     }
 
-                    // 3. Scene Occlusion Culler (G-Buffer 6-MRT)
+                    // 3. Scene Occlusion Culler (G-Buffer 6/7-MRT)
                     Rasterizer::MtOcclusionDecision occ_decision{};
-                    if (target_summary.is_gbuffer) {
+                    if (cur_ts.is_gbuffer) {
                         occ_decision = rasterizer.EvaluateGBufferOcclusionMt(
                             rregs, pso, scratch.vs_flat_ud.data(), vs_pgm_base, dp.is_indexed,
                             dp.start_index, vsharps, occ_block_id, resolve_cb_for_occ, &cb_ctx,
@@ -2294,228 +2758,23 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
                         }
                     }
 
-                    // Bind Graphics Pipeline
-                    const vk::Pipeline vk_pso = pso->Handle();
-                    if (w.bound_pipeline != vk_pso) {
-                        w.active_cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, vk_pso);
-                        w.bound_pipeline = vk_pso;
-                    }
-
-                    // Build PushData & Stage Descriptor Writes
-                    Shader::PushData push_data{};
-                    {
-                        const auto& ctl = rregs.viewport_control;
-                        const auto& vp0 = rregs.viewports[0];
-                        push_data.xoffset = ctl.xoffset_enable ? vp0.xoffset : 0.f;
-                        push_data.xscale = ctl.xscale_enable ? vp0.xscale : 1.f;
-                        push_data.yoffset = ctl.yoffset_enable ? vp0.yoffset : 0.f;
-                        push_data.yscale = ctl.yscale_enable ? vp0.yscale : 1.f;
-                        push_data.buf_offsets[39] = fx_mask;
-                    }
-
-                    std::array<vk::DescriptorBufferInfo, 64> buf_infos{};
-                    std::array<vk::DescriptorImageInfo, 64> img_infos{};
-                    std::array<vk::WriteDescriptorSet, 64> desc_writes{};
-                    u32 num_buf_infos = 0;
-                    u32 num_img_infos = 0;
-                    u32 num_desc_writes = 0;
-                    Shader::Backend::Bindings binding{};
-
-                    for (const auto* stage : pso->GetStages()) {
-                        if (!stage) {
-                            continue;
+                    // Compute draw vertex/instance offsets up front (shared by ObjectMotion & Draw)
+                    u32 vertex_offset = rregs.index_offset;
+                    u32 instance_offset = 0u;
+                    if (fetch) {
+                        if (vertex_offset == 0u && fetch->vertex_offset_sgpr != -1 &&
+                            static_cast<u32>(fetch->vertex_offset_sgpr) < 16u) {
+                            vertex_offset =
+                                rregs.vs_program.user_data[fetch->vertex_offset_sgpr];
                         }
-                        const bool is_vs = (stage->sw_stage == Shader::SwStage::Vertex);
-                        const u32* const ud16 = is_vs ? rregs.vs_program.user_data.data()
-                                                      : rregs.ps_program.user_data.data();
-                        const u32* const flat_ud =
-                            is_vs ? scratch.vs_flat_ud.data() : scratch.ps_flat_ud.data();
-                        const VAddr pgm_base = is_vs ? vs_pgm_base : ps_pgm_base;
-
-                        u32 ud_mask = stage->ud_mask.mask;
-                        while (ud_mask != 0u) {
-                            const u32 bit = static_cast<u32>(std::countr_zero(ud_mask));
-                            ud_mask &= (ud_mask - 1u);
-                            push_data.ud_regs[binding.user_data++] = ud16[bit];
-                        }
-
-                        // Buffers (all StorageBuffers per SPIR-V backend)
-                        for (const auto& desc : stage->buffers) {
-                            if (num_buf_infos >= buf_infos.size() ||
-                                num_desc_writes >= desc_writes.size()) {
-                                return abort_pass();
-                            }
-                            vk::DescriptorBufferInfo& bi = buf_infos[num_buf_infos++];
-                            if (desc.IsSpecial()) {
-                                switch (desc.buffer_type) {
-                                case Shader::BufferType::Flatbuf: {
-                                    const u32 fsz =
-                                        stage->srt_info.flattened_bufsize_dw * sizeof(u32);
-                                    const auto alloc = AllocateWorkerConstants(
-                                        worker_id, fsz, storage_align, flat_ud);
-                                    if (!alloc) {
-                                        return abort_pass();
-                                    }
-                                    bi = vk::DescriptorBufferInfo{alloc.buffer, alloc.offset, fsz};
-                                    break;
-                                }
-                                case Shader::BufferType::ClipPlanes: {
-                                    if (rregs.clipper_control.user_clip_plane_enable == 0u) {
-                                        bi = vk::DescriptorBufferInfo{VK_NULL_HANDLE, 0,
-                                                                      VK_WHOLE_SIZE};
-                                    } else {
-                                        std::array<float, Gcn::NUM_CLIP_PLANES * 4> planes{};
-                                        for (u32 p = 0; p < Gcn::NUM_CLIP_PLANES; ++p) {
-                                            const auto& pl = rregs.clip_user_data[p];
-                                            planes[p * 4 + 0] = std::bit_cast<float>(pl.data_x);
-                                            planes[p * 4 + 1] = std::bit_cast<float>(pl.data_y);
-                                            planes[p * 4 + 2] = std::bit_cast<float>(pl.data_z);
-                                            planes[p * 4 + 3] = std::bit_cast<float>(pl.data_w);
-                                        }
-                                        const auto alloc = AllocateWorkerConstants(
-                                            worker_id, sizeof(planes), storage_align,
-                                            planes.data());
-                                        if (!alloc) {
-                                            return abort_pass();
-                                        }
-                                        bi = vk::DescriptorBufferInfo{alloc.buffer, alloc.offset,
-                                                                      sizeof(planes)};
-                                    }
-                                    break;
-                                }
-                                case Shader::BufferType::BdaPagetable: {
-                                    const auto* tbl =
-                                        rasterizer.GetBufferCache().GetBdaPageTableBuffer();
-                                    if (!tbl) {
-                                        return abort_pass();
-                                    }
-                                    bi = vk::DescriptorBufferInfo{tbl->Handle(), 0,
-                                                                  tbl->SizeBytes()};
-                                    break;
-                                }
-                                case Shader::BufferType::FaultBuffer: {
-                                    const auto* flt = rasterizer.GetBufferCache().GetFaultBuffer();
-                                    if (!flt) {
-                                        return abort_pass();
-                                    }
-                                    bi = vk::DescriptorBufferInfo{flt->Handle(), 0,
-                                                                  flt->SizeBytes()};
-                                    break;
-                                }
-                                default:
-                                    return abort_pass();
-                                }
-                            } else {
-                                const Gcn::Buffer vsharp = desc.GetSharpDirect(flat_ud, pgm_base);
-                                const VAddr b_addr = vsharp.base_address;
-                                const u64 b_size = vsharp.GetSize();
-                                if (b_addr == 0 || b_size == 0) {
-                                    bi = vk::DescriptorBufferInfo{VK_NULL_HANDLE, 0, VK_WHOLE_SIZE};
-                                } else {
-                                    if (b_size == 864ULL && target_summary.is_gbuffer &&
-                                        !has_camera_cb) {
-                                        const u8* cam_ptr = nullptr;
-                                        u32 cam_sz = 0;
-                                        if (resolve_cb_for_occ(&cb_ctx, vsharp, cam_ptr, cam_sz) &&
-                                            cam_ptr && cam_sz >= 864u) {
-                                            std::memcpy(camera_cb_floats.data(), cam_ptr, 864u);
-                                            has_camera_cb = true;
-                                        }
-                                    }
-                                    vk::Buffer r_buf{};
-                                    u64 r_off = 0;
-                                    u64 r_tot = 0;
-                                    if (!resolve_gpu_stream_range(b_addr, b_size, 1ULL, r_buf,
-                                                                  r_off, r_tot)) {
-                                        return abort_pass();
-                                    }
-                                    const u64 aligned_off = Common::AlignDown(r_off, storage_align);
-                                    const auto adjust = static_cast<u32>(r_off - aligned_off);
-                                    const u64 avail_range =
-                                        (r_tot > aligned_off) ? (r_tot - aligned_off) : 0ULL;
-                                    const u64 bind_range =
-                                        std::min<u64>(b_size + adjust, avail_range);
-                                    if (bind_range == 0ULL) {
-                                        return abort_pass();
-                                    }
-                                    push_data.AddOffset(binding.buffer, adjust);
-                                    bi = vk::DescriptorBufferInfo{r_buf, aligned_off, bind_range};
-                                }
-                            }
-                            desc_writes[num_desc_writes++] = vk::WriteDescriptorSet{
-                                .dstBinding = binding.unified++,
-                                .dstArrayElement = 0,
-                                .descriptorCount = 1,
-                                .descriptorType = vk::DescriptorType::eStorageBuffer,
-                                .pBufferInfo = &bi,
-                            };
-                            ++binding.buffer;
-                        }
-
-                        // Sampled Images
-                        for (const auto& img : stage->images) {
-                            if (num_img_infos >= img_infos.size() ||
-                                num_desc_writes >= desc_writes.size()) {
-                                return abort_pass();
-                            }
-                            const Gcn::Image tsharp = img.GetSharpDirect(flat_ud);
-                            vk::DescriptorImageInfo& ii = img_infos[num_img_infos++];
-                            if (tsharp.Address() == 0 ||
-                                tsharp.GetDataFmt() == Gcn::DataFormat::FormatInvalid ||
-                                (mem && !mem->IsValidGpuMapping(tsharp.Address(), 0))) {
-                                ii = vk::DescriptorImageInfo{VK_NULL_HANDLE, VK_NULL_HANDLE,
-                                                             vk::ImageLayout::eGeneral};
-                            } else {
-                                const vk::ImageView view = ResolveSrv(worker_id, tsharp, img);
-                                if (!view) {
-                                    return abort_pass();
-                                }
-                                ii = vk::DescriptorImageInfo{
-                                    VK_NULL_HANDLE, view,
-                                    img.is_depth ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
-                                                 : vk::ImageLayout::eShaderReadOnlyOptimal};
-                            }
-                            desc_writes[num_desc_writes++] = vk::WriteDescriptorSet{
-                                .dstBinding = binding.unified++,
-                                .dstArrayElement = 0,
-                                .descriptorCount = 1,
-                                .descriptorType = vk::DescriptorType::eSampledImage,
-                                .pImageInfo = &ii,
-                            };
-                        }
-
-                        // Samplers
-                        for (const auto& smp : stage->samplers) {
-                            if (num_img_infos >= img_infos.size() ||
-                                num_desc_writes >= desc_writes.size()) {
-                                return abort_pass();
-                            }
-                            const Gcn::Sampler ssharp = smp.GetSharpDirect(flat_ud);
-                            const vk::Sampler vk_smp = ResolveSampler(
-                                worker_id, ssharp, smp.is_depth, target_summary.sampler_lod_bias,
-                                rregs.ta_bc_base);
-                            if (!vk_smp) {
-                                return abort_pass();
-                            }
-                            vk::DescriptorImageInfo& ii = img_infos[num_img_infos++];
-                            ii = vk::DescriptorImageInfo{vk_smp, VK_NULL_HANDLE,
-                                                         vk::ImageLayout::eUndefined};
-                            desc_writes[num_desc_writes++] = vk::WriteDescriptorSet{
-                                .dstBinding = binding.unified++,
-                                .dstArrayElement = 0,
-                                .descriptorCount = 1,
-                                .descriptorType = vk::DescriptorType::eSampler,
-                                .pImageInfo = &ii,
-                            };
+                        if (fetch->instance_offset_sgpr != -1 &&
+                            static_cast<u32>(fetch->instance_offset_sgpr) < 16u) {
+                            instance_offset =
+                                rregs.vs_program.user_data[fetch->instance_offset_sgpr];
                         }
                     }
 
-                    PushGraphicsResources(
-                        worker_id, pso->GetLayout(), pso->UsesPushDescriptors(), push_data,
-                        std::span<const vk::WriteDescriptorSet>{desc_writes.data(),
-                                                                num_desc_writes});
-
-                    // Vertex Buffers
+                    // Resolve Vertex Inputs & Ranges before PushData (needed for ObjectMotion hash)
                     VertexInputs<vk::VertexInputAttributeDescription2EXT> vb_attrs;
                     VertexInputs<vk::VertexInputBindingDescription2EXT> vb_bindings;
                     VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT> vb_divisors;
@@ -2580,10 +2839,330 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
                         }
                         if (!resolve_gpu_stream_range(rng.begin, rng.end - rng.begin, min_span,
                                                       rng.handle, rng.offset, rng.total_bytes)) {
-                            return abort_pass();
+                            return abort_pass(MtBailReason::Buf);
                         }
                     }
 
+                    // Resolve Index Buffer if indexed
+                    const bool index16 =
+                        rregs.index_buffer_type.index_type == Gcn::IndexType::Index16;
+                    const u32 idx_sz = index16 ? 2u : 4u;
+                    const VAddr ib_addr =
+                        dp.is_indexed
+                            ? (rregs.index_base_address.Address<VAddr>() +
+                               u64(dp.start_index) * idx_sz)
+                            : VAddr{0};
+                    const u64 ib_bytes = dp.is_indexed ? (u64(rregs.num_indices) * idx_sz) : 0ULL;
+                    vk::Buffer ib_buf{};
+                    u64 ib_off = 0;
+                    if (dp.is_indexed) {
+                        u64 ib_tot = 0;
+                        if (!resolve_gpu_stream_range(ib_addr, ib_bytes, ib_bytes, ib_buf, ib_off,
+                                                      ib_tot)) {
+                            return abort_pass(MtBailReason::Buf);
+                        }
+                    }
+
+                    // Build PushData (target_scale + scene_size + ObjectMotion parameter)
+                    Shader::PushData push_data{};
+                    {
+                        const auto& ctl = rregs.viewport_control;
+                        const auto& vp0 = rregs.viewports[0];
+                        push_data.xoffset =
+                            (ctl.xoffset_enable ? vp0.xoffset : 0.f) * cur_ts.target_scale[0];
+                        push_data.xscale =
+                            (ctl.xscale_enable ? vp0.xscale : 1.f) * cur_ts.target_scale[0];
+                        push_data.yoffset =
+                            (ctl.yoffset_enable ? vp0.yoffset : 0.f) * cur_ts.target_scale[1];
+                        push_data.yscale =
+                            (ctl.yscale_enable ? vp0.yscale : 1.f) * cur_ts.target_scale[1];
+                        push_data.scene_size = cur_ts.scene_size;
+                        push_data.buf_offsets[39] = fx_mask;
+                    }
+
+                    if (pso->GetGraphicsKey().motion_vectors != 0u && !guest_vbs.empty()) {
+                        if (auto* obj_motion = rasterizer.GetObjectMotion();
+                            obj_motion && obj_motion->Enabled()) {
+                            const u64 motion_geometry = XXH3_64bits(
+                                guest_vbs.data(), guest_vbs.size() * sizeof(Gcn::Buffer));
+                            bool gated = !all_motion;
+                            u64 palette = 0ULL;
+                            for (const auto& res : vs_stage->buffers) {
+                                if (res.IsSpecial()) {
+                                    continue;
+                                }
+                                const Gcn::Buffer bsharp =
+                                    res.GetSharpDirect(scratch.vs_flat_ud.data(), vs_pgm_base);
+                                const u32 bsz = bsharp.GetSize();
+                                if (!bsharp.Valid() || bsharp.GetStride() != 16u) {
+                                    continue;
+                                }
+                                const auto role = Motion::ClassifyBuffer(bsz);
+                                if (role == Motion::BufferRole::Skeleton) {
+                                    gated = false;
+                                    break;
+                                }
+                                if (role == Motion::BufferRole::SmallSkeleton) {
+                                    const u8* pal_ptr = nullptr;
+                                    u32 pal_sz = 0u;
+                                    if (resolve_cb_for_occ(&cb_ctx, bsharp, pal_ptr, pal_sz) &&
+                                        pal_ptr && pal_sz >= bsz) {
+                                        palette = XXH3_64bits_withSeed(pal_ptr, bsz, palette);
+                                    }
+                                }
+                            }
+                            const void* idx_cpu_ptr =
+                                dp.is_indexed ? resolve_cpu_index_ptr(ib_addr, ib_bytes) : nullptr;
+                            u32 used_slot = ~0u;
+                            push_data.motion_param = obj_motion->PrepareDrawMt(
+                                guest_flip_epoch, gated,
+                                Motion::History::GateKey{
+                                    .shader = vs_stage->pgm_hash,
+                                    .geometry = motion_geometry,
+                                    .indices = ib_addr,
+                                    .index_count = rregs.num_indices,
+                                    .instances = num_instances,
+                                    .first_instance = instance_offset,
+                                },
+                                palette, dp.is_indexed, ib_addr, rregs.num_indices, idx_sz,
+                                static_cast<s32>(vertex_offset),
+                                (rregs.enable_primitive_restart & 1u) != 0u, num_instances,
+                                instance_offset, idx_cpu_ptr, used_slot);
+                            if (used_slot < 4u) {
+                                cur_motion_slot = static_cast<u8>(used_slot);
+                            }
+                        }
+                    }
+
+                    // Bind Graphics Pipeline
+                    const vk::Pipeline vk_pso = pso->Handle();
+                    if (w.bound_pipeline != vk_pso) {
+                        w.active_cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, vk_pso);
+                        w.bound_pipeline = vk_pso;
+                    }
+
+                    std::array<vk::DescriptorBufferInfo, 64> buf_infos{};
+                    std::array<vk::DescriptorImageInfo, 64> img_infos{};
+                    std::array<vk::WriteDescriptorSet, 64> desc_writes{};
+                    u32 num_buf_infos = 0;
+                    u32 num_img_infos = 0;
+                    u32 num_desc_writes = 0;
+                    Shader::Backend::Bindings binding{};
+
+                    for (const auto* stage : pso->GetStages()) {
+                        if (!stage) {
+                            continue;
+                        }
+                        const bool is_vs = (stage->sw_stage == Shader::SwStage::Vertex);
+                        const u32* const ud16 = is_vs ? rregs.vs_program.user_data.data()
+                                                      : rregs.ps_program.user_data.data();
+                        const u32* const flat_ud =
+                            is_vs ? scratch.vs_flat_ud.data() : scratch.ps_flat_ud.data();
+                        const VAddr pgm_base = is_vs ? vs_pgm_base : ps_pgm_base;
+
+                        u32 ud_mask = stage->ud_mask.mask;
+                        while (ud_mask != 0u) {
+                            const u32 bit = static_cast<u32>(std::countr_zero(ud_mask));
+                            ud_mask &= (ud_mask - 1u);
+                            push_data.ud_regs[binding.user_data++] = ud16[bit];
+                        }
+
+                        // Buffers (all StorageBuffers per SPIR-V backend)
+                        for (const auto& desc : stage->buffers) {
+                            if (num_buf_infos >= buf_infos.size() ||
+                                num_desc_writes >= desc_writes.size()) {
+                                return abort_pass(MtBailReason::Other);
+                            }
+                            vk::DescriptorBufferInfo& bi = buf_infos[num_buf_infos++];
+                            if (desc.IsSpecial()) {
+                                switch (desc.buffer_type) {
+                                case Shader::BufferType::Flatbuf: {
+                                    const u32 fsz =
+                                        stage->srt_info.flattened_bufsize_dw * sizeof(u32);
+                                    const auto alloc = AllocateWorkerConstants(
+                                        worker_id, fsz, storage_align, flat_ud);
+                                    if (!alloc) {
+                                        return abort_pass(MtBailReason::Buf);
+                                    }
+                                    bi = vk::DescriptorBufferInfo{alloc.buffer, alloc.offset, fsz};
+                                    break;
+                                }
+                                case Shader::BufferType::ClipPlanes: {
+                                    if (rregs.clipper_control.user_clip_plane_enable == 0u) {
+                                        bi = vk::DescriptorBufferInfo{VK_NULL_HANDLE, 0,
+                                                                      VK_WHOLE_SIZE};
+                                    } else {
+                                        std::array<float, Gcn::NUM_CLIP_PLANES * 4> planes{};
+                                        for (u32 p = 0; p < Gcn::NUM_CLIP_PLANES; ++p) {
+                                            const auto& pl = rregs.clip_user_data[p];
+                                            planes[p * 4 + 0] = std::bit_cast<float>(pl.data_x);
+                                            planes[p * 4 + 1] = std::bit_cast<float>(pl.data_y);
+                                            planes[p * 4 + 2] = std::bit_cast<float>(pl.data_z);
+                                            planes[p * 4 + 3] = std::bit_cast<float>(pl.data_w);
+                                        }
+                                        const auto alloc = AllocateWorkerConstants(
+                                            worker_id, sizeof(planes), storage_align,
+                                            planes.data());
+                                        if (!alloc) {
+                                            return abort_pass(MtBailReason::Buf);
+                                        }
+                                        bi = vk::DescriptorBufferInfo{alloc.buffer, alloc.offset,
+                                                                      sizeof(planes)};
+                                    }
+                                    break;
+                                }
+                                case Shader::BufferType::BdaPagetable: {
+                                    const auto* tbl =
+                                        rasterizer.GetBufferCache().GetBdaPageTableBuffer();
+                                    if (!tbl) {
+                                        return abort_pass(MtBailReason::Buf);
+                                    }
+                                    bi = vk::DescriptorBufferInfo{tbl->Handle(), 0,
+                                                                  tbl->SizeBytes()};
+                                    break;
+                                }
+                                case Shader::BufferType::FaultBuffer: {
+                                    const auto* flt = rasterizer.GetBufferCache().GetFaultBuffer();
+                                    if (!flt) {
+                                        return abort_pass(MtBailReason::Buf);
+                                    }
+                                    bi = vk::DescriptorBufferInfo{flt->Handle(), 0,
+                                                                  flt->SizeBytes()};
+                                    break;
+                                }
+                                default:
+                                    return abort_pass(MtBailReason::Buf);
+                                }
+                            } else {
+                                const Gcn::Buffer vsharp = desc.GetSharpDirect(flat_ud, pgm_base);
+                                const VAddr b_addr = vsharp.base_address;
+                                const u64 b_size = vsharp.GetSize();
+                                if (b_addr == 0 || b_size == 0) {
+                                    bi = vk::DescriptorBufferInfo{VK_NULL_HANDLE, 0, VK_WHOLE_SIZE};
+                                } else {
+                                    if (b_size == 864ULL && cur_ts.is_gbuffer && !has_camera_cb) {
+                                        const u8* cam_ptr = nullptr;
+                                        u32 cam_sz = 0;
+                                        if (resolve_cb_for_occ(&cb_ctx, vsharp, cam_ptr, cam_sz) &&
+                                            cam_ptr && cam_sz >= 864u) {
+                                            std::memcpy(camera_cb_floats.data(), cam_ptr, 864u);
+                                            has_camera_cb = true;
+                                        }
+                                    }
+                                    vk::Buffer r_buf{};
+                                    u64 r_off = 0;
+                                    u64 r_tot = 0;
+                                    if (!resolve_gpu_stream_range(b_addr, b_size, 1ULL, r_buf,
+                                                                  r_off, r_tot)) {
+                                        return abort_pass(MtBailReason::Buf);
+                                    }
+                                    const u64 aligned_off = Common::AlignDown(r_off, storage_align);
+                                    const auto adjust = static_cast<u32>(r_off - aligned_off);
+                                    const u64 avail_range =
+                                        (r_tot > aligned_off) ? (r_tot - aligned_off) : 0ULL;
+                                    const u64 bind_range =
+                                        std::min<u64>(b_size + adjust, avail_range);
+                                    if (bind_range == 0ULL) {
+                                        return abort_pass(MtBailReason::Buf);
+                                    }
+                                    push_data.AddOffset(binding.buffer, adjust);
+                                    bi = vk::DescriptorBufferInfo{r_buf, aligned_off, bind_range};
+                                }
+                            }
+                            desc_writes[num_desc_writes++] = vk::WriteDescriptorSet{
+                                .dstBinding = binding.unified++,
+                                .dstArrayElement = 0,
+                                .descriptorCount = 1,
+                                .descriptorType = vk::DescriptorType::eStorageBuffer,
+                                .pBufferInfo = &bi,
+                            };
+                            ++binding.buffer;
+                        }
+
+                        // Sampled Images (native static textures + dynamic scene/shadow RT SRVs)
+                        for (const auto& img : stage->images) {
+                            if (num_img_infos >= img_infos.size() ||
+                                num_desc_writes >= desc_writes.size()) {
+                                return abort_pass(MtBailReason::Other);
+                            }
+                            const Gcn::Image tsharp = img.GetSharpDirect(flat_ud);
+                            vk::DescriptorImageInfo& ii = img_infos[num_img_infos++];
+                            if (tsharp.Address() == 0 ||
+                                tsharp.GetDataFmt() == Gcn::DataFormat::FormatInvalid ||
+                                (mem && !mem->IsValidGpuMapping(tsharp.Address(), 0))) {
+                                ii = vk::DescriptorImageInfo{VK_NULL_HANDLE, VK_NULL_HANDLE,
+                                                             vk::ImageLayout::eGeneral};
+                            } else {
+                                const auto srv = ResolveSceneSrv(worker_id, tsharp, img, cur_ts);
+                                if (!srv.view) {
+                                    return abort_pass(MtBailReason::Target);
+                                }
+                                if (srv.needs_stage_b_transit) {
+                                    bool dup = false;
+                                    for (u8 ri = 0; ri < cur_num_sampled_rts; ++ri) {
+                                        const auto& ex = cur_sampled_rts[ri];
+                                        if (ex.id == srv.id && ex.uid == srv.uid &&
+                                            ex.range == srv.range) {
+                                            dup = true;
+                                            break;
+                                        }
+                                    }
+                                    if (!dup) {
+                                        if (cur_num_sampled_rts >=
+                                            MtCompletedPassMeta::kMaxSampledRts) {
+                                            return abort_pass(MtBailReason::Target);
+                                        }
+                                        cur_sampled_rts[cur_num_sampled_rts++] =
+                                            MtCompletedPassMeta::SampledRtRef{
+                                                .id = srv.id,
+                                                .uid = srv.uid,
+                                                .range = srv.range,
+                                            };
+                                    }
+                                }
+                                ii = vk::DescriptorImageInfo{VK_NULL_HANDLE, srv.view, srv.layout};
+                            }
+                            desc_writes[num_desc_writes++] = vk::WriteDescriptorSet{
+                                .dstBinding = binding.unified++,
+                                .dstArrayElement = 0,
+                                .descriptorCount = 1,
+                                .descriptorType = vk::DescriptorType::eSampledImage,
+                                .pImageInfo = &ii,
+                            };
+                        }
+
+                        // Samplers
+                        for (const auto& smp : stage->samplers) {
+                            if (num_img_infos >= img_infos.size() ||
+                                num_desc_writes >= desc_writes.size()) {
+                                return abort_pass(MtBailReason::Other);
+                            }
+                            const Gcn::Sampler ssharp = smp.GetSharpDirect(flat_ud);
+                            const vk::Sampler vk_smp = ResolveSampler(
+                                worker_id, ssharp, smp.is_depth, cur_ts.sampler_lod_bias,
+                                rregs.ta_bc_base);
+                            if (!vk_smp) {
+                                return abort_pass(MtBailReason::Target);
+                            }
+                            vk::DescriptorImageInfo& ii = img_infos[num_img_infos++];
+                            ii = vk::DescriptorImageInfo{vk_smp, VK_NULL_HANDLE,
+                                                         vk::ImageLayout::eUndefined};
+                            desc_writes[num_desc_writes++] = vk::WriteDescriptorSet{
+                                .dstBinding = binding.unified++,
+                                .dstArrayElement = 0,
+                                .descriptorCount = 1,
+                                .descriptorType = vk::DescriptorType::eSampler,
+                                .pImageInfo = &ii,
+                            };
+                        }
+                    }
+
+                    PushGraphicsResources(
+                        worker_id, pso->GetLayout(), pso->UsesPushDescriptors(), push_data,
+                        std::span<const vk::WriteDescriptorSet>{desc_writes.data(),
+                                                                num_desc_writes});
+
+                    // Bind Vertex Buffers
                     const u32 num_vbs = static_cast<u32>(guest_vbs.size());
                     VertexInputs<vk::Buffer> host_vbs;
                     VertexInputs<vk::DeviceSize> host_offs;
@@ -2600,7 +3179,7 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
                                 return gb.base_address >= r.begin && gb.base_address < r.end;
                             });
                             if (it == vb_ranges.end()) {
-                                return abort_pass();
+                                return abort_pass(MtBailReason::Buf);
                             }
                             const u64 h_off = it->offset + (gb.base_address - it->begin);
                             host_vbs.push_back(it->handle);
@@ -2660,21 +3239,8 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
                                                            host_strides.data());
                     }
 
-                    // Index Buffer
+                    // Bind Index Buffer
                     if (dp.is_indexed) {
-                        const bool index16 =
-                            rregs.index_buffer_type.index_type == Gcn::IndexType::Index16;
-                        const u32 idx_sz = index16 ? 2u : 4u;
-                        const VAddr ib_addr = rregs.index_base_address.Address<VAddr>() +
-                                              u64(dp.start_index) * idx_sz;
-                        const u64 ib_bytes = u64(rregs.num_indices) * idx_sz;
-                        vk::Buffer ib_buf{};
-                        u64 ib_off = 0;
-                        u64 ib_tot = 0;
-                        if (!resolve_gpu_stream_range(ib_addr, ib_bytes, ib_bytes, ib_buf, ib_off,
-                                                      ib_tot)) {
-                            return abort_pass();
-                        }
                         if (ib_buf != prev_ib_buf || ib_off != prev_ib_off ||
                             index16 != prev_ib_16) {
                             w.active_cmdbuf.bindIndexBuffer(
@@ -2686,16 +3252,25 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
                         }
                     }
 
-                    // Dynamic State Commit
+                    // Dynamic State Commit (with upscaler target_scale & jitter_eligible check)
+                    const bool jitter_eligible =
+                        cur_ts.is_scene_depth && vs_stage->pgm_hash != 0x000000008747a367ULL &&
+                        (rregs.num_indices > 6u || num_instances > 1u);
+                    const std::array<float, 2> cur_draw_jitter =
+                        jitter_eligible ? cur_ts.frame_jitter : std::array<float, 2>{0.0f, 0.0f};
+
                     if (has_prev_dyn && !w.dyn_state.AnyDirty() &&
-                        prev_dyn_epoch == replay_dyn_epoch && prev_dyn_indexed == dp.is_indexed) {
+                        prev_dyn_epoch == replay_dyn_epoch && prev_dyn_indexed == dp.is_indexed &&
+                        prev_dyn_jitter == cur_draw_jitter) {
                         UpdateWorkerColorBlendingState(w.dyn_state, rregs, pso);
                     } else {
                         UpdateWorkerDynamicStateFull(w.dyn_state, instance, rregs, pso,
-                                                     dp.is_indexed);
+                                                     dp.is_indexed, cur_ts.target_scale,
+                                                     cur_draw_jitter);
                         has_prev_dyn = true;
                         prev_dyn_epoch = replay_dyn_epoch;
                         prev_dyn_indexed = dp.is_indexed;
+                        prev_dyn_jitter = cur_draw_jitter;
                     }
                     if (w.dyn_state.AnyDirty()) {
                         w.dyn_state.CommitWith(
@@ -2703,22 +3278,6 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
                             instance.IsDynamicColorWriteMaskSupported(),
                             instance.IsAttachmentFeedbackLoopLayoutSupported(),
                             [cmd = w.active_cmdbuf](auto&& fn) { fn(cmd); });
-                    }
-
-                    // Draw Offsets & Draw Call
-                    u32 vertex_offset = rregs.index_offset;
-                    u32 instance_offset = 0u;
-                    if (fetch) {
-                        if (vertex_offset == 0u && fetch->vertex_offset_sgpr != -1 &&
-                            static_cast<u32>(fetch->vertex_offset_sgpr) < 16u) {
-                            vertex_offset =
-                                rregs.vs_program.user_data[fetch->vertex_offset_sgpr];
-                        }
-                        if (fetch->instance_offset_sgpr != -1 &&
-                            static_cast<u32>(fetch->instance_offset_sgpr) < 16u) {
-                            instance_offset =
-                                rregs.vs_program.user_data[fetch->instance_offset_sgpr];
-                        }
                     }
 
                     if (occ_decision.query_slot >= 0 && occ_decision.pool) {
@@ -2752,84 +3311,93 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
         }
     }
 
+    seal_active_subpass();
+    if (scratch.sealed_subpasses.size() != planned_subpasses) {
+        return abort_pass(MtBailReason::Other);
+    }
+
     // -------------------------------------------------------------------------
-    // Phase 3: Seal Metadata & Rewrite DCB Slots In-Place (`m_beginptr` intact).
+    // Phase 3: Atomic Commit & Rewrite DCB Slots In-Place (`m_beginptr` intact).
     // -------------------------------------------------------------------------
     if (occ_block_id != 0xFFFFu) {
         rasterizer.SealMtOcclusionQueryBlock(occ_block_id);
         w.active_occ_block_id = 0xFFFFu;
     }
+    w.local_stats.FlushToGlobal(rasterizer);
 
-    const u32 final_draws = w.recorded_draws;
-    u64 cmd_seq = 0ULL;
-    const vk::CommandBuffer sec_cmd = EndWorkerPass(worker_id, &cmd_seq);
-    if (!sec_cmd || cmd_seq == 0ULL) {
-        if (occ_block_id != 0xFFFFu) {
-            rasterizer.AbortMtOcclusionQueryBlock(occ_block_id);
-        }
-        return false;
-    }
-
-    MtCompletedPassMeta& pub_meta = w.completed_meta[cmd_seq & (kCompletedMetaSlots - 1u)];
-    pub_meta.sh_gfx_regs = scratch.scan_pass_meta.sh_gfx_regs;
-    pub_meta.context_regs = scratch.scan_pass_meta.context_regs;
-    pub_meta.uconfig_so_regs = scratch.scan_pass_meta.uconfig_so_regs;
-    pub_meta.uconfig_vgt_regs = scratch.scan_pass_meta.uconfig_vgt_regs;
-    pub_meta.cb_extent = first_cb_extent;
-    pub_meta.db_extent = first_db_extent;
-    pub_meta.cb_uid = first_cb_uid;
-    pub_meta.db_uid = first_db_uid;
-    pub_meta.first_pso = first_pso;
-    pub_meta.sec_cmd = sec_cmd;
-    pub_meta.recorded_draws = final_draws;
-    pub_meta.occ_block_id = occ_block_id;
-    pub_meta.is_gbuffer = target_summary.is_gbuffer;
-    pub_meta.has_camera_cb = has_camera_cb;
-    if (has_camera_cb) {
-        pub_meta.camera_cb_floats = camera_cb_floats;
-    }
-    pub_meta.published_seq.store(cmd_seq, std::memory_order_release);
-
-    // Stage all retained packets + Op::ExecuteSecondaryCmds into `scratch.emit_words` first
-    // so in-place DCB writes never alias source words in `slices[0]`.
-    std::array<u32, 7> exec_pkt{};
-    exec_pkt[0] = (3u << 30u) | ((6u - 1u) << 16u) | (u32(BbCp::Op::Nop) << 8u);
-    exec_pkt[1] = BbCp::NopPayload::DirectVulkan;
-    exec_pkt[2] = u32(BbCp::DirectVk::Op::ExecuteSecondaryCmds);
-    const BbCp::DirectVk::ExecuteSecondaryArgs exec_args{
-        .worker_and_draws = (worker_id & 0xFFu) | (final_draws << 8u),
-        .occ_and_flags = static_cast<u32>(occ_block_id),
-        .cmd_seq = cmd_seq,
-    };
-    std::memcpy(&exec_pkt[3], &exec_args, sizeof(exec_args));
-
-    struct StagedPkt {
-        u32 offset{0};
-        u32 words{0};
-    };
-    std::array<StagedPkt, 130> staged_pkts{};
-    u32 num_staged = 0;
+    scratch.staged_pkts.clear();
     scratch.emit_words.clear();
-
     auto stage_pkt = [&](const u32* words_ptr, u32 cnt) {
         const auto off = static_cast<u32>(scratch.emit_words.size());
         scratch.emit_words.insert(scratch.emit_words.end(), words_ptr, words_ptr + cnt);
-        staged_pkts[num_staged++] = StagedPkt{off, cnt};
+        scratch.staged_pkts.push_back({off, cnt});
     };
-    for (u32 i = 0; i < num_pre_pkts; ++i) {
-        stage_pkt(pre_pkts[i].ptr, pre_pkts[i].words);
-    }
-    stage_pkt(exec_pkt.data(), static_cast<u32>(exec_pkt.size()));
-    for (u32 i = 0; i < num_post_pkts; ++i) {
-        stage_pkt(post_pkts[i].ptr, post_pkts[i].words);
+
+    for (const auto& pk : scratch.pre_pkts) {
+        stage_pkt(pk.ptr, pk.words);
     }
 
+    u64 total_recorded_draws = 0ULL;
+    for (u32 sp_i = 0; sp_i < planned_subpasses; ++sp_i) {
+        const auto& sp = scratch.sealed_subpasses[sp_i];
+        const u64 cmd_seq = ++w.cmd_seq_gen;
+        if (sp.pool_idx < w.pools.size()) {
+            auto& fp = w.pools[sp.pool_idx];
+            fp.last_cmd_seq = cmd_seq;
+            fp.end_ring_pos = sp.end_ring_pos;
+        }
+        const u16 sp_occ_id = (sp_i + 1u == planned_subpasses) ? occ_block_id : 0xFFFFu;
+
+        MtCompletedPassMeta& pub_meta = w.completed_meta[cmd_seq & (kCompletedMetaSlots - 1u)];
+        pub_meta.sh_gfx_regs = sp.sh_gfx_regs;
+        pub_meta.context_regs = sp.context_regs;
+        pub_meta.uconfig_so_regs = sp.uconfig_so_regs;
+        pub_meta.uconfig_vgt_regs = sp.uconfig_vgt_regs;
+        pub_meta.cb_extent = sp.cb_extent;
+        pub_meta.db_extent = sp.db_extent;
+        pub_meta.cb_uid = sp.cb_uid;
+        pub_meta.db_uid = sp.db_uid;
+        pub_meta.first_pso = sp.first_pso;
+        pub_meta.sec_cmd = sp.sec_cmd;
+        pub_meta.recorded_draws = sp.recorded_draws;
+        pub_meta.occ_block_id = sp_occ_id;
+        pub_meta.is_gbuffer = sp.is_gbuffer;
+        pub_meta.has_camera_cb = sp.is_gbuffer && has_camera_cb;
+        pub_meta.num_sampled_rt_refs = sp.num_sampled_rt_refs;
+        pub_meta.motion_slot = sp.motion_slot;
+        if (sp.num_sampled_rt_refs != 0u) {
+            pub_meta.sampled_rt_refs = sp.sampled_rt_refs;
+        }
+        if (pub_meta.has_camera_cb) {
+            pub_meta.camera_cb_floats = camera_cb_floats;
+        }
+        pub_meta.published_seq.store(cmd_seq, std::memory_order_release);
+
+        std::array<u32, 7> exec_pkt{};
+        exec_pkt[0] = (3u << 30u) | ((6u - 1u) << 16u) | (u32(BbCp::Op::Nop) << 8u);
+        exec_pkt[1] = BbCp::NopPayload::DirectVulkan;
+        exec_pkt[2] = u32(BbCp::DirectVk::Op::ExecuteSecondaryCmds);
+        const BbCp::DirectVk::ExecuteSecondaryArgs exec_args{
+            .worker_and_draws = (worker_id & 0xFFu) | (sp.recorded_draws << 8u),
+            .occ_and_flags = static_cast<u32>(sp_occ_id),
+            .cmd_seq = cmd_seq,
+        };
+        std::memcpy(&exec_pkt[3], &exec_args, sizeof(exec_args));
+        stage_pkt(exec_pkt.data(), static_cast<u32>(exec_pkt.size()));
+        total_recorded_draws += sp.recorded_draws;
+    }
+
+    for (const auto& pk : scratch.post_pkts) {
+        stage_pkt(pk.ptr, pk.words);
+    }
+
+    const auto num_staged = static_cast<u32>(scratch.staged_pkts.size());
     u32 pkt_cursor = 0;
     for (u32 s = 0; s < num_slices; ++s) {
         u32 written = 0;
         while (pkt_cursor < num_staged &&
-               written + staged_pkts[pkt_cursor].words <= slices[s].orig_words) {
-            const auto& sp = staged_pkts[pkt_cursor++];
+               written + scratch.staged_pkts[pkt_cursor].words <= slices[s].orig_words) {
+            const auto& sp = scratch.staged_pkts[pkt_cursor++];
             std::memcpy(slices[s].begin_ptr + written, scratch.emit_words.data() + sp.offset,
                         sp.words * sizeof(u32));
             written += sp.words;
@@ -2842,6 +3410,9 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
         *reinterpret_cast<u32**>(slices[s].slot_raw + 0x10) = slices[s].begin_ptr + written;
     }
 
+    g_mt_lists_compiled.fetch_add(1ULL, std::memory_order_relaxed);
+    g_mt_draws_recorded.fetch_add(total_recorded_draws, std::memory_order_relaxed);
+    MtReportTelemetryIfDue(cur_guest_frame);
     return true;
 }
 

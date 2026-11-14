@@ -126,19 +126,53 @@ public:
     struct MtPassTargetSummary {
         u32 num_color_attachments{0};
         std::array<vk::Format, 8> color_formats{};
+        std::array<VideoCore::ImageId, Gcn::NUM_COLOR_BUFFERS> cb_ids{};
+        VideoCore::ImageId db_id{};
         vk::Format depth_format{vk::Format::eUndefined};
         vk::Format stencil_format{vk::Format::eUndefined};
         vk::SampleCountFlagBits rasterization_samples{vk::SampleCountFlagBits::e1};
         float sampler_lod_bias{0.0f};
+        std::array<float, 2> target_scale{1.0f, 1.0f};
+        std::array<float, 2> frame_jitter{0.0f, 0.0f};
+        u32 scene_size{0};
+        bool reduced_scene_active{false};
         bool is_gbuffer{false};
+        bool is_scene_depth{false};
+        bool is_scene_color{false};
+        bool depth_write_or_stencil_write{false};
+        bool has_motion_attachment{false};
+    };
+
+    struct MtResolvedSrv {
+        vk::ImageView view{};
+        vk::ImageLayout layout{vk::ImageLayout::eShaderReadOnlyOptimal};
+        VideoCore::ImageId id{};
+        u64 uid{0};
+        VideoCore::SubresourceRange range{};
+        bool needs_stage_b_transit{false};
     };
 
     using MtResolveCbBytesFn = bool (*)(void* ctx, const Gcn::Buffer& sharp, const u8*& out_ptr,
                                         u32& out_size) noexcept;
 
+    [[nodiscard]] bool InspectMtPassTargets(
+        const Gcn::Regs& regs, const GraphicsPipeline* first_pso,
+        std::span<const Gcn::CbDbExtent, Gcn::NUM_COLOR_BUFFERS> cb_extents,
+        Gcn::CbDbExtent db_extent, MtPassTargetSummary& out) noexcept;
     [[nodiscard]] bool InspectMtPassTargets(const Gcn::Regs& regs,
                                             const GraphicsPipeline* first_pso,
-                                            MtPassTargetSummary& out) const noexcept;
+                                            MtPassTargetSummary& out) noexcept {
+        const std::array<Gcn::CbDbExtent, Gcn::NUM_COLOR_BUFFERS> empty_cb{};
+        return InspectMtPassTargets(regs, first_pso, empty_cb, Gcn::CbDbExtent{}, out);
+    }
+    [[nodiscard]] MtResolvedSrv ResolveSceneSrvViewMt(const Gcn::Image& raw_sharp,
+                                                      const Shader::ImageResource& res,
+                                                      const MtPassTargetSummary& pass_targets,
+                                                      u64* out_hits = nullptr,
+                                                      u64* out_misses = nullptr);
+    [[nodiscard]] ObjectMotion* GetObjectMotion() noexcept {
+        return object_motion.get();
+    }
     void ExecuteSecondaryCmdBuf(u32 worker_id, u64 cmd_seq, u32 recorded_draws, u16 occ_block_id);
     [[nodiscard]] Core::MemoryManager* GetMemoryManager() const noexcept {
         return memory;
@@ -1508,6 +1542,7 @@ private:
     void SubmitForSignalsNow();
     /// steady_clock nanoseconds of the last submission (written by both pipeline stages).
     std::atomic<s64> last_flush_ns{0};
+    mutable std::atomic<VAddr> mt_scene_depth_addr{0};
 };
 
 } // namespace Vulkan

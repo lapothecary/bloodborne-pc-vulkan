@@ -15,6 +15,7 @@
 #include "vulkan/instance.h"
 #include "render/runtime.h"
 #include "render/scheduler.h"
+#include "upscale/vk_scene_resolution.h"
 
 namespace VideoCore {
 
@@ -804,6 +805,238 @@ vk::ImageView TextureCache::TryResolveDirectImmutableViewMt(const Gcn::Image& cl
         return {};
     }
     return img.TryFindExistingViewMt(desc.view_info);
+}
+
+ImageId TextureCache::TryFindExistingImageLocked(ImageDesc& desc) const {
+    const ImageInfo& info = desc.info;
+    if (info.guest_address == 0 || info.guest_size == 0) {
+        return {};
+    }
+    const auto depth_compatible_no_recreate = [&](const ImageInfo& cached) noexcept -> bool {
+        if (!cached.props.is_depth && !info.props.is_depth) {
+            return true;
+        }
+        if (cached.resources < info.resources) {
+            return false;
+        }
+        switch (desc.type) {
+        case BindingType::Texture:
+            return !(info.props.is_depth && !cached.props.is_depth);
+        case BindingType::Storage:
+            return !cached.props.is_depth;
+        case BindingType::RenderTarget:
+            return !cached.props.is_depth && !info.props.is_depth;
+        case BindingType::DepthTarget:
+            return cached.props.is_depth && info.props.has_stencil == cached.props.has_stencil &&
+                   info.num_bits == cached.num_bits;
+        default:
+            return false;
+        }
+    };
+
+    ImageIds overlapping;
+    const_cast<TextureCache*>(this)->ForEachImageInRegion(
+        info.guest_address, info.guest_size, [&](ImageId id, Image&) { overlapping.push_back(id); });
+    if (overlapping.empty()) {
+        return {};
+    }
+
+    ImageId image_id{};
+    for (const ImageId id : overlapping) {
+        const ImageInfo& cached = slot_images[id].info;
+        if (cached.guest_address == info.guest_address && cached.guest_size == info.guest_size &&
+            cached.size == info.size && depth_compatible_no_recreate(cached) &&
+            IsVulkanFormatCompatible(cached.pixel_format, info.pixel_format) &&
+            (cached.type == info.type || info.size == Extent3D{1, 1, 1})) {
+            image_id = id;
+        }
+    }
+
+    int view_mip = -1;
+    int view_slice = -1;
+    if (!image_id) {
+        const u64 cur_tick = CurrentTick();
+        for (const ImageId id : overlapping) {
+            const Image& cand = slot_images[id];
+            const ImageInfo& old = cand.info;
+            const bool stale = cur_tick - cand.tick_accessed_last > TicksBeforeRemoval;
+            const ImageInfo& merged = image_id ? slot_images[image_id].info : info;
+
+            if (merged.guest_address == old.guest_address) {
+                if (merged.BlockDim() != old.BlockDim() ||
+                    merged.num_bits * merged.num_samples != old.num_bits * old.num_samples) {
+                    if (!stale) {
+                        return {};
+                    }
+                    continue;
+                }
+                if (!depth_compatible_no_recreate(old)) {
+                    return {};
+                }
+                if ((merged.props.is_block && !old.props.is_block) ||
+                    (merged.guest_size == old.guest_size &&
+                     (merged.type == Gcn::ImageType::Color3D ||
+                      old.type == Gcn::ImageType::Color3D) &&
+                     merged.type != old.type)) {
+                    return {};
+                }
+                const bool only_pow2_padding =
+                    merged.props.is_pow2 != old.props.is_pow2 &&
+                    merged.tile_mode == old.tile_mode && merged.size == old.size &&
+                    merged.pitch == old.pitch && merged.resources.levels == 1 &&
+                    old.resources.levels == 1 && merged.resources.layers == 1 &&
+                    old.resources.layers == 1;
+                if (merged.pixel_format != old.pixel_format || merged.guest_size <= old.guest_size ||
+                    only_pow2_padding) {
+                    const ImageId res_id = image_id ? image_id : id;
+                    if (!IsVulkanFormatCompatible(slot_images[res_id].info.pixel_format,
+                                                  merged.pixel_format)) {
+                        return {};
+                    }
+                    image_id = res_id;
+                    view_mip = -1;
+                    view_slice = -1;
+                    continue;
+                }
+                return {};
+            }
+
+            if (merged.guest_address > old.guest_address) {
+                if (const s32 mip = merged.MipOf(old); mip >= 0) {
+                    if (const s32 slice = merged.SliceOf(old, mip); slice >= 0) {
+                        if (!depth_compatible_no_recreate(old) ||
+                            !IsVulkanFormatCompatible(old.pixel_format, merged.pixel_format)) {
+                            return {};
+                        }
+                        image_id = id;
+                        view_mip = mip;
+                        view_slice = slice;
+                        continue;
+                    }
+                }
+                if (!stale) {
+                    return {};
+                }
+                continue;
+            }
+
+            if (!stale) {
+                return {};
+            }
+        }
+    }
+
+    if (!image_id || slot_images[image_id].info.resources < info.resources) {
+        return {};
+    }
+    if (view_mip > 0) {
+        desc.view_info.range.base.level = view_mip;
+    }
+    if (view_slice > 0) {
+        desc.view_info.range.base.layer = view_slice;
+    }
+    return image_id;
+}
+
+bool TextureCache::TryInspectTargetMt(ImageDesc& desc, ImageId& out_id, ImageInfo& out_info,
+                                      u32& out_backing_samples, vk::Format& out_backing_fmt,
+                                      vk::ImageAspectFlags& out_aspect_mask,
+                                      bool& out_has_scene_proxy) {
+    out_id = {};
+    if (desc.info.guest_address == 0 || desc.info.guest_size == 0) {
+        return false;
+    }
+    std::scoped_lock lock{mutex};
+    const ImageId id = TryFindExistingImageLocked(desc);
+    if (!id || !slot_images.is_allocated(id)) {
+        return false;
+    }
+    const Image& img = slot_images[id];
+    if (!True(img.flags & ImageFlagBits::Registered) || True(img.flags & ImageFlagBits::Dirty) ||
+        img.binding.needs_rebind || !img.backing) {
+        return false;
+    }
+    if (!img.TryFindExistingViewMt(desc.view_info)) {
+        return false;
+    }
+    out_id = id;
+    out_info = img.info;
+    out_backing_samples = img.backing->num_samples;
+    out_backing_fmt = img.backing->image.image_ci.format;
+    out_aspect_mask = img.aspect_mask;
+    out_has_scene_proxy = img.scene_proxy;
+    return true;
+}
+
+bool TextureCache::TryResolveSceneSrvViewMt(
+    const Gcn::Image& clean_sharp, const Shader::ImageResource& res, bool reduced_scene_active,
+    const Vulkan::SceneTargets* scene_targets, ImageId& out_id, u64& out_uid,
+    vk::ImageView& out_view, vk::ImageLayout& out_layout, SubresourceRange& out_range,
+    bool& out_needs_stage_b_transit) {
+    out_id = {};
+    out_uid = 0;
+    out_view = vk::ImageView{};
+    out_layout = vk::ImageLayout::eUndefined;
+    out_needs_stage_b_transit = false;
+
+    if (!clean_sharp.Valid() || clean_sharp.Address() == 0 || clean_sharp.IsMsaa() ||
+        res.is_written || res.mip_fallback_mode != Shader::MipStorageFallbackMode::None) {
+        return false;
+    }
+    const auto valid_swizzle = [](u64 sel) noexcept {
+        return sel <= u64(Gcn::CompSwizzle::Alpha) && sel != 2 && sel != 3;
+    };
+    if (!valid_swizzle(clean_sharp.dst_sel_x) || !valid_swizzle(clean_sharp.dst_sel_y) ||
+        !valid_swizzle(clean_sharp.dst_sel_z) || !valid_swizzle(clean_sharp.dst_sel_w)) {
+        return false;
+    }
+    if (Vulkan::GcnToVk::TrySurfaceFormat(clean_sharp.GetDataFmt(), clean_sharp.GetNumberFmt()) ==
+        vk::Format::eUndefined) {
+        return false;
+    }
+
+    ImageDesc desc{clean_sharp, res};
+    if (desc.info.guest_address == 0 || desc.info.guest_size == 0) {
+        return false;
+    }
+
+    std::scoped_lock lock{mutex};
+    const ImageId id = TryFindExistingImageLocked(desc);
+    if (!id || !slot_images.is_allocated(id)) {
+        return false;
+    }
+    const Image& img = slot_images[id];
+    if (!True(img.flags & ImageFlagBits::Registered) || True(img.flags & ImageFlagBits::Dirty) ||
+        True(img.flags & ImageFlagBits::SharedHotPage) || img.prompt_icon || img.prompt_atlas ||
+        img.MaybePromptIcon() || img.binding.needs_rebind || img.binding.force_general ||
+        !img.backing) {
+        return false;
+    }
+    if (reduced_scene_active && scene_targets &&
+        (img.scene_proxy ||
+         scene_targets->EligibleInfoMt(img.info, img.backing->num_samples,
+                                       img.backing->image.image_ci.format, img.aspect_mask))) {
+        return false;
+    }
+    const vk::ImageView view = img.TryFindExistingViewMt(desc.view_info);
+    if (!view) {
+        return false;
+    }
+
+    const bool already_settled_ro =
+        !img.info.props.is_depth && !img.scene_proxy && !img.binding.is_target &&
+        !True(img.flags & ImageFlagBits::GpuModified) && img.backing->subresource_states.empty() &&
+        img.backing->state.layout == vk::ImageLayout::eShaderReadOnlyOptimal &&
+        img.backing->state.access_mask == vk::AccessFlagBits2::eShaderRead;
+
+    out_id = id;
+    out_uid = img.image_uid;
+    out_view = view;
+    out_layout = img.info.props.is_depth ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
+                                         : vk::ImageLayout::eShaderReadOnlyOptimal;
+    out_range = desc.view_info.range;
+    out_needs_stage_b_transit = !already_settled_ro;
+    return true;
 }
 
 void TextureCache::MarkDirectImmutableAsset(ImageId image_id) {

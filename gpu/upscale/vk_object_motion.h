@@ -8,6 +8,7 @@
 #pragma once
 
 #include <array>
+#include <mutex>
 #include "upscale/motion_history.h"
 
 #include "common/types.h"
@@ -31,14 +32,23 @@ public:
 
     using DrawInfo = Motion::Draw;
     u32 PrepareDraw(const DrawInfo& draw);
+    /// Phase 4.2b: Thread-safe G-Buffer object-motion parameter allocation for `GXWorker:1..5`.
+    u32 PrepareDrawMt(u32 guest_flip_epoch, bool gated, const Motion::History::GateKey& gate_key,
+                      u64 palette, bool is_indexed, VAddr index_address, u32 index_count,
+                      u32 index_size, s32 base_vertex, bool prim_restart, u32 num_instances,
+                      u32 first_instance, const void* index_cpu_ptr, u32& out_slot) noexcept;
+    void NoteSlotSubmittedOnStageB(u32 slot) noexcept;
+
     /// Small skeletons: whether the bone palette changed (Motion::History::Moving).
     bool Moving(const Motion::History::GateKey& key, u64 palette) {
+        std::scoped_lock lk{mt_mutex};
         return history.Moving(key, palette);
     }
     /// Index range and topology hash of an indexed draw, reused across frames.
     template <class Scan>
     Motion::IndexRangeCache::Result IndexRange(const Motion::IndexRangeCache::Key& key,
                                                Scan&& scan) {
+        std::scoped_lock lk{mt_mutex};
         return index_ranges.Get(key, frame, scan);
     }
 
@@ -47,7 +57,11 @@ public:
 
     /// Start of a frame (display pass).
     void OnFrameStart();
-    void InvalidateHistory() { history.NextFrame(); history.NextFrame(); }
+    void InvalidateHistory() {
+        std::scoped_lock lk{mt_mutex};
+        history.NextFrame();
+        history.NextFrame();
+    }
 
     /// The motion image for the compose pass (layout General after this call) and whether it
     /// holds this frame's vectors at `width` x `height`.
@@ -87,6 +101,7 @@ private:
     /// The image of this size, created when missing (replacing the one used longest ago; it is
     /// destroyed once the GPU is done with it, without waiting).
     Target& GetTarget(u32 width, u32 height);
+    void AdvanceCpuHistoryToFlipLocked(u32 flip_epoch);
 
     const Instance& instance;
     Scheduler& scheduler;
@@ -98,9 +113,12 @@ private:
     static constexpr u32 ParamsPerFrame = 8192;
     // Positions (device local): two halves (current/previous frame) of vec4; element 0 is reserved.
     static constexpr u32 PositionsPerFrame = 4u << 20;
+    mutable std::mutex mt_mutex;
     Motion::History history{PositionsPerFrame};
     Motion::IndexRangeCache index_ranges;
     std::array<u64, FrameSlots> params_ticks{};
+    std::array<u32, FrameSlots> slot_params_used{};
+    u32 cpu_flip_epoch{~0u};
     vk::Buffer params_buffer{};
     VmaAllocation params_allocation{};
     u32* params_mapped{};
@@ -108,7 +126,6 @@ private:
     VmaAllocation positions_allocation{};
 
     u64 frame = 0;
-    u32 params_used = 0;
     std::array<Target, MaxTargets> targets;
     const Target* read_target = nullptr; ///< of the last PrepareRead
 };

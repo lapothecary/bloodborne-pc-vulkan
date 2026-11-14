@@ -881,11 +881,10 @@ Rasterizer::MtOcclusionDecision Rasterizer::EvaluateGBufferOcclusionMt(
     }
     auto& culler = *scene_occlusion_culler;
     if (!culler.enabled || !culler.mt_pool || !is_indexed ||
-        pipeline->GetGraphicsKey().mrt_mask != 0x3fu || regs.blend_control[0].enable ||
+        (pipeline->GetGraphicsKey().mrt_mask & 0x3fu) != 0x3fu || regs.blend_control[0].enable ||
         !regs.depth_control.depth_enable || !regs.depth_control.depth_write_enable ||
         regs.depth_render_control.depth_clear_enable ||
-        regs.depth_render_control.stencil_clear_enable || regs.num_indices < 36u ||
-        (occlusion && occlusion->Events() != 0u)) {
+        regs.depth_render_control.stencil_clear_enable || regs.num_indices < 36u) {
         return decision;
     }
 
@@ -1134,6 +1133,29 @@ void Rasterizer::ExecuteSecondaryCmdBuf(u32 worker_id, u64 cmd_seq, u32 recorded
     } reg_scope{*this, *meta};
 
     const GraphicsPipeline* pipeline = meta->first_pso;
+    for (u32 i = 0; i < meta->num_sampled_rt_refs; ++i) {
+        const auto& ref = meta->sampled_rt_refs[i];
+        if (auto* img = texture_cache.TryGetImage(ref.id, ref.uid);
+            img && img->backing && !img->binding.needs_rebind) {
+            img->tick_accessed_last = scheduler.CurrentTick();
+            constexpr auto ShaderStages =
+                vk::PipelineStageFlagBits2::eAllGraphics | vk::PipelineStageFlagBits2::eComputeShader;
+            const auto read_access =
+                img->info.props.is_depth
+                    ? (vk::AccessFlagBits2::eDepthStencilAttachmentRead |
+                       vk::AccessFlagBits2::eShaderRead)
+                    : vk::AccessFlagBits2::eShaderRead;
+            const auto layout = img->info.props.is_depth
+                                    ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
+                                    : vk::ImageLayout::eShaderReadOnlyOptimal;
+            needs_barrier |= runtime.Transit(img, layout, ShaderStages, read_access, ref.range);
+        }
+    }
+    if (needs_barrier) {
+        runtime.FlushBarriers();
+        needs_barrier = false;
+    }
+
     PrepareRenderState(pipeline);
     NoteUpscalerDraw(pipeline);
     if (gbuffer_draw && meta->has_camera_cb && camera_motion && !camera_motion->PassHasCamera()) {
@@ -1161,7 +1183,7 @@ void Rasterizer::ExecuteSecondaryCmdBuf(u32 worker_id, u64 cmd_seq, u32 recorded
     if (occlusion) {
         occlusion->SetPassScale(target_scale[0] * target_scale[1]);
     }
-    if (will_begin_pass) {
+    if (will_begin_pass || !scheduler.IsRendering()) {
         scheduler.BeginRendering(state, 0);
         if (begin_memo.valid) {
             begin_memo.cmd_epoch = scheduler.DescriptorStateEpoch();
@@ -1173,6 +1195,9 @@ void Rasterizer::ExecuteSecondaryCmdBuf(u32 worker_id, u64 cmd_seq, u32 recorded
 
     const vk::CommandBuffer sec_cmd = meta->sec_cmd;
     mt_direct_recorder->ExecuteSecondaryBuffers({&sec_cmd, 1}, worker_id, cmd_seq, occ_block_id);
+    if (meta->motion_slot < 4u && object_motion) {
+        object_motion->NoteSlotSubmittedOnStageB(meta->motion_slot);
+    }
     meta->MarkConsumed(cmd_seq);
 
     BB_SECTION(Kick);

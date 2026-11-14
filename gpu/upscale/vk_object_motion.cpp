@@ -6,9 +6,11 @@
 #include <cstring>
 
 #include <vk_mem_alloc.h>
+#include <xxhash.h>
 #include "bbport_settings.h"
 #include "bbport_toggles.h"
 #include "shader/runtime_info.h"
+#include "upscale/vk_temporal_upscaler.h"
 #include "vulkan/instance.h"
 #include "render/scheduler.h"
 
@@ -91,8 +93,8 @@ ObjectMotion::~ObjectMotion() {
     }
 }
 
-void ObjectMotion::OnFrameStart() {
-    if (!enabled) {
+void ObjectMotion::AdvanceCpuHistoryToFlipLocked(u32 flip_epoch) {
+    if (cpu_flip_epoch == flip_epoch) {
         return;
     }
     if (BbStats::enabled && (frame % 600) == 0 && history.stats.draws) {
@@ -115,13 +117,29 @@ void ObjectMotion::OnFrameStart() {
     if (frame % Motion::IndexRangeCache::Unused == 0) {
         index_ranges.Trim(frame);
     }
-    const u32 slot = u32(frame % FrameSlots);
-    // Do not overwrite host parameters still referenced by queued GPU work.
-    if (params_ticks[slot]) {
-        scheduler.Wait(params_ticks[slot]);
-        params_ticks[slot] = 0;
+    const u32 slot = u32(flip_epoch % FrameSlots);
+    slot_params_used[slot] = 0;
+    cpu_flip_epoch = flip_epoch;
+}
+
+void ObjectMotion::OnFrameStart() {
+    if (!enabled) {
+        return;
     }
-    params_used = 0;
+    const u32 next_stage_b_flip = TemporalUpscaler::StageBFlipsRetiredForMt() + 1u;
+    const u32 slot = u32(next_stage_b_flip % FrameSlots);
+    u64 wait_tick = 0;
+    {
+        std::scoped_lock lk{mt_mutex};
+        if (cpu_flip_epoch == ~0u || static_cast<s32>(next_stage_b_flip - cpu_flip_epoch) > 0) {
+            wait_tick = params_ticks[slot];
+            params_ticks[slot] = 0;
+            AdvanceCpuHistoryToFlipLocked(next_stage_b_flip);
+        }
+    }
+    if (wait_tick) {
+        scheduler.Wait(wait_tick);
+    }
     for (auto& target : targets) {
         target.written = false;
     }
@@ -140,7 +158,18 @@ void ObjectMotion::OnFrameStart() {
 }
 
 u32 ObjectMotion::PrepareDraw(const DrawInfo& draw) {
-    if (!enabled || BbToggle::Disabled(1u << 29) || params_used >= ParamsPerFrame) {
+    if (!enabled || BbToggle::Disabled(1u << 29)) {
+        return 0;
+    }
+    const u32 cur_stage_b_flip = TemporalUpscaler::StageBFlipsRetiredForMt();
+    std::scoped_lock lk{mt_mutex};
+    if (cpu_flip_epoch == ~0u) {
+        AdvanceCpuHistoryToFlipLocked(cur_stage_b_flip);
+    } else if (cur_stage_b_flip != cpu_flip_epoch) {
+        return 0;
+    }
+    const u32 slot = u32(cpu_flip_epoch % FrameSlots);
+    if (slot_params_used[slot] >= ParamsPerFrame) {
         return 0;
     }
     const auto allocation = history.Prepare(draw);
@@ -149,8 +178,7 @@ u32 ObjectMotion::PrepareDraw(const DrawInfo& draw) {
     if (!flags) {
         return 0;
     }
-    const u32 slot = u32(frame % FrameSlots);
-    const u32 index = 1 + slot * ParamsPerFrame + params_used++;
+    const u32 index = 1 + slot * ParamsPerFrame + slot_params_used[slot]++;
     u32* param = params_mapped + index * 8;
     param[0] = allocation.store;
     param[1] = allocation.load;
@@ -162,6 +190,98 @@ u32 ObjectMotion::PrepareDraw(const DrawInfo& draw) {
     param[7] = 0;
     params_ticks[slot] = scheduler.CurrentTick();
     return index;
+}
+
+u32 ObjectMotion::PrepareDrawMt(u32 guest_flip_epoch, bool gated,
+                                const Motion::History::GateKey& gate_key, u64 palette,
+                                bool is_indexed, VAddr index_address, u32 index_count,
+                                u32 index_size, s32 base_vertex, bool prim_restart,
+                                u32 num_instances, u32 first_instance, const void* index_cpu_ptr,
+                                u32& out_slot) noexcept {
+    out_slot = ~0u;
+    if (!enabled || BbToggle::Disabled(1u << 29) || index_count == 0u || num_instances == 0u) {
+        return 0;
+    }
+    std::scoped_lock lk{mt_mutex};
+    if (cpu_flip_epoch == ~0u || static_cast<s32>(guest_flip_epoch - cpu_flip_epoch) > 0) {
+        AdvanceCpuHistoryToFlipLocked(guest_flip_epoch);
+    } else if (guest_flip_epoch != cpu_flip_epoch) {
+        return 0;
+    }
+    const u32 slot = u32(cpu_flip_epoch % FrameSlots);
+    if (params_ticks[slot] != 0) {
+        if (scheduler.IsFree(params_ticks[slot])) {
+            params_ticks[slot] = 0;
+        } else {
+            return 0;
+        }
+    }
+    if (slot_params_used[slot] >= ParamsPerFrame) {
+        return 0;
+    }
+    if (gated && !history.Moving(gate_key, palette)) {
+        return 0;
+    }
+
+    Motion::VertexRange range{static_cast<u32>(base_vertex), index_count};
+    u64 topology = 0;
+    if (is_indexed) {
+        if (!index_cpu_ptr || index_address == 0) {
+            return 0;
+        }
+        const u64 bytes = u64(index_count) * index_size;
+        const auto scanned = index_ranges.Get(
+            {index_address, index_count, index_size, base_vertex, prim_restart}, frame, [&] {
+                const auto scan_range =
+                    index_size == 2u
+                        ? Motion::IndexedRange(
+                              std::span(static_cast<const u16*>(index_cpu_ptr), index_count),
+                              base_vertex, prim_restart)
+                        : Motion::IndexedRange(
+                              std::span(static_cast<const u32*>(index_cpu_ptr), index_count),
+                              base_vertex, prim_restart);
+                return Motion::IndexRangeCache::Result{scan_range,
+                                                       XXH3_64bits(index_cpu_ptr, bytes)};
+            });
+        range = scanned.range;
+        topology = scanned.topology;
+    }
+
+    const auto allocation = history.Prepare({
+        .shader = gate_key.shader,
+        .geometry = gate_key.geometry,
+        .indices = index_address,
+        .topology = topology,
+        .index_count = index_count,
+        .instances = num_instances,
+        .first_instance = first_instance,
+        .vertices = range,
+    });
+    const u32 flags = (allocation.store ? Shader::MotionVectors::FlagStore : 0) |
+                      (allocation.load ? Shader::MotionVectors::FlagLoad : 0);
+    if (!flags) {
+        return 0;
+    }
+    const u32 index = 1 + slot * ParamsPerFrame + slot_params_used[slot]++;
+    u32* param = params_mapped + index * 8;
+    param[0] = allocation.store;
+    param[1] = allocation.load;
+    param[2] = allocation.vertices;
+    param[3] = flags;
+    param[4] = allocation.first_vertex;
+    param[5] = allocation.first_instance;
+    param[6] = allocation.instances;
+    param[7] = 0;
+    out_slot = slot;
+    return index;
+}
+
+void ObjectMotion::NoteSlotSubmittedOnStageB(u32 slot) noexcept {
+    if (!enabled || slot >= FrameSlots) {
+        return;
+    }
+    std::scoped_lock lk{mt_mutex};
+    params_ticks[slot] = scheduler.CurrentTick();
 }
 
 ObjectMotion::Target& ObjectMotion::GetTarget(u32 width, u32 height) {

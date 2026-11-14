@@ -47,6 +47,7 @@ namespace Vulkan {
 class Instance;
 class Scheduler;
 class Runtime;
+class SceneTargets;
 } // namespace Vulkan
 
 namespace VideoCore {
@@ -132,6 +133,19 @@ public:
     /// `VkImageView` in `eShaderReadOnlyOptimal` layout under `TextureCache::mutex`.
     [[nodiscard]] vk::ImageView TryResolveDirectImmutableViewMt(
         const Gcn::Image& clean_sharp, const Shader::ImageResource& res);
+    /// Phase 4.2b/4.3: Read-only thread-safe inspection of an existing render/depth target image
+    /// and view on `GXWorker:1..5` without mutating cache state.
+    [[nodiscard]] bool TryInspectTargetMt(ImageDesc& desc, ImageId& out_id, ImageInfo& out_info,
+                                          u32& out_backing_samples, vk::Format& out_backing_fmt,
+                                          vk::ImageAspectFlags& out_aspect_mask,
+                                          bool& out_has_scene_proxy);
+    /// Phase 4.2b/4.3: Read-only thread-safe resolution of any clean existing SRV (including
+    /// dynamic shadow/depth/HDR scene RTs and non-tagged textures) on `GXWorker:1..5`.
+    [[nodiscard]] bool TryResolveSceneSrvViewMt(
+        const Gcn::Image& clean_sharp, const Shader::ImageResource& res, bool reduced_scene_active,
+        const Vulkan::SceneTargets* scene_targets, ImageId& out_id, u64& out_uid,
+        vk::ImageView& out_view, vk::ImageLayout& out_layout, SubresourceRange& out_range,
+        bool& out_needs_stage_b_transit);
 
     Image* TryGetImage(ImageId id, u64 uid) {
         if (!slot_images.is_allocated(id)) {
@@ -391,6 +405,7 @@ private:
     u64 CurrentTick() const;
 
     // Lookup (texture_cache.cpp).
+    ImageId TryFindExistingImageLocked(ImageDesc& desc) const;
     ImageId InsertImage(const ImageInfo& info);
     std::tuple<ImageId, int, int> ResolveOverlap(const ImageInfo& info, BindingType binding,
                                                  ImageId cache_id, ImageId merged_id);

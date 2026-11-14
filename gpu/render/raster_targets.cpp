@@ -426,6 +426,7 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
     // main camera (shadow passes bind the same layout with the light's camera).
     gbuffer_draw = camera_motion->Enabled() && std::popcount(key.mrt_mask) >= 5 && db_desc.first;
     if (gbuffer_draw) {
+        mt_scene_depth_addr.store(regs.depth_buffer.DepthAddress(), std::memory_order_relaxed);
         const auto& vp = regs.viewports[0];
         camera_motion->OnGBufferPass(db_desc.first, vp.xscale < 0.0f ? -1.0f : 1.0f,
                                      vp.yscale < 0.0f ? -1.0f : 1.0f);
@@ -514,17 +515,14 @@ Rasterizer::BeginSignature Rasterizer::MakeBeginSignature(const GraphicsPipeline
     return sig;
 }
 
-bool Rasterizer::InspectMtPassTargets(const Gcn::Regs& regs, const GraphicsPipeline* first_pso,
-                                      MtPassTargetSummary& out) const noexcept {
+bool Rasterizer::InspectMtPassTargets(
+    const Gcn::Regs& regs, const GraphicsPipeline* first_pso,
+    std::span<const Gcn::CbDbExtent, Gcn::NUM_COLOR_BUFFERS> cb_extents, Gcn::CbDbExtent db_extent,
+    MtPassTargetSummary& out) noexcept {
     out = {};
     if (!first_pso || host_markers_enabled || guest_markers_enabled || FrameCapture::Active() ||
-        Breadcrumbs::Enabled() || DynCheck::Enabled()) {
-        return false;
-    }
-    if ((upscaler && (upscaler->Enabled() || upscaler->RasterScaling())) ||
-        (scene_targets && scene_targets->Reduced()) ||
-        (camera_motion && camera_motion->DebugOverlay()) ||
-        (occlusion && occlusion->Events() != 0u)) {
+        Breadcrumbs::Enabled() || DynCheck::Enabled() ||
+        (camera_motion && camera_motion->DebugOverlay())) {
         return false;
     }
     if (DrawPassOf(regs).pass != DrawPass::Draw || regs.color_control.degamma_enable ||
@@ -534,9 +532,19 @@ bool Rasterizer::InspectMtPassTargets(const Gcn::Regs& regs, const GraphicsPipel
     }
 
     const auto& key = first_pso->GetGraphicsKey();
-    if (key.motion_vectors != 0u || key.num_color_attachments > Gcn::NUM_COLOR_BUFFERS) {
+    if (key.num_color_attachments > Gcn::NUM_COLOR_BUFFERS) {
         return false;
     }
+    const bool has_motion_mv =
+        key.motion_vectors != 0u && ((upscaler && upscaler->Enabled()) ||
+                                     (camera_motion && camera_motion->DebugOverlay()));
+    if (key.motion_vectors != 0u && !has_motion_mv) {
+        return false;
+    }
+    const u32 guest_mrt_mask =
+        key.motion_vectors != 0u ? (key.mrt_mask & ~(1u << Shader::MotionVectors::Output))
+                                 : key.mrt_mask;
+    const u32 num_guest_cb = std::bit_width(guest_mrt_mask);
 
     // Ensure `PrepareRenderState`'s `want_depth` agrees with `GraphicsPipelineKey`'s depth/stencil
     // formats so `VkCommandBufferInheritanceRenderingInfo` and `VkRenderingInfo` match 100%.
@@ -552,10 +560,16 @@ bool Rasterizer::InspectMtPassTargets(const Gcn::Regs& regs, const GraphicsPipel
         return false;
     }
 
+    // Keep Scaleform stencil-only masks (`mrt_mask == 0 && WritesStencil()`) on Stage A/B so
+    // `TemporalUpscaler::RedirectDepth` and `VfxUiBatcher` stay single-threaded.
+    if (guest_mrt_mask == 0u && (!want_depth || regs.WritesStencil())) {
+        return false;
+    }
+
     const bool color_disabled =
         regs.color_control.mode == Gcn::ColorControl::OperationMode::Disable;
-    for (u32 cb = 0; cb < key.num_color_attachments; ++cb) {
-        if ((key.mrt_mask & (1u << cb)) == 0u) {
+    for (u32 cb = 0; cb < num_guest_cb; ++cb) {
+        if ((guest_mrt_mask & (1u << cb)) == 0u) {
             continue;
         }
         if (color_disabled || !regs.color_buffers[cb] ||
@@ -585,6 +599,101 @@ bool Rasterizer::InspectMtPassTargets(const Gcn::Regs& regs, const GraphicsPipel
             GcnToVk::SurfaceFormat(color.data_format, color.num_format),
             vk::FormatFeatureFlagBits2::eColorAttachment);
     }
+    if (has_motion_mv) {
+        out.color_formats[Shader::MotionVectors::Output] = vk::Format::eR32G32B32A32Sfloat;
+        out.num_color_attachments =
+            std::max<u32>(out.num_color_attachments, Shader::MotionVectors::Output + 1u);
+        out.has_motion_attachment = true;
+    }
+
+    // Keep single-target LDR 8-bit passes (UI / Scaleform / SMAA / Tonemap LDR) on Stage A/B so
+    // `TemporalUpscaler::RedirectColor` and `VfxUiBatcher` never collide with secondary buffers.
+    if (std::popcount(guest_mrt_mask) == 1) {
+        const u32 only_cb = static_cast<u32>(std::countr_zero(guest_mrt_mask));
+        const vk::Format fmt = out.color_formats[only_cb];
+        if (fmt == vk::Format::eR8G8B8A8Unorm || fmt == vk::Format::eR8G8B8A8Srgb ||
+            fmt == vk::Format::eB8G8R8A8Unorm || fmt == vk::Format::eB8G8R8A8Srgb) {
+            return false;
+        }
+    }
+
+    const bool reduced_cfg = scene_targets && scene_targets->ReducedMt();
+    out.reduced_scene_active = reduced_cfg;
+    bool pass_reduced = reduced_cfg && key.num_samples == 1;
+    std::optional<SceneResolution::Size> pass_proxy_size;
+    const auto check_same_proxy = [&](const VideoCore::ImageInfo& info, u32 level) noexcept {
+        const auto p = scene_targets->ProxySizeInfoMt(info, level);
+        if (!pass_proxy_size) {
+            pass_proxy_size = p;
+        }
+        return *pass_proxy_size == p;
+    };
+
+    VideoCore::ImageInfo cb0_info{};
+    for (u32 cb = 0; cb < num_guest_cb; ++cb) {
+        if ((guest_mrt_mask & (1u << cb)) == 0u) {
+            continue;
+        }
+        VideoCore::TextureCache::ImageDesc desc{regs.color_buffers[cb], cb_extents[cb]};
+        VideoCore::ImageId id{};
+        VideoCore::ImageInfo info{};
+        u32 backing_samples = 1;
+        vk::Format backing_fmt = vk::Format::eUndefined;
+        vk::ImageAspectFlags aspect{};
+        bool has_proxy = false;
+        if (!texture_cache.TryInspectTargetMt(desc, id, info, backing_samples, backing_fmt, aspect,
+                                              has_proxy)) {
+            return false;
+        }
+        if (backing_samples != key.color_samples[cb]) {
+            return false;
+        }
+        out.cb_ids[cb] = id;
+        if (cb == 0u) {
+            cb0_info = info;
+        }
+        if (pass_reduced) {
+            const auto& range = desc.view_info.range;
+            if (!scene_targets->EligibleInfoMt(info, backing_samples, backing_fmt, aspect) ||
+                range.base.layer != 0 || !check_same_proxy(info, range.base.level)) {
+                pass_reduced = false;
+            }
+        }
+    }
+
+    VideoCore::ImageInfo db_info{};
+    bool db_eligible_scene = false;
+    if (want_depth) {
+        const VAddr htile_addr = regs.depth_htile_data_base.GetAddress();
+        VideoCore::TextureCache::ImageDesc desc{regs.depth_buffer, regs.depth_view,
+                                                regs.depth_control, htile_addr, db_extent};
+        VideoCore::ImageId id{};
+        u32 backing_samples = 1;
+        vk::Format backing_fmt = vk::Format::eUndefined;
+        vk::ImageAspectFlags aspect{};
+        bool has_proxy = false;
+        if (!texture_cache.TryInspectTargetMt(desc, id, db_info, backing_samples, backing_fmt,
+                                              aspect, has_proxy)) {
+            return false;
+        }
+        out.db_id = id;
+        if (scene_targets) {
+            db_eligible_scene =
+                scene_targets->EligibleSceneInfoMt(db_info, backing_samples, backing_fmt, aspect);
+            if (pass_reduced &&
+                (!scene_targets->EligibleInfoMt(db_info, backing_samples, backing_fmt, aspect) ||
+                 !check_same_proxy(db_info, 0))) {
+                pass_reduced = false;
+            }
+        }
+    }
+
+    // On reduced presets, a depth-only pass targeting full-size `scene_depth` before G-Buffer
+    // (`scene_started == false`) would stay native on Stage B; defer only that edge case.
+    if (reduced_cfg && guest_mrt_mask == 0u && db_eligible_scene) {
+        return false;
+    }
+
     out.depth_format =
         key.z_format != Gcn::DepthBuffer::ZFormat::Invalid ? depth_format : vk::Format::eUndefined;
     out.stencil_format = key.stencil_format != Gcn::DepthBuffer::StencilFormat::Invalid
@@ -592,8 +701,42 @@ bool Rasterizer::InspectMtPassTargets(const Gcn::Regs& regs, const GraphicsPipel
                              : vk::Format::eUndefined;
     out.rasterization_samples = GcnToVk::NumSamples(
         key.num_samples, instance.GetColorSampleCounts() & instance.GetDepthSampleCounts());
-    out.is_gbuffer = (std::popcount(key.mrt_mask) >= 5 && want_depth);
-    out.sampler_lod_bias = 0.0f;
+    out.is_gbuffer = (std::popcount(guest_mrt_mask) >= 5 && want_depth);
+    const VAddr db_addr = want_depth ? regs.depth_buffer.DepthAddress() : VAddr{0};
+    if (out.is_gbuffer && db_addr != 0) {
+        mt_scene_depth_addr.store(db_addr, std::memory_order_relaxed);
+    }
+    const VAddr known_scene_db = mt_scene_depth_addr.load(std::memory_order_relaxed);
+    if (upscaler && upscaler->Enabled() && want_depth && !out.is_gbuffer && known_scene_db == 0) {
+        return false;
+    }
+    out.is_scene_depth =
+        want_depth && (out.is_gbuffer || (db_addr != 0 && db_addr == known_scene_db));
+    out.depth_write_or_stencil_write =
+        want_depth && (bool(regs.depth_control.depth_write_enable) || regs.WritesStencil());
+    out.is_scene_color =
+        out.is_scene_depth && out.cb_ids[0] && std::popcount(guest_mrt_mask) <= 2 &&
+        cb0_info.pixel_format == vk::Format::eR16G16B16A16Sfloat &&
+        cb0_info.size.width == db_info.size.width && cb0_info.size.height == db_info.size.height;
+
+    if (pass_reduced && scene_targets) {
+        const auto sz = scene_targets->SizeMt();
+        const auto base = scene_targets->BaseSizeMt();
+        if (sz.width != 0 && sz.height != 0 && base.width != 0 && base.height != 0) {
+            const u32 eff_w =
+                std::max(1u, u32(std::lround(double(sz.width) * 1920.0 / double(base.width))));
+            const u32 eff_h =
+                std::max(1u, u32(std::lround(double(sz.height) * 1080.0 / double(base.height))));
+            out.scene_size = SceneResolution::Pack({eff_w, eff_h});
+            out.target_scale = {float(sz.width) / float(base.width),
+                                float(sz.height) / float(base.height)};
+        }
+    }
+    out.sampler_lod_bias =
+        (out.is_gbuffer && upscaler) ? upscaler->SceneMipBiasMt() : 0.0f;
+    out.frame_jitter =
+        (out.is_scene_depth && upscaler) ? upscaler->MtJitterForGuestFrame()
+                                         : std::array<float, 2>{0.0f, 0.0f};
     return true;
 }
 

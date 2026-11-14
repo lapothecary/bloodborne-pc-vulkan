@@ -583,6 +583,7 @@ s32 PS4_SYSV_ABI sceGnmSubmitAndFlipCommandBuffers(u32 count, u32* dcbs[], u32* 
     if (patched != BbErr::Ok) {
         return patched;
     }
+    Vulkan::TemporalUpscaler::NoteGuestFlipSubmittedForMt();
     Submit(count, const_cast<const u32* const*>(dcbs), dcb_sizes,
            const_cast<const u32* const*>(ccbs), ccb_sizes);
     if (SubmitLockOnDecode() && !flip_lock) {

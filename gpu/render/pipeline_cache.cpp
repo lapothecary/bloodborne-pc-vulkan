@@ -1712,8 +1712,6 @@ const GraphicsPipeline* PipelineCache::SelectGraphicsPipelineMt(const Gcn::Regs&
                                                                 DrawIndirectParams params,
                                                                 bool indirect,
                                                                 bool allow_compile_fallback) {
-    worker_state.ResetForPass();
-
     std::array<u32, MtFastPsoTable::MaxSigWords> sig;
     const u32 sig_len =
         BuildFastSelectSig(regs, params, instance.IsVertexInputDynamicState(),

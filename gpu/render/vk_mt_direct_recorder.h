@@ -60,6 +60,13 @@ struct MtConstantAllocation {
 /// Metadata published by `GXWorker` when sealing a secondary `vk::CommandBuffer` and consumed on
 /// `Stage B` inside `Rasterizer::ExecuteSecondaryCmdBuf` (`+0 B` `PT_TLS`, compact ~6.8 KiB/slot).
 struct alignas(64) MtCompletedPassMeta {
+    struct SampledRtRef {
+        VideoCore::ImageId id{};
+        u64 uid{0};
+        VideoCore::SubresourceRange range{};
+    };
+    static constexpr u32 kMaxSampledRts = 16;
+
     std::atomic<u64> published_seq{0};
     std::atomic<u64> consumed_seq{0};
     vk::CommandBuffer sec_cmd{};
@@ -76,6 +83,9 @@ struct alignas(64) MtCompletedPassMeta {
     u32 recorded_draws{0};
     bool is_gbuffer{false};
     bool has_camera_cb{false};
+    u8 num_sampled_rt_refs{0};
+    u8 motion_slot{0xFFu};
+    std::array<SampledRtRef, kMaxSampledRts> sampled_rt_refs{};
     std::array<float, 216> camera_cb_floats{};
 
     void CaptureFromRegs(const Gcn::Regs& src) noexcept {
@@ -109,7 +119,7 @@ class VkMtDirectRecorder {
 public:
     static constexpr u32 kMaxWorkers = 16;
     static constexpr u32 kFrameSlices = 4;
-    static constexpr u32 kCompletedMetaSlots = 256;
+    static constexpr u32 kCompletedMetaSlots = 1024;
     static constexpr u64 kWorkerConstantRingBytes = 4ULL << 20; // 4 MiB per worker
 
     VkMtDirectRecorder(const Instance& instance, Scheduler& scheduler, Rasterizer& rasterizer);
@@ -174,6 +184,9 @@ public:
         u32 worker_id, VAddr addr, u64 requested_size) noexcept;
     [[nodiscard]] vk::ImageView ResolveSrv(u32 worker_id, const Gcn::Image& raw_sharp,
                                            const Shader::ImageResource& res);
+    [[nodiscard]] Rasterizer::MtResolvedSrv ResolveSceneSrv(
+        u32 worker_id, const Gcn::Image& raw_sharp, const Shader::ImageResource& res,
+        const Rasterizer::MtPassTargetSummary& pass_targets);
     [[nodiscard]] vk::Sampler ResolveSampler(u32 worker_id, const Gcn::Sampler& raw_ssharp,
                                              bool is_depth, float lod_bias,
                                              Gcn::BorderColorBuffer bc_base);

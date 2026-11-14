@@ -268,6 +268,16 @@ TemporalUpscaler::TemporalUpscaler(const Instance& instance_, Scheduler& schedul
                     BbSettings::Get().upscaler != BbSettings::UpscalerOff ? "on" : "off",
                     static_cast<unsigned long long>(trigger_hash));
     }
+    const bool init_jitter = Active() && BbSettings::Get().jitter && !BbToggle::Disabled(1u << 25);
+    const u32 init_phases =
+        Scaled() ? Motion::JitterPhases(render_width, target_width)
+                 : Motion::JitterPhases(scene_targets.Size().width
+                                            ? scene_targets.Size().width
+                                            : render_width,
+                                        1920);
+    mt_jitter_state.store((u64(std::min(init_phases, 0x7FFFu)) << 48) |
+                              (init_jitter ? (1ull << 63) : 0ull),
+                          std::memory_order_relaxed);
 }
 
 TemporalUpscaler::~TemporalUpscaler() {
@@ -339,6 +349,15 @@ void TemporalUpscaler::OnSceneColor(VideoCore::ImageId color) {
 }
 
 namespace {
+std::atomic<u32> g_mt_guest_flips_submitted{0};
+std::atomic<u32> g_mt_stage_b_flips_retired{0};
+
+constexpr u64 PackMtJitterState(u32 eff_flips, u32 jitter_idx, u32 phases,
+                                bool jitter_on) noexcept {
+    return u64(eff_flips) | (u64(jitter_idx & 0xFFFFu) << 32) |
+           (u64(std::min(phases, 0x7FFFu)) << 48) | (jitter_on ? (1ull << 63) : 0ull);
+}
+
 float Halton(u32 index, u32 base) {
     float f = 1.0f, result = 0.0f;
     for (u32 i = index; i > 0; i /= base) {
@@ -348,6 +367,53 @@ float Halton(u32 index, u32 base) {
     return result;
 }
 } // namespace
+
+void TemporalUpscaler::NoteGuestFlipSubmittedForMt() noexcept {
+    g_mt_guest_flips_submitted.fetch_add(1u, std::memory_order_release);
+}
+
+u32 TemporalUpscaler::GuestFlipsSubmittedForMt() noexcept {
+    return g_mt_guest_flips_submitted.load(std::memory_order_acquire);
+}
+
+u32 TemporalUpscaler::StageBFlipsRetiredForMt() noexcept {
+    return g_mt_stage_b_flips_retired.load(std::memory_order_acquire);
+}
+
+void TemporalUpscaler::OnStageBFlipRetiredForMt() noexcept {
+    ++stage_b_flips_retired;
+    g_mt_stage_b_flips_retired.store(stage_b_flips_retired, std::memory_order_release);
+    if (!flip_frame_started) {
+        const u64 prev = mt_jitter_state.load(std::memory_order_relaxed);
+        mt_jitter_state.store((prev & ~0xFFFF'FFFFull) | u64(stage_b_flips_retired),
+                              std::memory_order_release);
+    }
+    flip_frame_started = false;
+}
+
+std::array<float, 2> TemporalUpscaler::MtJitterForGuestFrame() const noexcept {
+    if (!enabled) {
+        return {};
+    }
+    const u32 guest_flips = GuestFlipsSubmittedForMt();
+    const u64 s = mt_jitter_state.load(std::memory_order_acquire);
+    if ((s & (1ull << 63)) == 0ull) {
+        return {};
+    }
+    const u32 eff = static_cast<u32>(s & 0xFFFF'FFFFull);
+    const u32 j_idx = static_cast<u32>((s >> 32) & 0xFFFFu);
+    const u32 phases = static_cast<u32>((s >> 48) & 0x7FFFu);
+    if (phases == 0u) {
+        return {};
+    }
+    const u32 delta = (guest_flips > eff) ? (guest_flips - eff) : 0u;
+    if (j_idx == 0u && delta == 0u) {
+        return {};
+    }
+    const u32 idx =
+        (j_idx == 0u) ? ((delta - 1u) % phases + 1u) : ((j_idx - 1u + delta) % phases + 1u);
+    return {Halton(idx, 2) - 0.5f, Halton(idx, 3) - 0.5f};
+}
 
 bool TemporalUpscaler::ReducedScene(const VideoCore::Image& color) const {
     return scene_targets.Reduced() && scene_targets.EligibleScene(color);
@@ -494,6 +560,9 @@ bool TemporalUpscaler::OnFrameStart() {
     // already-output-sized ui_color directly when UI ran in-place).
     display_redirect = ui_phase;
     display_in_place = ui_phase && ui_in_place;
+    mt_redirected_sampled_id.store(
+        (display_redirect && !display_in_place) ? ui_color.index : 0u,
+        std::memory_order_relaxed);
     ui_phase = false;
     ui_in_place = false;
     ui_read_barrier = false;
@@ -504,9 +573,14 @@ bool TemporalUpscaler::OnFrameStart() {
     snapshot_taken = false;
     opaque_valid = false;
     mask_ready = false;
+    mt_scene_mip_bias_bits.store(std::bit_cast<u32>(SceneMipBias()), std::memory_order_relaxed);
     // Halton(2, 3); the menu or toggle 1 << 25 disables it.
+    flip_frame_started = true;
+    const u32 next_eff_flips = stage_b_flips_retired + 1u;
     if (!jitter_on) {
         jitter = {};
+        mt_jitter_state.store(PackMtJitterState(next_eff_flips, jitter_index, 8u, false),
+                              std::memory_order_release);
         return changed;
     }
     // CameraMotion::OnDisplayPass has already cleared Depth(). Use the context's render
@@ -516,6 +590,8 @@ bool TemporalUpscaler::OnFrameStart() {
         : Motion::JitterPhases(scene_targets.Size().width, 1920);
     jitter_index = jitter_index % phases + 1;
     jitter = {Halton(jitter_index, 2) - 0.5f, Halton(jitter_index, 3) - 0.5f};
+    mt_jitter_state.store(PackMtJitterState(next_eff_flips, jitter_index, phases, true),
+                          std::memory_order_release);
     return changed;
 }
 
@@ -2561,6 +2637,7 @@ bool TemporalUpscaler::RedirectColor(VideoCore::ImageId color,
     const VAddr address = image.info.guest_address;
     if (!FrameCapture::IsDisplayBuffer(address)) {
         display_redirect = false;
+        mt_redirected_sampled_id.store(0u, std::memory_order_relaxed);
         return false;
     }
     std::scoped_lock lock{display_mutex};

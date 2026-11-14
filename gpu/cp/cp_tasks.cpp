@@ -291,6 +291,7 @@ void CopyDataTask(Vulkan::Rasterizer& rasterizer, const u8* data) {
 }
 
 void FlipTask(Vulkan::Rasterizer& rasterizer, const u8*) {
+    rasterizer.GetUpscaler().OnStageBFlipRetiredForMt();
     rasterizer.OnSubmit();
     rasterizer.WaitDeferredSignals();
     // BB_EXP_FLIP_FINISH=1 (experiment): the flip is signalled once the GPU has run the frame.

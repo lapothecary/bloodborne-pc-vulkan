@@ -3,7 +3,9 @@
 
 #include <source_location>
 #include <array>
+#include <atomic>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <functional>
 #include <unordered_map>
@@ -26,10 +28,34 @@ public:
     SceneTargets(const Instance&, Scheduler&, Runtime&, Lookup);
     ~SceneTargets();
     bool SetSize(SceneResolution::Size);
-    void SetBaseSize(SceneResolution::Size base) { base_size = base; size = base; }
+    void SetBaseSize(SceneResolution::Size base) {
+        base_size = base;
+        size = base;
+        atomic_base_packed.store(PackMtSize(base), std::memory_order_release);
+        atomic_size_packed.store(PackMtSize(base), std::memory_order_release);
+    }
     SceneResolution::Size Size() const { return size; }
     SceneResolution::Size BaseSize() const { return base_size; }
     bool Reduced() const { return size != SceneResolution::Size{} && size != base_size; }
+    [[nodiscard]] SceneResolution::Size SizeMt() const noexcept {
+        return UnpackMtSize(atomic_size_packed.load(std::memory_order_acquire));
+    }
+    [[nodiscard]] SceneResolution::Size BaseSizeMt() const noexcept {
+        return UnpackMtSize(atomic_base_packed.load(std::memory_order_acquire));
+    }
+    [[nodiscard]] bool ReducedMt() const noexcept {
+        const auto s = SizeMt();
+        const auto b = BaseSizeMt();
+        return s != SceneResolution::Size{} && s != b;
+    }
+    [[nodiscard]] bool EligibleInfoMt(const VideoCore::ImageInfo& info, u32 backing_samples,
+                                      vk::Format backing_fmt,
+                                      vk::ImageAspectFlags aspect_mask) const noexcept;
+    [[nodiscard]] bool EligibleSceneInfoMt(const VideoCore::ImageInfo& info, u32 backing_samples,
+                                           vk::Format backing_fmt,
+                                           vk::ImageAspectFlags aspect_mask) const noexcept;
+    [[nodiscard]] SceneResolution::Size ProxySizeInfoMt(const VideoCore::ImageInfo& info,
+                                                        u32 level = 0) const noexcept;
     /// A reduced proxy can stand in for the image: a 1920x1080 scene target or, scaled by
     /// the same factor, a half-resolution (960x540) one (toggle SceneHalfRes).
     bool Eligible(const VideoCore::Image&) const;
@@ -105,20 +131,29 @@ private:
     void CreateResampleResources();
     void Transition(Entry&, vk::ImageAspectFlags, vk::ImageLayout,
                     vk::PipelineStageFlags2, vk::AccessFlags2);
+    static constexpr u64 PackMtSize(SceneResolution::Size s) noexcept {
+        return u64(s.width) | (u64(s.height) << 32);
+    }
+    static constexpr SceneResolution::Size UnpackMtSize(u64 p) noexcept {
+        return {static_cast<u32>(p & 0xFFFF'FFFFull), static_cast<u32>(p >> 32)};
+    }
     const Instance& instance;
     Scheduler& scheduler;
     Runtime& runtime;
     Lookup lookup;
     SceneResolution::Size size;
     SceneResolution::Size base_size{};
+    std::atomic<u64> atomic_size_packed{0};
+    std::atomic<u64> atomic_base_packed{0};
     std::unordered_map<u64, std::unique_ptr<Entry>> entries; ///< by Key(uid, level)
     std::unordered_set<u64> tracked; ///< uids with proxies
     bool copying = false;
     bool force_stencil_bits = false; ///< test the portable resampler on any driver
     u64 generation = 0;
+    mutable std::mutex features_mutex;
     mutable std::unordered_map<vk::Format, vk::FormatFeatureFlags> format_features;
     mutable std::array<vk::FormatFeatureFlags, 256> format_table{};
-    mutable std::array<bool, 256> format_known{};
+    mutable std::array<std::atomic<bool>, 256> format_known{};
     std::array<std::pair<u64, Entry*>, 8> recent{}; ///< last entries by Key
     u32 recent_next = 0;
     vk::UniqueShaderModule fs_tri_vert, depth_frag, depth_stencil_frag, stencil_bits_frag;

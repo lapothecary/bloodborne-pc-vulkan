@@ -1364,6 +1364,76 @@ vk::ImageView Rasterizer::ResolveSrvViewMt(const Gcn::Image& raw_sharp,
     return resolved;
 }
 
+Rasterizer::MtResolvedSrv Rasterizer::ResolveSceneSrvViewMt(
+    const Gcn::Image& raw_sharp, const Shader::ImageResource& res,
+    const MtPassTargetSummary& pass_targets, u64* out_hits, u64* out_misses) {
+    MtResolvedSrv out{};
+    if (const vk::ImageView fast = ResolveSrvViewMt(raw_sharp, res, out_hits, nullptr)) [[likely]] {
+        out.view = fast;
+        out.layout = vk::ImageLayout::eShaderReadOnlyOptimal;
+        return out;
+    }
+    if (res.is_written || res.mip_fallback_mode != Shader::MipStorageFallbackMode::None) {
+        if (out_misses) {
+            ++(*out_misses);
+        }
+        return {};
+    }
+
+    Gcn::Image clean_sharp = raw_sharp;
+    u8 dummy_gen8 = 0;
+    (void)VideoCore::DirectTextures::UnpackAndCleanSrv(clean_sharp, dummy_gen8);
+
+    VideoCore::ImageId id{};
+    u64 uid = 0;
+    vk::ImageView view{};
+    vk::ImageLayout layout = vk::ImageLayout::eUndefined;
+    VideoCore::SubresourceRange range{};
+    bool needs_transit = false;
+    if (!texture_cache.TryResolveSceneSrvViewMt(clean_sharp, res, pass_targets.reduced_scene_active,
+                                                scene_targets.get(), id, uid, view, layout, range,
+                                                needs_transit) ||
+        !view || !id) {
+        if (out_misses) {
+            ++(*out_misses);
+        }
+        return {};
+    }
+    if (upscaler && upscaler->RedirectsSampledMt(id)) {
+        if (out_misses) {
+            ++(*out_misses);
+        }
+        return {};
+    }
+    for (const auto cb_id : pass_targets.cb_ids) {
+        if (cb_id == id) {
+            if (out_misses) {
+                ++(*out_misses);
+            }
+            return {};
+        }
+    }
+    if (pass_targets.db_id == id && pass_targets.depth_write_or_stencil_write) {
+        if (out_misses) {
+            ++(*out_misses);
+        }
+        return {};
+    }
+
+    if (!needs_transit && out_hits) {
+        ++(*out_hits);
+    } else if (needs_transit && out_misses) {
+        ++(*out_misses);
+    }
+    out.view = view;
+    out.layout = layout;
+    out.id = id;
+    out.uid = uid;
+    out.range = range;
+    out.needs_stage_b_transit = needs_transit;
+    return out;
+}
+
 vk::Sampler Rasterizer::ResolveSamplerMt(const Gcn::Sampler& raw_ssharp, bool is_depth,
                                          float lod_bias, Gcn::BorderColorBuffer bc_base,
                                          u64* out_hits) {
