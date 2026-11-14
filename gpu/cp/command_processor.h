@@ -140,6 +140,13 @@ public:
                                             bool compute_checksum = true,
                                             u64* pso_sig_epoch = nullptr,
                                             u64* dyn_reg_epoch = nullptr);
+    static bool InitGnmDefaultRegs(Regs& regs, u32 gen = 3u, RegDirty* dirty = nullptr,
+                                   bool track_all = false, u64* pso_sig_epoch = nullptr,
+                                   u64* dyn_reg_epoch = nullptr) noexcept;
+    static bool ApplyDrawBundleRegs(Regs& regs, RegDirty* dirty, bool track_all, u32 op_word,
+                                    const u32* body, u32 body_words,
+                                    u64* pso_sig_epoch = nullptr,
+                                    u64* dyn_reg_epoch = nullptr) noexcept;
     static u64 HashRegisterPacket(u64 checksum, const u32* words, u32 count);
 
     Regs regs{};

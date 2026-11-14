@@ -47,6 +47,7 @@
 #include "buffers/buffer_cache.h"
 #include "buffers/direct_buffers.h"
 #include "render/rasterizer.h"
+#include "render/vk_mt_direct_recorder.h"
 #include "textures/direct_textures.h"
 
 namespace BbCp {
@@ -188,8 +189,8 @@ constexpr u32 ComputeWords = sizeof(ComputeProgram) / 4;
                 const u32 bit = static_cast<u32>(std::countr_zero(mask));
                 mask &= (mask - 1u);
                 regs.reg_array[Bank::Sh + sh_offset + bit] = pay[src++];
+                MarkShReg(dirty, track_all, Bank::Sh + sh_offset + bit, 1u);
             }
-            MarkShReg(dirty, track_all, Bank::Sh + sh_offset, 16u);
         }
         if ((sh_offset & 0x3Fu) < 0x0Cu) [[unlikely]] {
             pso_chg = true;
@@ -684,6 +685,23 @@ u64 CommandProcessor::HashRegisterPacket(u64 checksum, const u32* words, u32 cou
     return checksum;
 }
 
+bool CommandProcessor::InitGnmDefaultRegs(Regs& regs, u32 gen, RegDirty* dirty, bool track_all,
+                                          u64* pso_sig_epoch, u64* dyn_reg_epoch) noexcept {
+    if (gen > 5u) {
+        return false;
+    }
+    const u32 op_word = u32(DirectVk::Op::InitDefaultHardwareState) | (gen << 16u);
+    return ApplyInitDefaultHardwareState(regs, dirty, track_all, op_word, pso_sig_epoch,
+                                         dyn_reg_epoch);
+}
+
+bool CommandProcessor::ApplyDrawBundleRegs(Regs& regs, RegDirty* dirty, bool track_all,
+                                           u32 op_word, const u32* body, u32 body_words,
+                                           u64* pso_sig_epoch, u64* dyn_reg_epoch) noexcept {
+    return ApplyDrawBundlePacket(regs, dirty, track_all, op_word, body, body_words, pso_sig_epoch,
+                                 dyn_reg_epoch);
+}
+
 bool CommandProcessor::ApplyGraphicsRegisterPacket(Regs& regs, const u32* packet, u64& checksum,
                                                    RegDirty* dirty, bool compute_checksum,
                                                    u64* pso_sig_epoch, u64* dyn_reg_epoch) {
@@ -884,6 +902,25 @@ bool CommandProcessor::ApplyGraphicsRegisterPacket(Regs& regs, const u32* packet
             }
             handled_completely = true;
             break;
+        case DirectVk::Op::ExecuteSecondaryCmds: {
+            if (body_words != 6u) {
+                return false;
+            }
+            DirectVk::ExecuteSecondaryArgs args{};
+            std::memcpy(&args, body + 2u, sizeof(args));
+            if ((args.occ_and_flags & DirectVk::kExecSecondaryFlagSyncRegs) == 0u) {
+                return false;
+            }
+            if (auto* rec = Vulkan::VkMtDirectRecorder::ActiveInstance()) {
+                if (const auto* meta = rec->LookupCompletedPass(args.worker_and_draws & 0xFFu,
+                                                                args.cmd_seq);
+                    meta && meta->has_end_sync) {
+                    meta->ApplyEndSyncToRegs(regs, dirty, track_all);
+                    BumpPsoAndDyn(pso_sig_epoch, dyn_reg_epoch);
+                }
+            }
+            break;
+        }
         default:
             return false;
         }

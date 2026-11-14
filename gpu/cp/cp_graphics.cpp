@@ -28,6 +28,7 @@
 #include "render/vk_draw_prep.h"
 #include "buffers/buffer_cache.h"
 #include "render/rasterizer.h"
+#include "render/vk_mt_direct_recorder.h"
 
 namespace BbCp {
 
@@ -603,6 +604,32 @@ CommandProcessor::Step CommandProcessor::Graphics(Work& work, Level& level, cons
                         const u32 recorded_draws = args.worker_and_draws >> 8;
                         if (recorded_draws != 0u) {
                             BbStats::draws.fetch_add(recorded_draws, std::memory_order_relaxed);
+                        }
+                        if ((args.occ_and_flags & DirectVk::kExecSecondaryFlagSyncRegs) != 0u) {
+                            if (auto* rec = Vulkan::VkMtDirectRecorder::ActiveInstance()) {
+                                if (const auto* meta = rec->LookupCompletedPass(
+                                        args.worker_and_draws & 0xFFu, args.cmd_seq);
+                                    meta && meta->has_end_sync) {
+                                    if (meta->end_reset) {
+                                        last_cb_extent.fill(CbDbExtent{});
+                                        last_db_extent.raw = 0u;
+                                        last_cb_uid.fill(0u);
+                                        last_db_uid = 0u;
+                                    }
+                                    u8 cb_mask = meta->end_cb_written_mask;
+                                    while (cb_mask != 0u) {
+                                        const u32 cb = static_cast<u32>(std::countr_zero(cb_mask));
+                                        cb_mask &= static_cast<u8>(cb_mask - 1u);
+                                        last_cb_extent[cb] = meta->end_cb_extent[cb];
+                                        last_cb_uid[cb] = meta->end_cb_uid[cb];
+                                    }
+                                    if (meta->end_db_written) {
+                                        last_db_extent = meta->end_db_extent;
+                                        last_db_uid = meta->end_db_uid;
+                                    }
+                                    rasterizer->InvalidateStageARtMeta();
+                                }
+                            }
                         }
                         rasterizer->FlushVsmShadowMemo();
                         rasterizer->FlushLightTileBatches();

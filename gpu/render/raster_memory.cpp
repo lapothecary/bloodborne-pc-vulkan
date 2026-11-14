@@ -400,7 +400,8 @@ void Rasterizer::ExecuteDirectCopyBuffers(std::span<const DirectCopyRegion> regi
     // rename remaining non-native transient `cueHeap -> dst_va` UpdateSubresource buffer copies into
     // `stream_buffer` without calling `scheduler.EndRendering()`, coalescing the `arena` writeback
     // once when the RenderPass naturally ends.
-    if (v7_inpass_rename && scheduler.IsRendering() && !VideoCore::GuestInPlace() &&
+    if (v7_inpass_rename && scheduler.IsRendering() &&
+        !scheduler.GetRenderState().secondary_contents && !VideoCore::GuestInPlace() &&
         !VideoCore::BufferCache::LayerActive()) {
         static thread_local std::vector<VideoCore::BufferCache::InPassCopySlice> inpass_slices;
         inpass_slices.clear();

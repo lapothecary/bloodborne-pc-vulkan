@@ -354,6 +354,9 @@ public:
     /// Stage 8: Stage-A CPU-source constant shadow & deferred local-light tile batcher hooks.
     void NoteStageACpuCopyBatch(const u32* raw_regions, u32 count) noexcept;
     void InvalidateStageACpuShadow(VAddr addr, u64 size) noexcept;
+    void InvalidateStageARtMeta() noexcept {
+        stage_a_rt_meta_valid = false;
+    }
     void FlushLightTileBatches();
     [[nodiscard]] bool HasPendingLightTiles() const noexcept;
     /// Stage 9: Stage-A local VSM point/spot shadow map & Sample13Weight blur memoization hooks.

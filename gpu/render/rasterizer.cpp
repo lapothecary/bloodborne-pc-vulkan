@@ -1101,9 +1101,14 @@ void Rasterizer::ExecuteSecondaryCmdBuf(u32 worker_id, u64 cmd_seq, u32 recorded
 
     if (!mt_stage_b_regs) [[unlikely]] {
         mt_stage_b_regs = std::make_unique<Gcn::Regs>();
-        mt_stage_b_regs->SetDefaults();
+        BbCp::CommandProcessor::InitGnmDefaultRegs(*mt_stage_b_regs, 3u);
     }
     meta->ApplyToRegs(*mt_stage_b_regs);
+
+    if (direct_buffers.HasPendingWritebacks()) {
+        direct_buffers.FlushPendingWritebacks();
+        needs_barrier = true;
+    }
 
     struct ScopedMtPipeRegs {
         Rasterizer& self;

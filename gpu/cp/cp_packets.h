@@ -605,6 +605,7 @@ struct DispatchIndirectArgs {
     u32 reserved;
 };
 static_assert(sizeof(DispatchIndirectArgs) == 16);
+constexpr u32 kExecSecondaryFlagSyncRegs = 0x10000u;
 struct ExecuteSecondaryArgs {
     u32 worker_and_draws;
     u32 occ_and_flags;

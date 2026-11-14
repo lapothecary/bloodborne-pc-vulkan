@@ -1711,7 +1711,11 @@ const GraphicsPipeline* PipelineCache::SelectGraphicsPipelineMt(const Gcn::Regs&
                                                                 MtWorkerPsoState& worker_state,
                                                                 DrawIndirectParams params,
                                                                 bool indirect,
-                                                                bool allow_compile_fallback) {
+                                                                bool allow_compile_fallback,
+                                                                MtPsoFailKind* out_fail_kind) {
+    if (out_fail_kind) {
+        *out_fail_kind = MtPsoFailKind::None;
+    }
     std::array<u32, MtFastPsoTable::MaxSigWords> sig;
     const u32 sig_len =
         BuildFastSelectSig(regs, params, instance.IsVertexInputDynamicState(),
@@ -1975,6 +1979,9 @@ const GraphicsPipeline* PipelineCache::SelectGraphicsPipelineMt(const Gcn::Regs&
     worker_state.sel.worker = &worker_state.prep_worker;
     worker_state.sel.draw_indirect_params = params;
     if (!PrepareGraphicsPipeline(worker_state.sel)) {
+        if (out_fail_kind) {
+            *out_fail_kind = MtPsoFailKind::SpecMiss;
+        }
         return nullptr;
     }
 
@@ -2011,6 +2018,9 @@ const GraphicsPipeline* PipelineCache::SelectGraphicsPipelineMt(const Gcn::Regs&
         }
     }
     if (!resolved_pso) {
+        if (out_fail_kind) {
+            *out_fail_kind = MtPsoFailKind::SigMiss;
+        }
         return nullptr;
     }
 

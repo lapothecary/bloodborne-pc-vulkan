@@ -88,6 +88,58 @@ struct alignas(64) MtCompletedPassMeta {
     std::array<SampledRtRef, kMaxSampledRts> sampled_rt_refs{};
     std::array<float, 216> camera_cb_floats{};
 
+    // Final register/extent/UID delta of a compiled deferred command list, synchronized to
+    // Stage A (`liverpool->regs`) and `DrawPreparation` (`bb:DrawScan` / `bb:DrawPrep`) when
+    // `DirectVk::kExecSecondaryFlagSyncRegs` is set on the list's final `ExecuteSecondaryCmds`.
+    bool has_end_sync{false};
+    bool end_reset{false};
+    bool end_db_written{false};
+    u8 end_cb_written_mask{0};
+    u64 end_stage_b_mask[2]{};
+    std::bitset<Gcn::RegDirty::NumBlocks> end_dirty_blocks{};
+    std::vector<u32> end_span_headers{}; // (word_count << 16) | word_offset
+    std::vector<u32> end_span_values{};
+    std::array<Gcn::CbDbExtent, Gcn::NUM_COLOR_BUFFERS> end_cb_extent{};
+    Gcn::CbDbExtent end_db_extent{};
+    std::array<u16, Gcn::NUM_COLOR_BUFFERS> end_cb_uid{};
+    u16 end_db_uid{0};
+
+    void ApplyEndSyncToRegs(Gcn::Regs& dst, Gcn::RegDirty* dirty, bool track_all) const noexcept {
+        if (!has_end_sync) {
+            return;
+        }
+        if (end_reset) {
+            dst.SetDefaults();
+            if (dirty) {
+                dirty->Clear();
+                dirty->reset = true;
+            }
+        }
+        size_t val_cursor = 0;
+        for (const u32 hdr : end_span_headers) {
+            const u32 word_off = hdr & 0xFFFFu;
+            const u32 count = hdr >> 16u;
+            if (count != 0u && word_off + count <= Gcn::Regs::NumRegs &&
+                val_cursor + count <= end_span_values.size()) {
+                std::memcpy(&dst.reg_array[word_off], &end_span_values[val_cursor],
+                            count * sizeof(u32));
+                if (dirty && dirty->exact_words) [[unlikely]] {
+                    for (u32 w = word_off; w < word_off + count; ++w) {
+                        dirty->exact_words->set(w);
+                    }
+                }
+            }
+            val_cursor += count;
+        }
+        if (dirty) {
+            dirty->stage_b_mask[0] |= end_stage_b_mask[0];
+            dirty->stage_b_mask[1] |= end_stage_b_mask[1];
+            if (dirty->track_all_blocks || track_all) {
+                dirty->blocks |= end_dirty_blocks;
+            }
+        }
+    }
+
     void CaptureFromRegs(const Gcn::Regs& src) noexcept {
         std::memcpy(sh_gfx_regs.data(), &src.reg_array[0x2C00],
                     sh_gfx_regs.size() * sizeof(u32));

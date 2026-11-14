@@ -138,6 +138,7 @@ struct MtResolvedBuffer {
     u64 clamped_size{0};
     bool is_static_immutable{false};
     bool is_gpu_written{false};
+    bool is_direct_vram{false};
 
     [[nodiscard]] explicit operator bool() const noexcept {
         return handle != VK_NULL_HANDLE;
@@ -159,6 +160,7 @@ struct MtReadMru {
         u64 gen{0};
         bool is_static_immutable{false};
         bool is_gpu_written{false};
+        bool is_direct_vram{false};
     };
 
     std::array<Slot, kSlots> slots{};

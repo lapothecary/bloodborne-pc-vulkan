@@ -32,6 +32,7 @@
 #include "render/scheduler.h"
 #include "render/vk_frame_capture.h"
 #include "render/vk_obj_vel_cull.h"
+#include "render/vk_vsm_shadow_memo.h"
 #include "shim/bbport_toggles.h"
 #include "textures/direct_textures.h"
 #include "textures/texture_cache.h"
@@ -555,6 +556,17 @@ struct VkMtDirectRecorder::WorkerCompileScratch {
         u64 gen{0};
     };
 
+    struct ChunkGpuWriteSlice {
+        VAddr dst_va{0};
+        u32 byte_size{0};
+        u64 gen{0};
+    };
+
+    struct ChunkTargetWrite {
+        VAddr addr{0};
+        u64 size{0};
+    };
+
     struct UploadedConstMemo {
         VAddr addr{0};
         u32 byte_size{0};
@@ -563,9 +575,22 @@ struct VkMtDirectRecorder::WorkerCompileScratch {
         u64 offset{0};
     };
 
-    struct RetainedPkt {
+    struct StreamItem {
+        enum class Kind : u8 {
+            RawPkt = 0,
+            SubPass = 1,
+        };
+        Kind kind{Kind::RawPkt};
+        u32 subpass_idx{0};
         const u32* ptr{nullptr};
         u32 words{0};
+
+        static constexpr StreamItem Raw(const u32* p, u32 w) noexcept {
+            return StreamItem{Kind::RawPkt, 0u, p, w};
+        }
+        static constexpr StreamItem Pass(u32 idx) noexcept {
+            return StreamItem{Kind::SubPass, idx, nullptr, 7u};
+        }
     };
 
     struct StagedPkt {
@@ -630,9 +655,11 @@ struct VkMtDirectRecorder::WorkerCompileScratch {
     alignas(16) std::array<u8, 32768> cb_temp{};
     alignas(16) std::array<u32, 256> vs_flat_ud{};
     alignas(16) std::array<u32, 256> ps_flat_ud{};
+    std::bitset<Gcn::Regs::NumRegs> replay_exact_words{};
     std::vector<ChunkCopySlice> chunk_copies;
-    std::vector<RetainedPkt> pre_pkts;
-    std::vector<RetainedPkt> post_pkts;
+    std::vector<ChunkGpuWriteSlice> chunk_gpu_writes;
+    std::vector<ChunkTargetWrite> chunk_target_writes;
+    std::vector<StreamItem> stream_items;
     std::vector<StagedPkt> staged_pkts;
     std::vector<SubPassPlan> subpass_plans;
     std::vector<SealedSubPass> sealed_subpasses;
@@ -642,17 +669,79 @@ struct VkMtDirectRecorder::WorkerCompileScratch {
 
     WorkerCompileScratch() {
         chunk_copies.reserve(128);
-        pre_pkts.reserve(256);
-        post_pkts.reserve(128);
+        chunk_gpu_writes.reserve(32);
+        chunk_target_writes.reserve(32);
+        stream_items.reserve(384);
         staged_pkts.reserve(512);
         subpass_plans.reserve(64);
         sealed_subpasses.reserve(64);
         emit_words.reserve(1024);
     }
 
+    void NoteTargetWrite(VAddr addr, u64 size) noexcept {
+        if (addr == 0ULL) {
+            return;
+        }
+        const u64 eff_size = std::max<u64>(size, 4096ULL);
+        for (const auto& tw : chunk_target_writes) {
+            if (tw.addr == addr && tw.size >= eff_size) {
+                return;
+            }
+        }
+        chunk_target_writes.push_back({addr, eff_size});
+    }
+
+    [[nodiscard]] bool OverlapsTargetWrite(VAddr addr) const noexcept {
+        if (addr == 0ULL || chunk_target_writes.empty()) {
+            return false;
+        }
+        for (const auto& tw : chunk_target_writes) {
+            const VAddr tw_end = (tw.size > (~0ULL - tw.addr)) ? ~0ULL : (tw.addr + tw.size);
+            if (addr >= tw.addr && addr < tw_end) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     void ResetConstMemo() noexcept {
         const_memo.fill(UploadedConstMemo{});
         const_memo_cursor = 0;
+    }
+
+    [[nodiscard]] u64 MaxGpuWriteGenOverlapping(VAddr addr, u64 size) const noexcept {
+        if (!addr || size == 0ULL || chunk_gpu_writes.empty()) {
+            return 0ULL;
+        }
+        const VAddr end = (size > (~0ULL - addr)) ? ~0ULL : (addr + size);
+        u64 max_gen = 0ULL;
+        for (const auto& gw : chunk_gpu_writes) {
+            if (!gw.dst_va || gw.byte_size == 0u) {
+                continue;
+            }
+            const VAddr gw_end = gw.dst_va + gw.byte_size;
+            if (addr < gw_end && gw.dst_va < end && gw.gen > max_gen) {
+                max_gen = gw.gen;
+            }
+        }
+        return max_gen;
+    }
+
+    [[nodiscard]] bool FullGpuWriteCovers(VAddr addr, u64 size, u64 min_gen) const noexcept {
+        if (!addr || size == 0ULL || chunk_gpu_writes.empty()) {
+            return false;
+        }
+        const VAddr end = (size > (~0ULL - addr)) ? ~0ULL : (addr + size);
+        for (size_t i = chunk_gpu_writes.size(); i-- > 0;) {
+            const auto& gw = chunk_gpu_writes[i];
+            if (gw.gen < min_gen) {
+                break;
+            }
+            if (gw.dst_va != 0ULL && addr >= gw.dst_va && end <= gw.dst_va + gw.byte_size) {
+                return true;
+            }
+        }
+        return false;
     }
 };
 
@@ -1370,6 +1459,8 @@ enum class MtPktKind : u8 {
     InitHwState,
     Draw,
     CopyBatch,
+    FillBuf,
+    TargetRawOp,
     SyncRetain,
     PostSyncRetain,
 };
@@ -1387,11 +1478,48 @@ std::atomic<u64> g_mt_lists_compiled{0};
 std::atomic<u64> g_mt_draws_recorded{0};
 std::atomic<u64> g_mt_bail_pkt{0};
 std::atomic<u64> g_mt_bail_pso{0};
+std::atomic<u64> g_mt_bail_pso_sig{0};
+std::atomic<u64> g_mt_bail_pso_spec{0};
+std::atomic<u64> g_mt_bail_pso_unsafe{0};
 std::atomic<u64> g_mt_bail_target{0};
 std::atomic<u64> g_mt_bail_buf{0};
 std::atomic<u64> g_mt_bail_other{0};
 std::atomic<u32> g_mt_last_report_frame{0};
-std::atomic<u32> g_mt_bad_pkt_samples{0};
+std::array<std::atomic<u32>, 16> g_mt_seen_bail_ops{};
+
+void MtMaybeLogBadPktSample(const u32* cur, u32 rem) noexcept {
+    if (!cur || rem == 0u) {
+        return;
+    }
+    const u32 hdr = cur[0];
+    const u32 op = (hdr >> 8u) & 0xFFu;
+    const u32 b0 = rem > 1u ? cur[1] : 0u;
+    const u32 b1 = rem > 2u ? cur[2] : 0u;
+    const u32 vk_op =
+        (op == u32(BbCp::Op::Nop) && rem > 2u && b0 == BbCp::NopPayload::DirectVulkan)
+            ? (b1 & 0xFFFFu)
+            : 0xFFFFu;
+    const u32 key = 0x80000000u | (op << 16u) | vk_op;
+    for (auto& slot : g_mt_seen_bail_ops) {
+        u32 cur_val = slot.load(std::memory_order_relaxed);
+        if (cur_val == key) {
+            return;
+        }
+        if (cur_val == 0u) {
+            if (slot.compare_exchange_strong(cur_val, key, std::memory_order_acq_rel,
+                                             std::memory_order_relaxed)) {
+                std::printf("[BB-MT] bail_pkt sample: hdr=0x%08x op=0x%02x vk_op=0x%04x "
+                            "b0=0x%08x b1=0x%08x\n",
+                            hdr, op, vk_op, b0, b1);
+                std::fflush(stdout);
+                return;
+            }
+            if (cur_val == key) {
+                return;
+            }
+        }
+    }
+}
 
 void MtReportTelemetryIfDue(u32 cur_guest_frame) noexcept {
     u32 last = g_mt_last_report_frame.load(std::memory_order_relaxed);
@@ -1413,14 +1541,19 @@ void MtReportTelemetryIfDue(u32 cur_guest_frame) noexcept {
     const u64 draws = g_mt_draws_recorded.exchange(0ULL, std::memory_order_relaxed);
     const u64 b_pkt = g_mt_bail_pkt.exchange(0ULL, std::memory_order_relaxed);
     const u64 b_pso = g_mt_bail_pso.exchange(0ULL, std::memory_order_relaxed);
+    const u64 b_pso_sig = g_mt_bail_pso_sig.exchange(0ULL, std::memory_order_relaxed);
+    const u64 b_pso_spec = g_mt_bail_pso_spec.exchange(0ULL, std::memory_order_relaxed);
+    const u64 b_pso_uns = g_mt_bail_pso_unsafe.exchange(0ULL, std::memory_order_relaxed);
     const u64 b_tgt = g_mt_bail_target.exchange(0ULL, std::memory_order_relaxed);
     const u64 b_buf = g_mt_bail_buf.exchange(0ULL, std::memory_order_relaxed);
     const u64 b_oth = g_mt_bail_other.exchange(0ULL, std::memory_order_relaxed);
     std::printf("[BB-MT] 600f: compiled %llu/%llu lists (mt_draws=%llu, bail: pkt=%llu, "
-                "pso=%llu, target=%llu, buf=%llu, other=%llu)\n",
+                "pso=%llu(sig=%llu,spec=%llu,unsafe=%llu), target=%llu, buf=%llu, other=%llu)\n",
                 static_cast<unsigned long long>(comp), static_cast<unsigned long long>(seen),
                 static_cast<unsigned long long>(draws), static_cast<unsigned long long>(b_pkt),
-                static_cast<unsigned long long>(b_pso), static_cast<unsigned long long>(b_tgt),
+                static_cast<unsigned long long>(b_pso), static_cast<unsigned long long>(b_pso_sig),
+                static_cast<unsigned long long>(b_pso_spec),
+                static_cast<unsigned long long>(b_pso_uns), static_cast<unsigned long long>(b_tgt),
                 static_cast<unsigned long long>(b_buf), static_cast<unsigned long long>(b_oth));
     std::fflush(stdout);
 }
@@ -1444,6 +1577,76 @@ void MtNoteBail(MtBailReason reason, u32 cur_guest_frame) noexcept {
         break;
     }
     MtReportTelemetryIfDue(cur_guest_frame);
+}
+
+void MtNotePsoBail(PipelineCache::MtPsoFailKind fail_kind, bool unsafe_pso,
+                   u32 cur_guest_frame) noexcept {
+    g_mt_bail_pso.fetch_add(1ULL, std::memory_order_relaxed);
+    if (unsafe_pso) {
+        g_mt_bail_pso_unsafe.fetch_add(1ULL, std::memory_order_relaxed);
+    } else if (fail_kind == PipelineCache::MtPsoFailKind::SpecMiss) {
+        g_mt_bail_pso_spec.fetch_add(1ULL, std::memory_order_relaxed);
+    } else {
+        g_mt_bail_pso_sig.fetch_add(1ULL, std::memory_order_relaxed);
+    }
+    MtReportTelemetryIfDue(cur_guest_frame);
+}
+
+[[nodiscard]] constexpr bool IsMtVsmDim(u32 dim) noexcept {
+    return dim == 32u || dim == 64u || dim == 128u || dim == 256u || dim == 512u;
+}
+
+[[nodiscard]] bool IsMtVsmImageSharp(const u64 raw_words[4]) noexcept {
+    Gcn::Image img{};
+    std::memcpy(&img, raw_words, sizeof(img));
+    reinterpret_cast<u32*>(&img)[7] = 0u;
+    if (!img.Valid() || img.IsMsaa() || img.base_level != 0u ||
+        img.GetDataFmt() != Gcn::DataFormat::Format16_16 ||
+        img.GetNumberFmt() != Gcn::NumberFormat::Float) {
+        return false;
+    }
+    const u32 w = static_cast<u32>(img.width) + 1u;
+    const u32 h = static_cast<u32>(img.height) + 1u;
+    return w == h && IsMtVsmDim(w);
+}
+
+[[nodiscard]] bool IsVsmTargetRawPacket(const u32* cur, u32 pkt_words) noexcept {
+    if (!VsmShadowMemo::Enabled() || !cur || pkt_words < 3u ||
+        cur[1] != BbCp::NopPayload::DirectVulkan) {
+        return false;
+    }
+    const auto vk_op = BbCp::DirectVk::Op(cur[2] & 0xFFFFu);
+    switch (vk_op) {
+    case BbCp::DirectVk::Op::ClearColorImage: {
+        if (pkt_words != 19u) {
+            return false;
+        }
+        BbCp::DirectVk::ClearColorArgs args{};
+        std::memcpy(&args, cur + 3u, sizeof(args));
+        return args.num_bits == 32u && IsMtVsmImageSharp(args.tsharp);
+    }
+    case BbCp::DirectVk::Op::ClearDepthStencil: {
+        if (pkt_words != 21u) {
+            return false;
+        }
+        BbCp::DirectVk::ClearDepthStencilArgs args{};
+        std::memcpy(&args, cur + 3u, sizeof(args));
+        const Gcn::CbDbExtent ext{.raw = args.cb_db_extent};
+        return args.slice_count == 1u && ext.Valid() && ext.width == ext.height &&
+               IsMtVsmDim(ext.width);
+    }
+    case BbCp::DirectVk::Op::CopyTextureRegion: {
+        if (pkt_words != 35u) {
+            return false;
+        }
+        BbCp::DirectVk::CopyTextureRegionArgs args{};
+        std::memcpy(&args, cur + 3u, sizeof(args));
+        return args.copy_d == 1u && IsMtVsmImageSharp(args.srv_tsharp) &&
+               IsMtVsmImageSharp(args.uav_tsharp);
+    }
+    default:
+        return false;
+    }
 }
 
 [[nodiscard]] constexpr bool IsStageACoalescerShader(u64 vs_hash, u64 ps_hash) noexcept {
@@ -1474,7 +1677,8 @@ struct MtDecodedPkt {
     const u32* cur, u32 avail_words, Gcn::Regs& regs,
     std::array<Gcn::CbDbExtent, Gcn::NUM_COLOR_BUFFERS>& cb_extent, Gcn::CbDbExtent& db_extent,
     std::array<u16, Gcn::NUM_COLOR_BUFFERS>& cb_uid, u16& db_uid, u64& pso_epoch, u64& dyn_epoch,
-    Core::MemoryManager* mem, bool host_markers_enabled) noexcept {
+    Core::MemoryManager* mem, bool host_markers_enabled, Gcn::RegDirty* dirty = nullptr,
+    u8* cb_written_mask = nullptr, bool* db_written = nullptr) noexcept {
     MtDecodedPkt out{};
     if (avail_words == 0u) {
         return out;
@@ -1529,7 +1733,7 @@ struct MtDecodedPkt {
         case BbCp::DirectVk::Op::BindLsShader:
         case BbCp::DirectVk::Op::SetVgtControl:
             if (!BbCp::CommandProcessor::ApplyGraphicsRegisterPacket(
-                    regs, cur, dummy_csum, nullptr, false, &pso_epoch, &dyn_epoch)) {
+                    regs, cur, dummy_csum, dirty, false, &pso_epoch, &dyn_epoch)) {
                 return {};
             }
             out.kind = MtPktKind::StateOnly;
@@ -1540,7 +1744,7 @@ struct MtDecodedPkt {
                 return {}; // Reject compute stage user data
             }
             if (!BbCp::CommandProcessor::ApplyGraphicsRegisterPacket(
-                    regs, cur, dummy_csum, nullptr, false, &pso_epoch, &dyn_epoch)) {
+                    regs, cur, dummy_csum, dirty, false, &pso_epoch, &dyn_epoch)) {
                 return {};
             }
             out.kind = MtPktKind::StateOnly;
@@ -1551,13 +1755,19 @@ struct MtDecodedPkt {
                 return {};
             }
             if (!BbCp::CommandProcessor::ApplyGraphicsRegisterPacket(
-                    regs, cur, dummy_csum, nullptr, false, &pso_epoch, &dyn_epoch)) {
+                    regs, cur, dummy_csum, dirty, false, &pso_epoch, &dyn_epoch)) {
                 return {};
             }
             cb_extent.fill(Gcn::CbDbExtent{});
             db_extent.raw = 0u;
             cb_uid.fill(0u);
             db_uid = 0u;
+            if (cb_written_mask) {
+                *cb_written_mask = 0xFFu;
+            }
+            if (db_written) {
+                *db_written = true;
+            }
             out.kind = MtPktKind::InitHwState;
             return out;
 
@@ -1568,13 +1778,16 @@ struct MtDecodedPkt {
                 return {};
             }
             (void)BbCp::CommandProcessor::ApplyGraphicsRegisterPacket(
-                regs, cur, dummy_csum, nullptr, false, &pso_epoch, &dyn_epoch);
+                regs, cur, dummy_csum, dirty, false, &pso_epoch, &dyn_epoch);
             if (valid) {
                 cb_extent[slot].raw = body[13];
                 cb_uid[slot] = static_cast<u16>((op_word >> 20u) & 0xFFFu);
             } else {
                 cb_extent[slot].raw = 0u;
                 cb_uid[slot] = 0u;
+            }
+            if (cb_written_mask) {
+                *cb_written_mask |= static_cast<u8>(1u << slot);
             }
             out.kind = MtPktKind::StateOnly;
             return out;
@@ -1586,13 +1799,16 @@ struct MtDecodedPkt {
                 return {};
             }
             (void)BbCp::CommandProcessor::ApplyGraphicsRegisterPacket(
-                regs, cur, dummy_csum, nullptr, false, &pso_epoch, &dyn_epoch);
+                regs, cur, dummy_csum, dirty, false, &pso_epoch, &dyn_epoch);
             if (valid) {
                 db_extent.raw = body[14];
                 db_uid = static_cast<u16>((op_word >> 20u) & 0xFFFu);
             } else {
                 db_extent.raw = 0u;
                 db_uid = 0u;
+            }
+            if (db_written) {
+                *db_written = true;
             }
             out.kind = MtPktKind::StateOnly;
             return out;
@@ -1603,7 +1819,7 @@ struct MtDecodedPkt {
                 return {};
             }
             (void)BbCp::CommandProcessor::ApplyGraphicsRegisterPacket(
-                regs, cur, dummy_csum, nullptr, false, &pso_epoch, &dyn_epoch);
+                regs, cur, dummy_csum, dirty, false, &pso_epoch, &dyn_epoch);
             out.kind = MtPktKind::Draw;
             out.is_indexed = true;
             out.start_index = body[4];
@@ -1614,7 +1830,7 @@ struct MtDecodedPkt {
                 return {};
             }
             (void)BbCp::CommandProcessor::ApplyGraphicsRegisterPacket(
-                regs, cur, dummy_csum, nullptr, false, &pso_epoch, &dyn_epoch);
+                regs, cur, dummy_csum, dirty, false, &pso_epoch, &dyn_epoch);
             out.kind = MtPktKind::Draw;
             out.is_indexed = true;
             out.start_index = 0u;
@@ -1625,11 +1841,25 @@ struct MtDecodedPkt {
                 return {};
             }
             (void)BbCp::CommandProcessor::ApplyGraphicsRegisterPacket(
-                regs, cur, dummy_csum, nullptr, false, &pso_epoch, &dyn_epoch);
+                regs, cur, dummy_csum, dirty, false, &pso_epoch, &dyn_epoch);
             out.kind = MtPktKind::Draw;
             out.is_indexed = false;
             out.start_index = 0u;
             return out;
+
+        case BbCp::DirectVk::Op::DrawBundle: {
+            const u32 draw_kind = (op_word >> 16u) & 0xFu;
+            if (body_words < 7u || draw_kind > 2u ||
+                !BbCp::CommandProcessor::ApplyDrawBundleRegs(
+                    regs, dirty, dirty && dirty->track_all_blocks, op_word, body, body_words,
+                    &pso_epoch, &dyn_epoch)) {
+                return {};
+            }
+            out.kind = MtPktKind::Draw;
+            out.is_indexed = (draw_kind != 1u);
+            out.start_index = (draw_kind == 0u) ? body[body_words - 2u] : 0u;
+            return out;
+        }
 
         case BbCp::DirectVk::Op::CopyBufferBatch: {
             const u32 count = op_word >> 16u;
@@ -1648,6 +1878,43 @@ struct MtDecodedPkt {
             out.kind = MtPktKind::CopyBatch;
             return out;
         }
+
+        case BbCp::DirectVk::Op::FillBuffer: {
+            if (body_words != 6u) {
+                return {};
+            }
+            BbCp::DirectVk::FillArgs args{};
+            std::memcpy(&args, body + 2u, sizeof(args));
+            if (!args.dst_va || args.byte_size == 0u ||
+                ((args.dst_va | args.byte_size) & 3ULL) != 0ULL) {
+                return {};
+            }
+            out.kind = MtPktKind::FillBuf;
+            return out;
+        }
+
+        case BbCp::DirectVk::Op::ClearColorImage:
+        case BbCp::DirectVk::Op::EliminateFastClear:
+            if (body_words != 18u) {
+                return {};
+            }
+            out.kind = MtPktKind::TargetRawOp;
+            return out;
+
+        case BbCp::DirectVk::Op::CopyTextureRegion:
+            if (body_words != 34u) {
+                return {};
+            }
+            out.kind = MtPktKind::TargetRawOp;
+            return out;
+
+        case BbCp::DirectVk::Op::DecompressDepth:
+        case BbCp::DirectVk::Op::ClearDepthStencil:
+            if (body_words != 20u) {
+                return {};
+            }
+            out.kind = MtPktKind::TargetRawOp;
+            return out;
 
         case BbCp::DirectVk::Op::TimestampQuery:
             if (body_words != 4u || (op_word >> 16u) > 2u) {
@@ -1737,30 +2004,124 @@ struct MtDecodedPkt {
         return {};
 
     case BbCp::Op::ClearState:
-        regs.SetDefaults();
+        (void)BbCp::CommandProcessor::ApplyGraphicsRegisterPacket(
+            regs, cur, dummy_csum, dirty, false, &pso_epoch, &dyn_epoch);
         cb_extent.fill(Gcn::CbDbExtent{});
         db_extent.raw = 0u;
         cb_uid.fill(0u);
         db_uid = 0u;
-        ++pso_epoch;
-        ++dyn_epoch;
+        if (cb_written_mask) {
+            *cb_written_mask = 0xFFu;
+        }
+        if (db_written) {
+            *db_written = true;
+        }
         out.kind = MtPktKind::InitHwState;
         return out;
 
+    case BbCp::Op::SetContextReg: {
+        if (body_words < 2u) {
+            return {};
+        }
+        const u32 ctx_off = body[0] & 0xFFFFu;
+        const u32 count_field = body_words - 1u;
+        if (0xA000u + ctx_off + count_field > Gcn::Regs::NumRegs) {
+            return {};
+        }
+        (void)BbCp::CommandProcessor::ApplyGraphicsRegisterPacket(
+            regs, cur, dummy_csum, dirty, false, &pso_epoch, &dyn_epoch);
+        constexpr u32 kDbZInfo = 0xA010u;
+        constexpr u32 kCbColor0Base = 0xA318u;
+        constexpr u32 kCbColor0Cmask = 0xA31Fu;
+        constexpr u32 kCbColorStride = 0xFu;
+        constexpr u32 kNopHeader = 0xC0001000u;
+        const u32 reg = 0xA000u + ctx_off;
+        const u32* const values = body + 1u;
+        if (reg >= kCbColor0Base && reg < kCbColor0Base + 8u * kCbColorStride &&
+            (reg - kCbColor0Base) % kCbColorStride == 0u) {
+            const u32 target = (reg - kCbColor0Base) / kCbColorStride;
+            cb_uid[target] = 0u;
+            if (cb_written_mask) {
+                *cb_written_mask |= static_cast<u8>(1u << target);
+            }
+            if ((count_field == 0x0Eu || count_field == 0x0Du || count_field == 0x0Bu) &&
+                avail_words >= pkt_words + 2u && values[count_field] == kNopHeader) {
+                cb_extent[target].raw = values[count_field + 1u];
+            } else {
+                cb_extent[target].raw = 0u;
+            }
+        } else if (reg >= kCbColor0Cmask && reg < kCbColor0Cmask + 8u * kCbColorStride &&
+                   (reg - kCbColor0Cmask) % kCbColorStride == 0u) {
+            const u32 target = (reg - kCbColor0Cmask) / kCbColorStride;
+            cb_uid[target] = 0u;
+            if (cb_written_mask) {
+                *cb_written_mask |= static_cast<u8>(1u << target);
+            }
+            if (count_field == 0x04u && avail_words >= pkt_words + 2u &&
+                values[count_field] == kNopHeader) {
+                cb_extent[target].raw = values[count_field + 1u];
+            }
+        } else if (reg == kDbZInfo) {
+            db_uid = 0u;
+            if (db_written) {
+                *db_written = true;
+            }
+            if (count_field == 8u && avail_words >= 24u && values[20] == kNopHeader) {
+                db_extent.raw = values[21];
+            } else {
+                db_extent.raw = 0u;
+            }
+        }
+        out.kind = MtPktKind::StateOnly;
+        return out;
+    }
+
     case BbCp::Op::SetShReg:
-        if ((body[0] & 0xFFFFu) >= 0x200u) {
-            return {}; // Reject compute SH registers
+        if (body_words < 2u || (body[0] & 0xFFFFu) >= 0x200u ||
+            0x2C00u + (body[0] & 0xFFFFu) + (body_words - 1u) > Gcn::Regs::NumRegs) {
+            return {}; // Reject compute or out-of-range SH registers
+        }
+        if (!BbCp::CommandProcessor::ApplyGraphicsRegisterPacket(
+                regs, cur, dummy_csum, dirty, false, &pso_epoch, &dyn_epoch)) {
+            return {};
+        }
+        out.kind = MtPktKind::StateOnly;
+        return out;
+
+    case BbCp::Op::SetConfigReg:
+        if (body_words < 2u ||
+            0x2000u + (body[0] & 0xFFFFu) + (body_words - 1u) > Gcn::Regs::NumRegs) {
+            return {};
+        }
+        if (!BbCp::CommandProcessor::ApplyGraphicsRegisterPacket(
+                regs, cur, dummy_csum, dirty, false, &pso_epoch, &dyn_epoch)) {
+            return {};
+        }
+        out.kind = MtPktKind::StateOnly;
+        return out;
+
+    case BbCp::Op::SetUconfigReg:
+        if (body_words < 2u ||
+            0xC000u + (body[0] & 0xFFFFu) + (body_words - 1u) > Gcn::Regs::NumRegs) {
+            return {};
+        }
+        if (!BbCp::CommandProcessor::ApplyGraphicsRegisterPacket(
+                regs, cur, dummy_csum, dirty, false, &pso_epoch, &dyn_epoch)) {
+            return {};
+        }
+        out.kind = MtPktKind::StateOnly;
+        return out;
+
+    case BbCp::Op::IndexBase:
+        if (body_words < 2u) {
+            return {};
         }
         [[fallthrough]];
-    case BbCp::Op::SetConfigReg:
-    case BbCp::Op::SetContextReg:
-    case BbCp::Op::SetUconfigReg:
     case BbCp::Op::IndexType:
     case BbCp::Op::NumInstances:
-    case BbCp::Op::IndexBase:
     case BbCp::Op::IndexBufferSize:
         if (!BbCp::CommandProcessor::ApplyGraphicsRegisterPacket(
-                regs, cur, dummy_csum, nullptr, false, &pso_epoch, &dyn_epoch)) {
+                regs, cur, dummy_csum, dirty, false, &pso_epoch, &dyn_epoch)) {
             return {};
         }
         out.kind = MtPktKind::StateOnly;
@@ -1771,7 +2132,7 @@ struct MtDecodedPkt {
             return {};
         }
         (void)BbCp::CommandProcessor::ApplyGraphicsRegisterPacket(
-            regs, cur, dummy_csum, nullptr, false, &pso_epoch, &dyn_epoch);
+            regs, cur, dummy_csum, dirty, false, &pso_epoch, &dyn_epoch);
         out.kind = MtPktKind::Draw;
         out.is_indexed = true;
         out.start_index = 0u;
@@ -1782,7 +2143,7 @@ struct MtDecodedPkt {
             return {};
         }
         (void)BbCp::CommandProcessor::ApplyGraphicsRegisterPacket(
-            regs, cur, dummy_csum, nullptr, false, &pso_epoch, &dyn_epoch);
+            regs, cur, dummy_csum, dirty, false, &pso_epoch, &dyn_epoch);
         out.kind = MtPktKind::Draw;
         out.is_indexed = true;
         out.start_index = body[1];
@@ -1793,7 +2154,7 @@ struct MtDecodedPkt {
             return {};
         }
         (void)BbCp::CommandProcessor::ApplyGraphicsRegisterPacket(
-            regs, cur, dummy_csum, nullptr, false, &pso_epoch, &dyn_epoch);
+            regs, cur, dummy_csum, dirty, false, &pso_epoch, &dyn_epoch);
         out.kind = MtPktKind::Draw;
         out.is_indexed = false;
         out.start_index = 0u;
@@ -1928,19 +2289,19 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
     // -------------------------------------------------------------------------
     // Phase 1: Pure read-only pre-scan (validates eligibility, warm PSOs, and
     // multi-subpass target layouts with ZERO mutation of `cmd_list_impl`).
-    // `GXGnmCommandContext_BeginCommandList` (`0x216aca0`) resets caches from the
-    // default hardware state without emitting `Op::InitDefaultHardwareState`
-    // into `cmdListImpl`, so `sregs.SetDefaults()` IS the valid initial state.
+    // Deferred worker contexts initialize hardware defaults via
+    // `EmitInitDefaultHardwareState(gen = 3u)` (`0xA100 = 0xFFFFFFFF`,
+    // `0xA202 = 0xCC0010`, `0xA1B1 = 2`, etc.) and reset dirty caches per list,
+    // so `InitGnmDefaultRegs(sregs, 3u)` is the exact initial register state.
     // -------------------------------------------------------------------------
     auto* mem = rasterizer.GetMemoryManager();
     auto& scratch = *w.compile_scratch;
-    scratch.pre_pkts.clear();
-    scratch.post_pkts.clear();
+    scratch.stream_items.clear();
     scratch.subpass_plans.clear();
     scratch.sealed_subpasses.clear();
 
     Gcn::Regs& sregs = *w.scan_regs;
-    sregs.SetDefaults();
+    BbCp::CommandProcessor::InitGnmDefaultRegs(sregs, 3u);
     w.pso_state.ResetForPass();
 
     std::array<Gcn::CbDbExtent, Gcn::NUM_COLOR_BUFFERS> scan_cb_extent{};
@@ -1951,6 +2312,7 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
     u64 scan_dyn_epoch = 0ULL;
 
     bool seen_draw = false;
+    bool force_new_subpass = false;
     u32 candidate_draws = 0;
     bool list_any_gbuffer = false;
     bool list_is_core_geom = false;
@@ -1980,13 +2342,7 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
                 cur, rem, sregs, scan_cb_extent, scan_db_extent, scan_cb_uid, scan_db_uid,
                 scan_pso_epoch, scan_dyn_epoch, mem, false);
             if (dp.kind == MtPktKind::Invalid || dp.pkt_words == 0u || dp.pkt_words > rem) {
-                if (g_mt_bad_pkt_samples.fetch_add(1u, std::memory_order_relaxed) < 8u) {
-                    const u32 hdr = cur[0];
-                    const u32 b0 = rem > 1u ? cur[1] : 0u;
-                    const u32 b1 = rem > 2u ? cur[2] : 0u;
-                    std::printf("[BB-MT] bail_pkt sample: hdr=0x%08x op=0x%02x b0=0x%08x b1=0x%08x\n",
-                                hdr, (hdr >> 8u) & 0xFFu, b0, b1);
-                }
+                MtMaybeLogBadPktSample(cur, rem);
                 MtNoteBail(MtBailReason::Pkt, cur_guest_frame);
                 return false;
             }
@@ -2001,27 +2357,25 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
                     MtNoteBail(MtBailReason::Pkt, cur_guest_frame);
                     return false;
                 }
-                scratch.pre_pkts.push_back({cur, dp.pkt_words});
+                scratch.stream_items.push_back(
+                    WorkerCompileScratch::StreamItem::Raw(cur, dp.pkt_words));
                 break;
 
-            case MtPktKind::CopyBatch:
-                // Execute staging DMA uploads on Stage B BEFORE ExecuteSecondaryCmds, while
-                // Phase 2 mirrors them in stream order into `scratch.chunk_copies` -> worker ring.
-                scratch.pre_pkts.push_back({cur, dp.pkt_words});
-                break;
-
-            case MtPktKind::SyncRetain:
-                if (!seen_draw) {
-                    scratch.pre_pkts.push_back({cur, dp.pkt_words});
-                } else {
-                    scratch.post_pkts.push_back({cur, dp.pkt_words});
+            case MtPktKind::TargetRawOp:
+                if (IsVsmTargetRawPacket(cur, dp.pkt_words)) {
+                    MtNoteBail(MtBailReason::Other, cur_guest_frame);
+                    return false;
                 }
-                break;
-
+                [[fallthrough]];
+            case MtPktKind::CopyBatch:
+            case MtPktKind::FillBuf:
+            case MtPktKind::SyncRetain:
             case MtPktKind::PostSyncRetain:
-                // Chunk-boundary ReleaseLabelsBatch / ReleaseU32LabelsBatch / EOP / EOS fences
-                // run AFTER all secondary command buffers of this list without blocking draws.
-                scratch.post_pkts.push_back({cur, dp.pkt_words});
+                scratch.stream_items.push_back(
+                    WorkerCompileScratch::StreamItem::Raw(cur, dp.pkt_words));
+                if (seen_draw) {
+                    force_new_subpass = true;
+                }
                 break;
 
             case MtPktKind::Draw: {
@@ -2035,11 +2389,17 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
                     MtNoteBail(MtBailReason::Pkt, cur_guest_frame);
                     return false;
                 }
+                PipelineCache::MtPsoFailKind pso_fail = PipelineCache::MtPsoFailKind::None;
                 const GraphicsPipeline* pso =
                     rasterizer.GetPipelineCache().SelectGraphicsPipelineMt(
-                        sregs, w.pso_state, {}, false, /*allow_compile_fallback=*/false);
+                        sregs, w.pso_state, {}, false, /*allow_compile_fallback=*/false,
+                        &pso_fail);
+                if (!pso) {
+                    MtNotePsoBail(pso_fail, /*unsafe_pso=*/false, cur_guest_frame);
+                    return false;
+                }
                 if (!IsPipelineMtSafe(pso)) {
-                    MtNoteBail(MtBailReason::Pso, cur_guest_frame);
+                    MtNotePsoBail(pso_fail, /*unsafe_pso=*/true, cur_guest_frame);
                     return false;
                 }
 
@@ -2064,8 +2424,8 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
                 const u32 cur_db_view = std::bit_cast<u32>(sregs.depth_view);
                 const u32 cur_htile = sregs.reg_array[0xA005];
 
-                bool need_new_subpass = !seen_draw;
-                if (seen_draw) {
+                bool need_new_subpass = !seen_draw || force_new_subpass;
+                if (seen_draw && !need_new_subpass) {
                     const auto& prev_sp = scratch.subpass_plans.back();
                     const u8 next_sc_submode =
                         calc_scene_color_submode(prev_sp.target_summary.is_scene_color, sregs);
@@ -2134,8 +2494,11 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
                     plan.writes_stencil = cur_writes_stencil;
                     plan.scene_color_submode = calc_scene_color_submode(ts.is_scene_color, sregs);
                     plan.CaptureRegs(sregs);
+                    const auto sp_idx = static_cast<u32>(scratch.subpass_plans.size());
                     scratch.subpass_plans.push_back(plan);
+                    scratch.stream_items.push_back(WorkerCompileScratch::StreamItem::Pass(sp_idx));
                     seen_draw = true;
+                    force_new_subpass = false;
                 }
                 ++candidate_draws;
                 break;
@@ -2178,20 +2541,8 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
             }
             return false;
         };
-        for (const auto& pk : scratch.pre_pkts) {
-            if (!can_place(pk.words)) {
-                MtNoteBail(MtBailReason::Other, cur_guest_frame);
-                return false;
-            }
-        }
-        for (u32 sp_i = 0; sp_i < planned_subpasses; ++sp_i) {
-            if (!can_place(7u)) { // Op::ExecuteSecondaryCmds = 7 dwords per subpass
-                MtNoteBail(MtBailReason::Other, cur_guest_frame);
-                return false;
-            }
-        }
-        for (const auto& pk : scratch.post_pkts) {
-            if (!can_place(pk.words)) {
+        for (const auto& item : scratch.stream_items) {
+            if (!can_place(item.words)) {
                 MtNoteBail(MtBailReason::Other, cur_guest_frame);
                 return false;
             }
@@ -2291,6 +2642,14 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
         sp.motion_slot = cur_motion_slot;
         sp.sampled_rt_refs = cur_sampled_rts;
         scratch.sealed_subpasses.push_back(sp);
+        for (u32 cb = 0; cb < Gcn::NUM_COLOR_BUFFERS; ++cb) {
+            if (plan.cb[cb]) {
+                scratch.NoteTargetWrite(plan.cb[cb].Address(), 4096ULL);
+            }
+        }
+        if ((plan.writes_depth || plan.writes_stencil) && plan.db.DepthAddress() != 0ULL) {
+            scratch.NoteTargetWrite(plan.db.DepthAddress(), 4096ULL);
+        }
 
         w.active_cmdbuf = vk::CommandBuffer{};
         w.is_recording = false;
@@ -2299,7 +2658,10 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
         w.push_tracker.InvalidateAll();
     };
 
-    auto abort_pass = [&](MtBailReason reason) noexcept -> bool {
+    auto abort_pass = [&](MtBailReason reason,
+                          PipelineCache::MtPsoFailKind pso_fail =
+                              PipelineCache::MtPsoFailKind::None,
+                          bool pso_unsafe = false) noexcept -> bool {
         if (w.is_recording && w.active_cmdbuf) {
             (void)w.active_cmdbuf.end();
         }
@@ -2318,7 +2680,11 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
         w.bound_pipeline = vk::Pipeline{};
         w.push_tracker.InvalidateAll();
         scratch.sealed_subpasses.clear();
-        MtNoteBail(reason, cur_guest_frame);
+        if (reason == MtBailReason::Pso) {
+            MtNotePsoBail(pso_fail, pso_unsafe, cur_guest_frame);
+        } else {
+            MtNoteBail(reason, cur_guest_frame);
+        }
         return false;
     };
 
@@ -2343,6 +2709,8 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
     const u32 guest_flip_epoch = TemporalUpscaler::GuestFlipsSubmittedForMt();
 
     scratch.chunk_copies.clear();
+    scratch.chunk_gpu_writes.clear();
+    scratch.chunk_target_writes.clear();
     scratch.ResetConstMemo();
     u64 local_copy_gen = 0x8000000000000000ULL;
 
@@ -2393,12 +2761,16 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
         if (!addr || req_sz < min_bytes || min_bytes == 0u) {
             return false;
         }
+        const u64 gw_gen = c.sc->MaxGpuWriteGenOverlapping(addr, req_sz);
         for (size_t i = c.sc->chunk_copies.size(); i-- > 0;) {
             const auto& cp = c.sc->chunk_copies[i];
+            if (cp.gen < gw_gen) {
+                break;
+            }
             if (addr >= cp.dst_va && addr < cp.dst_va + cp.byte_size) {
                 const u64 off = addr - cp.dst_va;
                 const u64 avail = cp.byte_size - off;
-                if (avail >= min_bytes) {
+                if (avail >= min_bytes && (gw_gen == 0ULL || avail >= req_sz)) {
                     out_ptr = reinterpret_cast<const u8*>(cp.src_va + off);
                     out_size = static_cast<u32>(std::min<u64>(avail, req_sz));
                     out_gen = cp.gen;
@@ -2406,6 +2778,9 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
                 }
                 break;
             }
+        }
+        if (gw_gen != 0ULL) {
+            return false;
         }
         if ((addr >= c.cue_base && addr < c.cue_end) ||
             VideoCore::DirectBuffers::IsTransientAuxCpuRing(addr, req_sz)) {
@@ -2457,18 +2832,25 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
         if (!addr || req_sz < min_b || min_b == 0u) {
             return false;
         }
+        const u64 gw_gen = c.sc->MaxGpuWriteGenOverlapping(addr, req_sz);
         for (size_t i = c.sc->chunk_copies.size(); i-- > 0;) {
             const auto& cp = c.sc->chunk_copies[i];
+            if (cp.gen < gw_gen) {
+                break;
+            }
             if (addr >= cp.dst_va && addr < cp.dst_va + cp.byte_size) {
                 const u64 off = addr - cp.dst_va;
                 const u64 avail = cp.byte_size - off;
-                if (avail >= min_b) {
+                if (avail >= min_b && (gw_gen == 0ULL || avail >= req_sz)) {
                     out_ptr = reinterpret_cast<const u8*>(cp.src_va + off);
                     out_size = static_cast<u32>(std::min<u64>(avail, req_sz));
                     return true;
                 }
                 break;
             }
+        }
+        if (gw_gen != 0ULL) {
+            return false;
         }
         if ((addr >= c.cue_base && addr < c.cue_end) ||
             VideoCore::DirectBuffers::IsTransientAuxCpuRing(addr, req_sz)) {
@@ -2511,12 +2893,16 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
         if (!addr || req_size == 0ULL) {
             return false;
         }
+        const u64 gw_gen = scratch.MaxGpuWriteGenOverlapping(addr, req_size);
         for (size_t i = scratch.chunk_copies.size(); i-- > 0;) {
             const auto& cp = scratch.chunk_copies[i];
+            if (cp.gen < gw_gen) {
+                break;
+            }
             if (addr >= cp.dst_va && addr < cp.dst_va + cp.byte_size) {
                 const u64 off = addr - cp.dst_va;
                 const u64 avail = cp.byte_size - off;
-                if (avail < min_span) {
+                if (avail < min_span || (gw_gen != 0ULL && avail < req_size)) {
                     return false;
                 }
                 const u32 up_sz = static_cast<u32>(std::min<u64>(req_size, avail));
@@ -2536,6 +2922,20 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
         const bool in_transient =
             (addr >= cue_base && addr < cue_end) ||
             VideoCore::DirectBuffers::IsTransientAuxCpuRing(addr, 1ULL);
+        if (gw_gen != 0ULL) {
+            if (!in_transient) {
+                const auto resolved = ResolveBuffer(worker_id, addr, req_size);
+                if (resolved && resolved.is_direct_vram && resolved.clamped_size >= min_span &&
+                    scratch.FullGpuWriteCovers(addr, resolved.clamped_size, gw_gen)) {
+                    out_buf = vk::Buffer{resolved.handle};
+                    out_off = resolved.offset;
+                    out_total_bytes = resolved.offset + resolved.clamped_size;
+                    return true;
+                }
+            }
+            return false;
+        }
+
         if (!in_transient && req_size <= scratch.cb_temp.size()) {
             u32 copied = 0;
             u64 s_gen = 0;
@@ -2586,8 +2986,12 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
         if (!ib_addr || ib_bytes == 0ULL) {
             return nullptr;
         }
+        const u64 gw_gen = scratch.MaxGpuWriteGenOverlapping(ib_addr, ib_bytes);
         for (size_t i = scratch.chunk_copies.size(); i-- > 0;) {
             const auto& cp = scratch.chunk_copies[i];
+            if (cp.gen < gw_gen) {
+                break;
+            }
             if (ib_addr >= cp.dst_va && ib_addr < cp.dst_va + cp.byte_size) {
                 const u64 off = ib_addr - cp.dst_va;
                 return (cp.byte_size - off >= ib_bytes)
@@ -2598,6 +3002,9 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
                 return nullptr;
             }
         }
+        if (gw_gen != 0ULL) {
+            return nullptr;
+        }
         if (WasCoarseRangeModifiedRecently(ib_addr, ib_bytes, cur_guest_frame) ||
             rasterizer.IsRegionGpuModifiedForMt(ib_addr, ib_bytes) ||
             (mem && mem->ClampRangeSize(ib_addr, ib_bytes) != ib_bytes)) {
@@ -2607,8 +3014,14 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
     };
 
     Gcn::Regs& rregs = *w.replay_regs;
-    rregs.SetDefaults();
+    BbCp::CommandProcessor::InitGnmDefaultRegs(rregs, 3u);
     w.pso_state.ResetForPass();
+    Gcn::RegDirty replay_dirty{};
+    replay_dirty.track_all_blocks = true;
+    scratch.replay_exact_words.reset();
+    replay_dirty.exact_words = &scratch.replay_exact_words;
+    u8 replay_cb_written_mask = 0u;
+    bool replay_db_written = false;
     std::array<Gcn::CbDbExtent, Gcn::NUM_COLOR_BUFFERS> replay_cb_extent{};
     Gcn::CbDbExtent replay_db_extent{};
     std::array<u16, Gcn::NUM_COLOR_BUFFERS> replay_cb_uid{};
@@ -2644,7 +3057,8 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
         while (rem > 0u) {
             const MtDecodedPkt dp = DecodeAndApplyMtPacket(
                 cur, rem, rregs, replay_cb_extent, replay_db_extent, replay_cb_uid, replay_db_uid,
-                replay_pso_epoch, replay_dyn_epoch, mem, false);
+                replay_pso_epoch, replay_dyn_epoch, mem, false, &replay_dirty,
+                &replay_cb_written_mask, &replay_db_written);
             if (dp.kind == MtPktKind::Invalid || dp.pkt_words == 0u) {
                 return abort_pass(MtBailReason::Pkt);
             }
@@ -2657,6 +3071,25 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
                     std::memcpy(&reg, body + 2u + i * 6u, sizeof(reg));
                     scratch.chunk_copies.push_back(
                         {reg.dst_va, reg.src_va, reg.byte_size, ++local_copy_gen});
+                }
+            } else if (dp.kind == MtPktKind::FillBuf) {
+                BbCp::DirectVk::FillArgs fargs{};
+                std::memcpy(&fargs, cur + 3u, sizeof(fargs));
+                scratch.chunk_gpu_writes.push_back(
+                    {fargs.dst_va, fargs.byte_size, ++local_copy_gen});
+                scratch.NoteTargetWrite(fargs.dst_va, fargs.byte_size);
+            } else if (dp.kind == MtPktKind::TargetRawOp) {
+                const auto raw_vk_op = BbCp::DirectVk::Op(cur[2] & 0xFFFFu);
+                if (raw_vk_op == BbCp::DirectVk::Op::CopyTextureRegion) {
+                    BbCp::DirectVk::CopyTextureRegionArgs cargs{};
+                    std::memcpy(&cargs, cur + 3u, sizeof(cargs));
+                    scratch.NoteTargetWrite(cargs.dst_va, cargs.dst_byte_size);
+                } else {
+                    VAddr raw_dst_va = 0;
+                    u32 raw_dst_sz = 0;
+                    std::memcpy(&raw_dst_va, cur + 3u, sizeof(VAddr));
+                    std::memcpy(&raw_dst_sz, cur + 5u, sizeof(u32));
+                    scratch.NoteTargetWrite(raw_dst_va, raw_dst_sz);
                 }
             } else if (dp.kind == MtPktKind::Draw) {
                 if (next_plan_idx < planned_subpasses &&
@@ -2678,17 +3111,19 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
                 const auto& cur_ts = cur_plan.target_summary;
                 const u32 num_instances = rregs.num_instances.NumInstances();
                 if (rregs.num_indices != 0u && num_instances != 0u) {
+                    PipelineCache::MtPsoFailKind p2_fail = PipelineCache::MtPsoFailKind::None;
                     const GraphicsPipeline* pso =
                         rasterizer.GetPipelineCache().SelectGraphicsPipelineMt(
-                            rregs, w.pso_state, {}, false, /*allow_compile_fallback=*/false);
+                            rregs, w.pso_state, {}, false, /*allow_compile_fallback=*/false,
+                            &p2_fail);
                     if (!pso) {
-                        return abort_pass(MtBailReason::Pso);
+                        return abort_pass(MtBailReason::Pso, p2_fail, false);
                     }
 
                     const auto* vs_stage = pso->GetStages()[u32(Shader::SwStage::Vertex)];
                     const auto* ps_stage = pso->GetStages()[u32(Shader::SwStage::Fragment)];
                     if (!vs_stage) {
-                        return abort_pass(MtBailReason::Pso);
+                        return abort_pass(MtBailReason::Pso, p2_fail, true);
                     }
 
                     // Flatten VS & PS user-data into worker heap scratch (+0 B TLS / stack).
@@ -3097,7 +3532,12 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
                                 if (!srv.view) {
                                     return abort_pass(MtBailReason::Target);
                                 }
-                                if (srv.needs_stage_b_transit) {
+                                const bool written_in_list =
+                                    scratch.OverlapsTargetWrite(tsharp.Address());
+                                if (written_in_list && !srv.id) {
+                                    return abort_pass(MtBailReason::Target);
+                                }
+                                if (srv.needs_stage_b_transit || (written_in_list && bool(srv.id))) {
                                     bool dup = false;
                                     for (u8 ri = 0; ri < cur_num_sampled_rts; ++ri) {
                                         const auto& ex = cur_sampled_rts[ri];
@@ -3319,6 +3759,9 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
     // -------------------------------------------------------------------------
     // Phase 3: Atomic Commit & Rewrite DCB Slots In-Place (`m_beginptr` intact).
     // -------------------------------------------------------------------------
+    for (const auto& gw : scratch.chunk_gpu_writes) {
+        InvalidateGuestCopyShadow(gw.dst_va, gw.byte_size);
+    }
     if (occ_block_id != 0xFFFFu) {
         rasterizer.SealMtOcclusionQueryBlock(occ_block_id);
         w.active_occ_block_id = 0xFFFFu;
@@ -3333,12 +3776,14 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
         scratch.staged_pkts.push_back({off, cnt});
     };
 
-    for (const auto& pk : scratch.pre_pkts) {
-        stage_pkt(pk.ptr, pk.words);
-    }
-
     u64 total_recorded_draws = 0ULL;
-    for (u32 sp_i = 0; sp_i < planned_subpasses; ++sp_i) {
+    for (const auto& item : scratch.stream_items) {
+        if (item.kind == WorkerCompileScratch::StreamItem::Kind::RawPkt) {
+            stage_pkt(item.ptr, item.words);
+            continue;
+        }
+        const u32 sp_i = item.subpass_idx;
+        const bool is_last_sp = (sp_i + 1u == planned_subpasses);
         const auto& sp = scratch.sealed_subpasses[sp_i];
         const u64 cmd_seq = ++w.cmd_seq_gen;
         if (sp.pool_idx < w.pools.size()) {
@@ -3346,7 +3791,7 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
             fp.last_cmd_seq = cmd_seq;
             fp.end_ring_pos = sp.end_ring_pos;
         }
-        const u16 sp_occ_id = (sp_i + 1u == planned_subpasses) ? occ_block_id : 0xFFFFu;
+        const u16 sp_occ_id = is_last_sp ? occ_block_id : 0xFFFFu;
 
         MtCompletedPassMeta& pub_meta = w.completed_meta[cmd_seq & (kCompletedMetaSlots - 1u)];
         pub_meta.sh_gfx_regs = sp.sh_gfx_regs;
@@ -3371,6 +3816,56 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
         if (pub_meta.has_camera_cb) {
             pub_meta.camera_cb_floats = camera_cb_floats;
         }
+        if (is_last_sp) {
+            pub_meta.has_end_sync = true;
+            pub_meta.end_reset = replay_dirty.reset;
+            pub_meta.end_db_written = replay_db_written;
+            pub_meta.end_cb_written_mask = replay_cb_written_mask;
+            pub_meta.end_stage_b_mask[0] = replay_dirty.stage_b_mask[0];
+            pub_meta.end_stage_b_mask[1] = replay_dirty.stage_b_mask[1];
+            pub_meta.end_dirty_blocks = replay_dirty.blocks;
+            pub_meta.end_cb_extent = replay_cb_extent;
+            pub_meta.end_db_extent = replay_db_extent;
+            pub_meta.end_cb_uid = replay_cb_uid;
+            pub_meta.end_db_uid = replay_db_uid;
+            pub_meta.end_span_headers.clear();
+            pub_meta.end_span_values.clear();
+
+            u32 span_start = ~0u;
+            u32 span_len = 0u;
+            const auto flush_span = [&]() {
+                if (span_len == 0u) {
+                    return;
+                }
+                pub_meta.end_span_headers.push_back((span_len << 16u) | span_start);
+                const u32* const src_w = &rregs.reg_array[span_start];
+                pub_meta.end_span_values.insert(pub_meta.end_span_values.end(), src_w,
+                                                src_w + span_len);
+                span_start = ~0u;
+                span_len = 0u;
+            };
+            replay_dirty.ForEachBlock([&](size_t blk) {
+                const u32 base = static_cast<u32>(blk * Gcn::RegDirty::BlockWords);
+                const u32 end =
+                    std::min<u32>(base + Gcn::RegDirty::BlockWords, Gcn::Regs::NumRegs);
+                for (u32 idx = base; idx < end; ++idx) {
+                    if (scratch.replay_exact_words.test(idx)) {
+                        if (span_len != 0u && idx == span_start + span_len && span_len < 0xFFFFu) {
+                            ++span_len;
+                        } else {
+                            flush_span();
+                            span_start = idx;
+                            span_len = 1u;
+                        }
+                    } else {
+                        flush_span();
+                    }
+                }
+            });
+            flush_span();
+        } else {
+            pub_meta.has_end_sync = false;
+        }
         pub_meta.published_seq.store(cmd_seq, std::memory_order_release);
 
         std::array<u32, 7> exec_pkt{};
@@ -3379,16 +3874,13 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
         exec_pkt[2] = u32(BbCp::DirectVk::Op::ExecuteSecondaryCmds);
         const BbCp::DirectVk::ExecuteSecondaryArgs exec_args{
             .worker_and_draws = (worker_id & 0xFFu) | (sp.recorded_draws << 8u),
-            .occ_and_flags = static_cast<u32>(sp_occ_id),
+            .occ_and_flags = static_cast<u32>(sp_occ_id) |
+                             (is_last_sp ? BbCp::DirectVk::kExecSecondaryFlagSyncRegs : 0u),
             .cmd_seq = cmd_seq,
         };
         std::memcpy(&exec_pkt[3], &exec_args, sizeof(exec_args));
         stage_pkt(exec_pkt.data(), static_cast<u32>(exec_pkt.size()));
         total_recorded_draws += sp.recorded_draws;
-    }
-
-    for (const auto& pk : scratch.post_pkts) {
-        stage_pkt(pk.ptr, pk.words);
     }
 
     const auto num_staged = static_cast<u32>(scratch.staged_pkts.size());

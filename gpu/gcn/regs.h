@@ -250,6 +250,7 @@ struct RegDirty {
         (((1ULL << 15u) - 1ULL) << (99u - 64u)) | (1ULL << (116u - 64u));
 
     std::bitset<NumBlocks> blocks;
+    std::bitset<Regs::NumRegs>* exact_words = nullptr;
     u64 stage_b_mask[2]{};
     bool track_all_blocks = true;
     bool reset = false; ///< CLEAR_STATE: the defaults, then only the blocks marked after it
@@ -302,6 +303,11 @@ struct RegDirty {
             for (u32 block = word / BlockWords; block <= last / BlockWords; ++block) {
                 blocks.set(block);
             }
+            if (exact_words) [[unlikely]] {
+                for (u32 w = word; w < end; ++w) {
+                    exact_words->set(w);
+                }
+            }
         }
     }
     template <typename T>
@@ -313,6 +319,9 @@ struct RegDirty {
     void Clear() {
         if (track_all_blocks) {
             blocks.reset();
+            if (exact_words) [[unlikely]] {
+                exact_words->reset();
+            }
         }
         stage_b_mask[0] = 0ULL;
         stage_b_mask[1] = 0ULL;

@@ -193,11 +193,17 @@ public:
     /// mutations), populating `worker_state.bound_stage_infos` and `worker_state.vsharps`.
     /// Cold misses fall back safely to `PrepareGraphicsPipeline` + `graphics_pipelines_mutex`
     /// (and optional synchronous `compile_fallback_mutex` when `allow_compile_fallback` is true).
+    enum class MtPsoFailKind : u8 {
+        None = 0,
+        SigMiss = 1,
+        SpecMiss = 2,
+    };
     const GraphicsPipeline* SelectGraphicsPipelineMt(const Gcn::Regs& regs,
                                                      MtWorkerPsoState& worker_state,
                                                      DrawIndirectParams params = {},
                                                      bool indirect = false,
-                                                     bool allow_compile_fallback = false);
+                                                     bool allow_compile_fallback = false,
+                                                     MtPsoFailKind* out_fail_kind = nullptr);
 
     /// Worker side of draw preparation: selects the pipeline key for `sel.regs` without
     /// creating anything. False when a program or permutation does not exist yet.

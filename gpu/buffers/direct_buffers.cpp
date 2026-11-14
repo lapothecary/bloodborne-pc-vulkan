@@ -1431,6 +1431,7 @@ MtResolvedBuffer Manager::TryResolveReadMt(VAddr addr, u64 requested_size,
                 .clamped_size = clamped,
                 .is_static_immutable = s.is_static_immutable,
                 .is_gpu_written = s.is_gpu_written,
+                .is_direct_vram = s.is_direct_vram,
             };
         }
         return {};
@@ -1503,6 +1504,8 @@ MtResolvedBuffer Manager::TryResolveReadMt(VAddr addr, u64 requested_size,
     const bool gpu_written =
         (e.buffer && e.buffer->uav_written) || e.gpu_written_without_shadow ||
         e.stream_override_buf != nullptr || e.dirty_writeback;
+    const bool direct_vram =
+        (e.buffer != nullptr && !e.stream_override_buf && !e.needs_zero_init);
     const MtReadMru::Slot populated{
         .base_addr = base,
         .raw_size = e.raw_size,
@@ -1512,6 +1515,7 @@ MtResolvedBuffer Manager::TryResolveReadMt(VAddr addr, u64 requested_size,
         .gen = locked_gen,
         .is_static_immutable = static_imm,
         .is_gpu_written = gpu_written,
+        .is_direct_vram = direct_vram,
     };
     lock.unlock();
 
