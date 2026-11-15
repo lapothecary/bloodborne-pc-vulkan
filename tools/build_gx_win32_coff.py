@@ -47,6 +47,12 @@ SYSV_LIBC_REWRITES = {
     "getenv": "__gx_sysv_getenv",
     "strtoul": "__gx_sysv_strtoul",
     "__isoc23_strtoul": "__gx_sysv_strtoul",
+    "strtoull": "__gx_sysv_strtoul",
+    "__isoc23_strtoull": "__gx_sysv_strtoul",
+    "strtol": "__gx_sysv_strtol",
+    "__isoc23_strtol": "__gx_sysv_strtol",
+    "strtoll": "__gx_sysv_strtol",
+    "__isoc23_strtoll": "__gx_sysv_strtol",
     "cosf": "__gx_sysv_cosf",
     "sinf": "__gx_sysv_sinf",
     "tanf": "__gx_sysv_tanf",
@@ -393,6 +399,10 @@ def main() -> int:
     )
     for s in final_ext:
         print(f"  U {s}")
+    bad_libc = [s for s in final_ext if s.startswith("__isoc23_")]
+    if bad_libc:
+        print(f"ERROR: unrewritten glibc C23 symbols in Windows archive: {bad_libc}", file=sys.stderr)
+        return 1
     return 0
 
 

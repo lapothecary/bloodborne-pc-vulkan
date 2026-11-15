@@ -78,6 +78,9 @@ char* GX_SYSV_ABI __gx_sysv_getenv(const char* name) noexcept {
 std::uint64_t GX_SYSV_ABI __gx_sysv_strtoul(const char* nptr, char** endptr, int base) noexcept {
     return static_cast<std::uint64_t>(std::strtoull(nptr, endptr, base));
 }
+std::int64_t GX_SYSV_ABI __gx_sysv_strtol(const char* nptr, char** endptr, int base) noexcept {
+    return static_cast<std::int64_t>(std::strtoll(nptr, endptr, base));
+}
 float GX_SYSV_ABI __gx_sysv_cosf(float x) noexcept { return std::cos(x); }
 float GX_SYSV_ABI __gx_sysv_sinf(float x) noexcept { return std::sin(x); }
 float GX_SYSV_ABI __gx_sysv_tanf(float x) noexcept { return std::tan(x); }
