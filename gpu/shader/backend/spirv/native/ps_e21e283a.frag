@@ -111,24 +111,33 @@ void main() {
     vec3 R = -V + N * (NdotV * 2.0);
     float horizon = clamp(dot(R, N_vert) + 1.0, 0.0, 1.0);
 
-    vec4 tex0 = texture(sampler2D(fs_img0, fs_samp0), uv1);
-    float tex2_x = texture(sampler2D(fs_img2, fs_samp2), xform_uv(d1 + 8u, uv0)).x;
-    vec2 tex3_xy = texture(sampler2D(fs_img3, fs_samp2), uv1).xy;
-
     float det_w = s3f(d2 + 24u);
+    vec4 tex0 = vec4(0.0, 0.0, 0.0, 1.0);
+    vec2 tex3_xy = vec2(0.0);
+    if (det_w != 0.0) {
+        tex0 = texture(sampler2D(fs_img0, fs_samp0), uv1);
+        tex3_xy = texture(sampler2D(fs_img3, fs_samp2), uv1).xy;
+    }
+    float tex2_x = texture(sampler2D(fs_img2, fs_samp2), xform_uv(d1 + 8u, uv0)).x;
+
     float gloss_scale = s3f(d2 + 8u) * 0.00390625;
     float gloss = (det_w * ((tex0.w * tex2_x + tex3_xy.x) - tex2_x) + tex2_x) * gloss_scale;
-    float mip_lod = min(6.0, 6.5 - gloss * 6.5);
-    vec3 c_uv = cube_uv(is_front ? R : vec3(R.x, abs(R.y), R.z));
-    vec3 env0 = textureLod(sampler2DArray(fs_img5, fs_samp3), c_uv, mip_lod).rgb;
-    vec3 env1 = textureLod(sampler2DArray(fs_img6, fs_samp3), c_uv, mip_lod).rgb;
 
     uint inst_off = uint(fs_in_attr0_p.w * 1.00001526) * 13u;
     uint sh_base = (inst_off + 8u) * 4u + d3;
     float e_w0 = ssbo_4.data[sh_base];
     float e_w1 = ssbo_4.data[sh_base + 1u];
     float e_w2 = ssbo_4.data[sh_base + 2u];
-    vec3 env_blend = (e_w0 * (-e_w1 * env1 + e_w2 * env0) + e_w1 * env1) * (horizon * horizon);
+    float c_env0 = e_w0 * e_w2;
+    float c_env1 = fma(-e_w0, e_w1, e_w1);
+    vec3 env_blend = vec3(0.0);
+    if (horizon > 0.0 && (c_env0 != 0.0 || c_env1 != 0.0)) {
+        float mip_lod = min(6.0, 6.5 - gloss * 6.5);
+        vec3 c_uv = cube_uv(is_front ? R : vec3(R.x, abs(R.y), R.z));
+        vec3 env0 = (c_env0 != 0.0) ? textureLod(sampler2DArray(fs_img5, fs_samp3), c_uv, mip_lod).rgb : vec3(0.0);
+        vec3 env1 = (c_env1 != 0.0) ? textureLod(sampler2DArray(fs_img6, fs_samp3), c_uv, mip_lod).rgb : vec3(0.0);
+        env_blend = fma(vec3(c_env0), env0, c_env1 * env1) * (horizon * horizon);
+    }
 
     // Stage 3: Specular + Albedo -> 6-MRT export
     vec3 tex4_rgb = texture(sampler2D(fs_img4, fs_samp2), xform_uv(d1 + 4u, uv0)).rgb;

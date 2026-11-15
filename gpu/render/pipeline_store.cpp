@@ -117,6 +117,22 @@ bool IsOpt33Phase2ShaderHash(u64 pgm_hash) noexcept {
     }
 }
 
+bool IsOpt35Phase5ShaderHash(u64 pgm_hash) noexcept {
+    switch (pgm_hash) {
+    // Phase 5.3: G-Buffer 2b Foliage/Cutout native VS + uniform detail/probe early-out PS
+    case 0x00000000ddbe557eULL:
+    case 0x00000000803b9d24ULL:
+    case 0x00000000b10c4f55ULL:
+    case 0x00000000e859b6d9ULL:
+    case 0x00000000e21e283aULL:
+    case 0x0000000070bb42afULL:
+    case 0x0000000052738b8aULL:
+        return true;
+    default:
+        return false;
+    }
+}
+
 std::string OptBinaryName(u64 pgm_hash, size_t perm_idx) {
     const bool hw_interp = Shader::Backend::SPIRV::HwInterpEnabled();
     const bool fast_fp = Shader::Backend::SPIRV::FastFpEnabled();
@@ -126,12 +142,14 @@ std::string OptBinaryName(u64 pgm_hash, size_t perm_idx) {
     if (hw_interp) {
         if (fast_fp) {
             prefix = native_sh
-                         ? (IsOpt33Phase2ShaderHash(pgm_hash)
-                                ? "opt33"
-                                : ((pgm_hash == 0x0000000024042a9bULL ||
-                                    pgm_hash == 0x00000000f55643deULL || ltb_patched)
-                                       ? "opt32"
-                                       : "opt31"))
+                         ? (IsOpt35Phase5ShaderHash(pgm_hash)
+                                ? "opt35"
+                                : (IsOpt33Phase2ShaderHash(pgm_hash)
+                                       ? "opt33"
+                                       : ((pgm_hash == 0x0000000024042a9bULL ||
+                                           pgm_hash == 0x00000000f55643deULL || ltb_patched)
+                                              ? "opt32"
+                                              : "opt31")))
                          : (ltb_patched ? "opt6_ltb2" : "opt6_nonat");
         } else {
             prefix = ltb_patched ? "opt3_ltb2" : "opt3_strict";
@@ -153,7 +171,7 @@ const char* DriverCacheBlobName() noexcept {
     const bool native_sh = Shader::Backend::SPIRV::NativeShadersEnabled();
     if (hw_interp) {
         if (fast_fp) {
-            return native_sh ? "vk_driver_cache_opt34" : "vk_driver_cache_opt6_nonat";
+            return native_sh ? "vk_driver_cache_opt35" : "vk_driver_cache_opt6_nonat";
         }
         return "vk_driver_cache_opt3_strict";
     }

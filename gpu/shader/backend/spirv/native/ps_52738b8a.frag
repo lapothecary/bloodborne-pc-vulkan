@@ -150,23 +150,32 @@ void main() {
     vec3 R = -V + N * (NdotV * 2.0);
     float horizon = clamp(dot(R, N_vert) + 1.0, 0.0, 1.0);
 
-    vec4 tex_detail0 = texture(sampler2D(fs_img0, fs_samp0), fs_in_attr7_p.xy);
+    float detail_w = s3f(d2 + 24u);
+    vec4 tex_detail0 = vec4(0.0, 0.0, 0.0, 1.0);
+    vec2 tex_detail5 = vec2(0.0);
+    if (detail_w != 0.0) {
+        tex_detail0 = texture(sampler2D(fs_img0, fs_samp0), fs_in_attr7_p.xy);
+        tex_detail5 = texture(sampler2D(fs_img5, fs_samp2), fs_in_attr7_p.xy).xy;
+    }
     float tex_rgh0_x = texture(sampler2D(fs_img3, fs_samp2), xform_uv2(d1 + 8u, uv0)).x;
     float tex_rgh1_x = texture(sampler2D(fs_img4, fs_samp2), xform_uv2(d1 + 36u, uv1)).x;
-    vec2 tex_detail5 = texture(sampler2D(fs_img5, fs_samp2), fs_in_attr7_p.xy).xy;
 
     float rgh_mix = blend_w * (tex_rgh1_x - tex_rgh0_x) + tex_rgh0_x;
-    float detail_w = s3f(d2 + 24u);
     float gloss_scale = s3f(d2 + 8u) * 0.00390625;
     float gloss = (detail_w * ((rgh_mix * tex_detail0.w + tex_detail5.x) - rgh_mix) + rgh_mix) * gloss_scale;
-    float mip = min(6.0, 6.5 - gloss * 6.5);
-    vec3 cube_tc = cubemap_coords(R);
-    vec3 env0 = textureLod(sampler2DArray(fs_img10, fs_samp3), cube_tc, mip).rgb;
-    vec3 env1 = textureLod(sampler2DArray(fs_img11, fs_samp3), cube_tc, mip).rgb;
 
     uint inst_base = uint(fs_in_attr0_p.w * 1.00001526) * 13u;
     vec4 env_w = load_s4_v4((inst_base + 8u) * 4u + d3);
-    vec3 env_col = (env_w.x * (-env_w.y * env1 + env_w.z * env0) + env_w.y * env1) * (horizon * horizon);
+    float c_env0 = env_w.x * env_w.z;
+    float c_env1 = fma(-env_w.x, env_w.y, env_w.y);
+    vec3 env_col = vec3(0.0);
+    if (horizon > 0.0 && (c_env0 != 0.0 || c_env1 != 0.0)) {
+        float mip = min(6.0, 6.5 - gloss * 6.5);
+        vec3 cube_tc = cubemap_coords(R);
+        vec3 env0 = (c_env0 != 0.0) ? textureLod(sampler2DArray(fs_img10, fs_samp3), cube_tc, mip).rgb : vec3(0.0);
+        vec3 env1 = (c_env1 != 0.0) ? textureLod(sampler2DArray(fs_img11, fs_samp3), cube_tc, mip).rgb : vec3(0.0);
+        env_col = fma(vec3(c_env0), env0, c_env1 * env1) * (horizon * horizon);
+    }
 
     // Stage 3: Specular + 2-Layer Albedo + Uniform-gated AO -> 6-MRT export
     vec2 uv_alb0 = xform_uv2(d1 + 0u, uv0);

@@ -130,6 +130,10 @@
 #include "bbgpu/shaders/ps_ff902740_frag.h"
 #include "bbgpu/shaders/ps_e80526cc_frag.h"
 #include "bbgpu/shaders/vs_3deaa573_vert.h"
+#include "bbgpu/shaders/vs_803b9d24_vert.h"
+#include "bbgpu/shaders/vs_b10c4f55_vert.h"
+#include "bbgpu/shaders/vs_ddbe557e_vert.h"
+#include "bbgpu/shaders/vs_e859b6d9_vert.h"
 
 namespace Shader::Backend::SPIRV {
 
@@ -198,7 +202,7 @@ struct NativeShaderCandidate {
     const char* label;
 };
 
-constexpr std::array<NativeShaderCandidate, 119> kNativeRegistry{{
+constexpr std::array<NativeShaderCandidate, 123> kNativeRegistry{{
     {0x000000000f61fd27ull, PS_0F61FD27_VSM_BLUR_FRAG, "ps_0f61fd27_vsm_blur"},
     {0x000000001ae03d75ull, PS_1AE03D75_VSM_MOMENT_CLDIST_FRAG, "ps_1ae03d75_vsm_moment_cldist"},
     {0x000000001ae03d75ull, PS_1AE03D75_VSM_MOMENT_NOCLIP_FRAG, "ps_1ae03d75_vsm_moment_noclip"},
@@ -318,6 +322,10 @@ constexpr std::array<NativeShaderCandidate, 119> kNativeRegistry{{
     {0x00000000ff902740ull, PS_FF902740_FRAG, "ps_ff902740_yebis_coc"},
     {0x00000000e80526ccull, PS_E80526CC_FRAG, "ps_e80526cc_yebis_tap7"},
     {0x000000003deaa573ull, VS_3DEAA573_VERT, "vs_3deaa573_gbuf_skin4"},
+    {0x00000000ddbe557eull, VS_DDBE557E_VERT, "vs_ddbe557e_gbuf_foliage_skin4"},
+    {0x00000000803b9d24ull, VS_803B9D24_VERT, "vs_803b9d24_gbuf_foliage_uv2"},
+    {0x00000000b10c4f55ull, VS_B10C4F55_VERT, "vs_b10c4f55_gbuf_foliage_dual_skin4"},
+    {0x00000000e859b6d9ull, VS_E859B6D9_VERT, "vs_e859b6d9_gbuf_foliage_inst_uv2"},
 }};
 
 struct DescSlot {
@@ -621,6 +629,23 @@ u32 NativeShadersMaxIdx() noexcept {
 
 namespace {
 
+constexpr size_t ExpectedVsConsecutiveBufs(u64 pgm_hash) noexcept {
+    switch (pgm_hash) {
+    case 0x000000008747a367ull:
+    case 0x0000000024042a9bull:
+        return 1u;
+    case 0x000000003deaa573ull:
+    case 0x00000000ddbe557eull:
+    case 0x00000000803b9d24ull:
+    case 0x00000000e859b6d9ull:
+        return 4u;
+    case 0x00000000b10c4f55ull:
+        return 5u;
+    default:
+        return 0u;
+    }
+}
+
 s32 ExtractFirstConsecutiveBufSlot(std::span<const u32> spv, size_t expected_count) {
     if (expected_count == 0u || spv.size() < 5 || spv[0] != kSpirvMagic) {
         return -1;
@@ -820,10 +845,9 @@ bool TryReplaceWithNativeShader(u64 pgm_hash, const std::vector<u32>& ref_spv,
         return false;
     }
     s32 vs_first_buf_slot = -1;
-    if (pgm_hash == 0x000000008747a367ull || pgm_hash == 0x0000000024042a9bull ||
-        pgm_hash == 0x000000003deaa573ull) {
-        const size_t expected_bufs = (pgm_hash == 0x000000003deaa573ull) ? 4u : 1u;
-        vs_first_buf_slot = ExtractFirstConsecutiveBufSlot(ref_spv, expected_bufs);
+    const size_t expected_vs_bufs = ExpectedVsConsecutiveBufs(pgm_hash);
+    if (expected_vs_bufs != 0u) {
+        vs_first_buf_slot = ExtractFirstConsecutiveBufSlot(ref_spv, expected_vs_bufs);
         if (vs_first_buf_slot < 0) {
             return false;
         }
@@ -959,8 +983,7 @@ bool TryReplaceWithNativeShader(u64 pgm_hash, const std::vector<u32>& ref_spv,
                 pos += wc;
             }
         }
-        if ((pgm_hash == 0x000000008747a367ull || pgm_hash == 0x0000000024042a9bull ||
-             pgm_hash == 0x000000003deaa573ull) &&
+        if (expected_vs_bufs != 0u &&
             !SpecializeConstantId0(out_spv, static_cast<u32>(vs_first_buf_slot))) {
             return false;
         }

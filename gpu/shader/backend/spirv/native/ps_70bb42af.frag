@@ -104,10 +104,15 @@ void main() {
         return;
     }
 
-    const vec4 det_alb = texture(sampler2D(fs_img1, fs_samp1), uv1);
+    const float det_w = s4f(d3 + 24u);
+    vec4 det_alb = vec4(0.0, 0.0, 0.0, 1.0);
+    vec2 det_gs = vec2(0.0);
+    if (det_w != 0.0) {
+        det_alb = texture(sampler2D(fs_img1, fs_samp1), uv1);
+        det_gs = texture(sampler2D(fs_img5, fs_samp3), uv1).xy;
+    }
     const vec4 nrm_tex = texture(sampler2D(fs_img3, fs_samp2), xform_uv(d1 + 12u, uv0));
     const float gloss_base = texture(sampler2D(fs_img4, fs_samp3), xform_uv(d1 + 8u, uv0)).x;
-    const vec2 det_gs = texture(sampler2D(fs_img5, fs_samp3), uv1).xy;
     const vec3 spec_tex = texture(sampler2D(fs_img6, fs_samp3), xform_uv(d1 + 4u, uv0)).rgb;
     if (keep == 0.0) {
         return;
@@ -128,13 +133,8 @@ void main() {
 
     const float NdotV = dot(N, V);
     const vec3 R = -V + N * (2.0 * NdotV);
-    const float det_w = s4f(d3 + 24u);
     const float gloss_scale = s4f(d3 + 8u) * 0.00390625;
     const float gloss = (det_w * ((det_alb.w * gloss_base + det_gs.x) - gloss_base) + gloss_base) * gloss_scale;
-    const float mip_lod = min(6.0, 6.5 - gloss * 6.5);
-    const vec3 cuv = cube_uv(is_front ? R : vec3(R.x, abs(R.y), R.z));
-    const vec3 env0 = textureLod(sampler2DArray(fs_img7, fs_samp0), cuv, mip_lod).rgb;
-    const vec3 env1 = textureLod(sampler2DArray(fs_img8, fs_samp0), cuv, mip_lod).rgb;
 
     const vec4 sh_8 = load_s3_v4(d2 + (mat_row + 8u) * 4u);
     const vec4 sh_9 = load_s3_v4(d2 + (mat_row + 9u) * 4u);
@@ -145,7 +145,16 @@ void main() {
     const vec3 sh_amb = max(vec3(0.0), max(sh_w + sh_dot, (sh_w - sh_dot) * 0.85));
 
     const float r_occ = clamp(dot(R, N_vert) + 1.0, 0.0, 1.0);
-    const vec3 env_col = (sh_8.x * (sh_8.z * env0 - sh_8.y * env1) + sh_8.y * env1) * (r_occ * r_occ);
+    const float c_env0 = sh_8.x * sh_8.z;
+    const float c_env1 = fma(-sh_8.x, sh_8.y, sh_8.y);
+    vec3 env_col = vec3(0.0);
+    if (r_occ > 0.0 && (c_env0 != 0.0 || c_env1 != 0.0)) {
+        const float mip_lod = min(6.0, 6.5 - gloss * 6.5);
+        const vec3 cuv = cube_uv(is_front ? R : vec3(R.x, abs(R.y), R.z));
+        const vec3 env0 = (c_env0 != 0.0) ? textureLod(sampler2DArray(fs_img7, fs_samp0), cuv, mip_lod).rgb : vec3(0.0);
+        const vec3 env1 = (c_env1 != 0.0) ? textureLod(sampler2DArray(fs_img8, fs_samp0), cuv, mip_lod).rgb : vec3(0.0);
+        env_col = fma(vec3(c_env0), env0, c_env1 * env1) * (r_occ * r_occ);
+    }
     const vec3 F0_base = (spec_tex.z == 0.0 && spec_tex.y == 0.0) ? vec3(spec_tex.x) : spec_tex;
     const vec3 F0 = det_w * ((det_alb.w * F0_base + vec3(det_gs.y * det_gs.y)) - F0_base) + F0_base;
     const float fresnel = clamp((1.0 + NdotV) * (1.0 + NdotV), 0.0, 1.0) * schlick5(1.0 - clamp(NdotV, 0.0, 1.0));
