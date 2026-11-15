@@ -53,6 +53,8 @@ struct SceneOcclusionCuller {
     static constexpr float kSkelTrackDistSq = 1.00f;     // 1.0m per-frame 3D anchor tracking radius
     static constexpr float kSkelSameSpotDistSq = 0.04f;  // 0.2m same-frame duplicate threshold
 
+    static constexpr size_t kMeshFilterSlots = 8192; // 16 KiB L1d active-occluded mesh refcounts
+
     struct Entry {
         std::atomic<u64> key{0};
         std::atomic<u32> last_seen_frame{0};
@@ -61,9 +63,11 @@ struct SceneOcclusionCuller {
         std::atomic<float> pos_y{0.0f};
         std::atomic<float> pos_z{0.0f};
         std::atomic<u16> zero_streak{0};
+        std::atomic<u16> mesh_slot{0};
         std::atomic<u8> probe_in_flight{0};
         std::atomic<u8> multi_occ{0};
         std::atomic<u8> is_skel{0};
+        std::atomic<u8> occ_active{0};
     };
 
     enum class MtBlockState : u8 {
@@ -89,8 +93,8 @@ struct SceneOcclusionCuller {
     bool skel_occ_cull = true;
     bool mt_occ_cull = true;
     bool micro_shadow_cull = true;
-    std::atomic<u32> cur_frame{1};
-    std::atomic<u32> stage_a_frame{8};
+    std::atomic<u32> cur_frame{16};
+    std::atomic<u32> stage_a_frame{16};
     u32 cur_slice = 0;
     u32 gbuf_draws_in_frame = 0;
     u32 stage_a_gbuf_draws = 0;
@@ -116,11 +120,13 @@ struct SceneOcclusionCuller {
 
     std::array<MtQueryBlock, MtQueryBlocks> mt_blocks{};
     std::array<Entry, TotalEntries> entries{};
+    std::array<std::atomic<u16>, kMeshFilterSlots> active_mesh_occ{};
 
     std::atomic<u64> stat_gbuf_candidates{0};
     std::atomic<u64> stat_gbuf_skipped{0};
     std::atomic<u64> stat_stage_a_skipped{0};
     std::atomic<u64> stat_stage_b_fallbacks{0};
+    std::atomic<u64> stat_vis_offload{0};
     std::atomic<u64> stat_gbuf_probed{0};
     std::atomic<u64> stat_skel_candidates{0};
     std::atomic<u64> stat_skel_skipped{0};
@@ -129,8 +135,10 @@ struct SceneOcclusionCuller {
     std::atomic<u64> stat_light_candidates{0};
     std::atomic<u64> stat_light_skipped{0};
 
-    // Phase 5.2b: Zero-memcpy Stage-A copy redirect + settled `DirectBuffers::cpu_shadow` MRU.
-    static constexpr size_t kCoarseBuckets = 65536; // 256 KiB granules across 40-bit VA space
+    // Phase 5.2c: Active-occluded L1 pre-filter + exact non-self-wiping Stage-A copy redirect +
+    // 256-byte fine write-frame settled `DirectBuffers::shadow_dir` MRU.
+    static constexpr size_t kCoarseBuckets = 65536;     // 256 KiB granules across 40-bit VA space
+    static constexpr size_t kFineWriteBuckets = 65536;  // 256 B fine write-frame slots (256 KiB)
     static constexpr u32 kTinyRedirMax = 512u;
     static constexpr u32 kTinyRedirShift = 9u;
     static constexpr size_t kTinyRedirSets = 512;
@@ -148,12 +156,12 @@ struct SceneOcclusionCuller {
     struct RedirSlot {
         VAddr dst_va{0};
         VAddr src_va{0};
-        u64 src_cue_stamp{0};
         u32 byte_size{0};
         u32 dst_e0{0};
         u32 dst_e1{0};
         u32 recorded_frame{0};
         u32 last_use{0};
+        u8 src_is_ring{0};
     };
 
     struct SettledMruSlot {
@@ -165,6 +173,7 @@ struct SceneOcclusionCuller {
 
     std::vector<u32> coarse_epoch_256k;
     std::vector<u32> last_write_frame_256k;
+    std::vector<u32> last_write_frame_256b;
     std::vector<RedirSlot> tiny_redir;
     std::vector<RedirSlot> small_redir;
     std::vector<RedirSlot> large_redir;
@@ -172,8 +181,38 @@ struct SceneOcclusionCuller {
     SettledMruSlot last_settled_hit{};
     u32 redir_clock = 0;
 
+    [[nodiscard]] static constexpr u16 ComputeMeshFilterSlot(VAddr index_address, u64 vs_hash,
+                                                             u32 num_indices) noexcept {
+        u64 h = index_address ^ (vs_hash * 0x9E3779B97F4A7C15ULL) ^
+                (u64(num_indices) * 0xBF58476D1CE4E5B9ULL);
+        h ^= h >> 32;
+        h ^= h >> 16;
+        return static_cast<u16>(h & (kMeshFilterSlots - 1u));
+    }
+
+    void SetEntryOccActive(Entry& e, bool active) noexcept {
+        if (active) {
+            if (e.occ_active.exchange(1u, std::memory_order_relaxed) == 0u) {
+                const u16 slot =
+                    e.mesh_slot.load(std::memory_order_relaxed) & u16(kMeshFilterSlots - 1u);
+                active_mesh_occ[slot].fetch_add(1u, std::memory_order_relaxed);
+            }
+        } else {
+            if (e.occ_active.exchange(0u, std::memory_order_relaxed) != 0u) {
+                const u16 slot =
+                    e.mesh_slot.load(std::memory_order_relaxed) & u16(kMeshFilterSlots - 1u);
+                active_mesh_occ[slot].fetch_sub(1u, std::memory_order_relaxed);
+            }
+        }
+    }
+
     [[nodiscard]] static constexpr size_t CoarseBucket(VAddr addr) noexcept {
         return static_cast<size_t>(((addr >> 18) ^ (addr >> 34)) & (kCoarseBuckets - 1));
+    }
+    [[nodiscard]] static constexpr size_t FineWriteBucket256B(u64 gran256) noexcept {
+        u64 h = gran256 * 0x9E3779B97F4A7C15ULL;
+        h ^= h >> 32;
+        return static_cast<size_t>(h & (kFineWriteBuckets - 1));
     }
     [[nodiscard]] static constexpr size_t PageSetIdx(VAddr page, size_t num_sets) noexcept {
         u64 h = page * 0x9E3779B97F4A7C15ULL;
@@ -185,17 +224,38 @@ struct SceneOcclusionCuller {
                                    (kSettledMruSlots - 1));
     }
 
-    void StampAndBumpCoarse(VAddr addr, u64 size, u32 cur_f, bool bump_epoch) noexcept {
-        if (!addr || size == 0 || last_write_frame_256k.empty()) {
+    [[nodiscard]] static bool IsReadableCpuSource(VAddr src_va, u32 byte_size,
+                                                  bool& out_is_ring) noexcept {
+        out_is_ring = false;
+        if (!src_va || byte_size == 0u) {
+            return false;
+        }
+        if (VideoCore::DirectBuffers::IsTransientCueHeap(src_va, byte_size) ||
+            VideoCore::DirectBuffers::IsTransientAuxCpuRing(src_va, byte_size)) {
+            out_is_ring = true;
+            return true;
+        }
+        if (VideoCore::DirectBuffers::OverlapsNativeOwnedRange(src_va, byte_size)) {
+            return false;
+        }
+        uintptr_t mapped_end = 0;
+        return BbLookupMappedEnd(src_va, mapped_end) && byte_size <= (mapped_end - src_va);
+    }
+
+    void StampWriteFrames(VAddr addr, u64 size, u32 cur_f) noexcept {
+        if (!addr || size == 0 || last_write_frame_256b.empty()) {
+            return;
+        }
+        if (size <= 4096ULL) {
+            const u64 g_lo = addr >> 8;
+            const u64 g_hi = (addr + size - 1ULL) >> 8;
+            for (u64 g = g_lo; g <= g_hi; ++g) {
+                last_write_frame_256b[FineWriteBucket256B(g)] = cur_f;
+            }
             return;
         }
         if (size > (16ULL << 20)) {
             std::fill(last_write_frame_256k.begin(), last_write_frame_256k.end(), cur_f);
-            if (bump_epoch) {
-                for (u32& e : coarse_epoch_256k) {
-                    ++e;
-                }
-            }
             return;
         }
         const u64 first_p = addr >> 18;
@@ -203,10 +263,49 @@ struct SceneOcclusionCuller {
         for (u64 p = first_p; p <= last_p; ++p) {
             const size_t b = static_cast<size_t>((p ^ (p >> 16)) & (kCoarseBuckets - 1));
             last_write_frame_256k[b] = cur_f;
-            if (bump_epoch) {
-                ++coarse_epoch_256k[b];
-            }
         }
+    }
+
+    void InvalidateRedirectRange(VAddr addr, u64 size) noexcept {
+        if (!addr || size == 0 || tiny_redir.empty()) {
+            return;
+        }
+        const VAddr end = (size > (~0ULL - addr)) ? ~0ULL : (addr + size);
+        const u64 span = end - addr;
+        if (span > kLargeRedirMax) {
+            if (span > (16ULL << 20)) {
+                for (u32& e : coarse_epoch_256k) {
+                    ++e;
+                }
+            } else {
+                const u64 first_p = addr >> 18;
+                const u64 last_p = (end - 1ULL) >> 18;
+                for (u64 p = first_p; p <= last_p; ++p) {
+                    ++coarse_epoch_256k[static_cast<size_t>((p ^ (p >> 16)) &
+                                                            (kCoarseBuckets - 1))];
+                }
+            }
+            return;
+        }
+        const auto inv_tier = [&](RedirSlot* table, u32 max_bytes, u32 shift, size_t num_sets,
+                                  size_t ways) noexcept {
+            const VAddr p_lo = (addr >= max_bytes) ? ((addr - max_bytes) >> shift) : 0ULL;
+            const VAddr p_hi = (end - 1ULL) >> shift;
+            for (VAddr p = p_lo; p <= p_hi; ++p) {
+                const size_t set_base = PageSetIdx(p, num_sets) * ways;
+                for (size_t w = 0; w < ways; ++w) {
+                    auto& s = table[set_base + w];
+                    if (s.byte_size != 0u && s.dst_va < end && addr < (s.dst_va + s.byte_size)) {
+                        s.byte_size = 0u;
+                    }
+                }
+            }
+        };
+        inv_tier(tiny_redir.data(), kTinyRedirMax, kTinyRedirShift, kTinyRedirSets, kTinyRedirWays);
+        inv_tier(small_redir.data(), kSmallRedirMax, kSmallRedirShift, kSmallRedirSets,
+                 kSmallRedirWays);
+        inv_tier(large_redir.data(), kLargeRedirMax, kLargeRedirShift, kLargeRedirSets,
+                 kLargeRedirWays);
     }
 
     void NoteStageACpuCopyBatch(const u32* raw_regions, u32 count) noexcept {
@@ -218,19 +317,19 @@ struct SceneOcclusionCuller {
         for (u32 i = 0; i < count; ++i) {
             Rasterizer::DirectCopyRegion reg{};
             std::memcpy(&reg, raw_regions + i * 6u, sizeof(reg));
-            if (reg.dst_va == 0 || reg.byte_size == 0) {
-                continue;
-            }
-            if (reg.reserved != gx_direct_vk::kCopyFlagKnownCpuSource ||
-                reg.byte_size > kLargeRedirMax || reg.src_va == 0 ||
+            if (reg.dst_va == 0 || reg.byte_size == 0 ||
                 !VideoCore::DirectBuffers::OverlapsNativeOwnedRange(reg.dst_va, reg.byte_size)) {
-                StampAndBumpCoarse(reg.dst_va, reg.byte_size, cur_f, /*bump_epoch=*/true);
                 continue;
             }
+            StampWriteFrames(reg.dst_va, reg.byte_size, cur_f);
 
-            StampAndBumpCoarse(reg.dst_va, reg.byte_size, cur_f, /*bump_epoch=*/false);
-            const u64 cue_stamp =
-                VideoCore::DirectBuffers::ComputeTransientCueStamp(reg.src_va, reg.byte_size);
+            bool src_is_ring = false;
+            if (reg.reserved != gx_direct_vk::kCopyFlagKnownCpuSource || reg.byte_size < 48u ||
+                reg.byte_size > kLargeRedirMax ||
+                !IsReadableCpuSource(reg.src_va, reg.byte_size, src_is_ring)) {
+                InvalidateRedirectRange(reg.dst_va, reg.byte_size);
+                continue;
+            }
 
             RedirSlot* table = nullptr;
             size_t set_base = 0;
@@ -259,9 +358,9 @@ struct SceneOcclusionCuller {
                 if (s.dst_va == reg.dst_va && s.byte_size == reg.byte_size && s.dst_e0 == cur_e0 &&
                     s.dst_e1 == cur_e1) {
                     s.src_va = reg.src_va;
-                    s.src_cue_stamp = cue_stamp;
                     s.recorded_frame = cur_f;
                     s.last_use = ++redir_clock;
+                    s.src_is_ring = src_is_ring ? 1u : 0u;
                     updated_in_place = true;
                     break;
                 }
@@ -270,9 +369,7 @@ struct SceneOcclusionCuller {
                 continue;
             }
 
-            StampAndBumpCoarse(reg.dst_va, reg.byte_size, cur_f, /*bump_epoch=*/true);
-            const u32 new_e0 = coarse_epoch_256k[CoarseBucket(reg.dst_va)];
-            const u32 new_e1 = coarse_epoch_256k[CoarseBucket(reg.dst_va + reg.byte_size - 1u)];
+            InvalidateRedirectRange(reg.dst_va, reg.byte_size);
             size_t victim = 0;
             u32 oldest = ~0u;
             for (size_t w = 0; w < ways; ++w) {
@@ -291,12 +388,12 @@ struct SceneOcclusionCuller {
             auto& dst_s = table[set_base + victim];
             dst_s.dst_va = reg.dst_va;
             dst_s.src_va = reg.src_va;
-            dst_s.src_cue_stamp = cue_stamp;
             dst_s.byte_size = reg.byte_size;
-            dst_s.dst_e0 = new_e0;
-            dst_s.dst_e1 = new_e1;
+            dst_s.dst_e0 = cur_e0;
+            dst_s.dst_e1 = cur_e1;
             dst_s.recorded_frame = cur_f;
             dst_s.last_use = ++redir_clock;
+            dst_s.src_is_ring = src_is_ring ? 1u : 0u;
         }
     }
 
@@ -304,8 +401,8 @@ struct SceneOcclusionCuller {
         if (!enabled || !stage_a_occ_cull || !addr || size == 0 || last_write_frame_256k.empty()) {
             return;
         }
-        StampAndBumpCoarse(addr, size, stage_a_frame.load(std::memory_order_relaxed),
-                           /*bump_epoch=*/true);
+        StampWriteFrames(addr, size, stage_a_frame.load(std::memory_order_relaxed));
+        InvalidateRedirectRange(addr, size);
     }
 
     [[nodiscard]] const u8* LookupStageARedirect(VAddr addr, u32 cb_size, u32 frame_tag) noexcept {
@@ -335,13 +432,8 @@ struct SceneOcclusionCuller {
                         s.byte_size = 0u;
                         continue;
                     }
-                    if (s.src_cue_stamp != 0ULL) {
-                        if (VideoCore::DirectBuffers::ComputeTransientCueStamp(
-                                s.src_va, s.byte_size) != s.src_cue_stamp) [[unlikely]] {
-                            s.byte_size = 0u;
-                            continue;
-                        }
-                    } else if (s.recorded_frame != frame_tag) {
+                    const u32 age = frame_tag - s.recorded_frame;
+                    if (s.src_is_ring != 0u ? (age > 4u) : (age != 0u)) {
                         s.byte_size = 0u;
                         continue;
                     }
@@ -369,13 +461,21 @@ struct SceneOcclusionCuller {
 
     [[nodiscard]] const u8* LookupSettledMirror(const VideoCore::DirectBuffers::Manager& direct_bufs,
                                                 VAddr addr, u32 cb_size, u32 frame_tag) noexcept {
-        if (settled_mru.empty() || last_write_frame_256k.empty()) {
+        if (settled_mru.empty() || last_write_frame_256b.empty()) {
             return nullptr;
         }
-        const u32 wf0 = last_write_frame_256k[CoarseBucket(addr)];
-        const u32 wf1 = last_write_frame_256k[CoarseBucket(addr + cb_size - 1u)];
-        if ((frame_tag - wf0) < 4u || (frame_tag - wf1) < 4u) {
+        const u32 c_wf0 = last_write_frame_256k[CoarseBucket(addr)];
+        const u32 c_wf1 = last_write_frame_256k[CoarseBucket(addr + cb_size - 1u)];
+        if ((frame_tag - c_wf0) < 4u || (frame_tag - c_wf1) < 4u) {
             return nullptr;
+        }
+        const u32 check_span = std::min<u32>(cb_size, 1024u);
+        const u64 g_lo = addr >> 8;
+        const u64 g_hi = (addr + check_span - 1u) >> 8;
+        for (u64 g = g_lo; g <= g_hi; ++g) {
+            if ((frame_tag - last_write_frame_256b[FineWriteBucket256B(g)]) < 4u) {
+                return nullptr;
+            }
         }
         const u64 cur_gen = direct_bufs.ShadowDirEraseGen();
         if (last_settled_hit.erase_gen == cur_gen && last_settled_hit.mirror_base &&
@@ -465,6 +565,7 @@ struct SceneOcclusionCuller {
         if (stage_a_occ_cull) {
             coarse_epoch_256k.assign(kCoarseBuckets, 1u);
             last_write_frame_256k.assign(kCoarseBuckets, 0u);
+            last_write_frame_256b.assign(kFineWriteBuckets, 0u);
             tiny_redir.resize(kTinyRedirSets * kTinyRedirWays);
             small_redir.resize(kSmallRedirSets * kSmallRedirWays);
             large_redir.resize(kLargeRedirSets * kLargeRedirWays);
@@ -500,6 +601,7 @@ struct SceneOcclusionCuller {
             if (e.multi_occ.load(std::memory_order_relaxed) != 0u) {
                 e.zero_streak.store(0, std::memory_order_relaxed);
                 e.skip_until_frame.store(0, std::memory_order_relaxed);
+                SetEntryOccActive(e, false);
             } else if (samples[i] == 0) {
                 u16 zs = e.zero_streak.load(std::memory_order_relaxed);
                 if (zs < 32u) {
@@ -517,10 +619,12 @@ struct SceneOcclusionCuller {
                                            : zs >= 5u ? (4u + stagger)
                                                       : (2u + stagger)));
                     e.skip_until_frame.store(ref_frame + skip_len, std::memory_order_relaxed);
+                    SetEntryOccActive(e, true);
                 }
             } else {
                 e.zero_streak.store(0, std::memory_order_relaxed);
                 e.skip_until_frame.store(0, std::memory_order_relaxed);
+                SetEntryOccActive(e, false);
             }
             e.probe_in_flight.store(0u, std::memory_order_release);
         }
@@ -541,10 +645,11 @@ struct SceneOcclusionCuller {
     void NoteStageAFrameStart() noexcept {
         stage_a_gbuf_draws = 0;
         const u32 prev_f = stage_a_frame.load(std::memory_order_relaxed);
+        const u32 sb_f = cur_frame.load(std::memory_order_relaxed);
         const u32 next_f =
             (VkMtDirectRecorder::ConfiguredMode() > 0)
                 ? std::max(prev_f + 1u, BbStats::guest_frame_number.load(std::memory_order_relaxed))
-                : (prev_f + 1u);
+                : std::clamp(prev_f + 1u, sb_f, sb_f + 1u);
         stage_a_frame.store(next_f, std::memory_order_relaxed);
     }
 
@@ -634,6 +739,7 @@ struct SceneOcclusionCuller {
                     if (e.zero_streak.load(std::memory_order_relaxed) > 2u) {
                         e.zero_streak.store(2u, std::memory_order_relaxed);
                     }
+                    SetEntryOccActive(e, false);
                 }
             } else if (cos_ang < 0.99995f || dist_sq > 0.0002f) {
                 mov = true;
@@ -717,6 +823,7 @@ struct SceneOcclusionCuller {
             const u64 skip = stat_gbuf_skipped.exchange(0, std::memory_order_relaxed);
             const u64 sa_skip = stat_stage_a_skipped.exchange(0, std::memory_order_relaxed);
             const u64 sb_fb = stat_stage_b_fallbacks.exchange(0, std::memory_order_relaxed);
+            const u64 vis_off = stat_vis_offload.exchange(0, std::memory_order_relaxed);
             const u64 prob = stat_gbuf_probed.exchange(0, std::memory_order_relaxed);
             const u64 skel_cand = stat_skel_candidates.exchange(0, std::memory_order_relaxed);
             const u64 skel_skip = stat_skel_skipped.exchange(0, std::memory_order_relaxed);
@@ -727,11 +834,12 @@ struct SceneOcclusionCuller {
             if (cand > 0 || sh_skip > 0 || lt_cand > 0) {
                 std::printf(
                     "[BB-CULL] 600f: GBuf occluded skipped %llu/%llu (%.1f%%, stageA %llu, "
-                    "sb_fb %llu, skel %llu/%llu, probed %llu, multi %llu), Lights skipped "
-                    "%llu/%llu, MicroShadow skipped %llu\n",
+                    "vis_off %llu, sb_fb %llu, skel %llu/%llu, probed %llu, multi %llu), Lights "
+                    "skipped %llu/%llu, MicroShadow skipped %llu\n",
                     static_cast<unsigned long long>(skip), static_cast<unsigned long long>(cand),
                     cand ? (100.0 * double(skip) / double(cand)) : 0.0,
                     static_cast<unsigned long long>(sa_skip),
+                    static_cast<unsigned long long>(vis_off),
                     static_cast<unsigned long long>(sb_fb),
                     static_cast<unsigned long long>(skel_skip),
                     static_cast<unsigned long long>(skel_cand),
@@ -744,7 +852,7 @@ struct SceneOcclusionCuller {
         }
     }
 
-    u16 FindOrInsertEntry(u64 key, u32 frame_tag, bool& out_inserted) noexcept {
+    u16 FindOrInsertEntry(u64 key, u16 mesh_slot, u32 frame_tag, bool& out_inserted) noexcept {
         out_inserted = false;
         const u32 bucket = static_cast<u32>((key ^ (key >> 33)) & (TableBuckets - 1));
         const u16 base = static_cast<u16>(bucket * BucketWays);
@@ -764,6 +872,8 @@ struct SceneOcclusionCuller {
             if (old_key == 0 || (old_seen != 0u && static_cast<s32>(frame_tag - old_seen) > 4)) {
                 if (cand.key.compare_exchange_strong(old_key, key, std::memory_order_acq_rel,
                                                      std::memory_order_relaxed)) {
+                    SetEntryOccActive(cand, false);
+                    cand.mesh_slot.store(mesh_slot, std::memory_order_relaxed);
                     cand.is_skel.store(0u, std::memory_order_relaxed);
                     cand.skip_until_frame.store(0, std::memory_order_relaxed);
                     cand.zero_streak.store(0, std::memory_order_relaxed);
@@ -780,8 +890,8 @@ struct SceneOcclusionCuller {
         return 0xFFFFu;
     }
 
-    u16 FindOrInsertSkelEntry(u64 mesh_key, float wx, float wy, float wz, u32 frame_tag,
-                              bool& out_inserted) noexcept {
+    u16 FindOrInsertSkelEntry(u64 mesh_key, u16 mesh_slot, float wx, float wy, float wz,
+                              u32 frame_tag, bool& out_inserted) noexcept {
         out_inserted = false;
         const u32 base_bucket = static_cast<u32>((mesh_key ^ (mesh_key >> 33)) & (TableBuckets - 1));
         u16 best_idx = 0xFFFFu;
@@ -834,6 +944,8 @@ struct SceneOcclusionCuller {
                     if (cand.key.compare_exchange_strong(old_key, mesh_key,
                                                          std::memory_order_acq_rel,
                                                          std::memory_order_relaxed)) {
+                        SetEntryOccActive(cand, false);
+                        cand.mesh_slot.store(mesh_slot, std::memory_order_relaxed);
                         cand.pos_x.store(wx, std::memory_order_relaxed);
                         cand.pos_y.store(wy, std::memory_order_relaxed);
                         cand.pos_z.store(wz, std::memory_order_relaxed);
@@ -1484,6 +1596,8 @@ Rasterizer::MtOcclusionDecision Rasterizer::EvaluateGBufferOcclusionMt(
                               (u64(num_instances) * 0x94D049BB133111EBull) ^ off_mix ^
                               (vtx_buf_hash * 0xC2B2AE3D27D4EB4Full);
 
+    const u16 mesh_slot =
+        SceneOcclusionCuller::ComputeMeshFilterSlot(index_address, vs_hash, num_indices);
     bool inserted = false;
     u16 e_idx = 0xFFFFu;
     float skel_wx = 0.0f;
@@ -1523,8 +1637,8 @@ Rasterizer::MtOcclusionDecision Rasterizer::EvaluateGBufferOcclusionMt(
             ++(*out_candidates);
         }
         culler.stat_skel_candidates.fetch_add(1, std::memory_order_relaxed);
-        e_idx = culler.FindOrInsertSkelEntry(skel_key, skel_wx, skel_wy, skel_wz, frame_tag,
-                                             inserted);
+        e_idx = culler.FindOrInsertSkelEntry(skel_key, mesh_slot, skel_wx, skel_wy, skel_wz,
+                                             frame_tag, inserted);
     } else {
         if (out_candidates) {
             ++(*out_candidates);
@@ -1557,7 +1671,7 @@ Rasterizer::MtOcclusionDecision Rasterizer::EvaluateGBufferOcclusionMt(
         if (draw_key == 0ull) {
             draw_key = 1ull;
         }
-        e_idx = culler.FindOrInsertEntry(draw_key, frame_tag, inserted);
+        e_idx = culler.FindOrInsertEntry(draw_key, mesh_slot, frame_tag, inserted);
     }
     if (e_idx == 0xFFFFu) {
         return decision;
@@ -1570,6 +1684,7 @@ Rasterizer::MtOcclusionDecision Rasterizer::EvaluateGBufferOcclusionMt(
             e.multi_occ.store(8u, std::memory_order_relaxed);
             e.zero_streak.store(0u, std::memory_order_relaxed);
             e.skip_until_frame.store(0u, std::memory_order_relaxed);
+            culler.SetEntryOccActive(e, false);
             culler.stat_multi_occ.fetch_add(1, std::memory_order_relaxed);
             return decision;
         }
@@ -1582,6 +1697,7 @@ Rasterizer::MtOcclusionDecision Rasterizer::EvaluateGBufferOcclusionMt(
             e.zero_streak.store(0u, std::memory_order_relaxed);
             e.skip_until_frame.store(0u, std::memory_order_relaxed);
             e.multi_occ.store(0u, std::memory_order_relaxed);
+            culler.SetEntryOccActive(e, false);
         } else if (const u8 m = e.multi_occ.load(std::memory_order_relaxed); m > 0u) {
             e.multi_occ.store(static_cast<u8>(m - 1u), std::memory_order_relaxed);
         }
@@ -1934,9 +2050,27 @@ bool Rasterizer::TryCullSceneOcclusionStageA(const GraphicsPipeline* pipeline,
     }
 
     const u32 gbuf_ord = ++culler.stage_a_gbuf_draws;
+    if (gbuf_ord <= 12u) {
+        culler.stat_vis_offload.fetch_add(1, std::memory_order_relaxed);
+        out_handoff = kOccStageBFallback;
+        return false;
+    }
     const u32 frame_tag = culler.stage_a_frame.load(std::memory_order_relaxed);
     const auto& vs_stage = pipeline->GetStage(Shader::SwStage::Vertex);
     const u64 vs_hash = vs_stage.pgm_hash;
+    const u32 index_size =
+        regs.index_buffer_type.index_type == Gcn::IndexType::Index16 ? 2u : 4u;
+    const VAddr index_address =
+        regs.index_base_address.Address<VAddr>() + u64(index_offset) * index_size;
+    const u16 mesh_slot =
+        SceneOcclusionCuller::ComputeMeshFilterSlot(index_address, vs_hash, num_indices);
+    if (culler.active_mesh_occ[mesh_slot].load(std::memory_order_relaxed) == 0u) [[likely]] {
+        // Mesh currently has zero occluded instances in the scene: offload periodic probe
+        // scheduling to Stage B (`bb:DrawRec` idle headroom) at ~1 ns cost on Stage A.
+        culler.stat_vis_offload.fetch_add(1, std::memory_order_relaxed);
+        out_handoff = kOccStageBFallback;
+        return false;
+    }
     const auto* ps_stage = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
     const u32 num_instances = regs.num_instances.NumInstances();
 
@@ -2129,10 +2263,6 @@ bool Rasterizer::TryCullSceneOcclusionStageA(const GraphicsPipeline* pipeline,
         (has_model_cb && u64(model_base_matrix_idx) * 48ull + 48ull <= u64(palette_size))
             ? (model_base_matrix_idx * 48u)
             : 0u;
-    const u32 index_size =
-        regs.index_buffer_type.index_type == Gcn::IndexType::Index16 ? 2u : 4u;
-    const VAddr index_address =
-        regs.index_base_address.Address<VAddr>() + u64(index_offset) * index_size;
     const auto [vtx_off, inst_off] = GetDrawOffsets(regs, vs_stage, pipeline->GetFetchShader());
     const u64 ps_hash = ps_stage ? ps_stage->pgm_hash : 0ull;
     const u64 off_mix =
@@ -2170,8 +2300,8 @@ bool Rasterizer::TryCullSceneOcclusionStageA(const GraphicsPipeline* pipeline,
         }
         culler.stat_gbuf_candidates.fetch_add(1, std::memory_order_relaxed);
         culler.stat_skel_candidates.fetch_add(1, std::memory_order_relaxed);
-        e_idx =
-            culler.FindOrInsertSkelEntry(skel_key, skel_wx, skel_wy, skel_wz, frame_tag, inserted);
+        e_idx = culler.FindOrInsertSkelEntry(skel_key, mesh_slot, skel_wx, skel_wy, skel_wz,
+                                             frame_tag, inserted);
     } else {
         culler.stat_gbuf_candidates.fetch_add(1, std::memory_order_relaxed);
         const u32 hash_bytes =
@@ -2202,7 +2332,7 @@ bool Rasterizer::TryCullSceneOcclusionStageA(const GraphicsPipeline* pipeline,
         if (draw_key == 0) {
             draw_key = 1;
         }
-        e_idx = culler.FindOrInsertEntry(draw_key, frame_tag, inserted);
+        e_idx = culler.FindOrInsertEntry(draw_key, mesh_slot, frame_tag, inserted);
     }
 
     if (e_idx == 0xFFFFu) {
@@ -2216,6 +2346,7 @@ bool Rasterizer::TryCullSceneOcclusionStageA(const GraphicsPipeline* pipeline,
             e.multi_occ.store(8u, std::memory_order_relaxed);
             e.zero_streak.store(0u, std::memory_order_relaxed);
             e.skip_until_frame.store(0u, std::memory_order_relaxed);
+            culler.SetEntryOccActive(e, false);
             culler.stat_multi_occ.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
@@ -2228,6 +2359,7 @@ bool Rasterizer::TryCullSceneOcclusionStageA(const GraphicsPipeline* pipeline,
             e.zero_streak.store(0u, std::memory_order_relaxed);
             e.skip_until_frame.store(0u, std::memory_order_relaxed);
             e.multi_occ.store(0u, std::memory_order_relaxed);
+            culler.SetEntryOccActive(e, false);
         } else if (const u8 m = e.multi_occ.load(std::memory_order_relaxed); m > 0u) {
             e.multi_occ.store(static_cast<u8>(m - 1u), std::memory_order_relaxed);
         }
@@ -2676,6 +2808,8 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
                     (u64(num_instances) * 0x94D049BB133111EBull) ^ off_mix ^
                     (vtx_buf_hash * 0xC2B2AE3D27D4EB4Full);
 
+                const u16 mesh_slot = SceneOcclusionCuller::ComputeMeshFilterSlot(
+                    index_address, vs_hash, num_indices);
                 bool inserted = false;
                 u16 e_idx = 0xFFFFu;
                 float skel_wx = 0.0f;
@@ -2706,8 +2840,9 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
                             }
                             culler.stat_gbuf_candidates.fetch_add(1, std::memory_order_relaxed);
                             culler.stat_skel_candidates.fetch_add(1, std::memory_order_relaxed);
-                            e_idx = culler.FindOrInsertSkelEntry(
-                                skel_key, skel_wx, skel_wy, skel_wz, frame_tag, inserted);
+                            e_idx = culler.FindOrInsertSkelEntry(skel_key, mesh_slot, skel_wx,
+                                                                 skel_wy, skel_wz, frame_tag,
+                                                                 inserted);
                         }
                     }
                 } else {
@@ -2741,7 +2876,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
                     if (draw_key == 0) {
                         draw_key = 1;
                     }
-                    e_idx = culler.FindOrInsertEntry(draw_key, frame_tag, inserted);
+                    e_idx = culler.FindOrInsertEntry(draw_key, mesh_slot, frame_tag, inserted);
                 }
 
                 if (e_idx != 0xFFFFu) {
@@ -2754,6 +2889,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
                             e.multi_occ.store(8u, std::memory_order_relaxed);
                             e.zero_streak.store(0u, std::memory_order_relaxed);
                             e.skip_until_frame.store(0u, std::memory_order_relaxed);
+                            culler.SetEntryOccActive(e, false);
                             culler.stat_multi_occ.fetch_add(1, std::memory_order_relaxed);
                             is_dup_in_frame = true;
                         } else {
@@ -2767,6 +2903,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
                                 e.zero_streak.store(0u, std::memory_order_relaxed);
                                 e.skip_until_frame.store(0u, std::memory_order_relaxed);
                                 e.multi_occ.store(0u, std::memory_order_relaxed);
+                                culler.SetEntryOccActive(e, false);
                             } else if (const u8 m = e.multi_occ.load(std::memory_order_relaxed);
                                        m > 0u) {
                                 e.multi_occ.store(static_cast<u8>(m - 1u),

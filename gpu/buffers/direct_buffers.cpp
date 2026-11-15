@@ -1430,10 +1430,8 @@ void Manager::RetireOverlapping(VAddr addr, u64 size, bool clear_global_owned) {
                 ClearNativeOwnedRange(e_start, e_size);
                 SetExactNativeBufferOwned(e_start, false);
             }
-            if (it->second.cpu_shadow) {
-                dead_shadows.emplace_back(e_start, std::move(it->second.cpu_shadow));
-                it->second.has_cpu_shadow = false;
-            }
+            dead_shadows.emplace_back(e_start, std::move(it->second.cpu_shadow));
+            it->second.has_cpu_shadow = false;
             retired.emplace_back(tick, std::move(it->second.buffer));
             it = entries_by_base.erase(it);
             RebuildBitmapAroundErase(e_start, e_end);
@@ -1934,9 +1932,7 @@ std::pair<const Buffer*, u64> Manager::TryResolveWrite(VAddr addr, u64 size, boo
             }
             atomic_override_gen.fetch_add(1, std::memory_order_release);
         }
-        if (dead_shadow) {
-            UnpublishShadowDirEntry(base, std::move(dead_shadow), scheduler.CurrentTick());
-        }
+        UnpublishShadowDirEntry(base, std::move(dead_shadow), scheduler.CurrentTick());
         if (do_invalidate_shaders) {
             Vulkan::DirectShaders::InvalidateRange(base, entry_alloc_size);
         }
@@ -2143,6 +2139,11 @@ void Manager::StageNativeCpuCopyBatch(std::span<const NativeCopyRegion> regions,
                         std::memcpy(data + s.rel_offset, e.cpu_shadow.get(), s.slice_span);
                     }
                     continue;
+                }
+                if (s.entry) {
+                    s.entry->has_cpu_shadow = false;
+                    UnpublishShadowDirEntry(s.base_va, std::move(s.entry->cpu_shadow),
+                                            scheduler.CurrentTick());
                 }
                 u8* dst = data + s.rel_offset;
                 if (s.dst_in_buf_off != 0) {
@@ -2655,7 +2656,9 @@ void Manager::ProcessEvents(Core::MemoryManager* memory) {
                 entry.stream_override_buf = sbuf_ptr;
                 entry.stream_override_off = stream_off;
                 entry.buffer = std::move(buf);
-                const u8* pub_shadow_ptr = entry.has_cpu_shadow ? entry.cpu_shadow.get() : nullptr;
+                const u8* pub_shadow_ptr =
+                    entry.has_cpu_shadow ? entry.cpu_shadow.get()
+                                         : reinterpret_cast<const u8*>(ev.addr);
                 {
                     WriteLockGuard lock{entries_rw_mutex, mt_lock_enabled};
                     auto& inserted = (entries_by_base[ev.addr] = std::move(entry));
@@ -2807,7 +2810,10 @@ void Manager::ProcessEvents(Core::MemoryManager* memory) {
         entry.alloc_size = guest_span;
         entry.cpu_shadow = std::move(init_shadow);
         entry.buffer = std::move(buf);
-        const u8* pub_shadow_ptr = entry.has_cpu_shadow ? entry.cpu_shadow.get() : nullptr;
+        const u8* pub_shadow_ptr =
+            entry.has_cpu_shadow
+                ? entry.cpu_shadow.get()
+                : ((ev.has_initial_data != 0) ? reinterpret_cast<const u8*>(ev.addr) : nullptr);
         {
             WriteLockGuard lock{entries_rw_mutex, mt_lock_enabled};
             auto& inserted = (entries_by_base[ev.addr] = std::move(entry));
