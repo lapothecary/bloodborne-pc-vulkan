@@ -50,6 +50,8 @@ struct DrawPacket {
     static constexpr u8 kReusePrevVsharps = 0x40u;
     static constexpr u8 kCompactStageBDesc = 0x80u;
     PacketKind kind;
+    u16 occ_handoff; ///< Step 5.2: Stage-A occlusion probe entry idx, kOccNoProbe, or kOccStageBFallback
+    u16 pad0;
     const Pipeline* pipeline;
     const PreparedDraw* prepared;
     u32 index_offset;
@@ -131,13 +133,16 @@ void Rasterizer::NoteStageACpuCopyBatch(const u32* raw_regions, u32 count) noexc
             }
         }
     }
-    if (light_tile_batcher && OnStageA()) {
+    if (!OnStageA()) {
+        return;
+    }
+    if (light_tile_batcher) {
         light_tile_batcher->NoteStageACpuCopyBatch(raw_regions, count);
     }
-    if (object_vel_culler && OnStageA()) {
+    if (object_vel_culler) {
         object_vel_culler->NoteStageACpuCopyBatch(raw_regions, count);
     }
-    if (vfx_ui_batcher && OnStageA()) {
+    if (vfx_ui_batcher) {
         vfx_ui_batcher->NoteStageACpuCopyBatch(raw_regions, count);
     }
 }
@@ -147,13 +152,16 @@ void Rasterizer::InvalidateStageACpuShadow(VAddr addr, u64 size) noexcept {
         VideoCore::DirectBuffers::ClearCpuImmutableRange(addr, size);
     }
     VsmShadowMemo::NoteBufferWriteGlobal(addr, size);
-    if (light_tile_batcher && OnStageA()) {
+    if (!OnStageA()) {
+        return;
+    }
+    if (light_tile_batcher) {
         light_tile_batcher->InvalidateCpuShadow(addr, size);
     }
-    if (object_vel_culler && OnStageA()) {
+    if (object_vel_culler) {
         object_vel_culler->InvalidateCpuShadow(addr, size);
     }
-    if (vfx_ui_batcher && OnStageA()) {
+    if (vfx_ui_batcher) {
         vfx_ui_batcher->InvalidateCpuShadow(addr, size);
     }
 }
@@ -1039,7 +1047,7 @@ void Rasterizer::CollectRingBindings(const Shader::Info& stage, const PreparedDr
 void Rasterizer::PostDraw(const Pipeline* pipeline, const PreparedDraw* used_prepared,
                           bool is_indexed, u32 index_offset, const Gcn::ComputeProgram* cs,
                           const IndirectDraw* indirect,
-                          const BatchedLightDrawOverride* batch_override) {
+                          const BatchedLightDrawOverride* batch_override, u16 occ_handoff) {
     if (!batch_override) {
         if (HasPendingVsmShadowWork()) {
             FlushVsmShadowMemo();
@@ -1435,6 +1443,8 @@ void Rasterizer::PostDraw(const Pipeline* pipeline, const PreparedDraw* used_pre
                   : indirect ? PacketKind::Indirect
                   : pipeline ? PacketKind::Draw
                              : PacketKind::Special;
+    packet.occ_handoff = occ_handoff;
+    packet.pad0 = 0u;
     packet.pipeline = pipeline;
     packet.prepared = used_prepared;
     packet.index_offset = index_offset;
@@ -1888,7 +1898,7 @@ void Rasterizer::RunDrawPacket(void* context, const u8* data, u32 size) {
                                 packet.is_indexed, *indirect);
     } else {
         self.DrawRecord(static_cast<const GraphicsPipeline*>(packet.pipeline), packet.prepared,
-                        packet.is_indexed, packet.index_offset);
+                        packet.is_indexed, packet.index_offset, packet.occ_handoff);
     }
     Shader::Info::num_ud_snapshots = 0;
     self.num_ring_stages = 0;

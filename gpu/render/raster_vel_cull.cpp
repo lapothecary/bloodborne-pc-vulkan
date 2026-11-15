@@ -172,12 +172,20 @@ bool ObjectVelocityCuller::IsSilhouetteMaskActive() noexcept {
     return false;
 }
 
+void ObjectVelocityCuller::KeepStageAShadowAwake(bool keep) noexcept {
+    occ_keep_awake = keep;
+    if (keep && !shadow_awake) {
+        shadow_awake = true;
+        last_stage_a_active_frame = BbStats::frame_number.load(std::memory_order_relaxed);
+    }
+}
+
 void ObjectVelocityCuller::InvalidateCpuShadow(VAddr addr, u64 size) noexcept {
     if (!shadow_awake || !addr || size == 0u) [[likely]] {
         return;
     }
     const u64 cur_frame = BbStats::frame_number.load(std::memory_order_relaxed);
-    if (cur_frame > last_stage_a_active_frame + kShadowSleepFrames) {
+    if (!occ_keep_awake && cur_frame > last_stage_a_active_frame + kShadowSleepFrames) {
         shadow_awake = false;
         ++coarse_wipe_bias;
         pair_memo.fill(PairMemoEntry{});
@@ -252,11 +260,12 @@ void ObjectVelocityCuller::InvalidateCpuShadow(VAddr addr, u64 size) noexcept {
 }
 
 void ObjectVelocityCuller::NoteStageACpuCopyBatch(const u32* raw_regions, u32 count) noexcept {
-    if (!shadow_awake || !raw_regions || count == 0u || count > 32u || !Enabled()) [[likely]] {
+    if (!shadow_awake || !raw_regions || count == 0u || count > 32u ||
+        (!Enabled() && !occ_keep_awake)) [[likely]] {
         return;
     }
     const u64 cur_frame = BbStats::frame_number.load(std::memory_order_relaxed);
-    if (cur_frame > last_stage_a_active_frame + kShadowSleepFrames) {
+    if (!occ_keep_awake && cur_frame > last_stage_a_active_frame + kShadowSleepFrames) {
         shadow_awake = false;
         ++coarse_wipe_bias;
         pair_memo.fill(PairMemoEntry{});
@@ -268,10 +277,10 @@ void ObjectVelocityCuller::NoteStageACpuCopyBatch(const u32* raw_regions, u32 co
         if (!reg.dst_va || reg.byte_size == 0u) {
             continue;
         }
-        InvalidateCpuShadow(reg.dst_va, reg.byte_size);
         if (reg.reserved != gx_direct_vk::kCopyFlagKnownCpuSource || !reg.src_va ||
             reg.byte_size < 16u || reg.byte_size > kMaxLargeBytes ||
             !IsReadableCpuSourceRange(reg.src_va, reg.byte_size)) {
+            InvalidateCpuShadow(reg.dst_va, reg.byte_size);
             continue;
         }
 
@@ -283,8 +292,24 @@ void ObjectVelocityCuller::NoteStageACpuCopyBatch(const u32* raw_regions, u32 co
         const u32 ce0 = CoarseEpochAt(reg.dst_va);
         const u32 ce1 = CoarseEpochAt(reg.dst_va + reg.byte_size - 1u);
 
+        // Inductive non-overlap fast path: no two live entries across `tiny_meta`, `small_meta`,
+        // `large_meta` ever overlap, so an in-place overwrite of an existing live `(dst_va,
+        // byte_size)` slot with valid coarse epochs cannot overlap any other live slot and skips
+        // the cross-tier multi-page `InvalidateCpuShadow` scan (~500 slot checks saved per copy).
         if (reg.byte_size <= kMaxTinyPivot) {
             const size_t set_base = TinyPageSet(reg.dst_va >> 9) * kTinyWays;
+            for (size_t w = 0; w < kTinyWays; ++w) {
+                auto& s = tiny_meta[set_base + w];
+                if (s.byte_size == reg.byte_size && s.dst_va == reg.dst_va &&
+                    s.coarse_e0 == ce0 && s.coarse_e1 == ce1) {
+                    s.last_use = use_stamp;
+                    s.upload_gen = gen;
+                    std::memcpy(&tiny_bytes[(set_base + w) * size_t(kTinySlotStride)],
+                                reinterpret_cast<const void*>(reg.src_va), reg.byte_size);
+                    goto next_region;
+                }
+            }
+            InvalidateCpuShadow(reg.dst_va, reg.byte_size);
             size_t victim = set_base;
             for (size_t w = 0; w < kTinyWays; ++w) {
                 const auto& s = tiny_meta[set_base + w];
@@ -307,6 +332,18 @@ void ObjectVelocityCuller::NoteStageACpuCopyBatch(const u32* raw_regions, u32 co
                         reinterpret_cast<const void*>(reg.src_va), reg.byte_size);
         } else if (reg.byte_size <= kMaxSmallBytes) {
             const size_t set_base = SmallPageSet(reg.dst_va >> 11) * kSmallWays;
+            for (size_t w = 0; w < kSmallWays; ++w) {
+                auto& s = small_meta[set_base + w];
+                if (s.byte_size == reg.byte_size && s.dst_va == reg.dst_va &&
+                    s.coarse_e0 == ce0 && s.coarse_e1 == ce1) {
+                    s.last_use = use_stamp;
+                    s.upload_gen = gen;
+                    std::memcpy(&small_bytes[(set_base + w) * size_t(kMaxSmallBytes)],
+                                reinterpret_cast<const void*>(reg.src_va), reg.byte_size);
+                    goto next_region;
+                }
+            }
+            InvalidateCpuShadow(reg.dst_va, reg.byte_size);
             size_t victim = set_base;
             for (size_t w = 0; w < kSmallWays; ++w) {
                 const auto& s = small_meta[set_base + w];
@@ -329,6 +366,18 @@ void ObjectVelocityCuller::NoteStageACpuCopyBatch(const u32* raw_regions, u32 co
                         reinterpret_cast<const void*>(reg.src_va), reg.byte_size);
         } else {
             const size_t set_base = LargePageSet(reg.dst_va >> 15) * kLargeWays;
+            for (size_t w = 0; w < kLargeWays; ++w) {
+                auto& s = large_meta[set_base + w];
+                if (s.byte_size == reg.byte_size && s.dst_va == reg.dst_va &&
+                    s.coarse_e0 == ce0 && s.coarse_e1 == ce1) {
+                    s.last_use = use_stamp;
+                    s.upload_gen = gen;
+                    std::memcpy(&large_bytes[(set_base + w) * size_t(kMaxLargeBytes)],
+                                reinterpret_cast<const void*>(reg.src_va), reg.byte_size);
+                    goto next_region;
+                }
+            }
+            InvalidateCpuShadow(reg.dst_va, reg.byte_size);
             size_t victim = set_base;
             for (size_t w = 0; w < kLargeWays; ++w) {
                 const auto& s = large_meta[set_base + w];
@@ -350,6 +399,7 @@ void ObjectVelocityCuller::NoteStageACpuCopyBatch(const u32* raw_regions, u32 co
             std::memcpy(&large_bytes[victim * size_t(kMaxLargeBytes)],
                         reinterpret_cast<const void*>(reg.src_va), reg.byte_size);
         }
+    next_region:;
     }
 }
 

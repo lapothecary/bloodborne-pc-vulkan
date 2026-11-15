@@ -339,10 +339,27 @@ void LightTileBatcher::NoteStageACpuCopyBatch(const u32* raw_regions, u32 count)
             InvalidateCpuShadow(reg.dst_va, reg.byte_size);
             continue;
         }
+        const u32 ce0 = CoarseEpochAt(reg.dst_va);
+        const u32 ce1 = CoarseEpochAt(reg.dst_va + reg.byte_size - 1u);
+        const size_t set_base = ShadowPageSet(reg.dst_va >> 11) * kShadowWays;
+        bool updated_in_place = false;
+        for (size_t w = 0; w < kShadowWays; ++w) {
+            auto& slot = shadow_meta[set_base + w];
+            if (slot.byte_size == reg.byte_size && slot.dst_va == reg.dst_va &&
+                slot.coarse_e0 == ce0 && slot.coarse_e1 == ce1) {
+                slot.last_use = ++shadow_clock;
+                std::memcpy(&shadow_bytes[(set_base + w) * kMaxShadowBytes],
+                            reinterpret_cast<const void*>(reg.src_va), reg.byte_size);
+                updated_in_place = true;
+                break;
+            }
+        }
+        if (updated_in_place) {
+            continue;
+        }
         // Invalidate any overlapping partial entries at different base addresses first:
         InvalidateCpuShadow(reg.dst_va, reg.byte_size);
 
-        const size_t set_base = ShadowPageSet(reg.dst_va >> 11) * kShadowWays;
         size_t victim = set_base;
         for (size_t w = 0; w < kShadowWays; ++w) {
             const auto& slot = shadow_meta[set_base + w];
@@ -358,8 +375,8 @@ void LightTileBatcher::NoteStageACpuCopyBatch(const u32* raw_regions, u32 count)
         dst_slot.dst_va = reg.dst_va;
         dst_slot.byte_size = reg.byte_size;
         dst_slot.last_use = ++shadow_clock;
-        dst_slot.coarse_e0 = CoarseEpochAt(reg.dst_va);
-        dst_slot.coarse_e1 = CoarseEpochAt(reg.dst_va + reg.byte_size - 1u);
+        dst_slot.coarse_e0 = ce0;
+        dst_slot.coarse_e1 = ce1;
         shadow_min_va = std::min(shadow_min_va, reg.dst_va);
         shadow_max_va = std::max(shadow_max_va, reg.dst_va + reg.byte_size);
         std::memcpy(&shadow_bytes[victim * kMaxShadowBytes],

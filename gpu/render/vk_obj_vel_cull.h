@@ -99,6 +99,17 @@ public:
     /// Invalidates any cached CPU shadow overlapping `[addr, addr + size)` on Stage A.
     void InvalidateCpuShadow(VAddr addr, u64 size) noexcept;
 
+    /// Step 5.2: Keeps the Stage-A CPU constant shadow awake from Frame 0 when Stage-A G-Buffer
+    /// occlusion culling is enabled (even if in-game Motion Blur / `BB_VEL_CULL` is disabled).
+    void KeepStageAShadowAwake(bool keep = true) noexcept;
+
+    /// Step 5.2: Lock-free Stage-A CPU constant shadow lookup (`tiny`/`small`/`large` tiers).
+    [[nodiscard]] const u8* LookupStageACpuShadow(VAddr addr, u32 min_bytes, u32 size_hint,
+                                                  u32* out_rem = nullptr) noexcept {
+        return shadow_awake ? LookupCpuShadow(addr, min_bytes, size_hint, out_rem, nullptr)
+                            : nullptr;
+    }
+
     /// Stage-A draw hook called from `Rasterizer::Draw` before `PostDraw` / `DrawRecord`.
     /// Returns `true` if the draw is a `Pass 0x2e` object-velocity draw whose object transform /
     /// bone palette delta vs the previous frame is `<= EpsilonThreshold()` (`0` pixels of object
@@ -156,6 +167,7 @@ private:
     u32 coarse_clock = 0;
     u32 coarse_wipe_bias = 0;
     bool shadow_awake = false;
+    bool occ_keep_awake = false;
     u64 last_stage_a_active_frame = 0;
     u64 shadow_upload_gen = 0;
 

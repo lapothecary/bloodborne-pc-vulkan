@@ -82,9 +82,14 @@ void GpuProfiler::OnFrame() {
         return;
     }
     if (!stored_ptr->permanent) {
+        static const bool auto_profile_env = [] {
+            const char* e = std::getenv("BB_GPU_PROFILE");
+            return e && e[0] != '\0' && e[0] != '0';
+        }();
         const bool trigger_file = (f & 31) == 0 && ::access("/tmp/bb_gpu_profile_trigger", F_OK) == 0;
-        const bool auto_scene = (scene_frames == 120 && !captured_scene) ||
-                                (scene_frames >= 120 && (scene_frames % 1200) == 120);
+        const bool auto_scene =
+            auto_profile_env && ((scene_frames == 120 && !captured_scene) ||
+                                 (scene_frames >= 120 && (scene_frames % 1200) == 120));
         if (trigger_file || auto_scene) {
             if (trigger_file) {
                 ::unlink("/tmp/bb_gpu_profile_trigger");
