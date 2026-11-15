@@ -225,6 +225,20 @@ bool LightTileBatcher::Enabled() noexcept {
     return on;
 }
 
+bool LightTileBatcher::ForceStageAMode() noexcept {
+    static const bool force = [] {
+        const char* env = std::getenv("BB_LIGHT_TILE_BATCH");
+        return env && env[0] == '2';
+    }();
+    return force;
+}
+
+void LightTileBatcher::WipeCpuShadow() noexcept {
+    ++coarse_wipe_bias;
+    shadow_min_va = ~VAddr{0};
+    shadow_max_va = 0;
+}
+
 bool LightTileBatcher::IsBatchedLightAccPsHash(u64 pgm_hash) noexcept {
     switch (pgm_hash) {
     case 0x0000000002cd8f9bULL:
@@ -312,8 +326,13 @@ bool LightTileBatcher::IsBatchSafeCpuConstantCopyTask(Rasterizer::OrderedTask ta
 }
 
 void LightTileBatcher::NoteStageACpuCopyBatch(const u32* raw_regions, u32 count) noexcept {
-    if (!raw_regions || count == 0u || count > 32u ||
-        (!Enabled() && !VsmShadowMemo::Enabled() && !VfxUiBatcher::Enabled())) {
+    if (!shadow_awake || !raw_regions || count == 0u || count > 32u || !Enabled()) [[likely]] {
+        return;
+    }
+    const u64 cur_frame = BbStats::frame_number.load(std::memory_order_relaxed);
+    if (cur_frame > last_stage_a_active_frame + kShadowSleepFrames) {
+        shadow_awake = false;
+        WipeCpuShadow();
         return;
     }
     for (u32 i = 0; i < count; ++i) {
@@ -357,7 +376,13 @@ void LightTileBatcher::NoteStageACpuCopyBatch(const u32* raw_regions, u32 count)
 }
 
 void LightTileBatcher::InvalidateCpuShadow(VAddr addr, u64 size) noexcept {
-    if (!addr || size == 0u || shadow_max_va == 0u) {
+    if (!shadow_awake || !addr || size == 0u || shadow_max_va == 0u) [[likely]] {
+        return;
+    }
+    const u64 cur_frame = BbStats::frame_number.load(std::memory_order_relaxed);
+    if (cur_frame > last_stage_a_active_frame + kShadowSleepFrames) {
+        shadow_awake = false;
+        WipeCpuShadow();
         return;
     }
     const VAddr end = (size > (~0ULL - addr)) ? ~0ULL : (addr + size);
@@ -400,8 +425,8 @@ void LightTileBatcher::InvalidateCpuShadow(VAddr addr, u64 size) noexcept {
 
 const u8* LightTileBatcher::LookupCpuShadow(VAddr addr, u32 size,
                                             u32* out_entry_remaining) noexcept {
-    if (!addr || size == 0u || size > kMaxShadowBytes || shadow_max_va == 0u ||
-        addr >= shadow_max_va || (addr + size) <= shadow_min_va) {
+    if (!shadow_awake || !addr || size == 0u || size > kMaxShadowBytes || shadow_max_va == 0u ||
+        addr >= shadow_max_va || (addr + size) <= shadow_min_va) [[likely]] {
         return nullptr;
     }
     const u64 page = addr >> 11;
@@ -493,6 +518,15 @@ bool LightTileBatcher::TryBatchDraw(Rasterizer& rasterizer, const GraphicsPipeli
             return false;
         }
     }
+
+    const u64 cur_frame = BbStats::frame_number.load(std::memory_order_relaxed);
+    if (!shadow_awake || cur_frame > last_stage_a_active_frame + kShadowSleepFrames) {
+        WipeCpuShadow();
+        shadow_awake = true;
+        last_stage_a_active_frame = cur_frame;
+        return false;
+    }
+    last_stage_a_active_frame = cur_frame;
 
     ++stat_seen;
     auto fail = [&](u64& bucket) noexcept {

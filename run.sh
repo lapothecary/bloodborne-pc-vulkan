@@ -47,8 +47,8 @@ if [[ ${BB_SAVE_LOG:-} == 1 ]]; then
     logs=$data/logs
     mkdir -p "$logs"
     printf -v stamp '%(%Y%m%d_%H%M%S)T' -1
-    export BB_FRAME_STATS=1
     if [[ ${BB_CSV_LOG:-0} == 1 ]]; then
+        export BB_FRAME_STATS=${BB_FRAME_STATS:-1}
         export BB_FRAME_LOG=${BB_FRAME_LOG:-$logs/$stamp.frames.csv}
         export BB_READBACK_LOG=${BB_READBACK_LOG:-$logs/$stamp.readbacks.csv}
     fi

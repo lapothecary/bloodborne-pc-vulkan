@@ -18,6 +18,7 @@
 extern "C" __declspec(dllimport) unsigned long __stdcall GetCurrentProcessId(void);
 #else
 #include <dirent.h>
+#include <fcntl.h>
 #include <unistd.h>
 #endif
 
@@ -2279,9 +2280,186 @@ void UpdateHudBreakdown(HudBreakdown& h) {
             std::fclose(f);
         }
         static Clock::time_point last_log_print = now;
-        if (std::chrono::duration<double>(now - last_log_print).count() >= 5.0 && h.draws_pf >= 10.0f) {
+        static std::uint64_t last_log_frames = cur_frames;
+#ifndef _WIN32
+        auto sample_overlay_thread_cpu = [](std::uint64_t frames, double window_sec, bool print_out) {
+            struct PrevEntry {
+                int tid;
+                std::uint64_t runtime_ns;
+            };
+            struct Row {
+                int tid;
+                std::uint64_t delta_ns;
+                char name[24];
+            };
+            static std::vector<PrevEntry> prev;
+            static bool seeded = false;
+            static const long clk_tck = std::max<long>(1, sysconf(_SC_CLK_TCK));
+            static const long hw_threads = std::max<long>(1, sysconf(_SC_NPROCESSORS_ONLN));
+
+            std::vector<PrevEntry> next;
+            std::vector<Row> rows;
+            next.reserve(64);
+            if (print_out) {
+                rows.reserve(64);
+            }
+            const int main_tid = static_cast<int>(getpid());
+
+            if (DIR* dir = opendir("/proc/self/task")) {
+                while (const dirent* ent = readdir(dir)) {
+                    if (ent->d_name[0] < '1' || ent->d_name[0] > '9') {
+                        continue;
+                    }
+                    const int tid = std::atoi(ent->d_name);
+                    if (tid <= 0) {
+                        continue;
+                    }
+                    std::uint64_t runtime_ns = 0;
+                    bool got_time = false;
+                    char path[64];
+                    std::snprintf(path, sizeof(path), "/proc/self/task/%d/schedstat", tid);
+                    int fd = open(path, O_RDONLY);
+                    if (fd >= 0) {
+                        char buf[64]{};
+                        const ssize_t n = read(fd, buf, sizeof(buf) - 1);
+                        close(fd);
+                        if (n > 0) {
+                            runtime_ns = std::strtoull(buf, nullptr, 10);
+                            got_time = true;
+                        }
+                    }
+                    if (!got_time) {
+                        std::snprintf(path, sizeof(path), "/proc/self/task/%d/stat", tid);
+                        fd = open(path, O_RDONLY);
+                        if (fd >= 0) {
+                            char sbuf[512]{};
+                            const ssize_t n = read(fd, sbuf, sizeof(sbuf) - 1);
+                            close(fd);
+                            if (n > 0) {
+                                if (const char* rp = std::strrchr(sbuf, ')')) {
+                                    const char* p = rp + 2;
+                                    // Skip fields 3..13 (state..cmajflt) to reach 14 (utime) & 15 (stime).
+                                    for (int f = 3; f < 14 && *p; ++f) {
+                                        while (*p && *p != ' ') {
+                                            ++p;
+                                        }
+                                        while (*p == ' ') {
+                                            ++p;
+                                        }
+                                    }
+                                    char* endp = nullptr;
+                                    const unsigned long long ut = std::strtoull(p, &endp, 10);
+                                    const unsigned long long st =
+                                        (endp && *endp) ? std::strtoull(endp, nullptr, 10) : 0ULL;
+                                    runtime_ns =
+                                        ((ut + st) * 1000000000ULL) / static_cast<std::uint64_t>(clk_tck);
+                                    got_time = true;
+                                }
+                            }
+                        }
+                    }
+                    if (!got_time) {
+                        continue;
+                    }
+                    next.push_back({tid, runtime_ns});
+                    if (!print_out || !seeded) {
+                        continue;
+                    }
+                    std::uint64_t old_ns = 0;
+                    bool found = false;
+                    for (const auto& pe : prev) {
+                        if (pe.tid == tid) {
+                            old_ns = pe.runtime_ns;
+                            found = true;
+                            break;
+                        }
+                    }
+                    const std::uint64_t delta =
+                        found ? (runtime_ns >= old_ns ? runtime_ns - old_ns : 0ULL) : runtime_ns;
+                    if (delta == 0) {
+                        continue;
+                    }
+                    Row row{tid, delta, {}};
+                    if (tid == main_tid) {
+                        std::snprintf(row.name, sizeof(row.name), "Main");
+                    } else {
+                        std::snprintf(path, sizeof(path), "/proc/self/task/%d/comm", tid);
+                        const int cfd = open(path, O_RDONLY);
+                        if (cfd >= 0) {
+                            const ssize_t cn = read(cfd, row.name, sizeof(row.name) - 1);
+                            close(cfd);
+                            if (cn > 0) {
+                                for (ssize_t i = 0; i < cn; ++i) {
+                                    if (row.name[i] == '\n' || row.name[i] == '\r') {
+                                        row.name[i] = '\0';
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if (row.name[0] == '\0') {
+                            std::snprintf(row.name, sizeof(row.name), "tid:%d", tid);
+                        }
+                    }
+                    rows.push_back(row);
+                }
+                closedir(dir);
+            }
+
+            const bool was_seeded = seeded;
+            prev = std::move(next);
+            seeded = true;
+            if (!print_out || !was_seeded || rows.empty() || frames == 0 || window_sec <= 0.0) {
+                return;
+            }
+            std::uint64_t total_ns = 0;
+            for (const auto& r : rows) {
+                total_ns += r.delta_ns;
+            }
+            std::sort(rows.begin(), rows.end(),
+                      [](const Row& a, const Row& b) { return a.delta_ns > b.delta_ns; });
+            const double total_ms_pf = double(total_ns) / (double(frames) * 1e6);
+            const double pct_all =
+                (double(total_ns) / (window_sec * 1e9 * double(hw_threads))) * 100.0;
+            std::printf("Thread CPU (ms/frame, total %.2f ms = %.1f%% of %ldT):",
+                        total_ms_pf, pct_all, hw_threads);
+            const std::size_t show = std::min<std::size_t>(rows.size(), 14);
+            for (std::size_t i = 0; i < show; ++i) {
+                const double ms = double(rows[i].delta_ns) / (double(frames) * 1e6);
+                if (ms < 0.02 && i >= 6) {
+                    break;
+                }
+                std::printf("%s %s %.2f", i ? "," : "", rows[i].name, ms);
+            }
+            std::printf("\n");
+        };
+        static const bool frame_stats_on = [] {
+            const char* e = std::getenv("BB_FRAME_STATS");
+            return e && e[0] != '\0' && e[0] != '0';
+        }();
+        static bool log_cpu_seeded = false;
+        if (!log_cpu_seeded && h.draws_pf >= 10.0f) {
+            log_cpu_seeded = true;
             last_log_print = now;
+            last_log_frames = cur_frames;
+            if (!frame_stats_on) {
+                sample_overlay_thread_cpu(0, 0.0, false);
+            }
+        }
+#endif
+        const double log_dt = std::chrono::duration<double>(now - last_log_print).count();
+        if (log_dt >= 5.0 && h.draws_pf >= 10.0f) {
+            const std::uint32_t log_df32 =
+                static_cast<std::uint32_t>(cur_frames) - static_cast<std::uint32_t>(last_log_frames);
+            const std::uint64_t log_df = log_df32 > 0 ? static_cast<std::uint64_t>(log_df32) : 1ULL;
+            last_log_print = now;
+            last_log_frames = cur_frames;
             std::printf("\n[HUD Telemetry]\n%s", hud_buf);
+#ifndef _WIN32
+            if (!frame_stats_on) {
+                sample_overlay_thread_cpu(log_df, log_dt, true);
+            }
+#endif
             std::fflush(stdout);
         }
     }

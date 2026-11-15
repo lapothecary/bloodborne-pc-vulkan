@@ -33,6 +33,7 @@
 #include "render/scheduler.h"
 #include "render/vk_frame_capture.h"
 #include "render/vk_indirect_guard.h"
+#include "render/vk_light_tile_batch.h"
 #include "render/vk_obj_vel_cull.h"
 #include "render/vk_vsm_shadow_memo.h"
 #include "shim/bbport_toggles.h"
@@ -2007,13 +2008,12 @@ void MtNotePsoBail(PipelineCache::MtPsoFailKind fail_kind, bool unsafe_pso,
     }
 }
 
-[[nodiscard]] constexpr bool IsStageACoalescerShader(u64 vs_hash, u64 ps_hash) noexcept {
-    // Keep Stage A specialized batchers (`LightTileBatcher` and `VsmShadowMemo` blur) on Stage A
-    // where tile coalescing / shadow-face elision eliminates whole GPU passes. Scaleform UI and
-    // non-tessellated `GXFfx` quad command lists (`0x24042a9b`, `0xe94b5b06`, `0xa400228b`,
-    // `0x41ae600f`) compile directly on `GXWorker:1..5` (hardware tessellation `LsHs` lists are
-    // already filtered to Stage A by `stage_enable.raw != Vs`).
-    if (vs_hash == 0x000000008747a367ULL) { // LightTileBatcher
+[[nodiscard]] inline bool IsStageACoalescerShader(u64 vs_hash, u64 ps_hash) noexcept {
+    // Compile local point-light (`0x8747a367`) command lists directly on `GXWorker:1..5` by
+    // default (`BB_LIGHT_TILE_BATCH=2` keeps `0x8747a367` on Stage A batcher for weak GPUs).
+    // Keep `VsmShadowMemo` Sample13Weight blur (`0x0b0acf50` + `0x0f61fd27`) on Stage A where
+    // shadow-face elision eliminates whole GPU passes.
+    if (vs_hash == 0x000000008747a367ULL && LightTileBatcher::ForceStageAMode()) {
         return true;
     }
     if (vs_hash == 0x000000000b0acf50ULL && ps_hash == 0x000000000f61fd27ULL) { // VSM blur
@@ -2932,13 +2932,7 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
                     IsAttachmentlessDummyIndirectDraw(sregs, pso, vs_st, ps_st)) {
                     break;
                 }
-                if (mode == 1 && IsStageACoalescerShader(vs_hash, ps_hash)) {
-                    MtNoteBail(MtBailReason::Other, cur_guest_frame, MtOtherKind::Skip);
-                    return false;
-                }
-                if (mode != 1 && (vs_hash == 0x000000008747a367ULL ||
-                                  (vs_hash == 0x000000000b0acf50ULL &&
-                                   ps_hash == 0x000000000f61fd27ULL))) {
+                if (IsStageACoalescerShader(vs_hash, ps_hash)) {
                     MtNoteBail(MtBailReason::Other, cur_guest_frame, MtOtherKind::Skip);
                     return false;
                 }
@@ -3015,6 +3009,7 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
                     if (!seen_draw) {
                         list_is_core_geom =
                             ts.is_gbuffer || guest_mrt == 0x0u ||
+                            vs_hash == 0x000000008747a367ULL ||
                             (guest_mrt == 0x1u &&
                              ObjectVelocityCuller::IsObjectVelocityPs(ps_hash));
                     }

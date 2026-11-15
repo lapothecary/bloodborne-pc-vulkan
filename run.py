@@ -411,8 +411,8 @@ def run(extra_args=(), env=None, on_line=None):
     stamp = time.strftime('%Y%m%d_%H%M%S')
     _log_file = open(logs / f'{stamp}.log', 'w', encoding='utf-8', errors='replace')
     if env.get('BB_SAVE_LOG') == '1':
-        env['BB_FRAME_STATS'] = '1'
         if env.get('BB_CSV_LOG') == '1':
+            setdefault(env, 'BB_FRAME_STATS', '1')
             setdefault(env, 'BB_FRAME_LOG', str(logs / f'{stamp}.frames.csv'))
     elif sys.platform == 'win32':
         # Windows builds: log lightweight 10 s summaries and slow image creations (20 ms+);

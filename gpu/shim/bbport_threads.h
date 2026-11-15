@@ -102,7 +102,7 @@ struct TopologyMasks {
     cpu_set_t draw_rec;     // bb:DrawRec / Stage B (dedicated #2 physical core in CCD1, sharing L3 with GpuComm & VkRecorder)
     cpu_set_t vk_recorder;  // bb:VkRecorder (dedicated #3 physical core in CCD1, sharing L3 with GpuComm & DrawRec)
     cpu_set_t game_workers; // HavokWorker*, CSChrThread*, CSClothThread*, SpCloth*, GXRender*
-    cpu_set_t gx_workers;   // GXWorker* (CCD1 `topo.gpu` on Multi-CCD when BB_MT_DIRECT_VK!=0, else `game_workers`)
+    cpu_set_t gx_workers;   // GXWorker* (game L3 domain `game_workers` by default; secondary GPU CCD with BB_GX_WORKERS_GPU_CCD=1)
     cpu_set_t gpu;          // bb:Resolve*, bb:TexBind, bb:VkRecorder1+, bb:Present, driver helper threads
     cpu_set_t helper;       // bb:Copy*, bb:DrawScan, EzWorkPool*, Core.Res.*, FMOD*, NGX/CUDA/SDL helpers
     int best_main_cpu = -1;
@@ -475,10 +475,9 @@ inline const TopologyMasks& GetTopology() {
                 result.draw_rec = result.gpu;
                 result.vk_recorder = result.gpu;
             }
-            const char* env_mt = std::getenv("BB_MT_DIRECT_VK");
-            const bool mt_direct_vk =
-                !env_mt || env_mt[0] == '\0' || std::strtol(env_mt, nullptr, 10) != 0;
-            if (mt_direct_vk && CPU_COUNT(&result.gpu) >= 4) {
+            const char* env_gx_gpu = std::getenv("BB_GX_WORKERS_GPU_CCD");
+            const bool gx_on_gpu_ccd = env_gx_gpu && env_gx_gpu[0] == '1';
+            if (gx_on_gpu_ccd && CPU_COUNT(&result.gpu) >= 4) {
                 result.gx_workers = result.gpu;
             } else {
                 result.gx_workers = result.game_workers;

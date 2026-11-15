@@ -621,11 +621,11 @@ const Win32TopologyMasks& GetWin32Topology() {
             if (res.helper == 0) {
                 res.helper = res.gpu;
             }
-            const char* env_mt = bb_env("BB_MT_DIRECT_VK");
-            const bool mt_direct_vk =
-                !env_mt || env_mt[0] == '\0' || std::strtol(env_mt, nullptr, 10) != 0;
-            res.gx_workers =
-                (mt_direct_vk && __builtin_popcountll(res.gpu) >= 4) ? res.gpu : res.game_workers;
+            const char* env_gx_gpu = bb_env("BB_GX_WORKERS_GPU_CCD");
+            const bool gx_on_gpu_ccd = env_gx_gpu && env_gx_gpu[0] == '1';
+            res.gx_workers = (gx_on_gpu_ccd && __builtin_popcountll(res.gpu) >= 4)
+                                 ? res.gpu
+                                 : res.game_workers;
         } else {
             // Single L3 domain: check Intel Hybrid P+E (`max_eff > min_eff`) vs Homogeneous (`>= 6` cores).
             DWORD_PTR p_mask = 0, e_mask = 0;

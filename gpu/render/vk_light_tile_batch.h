@@ -39,6 +39,7 @@ public:
     static constexpr size_t kShadowSlots = kShadowSets * kShadowWays;
     static constexpr size_t kMaxGroupsPerPass = 32u;
     static constexpr u32 kMaxGroupSsbo2Dwords = 60000u * 4u; // <= 960 KiB, fits in exact f32 tile_v4_idx
+    static constexpr u64 kShadowSleepFrames = 8ULL; // sleep Stage-A CPU shadow when MT handles 0x8747a367
     static constexpr size_t kStageBWords =
         Gcn::RegDirty::StageBNumChunks * Gcn::RegDirty::StageBChunkWords;
 
@@ -61,6 +62,7 @@ public:
     LightTileBatcher& operator=(const LightTileBatcher&) = delete;
 
     [[nodiscard]] static bool Enabled() noexcept;
+    [[nodiscard]] static bool ForceStageAMode() noexcept;
     [[nodiscard]] static bool IsBatchedLightAccPsHash(u64 pgm_hash) noexcept;
 
     [[nodiscard]] bool HasPendingTiles() const noexcept {
@@ -159,6 +161,7 @@ private:
         return coarse_epoch_256k[(addr >> kCoarseShift) & (kCoarseBuckets - 1u)] +
                coarse_wipe_bias;
     }
+    void WipeCpuShadow() noexcept;
 
     std::vector<ShadowMeta> shadow_meta;
     std::vector<u8> shadow_bytes;
@@ -168,6 +171,8 @@ private:
     u32 shadow_clock = 0;
     u32 coarse_clock = 0;
     u32 coarse_wipe_bias = 0;
+    bool shadow_awake = false;
+    u64 last_stage_a_active_frame = 0;
 
     bool pass_active = false;
     bool pass_commutative_blend = false;

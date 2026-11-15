@@ -377,7 +377,11 @@ static void guest_call_sites(uint64_t out[3]) {
 }
 void runtime_wait_note(int kind, uint64_t ns) {
     static int enabled=-1;
-    if (enabled<0) enabled=bb_env("BB_FRAME_STATS")!=NULL;
+    if (enabled<0) {
+        const char *e=bb_env("BB_WAIT_PROFILE");
+        const char *wl=bb_env("BB_WAIT_LOG");
+        enabled=((e && *e && *e!='0') || (wl && *wl)) ? 1 : 0;
+    }
     if (!enabled) return;
     if (!wait_tid) wait_tid=(int)syscall(SYS_gettid);
     uint64_t sites[3];
