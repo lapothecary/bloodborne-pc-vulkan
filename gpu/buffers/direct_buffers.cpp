@@ -1602,7 +1602,12 @@ MtResolvedBuffer Manager::TryResolveReadMt(VAddr addr, u64 requested_size,
         }
     }
 
-    // Cold worker MRU miss: resolve under shared reader lock and populate worker's private MRU.
+    // Cold worker MRU miss: lock-free native-owned bitmap check first so non-DirectBuffers
+    // addresses (cueHeap, regular guest RAM CBs/IBs) never contend on `entries_rw_mutex`.
+    if (!IsNativeOwnedAddress(addr)) [[likely]] {
+        return {};
+    }
+
     std::shared_lock lock{entries_rw_mutex};
     if (entries_by_base.empty()) {
         lock.unlock();
@@ -1683,6 +1688,9 @@ MtResolvedBuffer Manager::TryResolveReadMt(VAddr addr, u64 requested_size,
 bool Manager::TryCopyCpuMirrorMt(VAddr addr, void* dst, u64 size) const noexcept {
     if (!dst || size == 0 || addr >= kMaxGuestVa ||
         atomic_live_count.load(std::memory_order_acquire) == 0u) {
+        return false;
+    }
+    if (!IsNativeOwnedAddress(addr)) [[likely]] {
         return false;
     }
     std::shared_lock lock{entries_rw_mutex};

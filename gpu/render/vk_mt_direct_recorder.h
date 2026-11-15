@@ -366,6 +366,7 @@ private:
 
     std::unique_ptr<MtGuestCopyShadowCache> guest_copy_shadow;
     std::array<std::atomic<u64>, kMaxWorkers> slot_thread_keys{};
+    std::array<std::atomic<u8>, kMaxWorkers> slot_is_main_thread{};
     std::array<std::atomic<WorkerSlot*>, kMaxWorkers> worker_ptrs{};
     std::array<std::unique_ptr<WorkerSlot>, kMaxWorkers> workers_owned{};
     std::mutex worker_init_mutex;

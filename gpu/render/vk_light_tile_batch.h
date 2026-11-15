@@ -62,7 +62,6 @@ public:
     LightTileBatcher& operator=(const LightTileBatcher&) = delete;
 
     [[nodiscard]] static bool Enabled() noexcept;
-    [[nodiscard]] static bool ForceStageAMode() noexcept;
     [[nodiscard]] static bool IsBatchedLightAccPsHash(u64 pgm_hash) noexcept;
 
     [[nodiscard]] bool HasPendingTiles() const noexcept {
@@ -171,7 +170,7 @@ private:
     u32 shadow_clock = 0;
     u32 coarse_clock = 0;
     u32 coarse_wipe_bias = 0;
-    bool shadow_awake = false;
+    bool shadow_awake = true;
     u64 last_stage_a_active_frame = 0;
 
     bool pass_active = false;

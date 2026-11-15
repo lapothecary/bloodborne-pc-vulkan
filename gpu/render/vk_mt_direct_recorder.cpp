@@ -13,6 +13,7 @@
 #include <windows.h>
 #else
 #include <pthread.h>
+#include <unistd.h>
 #endif
 
 #include <boost/container/static_vector.hpp>
@@ -518,6 +519,9 @@ void VkMtDirectRecorder::WorkerLocalStats::FlushToGlobal(Rasterizer& rasterizer_
 }
 
 u32 VkMtDirectRecorder::AcquireThreadWorkerId() noexcept {
+#ifdef _WIN32
+    static const DWORD g_win32_main_tid = GetCurrentThreadId();
+#endif
     const u64 key = CurrentOsThreadKey();
     for (u32 i = 0; i < kMaxWorkers; ++i) {
         if (slot_thread_keys[i].load(std::memory_order_relaxed) == key) [[likely]] {
@@ -528,6 +532,12 @@ u32 VkMtDirectRecorder::AcquireThreadWorkerId() noexcept {
         u64 expected = 0ULL;
         if (slot_thread_keys[i].compare_exchange_strong(expected, key, std::memory_order_acq_rel,
                                                         std::memory_order_relaxed)) {
+#ifdef _WIN32
+            const bool is_main = (GetCurrentThreadId() == g_win32_main_tid);
+#else
+            const bool is_main = (::gettid() == ::getpid());
+#endif
+            slot_is_main_thread[i].store(is_main ? 2u : 1u, std::memory_order_release);
             return i;
         }
         if (expected == key) {
@@ -2009,13 +2019,15 @@ void MtNotePsoBail(PipelineCache::MtPsoFailKind fail_kind, bool unsafe_pso,
 }
 
 [[nodiscard]] inline bool IsStageACoalescerShader(u64 vs_hash, u64 ps_hash) noexcept {
-    // Compile local point-light (`0x8747a367`) command lists directly on `GXWorker:1..5` by
-    // default (`BB_LIGHT_TILE_BATCH=2` keeps `0x8747a367` on Stage A batcher for weak GPUs).
-    // Keep `VsmShadowMemo` Sample13Weight blur (`0x0b0acf50` + `0x0f61fd27`) on Stage A where
-    // shadow-face elision eliminates whole GPU passes.
-    if (vs_hash == 0x000000008747a367ULL && LightTileBatcher::ForceStageAMode()) {
+    // Skip local point-light (`0x8747a367`) command lists on the very 1st draw when
+    // `LightTileBatcher` is enabled (default `1`), avoiding pre-scanning 128 subpasses of
+    // per-tile `CopyBatch` packets before bailing to `LightTileBatcher` anyway.
+    // (`BB_LIGHT_TILE_BATCH=0` disables Stage-A batching and allows MT compilation).
+    if (vs_hash == 0x000000008747a367ULL && LightTileBatcher::Enabled()) {
         return true;
     }
+    // Keep `VsmShadowMemo` Sample13Weight blur (`0x0b0acf50` + `0x0f61fd27`) on Stage A where
+    // shadow-face elision eliminates whole GPU passes.
     if (vs_hash == 0x000000000b0acf50ULL && ps_hash == 0x000000000f61fd27ULL) { // VSM blur
         return true;
     }
@@ -2720,7 +2732,18 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
     }
 
     const u32 worker_id = AcquireThreadWorkerId();
-    if (worker_id >= kMaxWorkers || !EnsureWorkerInitialized(worker_id)) {
+    if (worker_id >= kMaxWorkers) {
+        return false;
+    }
+    static const bool allow_main_thread = [] {
+        const char* env = std::getenv("BB_MT_MAIN_THREAD");
+        return env && env[0] == '1';
+    }();
+    if (!allow_main_thread &&
+        slot_is_main_thread[worker_id].load(std::memory_order_acquire) == 2u) {
+        return false;
+    }
+    if (!EnsureWorkerInitialized(worker_id)) {
         return false;
     }
     WorkerSlot& w = *worker_ptrs[worker_id].load(std::memory_order_relaxed);
@@ -3525,9 +3548,11 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
         if (!in_transient) {
             const auto resolved = ResolveBuffer(worker_id, addr, req_size);
             if (resolved && resolved.clamped_size >= min_span) {
+                const u64 check_sz = std::min<u64>(req_size, resolved.clamped_size);
                 if (!resolved.is_gpu_written &&
-                    !WasCoarseRangeModifiedRecently(addr, req_size, cur_guest_frame) &&
-                    !rasterizer.IsRegionGpuModifiedForMt(addr, req_size)) {
+                    !WasCoarseRangeModifiedRecently(addr, check_sz, cur_guest_frame) &&
+                    (resolved.is_static_immutable ||
+                     !rasterizer.IsRegionGpuModifiedForMt(addr, check_sz))) {
                     out_buf = vk::Buffer{resolved.handle};
                     out_off = resolved.offset;
                     out_total_bytes = resolved.offset + resolved.clamped_size;

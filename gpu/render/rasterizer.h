@@ -1252,6 +1252,11 @@ private:
         std::atomic<u64> total_max{0};
         std::atomic<u64> big_max{0};
         std::array<std::atomic<u64>, 4> level_max{};
+        /// Substep 4.8: L1/L2-resident 1 MiB page max-packet filter (`(VAddr >> 20) & 4095`, 32 KiB)
+        /// rejecting untouched multi-MiB ranges in O(1) and narrowing partial overlaps before
+        /// scanning `big[128]` or 256-byte `tables[0]` granules.
+        std::array<std::atomic<u64>, 4096> mpage_max{};
+        std::atomic<u64> mpage_overflow_max{0};
         std::atomic<VAddr> active_min_addr{~VAddr{0}};
         std::atomic<VAddr> active_max_addr{0};
         static void BumpMax(std::atomic<u64>& target, u64 packet, bool single_writer) {
@@ -1265,6 +1270,18 @@ private:
             }
             while (seen < packet &&
                    !target.compare_exchange_weak(seen, packet, std::memory_order_relaxed)) {
+            }
+        }
+        void NoteMpages(VAddr address, u64 size, u64 packet, bool single_writer) noexcept {
+            const VAddr last_addr = (address + size > address) ? (address + size - 1) : ~VAddr{0};
+            const u64 m0 = address >> 20;
+            const u64 m1 = last_addr >> 20;
+            if (m1 - m0 < 64) {
+                for (u64 m = m0; m <= m1; ++m) {
+                    BumpMax(mpage_max[m & 4095u], packet, single_writer);
+                }
+            } else {
+                BumpMax(mpage_overflow_max, packet, single_writer);
             }
         }
         void UpdateAddrBounds(VAddr address, u64 size, u64 prev_max, u64 retired,
@@ -1305,6 +1322,7 @@ private:
             UpdateAddrBounds(address, size, prev_max, retired, single_writer);
             BumpMax(total_max, packet, single_writer);
             if (size > Limits[2]) {
+                NoteMpages(address, size, packet, single_writer);
                 BumpMax(big_max, packet, single_writer);
                 u32 free_idx = ~0u;
                 for (u32 i = 0; i < big.size(); ++i) {
@@ -1352,6 +1370,7 @@ private:
             const u64 prev_max = total_max.load(std::memory_order_relaxed);
             UpdateAddrBounds(address, size, prev_max, retired, single_writer);
             BumpMax(total_max, packet, single_writer);
+            NoteMpages(address, size, packet, single_writer);
             const u32 level = size <= Limits[0] ? 0 : size <= Limits[1] ? 1 : size <= Limits[2] ? 2 : 3;
             BumpMax(level_max[level], packet, single_writer);
             auto& table = tables[level];
@@ -1385,9 +1404,43 @@ private:
             if (size == 0 || total_max.load(std::memory_order_relaxed) < min_needed) {
                 return 0;
             }
-            if (address + size <= active_min_addr.load(std::memory_order_relaxed) ||
-                address >= active_max_addr.load(std::memory_order_relaxed)) {
+            const VAddr cur_min = active_min_addr.load(std::memory_order_relaxed);
+            const VAddr cur_max = active_max_addr.load(std::memory_order_relaxed);
+            const VAddr req_end = (address + size > address) ? (address + size) : ~VAddr{0};
+            if (req_end <= cur_min || address >= cur_max) {
                 return 0;
+            }
+            VAddr q_addr = std::max(address, cur_min);
+            VAddr q_end = std::min(req_end, cur_max);
+            if (q_addr >= q_end) {
+                return 0;
+            }
+            const u64 m0 = q_addr >> 20;
+            const u64 m1 = (q_end - 1) >> 20;
+            if (mpage_overflow_max.load(std::memory_order_relaxed) < min_needed &&
+                (m1 - m0) < 64) {
+                u64 first_hit = ~0ULL;
+                u64 last_hit = 0ULL;
+                for (u64 m = m0; m <= m1; ++m) {
+                    if (mpage_max[m & 4095u].load(std::memory_order_relaxed) >= min_needed) {
+                        if (first_hit == ~0ULL) {
+                            first_hit = m;
+                        }
+                        last_hit = m;
+                    }
+                }
+                if (first_hit == ~0ULL) {
+                    return 0;
+                }
+                const VAddr hit_begin = static_cast<VAddr>(first_hit << 20);
+                const VAddr hit_end = (last_hit < (~0ULL >> 20))
+                                          ? static_cast<VAddr>((last_hit + 1ULL) << 20)
+                                          : ~VAddr{0};
+                q_addr = std::max(q_addr, hit_begin);
+                q_end = std::min(q_end, hit_end);
+                if (q_addr >= q_end) {
+                    return 0;
+                }
             }
             u64 newest = 0;
             if (big_max.load(std::memory_order_relaxed) >= min_needed) {
@@ -1397,7 +1450,7 @@ private:
                         continue;
                     }
                     const VAddr end = b.end.load(std::memory_order_acquire);
-                    if (end > address && b.begin.load(std::memory_order_relaxed) < address + size) {
+                    if (end > q_addr && b.begin.load(std::memory_order_relaxed) < q_end) {
                         newest = bpkt;
                     }
                 }
@@ -1407,8 +1460,7 @@ private:
                     std::max(min_needed, newest + 1)) {
                     continue;
                 }
-                for (u64 g = address >> Shifts[level]; g <= (address + size - 1) >> Shifts[level];
-                     ++g) {
+                for (u64 g = q_addr >> Shifts[level]; g <= (q_end - 1) >> Shifts[level]; ++g) {
                     const u64 entry = tables[level][Slot(g, level)].load(std::memory_order_relaxed);
                     const u64 pkt = entry & kPktMask;
                     if (pkt < min_needed || pkt <= newest) {

@@ -225,14 +225,6 @@ bool LightTileBatcher::Enabled() noexcept {
     return on;
 }
 
-bool LightTileBatcher::ForceStageAMode() noexcept {
-    static const bool force = [] {
-        const char* env = std::getenv("BB_LIGHT_TILE_BATCH");
-        return env && env[0] == '2';
-    }();
-    return force;
-}
-
 void LightTileBatcher::WipeCpuShadow() noexcept {
     ++coarse_wipe_bias;
     shadow_min_va = ~VAddr{0};
