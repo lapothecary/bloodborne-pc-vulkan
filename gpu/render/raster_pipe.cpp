@@ -145,6 +145,7 @@ void Rasterizer::NoteStageACpuCopyBatch(const u32* raw_regions, u32 count) noexc
     if (vfx_ui_batcher) {
         vfx_ui_batcher->NoteStageACpuCopyBatch(raw_regions, count);
     }
+    NoteOccCullStageACpuCopyBatch(raw_regions, count);
 }
 
 void Rasterizer::InvalidateStageACpuShadow(VAddr addr, u64 size) noexcept {
@@ -164,6 +165,7 @@ void Rasterizer::InvalidateStageACpuShadow(VAddr addr, u64 size) noexcept {
     if (vfx_ui_batcher) {
         vfx_ui_batcher->InvalidateCpuShadow(addr, size);
     }
+    InvalidateOccCullStageACpuShadow(addr, size);
 }
 
 bool Rasterizer::HasPendingLightTiles() const noexcept {

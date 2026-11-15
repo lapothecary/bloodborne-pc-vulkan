@@ -15,6 +15,7 @@
 #include "render/vk_vfx_ui_batch.h"
 #include "shim/bbport_settings.h"
 #include "textures/direct_textures.h"
+#include "../../dantelion_gx/include/gx_direct_vulkan.h"
 #include <vk_mem_alloc.h>
 
 extern "C" bool BbLookupMappedEnd(u64 address, uintptr_t& out_end);
@@ -89,7 +90,7 @@ struct SceneOcclusionCuller {
     bool mt_occ_cull = true;
     bool micro_shadow_cull = true;
     std::atomic<u32> cur_frame{1};
-    std::atomic<u32> stage_a_frame{1};
+    std::atomic<u32> stage_a_frame{8};
     u32 cur_slice = 0;
     u32 gbuf_draws_in_frame = 0;
     u32 stage_a_gbuf_draws = 0;
@@ -127,6 +128,292 @@ struct SceneOcclusionCuller {
     std::atomic<u64> stat_shadow_skipped{0};
     std::atomic<u64> stat_light_candidates{0};
     std::atomic<u64> stat_light_skipped{0};
+
+    // Phase 5.2b: Zero-memcpy Stage-A copy redirect + settled `DirectBuffers::cpu_shadow` MRU.
+    static constexpr size_t kCoarseBuckets = 65536; // 256 KiB granules across 40-bit VA space
+    static constexpr u32 kTinyRedirMax = 512u;
+    static constexpr u32 kTinyRedirShift = 9u;
+    static constexpr size_t kTinyRedirSets = 512;
+    static constexpr size_t kTinyRedirWays = 4;
+    static constexpr u32 kSmallRedirMax = 4096u;
+    static constexpr u32 kSmallRedirShift = 12u;
+    static constexpr size_t kSmallRedirSets = 256;
+    static constexpr size_t kSmallRedirWays = 4;
+    static constexpr u32 kLargeRedirMax = 65536u;
+    static constexpr u32 kLargeRedirShift = 16u;
+    static constexpr size_t kLargeRedirSets = 128;
+    static constexpr size_t kLargeRedirWays = 4;
+    static constexpr size_t kSettledMruSlots = 2048;
+
+    struct RedirSlot {
+        VAddr dst_va{0};
+        VAddr src_va{0};
+        u64 src_cue_stamp{0};
+        u32 byte_size{0};
+        u32 dst_e0{0};
+        u32 dst_e1{0};
+        u32 recorded_frame{0};
+        u32 last_use{0};
+    };
+
+    struct SettledMruSlot {
+        VAddr base_va{0};
+        u64 raw_size{0};
+        const u8* mirror_base{nullptr};
+        u64 erase_gen{0};
+    };
+
+    std::vector<u32> coarse_epoch_256k;
+    std::vector<u32> last_write_frame_256k;
+    std::vector<RedirSlot> tiny_redir;
+    std::vector<RedirSlot> small_redir;
+    std::vector<RedirSlot> large_redir;
+    std::vector<SettledMruSlot> settled_mru;
+    SettledMruSlot last_settled_hit{};
+    u32 redir_clock = 0;
+
+    [[nodiscard]] static constexpr size_t CoarseBucket(VAddr addr) noexcept {
+        return static_cast<size_t>(((addr >> 18) ^ (addr >> 34)) & (kCoarseBuckets - 1));
+    }
+    [[nodiscard]] static constexpr size_t PageSetIdx(VAddr page, size_t num_sets) noexcept {
+        u64 h = page * 0x9E3779B97F4A7C15ULL;
+        h ^= h >> 32;
+        return static_cast<size_t>(h & (num_sets - 1));
+    }
+    [[nodiscard]] static constexpr size_t SettledMruHash(VAddr addr) noexcept {
+        return static_cast<size_t>(((addr >> 8) ^ (addr >> 17) ^ (addr >> 26)) &
+                                   (kSettledMruSlots - 1));
+    }
+
+    void StampAndBumpCoarse(VAddr addr, u64 size, u32 cur_f, bool bump_epoch) noexcept {
+        if (!addr || size == 0 || last_write_frame_256k.empty()) {
+            return;
+        }
+        if (size > (16ULL << 20)) {
+            std::fill(last_write_frame_256k.begin(), last_write_frame_256k.end(), cur_f);
+            if (bump_epoch) {
+                for (u32& e : coarse_epoch_256k) {
+                    ++e;
+                }
+            }
+            return;
+        }
+        const u64 first_p = addr >> 18;
+        const u64 last_p = (addr + size - 1ULL) >> 18;
+        for (u64 p = first_p; p <= last_p; ++p) {
+            const size_t b = static_cast<size_t>((p ^ (p >> 16)) & (kCoarseBuckets - 1));
+            last_write_frame_256k[b] = cur_f;
+            if (bump_epoch) {
+                ++coarse_epoch_256k[b];
+            }
+        }
+    }
+
+    void NoteStageACpuCopyBatch(const u32* raw_regions, u32 count) noexcept {
+        if (!enabled || !stage_a_occ_cull || !raw_regions || count == 0u || count > 32u ||
+            tiny_redir.empty()) {
+            return;
+        }
+        const u32 cur_f = stage_a_frame.load(std::memory_order_relaxed);
+        for (u32 i = 0; i < count; ++i) {
+            Rasterizer::DirectCopyRegion reg{};
+            std::memcpy(&reg, raw_regions + i * 6u, sizeof(reg));
+            if (reg.dst_va == 0 || reg.byte_size == 0) {
+                continue;
+            }
+            if (reg.reserved != gx_direct_vk::kCopyFlagKnownCpuSource ||
+                reg.byte_size > kLargeRedirMax || reg.src_va == 0 ||
+                !VideoCore::DirectBuffers::OverlapsNativeOwnedRange(reg.dst_va, reg.byte_size)) {
+                StampAndBumpCoarse(reg.dst_va, reg.byte_size, cur_f, /*bump_epoch=*/true);
+                continue;
+            }
+
+            StampAndBumpCoarse(reg.dst_va, reg.byte_size, cur_f, /*bump_epoch=*/false);
+            const u64 cue_stamp =
+                VideoCore::DirectBuffers::ComputeTransientCueStamp(reg.src_va, reg.byte_size);
+
+            RedirSlot* table = nullptr;
+            size_t set_base = 0;
+            size_t ways = 0;
+            if (reg.byte_size <= kTinyRedirMax) {
+                table = tiny_redir.data();
+                set_base = PageSetIdx(reg.dst_va >> kTinyRedirShift, kTinyRedirSets) * kTinyRedirWays;
+                ways = kTinyRedirWays;
+            } else if (reg.byte_size <= kSmallRedirMax) {
+                table = small_redir.data();
+                set_base =
+                    PageSetIdx(reg.dst_va >> kSmallRedirShift, kSmallRedirSets) * kSmallRedirWays;
+                ways = kSmallRedirWays;
+            } else {
+                table = large_redir.data();
+                set_base =
+                    PageSetIdx(reg.dst_va >> kLargeRedirShift, kLargeRedirSets) * kLargeRedirWays;
+                ways = kLargeRedirWays;
+            }
+
+            const u32 cur_e0 = coarse_epoch_256k[CoarseBucket(reg.dst_va)];
+            const u32 cur_e1 = coarse_epoch_256k[CoarseBucket(reg.dst_va + reg.byte_size - 1u)];
+            bool updated_in_place = false;
+            for (size_t w = 0; w < ways; ++w) {
+                auto& s = table[set_base + w];
+                if (s.dst_va == reg.dst_va && s.byte_size == reg.byte_size && s.dst_e0 == cur_e0 &&
+                    s.dst_e1 == cur_e1) {
+                    s.src_va = reg.src_va;
+                    s.src_cue_stamp = cue_stamp;
+                    s.recorded_frame = cur_f;
+                    s.last_use = ++redir_clock;
+                    updated_in_place = true;
+                    break;
+                }
+            }
+            if (updated_in_place) {
+                continue;
+            }
+
+            StampAndBumpCoarse(reg.dst_va, reg.byte_size, cur_f, /*bump_epoch=*/true);
+            const u32 new_e0 = coarse_epoch_256k[CoarseBucket(reg.dst_va)];
+            const u32 new_e1 = coarse_epoch_256k[CoarseBucket(reg.dst_va + reg.byte_size - 1u)];
+            size_t victim = 0;
+            u32 oldest = ~0u;
+            for (size_t w = 0; w < ways; ++w) {
+                const auto& s = table[set_base + w];
+                if (s.byte_size == 0u ||
+                    s.dst_e0 != coarse_epoch_256k[CoarseBucket(s.dst_va)] ||
+                    s.dst_e1 != coarse_epoch_256k[CoarseBucket(s.dst_va + s.byte_size - 1u)]) {
+                    victim = w;
+                    break;
+                }
+                if (s.last_use < oldest) {
+                    oldest = s.last_use;
+                    victim = w;
+                }
+            }
+            auto& dst_s = table[set_base + victim];
+            dst_s.dst_va = reg.dst_va;
+            dst_s.src_va = reg.src_va;
+            dst_s.src_cue_stamp = cue_stamp;
+            dst_s.byte_size = reg.byte_size;
+            dst_s.dst_e0 = new_e0;
+            dst_s.dst_e1 = new_e1;
+            dst_s.recorded_frame = cur_f;
+            dst_s.last_use = ++redir_clock;
+        }
+    }
+
+    void InvalidateStageACpuShadow(VAddr addr, u64 size) noexcept {
+        if (!enabled || !stage_a_occ_cull || !addr || size == 0 || last_write_frame_256k.empty()) {
+            return;
+        }
+        StampAndBumpCoarse(addr, size, stage_a_frame.load(std::memory_order_relaxed),
+                           /*bump_epoch=*/true);
+    }
+
+    [[nodiscard]] const u8* LookupStageARedirect(VAddr addr, u32 cb_size, u32 frame_tag) noexcept {
+        if (cb_size == 0 || cb_size > kLargeRedirMax || tiny_redir.empty()) {
+            return nullptr;
+        }
+        const auto probe_tier = [&](RedirSlot* table, u32 shift, size_t num_sets,
+                                    size_t ways) noexcept -> const u8* {
+            const VAddr page = addr >> shift;
+            for (u32 step = 0; step < 2u; ++step) {
+                if (step == 1u && page == 0u) {
+                    break;
+                }
+                const size_t set_base = PageSetIdx(page - step, num_sets) * ways;
+                for (size_t w = 0; w < ways; ++w) {
+                    auto& s = table[set_base + w];
+                    if (s.byte_size == 0u || addr < s.dst_va) {
+                        continue;
+                    }
+                    const u64 sub_off = addr - s.dst_va;
+                    if (sub_off >= s.byte_size || (s.byte_size - sub_off) < cb_size) {
+                        continue;
+                    }
+                    if (s.dst_e0 != coarse_epoch_256k[CoarseBucket(s.dst_va)] ||
+                        s.dst_e1 != coarse_epoch_256k[CoarseBucket(s.dst_va + s.byte_size - 1u)])
+                        [[unlikely]] {
+                        s.byte_size = 0u;
+                        continue;
+                    }
+                    if (s.src_cue_stamp != 0ULL) {
+                        if (VideoCore::DirectBuffers::ComputeTransientCueStamp(
+                                s.src_va, s.byte_size) != s.src_cue_stamp) [[unlikely]] {
+                            s.byte_size = 0u;
+                            continue;
+                        }
+                    } else if (s.recorded_frame != frame_tag) {
+                        s.byte_size = 0u;
+                        continue;
+                    }
+                    s.last_use = ++redir_clock;
+                    return reinterpret_cast<const u8*>(s.src_va + sub_off);
+                }
+            }
+            return nullptr;
+        };
+
+        if (cb_size <= kTinyRedirMax) {
+            if (const u8* p =
+                    probe_tier(tiny_redir.data(), kTinyRedirShift, kTinyRedirSets, kTinyRedirWays)) {
+                return p;
+            }
+        }
+        if (cb_size <= kSmallRedirMax) {
+            if (const u8* p = probe_tier(small_redir.data(), kSmallRedirShift, kSmallRedirSets,
+                                         kSmallRedirWays)) {
+                return p;
+            }
+        }
+        return probe_tier(large_redir.data(), kLargeRedirShift, kLargeRedirSets, kLargeRedirWays);
+    }
+
+    [[nodiscard]] const u8* LookupSettledMirror(const VideoCore::DirectBuffers::Manager& direct_bufs,
+                                                VAddr addr, u32 cb_size, u32 frame_tag) noexcept {
+        if (settled_mru.empty() || last_write_frame_256k.empty()) {
+            return nullptr;
+        }
+        const u32 wf0 = last_write_frame_256k[CoarseBucket(addr)];
+        const u32 wf1 = last_write_frame_256k[CoarseBucket(addr + cb_size - 1u)];
+        if ((frame_tag - wf0) < 4u || (frame_tag - wf1) < 4u) {
+            return nullptr;
+        }
+        const u64 cur_gen = direct_bufs.ShadowDirEraseGen();
+        if (last_settled_hit.erase_gen == cur_gen && last_settled_hit.mirror_base &&
+            addr >= last_settled_hit.base_va) {
+            const u64 sub_off = addr - last_settled_hit.base_va;
+            if (sub_off < last_settled_hit.raw_size &&
+                (last_settled_hit.raw_size - sub_off) >= cb_size) {
+                return last_settled_hit.mirror_base + sub_off;
+            }
+        }
+        const size_t h0 = SettledMruHash(addr);
+        const size_t h1 = (h0 + 1u) & (kSettledMruSlots - 1);
+        for (const size_t idx : {h0, h1}) {
+            const auto& slot = settled_mru[idx];
+            if (slot.erase_gen == cur_gen && slot.mirror_base && addr >= slot.base_va) {
+                const u64 sub_off = addr - slot.base_va;
+                if (sub_off < slot.raw_size && (slot.raw_size - sub_off) >= cb_size) {
+                    last_settled_hit = slot;
+                    return slot.mirror_base + sub_off;
+                }
+            }
+        }
+        VAddr base_va = 0;
+        u64 raw_size = 0;
+        const u8* mirror_base = nullptr;
+        u64 out_gen = 0;
+        if (!direct_bufs.TryLookupCpuShadowStageA(addr, cb_size, base_va, raw_size, mirror_base,
+                                                  out_gen)) {
+            return nullptr;
+        }
+        const SettledMruSlot fresh{base_va, raw_size, mirror_base, out_gen};
+        if (settled_mru[h0].base_va != base_va || settled_mru[h0].erase_gen != out_gen) {
+            settled_mru[h1] = settled_mru[h0];
+        }
+        settled_mru[h0] = fresh;
+        last_settled_hit = fresh;
+        return mirror_base + (addr - base_va);
+    }
 
     void EnsureInit(const Instance& instance) {
         if (initialized) {
@@ -174,6 +461,14 @@ struct SceneOcclusionCuller {
                 mt_pool = std::move(mt_res.value);
                 device.resetQueryPool(*mt_pool, 0, MtQueryBlocks * MtQueriesPerBlock);
             }
+        }
+        if (stage_a_occ_cull) {
+            coarse_epoch_256k.assign(kCoarseBuckets, 1u);
+            last_write_frame_256k.assign(kCoarseBuckets, 0u);
+            tiny_redir.resize(kTinyRedirSets * kTinyRedirWays);
+            small_redir.resize(kSmallRedirSets * kSmallRedirWays);
+            large_redir.resize(kLargeRedirSets * kLargeRedirWays);
+            settled_mru.resize(kSettledMruSlots);
         }
     }
 
@@ -672,8 +967,6 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     if (!EmulatorSettings.IsNullGPU()) {
         object_vel_culler = std::make_unique<ObjectVelocityCuller>();
         scene_occlusion_culler->EnsureInit(instance);
-        object_vel_culler->KeepStageAShadowAwake(scene_occlusion_culler->enabled &&
-                                                 scene_occlusion_culler->stage_a_occ_cull);
     }
     mt_direct_recorder = std::make_unique<VkMtDirectRecorder>(instance, scheduler, *this);
     draw_prep = std::make_unique<DrawPreparation>(pipeline_cache);
@@ -1590,6 +1883,18 @@ bool Rasterizer::TryCullMicroShadowDraw(const GraphicsPipeline* pipeline,
     return false;
 }
 
+void Rasterizer::NoteOccCullStageACpuCopyBatch(const u32* raw_regions, u32 count) noexcept {
+    if (scene_occlusion_culler) {
+        scene_occlusion_culler->NoteStageACpuCopyBatch(raw_regions, count);
+    }
+}
+
+void Rasterizer::InvalidateOccCullStageACpuShadow(VAddr addr, u64 size) noexcept {
+    if (scene_occlusion_culler) {
+        scene_occlusion_culler->InvalidateStageACpuShadow(addr, size);
+    }
+}
+
 bool Rasterizer::TryCullSceneOcclusionStageA(const GraphicsPipeline* pipeline,
                                              const PreparedDraw* used_prepared, bool is_indexed,
                                              u32 index_offset, u16& out_handoff) {
@@ -1751,18 +2056,21 @@ bool Rasterizer::TryCullSceneOcclusionStageA(const GraphicsPipeline* pipeline,
             VideoCore::DirectBuffers::IsTransientAuxCpuRing(cb_va, cb_size) ||
             VideoCore::DirectBuffers::IsCpuReadableImmutableRange(cb_va, cb_size)) {
             cb_ptr = reinterpret_cast<const u8*>(cb_va);
-        } else if (object_vel_culler) {
-            cb_ptr = object_vel_culler->LookupStageACpuShadow(cb_va, cb_size, cb_size);
+        } else {
+            cb_ptr = culler.LookupStageARedirect(cb_va, cb_size, frame_tag);
+            if (!cb_ptr && VideoCore::DirectBuffers::OverlapsNativeOwnedRange(cb_va, cb_size)) {
+                cb_ptr = culler.LookupSettledMirror(direct_buffers, cb_va, cb_size, frame_tag);
+                if (!cb_ptr) {
+                    if (role != OccCbRole::SceneCam) {
+                        culler.stat_stage_b_fallbacks.fetch_add(1, std::memory_order_relaxed);
+                        out_handoff = kOccStageBFallback;
+                        return false;
+                    }
+                    continue;
+                }
+            }
         }
         if (!cb_ptr) {
-            if (VideoCore::DirectBuffers::OverlapsNativeOwnedRange(cb_va, cb_size)) {
-                if (role != OccCbRole::SceneCam) {
-                    culler.stat_stage_b_fallbacks.fetch_add(1, std::memory_order_relaxed);
-                    out_handoff = kOccStageBFallback;
-                    return false;
-                }
-                continue;
-            }
             uintptr_t mapped_end = 0;
             if (BbLookupMappedEnd(cb_va, mapped_end) && cb_size <= (mapped_end - cb_va) &&
                 !PendingWriteOverlaps(cb_va, cb_size) &&

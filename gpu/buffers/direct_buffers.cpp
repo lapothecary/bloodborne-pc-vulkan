@@ -1372,9 +1372,34 @@ void Manager::ClearMruFor(const Buffer*) noexcept {}
 
 void Manager::UpdateMruEntry(VAddr, u64, const Buffer*, u64) noexcept {}
 
+void Manager::PublishShadowDirEntry(VAddr base_addr, u64 raw_size, u64 alloc_size,
+                                    const u8* shadow_ptr) noexcept {
+    if (!shadow_ptr || base_addr == 0 || raw_size == 0 || alloc_size == 0) {
+        return;
+    }
+    std::unique_lock lock{shadow_dir_mutex};
+    shadow_dir[base_addr] = SettledShadowInfo{raw_size, alloc_size, shadow_ptr};
+}
+
+void Manager::UnpublishShadowDirEntry(VAddr base_addr, std::unique_ptr<u8[]>&& shadow_buf,
+                                      u64 retire_tick) noexcept {
+    {
+        std::unique_lock lock{shadow_dir_mutex};
+        if (shadow_dir.erase(base_addr) != 0u) {
+            shadow_dir_erase_gen.fetch_add(1ULL, std::memory_order_release);
+        }
+    }
+    if (shadow_buf) {
+        retired_shadows.emplace_back(retire_tick, std::move(shadow_buf));
+    }
+}
+
 void Manager::ReclaimCompleted() noexcept {
     while (!retired.empty() && scheduler.IsFree(retired.front().first)) {
         retired.pop_front();
+    }
+    while (!retired_shadows.empty() && scheduler.IsFree(retired_shadows.front().first)) {
+        retired_shadows.pop_front();
     }
 }
 
@@ -1384,36 +1409,46 @@ void Manager::RetireOverlapping(VAddr addr, u64 size, bool clear_global_owned) {
     }
     const VAddr range_end = addr + size;
     const u64 tick = scheduler.CurrentTick();
-    WriteLockGuard lock{entries_rw_mutex, mt_lock_enabled};
-    auto it = entries_by_base.lower_bound(addr);
-    if (it != entries_by_base.begin()) {
-        --it;
-    }
-    bool erased_any = false;
-    while (it != entries_by_base.end() && it->first < range_end) {
-        const VAddr e_start = it->first;
-        const u64 e_size = it->second.alloc_size;
-        const VAddr e_end = e_start + e_size;
-        if (e_end <= addr) {
-            ++it;
-            continue;
+    std::vector<std::pair<VAddr, std::unique_ptr<u8[]>>> dead_shadows;
+    {
+        WriteLockGuard lock{entries_rw_mutex, mt_lock_enabled};
+        auto it = entries_by_base.lower_bound(addr);
+        if (it != entries_by_base.begin()) {
+            --it;
         }
-        erased_any = true;
-        if (clear_global_owned) {
-            ClearNativeOwnedRange(e_start, e_size);
-            SetExactNativeBufferOwned(e_start, false);
+        bool erased_any = false;
+        while (it != entries_by_base.end() && it->first < range_end) {
+            const VAddr e_start = it->first;
+            const u64 e_size = it->second.alloc_size;
+            const VAddr e_end = e_start + e_size;
+            if (e_end <= addr) {
+                ++it;
+                continue;
+            }
+            erased_any = true;
+            if (clear_global_owned) {
+                ClearNativeOwnedRange(e_start, e_size);
+                SetExactNativeBufferOwned(e_start, false);
+            }
+            if (it->second.cpu_shadow) {
+                dead_shadows.emplace_back(e_start, std::move(it->second.cpu_shadow));
+                it->second.has_cpu_shadow = false;
+            }
+            retired.emplace_back(tick, std::move(it->second.buffer));
+            it = entries_by_base.erase(it);
+            RebuildBitmapAroundErase(e_start, e_end);
         }
-        retired.emplace_back(tick, std::move(it->second.buffer));
-        it = entries_by_base.erase(it);
-        RebuildBitmapAroundErase(e_start, e_end);
+        if (erased_any) {
+            ++erase_generation;
+            ++map_erase_generation;
+            atomic_live_count.store(static_cast<u32>(entries_by_base.size()),
+                                    std::memory_order_release);
+            atomic_map_erase_gen.fetch_add(1, std::memory_order_release);
+            atomic_override_gen.fetch_add(1, std::memory_order_release);
+        }
     }
-    if (erased_any) {
-        ++erase_generation;
-        ++map_erase_generation;
-        atomic_live_count.store(static_cast<u32>(entries_by_base.size()),
-                                std::memory_order_release);
-        atomic_map_erase_gen.fetch_add(1, std::memory_order_release);
-        atomic_override_gen.fetch_add(1, std::memory_order_release);
+    for (auto& [dead_base, dead_buf] : dead_shadows) {
+        UnpublishShadowDirEntry(dead_base, std::move(dead_buf), tick);
     }
 }
 
@@ -1727,6 +1762,38 @@ bool Manager::TryCopyCpuMirrorMt(VAddr addr, void* dst, u64 size) const noexcept
     return false;
 }
 
+bool Manager::TryLookupCpuShadowStageA(VAddr addr, u64 size, VAddr& out_base, u64& out_raw_size,
+                                       const u8*& out_mirror_base,
+                                       u64& out_erase_gen) const noexcept {
+    if (size == 0 || addr >= kMaxGuestVa ||
+        atomic_live_count.load(std::memory_order_acquire) == 0u) {
+        return false;
+    }
+    std::shared_lock lock{shadow_dir_mutex};
+    if (shadow_dir.empty()) {
+        return false;
+    }
+    auto it = shadow_dir.upper_bound(addr);
+    if (it == shadow_dir.begin()) {
+        return false;
+    }
+    --it;
+    const VAddr base = it->first;
+    const SettledShadowInfo& info = it->second;
+    if (addr < base || addr >= base + info.alloc_size || !info.ptr) {
+        return false;
+    }
+    const u64 sub_off = addr - base;
+    if (sub_off >= info.raw_size || (info.raw_size - sub_off) < size) {
+        return false;
+    }
+    out_base = base;
+    out_raw_size = info.raw_size;
+    out_mirror_base = info.ptr;
+    out_erase_gen = shadow_dir_erase_gen.load(std::memory_order_acquire);
+    return true;
+}
+
 const u8* Manager::TryGetCpuMirrorPtr(VAddr addr, u64 size) noexcept {
     if (size == 0 || addr >= kMaxGuestVa || entries_by_base.empty()) {
         return nullptr;
@@ -1841,8 +1908,10 @@ std::pair<const Buffer*, u64> Manager::TryResolveWrite(VAddr addr, u64 size, boo
         }
         const Buffer* dst_buf = hit_entry->buffer.get();
         const u64 entry_alloc_size = hit_entry->alloc_size;
+        ClearCpuImmutableRange(base, entry_alloc_size);
         bool do_invalidate_shaders = false;
         bool do_zero_fill = false;
+        std::unique_ptr<u8[]> dead_shadow;
         {
             WriteLockGuard lock{entries_rw_mutex, mt_lock_enabled};
             if (!hit_entry->noted_ext_gpu_mod) {
@@ -1855,7 +1924,7 @@ std::pair<const Buffer*, u64> Manager::TryResolveWrite(VAddr addr, u64 size, boo
             }
             hit_entry->has_cpu_shadow = false;
             hit_entry->zero_known = false;
-            hit_entry->cpu_shadow.reset();
+            dead_shadow = std::move(hit_entry->cpu_shadow);
             if (hit_entry->needs_zero_init) {
                 hit_entry->needs_zero_init = false;
                 do_zero_fill = true;
@@ -1864,6 +1933,9 @@ std::pair<const Buffer*, u64> Manager::TryResolveWrite(VAddr addr, u64 size, boo
                 atomic_map_erase_gen.fetch_add(1, std::memory_order_release);
             }
             atomic_override_gen.fetch_add(1, std::memory_order_release);
+        }
+        if (dead_shadow) {
+            UnpublishShadowDirEntry(base, std::move(dead_shadow), scheduler.CurrentTick());
         }
         if (do_invalidate_shaders) {
             Vulkan::DirectShaders::InvalidateRange(base, entry_alloc_size);
@@ -2023,9 +2095,13 @@ void Manager::StageNativeCpuCopyBatch(std::span<const NativeCopyRegion> regions,
                         continue;
                     }
                     auto& e = *s.entry;
+                    bool newly_published = false;
                     if (s.full_overwrite) {
                         if (!e.cpu_shadow) {
                             e.cpu_shadow = std::make_unique_for_overwrite<u8[]>(s.slice_span);
+                            newly_published = true;
+                        } else if (!e.has_cpu_shadow) {
+                            newly_published = true;
                         }
                         if (s.fast_memcpy) {
                             std::memcpy(e.cpu_shadow.get(),
@@ -2042,9 +2118,14 @@ void Manager::StageNativeCpuCopyBatch(std::span<const NativeCopyRegion> regions,
                         e.gpu_written_without_shadow = false;
                     } else {
                         if (!e.has_cpu_shadow || !e.cpu_shadow) {
-                            e.cpu_shadow = std::make_unique<u8[]>(s.slice_span);
+                            if (!e.cpu_shadow) {
+                                e.cpu_shadow = std::make_unique<u8[]>(s.slice_span);
+                            } else {
+                                std::memset(e.cpu_shadow.get(), 0, s.slice_span);
+                            }
                             e.has_cpu_shadow = true;
                             e.zero_known = false;
+                            newly_published = true;
                         }
                         u8* shadow_dst = e.cpu_shadow.get() + s.dst_in_buf_off;
                         if (s.fast_memcpy) {
@@ -2053,6 +2134,10 @@ void Manager::StageNativeCpuCopyBatch(std::span<const NativeCopyRegion> regions,
                         } else {
                             memory->CopySparseMemory(s.src_va, shadow_dst, s.copy_bytes);
                         }
+                    }
+                    if (newly_published && e.cpu_shadow) {
+                        PublishShadowDirEntry(s.base_va, e.raw_size, e.alloc_size,
+                                              e.cpu_shadow.get());
                     }
                     if (s.emit_to_stream) {
                         std::memcpy(data + s.rel_offset, e.cpu_shadow.get(), s.slice_span);
@@ -2570,6 +2655,7 @@ void Manager::ProcessEvents(Core::MemoryManager* memory) {
                 entry.stream_override_buf = sbuf_ptr;
                 entry.stream_override_off = stream_off;
                 entry.buffer = std::move(buf);
+                const u8* pub_shadow_ptr = entry.has_cpu_shadow ? entry.cpu_shadow.get() : nullptr;
                 {
                     WriteLockGuard lock{entries_rw_mutex, mt_lock_enabled};
                     auto& inserted = (entries_by_base[ev.addr] = std::move(entry));
@@ -2578,6 +2664,9 @@ void Manager::ProcessEvents(Core::MemoryManager* memory) {
                     atomic_live_count.store(static_cast<u32>(entries_by_base.size()),
                                             std::memory_order_release);
                     atomic_override_gen.fetch_add(1, std::memory_order_release);
+                }
+                if (pub_shadow_ptr) {
+                    PublishShadowDirEntry(ev.addr, raw_size, guest_span, pub_shadow_ptr);
                 }
                 dirty_writeback_bases.push_back(ev.addr);
                 continue;
@@ -2718,6 +2807,7 @@ void Manager::ProcessEvents(Core::MemoryManager* memory) {
         entry.alloc_size = guest_span;
         entry.cpu_shadow = std::move(init_shadow);
         entry.buffer = std::move(buf);
+        const u8* pub_shadow_ptr = entry.has_cpu_shadow ? entry.cpu_shadow.get() : nullptr;
         {
             WriteLockGuard lock{entries_rw_mutex, mt_lock_enabled};
             auto& inserted = (entries_by_base[ev.addr] = std::move(entry));
@@ -2726,6 +2816,9 @@ void Manager::ProcessEvents(Core::MemoryManager* memory) {
             atomic_live_count.store(static_cast<u32>(entries_by_base.size()),
                                     std::memory_order_release);
             atomic_override_gen.fetch_add(1, std::memory_order_release);
+        }
+        if (pub_shadow_ptr) {
+            PublishShadowDirEntry(ev.addr, raw_size, guest_span, pub_shadow_ptr);
         }
 
         if (uploaded_bytes_since_flush >= (32ULL << 20)) {
@@ -2875,7 +2968,8 @@ void PS4_SYSV_ABI bb_direct_vk_register_native_buffer(uint32_t resource_id,
     VideoCore::DirectBuffers::NoteNativeGpuBlockAlloc(addr, span);
     VideoCore::DirectBuffers::MarkNativeOwnedRange(addr, span);
     VideoCore::DirectBuffers::ClearCpuImmutableRange(addr, span);
-    if (usage_type == 1u && has_initial_data != 0u && (bind_flags & 0x90u) == 0u) {
+    if ((usage_type == 0u || usage_type == 1u) && has_initial_data != 0u &&
+        (bind_flags & 0x90u) == 0u) {
         VideoCore::DirectBuffers::MarkCpuImmutableRange(addr, raw_byte_size);
     }
     VideoCore::DirectBuffers::NoteExactNativeBuffer(addr, raw_byte_size, static_cast<u32>(span),

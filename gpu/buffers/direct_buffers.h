@@ -227,6 +227,16 @@ public:
     /// initial guest RAM) into caller buffer `dst` under `entries_rw_mutex` shared reader lock.
     [[nodiscard]] bool TryCopyCpuMirrorMt(VAddr addr, void* dst, u64 size) const noexcept;
 
+    /// Phase 5.2b: Thread-safe Stage-A lookup of settled `Entry::cpu_shadow` base pointers
+    /// (backed by GPU-tick-retired `retired_shadows` quarantine so cached Stage-A MRU hits read
+    /// settled static `DEFAULT` FLVER buffers in ~1.5 ns with 0 locks and 0 `memcpy`).
+    [[nodiscard]] u64 ShadowDirEraseGen() const noexcept {
+        return shadow_dir_erase_gen.load(std::memory_order_acquire);
+    }
+    [[nodiscard]] bool TryLookupCpuShadowStageA(VAddr addr, u64 size, VAddr& out_base,
+                                                u64& out_raw_size, const u8*& out_mirror_base,
+                                                u64& out_erase_gen) const noexcept;
+
     /// N2.5: O(1) lookup of a valid CPU-side mirror pointer (`cpu_shadow` or untouched
     /// initial-data guest RAM) for `[addr, addr + size)` when scanning index buffers of dynamic
     /// `cueHeap` vertex draws; returns `nullptr` if the buffer was GPU-written without a shadow.
@@ -314,6 +324,16 @@ private:
     void ClearMruFor(const Buffer* buf) noexcept;
     void UpdateMruEntry(VAddr base_addr, u64 alloc_size, const Buffer* buf,
                         u64 base_offset) noexcept;
+    void PublishShadowDirEntry(VAddr base_addr, u64 raw_size, u64 alloc_size,
+                               const u8* shadow_ptr) noexcept;
+    void UnpublishShadowDirEntry(VAddr base_addr, std::unique_ptr<u8[]>&& shadow_buf,
+                                 u64 retire_tick) noexcept;
+
+    struct SettledShadowInfo {
+        u64 raw_size{0};
+        u64 alloc_size{0};
+        const u8* ptr{nullptr};
+    };
 
     const Vulkan::Instance& instance;
     Vulkan::Scheduler& scheduler;
@@ -326,6 +346,10 @@ private:
     std::vector<VAddr> dirty_writeback_bases;
     std::vector<Event> deferred_events;
     std::deque<std::pair<u64, std::unique_ptr<Buffer>>> retired;
+    std::deque<std::pair<u64, std::unique_ptr<u8[]>>> retired_shadows;
+    mutable std::shared_mutex shadow_dir_mutex;
+    std::map<VAddr, SettledShadowInfo> shadow_dir;
+    std::atomic<u64> shadow_dir_erase_gen{1};
     std::vector<u64> bitmap_64k;
     std::vector<MruSlot> mru;
     u64 erase_generation{1};
