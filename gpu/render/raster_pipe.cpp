@@ -421,6 +421,29 @@ void Rasterizer::NotePendingRead(VAddr address, u64 size, bool gpu_in_place) {
     }
 }
 
+void Rasterizer::NotePendingCopySrcBatch(const u32* raw_regions, u32 count) noexcept {
+    if (!draw_pipe || !raw_regions || count == 0u || count > 32u || !OnStageA()) {
+        return;
+    }
+    const bool skip_non_ce = FastNonCeRamSkip();
+    if (skip_non_ce && !buffer_cache.IsConstRamRange(0, (1ULL << 40) - 1)) [[likely]] {
+        return;
+    }
+    static const bool guest_in_place = VideoCore::GuestInPlace();
+    const u8 mask = guest_in_place ? u8(kCoalesceStageB | kCoalesceGpuInPl) : kCoalesceStageB;
+    const u64 pkt = draw_pipe->NextPacket();
+    for (u32 i = 0; i < count; ++i) {
+        DirectCopyRegion reg{};
+        std::memcpy(&reg, raw_regions + i * 6u, sizeof(reg));
+        if (reg.src_va && reg.byte_size) {
+            if (skip_non_ce && !buffer_cache.IsConstRamRange(reg.src_va, reg.byte_size)) {
+                continue;
+            }
+            NoteStageACoalescedRead(reg.src_va, reg.byte_size, pkt, mask);
+        }
+    }
+}
+
 namespace {
 /// BB_CONSTRAM_PIPE=0: a DumpConstRam waits for all queued draws, not only for those reading its
 /// bytes.

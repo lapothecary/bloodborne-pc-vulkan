@@ -233,13 +233,7 @@ CommandProcessor::Step CommandProcessor::Compute(Work& work, Level& level, const
                 const u32 count = op_word >> 16;
                 if (count > 0 && count <= 32 && body_words == 2u + count * 6u) {
                     rasterizer->NotifyVsmBeforeCopyBatch(body + 2u, count);
-                    for (u32 i = 0; i < count; ++i) {
-                        DirectVk::CopyRegion reg{};
-                        std::memcpy(&reg, body + 2u + i * 6u, sizeof(reg));
-                        if (reg.src_va && reg.byte_size) {
-                            rasterizer->NotePendingRead(reg.src_va, reg.byte_size);
-                        }
-                    }
+                    rasterizer->NotePendingCopySrcBatch(body + 2u, count);
                     const bool queued = rasterizer->RunInOrder(
                         &Tasks::DirectVkCopyBatchTask, body + 1, (1u + count * 6u) * sizeof(u32),
                         BbToggle::PipelinedMemoryWrites, false);

@@ -2974,8 +2974,7 @@ void PS4_SYSV_ABI bb_direct_vk_register_native_buffer(uint32_t resource_id,
     VideoCore::DirectBuffers::NoteNativeGpuBlockAlloc(addr, span);
     VideoCore::DirectBuffers::MarkNativeOwnedRange(addr, span);
     VideoCore::DirectBuffers::ClearCpuImmutableRange(addr, span);
-    if ((usage_type == 0u || usage_type == 1u) && has_initial_data != 0u &&
-        (bind_flags & 0x90u) == 0u) {
+    if (usage_type == 1u && has_initial_data != 0u && (bind_flags & 0x90u) == 0u) {
         VideoCore::DirectBuffers::MarkCpuImmutableRange(addr, raw_byte_size);
     }
     VideoCore::DirectBuffers::NoteExactNativeBuffer(addr, raw_byte_size, static_cast<u32>(span),

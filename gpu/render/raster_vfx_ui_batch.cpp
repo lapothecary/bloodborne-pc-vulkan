@@ -596,14 +596,31 @@ void VfxUiBatcher::NoteStageACpuCopyBatch(const u32* raw_regions, u32 count) noe
         if (!reg.dst_va || reg.byte_size == 0u) {
             continue;
         }
-        InvalidateCpuShadow(reg.dst_va, reg.byte_size);
         if (reg.reserved != gx_direct_vk::kCopyFlagKnownCpuSource || !reg.src_va ||
             !IsReadableCpuSourceRange(reg.src_va, reg.byte_size)) {
+            InvalidateCpuShadow(reg.dst_va, reg.byte_size);
             continue;
         }
         const u32 stamp = ++staging_clock;
         if (reg.byte_size <= kSmallStagingMaxBytes) {
+            const u32 ce0 = CoarseEpochAt(reg.dst_va);
+            const u32 ce1 = CoarseEpochAt(reg.dst_va + reg.byte_size - 1u);
             const size_t set_base = SmallStagingSet(reg.dst_va >> 12) * kCpuStagingWays;
+            bool updated_in_place = false;
+            for (size_t w = 0; w < kCpuStagingWays; ++w) {
+                auto& s = small_staging_map[set_base + w];
+                if (s.byte_size == reg.byte_size && s.dst_va == reg.dst_va && s.coarse_e0 == ce0 &&
+                    s.coarse_e1 == ce1) {
+                    s.src_va = reg.src_va;
+                    s.last_use = stamp;
+                    updated_in_place = true;
+                    break;
+                }
+            }
+            if (updated_in_place) {
+                continue;
+            }
+            InvalidateCpuShadow(reg.dst_va, reg.byte_size);
             size_t victim = set_base;
             for (size_t w = 0; w < kCpuStagingWays; ++w) {
                 const auto& s = small_staging_map[set_base + w];
@@ -620,9 +637,25 @@ void VfxUiBatcher::NoteStageACpuCopyBatch(const u32* raw_regions, u32 count) noe
             slot.src_va = reg.src_va;
             slot.byte_size = reg.byte_size;
             slot.last_use = stamp;
-            slot.coarse_e0 = CoarseEpochAt(reg.dst_va);
-            slot.coarse_e1 = CoarseEpochAt(reg.dst_va + reg.byte_size - 1u);
+            slot.coarse_e0 = ce0;
+            slot.coarse_e1 = ce1;
         } else {
+            bool updated_in_place = false;
+            if (large_active_count != 0u && reg.dst_va >= large_min_va &&
+                (reg.dst_va + reg.byte_size) <= large_max_va) {
+                for (auto& s : large_staging) {
+                    if (s.byte_size == reg.byte_size && s.dst_va == reg.dst_va) {
+                        s.src_va = reg.src_va;
+                        s.last_use = stamp;
+                        updated_in_place = true;
+                        break;
+                    }
+                }
+            }
+            if (updated_in_place) {
+                continue;
+            }
+            InvalidateCpuShadow(reg.dst_va, reg.byte_size);
             size_t victim = 0u;
             for (size_t s = 0; s < large_staging.size(); ++s) {
                 if (large_staging[s].byte_size == 0u || large_staging[s].dst_va == reg.dst_va) {

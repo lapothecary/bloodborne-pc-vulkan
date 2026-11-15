@@ -89,7 +89,7 @@ struct SceneOcclusionCuller {
     vk::UniqueQueryPool mt_pool;
     bool initialized = false;
     bool enabled = true;
-    bool stage_a_occ_cull = true;
+    bool stage_a_occ_cull = false;
     bool skel_occ_cull = true;
     bool mt_occ_cull = true;
     bool micro_shadow_cull = true;
@@ -191,6 +191,9 @@ struct SceneOcclusionCuller {
     }
 
     void SetEntryOccActive(Entry& e, bool active) noexcept {
+        if (!stage_a_occ_cull) [[likely]] {
+            return;
+        }
         if (active) {
             if (e.occ_active.exchange(1u, std::memory_order_relaxed) == 0u) {
                 const u16 slot =
@@ -659,7 +662,9 @@ struct SceneOcclusionCuller {
         }
         const u32 stage_b_frame = cur_frame.load(std::memory_order_relaxed);
         const u32 ref_frame =
-            std::max(stage_b_frame, stage_a_frame.load(std::memory_order_relaxed));
+            stage_a_occ_cull
+                ? std::max(stage_b_frame, stage_a_frame.load(std::memory_order_relaxed))
+                : stage_b_frame;
         std::array<u64, SliceQueries> samples{};
         for (u32 s = 0; s < NumSlices; ++s) {
             if (!slice_sealed[s] || !scheduler.IsFree(slice_last_tick[s])) {
@@ -798,9 +803,11 @@ struct SceneOcclusionCuller {
                 ? std::max(prev_f + 1u, BbStats::guest_frame_number.load(std::memory_order_relaxed))
                 : (prev_f + 1u);
         cur_frame.store(next_f, std::memory_order_relaxed);
-        u32 sa_f = stage_a_frame.load(std::memory_order_relaxed);
-        while (sa_f < next_f &&
-               !stage_a_frame.compare_exchange_weak(sa_f, next_f, std::memory_order_relaxed)) {
+        if (stage_a_occ_cull) [[unlikely]] {
+            u32 sa_f = stage_a_frame.load(std::memory_order_relaxed);
+            while (sa_f < next_f &&
+                   !stage_a_frame.compare_exchange_weak(sa_f, next_f, std::memory_order_relaxed)) {
+            }
         }
         const u32 last_cam_f = cam_updated_frame.load(std::memory_order_acquire);
         if (next_f > last_cam_f + 1u) {
@@ -2449,8 +2456,10 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const PreparedDraw* pre
             object_vel_culler->TryCullDraw(*this, pipeline, is_indexed)) {
             return;
         }
-        u16 occ_handoff = kOccNoProbe;
-        if (OnStageA() &&
+        const bool run_stage_a_occ =
+            scene_occlusion_culler && scene_occlusion_culler->stage_a_occ_cull && OnStageA();
+        u16 occ_handoff = run_stage_a_occ ? kOccNoProbe : kOccStageBFallback;
+        if (run_stage_a_occ &&
             TryCullSceneOcclusionStageA(pipeline, used_prepared, is_indexed, index_offset,
                                         occ_handoff)) {
             return;
@@ -2461,12 +2470,12 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const PreparedDraw* pre
             return;
         }
         const bool is_display_pass_draw =
-            OnStageA() && scene_occlusion_culler && camera_motion && camera_motion->Enabled() &&
+            run_stage_a_occ && camera_motion && camera_motion->Enabled() &&
             liverpool->regs.color_buffers[0] &&
             FrameCapture::IsDisplayBuffer(liverpool->regs.color_buffers[0].Address());
         PostDraw(pipeline, used_prepared, is_indexed, index_offset, nullptr, nullptr, nullptr,
                  occ_handoff);
-        if (is_display_pass_draw) {
+        if (is_display_pass_draw) [[unlikely]] {
             scene_occlusion_culler->NoteStageAFrameStart();
         }
         return;
