@@ -13,6 +13,7 @@
 #include "bbport_frame_rate.h"
 #include "bbport_overlay.h"
 #include "bbport_settings.h"
+#include "bbport_toggles.h"
 
 
 namespace {
@@ -230,13 +231,49 @@ int WindowSDL::PollTextInput(std::string& out) {
 }
 
 void WindowSDL::TakeMouse(double& dx, double& dy, int& up, int& down) {
-    std::scoped_lock lock{mouse_mutex};
-    dx = mouse_dx;
-    dy = mouse_dy;
-    up = wheel_up;
-    down = wheel_down;
-    mouse_dx = mouse_dy = 0;
-    wheel_up = wheel_down = 0;
+    u32 ev_cnt = 0;
+    {
+        std::scoped_lock lock{mouse_mutex};
+        dx = mouse_dx;
+        dy = mouse_dy;
+        up = wheel_up;
+        down = wheel_down;
+        ev_cnt = mouse_pending_events;
+        mouse_dx = mouse_dy = 0;
+        wheel_up = wheel_down = 0;
+        mouse_pending_events = 0;
+    }
+    const u64 now_ms = SDL_GetTicks();
+    static std::atomic<u64> last_nonzero_poll_ms{0};
+    if (dx != 0.0 || dy != 0.0 || ev_cnt > 0) {
+        last_nonzero_poll_ms.store(now_ms, std::memory_order_relaxed);
+        BbStats::mouse_active_polls.fetch_add(1, std::memory_order_relaxed);
+        std::uint32_t cur_min = BbStats::mouse_ev_per_poll_min.load(std::memory_order_relaxed);
+        while (ev_cnt < cur_min && !BbStats::mouse_ev_per_poll_min.compare_exchange_weak(
+                                       cur_min, ev_cnt, std::memory_order_relaxed)) {
+        }
+        std::uint32_t cur_max = BbStats::mouse_ev_per_poll_max.load(std::memory_order_relaxed);
+        while (ev_cnt > cur_max && !BbStats::mouse_ev_per_poll_max.compare_exchange_weak(
+                                       cur_max, ev_cnt, std::memory_order_relaxed)) {
+        }
+    } else if (mouse_captured.load(std::memory_order_relaxed)) {
+        const u64 prev_ms = last_nonzero_poll_ms.load(std::memory_order_relaxed);
+        if (prev_ms != 0 && now_ms >= prev_ms && (now_ms - prev_ms) <= 45) {
+            BbStats::mouse_zero_polls_moving.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+}
+
+void WindowSDL::WaitEvents(s32 timeout_ms) {
+    static const bool legacy_delay = [] {
+        const char* env = std::getenv("BB_WINDOW_POLL_DELAY");
+        return env && env[0] == '1' && env[1] == '\0';
+    }();
+    if (legacy_delay) {
+        SDL_Delay(2);
+        return;
+    }
+    SDL_WaitEventTimeout(nullptr, timeout_ms);
 }
 
 // Mouse look: relative mode while the window holds the mouse (runtime_pad.c turns its motion into
@@ -253,6 +290,7 @@ void WindowSDL::CaptureMouse(bool capture) {
         std::scoped_lock lock{mouse_mutex};
         mouse_dx = mouse_dy = 0;
         wheel_up = wheel_down = 0;
+        mouse_pending_events = 0;
     }
     mouse_captured.store(capture, std::memory_order_relaxed);
     if (capture) {
@@ -279,32 +317,50 @@ static bool mouse_user_released = false;
 static bool mouse_grabbed = false;
 
 bool WindowSDL::PollEvents() {
-    {
+    BbStats::mouse_window_wakeups.fetch_add(1, std::memory_order_relaxed);
+    const u64 poll_ticks = SDL_GetTicks();
+    bool do_housekeeping = (poll_ticks - last_housekeeping_ms >= 4) ||
+                           text_requested.load(std::memory_order_relaxed) ||
+                           capture_requested.load(std::memory_order_relaxed) ||
+                           BbOverlay::MenuOpen() || text_active;
+    if (text_requested.load(std::memory_order_relaxed)) {
         std::scoped_lock lock{text_mutex};
-        if (text_requested) { // SDL text input must be toggled from the window thread
-            text_requested = false;
+        if (text_requested.exchange(false, std::memory_order_relaxed)) { // SDL text input must be toggled from the window thread
             text_active = true;
             SDL_StartTextInput(window);
             UpdateTextTitle();
         }
     }
-    if (!text_active) {
+    if (do_housekeeping && !text_active) {
         BbOverlay::UpdateTextInput(window);
     }
     // A game module's menu wants the mouse as a pointer (bbgpu_add_pointer_query).
-    const bool pointer = bbgpu_pointer_wanted() != 0;
+    bool pointer = do_housekeeping ? (bbgpu_pointer_wanted() != 0) : pointer_shown;
+    bool refreshed_pointer = do_housekeeping;
     SDL_Event event;
     while (SDL_PollEvent(&event)) {
+        if (event.type != SDL_EVENT_MOUSE_MOTION) {
+            do_housekeeping = true;
+            if (!refreshed_pointer) {
+                pointer = bbgpu_pointer_wanted() != 0;
+                refreshed_pointer = true;
+            }
+        }
         if (FilteredByModule(&event, window)) {
             continue;
         }
         if (event.type == SDL_EVENT_MOUSE_MOTION) {
-            last_mouse_motion_ms = SDL_GetTicks();
+            const u64 ev_ticks = SDL_GetTicks();
+            last_mouse_motion_ms = ev_ticks;
             // Just taken: the pointer's jump into relative mode is not a turn of the camera.
-            if (mouse_captured.load(std::memory_order_relaxed) && SDL_GetTicks() >= capture_settle_ms) {
-                std::scoped_lock lock{mouse_mutex};
-                mouse_dx += event.motion.xrel;
-                mouse_dy += event.motion.yrel;
+            if (mouse_captured.load(std::memory_order_relaxed) && ev_ticks >= capture_settle_ms) {
+                {
+                    std::scoped_lock lock{mouse_mutex};
+                    mouse_dx += event.motion.xrel;
+                    mouse_dy += event.motion.yrel;
+                    ++mouse_pending_events;
+                }
+                BbStats::mouse_raw_events.fetch_add(1, std::memory_order_relaxed);
             }
         }
         if (text_active && (event.type == SDL_EVENT_TEXT_INPUT || event.type == SDL_EVENT_KEY_DOWN)) {
@@ -411,6 +467,10 @@ bool WindowSDL::PollEvents() {
             break;
         }
     }
+    if (!do_housekeeping) {
+        return is_open;
+    }
+    last_housekeeping_ms = SDL_GetTicks();
     {
         const int wanted_mode = BbSettings::Get().window_mode.load(std::memory_order_relaxed);
         const BbSettings::OutputSize wanted_out = BbSettings::CurrentOutput();

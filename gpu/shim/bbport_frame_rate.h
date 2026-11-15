@@ -22,4 +22,17 @@ bool CleanPacerEnabled() noexcept;
 /// community 60 FPS patch).
 void SetLimit(int fps);
 int Limit();
+/// Monotonic clock in nanoseconds (CLOCK_MONOTONIC on Linux, QPC steady_clock on Win32).
+std::uint64_t NowMonotonicNs() noexcept;
+/// High-precision deadline wait (TIMER_ABSTIME / high-res waitable timer + short _mm_pause tail).
+/// `timer_slot`: 0 for Main pacer, 1 for Present pacer (zero thread_local / PT_TLS cost).
+void SleepUntilMonotonicNs(std::uint64_t deadline_ns, int timer_slot = 0) noexcept;
+/// Active target frame period in nanoseconds when unlocked and capped, or 0 when uncapped.
+std::uint64_t TargetPeriodNs() noexcept;
+/// Increments whenever SetLimit() changes the frame rate target.
+std::uint64_t PacerEpoch() noexcept;
+/// Controlled by BB_PRESENT_PACE (default 1): paces vkQueuePresentKHR delivery on bb:Present
+/// when capped in Mailbox/Immediate so variable render durations (2.4..4.8 ms) do not cause
+/// early burst presents (172-175 FPS) or 2.5 ms phase jitter.
+bool PresentPacingEnabled() noexcept;
 } // namespace BbFrameRate

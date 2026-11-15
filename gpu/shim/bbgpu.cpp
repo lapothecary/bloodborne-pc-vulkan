@@ -10,6 +10,9 @@
 #include "game_profile.h"
 #include "bbport_copy.h"
 #include <sys/resource.h>
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
 #include "bbport_free_check.h"
 #include "bbport_toggles.h"
 #include <algorithm>
@@ -428,6 +431,9 @@ extern "C" int bbgpu_init(const BbGpuConfig* config) {
     const s32 width = config->width, height = config->height;
     g_window_thread = std::thread([title, width, height] {
         Common::SetCurrentThreadName("bb:window");
+#ifdef __linux__
+        prctl(PR_SET_TIMERSLACK, 1UL, 0UL, 0UL, 0UL);
+#endif
         auto* window = new Frontend::WindowSDL(width, height, title.c_str());
         {
             std::scoped_lock lock{g_window_mutex};
@@ -436,7 +442,7 @@ extern "C" int bbgpu_init(const BbGpuConfig* config) {
         }
         g_window_cv.notify_all();
         while (window->PollEvents()) {
-            SDL_Delay(2);
+            window->WaitEvents(4);
         }
         LOG_INFO(Frontend, "Window closed by user");
         std::fflush(stdout);

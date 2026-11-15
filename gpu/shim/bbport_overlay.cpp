@@ -93,6 +93,8 @@ float frame_ms_avg = 0.0f;
 double present_ms_sum_accum = 0.0;
 double present_ms_sq_sum_accum = 0.0;
 std::uint64_t present_ms_count_accum = 0;
+std::array<float, 4096> log_frame_ms_buf{};
+std::uint32_t log_frame_ms_cnt = 0;
 
 float PixelDensity(SDL_WindowID id);
 
@@ -1124,6 +1126,7 @@ struct HudSampleSlot {
     double gnm_wait_ms = 0.0;
     double game_cpu_work_ms = 0.0;
     double fps_cap_sleep_ms = 0.0;
+    double main_sync_wait_ms = 0.0;
     double a_pm4_pipe_ms = 0.0;
     double a_ring_ms = 0.0;
     double a_drain_ms = 0.0;
@@ -1194,6 +1197,7 @@ struct HudSlidingWindow {
             sum.gnm_wait_ms += s.gnm_wait_ms;
             sum.game_cpu_work_ms += s.game_cpu_work_ms;
             sum.fps_cap_sleep_ms += s.fps_cap_sleep_ms;
+            sum.main_sync_wait_ms += s.main_sync_wait_ms;
             sum.a_pm4_pipe_ms += s.a_pm4_pipe_ms;
             sum.a_ring_ms += s.a_ring_ms;
             sum.a_drain_ms += s.a_drain_ms;
@@ -1266,6 +1270,7 @@ struct HudBreakdown {
     float gnm_wait_ms = 0.0f, avg_gnm_wait_ms = 0.0f;
     float game_cpu_work_ms = 0.0f, avg_game_cpu_work_ms = 0.0f;
     float fps_cap_sleep_ms = 0.0f, avg_fps_cap_sleep_ms = 0.0f;
+    float main_sync_wait_ms = 0.0f, avg_main_sync_wait_ms = 0.0f;
     // Stage 2: Stage A (bb:GpuComm / DirectVk RHI)
     float a_total_ms = 0.0f, avg_a_total_ms = 0.0f;
     float a_pm4_pipe_ms = 0.0f, avg_a_pm4_pipe_ms = 0.0f;
@@ -1571,6 +1576,7 @@ void UpdateHudBreakdown(HudBreakdown& h) {
     static std::uint64_t last_draws = 0, last_dispatches = 0, last_submits = 0;
     static std::uint64_t last_idle_ns = 0, last_gnm_wait_ns = 0;
     static std::uint64_t last_main_cpu_ns = 0, last_main_cpu_frames = 0;
+    static std::uint64_t last_pacer_sleep_ns = 0, last_pacer_frames = 0, last_main_sync_wait_ns = 0;
     static std::uint64_t last_present_ns = 0, last_sync_rec_ns = 0, last_host_copy_ns = 0;
     static std::uint64_t last_pipe_drains = 0, last_pipe_drain_cyc = 0, last_pipe_busy_cyc = 0;
     static std::uint64_t last_faults = 0, last_eop = 0;
@@ -1599,6 +1605,9 @@ void UpdateHudBreakdown(HudBreakdown& h) {
         last_gnm_wait_ns = BbStats::gnm_frame_wait_ns.load(std::memory_order_relaxed);
         last_main_cpu_ns = BbStats::main_cpu_busy_ns.load(std::memory_order_relaxed);
         last_main_cpu_frames = BbStats::main_cpu_frames.load(std::memory_order_relaxed);
+        last_pacer_sleep_ns = BbStats::pacer_sleep_ns.load(std::memory_order_relaxed);
+        last_pacer_frames = BbStats::pacer_frames.load(std::memory_order_relaxed);
+        last_main_sync_wait_ns = BbStats::main_sync_wait_ns.load(std::memory_order_relaxed);
         last_present_ns = BbStats::present_wait_ns.load(std::memory_order_relaxed);
         last_sync_rec_ns = BbStats::sync_recording_ns.load(std::memory_order_relaxed) +
                            BbStats::tick_wait_ns.load(std::memory_order_relaxed);
@@ -1661,6 +1670,10 @@ void UpdateHudBreakdown(HudBreakdown& h) {
     const std::uint64_t cur_gnm_wait_ns = BbStats::gnm_frame_wait_ns.load(std::memory_order_relaxed);
     const std::uint64_t cur_main_cpu_ns = BbStats::main_cpu_busy_ns.load(std::memory_order_relaxed);
     const std::uint64_t cur_main_cpu_frames = BbStats::main_cpu_frames.load(std::memory_order_relaxed);
+    const std::uint64_t cur_pacer_sleep_ns = BbStats::pacer_sleep_ns.load(std::memory_order_relaxed);
+    const std::uint64_t cur_pacer_frames = BbStats::pacer_frames.load(std::memory_order_relaxed);
+    const std::uint64_t cur_main_sync_wait_ns =
+        BbStats::main_sync_wait_ns.load(std::memory_order_relaxed);
     const std::uint64_t cur_present_ns = BbStats::present_wait_ns.load(std::memory_order_relaxed);
     const std::uint64_t cur_sync_rec_ns = BbStats::sync_recording_ns.load(std::memory_order_relaxed) +
                                           BbStats::tick_wait_ns.load(std::memory_order_relaxed);
@@ -1863,12 +1876,31 @@ void UpdateHudBreakdown(HudBreakdown& h) {
     };
     const int fps_cap = effective_fps_cap();
     h.fps_cap_active = fps_cap;
-    if (fps_cap > 0 && d_main_cpu_frames > 0) {
+    const std::uint64_t d_pacer_frames = safe_delta(cur_pacer_frames, last_pacer_frames);
+    if (d_pacer_frames > 0) {
+        const float max_non_cpu_ms = std::max(0.0f, h.frame_ms - h.game_cpu_work_ms - h.gnm_wait_ms);
+        const float measured_pacer_sleep_ms =
+            float(double(safe_delta(cur_pacer_sleep_ns, last_pacer_sleep_ns)) * 1e-6 /
+                  double(d_pacer_frames));
+        h.fps_cap_sleep_ms =
+            fps_cap > 0 ? std::clamp(measured_pacer_sleep_ms, 0.0f, max_non_cpu_ms) : 0.0f;
+        const float raw_sync_wait_ms =
+            d_main_cpu_frames > 0
+                ? float(double(safe_delta(cur_main_sync_wait_ns, last_main_sync_wait_ns)) * 1e-6 /
+                        double(d_main_cpu_frames))
+                : 0.0f;
+        h.main_sync_wait_ms = std::clamp(
+            raw_sync_wait_ms - h.gnm_wait_ms, 0.0f,
+            std::max(0.0f, max_non_cpu_ms - h.fps_cap_sleep_ms));
+    } else if (fps_cap > 0 && d_main_cpu_frames > 0) {
         const float max_pipeline_ms = std::max(
             {h.game_cpu_work_ms + h.gnm_wait_ms, h.a_total_ms, h.b_total_ms, h.hw_gpu_busy_ms});
         const float max_sleep_ms =
             std::max(0.0f, h.frame_ms - h.game_cpu_work_ms - h.gnm_wait_ms);
         h.fps_cap_sleep_ms = std::clamp(h.frame_ms - max_pipeline_ms, 0.0f, max_sleep_ms);
+        h.main_sync_wait_ms = 0.0f;
+    } else {
+        h.main_sync_wait_ms = 0.0f;
     }
 
     // Exact 15.0-second wall-clock sliding average across all active render scenes
@@ -1915,6 +1947,7 @@ void UpdateHudBreakdown(HudBreakdown& h) {
         s.gnm_wait_ms = double(h.gnm_wait_ms) * f_weight;
         s.game_cpu_work_ms = double(h.game_cpu_work_ms) * f_weight;
         s.fps_cap_sleep_ms = double(h.fps_cap_sleep_ms) * f_weight;
+        s.main_sync_wait_ms = double(h.main_sync_wait_ms) * f_weight;
         s.a_pm4_pipe_ms = double(h.a_pm4_pipe_ms) * f_weight;
         s.a_ring_ms = double(h.a_ring_ms) * f_weight;
         s.a_drain_ms = double(h.a_drain_ms) * f_weight;
@@ -1986,6 +2019,7 @@ void UpdateHudBreakdown(HudBreakdown& h) {
         h.avg_gnm_wait_ms = float(win.sum.gnm_wait_ms * inv_af);
         h.avg_game_cpu_work_ms = float(win.sum.game_cpu_work_ms * inv_af);
         h.avg_fps_cap_sleep_ms = float(win.sum.fps_cap_sleep_ms * inv_af);
+        h.avg_main_sync_wait_ms = float(win.sum.main_sync_wait_ms * inv_af);
         h.avg_a_pm4_pipe_ms = float(win.sum.a_pm4_pipe_ms * inv_af);
         h.avg_a_ring_ms = float(win.sum.a_ring_ms * inv_af);
         h.avg_a_drain_ms = float(win.sum.a_drain_ms * inv_af);
@@ -2041,6 +2075,7 @@ void UpdateHudBreakdown(HudBreakdown& h) {
         h.avg_gnm_wait_ms = h.gnm_wait_ms;
         h.avg_game_cpu_work_ms = h.game_cpu_work_ms;
         h.avg_fps_cap_sleep_ms = h.fps_cap_sleep_ms;
+        h.avg_main_sync_wait_ms = h.main_sync_wait_ms;
         h.avg_a_pm4_pipe_ms = h.a_pm4_pipe_ms;
         h.avg_a_ring_ms = h.a_ring_ms;
         h.avg_a_drain_ms = h.a_drain_ms;
@@ -2082,9 +2117,9 @@ void UpdateHudBreakdown(HudBreakdown& h) {
     // never when Stage A or GPU render passes consume ~90-100% of the frame budget with 0 ms sleep.
     const bool cap_throttling =
         fps_cap > 0 &&
-        ((h.fps_cap_sleep_ms >= 0.15f && h.fps >= float(fps_cap) * 0.95f &&
-          max_active_ms < cap_budget_ms * 0.94f) ||
-         (h.fps >= float(fps_cap) * 0.99f && max_active_ms < cap_budget_ms * 0.88f));
+        ((h.fps_cap_sleep_ms >= 0.15f && h.fps >= float(fps_cap) * 0.94f &&
+          max_active_ms < cap_budget_ms * 0.95f) ||
+         (h.fps >= float(fps_cap) * 0.99f && max_active_ms < cap_budget_ms * 0.90f));
 
     if (cap_throttling) {
         h.bottleneck_kind = 5;
@@ -2184,6 +2219,11 @@ void UpdateHudBreakdown(HudBreakdown& h) {
     if (d_main_cpu_frames > 0) {
         last_main_cpu_ns = cur_main_cpu_ns;
         last_main_cpu_frames = cur_main_cpu_frames;
+        last_main_sync_wait_ns = cur_main_sync_wait_ns;
+    }
+    if (d_pacer_frames > 0) {
+        last_pacer_sleep_ns = cur_pacer_sleep_ns;
+        last_pacer_frames = cur_pacer_frames;
     }
     last_present_ns = cur_present_ns;
     last_sync_rec_ns = cur_sync_rec_ns;
@@ -2220,7 +2260,7 @@ void UpdateHudBreakdown(HudBreakdown& h) {
             "GPU HW: %.1f W | %d MHz | %d C | DrvBusy %d%% | VRAM Proc %.2f GB (Sys %.2f/%.2f GB)\n"
             "Counts/f: Draws %.0f (Avg %.0f) | Disp %.0f (Avg %.0f) | Subm %.1f (Avg %.1f) | PipeDrains %.1f | Faults/s %.1f | NativeVkBuf %.1f%% | NativeVkTex %.1f%% | DescSaved %.1f%% | DontCare %llu/%llu\n"
             "DirectShaders: reg %llu | manifest %llu/%u | stageA_hits %llu | worker_hits %llu\n"
-            "CPU 1. Game Engine: Work %.2f ms (Avg %.2f) | FpsCapSleep %.2f ms (Avg %.2f) | GnmWait %.2f ms (Avg %.2f)\n"
+            "CPU 1. Game Engine: Work %.2f ms (Avg %.2f) | ThreadSync %.2f ms (Avg %.2f) | FpsCapSleep %.2f ms (Avg %.2f) | GnmWait %.2f ms (Avg %.2f)\n"
             "CPU 2. Stage A (DirectVk RHI): Total %.2f ms (Avg %.2f) -> [2a.PM4+FastPSO %.2f | 2b.Buf+Vtx+Ring %.2f | 2c.Tex+PushDesc %.2f | 2d.Pass+State+Draw %.2f | 2e.Submit+Sync %.2f]\n"
             "CPU 3. Stage B (Vulkan Record): Total %.2f ms (Avg %.2f) -> [3a.Buffers %.2f | 3b.Tex+Desc %.2f | 3c.Pass+Draw+Disp %.2f | 3d.Tasks %.2f | 3e.Packet+Regs %.2f]\n"
             "GPU Render Passes: TotalBusy %.2f ms (Avg %.2f) | MidBubble %.2f ms (Avg %.2f) | InterWait %.2f ms (Avg %.2f) | PresentSync %.2f ms (Avg %.2f)\n"
@@ -2249,7 +2289,8 @@ void UpdateHudBreakdown(HudBreakdown& h) {
             shd.manifest_total,
             static_cast<unsigned long long>(shd.stage_a_direct_hits),
             static_cast<unsigned long long>(shd.worker_direct_hits),
-            h.game_cpu_work_ms, h.avg_game_cpu_work_ms, h.fps_cap_sleep_ms, h.avg_fps_cap_sleep_ms, h.gnm_wait_ms, h.avg_gnm_wait_ms,
+            h.game_cpu_work_ms, h.avg_game_cpu_work_ms, h.main_sync_wait_ms, h.avg_main_sync_wait_ms,
+            h.fps_cap_sleep_ms, h.avg_fps_cap_sleep_ms, h.gnm_wait_ms, h.avg_gnm_wait_ms,
             h.a_total_ms, h.avg_a_total_ms, h.a_decode_pso_ms, h.a_buf_ring_ms, h.a_tex_desc_ms, h.a_state_draw_ms, h.a_submit_sync_ms,
             h.b_total_ms, h.avg_b_total_ms, h.b_buffers_ms,
             h.b_tex_desc_ms, h.b_state_pass_ms,
@@ -2447,6 +2488,27 @@ void UpdateHudBreakdown(HudBreakdown& h) {
             }
         }
 #endif
+        static bool log_pacing_seeded = false;
+        static std::uint64_t prev_pres_pace_ns = 0;
+        static std::uint64_t prev_mouse_ev = 0;
+        static std::uint64_t prev_mouse_polls = 0;
+        static std::uint64_t prev_mouse_zero = 0;
+        static std::uint64_t prev_mouse_wake = 0;
+        if (!log_pacing_seeded && h.draws_pf >= 10.0f) {
+            log_pacing_seeded = true;
+            last_log_print = now;
+            last_log_frames = cur_frames;
+            log_frame_ms_cnt = 0;
+            prev_pres_pace_ns = BbStats::present_pace_sleep_ns.load(std::memory_order_relaxed);
+            prev_mouse_ev = BbStats::mouse_raw_events.load(std::memory_order_relaxed);
+            prev_mouse_polls = BbStats::mouse_active_polls.load(std::memory_order_relaxed);
+            prev_mouse_zero = BbStats::mouse_zero_polls_moving.load(std::memory_order_relaxed);
+            prev_mouse_wake = BbStats::mouse_window_wakeups.load(std::memory_order_relaxed);
+            BbStats::sim_dt_min_us.store(0xFFFFFFFFu, std::memory_order_relaxed);
+            BbStats::sim_dt_max_us.store(0u, std::memory_order_relaxed);
+            BbStats::mouse_ev_per_poll_min.store(0xFFFFFFFFu, std::memory_order_relaxed);
+            BbStats::mouse_ev_per_poll_max.store(0u, std::memory_order_relaxed);
+        }
         const double log_dt = std::chrono::duration<double>(now - last_log_print).count();
         if (log_dt >= 5.0 && h.draws_pf >= 10.0f) {
             const std::uint32_t log_df32 =
@@ -2455,6 +2517,83 @@ void UpdateHudBreakdown(HudBreakdown& h) {
             last_log_print = now;
             last_log_frames = cur_frames;
             std::printf("\n[HUD Telemetry]\n%s", hud_buf);
+            {
+                const std::uint32_t cnt = log_frame_ms_cnt;
+                log_frame_ms_cnt = 0;
+                float min_ms = 0.0f, p50_ms = 0.0f, p95_ms = 0.0f, p99_ms = 0.0f, max_ms = 0.0f;
+                std::uint32_t over_125 = 0, over_150 = 0;
+                if (cnt > 0) {
+                    std::sort(log_frame_ms_buf.begin(), log_frame_ms_buf.begin() + cnt);
+                    min_ms = log_frame_ms_buf[0];
+                    p50_ms = log_frame_ms_buf[cnt / 2];
+                    p95_ms = log_frame_ms_buf[(cnt * 95u) / 100u];
+                    p99_ms = log_frame_ms_buf[(cnt * 99u) / 100u];
+                    max_ms = log_frame_ms_buf[cnt - 1u];
+                    const int cap_now = BbFrameRate::Limit();
+                    const float ref_ms = cap_now > 0 ? (1000.0f / float(cap_now)) : p50_ms;
+                    for (std::uint32_t i = 0; i < cnt; ++i) {
+                        if (log_frame_ms_buf[i] > ref_ms * 1.25f) {
+                            ++over_125;
+                        }
+                        if (log_frame_ms_buf[i] > ref_ms * 1.50f) {
+                            ++over_150;
+                        }
+                    }
+                }
+                const std::uint64_t cur_pres_pace =
+                    BbStats::present_pace_sleep_ns.load(std::memory_order_relaxed);
+                const double pres_pace_ms =
+                    cur_pres_pace >= prev_pres_pace_ns
+                        ? double(cur_pres_pace - prev_pres_pace_ns) / (double(log_df) * 1e6)
+                        : 0.0;
+                prev_pres_pace_ns = cur_pres_pace;
+
+                const std::uint32_t dt_min_u =
+                    BbStats::sim_dt_min_us.exchange(0xFFFFFFFFu, std::memory_order_relaxed);
+                const std::uint32_t dt_max_u =
+                    BbStats::sim_dt_max_us.exchange(0u, std::memory_order_relaxed);
+                const float sim_min_ms = dt_min_u != 0xFFFFFFFFu ? float(dt_min_u) * 1e-3f : 0.0f;
+                const float sim_max_ms = float(dt_max_u) * 1e-3f;
+
+                const std::uint64_t cur_m_ev =
+                    BbStats::mouse_raw_events.load(std::memory_order_relaxed);
+                const std::uint64_t cur_m_polls =
+                    BbStats::mouse_active_polls.load(std::memory_order_relaxed);
+                const std::uint64_t cur_m_zero =
+                    BbStats::mouse_zero_polls_moving.load(std::memory_order_relaxed);
+                const std::uint64_t cur_m_wake =
+                    BbStats::mouse_window_wakeups.load(std::memory_order_relaxed);
+                const std::uint64_t d_m_ev = cur_m_ev >= prev_mouse_ev ? (cur_m_ev - prev_mouse_ev) : 0;
+                const std::uint64_t d_m_polls =
+                    cur_m_polls >= prev_mouse_polls ? (cur_m_polls - prev_mouse_polls) : 0;
+                const std::uint64_t d_m_zero =
+                    cur_m_zero >= prev_mouse_zero ? (cur_m_zero - prev_mouse_zero) : 0;
+                const std::uint64_t d_m_wake =
+                    cur_m_wake >= prev_mouse_wake ? (cur_m_wake - prev_mouse_wake) : 0;
+                prev_mouse_ev = cur_m_ev;
+                prev_mouse_polls = cur_m_polls;
+                prev_mouse_zero = cur_m_zero;
+                prev_mouse_wake = cur_m_wake;
+
+                const std::uint32_t m_min =
+                    BbStats::mouse_ev_per_poll_min.exchange(0xFFFFFFFFu, std::memory_order_relaxed);
+                const std::uint32_t m_max =
+                    BbStats::mouse_ev_per_poll_max.exchange(0u, std::memory_order_relaxed);
+                const double ev_per_poll =
+                    d_m_polls > 0 ? (double(d_m_ev) / double(d_m_polls)) : 0.0;
+
+                std::printf(
+                    "Pacing (%uf): min %.2f | p50 %.2f | p95 %.2f | p99 %.2f | max %.2f ms"
+                    " | >1.25x:%u >1.5x:%u | PresPace %.2f ms | SimDt %.2f..%.2f ms\n"
+                    "Input (5s): Mouse %llu ev / %llu active-f (%.1f ev/f, batch %u..%u, 0-ev-gaps %llu)"
+                    " | WinWake %llu\n",
+                    cnt, min_ms, p50_ms, p95_ms, p99_ms, max_ms, over_125, over_150, pres_pace_ms,
+                    sim_min_ms, sim_max_ms, static_cast<unsigned long long>(d_m_ev),
+                    static_cast<unsigned long long>(d_m_polls), ev_per_poll,
+                    m_min != 0xFFFFFFFFu ? m_min : 0u, m_max,
+                    static_cast<unsigned long long>(d_m_zero),
+                    static_cast<unsigned long long>(d_m_wake));
+            }
 #ifndef _WIN32
             if (!frame_stats_on) {
                 sample_overlay_thread_cpu(log_df, log_dt, true);
@@ -2745,12 +2884,19 @@ void FpsCounter() {
                 h.game_cpu_work_ms, h.avg_game_cpu_work_ms, h.bottleneck_kind == 1);
         const bool cap_sleeping =
             h.fps_cap_active > 0 && (h.fps_cap_sleep_ms >= 0.05f || h.avg_fps_cap_sleep_ms >= 0.05f);
+        const bool thread_syncing =
+            !cap_sleeping && (h.main_sync_wait_ms >= 0.25f || h.avg_main_sync_wait_ms >= 0.25f);
         const char* sync_row_label = cap_sleeping               ? "  FPS Cap Sleep + GnmSync"
                                    : (h.bottleneck_kind == 6)   ? "  Gnm Sync (External VSync)"
+                                   : thread_syncing             ? "  Engine Thread Sync (Wait)"
                                                                 : "  Gnm Frame Sync (GPU Wait)";
-        row_cpu(sync_row_label,
-                h.fps_cap_sleep_ms + h.gnm_wait_ms, h.avg_fps_cap_sleep_ms + h.avg_gnm_wait_ms,
-                h.bottleneck_kind == 4, true);
+        const float sync_row_now = cap_sleeping
+                                       ? (h.fps_cap_sleep_ms + h.gnm_wait_ms)
+                                       : (h.gnm_wait_ms + (thread_syncing ? h.main_sync_wait_ms : 0.0f));
+        const float sync_row_avg = cap_sleeping
+                                       ? (h.avg_fps_cap_sleep_ms + h.avg_gnm_wait_ms)
+                                       : (h.avg_gnm_wait_ms + (thread_syncing ? h.avg_main_sync_wait_ms : 0.0f));
+        row_cpu(sync_row_label, sync_row_now, sync_row_avg, h.bottleneck_kind == 4, true);
         row_cpu("CPU 2. Stage A (DirectVk RHI)",
                 h.a_total_ms, h.avg_a_total_ms, h.bottleneck_kind == 2);
         const bool stage_b_active = (h.b_total_ms >= 0.02f || h.avg_b_total_ms >= 0.02f);
@@ -3019,6 +3165,12 @@ void Init(const Vulkan::Instance& instance, vk::Format format, u32 image_count) 
 }
 
 void UpdateTextInput(SDL_Window* window) {
+    if (!menu_open.load(std::memory_order_relaxed)) {
+        if (SDL_TextInputActive(window)) {
+            SDL_StopTextInput(window);
+        }
+        return;
+    }
     bool want = false;
     {
         std::scoped_lock lock{imgui_mutex};
@@ -3166,6 +3318,26 @@ bool TryHandleDebugHotkeys(const SDL_Event& event) {
 }
 
 bool HandleEvent(const SDL_Event& event) {
+    if (!menu_open.load(std::memory_order_relaxed)) {
+        switch (event.type) {
+        case SDL_EVENT_KEY_DOWN:
+            if (event.key.repeat) {
+                return false;
+            }
+            break;
+        case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
+        case SDL_EVENT_GAMEPAD_BUTTON_UP:
+            if (event.gbutton.button != SDL_GAMEPAD_BUTTON_LEFT_STICK &&
+                event.gbutton.button != SDL_GAMEPAD_BUTTON_RIGHT_STICK) {
+                return false;
+            }
+            break;
+        case SDL_EVENT_MOUSE_BUTTON_DOWN:
+            break;
+        default:
+            return false;
+        }
+    }
     std::scoped_lock lock{imgui_mutex};
     if (!initialized) {
         return false;
@@ -3311,6 +3483,9 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
         present_ms_sum_accum += double(ms);
         present_ms_sq_sum_accum += double(ms) * double(ms);
         ++present_ms_count_accum;
+        if (log_frame_ms_cnt < log_frame_ms_buf.size()) {
+            log_frame_ms_buf[log_frame_ms_cnt++] = ms;
+        }
     }
     UpdateHudBreakdown(g_hud);
     // BB_FPS_PRINT=1: the present rate every 5 s on stdout, without the cost of BB_FRAME_STATS

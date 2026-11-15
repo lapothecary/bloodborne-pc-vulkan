@@ -10,12 +10,14 @@
 
 #include <vk_mem_alloc.h>
 
+#include "bbport_frame_rate.h"
 #include "bbport_game_menu.h"
 #include "bbport_overlay.h"
 #include "bbport_settings.h"
 #include "bbport_timeline.h"
 #include "bbport_toggles.h"
 #include "core/emulator_settings.h"
+#include "platform/videoout/display.h"
 #include "sdl_window.h"
 #include "textures/image.h"
 #include "textures/texture_cache.h"
@@ -661,6 +663,51 @@ bool Presenter::PresentImage(Frame* frame, vk::Image source, bool last) {
             return false;
         }
     }
+    const bool blank = frame == &blank_frame;
+    if (!blank && last && !source) {
+        const u64 period_ns =
+            BbFrameRate::PresentPacingEnabled() ? BbFrameRate::TargetPeriodNs() : 0ull;
+        const auto pmode = swapchain.GetPresentMode();
+        if (period_ns > 0 && pmode != vk::PresentModeKHR::eFifo &&
+            pmode != vk::PresentModeKHR::eFifoRelaxed) {
+            if (frame->ready_semaphore == draw_scheduler.GetWorkSemaphore()->Handle()) {
+                draw_scheduler.WaitSubmitted(frame->ready_tick);
+            }
+            WaitRendered(frame);
+            const u64 ready_ns = BbFrameRate::NowMonotonicNs();
+            const u64 epoch = BbFrameRate::PacerEpoch();
+            static u64 pres_deadline_ns = 0;
+            static u64 pres_last_period_ns = 0;
+            static u64 pres_seen_epoch = 0;
+            if (pres_deadline_ns == 0 || epoch != pres_seen_epoch ||
+                period_ns != pres_last_period_ns || BbVideoOut::QueuedPresentCount() > 0) {
+                pres_seen_epoch = epoch;
+                pres_last_period_ns = period_ns;
+                pres_deadline_ns = ready_ns;
+            } else {
+                pres_deadline_ns += period_ns;
+                if (ready_ns >= pres_deadline_ns) {
+                    pres_deadline_ns = ready_ns;
+                } else {
+                    if (pres_deadline_ns > ready_ns + period_ns) {
+                        pres_deadline_ns = ready_ns + period_ns;
+                    }
+                    const u64 cushion_ns = pres_deadline_ns - ready_ns;
+                    if (cushion_ns > 350'000ull) {
+                        const u64 pull =
+                            std::min<u64>((cushion_ns - 350'000ull) / 64ull, 20'000ull);
+                        pres_deadline_ns -= pull;
+                    }
+                    BbFrameRate::SleepUntilMonotonicNs(pres_deadline_ns, 1);
+                    const u64 after_ns = BbFrameRate::NowMonotonicNs();
+                    if (after_ns > ready_ns) {
+                        BbStats::present_pace_sleep_ns.fetch_add(
+                            after_ns - ready_ns, std::memory_order_relaxed);
+                    }
+                }
+            }
+        }
+    }
     if (!swapchain.AcquireNextImage()) {
         recreate();
         if (!swapchain.AcquireNextImage()) {
@@ -670,7 +717,6 @@ bool Presenter::PresentImage(Frame* frame, vk::Image source, bool last) {
         }
     }
 
-    const bool blank = frame == &blank_frame;
     const vk::Extent2D extent = swapchain.GetExtent();
     SetExpectedSize(extent.width, extent.height);
     // Reset here, not when the frame is taken: a frame skipped above keeps its fence signaled.

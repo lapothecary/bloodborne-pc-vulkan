@@ -28,6 +28,8 @@ namespace BbVideoOut {
 
 namespace {
 
+std::atomic<u32> g_queued_presents{0};
+
 constexpr s32 ErrorInvalidValue = s32(0x80290001);
 constexpr s32 ErrorInvalidPitch = s32(0x80290004);
 constexpr s32 ErrorInvalidTilingMode = s32(0x80290007);
@@ -221,6 +223,21 @@ void Display::QueueFlip(Port* port, s32 index, s64 flip_arg, bool at_eop) {
         ASSERT_MSG(buffer.group_index >= 0, "flip to an unregistered display buffer");
         frame = presenter->PrepareFrame(port->groups[buffer.group_index], buffer.address_left);
     }
+    // When the unlocked guest pacer owns timing and flip_rate == 0, VblankThread does zero
+    // throttling: dispatch Flip() directly from Stage B to bb:Present without bouncing through
+    // the 1000 Hz bb:Vblank middleman thread (eliminating 0..1 ms vblank wakeup jitter).
+    if (BbFrameRate::CleanPacerEnabled() && BbFrameRate::Unlocked() && port->flip_rate == 0) {
+        Request pending;
+        while (TakeRequest(pending)) {
+            Flip(pending);
+        }
+        {
+            std::scoped_lock lock{port->vblank_mutex};
+            port->last_queued = index;
+        }
+        Flip({frame, port, flip_arg, index, at_eop});
+        return;
+    }
     // BB_FLIP_AHEAD (default 1, 0 off): the buffer shown before this flip goes back to the game
     // when this flip is queued instead of when it is shown at the next vblank. A game with two
     // display buffers otherwise waits for a vblank whenever a frame takes a little longer than
@@ -301,8 +318,15 @@ void Display::PresentThread(std::stop_token stop) {
     }
 }
 
+u32 QueuedPresentCount() noexcept {
+    return g_queued_presents.load(std::memory_order_relaxed);
+}
+
 void Display::Flip(const Request& request) {
+    std::scoped_lock flip_lock{flip_call_mutex};
+    g_queued_presents.fetch_add(1, std::memory_order_relaxed);
     RunPresenter([frame = request.frame, hdr = request.port->is_hdr] {
+        g_queued_presents.fetch_sub(1, std::memory_order_relaxed);
         presenter->SetHDR(hdr);
         presenter->Present(frame);
     });

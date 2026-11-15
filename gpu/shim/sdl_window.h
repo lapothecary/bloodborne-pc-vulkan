@@ -30,6 +30,9 @@ public:
     bool IsOpen() const { return is_open.load(std::memory_order_relaxed); }
     /// Processes pending window events. Returns false once the user closed the window.
     bool PollEvents();
+    /// Blocks until the next OS input/window event arrives (or up to timeout_ms for housekeeping),
+    /// giving sub-100 us 1000+ Hz mouse delivery without SDL_Delay(2) quantum aliasing.
+    void WaitEvents(s32 timeout_ms = 4);
     /// Keyboard text entry for the system IME dialog; typed text shows in the title bar.
     void BeginTextInput(const std::string& initial, const std::string& prompt);
     /// 0 while typing, 1 confirmed (Enter), 2 cancelled (Escape); text is UTF-8.
@@ -48,7 +51,8 @@ private:
     std::atomic<s32> width, height;
     std::atomic<bool> is_open{true};
     std::mutex text_mutex;
-    bool text_requested{}, text_active{};
+    std::atomic<bool> text_requested{false};
+    bool text_active{};
     int text_state{};
     std::string text, text_prompt, base_title;
     void UpdateTextTitle();
@@ -58,6 +62,7 @@ private:
     s32 applied_output_w{0};
     s32 applied_output_h{0};
     u64 last_mouse_motion_ms{}; ///< SDL_GetTicks of the last mouse motion (UpdateCursor)
+    u64 last_housekeeping_ms{}; ///< SDL_GetTicks of the last non-motion window/cursor poll
     bool cursor_hidden{};
     u64 capture_settle_ms{}; ///< mouse motion before this (SDL_GetTicks) is not looking around
     bool pointer_shown{};        ///< a game module's pointer menu is open (bbgpu_pointer_wanted)
@@ -66,6 +71,7 @@ private:
     std::mutex mouse_mutex;
     double mouse_dx{}, mouse_dy{};
     int wheel_up{}, wheel_down{};
+    u32 mouse_pending_events{};
     std::atomic<bool> mouse_captured{false};
     std::atomic<bool> capture_requested{false};
     static inline std::atomic<bool> mouse_look{true};

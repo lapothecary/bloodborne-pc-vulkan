@@ -20,8 +20,11 @@
 #include "bbport_guest_code.h"
 #include "bbport_toggles.h"
 
+#include <cerrno>
+#include <chrono>
 #include <ctime>
 #include <sys/mman.h>
+#include <x86intrin.h>
 #ifdef __linux__
 #include <sys/prctl.h>
 #elif defined(_WIN32)
@@ -29,8 +32,9 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
-#include <x86intrin.h>
-#include <chrono>
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
 #endif
 #include <unistd.h>
 #include <algorithm>
@@ -80,6 +84,190 @@ Live* live = nullptr;
 float model_turn_base = 0.0f;         ///< the game's own model_turn (its constant, read at start)
 int base_rate = 0;               /// the launched mode's rate (0 = truly uncapped)
 std::atomic<int> live_limit{0};
+std::atomic<u64> pacer_epoch{1};
+bool pacer_wait_hooked = false;
+u64 pacer_prev_exit_ns = 0;
+u64 pacer_prev_exit_cpu_ns = 0;
+u64 pacer_next_deadline_ns = 0;
+u64 pacer_last_period_ns = 0;
+u64 pacer_seen_epoch = 0;
+
+u64 MonotonicNs() noexcept {
+#ifdef __linux__
+    struct timespec ts{};
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return u64(ts.tv_sec) * 1'000'000'000ull + u64(ts.tv_nsec);
+#else
+    return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count());
+#endif
+}
+
+u64 ThreadCpuNs(bool& ok) noexcept {
+#if defined(_WIN32)
+    ULONG64 thread_cycles = 0;
+    if (QueryThreadCycleTime(GetCurrentThread(), &thread_cycles)) {
+        static const u64 base_tsc = __rdtsc();
+        static const auto base_time = std::chrono::steady_clock::now();
+        const u64 dtsc = __rdtsc() - base_tsc;
+        const u64 dns = u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - base_time)
+                                .count());
+        const double ns_per_cyc = (dtsc > 100'000ull && dns > 100'000ull)
+                                      ? (double(dns) / double(dtsc))
+                                      : (1.0 / 3.6);
+        ok = true;
+        return u64(double(thread_cycles) * ns_per_cyc);
+    }
+    ok = false;
+    return 0;
+#elif defined(CLOCK_THREAD_CPUTIME_ID)
+    struct timespec ts_cpu{};
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts_cpu) == 0) {
+        ok = true;
+        return u64(ts_cpu.tv_sec) * 1'000'000'000ull + u64(ts_cpu.tv_nsec);
+    }
+    ok = false;
+    return 0;
+#else
+    ok = false;
+    return 0;
+#endif
+}
+
+/// Phase-locked monotonic deadline pacer replacing SprjFlipper's relative gettimeofday + usleep
+/// block (0x2034964..0x2034c55). Eliminates relative sleep wakeup drift and zero-catchup ratcheting
+/// while measuring exact active CPU work, off-CPU thread sync, and pacer sleep on MOMainThread.
+void SleepUntilDeadlineImpl(u64 entry_ns, u64 deadline_ns, int timer_slot) noexcept {
+    if (entry_ns >= deadline_ns) {
+        return;
+    }
+#if defined(__linux__)
+    (void)timer_slot;
+    constexpr u64 SpinMarginNs = 220'000ull; // 220 us precision spin after hrtimer wake
+    if (deadline_ns > entry_ns + SpinMarginNs) {
+        const u64 wake_ns = deadline_ns - SpinMarginNs;
+        struct timespec ts_wake{
+            .tv_sec = static_cast<time_t>(wake_ns / 1'000'000'000ull),
+            .tv_nsec = static_cast<long>(wake_ns % 1'000'000'000ull),
+        };
+        while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts_wake, nullptr) == EINTR) {
+        }
+    }
+#elif defined(_WIN32)
+    constexpr u64 SpinMarginNs = 450'000ull;
+    if (deadline_ns > entry_ns + SpinMarginNs + 100'000ull) {
+        static HANDLE hi_timers[2] = {nullptr, nullptr};
+        static bool hi_init[2] = {false, false};
+        const int idx = (timer_slot == 1) ? 1 : 0;
+        if (!hi_init[idx]) {
+            hi_init[idx] = true;
+            hi_timers[idx] = CreateWaitableTimerExW(
+                nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+        }
+        if (HANDLE ht = hi_timers[idx]) {
+            const u64 cur_ns = MonotonicNs();
+            if (deadline_ns > cur_ns + SpinMarginNs) {
+                const u64 sleep_100ns = (deadline_ns - cur_ns - SpinMarginNs) / 100ull;
+                if (sleep_100ns > 0) {
+                    LARGE_INTEGER due{};
+                    due.QuadPart = -static_cast<LONGLONG>(sleep_100ns);
+                    if (SetWaitableTimer(ht, &due, 0, nullptr, nullptr, FALSE)) {
+                        WaitForSingleObject(ht, 50);
+                    }
+                }
+            }
+        }
+    }
+#else
+    (void)timer_slot;
+#endif
+    while (MonotonicNs() < deadline_ns) {
+        _mm_pause();
+    }
+}
+
+u64 PS4_SYSV_ABI PacerWait(u64 pacer, std::uint32_t reset_flag) {
+#ifdef __linux__
+    static bool timerslack_set = false;
+    if (!timerslack_set) {
+        timerslack_set = true;
+        prctl(PR_SET_TIMERSLACK, 1UL, 0UL, 0UL, 0UL);
+    }
+#endif
+    const u64 entry_ns = MonotonicNs();
+    bool have_entry_cpu = false;
+    const u64 entry_cpu_ns = ThreadCpuNs(have_entry_cpu);
+
+    if (pacer_prev_exit_ns != 0 && entry_ns >= pacer_prev_exit_ns) {
+        const u64 active_wall_ns = entry_ns - pacer_prev_exit_ns;
+        if (have_entry_cpu && pacer_prev_exit_cpu_ns != 0 &&
+            entry_cpu_ns >= pacer_prev_exit_cpu_ns) {
+            const u64 active_cpu_ns = entry_cpu_ns - pacer_prev_exit_cpu_ns;
+            if (active_cpu_ns < 500'000'000ull) {
+                BbStats::main_cpu_busy_ns.fetch_add(active_cpu_ns, std::memory_order_relaxed);
+                BbStats::main_cpu_frames.fetch_add(1, std::memory_order_relaxed);
+                const u64 sync_wait_ns =
+                    (active_wall_ns > active_cpu_ns && active_wall_ns < 500'000'000ull)
+                        ? (active_wall_ns - active_cpu_ns)
+                        : 0ull;
+                BbStats::main_sync_wait_ns.fetch_add(sync_wait_ns, std::memory_order_relaxed);
+            }
+        }
+    }
+
+    const float target_s = live ? live->shortest : 0.0f;
+    const u64 period_ns =
+        (target_s > 0.0f && std::isfinite(target_s))
+            ? static_cast<u64>(std::llround(double(target_s) * 1'000'000'000.0))
+            : 0ull;
+    const u8 reset_273 = *reinterpret_cast<const u8*>(pacer + 0x273);
+    const u64 epoch = pacer_epoch.load(std::memory_order_relaxed);
+    bool did_wait = false;
+
+    if (period_ns == 0 || reset_flag != 0 || reset_273 != 0 || pacer_prev_exit_ns == 0) {
+        pacer_seen_epoch = epoch;
+        pacer_last_period_ns = period_ns;
+        pacer_next_deadline_ns = entry_ns;
+    } else {
+        if (epoch != pacer_seen_epoch || period_ns != pacer_last_period_ns) {
+            pacer_seen_epoch = epoch;
+            pacer_last_period_ns = period_ns;
+            pacer_next_deadline_ns = pacer_prev_exit_ns + period_ns;
+        } else {
+            pacer_next_deadline_ns += period_ns;
+        }
+        // Allow up to 1 full period of phase-locked catch-up debt so transient single-frame spikes
+        // (e.g. 7.5 ms + 3.2 ms -> 11.76 ms = 170.0 FPS) recover immediately without ratcheting
+        // FPS down, while preventing burst speedup after loading screens or sustained GPU bound.
+        if (entry_ns > pacer_next_deadline_ns + period_ns) {
+            pacer_next_deadline_ns = entry_ns;
+        }
+        if (entry_ns < pacer_next_deadline_ns) {
+            did_wait = true;
+            SleepUntilDeadlineImpl(entry_ns, pacer_next_deadline_ns, 0);
+        }
+    }
+
+    const u64 exit_ns = did_wait ? MonotonicNs() : entry_ns;
+    bool have_exit_cpu = have_entry_cpu;
+    const u64 exit_cpu_ns = did_wait ? ThreadCpuNs(have_exit_cpu) : entry_cpu_ns;
+    const u64 sleep_ns = exit_ns > entry_ns ? (exit_ns - entry_ns) : 0ull;
+    if (sleep_ns < 500'000'000ull) {
+        BbStats::pacer_sleep_ns.fetch_add(sleep_ns, std::memory_order_relaxed);
+        BbStats::pacer_frames.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    const u64 cur_us = exit_ns / u64(1000);
+    const u64 prev_us =
+        pacer_prev_exit_ns != 0 ? std::min<u64>(cur_us, pacer_prev_exit_ns / u64(1000)) : cur_us;
+    *reinterpret_cast<u64*>(pacer + 0x20) = prev_us;
+    *reinterpret_cast<u64*>(pacer + 0x28) = cur_us;
+    pacer_prev_exit_ns = exit_ns;
+    pacer_prev_exit_cpu_ns = have_exit_cpu ? exit_cpu_ns : 0ull;
+    return cur_us;
+}
 
 /// The pacer at the main loop's step (rdi: it): this frame's values.
 void PS4_SYSV_ABI FrameStep(u64 pacer) {
@@ -93,39 +281,16 @@ void PS4_SYSV_ABI FrameStep(u64 pacer) {
     }
 #endif
     const float measured = *reinterpret_cast<const float*>(pacer + 0x264);
-    const float min_dt = std::max(live->shortest, MinSimDt);
+    const float min_dt = pacer_wait_hooked ? MinSimDt : std::max(live->shortest, MinSimDt);
     float dt = std::clamp(std::isfinite(measured) ? measured : Frame30, min_dt, Frame30);
-    {
-        u64 cur_cpu_ns = 0;
+    if (!pacer_wait_hooked) {
         bool have_cpu_ns = false;
-#if defined(_WIN32)
-        ULONG64 thread_cycles = 0;
-        if (QueryThreadCycleTime(GetCurrentThread(), &thread_cycles)) {
-            static const u64 base_tsc = __rdtsc();
-            static const auto base_time = std::chrono::steady_clock::now();
-            const u64 dtsc = __rdtsc() - base_tsc;
-            const u64 dns = u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                    std::chrono::steady_clock::now() - base_time)
-                                    .count());
-            const double ns_per_cyc = (dtsc > 100'000ull && dns > 100'000ull)
-                                          ? (double(dns) / double(dtsc))
-                                          : (1.0 / 3.6);
-            cur_cpu_ns = u64(double(thread_cycles) * ns_per_cyc);
-            have_cpu_ns = true;
-        }
-#elif defined(CLOCK_THREAD_CPUTIME_ID)
-        struct timespec ts_cpu{};
-        if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts_cpu) == 0) {
-            cur_cpu_ns = u64(ts_cpu.tv_sec) * 1'000'000'000ull + u64(ts_cpu.tv_nsec);
-            have_cpu_ns = true;
-        }
-#endif
+        const u64 cur_cpu_ns = ThreadCpuNs(have_cpu_ns);
         if (have_cpu_ns) {
-            static thread_local u64 prev_cpu_ns = 0;
-            if (prev_cpu_ns != 0 && cur_cpu_ns > prev_cpu_ns) {
-                u64 delta_ns = cur_cpu_ns - prev_cpu_ns;
+            static u64 fallback_prev_cpu_ns = 0;
+            if (fallback_prev_cpu_ns != 0 && cur_cpu_ns > fallback_prev_cpu_ns) {
+                u64 delta_ns = cur_cpu_ns - fallback_prev_cpu_ns;
                 if (delta_ns < 500'000'000ull) {
-                    // Subtract the 200 us precision-spin margin when the frame pacer actively capped this frame.
                     if (live->shortest > 0.0f && std::isfinite(measured) &&
                         measured <= live->shortest * 1.05f) {
                         const u64 spin_ns = 200'000ull;
@@ -135,7 +300,7 @@ void PS4_SYSV_ABI FrameStep(u64 pacer) {
                     BbStats::main_cpu_frames.fetch_add(1, std::memory_order_relaxed);
                 }
             }
-            prev_cpu_ns = cur_cpu_ns;
+            fallback_prev_cpu_ns = cur_cpu_ns;
         }
     }
     // BB_FRAME_DT_SMOOTH=a (diagnostics, 0 < a < 1): the step follows the measured frame time by
@@ -150,6 +315,43 @@ void PS4_SYSV_ABI FrameStep(u64 pacer) {
         static float smoothed = 0.0f;
         smoothed = smoothed > 0.0f ? smoothed + smooth * (dt - smoothed) : dt;
         dt = std::clamp(smoothed, min_dt, Frame30);
+    } else {
+        static const bool cap_dt_stabilize = [] {
+            const char* env = std::getenv("BB_CAP_DT_STABILIZE");
+            return !env || !*env || !(env[0] == '0' && env[1] == '\0');
+        }();
+        if (cap_dt_stabilize && pacer_wait_hooked && live->shortest > 0.0f) {
+            static double dt_debt_s = 0.0;
+            static u64 dt_stab_epoch = 0;
+            static float dt_stab_target = 0.0f;
+            const u64 cur_ep = pacer_epoch.load(std::memory_order_relaxed);
+            const float target_f = live->shortest;
+            const double target_d = double(target_f);
+            if (cur_ep == dt_stab_epoch && target_f == dt_stab_target &&
+                std::isfinite(measured) && measured > 0.0f &&
+                double(dt) >= target_d * 0.55 && double(dt) <= target_d * 1.35) {
+                const double want = double(dt) + dt_debt_s;
+                const double step = std::clamp(
+                    target_d + (want - target_d) * 0.12, target_d * 0.88, target_d * 1.18);
+                dt_debt_s = std::clamp(want - step, -target_d * 1.5, target_d * 1.5);
+                dt = std::clamp(static_cast<float>(step), min_dt, Frame30);
+            } else {
+                dt_debt_s = 0.0;
+                dt_stab_epoch = cur_ep;
+                dt_stab_target = target_f;
+            }
+        }
+    }
+    {
+        const std::uint32_t dt_us = static_cast<std::uint32_t>(dt * 1'000'000.0f + 0.5f);
+        std::uint32_t cur_min = BbStats::sim_dt_min_us.load(std::memory_order_relaxed);
+        while (dt_us < cur_min && !BbStats::sim_dt_min_us.compare_exchange_weak(
+                                      cur_min, dt_us, std::memory_order_relaxed)) {
+        }
+        std::uint32_t cur_max = BbStats::sim_dt_max_us.load(std::memory_order_relaxed);
+        while (dt_us > cur_max && !BbStats::sim_dt_max_us.compare_exchange_weak(
+                                      cur_max, dt_us, std::memory_order_relaxed)) {
+        }
     }
     const float frames = dt * 30.0f; // the frame's length in 30 FPS frames
     const double frames_d = double(dt) * 30.0;
@@ -360,6 +562,23 @@ bool HookPacerMode() {
     return Detour(0x203493d, code, sizeof(code), e);
 }
 
+/// Monotonic phase-locked deadline detour at 0x2034964 (`mov rax, [r12 + 0x28]; mov [r12 + 0x20],
+/// rax`) jumping directly to SprjFlipper's post-wait dt/ring update at 0x2034c55.
+bool HookPacerWait() {
+    constexpr u8 code[] = {0x49, 0x8b, 0x44, 0x24, 0x28, 0x49, 0x89, 0x44, 0x24, 0x20};
+    Emitter e;
+    e.Bytes({0x4c, 0x89, 0xe7});       // mov rdi, r12 (pacer; rsp is already 16-byte aligned at 0x2034964)
+    e.Bytes({0x8b, 0x75, 0xbc});       // mov esi, [rbp - 0x44] (reset flag from 0x20348fa)
+    e.CallAbs(reinterpret_cast<const void*>(&PacerWait));
+    e.Bytes({0x48, 0x89, 0xc6});       // mov rsi, rax (cur_exit_us expected at 0x2034c87)
+    e.Bytes({0x31, 0xdb});             // xor ebx, ebx
+    e.Bytes({0x45, 0x31, 0xed});       // xor r13d, r13d
+    e.Bytes({0x45, 0x31, 0xff});       // xor r15d, r15d
+    e.Bytes({0xc5, 0xf8, 0x57, 0xc0}); // vxorps xmm0, xmm0, xmm0
+    e.JmpAbs(image_base + 0x2034c55);
+    return Detour(0x2034964, code, sizeof(code), e);
+}
+
 /// The pacer keeps its one vblank when a frame came late (0x2034d96: `test dl, dl; je; mov eax,
 /// [r12 + 0x10]`, then eax is stored back: 0 when late).
 bool HookPacerLate() {
@@ -538,6 +757,7 @@ void PatchImage(unsigned char* image, std::uint64_t image_size) {
     }
     int spin_redirected = 0;
     if (CleanPacerEnabled()) {
+        pacer_wait_hooked = HookPacerWait();
         constexpr Redirect PacerSpinRedirects[] = {
             {0x2034b9e, 0x4929390, offsetof(Live, spin_margin)},     // 1.0 ms threshold -> 200 us
             {0x2034ba8, 0x4929394, offsetof(Live, spin_margin)},     // 5.0 ms threshold -> 200 us
@@ -553,10 +773,11 @@ void PatchImage(unsigned char* image, std::uint64_t image_size) {
     std::printf("Frame rate: the model preview turns %.5f rad per stick unit per 30 FPS frame\n",
                 model_turn_base);
     std::printf("Frame rate: free (hooks, no patches): the game steps by each frame's time "
-                "(pacer=%s, sim=1/%d..1/30 s); %d fixed steps, %d of %zu per-frame values follow the frame's "
+                "(pacer=%s%s, sim=1/%d..1/30 s); %d fixed steps, %d of %zu per-frame values follow the frame's "
                 "time, foliage sway=%s, pacer usleep spin=%d/3, the run's wall check %s, "
                 "the cloth's stiffness %s\n",
-                live->shortest > 0.0f ? "capped" : "truly uncapped (0.0 ms)", MaxRate,
+                live->shortest > 0.0f ? "capped" : "truly uncapped (0.0 ms)",
+                pacer_wait_hooked ? " + monotonic-abstime" : "", MaxRate,
                 steps, redirected, std::size(Redirects),
                 foliage ? "fixed-amplitude + dt-phase" : "unchanged", spin_redirected,
                 run == 1 ? "by speed" : run == 2 ? "by speed (a Sprint Fix patch did it already)"
@@ -577,6 +798,7 @@ bool Unlocked() {
 }
 void SetLimit(int fps) {
     live_limit.store(fps, std::memory_order_relaxed);
+    pacer_epoch.fetch_add(1, std::memory_order_relaxed);
     if (!unlocked.load(std::memory_order_relaxed) || !live) {
         return;
     }
@@ -590,5 +812,46 @@ void SetLimit(int fps) {
 }
 int Limit() {
     return live_limit.load(std::memory_order_relaxed);
+}
+
+std::uint64_t NowMonotonicNs() noexcept {
+    return MonotonicNs();
+}
+
+void SleepUntilMonotonicNs(std::uint64_t deadline_ns, int timer_slot) noexcept {
+#ifdef __linux__
+    static bool slot_timerslack_set[2] = {false, false};
+    const int idx = (timer_slot == 1) ? 1 : 0;
+    if (!slot_timerslack_set[idx]) {
+        slot_timerslack_set[idx] = true;
+        prctl(PR_SET_TIMERSLACK, 1UL, 0UL, 0UL, 0UL);
+    }
+#endif
+    const u64 now = MonotonicNs();
+    if (now < deadline_ns) {
+        SleepUntilDeadlineImpl(now, deadline_ns, timer_slot);
+    }
+}
+
+std::uint64_t TargetPeriodNs() noexcept {
+    if (!unlocked.load(std::memory_order_relaxed) || !live) {
+        return 0ull;
+    }
+    const float t = live->shortest;
+    return (t > 0.0f && std::isfinite(t))
+               ? static_cast<u64>(std::llround(double(t) * 1'000'000'000.0))
+               : 0ull;
+}
+
+std::uint64_t PacerEpoch() noexcept {
+    return pacer_epoch.load(std::memory_order_relaxed);
+}
+
+bool PresentPacingEnabled() noexcept {
+    static const bool enabled = [] {
+        const char* env = std::getenv("BB_PRESENT_PACE");
+        return !env || !*env || !(env[0] == '0' && env[1] == '\0');
+    }();
+    return enabled;
 }
 } // namespace BbFrameRate

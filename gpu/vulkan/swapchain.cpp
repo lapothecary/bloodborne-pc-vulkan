@@ -89,6 +89,13 @@ void Swapchain::QuerySurface() {
     }
     // One image more than the minimum: one to draw into while the others are shown.
     image_count = caps.minImageCount + 1;
+    if (present_mode == vk::PresentModeKHR::eMailbox ||
+        present_mode == vk::PresentModeKHR::eImmediate) {
+        // On high-refresh Wayland/XWayland compositors (e.g. 170 Hz Mailbox when FPS == Hz),
+        // 3 images (1 scanout + 1 queued flip + 1 draw) can transiently starve vkAcquireNextImageKHR
+        // across scanout boundaries, causing 1-refresh jitter spikes. Request 5 images when allowed.
+        image_count = std::max(image_count, 5u);
+    }
     if (caps.maxImageCount > 0) {
         image_count = std::min(image_count, caps.maxImageCount);
     }

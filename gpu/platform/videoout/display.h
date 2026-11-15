@@ -22,6 +22,10 @@ struct Frame;
 
 namespace BbVideoOut {
 
+/// Number of real game frames queued in `present_work` behind the frame currently executing on
+/// `bb:Present` (0 when `bb:Present` has no backlog).
+u32 QueuedPresentCount() noexcept;
+
 /// sceVideoOutOpen's thread parameters (unused here).
 struct ServiceThreadParams {
     u32 unknown;
@@ -69,6 +73,7 @@ private:
     void RunPresenter(std::function<void()> work, bool only_if_idle = false);
 
     std::mutex present_mutex;
+    std::mutex flip_call_mutex;
     std::condition_variable_any present_cv;
     std::deque<std::function<void()>> present_work;
     bool present_busy = false;

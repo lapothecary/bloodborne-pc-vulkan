@@ -288,8 +288,16 @@ constexpr std::uint8_t ParentGpuCat(std::uint8_t subcat) noexcept {
 }
 inline std::array<std::atomic<std::uint64_t>, GpuCat_Count> hw_gpu_cat_ns{};
 inline std::array<std::atomic<std::uint64_t>, GpuSub_Count> hw_gpu_subcat_ns{};
-/// Active CPU execution nanoseconds of the game's Main thread (CLOCK_THREAD_CPUTIME_ID, excluding FPS cap sleep).
+/// Active CPU execution nanoseconds of the game's Main thread (CLOCK_THREAD_CPUTIME_ID, excluding FPS cap sleep & spin).
 inline std::atomic<std::uint64_t> main_cpu_busy_ns{0}, main_cpu_frames{0};
+/// Monotonic wall nanoseconds spent inside the frame pacer (sleep + spin) and off-CPU thread sync outside the pacer.
+inline std::atomic<std::uint64_t> pacer_sleep_ns{0}, pacer_frames{0}, main_sync_wait_ns{0};
+/// Output present pacing sleep (nanoseconds on bb:Present) + simulation dt min/max (microseconds, reset per 5s HUD log).
+inline std::atomic<std::uint64_t> present_pace_sleep_ns{0};
+inline std::atomic<std::uint32_t> sim_dt_min_us{0xFFFFFFFFu}, sim_dt_max_us{0u};
+/// Mouse event cadence telemetry (1000+ Hz event-driven window loop vs per-frame TakeMouse).
+inline std::atomic<std::uint64_t> mouse_raw_events{0}, mouse_active_polls{0}, mouse_zero_polls_moving{0}, mouse_window_wakeups{0};
+inline std::atomic<std::uint32_t> mouse_ev_per_poll_min{0xFFFFFFFFu}, mouse_ev_per_poll_max{0u};
 /// Frames shown (Presenter::PrepareFrame), guest flip frames (PatchFlip), and bytes the background pre-upload put into the arena.
 inline std::atomic<std::uint32_t> frame_number{0};
 inline std::atomic<std::uint32_t> guest_frame_number{1};

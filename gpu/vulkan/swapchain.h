@@ -65,6 +65,9 @@ public:
     u32 GetImageCount() const {
         return image_count;
     }
+    vk::PresentModeKHR GetPresentMode() const {
+        return present_mode;
+    }
     vk::Semaphore GetImageAcquiredSemaphore() const {
         return acquired[frame_index];
     }
