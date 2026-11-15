@@ -139,14 +139,16 @@ struct SceneOcclusionCuller {
             enabled = false;
             return;
         }
-        const vk::QueryPoolCreateInfo mt_info{
-            .queryType = vk::QueryType::eOcclusion,
-            .queryCount = MtQueryBlocks * MtQueriesPerBlock,
-        };
-        auto mt_res = device.createQueryPoolUnique(mt_info);
-        if (mt_res.result == vk::Result::eSuccess) {
-            mt_pool = std::move(mt_res.value);
-            device.resetQueryPool(*mt_pool, 0, MtQueryBlocks * MtQueriesPerBlock);
+        if (VkMtDirectRecorder::ConfiguredMode() > 0) {
+            const vk::QueryPoolCreateInfo mt_info{
+                .queryType = vk::QueryType::eOcclusion,
+                .queryCount = MtQueryBlocks * MtQueriesPerBlock,
+            };
+            auto mt_res = device.createQueryPoolUnique(mt_info);
+            if (mt_res.result == vk::Result::eSuccess) {
+                mt_pool = std::move(mt_res.value);
+                device.resetQueryPool(*mt_pool, 0, MtQueryBlocks * MtQueriesPerBlock);
+            }
         }
     }
 
@@ -217,7 +219,7 @@ struct SceneOcclusionCuller {
         if (!pool) {
             return;
         }
-        const u32 ref_frame = ActiveFrameTag();
+        const u32 stage_b_frame = cur_frame.load(std::memory_order_relaxed);
         std::array<u64, SliceQueries> samples{};
         for (u32 s = 0; s < NumSlices; ++s) {
             if (!slice_sealed[s] || !scheduler.IsFree(slice_last_tick[s])) {
@@ -230,7 +232,7 @@ struct SceneOcclusionCuller {
                     sizeof(u64), vk::QueryResultFlagBits::e64);
                 if (res == vk::Result::eSuccess) {
                     ApplyQuerySamplesToEntries(slice_entry_idx[s].data(), samples.data(), count,
-                                               ref_frame);
+                                               stage_b_frame);
                 } else {
                     for (u32 i = 0; i < count; ++i) {
                         entries[slice_entry_idx[s][i]].probe_in_flight.store(
@@ -246,6 +248,7 @@ struct SceneOcclusionCuller {
         if (!mt_pool) {
             return;
         }
+        const u32 mt_ref_frame = ActiveFrameTag();
         for (u32 b = 0; b < MtQueryBlocks; ++b) {
             auto& blk = mt_blocks[b];
             if (blk.state.load(std::memory_order_acquire) !=
@@ -260,7 +263,7 @@ struct SceneOcclusionCuller {
                 const auto res = device.getQueryPoolResults(
                     *mt_pool, b * MtQueriesPerBlock, count, count * sizeof(u64), samples.data(),
                     sizeof(u64), vk::QueryResultFlagBits::e64);
-                const u32 blk_ref = std::max(ref_frame, blk.frame_tag);
+                const u32 blk_ref = std::max(mt_ref_frame, blk.frame_tag);
                 if (res == vk::Result::eSuccess) {
                     ApplyQuerySamplesToEntries(blk.entry_idx.data(), samples.data(), count,
                                                blk_ref);
@@ -349,8 +352,10 @@ struct SceneOcclusionCuller {
         }
         SealCurrentSlice(scheduler.CurrentTick());
         const u32 prev_f = cur_frame.load(std::memory_order_relaxed);
-        const u32 gf = BbStats::guest_frame_number.load(std::memory_order_relaxed);
-        const u32 next_f = (gf != 0u) ? gf : (prev_f + 1u);
+        const u32 next_f =
+            (VkMtDirectRecorder::ConfiguredMode() > 0)
+                ? std::max(prev_f + 1u, BbStats::guest_frame_number.load(std::memory_order_relaxed))
+                : (prev_f + 1u);
         cur_frame.store(next_f, std::memory_order_relaxed);
         const u32 last_cam_f = cam_updated_frame.load(std::memory_order_acquire);
         if (next_f > last_cam_f + 1u) {
@@ -1604,7 +1609,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     if (scene_occlusion_culler) {
         auto& culler = *scene_occlusion_culler;
         culler.EnsureInit(instance);
-        const u32 frame_tag = culler.ActiveFrameTag();
+        const u32 frame_tag = culler.cur_frame.load(std::memory_order_relaxed);
         const auto& vs_stage = pipeline->GetStage(Shader::SwStage::Vertex);
         const u64 vs_hash = vs_stage.pgm_hash;
         const u32 num_indices = regs.num_indices;

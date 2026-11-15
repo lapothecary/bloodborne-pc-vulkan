@@ -484,7 +484,7 @@ int VkMtDirectRecorder::ConfiguredMode() noexcept {
     static const int cached_mode = []() -> int {
         const char* env = std::getenv("BB_MT_DIRECT_VK");
         if (!env || env[0] == '\0') {
-            return 1; // Default enabled on feat/mt-direct-vulkan
+            return 0; // Default off (Stage A + Stage B fast path; opt-in via BB_MT_DIRECT_VK=1/2)
         }
         return std::clamp<int>(static_cast<int>(std::strtol(env, nullptr, 10)), 0, 2);
     }();

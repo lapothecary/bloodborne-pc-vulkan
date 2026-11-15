@@ -1295,7 +1295,7 @@ struct WriteLockGuard {
     static const bool enabled = []() -> bool {
         const char* env = std::getenv("BB_MT_DIRECT_VK");
         if (!env || env[0] == '\0') {
-            return true; // Default enabled on feat/mt-direct-vulkan
+            return false; // Default off (zero mutex overhead unless BB_MT_DIRECT_VK=1/2)
         }
         return std::strtol(env, nullptr, 10) > 0;
     }();
