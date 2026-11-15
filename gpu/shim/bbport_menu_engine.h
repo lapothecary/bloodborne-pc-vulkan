@@ -59,6 +59,19 @@ namespace BbMenuEngine {
 //                  - background frame (Sprite 80, d=1)
 //                  - `Item_0_0` .. `Item_5_0` (Sprite 83: `Text_0` d=5, `Cursor` d=6)
 //                  - `ScrollBarV` (Sprite 91: `ArrowDown` d=1, `ArrowUp` d=3, `Bar` d=5)
+//
+//   Title Screen Layout (`menu/title.gfx`, `title_dlc.gfx`, `title_dlc_eu.gfx`):
+//     Root places `Top` (Sprite 43, tx=0, ty=0):
+//       - `StaticRegionText_401001` (Sprite 24, d=1, ty=1000.95) — bottom copyright line
+//       - `CommandList` (Sprite 32, d=7, tx=1179.45, ty=703.50)  — Title Menu item list:
+//           Vanilla places 5 rows (`Item_4_0 .. Item_0_0`, Sprite 31, tx=-514.15, ty=+112.00..-47.40,
+//           step=+39.85 px / +797 twips, depths 1, 6, 11, 16, 21). `src/runtime_file.c`
+//           (`fix_title_layout`) appends `Item_5_0` at `ty=+151.85` (`+3037` twips, stage y=855.35)
+//           and bumps `Item_4_0..Item_0_0` depths by +5 so all 6 Title Menu rows (`Continue`,
+//           `Load Game`, `New Game`, `System`, `Log In` / `Information`, `Exit Game`) display
+//           simultaneously without scrolling.
+//       - `Sprite 31` (Title row template): `EditText 27` (`Text_0`, d=10) + `Sprite 30` (`Cursor`, d=14, 30f)
+//       - `PressStart` (Sprite 34, d=29), `ProgressInfo` (Sprite 39, d=34), `Info` (Sprite 42, d=38)
 
 // ============================================================================
 // 2. Decompiled `eboot.bin` VMA Constants (file_offset = VMA + 0x4000)
@@ -67,6 +80,13 @@ namespace Vma {
 // Message repository lookup & text helpers
 inline constexpr u64 MsgLookup            = 0x0f6f340; // (repo, table, category, id) -> const char16_t*
 inline constexpr u64 MakeText             = 0x1ae8cc0; // (out_entry 0x40B, category, id)
+
+// Title Screen menu builder (`sub_1b4a3d0`, FMG 0xc8 IDs 401301..401307) & CommandList binding
+inline constexpr u64 StartupMenuBuilder   = 0x1b39030; // Play Offline / Play Online 2-item startup prompt
+inline constexpr u64 TitleMenuBuilder     = 0x1b4a3d0; // Main Title Menu builder (Continue/Load/New/System/LogIn)
+inline constexpr u64 AddActionItem        = 0x1b4c9a0; // (menu, name_help_texts, action_fn, out)
+inline constexpr u64 BindCommandList      = 0x1bea820; // (out_step, menu, cmd_list_mc) -> binds items to Top.CommandList
+inline constexpr u64 TitleMenuBindRet     = 0x1b4adb8; // Return VMA of BindCommandList call inside TitleMenuBuilder
 
 // Scaleform GFx MovieClip (`0x60`-byte wrapper) & Value operations
 inline constexpr u64 GetSubMovieClip      = 0x1adb220; // (GFxMovieClip* out, const GFxMovieClip* parent, const char* fmt, ...)

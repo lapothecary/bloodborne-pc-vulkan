@@ -345,6 +345,12 @@ static unsigned bits_read(Bits *b,int n) {
     while (n--) { v=v<<1 | ((b->p[b->bit>>3]>>(7-(b->bit&7)))&1); ++b->bit; }
     return v;
 }
+static int bits_read_signed(Bits *b,int n) {
+    if (n<=0) return 0;
+    unsigned v=bits_read(b,n);
+    if (v & (1u<<(n-1))) v |= ~0u<<n;
+    return (int)v;
+}
 /* A tag at `at` of `buf` (up to `end`): its code, body and the next tag. */
 static int swf_tag(const uint8_t *buf,size_t at,size_t end,unsigned *code,size_t *body,size_t *len,size_t *next) {
     if (at+2>end) return 0;
@@ -391,6 +397,28 @@ static const char *swf_place_name(const uint8_t *t,unsigned code,size_t len) {
     if (p>=len || !memchr(t+p,0,len-p)) return NULL;
     return (const char *)t+p;
 }
+/* PlaceObject2's 2D translation in twips when HasCharacter|HasMatrix (0x06) is set. */
+static int swf_place_translate(const uint8_t *t,unsigned code,size_t len,int *tx,int *ty) {
+    if (code!=26 || len<6 || (t[0]&0x06)!=0x06) return 0;
+    Bits b={t,5*8};
+    if (bits_read(&b,1)) { int n=(int)bits_read(&b,5); bits_read(&b,n); bits_read(&b,n); }
+    if (bits_read(&b,1)) { int n=(int)bits_read(&b,5); bits_read(&b,n); bits_read(&b,n); }
+    int n=(int)bits_read(&b,5);
+    *tx=bits_read_signed(&b,n);
+    *ty=bits_read_signed(&b,n);
+    return (b.bit+7)/8 <= len;
+}
+/* Encodes a pure-translation SWF MATRIX with 15-bit signed twips (40 bits = 5 bytes). */
+static void pack_matrix15(uint8_t out[5],int tx,int ty) {
+    const uint64_t v=((uint64_t)15<<33) |
+                     ((uint64_t)((unsigned)tx&0x7fffu)<<18) |
+                     ((uint64_t)((unsigned)ty&0x7fffu)<<3);
+    out[0]=(uint8_t)(v>>32);
+    out[1]=(uint8_t)(v>>24);
+    out[2]=(uint8_t)(v>>16);
+    out[3]=(uint8_t)(v>>8);
+    out[4]=(uint8_t)v;
+}
 /* Reverses the item rows' depths of the ControllSetting layout in `buf` (an uncompressed GFX). */
 static int fix_option_layout(uint8_t *buf,size_t size) {
     if (size<16 || memcmp(buf,"GFX",3)) return 0;
@@ -436,28 +464,148 @@ static int fix_option_layout(uint8_t *buf,size_t size) {
     }
     return 0;
 }
-/* The host file for `guest`: a fixed copy (a memfd) for the option layouts, else `host`. */
+/* Appends a 6th row slot (`Item_5_0`) to `Top.CommandList` in `title*.gfx` so all 6 Title Menu
+ * items (`Continue`, `Load Game`, `New Game`, `System`, `Log In` / `Information`, `Exit Game`)
+ * render simultaneously without scrolling. */
+static int fix_title_layout(const uint8_t *src,size_t size,uint8_t **out_buf,size_t *out_size) {
+    if (size<16 || memcmp(src,"GFX",3)) return 0;
+    const size_t rect=(5+4*(src[8]>>3)+7)/8, first=8+rect+4;
+    unsigned code; size_t body,len,next;
+    long cmd_sprite=-1;
+    for (size_t at=first; swf_tag(src,at,size,&code,&body,&len,&next) && code; at=next) {
+        if (code!=39 || len<4) continue;
+        size_t inner,ilen,inext; unsigned c;
+        for (size_t t=body+4; swf_tag(src,t,next,&c,&inner,&ilen,&inext) && c; t=inext) {
+            if ((c==26 || c==70) && ilen>=5 && (src[inner]&0x02) && !(c==70 && (src[inner+1]&0x08))) {
+                const char *name=swf_place_name(src+inner,c,ilen);
+                const size_t cid_off=(c==70 ? 4u : 3u);
+                if (name && !strcmp(name,"CommandList") && cid_off+2<=ilen)
+                    cmd_sprite=src[inner+cid_off] | (src[inner+cid_off+1]<<8);
+            }
+        }
+    }
+    if (cmd_sprite<0) return 0;
+    for (size_t at=first; swf_tag(src,at,size,&code,&body,&len,&next) && code; at=next) {
+        if (code!=39 || len<4 || (src[body] | src[body+1]<<8)!=cmd_sprite) continue;
+        int found[5]={0}, tx[5]={0}, ty[5]={0};
+        unsigned depth[5]={0}, item_cid=0;
+        size_t inner,ilen,inext; unsigned c;
+        for (size_t t=body+4; swf_tag(src,t,next,&c,&inner,&ilen,&inext) && c && c!=1; t=inext) {
+            if (c!=26 && c!=70) continue;
+            const char *name=swf_place_name(src+inner,c,ilen);
+            if (!name) continue;
+            if (!strcmp(name,"Item_5_0")) return 0;
+            if (!strncmp(name,"Item_",5) && name[5]>='0' && name[5]<='4' && !strcmp(name+6,"_0")) {
+                const int idx=name[5]-'0';
+                if (c!=26 || ilen<6 || (src[inner]&0x06)!=0x06) return 0;
+                if (!swf_place_translate(src+inner,c,ilen,&tx[idx],&ty[idx])) return 0;
+                const unsigned cid=(unsigned)src[inner+3] | ((unsigned)src[inner+4]<<8);
+                if (item_cid && cid!=item_cid) return 0;
+                item_cid=cid;
+                depth[idx]=(unsigned)src[inner+1] | ((unsigned)src[inner+2]<<8);
+                found[idx]=1;
+            }
+        }
+        for (int i=0;i<5;++i) if (!found[i] || !depth[i]) return 0;
+        const int step_y=ty[4]-ty[3];
+        const int ty5=ty[4]+step_y;
+        if (tx[4]!=tx[3] || step_y<=0 || depth[3]<=depth[4]) return 0;
+        if (tx[4]<-16384 || tx[4]>16383 || ty5<-16384 || ty5>16383) return 0;
+        const unsigned depth_step=depth[3]-depth[4];
+        uint8_t item5[25]={
+            0xbf, 0x06, 19, 0, 0, 0,
+            0x26,
+            (uint8_t)(depth[4]&0xff), (uint8_t)(depth[4]>>8),
+            (uint8_t)(item_cid&0xff), (uint8_t)(item_cid>>8),
+            0, 0, 0, 0, 0,
+            'I','t','e','m','_','5','_','0',0
+        };
+        pack_matrix15(item5+11,tx[4],ty5);
+
+        const size_t orig_hdr=body-at;
+        const size_t new_sprite_len=len+sizeof(item5);
+        const size_t new_total=size-orig_hdr+6+sizeof(item5);
+        uint8_t *dst=malloc(new_total);
+        if (!dst) return 0;
+        size_t wp=0;
+        memcpy(dst+wp,src,at); wp+=at;
+        dst[wp++]=0xff; dst[wp++]=0x09; /* DefineSprite (code=39) long header */
+        dst[wp++]=(uint8_t)(new_sprite_len&0xff);
+        dst[wp++]=(uint8_t)((new_sprite_len>>8)&0xff);
+        dst[wp++]=(uint8_t)((new_sprite_len>>16)&0xff);
+        dst[wp++]=(uint8_t)((new_sprite_len>>24)&0xff);
+        memcpy(dst+wp,src+body,4); wp+=4;
+        memcpy(dst+wp,item5,sizeof(item5)); wp+=sizeof(item5);
+        const size_t existing_start=wp;
+        const size_t existing_len=len-4;
+        memcpy(dst+wp,src+body+4,existing_len); wp+=existing_len;
+        for (size_t t=existing_start; swf_tag(dst,t,existing_start+existing_len,&c,&inner,&ilen,&inext) && c; t=inext) {
+            uint8_t *d=swf_depth(dst,c,inner,ilen);
+            if (!d) continue;
+            const unsigned v=(unsigned)d[0] | ((unsigned)d[1]<<8);
+            if (v+depth_step>0xffffu) { free(dst); return 0; }
+            const unsigned nv=v+depth_step;
+            d[0]=(uint8_t)(nv&0xff);
+            d[1]=(uint8_t)(nv>>8);
+        }
+        memcpy(dst+wp,src+next,size-next); wp+=size-next;
+        dst[4]=(uint8_t)(new_total&0xff);
+        dst[5]=(uint8_t)((new_total>>8)&0xff);
+        dst[6]=(uint8_t)((new_total>>16)&0xff);
+        dst[7]=(uint8_t)((new_total>>24)&0xff);
+        *out_buf=dst;
+        *out_size=new_total;
+        return 1;
+    }
+    return 0;
+}
+static int has_suffix_nocase(const char *s,size_t n,const char *suf) {
+    const size_t k=strlen(suf);
+    return n>=k && !strcasecmp(s+n-k,suf);
+}
+/* The host file for `guest`: a fixed copy (a memfd) for the option/title layouts, else `host`. */
 static int menu_layout_file(const char *guest,int host) {
-    static const char suffix[]="/menu/optionsetting.gfx";
-    const size_t n=strlen(guest), k=sizeof(suffix)-1;
-    if ((bb_env_off("BB_GAME_MENU")) || n<k || strcasecmp(guest+n-k,suffix)) return host;
+    if (bb_env_off("BB_GAME_MENU")) return host;
+    const size_t n=strlen(guest);
+    const int is_option=has_suffix_nocase(guest,n,"/menu/optionsetting.gfx");
+    const int is_title=!is_option && (has_suffix_nocase(guest,n,"/menu/title.gfx") ||
+                                      has_suffix_nocase(guest,n,"/menu/title_dlc.gfx") ||
+                                      has_suffix_nocase(guest,n,"/menu/title_dlc_eu.gfx"));
+    if (!is_option && !is_title) return host;
     struct stat s;
     if (fstat(host,&s) || s.st_size<=0 || s.st_size>(16<<20)) return host;
     uint8_t *buf=malloc((size_t)s.st_size);
     if (!buf) return host;
-    if (pread(host,buf,(size_t)s.st_size,0)!=s.st_size || !fix_option_layout(buf,(size_t)s.st_size)) {
-        free(buf); return host;
+    if (pread(host,buf,(size_t)s.st_size,0)!=s.st_size) { free(buf); return host; }
+    uint8_t *write_buf=buf;
+    size_t write_size=(size_t)s.st_size;
+    if (is_option) {
+        if (!fix_option_layout(buf,write_size)) { free(buf); return host; }
+    } else {
+        uint8_t *patched=NULL;
+        size_t patched_size=0;
+        if (!fix_title_layout(buf,write_size,&patched,&patched_size)) { free(buf); return host; }
+        free(buf);
+        buf=patched;
+        write_buf=patched;
+        write_size=patched_size;
     }
-    int fixed=memfd_create("optionsetting.gfx",MFD_CLOEXEC);
-    if (fixed<0 || write(fixed,buf,(size_t)s.st_size)!=s.st_size || lseek(fixed,0,SEEK_SET)) {
+    int fixed=memfd_create(is_option ? "optionsetting.gfx" : "title.gfx",MFD_CLOEXEC);
+    if (fixed<0 || write(fixed,write_buf,write_size)!=(ssize_t)write_size || lseek(fixed,0,SEEK_SET)) {
         if (fixed>=0) close(fixed);
         free(buf); return host;
     }
     free(buf);
     close(host);
-    static int told;
-    if (!__atomic_exchange_n(&told,1,__ATOMIC_RELAXED))
-        printf("Runtime: %s: the settings rows stack downwards (pop-up lists cover the rows below)\n",guest);
+    if (is_option) {
+        static int told_opt;
+        if (!__atomic_exchange_n(&told_opt,1,__ATOMIC_RELAXED))
+            printf("Runtime: %s: the settings rows stack downwards (pop-up lists cover the rows below)\n",guest);
+    } else {
+        static int told_title;
+        if (!__atomic_exchange_n(&told_title,1,__ATOMIC_RELAXED))
+            printf("Runtime: %s: added 6th CommandList row slot (Exit Game)\n",guest);
+    }
     return fixed;
 }
 /* All operations return >=0 or -(host errno); wrappers adapt the convention. */

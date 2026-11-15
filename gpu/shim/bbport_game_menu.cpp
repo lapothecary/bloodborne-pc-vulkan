@@ -100,6 +100,9 @@ constexpr Layout ControlsLayout{0x4934065, 113020, 0, 6}; // "ControllSetting"
 constexpr u32 TextName = 0xc8, TextHelp = 0xc9; // SP_menu text / SP_one-line help
 constexpr u32 ControlsItem = 110000;            // "Controls" in the System menu: Keybinds follow it
 constexpr u32 ScreenSoundItem = 110001;         // "Screen/Sound" in the System menu: Display/Effects follow it
+constexpr u32 TitleNewGameItem = 401303;        // "New Game" / "Новая игра" on the Title Screen
+constexpr u64 BindCommandList = 0x1bea820;      // (out_step, menu, cmd_list_mc): binds Title/Startup menu items
+constexpr u64 TitleMenuBindRet = 0x1b4adb8;     // return address of BindCommandList inside TitleMenuBuilder (0x1b4a3d0)
 
 const u8 MsgLookupPrologue[] = {0x89, 0xf0, 0x48, 0x8b, 0x77, 0x08, 0x48, 0x8b, 0x34, 0xc6};
 const u8 AddPageItemPrologue[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57};
@@ -223,6 +226,8 @@ const char* TranslateForCurrentGameLang(const char* en) {
         {"True Black & Vibrance", "Noir profond (OLED) & Vibrance", "Negro puro (OLED) y viveza", "Tiefschwarz (OLED) & Brillanz", "Nero puro (OLED) e vividezza", "Preto puro (OLED) e vivacidade", "Głęboka czerń (OLED) i nasycenie", "トゥルーブラック (OLED) & 彩度", "트루 블랙 (OLED) 및 채도", "纯黑去雾 (OLED) 与色彩鲜艳度"},
         {"Debug", "Debug", "Depuración", "Debug", "Debug", "Debug", "Debug", "デバッグ", "디버그", "调试信息"},
         {"Additional Debug", "Debug détaillé", "Depuración detallada", "Erweitertes Debug", "Debug dettagliato", "Debug detalhado", "Szczegółowy debug", "詳細デバッグ", "상세 디버그", "详细调试信息"},
+        {"Exit Game", "Quitter le jeu", "Salir del juego", "Spiel beenden", "Esci dal gioco", "Sair do jogo", "Wyjdź z gry", "ゲームを終了", "게임 종료", "退出游戏"},
+        {"Exit Bloodborne and return to desktop.", "Quitter Bloodborne et revenir au bureau.", "Salir de Bloodborne y volver al escritorio.", "Bloodborne beenden und zum Desktop zurückkehren.", "Esci da Bloodborne e torna al desktop.", "Sair de Bloodborne e voltar para a área de trabalho.", "Zamknij Bloodborne i wróć do pulpitu.", "Bloodborneを終了してデスクトップに戻ります。", "Bloodborne을 종료하고 바탕 화면으로 돌아갑니다.", "退出《血源诅咒》并返回桌面。"},
     };
     for (const auto& e : Table) {
         if (std::strcmp(en, e.en) == 0) {
@@ -250,12 +255,19 @@ u32 AddText(const char* english, const char* russian) {
     texts.push_back({Utf16(TranslateForCurrentGameLang(english)), Utf16(russian)});
     return IdBase + u32(texts.size() - 1);
 }
-/// The game's own language decides (its "Screen/Sound" text in Cyrillic: Russian, else English);
-/// the port's menu language until the game has looked that text up.
+/// The game's own language decides (its "New Game" / "Screen/Sound" text in Cyrillic: Russian,
+/// else English); falls back to BB_LANGUAGE=8 or BB_MENU_LANGUAGE=ru before any FMG lookup.
 enum class GameLanguage { Unknown, English, Russian };
 std::atomic<GameLanguage> game_language{GameLanguage::Unknown};
 
 bool RussianTexts() {
+    const GameLanguage gl = game_language.load(std::memory_order_relaxed);
+    if (gl == GameLanguage::Russian || ActiveOrbisLanguage() == 8) {
+        return true;
+    }
+    if (gl == GameLanguage::English) {
+        return false;
+    }
     const char* menu_lang = std::getenv("BB_MENU_LANGUAGE");
     return menu_lang && (menu_lang[0] == 'r' || menu_lang[0] == 'R') &&
            (menu_lang[1] == 'u' || menu_lang[1] == 'U');
@@ -449,8 +461,13 @@ struct Page {
 std::vector<Page> pages;
 
 std::vector<Row> controls_rows;
+u32 exit_game_name = 0;
+u32 exit_game_help = 0;
 
 void DefineTexts() {
+    exit_game_name = AddText("Exit Game", "Выйти из игры");
+    exit_game_help = AddText("Exit Bloodborne and return to desktop.",
+                             "Выйти из Bloodborne на рабочий стол.");
     const u32 off = AddText("Off", "Выкл"), on = AddText("On", "Вкл");
     const std::vector<u32> toggle = {off, on};
     const auto page = [](const char* en, const char* ru, const char* help_en, const char* help_ru,
@@ -2680,8 +2697,10 @@ u64 PS4_SYSV_ABI RowInputHook(u8* row, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, d
 
 using LookupFn = const char16_t* (PS4_SYSV_ABI*)(void*, u32, u32, u32);
 using AddFn = void* (PS4_SYSV_ABI*)(void*, void*, void*, void*);
+using BindCommandListFn = void* (PS4_SYSV_ABI*)(void*, void*, void*);
 LookupFn lookup_original = nullptr;
 AddFn add_original = nullptr;
+BindCommandListFn bind_command_list_original = nullptr;
 std::atomic<const void*> screen_sound_text{nullptr};
 
 const char16_t* PS4_SYSV_ABI LookupHook(void* repository, u32 table, u32 category, u32 id) {
@@ -2773,8 +2792,10 @@ const char16_t* PS4_SYSV_ABI LookupHook(void* repository, u32 table, u32 categor
         std::printf("Game menu: text %#x/%u%s from %#llx\n", category, id, building_page >= 0 ? " (our page)" : "",
                     (unsigned long long)(reinterpret_cast<u64>(__builtin_return_address(0)) - image_base));
     }
-    if (category == TextName && id == ScreenSoundItem && text) {
-        screen_sound_text = text;
+    if (category == TextName && (id == ScreenSoundItem || id == TitleNewGameItem) && text) {
+        if (id == ScreenSoundItem) {
+            screen_sound_text = text;
+        }
         bool cyrillic = false;
         for (const char16_t* c = text; *c; ++c) {
             cyrillic = cyrillic || (*c >= 0x400 && *c < 0x500);
@@ -2812,6 +2833,27 @@ void* PS4_SYSV_ABI AddHook(void* menu, void* pair, void* function, void* out) {
         }
     }
     return result;
+}
+
+void* PS4_SYSV_ABI ExitGameFactory(void* out, void* /*arg*/) {
+    BbSettings::Save();
+    std::printf("Game menu: Exit Game selected by user\n");
+    std::fflush(stdout);
+    std::fflush(stderr);
+    *static_cast<u64*>(out) = 0;
+    SDL_Event quit{};
+    quit.type = SDL_EVENT_QUIT;
+    SDL_PushEvent(&quit);
+    std::_Exit(0);
+    return out;
+}
+
+void* PS4_SYSV_ABI BindCommandListHook(void* out, void* menu, void* cmd_list_mc) {
+    const u64 ret_va = reinterpret_cast<u64>(__builtin_return_address(0)) - image_base;
+    if (ret_va == TitleMenuBindRet && exit_game_name != 0) {
+        AddItem(menu, exit_game_name, exit_game_help, reinterpret_cast<void*>(&ExitGameFactory));
+    }
+    return bind_command_list_original(out, menu, cmd_list_mc);
 }
 
 /// `jmp hook` at the function (via a near thunk); its moved prologue + `jmp` back is the original.
@@ -2921,9 +2963,12 @@ void PatchImage(unsigned char* image, std::uint64_t size) {
                reinterpret_cast<void*>(&OptionsPageNavigateHook),
                reinterpret_cast<void**>(&options_page_navigate_original), cursor) &&
         Detour(image, RowInput, RowInputPrologue, sizeof(RowInputPrologue),
-               reinterpret_cast<void*>(&RowInputHook), reinterpret_cast<void**>(&row_input_original), cursor);
+               reinterpret_cast<void*>(&RowInputHook), reinterpret_cast<void**>(&row_input_original), cursor) &&
+        Detour(image, BindCommandList, AddPageItemPrologue, sizeof(AddPageItemPrologue),
+               reinterpret_cast<void*>(&BindCommandListHook),
+               reinterpret_cast<void**>(&bind_command_list_original), cursor);
     mprotect(stubs, page, PROT_READ | PROT_EXEC);
-    std::printf("Game menu: %s (unified Controls + %zu pages in System)\n",
+    std::printf("Game menu: %s (Title Exit Game + unified Controls + %zu pages in System)\n",
                 ok ? "the port's pages are in" : "hooks failed, off", pages.size());
 }
 
