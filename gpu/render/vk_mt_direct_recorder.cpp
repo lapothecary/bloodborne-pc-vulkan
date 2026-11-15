@@ -897,6 +897,9 @@ struct VkMtDirectRecorder::WorkerCompileScratch {
     }
 };
 
+VkMtDirectRecorder::WorkerSlot::WorkerSlot() = default;
+VkMtDirectRecorder::WorkerSlot::~WorkerSlot() = default;
+
 VkMtDirectRecorder::VkMtDirectRecorder(const Instance& instance_, Scheduler& scheduler_,
                                        Rasterizer& rasterizer_)
     : instance{instance_}, scheduler{scheduler_}, rasterizer{rasterizer_},

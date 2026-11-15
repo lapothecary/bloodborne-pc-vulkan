@@ -325,6 +325,9 @@ private:
     struct WorkerCompileScratch;
 
     struct alignas(64) WorkerSlot {
+        WorkerSlot();
+        ~WorkerSlot();
+
         u32 worker_id{0};
         u32 cur_slice{0};
         std::atomic<bool> compile_busy{false};
@@ -368,7 +371,7 @@ private:
     std::array<std::atomic<u64>, kMaxWorkers> slot_thread_keys{};
     std::array<std::atomic<u8>, kMaxWorkers> slot_is_main_thread{};
     std::array<std::atomic<WorkerSlot*>, kMaxWorkers> worker_ptrs{};
-    std::array<std::unique_ptr<WorkerSlot>, kMaxWorkers> workers_owned{};
+    std::array<std::unique_ptr<WorkerSlot>, kMaxWorkers> workers_owned;
     std::mutex worker_init_mutex;
 
     static inline std::atomic<VkMtDirectRecorder*> active_instance{nullptr};
