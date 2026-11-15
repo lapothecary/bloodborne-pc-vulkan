@@ -68,6 +68,7 @@ int bb_close(int fd);
 ssize_t bb_pread(int fd, void* buffer, size_t size, int64_t offset);
 ssize_t bb_pwrite(int fd, const void* buffer, size_t size, int64_t offset);
 int bb_fsync(int fd);
+int bb_fsync_path(const char* path);
 int bb_ftruncate(int fd, int64_t size);
 int bb_rename(const char* from, const char* to);
 int bb_mkdir(const char* path, int mode);

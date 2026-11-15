@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "bbport_fast_load.h"
 #include "bbport_frame_rate.h"
 #include "bbport_threads.h"
 #include "common/assert.h"
@@ -29,6 +30,7 @@ namespace BbVideoOut {
 namespace {
 
 std::atomic<u32> g_queued_presents{0};
+std::atomic<u32> g_present_in_flight{0};
 
 constexpr s32 ErrorInvalidValue = s32(0x80290001);
 constexpr s32 ErrorInvalidPitch = s32(0x80290004);
@@ -218,6 +220,13 @@ void Display::QueueFlip(Port* port, s32 index, s64 flip_arg, bool at_eop) {
     Vulkan::Frame* frame;
     if (index == -1) {
         frame = presenter->PrepareBlankFrame(false);
+    } else if (BbFastLoad::IsLoadingBurstActive() &&
+               g_present_in_flight.load(std::memory_order_relaxed) > 0) {
+        // Keep the swapchain presenting loading-screen UI at full monitor refresh rate (e.g. 60/85 Hz
+        // VSync / Optimus DXGI), while intermediate 500 Hz state-machine ticks flush draw_scheduler
+        // uploads and advance guest flips immediately without stalling on swapchain frame fences.
+        presenter->PrepareBlankFrame(false);
+        frame = nullptr;
     } else {
         const DisplayBuffer& buffer = port->buffers[index];
         ASSERT_MSG(buffer.group_index >= 0, "flip to an unregistered display buffer");
@@ -324,12 +333,16 @@ u32 QueuedPresentCount() noexcept {
 
 void Display::Flip(const Request& request) {
     std::scoped_lock flip_lock{flip_call_mutex};
-    g_queued_presents.fetch_add(1, std::memory_order_relaxed);
-    RunPresenter([frame = request.frame, hdr = request.port->is_hdr] {
-        g_queued_presents.fetch_sub(1, std::memory_order_relaxed);
-        presenter->SetHDR(hdr);
-        presenter->Present(frame);
-    });
+    if (request.frame != nullptr) {
+        g_queued_presents.fetch_add(1, std::memory_order_relaxed);
+        g_present_in_flight.fetch_add(1, std::memory_order_relaxed);
+        RunPresenter([frame = request.frame, hdr = request.port->is_hdr] {
+            g_queued_presents.fetch_sub(1, std::memory_order_relaxed);
+            presenter->SetHDR(hdr);
+            presenter->Present(frame);
+            g_present_in_flight.fetch_sub(1, std::memory_order_relaxed);
+        });
+    }
     Port* port = request.port;
     Vulkan::FrameCapture::OnFlip(request.index >= 0 ? port->buffers[request.index].address_left
                                                     : 0);

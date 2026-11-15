@@ -319,8 +319,98 @@ static void sync_directory(const char *file) {
     int d=open(dir,O_RDONLY|O_DIRECTORY|O_CLOEXEC);
     if (d>=0) { fsync(d); close(d); }
 }
+static int fast_load_enabled(void) {
+    static int cached=-1;
+    int v=__atomic_load_n(&cached,__ATOMIC_RELAXED);
+    if (v<0) {
+        const char *e=bb_env("BB_FAST_LOAD");
+        v=(!e || !*e || !(e[0]=='0' && e[1]==0)) ? 1 : 0;
+        __atomic_store_n(&cached,v,__ATOMIC_RELAXED);
+    }
+    return v;
+}
+#define ASYNC_SYNC_CAP 64
+typedef struct { int fd; char *path; } AsyncSyncItem;
+static AsyncSyncItem async_sync_q[ASYNC_SYNC_CAP];
+static size_t async_sync_head, async_sync_count;
+static int async_sync_started, async_sync_busy;
+static pthread_mutex_t async_sync_lock=PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t async_sync_cv=PTHREAD_COND_INITIALIZER;
+static pthread_cond_t async_sync_done_cv=PTHREAD_COND_INITIALIZER;
+static void *async_sync_worker(void *arg) {
+    (void)arg;
+    for (;;) {
+        pthread_mutex_lock(&async_sync_lock);
+        while (!async_sync_count) {
+            async_sync_busy=0;
+            pthread_cond_broadcast(&async_sync_done_cv);
+            pthread_cond_wait(&async_sync_cv,&async_sync_lock);
+        }
+        AsyncSyncItem item=async_sync_q[async_sync_head];
+        async_sync_head=(async_sync_head+1)%ASYNC_SYNC_CAP;
+        --async_sync_count;
+        async_sync_busy=1;
+        pthread_mutex_unlock(&async_sync_lock);
+        if (item.fd>=0) { fsync(item.fd); close(item.fd); }
+#ifdef _WIN32
+        else if (item.path) bb_fsync_path(item.path);
+#endif
+        if (item.path) { sync_directory(item.path); free(item.path); }
+    }
+    return NULL;
+}
+void runtime_file_drain_sync(void) {
+    pthread_mutex_lock(&async_sync_lock);
+    while (async_sync_count || async_sync_busy)
+        pthread_cond_wait(&async_sync_done_cv,&async_sync_lock);
+    pthread_mutex_unlock(&async_sync_lock);
+}
+static void drain_async_sync(void) { runtime_file_drain_sync(); }
+void runtime_file_async_sync(int sync_fd, const char *path) {
+    char *copy=path ? strdup(path) : NULL;
+    pthread_mutex_lock(&async_sync_lock);
+    if (!async_sync_started) {
+        pthread_t th;
+        if (!pthread_create(&th,NULL,async_sync_worker,NULL)) {
+            pthread_detach(th);
+            async_sync_started=1;
+            atexit(drain_async_sync);
+        }
+    }
+    if (!async_sync_started || async_sync_count==ASYNC_SYNC_CAP) {
+        pthread_mutex_unlock(&async_sync_lock);
+        if (sync_fd>=0) { fsync(sync_fd); close(sync_fd); }
+#ifdef _WIN32
+        else if (copy) bb_fsync_path(copy);
+#endif
+        if (copy) { sync_directory(copy); free(copy); }
+        return;
+    }
+    size_t tail=(async_sync_head+async_sync_count)%ASYNC_SYNC_CAP;
+    async_sync_q[tail]=(AsyncSyncItem){sync_fd,copy};
+    ++async_sync_count;
+    pthread_cond_signal(&async_sync_cv);
+    pthread_mutex_unlock(&async_sync_lock);
+}
 static int commit_file(const File *f) {
     if (!f->dirty) { close(f->host); unlink(f->temp); return 0; } /* opened for writing, not written */
+    if (fast_load_enabled()) {
+#ifndef _WIN32
+        int sfd=dup(f->host);
+#else
+        int sfd=-1;
+#endif
+        int e=close(f->host) ? errno : 0;
+        if (!e && rename(f->temp,f->commit)) e=errno;
+        if (e) {
+            if (sfd>=0) close(sfd);
+            fprintf(stderr,"Runtime: save file %s not replaced (%s); the old one is kept\n",f->path,strerror(e));
+            unlink(f->temp);
+            return -e;
+        }
+        runtime_file_async_sync(sfd,f->commit);
+        return 0;
+    }
     int e=fsync(f->host) ? errno : 0;
     close(f->host);
     if (!e && rename(f->temp,f->commit)) e=errno;
@@ -886,7 +976,15 @@ static int64_t do_truncate(const char *guest,int64_t length) {
     if (save_trace() && save_path(guest)) printf("Save trace: truncate(%s, %lld)\n",guest,(long long)length);
     return truncate(path,length) ? -errno : 0;
 }
-static int64_t do_fsync(int fd) { int h=host_fd(fd); if (h<0) return -EBADF; return fsync(h) ? -errno : 0; }
+static int64_t do_fsync(int fd) {
+    if (fast_load_enabled() && fd>=3) {
+        File *f=get(fd);
+        if (f && f->commit) return 0; /* staged .bbtmp save file: synced asynchronously on close */
+    }
+    int h=host_fd(fd);
+    if (h<0) return -EBADF;
+    return fsync(h) ? -errno : 0;
+}
 static int64_t do_access(const char *guest,int mode) {
     char path[1024];
     int e=translate(guest,path,sizeof(path));

@@ -1,4 +1,5 @@
 #include "bbport_write_log.h"
+#include "bbport_fast_load.h"
 #include "bbport_frame_rate.h"
 #include "bbport_game_menu.h"
 #include "bbport_gnm_hooks.h"
@@ -495,6 +496,7 @@ extern "C" void bbgpu_patch_image(unsigned char* image, uint64_t size) {
     BbGameMenu::PatchImage(image, size);
     BbFrameRate::PatchImage(image, size);
     BbGoldenEngine::PatchImage(image, size);
+    BbFastLoad::PatchImage(image, size);
 }
 
 extern "C" unsigned bbgpu_symbol_count(void) {

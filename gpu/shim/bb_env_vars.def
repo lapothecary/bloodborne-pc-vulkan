@@ -133,6 +133,7 @@ BB_ENV(BB_DIRECT_MEMORY_ACCESS, TUNING, "=1: shadPS4's direct memory access mode
 BB_ENV(BB_DIRECT_SEGMENT, TUNING, "=0: the presenter waits for the recording threads instead of taking its own command segment")
 BB_ENV(BB_DISABLE_HTTPS, TUNING, "=1: the game's HTTPS requests go out as plain HTTP (online)")
 BB_ENV(BB_DRAW_PIPE, TUNING, "=0 / N: the draw pipeline off, or its depth")
+BB_ENV(BB_FAST_LOAD, TUNING, "=0 / 1: host SIMD zlib .dcx decompression, 500 Hz loading-screen pacer, P-core loader affinity, and async save fsync (default 1)")
 BB_ENV(BB_FAST_WRITER_FAULTS, TUNING, "=1: fast path for guest write faults (off: a device loss on a GTX 1050)")
 BB_ENV(BB_FAULT_WINDOW, TUNING, "=KiB: window unprotected around a guest write fault (default 256)")
 BB_ENV(BB_FFX_OWN_SHADERS, TUNING, "=0: FSR frame generation with the packaged shaders instead of the port's own")

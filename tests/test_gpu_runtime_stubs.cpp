@@ -26,6 +26,8 @@ int runtime_memory_write_backing(uintptr_t, const void*, uint64_t) { std::abort(
 void runtime_memory_read_backing(uintptr_t, void*, uint64_t) { std::abort(); }
 const uint64_t* runtime_memory_generation() { static const uint64_t generation = 0; return &generation; }
 void runtime_memory_note_write(uintptr_t, uint64_t) { std::abort(); }
+void runtime_memory_prepare_cpu_write(uintptr_t, uint64_t) {}
+void runtime_memory_note_cpu_write(uintptr_t, uint64_t) {}
 void runtime_memory_set_note_write_hook(void (*)(uintptr_t, uint64_t)) {}
 void runtime_memory_set_cpu_write_hook(void (*)(uintptr_t, uint64_t)) {}
 void runtime_memory_set_write_watch(uintptr_t, uint64_t, int) { std::abort(); }
@@ -48,5 +50,6 @@ unsigned runtime_pad_prompt_generation() { return 0; }
 int runtime_pad_mouse_look() { return 0; }
 int runtime_pad_prompt(const char*, int, char*, int) { return 0; }
 int runtime_file_host_path(const char*, char*, size_t) { return -1; }
+void runtime_file_drain_sync() {}
 void runtime_re_watch(uint64_t) {}
 }

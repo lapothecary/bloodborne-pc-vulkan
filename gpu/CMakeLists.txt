@@ -82,6 +82,7 @@ if(NOT miniz_FOUND)
     endif()
 endif()
 find_package(Zydis REQUIRED)
+find_package(ZLIB REQUIRED)
 find_program(GLSLANG_COMPILER NAMES glslang glslangValidator REQUIRED)
 
 set(SIRIT_USE_SYSTEM_SPIRV_HEADERS OFF CACHE BOOL "" FORCE)
@@ -354,7 +355,7 @@ target_link_libraries(bbgpu PRIVATE ffx-vulkan::portable ffx-vulkan::fsr4-v07-vu
     PkgConfig::SPIRV_TOOLS
     "${BB_GX_ENGINE_ARCHIVE}")
 target_link_libraries(bbgpu PUBLIC Vulkan::Headers fmt::fmt Boost::headers magic_enum::magic_enum
-    tsl::robin_map GPUOpen::VulkanMemoryAllocator PkgConfig::XXHASH PkgConfig::SDL3 PkgConfig::FFMPEG miniz::miniz Zydis::Zydis sirit)
+    tsl::robin_map GPUOpen::VulkanMemoryAllocator PkgConfig::XXHASH PkgConfig::SDL3 PkgConfig::FFMPEG miniz::miniz ZLIB::ZLIB Zydis::Zydis sirit)
 if (NOT WIN32)
     target_link_libraries(bbgpu PUBLIC PkgConfig::X11)
 endif()

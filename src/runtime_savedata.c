@@ -125,6 +125,20 @@ static int write_atomic(const char *path, const void *data, size_t size) {
     char temp[760]; snprintf(temp,sizeof(temp),"%s.bbtmp",path);
     FILE *f=fopen(temp,"wb");
     if (!f) return -1;
+    const char *fl=bb_env("BB_FAST_LOAD");
+    const int fast=(!fl || !*fl || !(fl[0]=='0' && fl[1]==0));
+    if (fast) {
+        int ok=fwrite(data,1,size,f)==size && !fflush(f);
+#ifndef _WIN32
+        int sfd=ok ? dup(fileno(f)) : -1;
+#else
+        int sfd=-1;
+#endif
+        ok=!fclose(f) && ok;
+        if (!ok || rename(temp,path)) { if (sfd>=0) close(sfd); unlink(temp); return -1; }
+        runtime_file_async_sync(sfd,path);
+        return 0;
+    }
     int ok=fwrite(data,1,size,f)==size && !fflush(f) && !fsync(fileno(f));
     ok=!fclose(f) && ok;
     if (!ok || rename(temp,path)) { unlink(temp); return -1; }

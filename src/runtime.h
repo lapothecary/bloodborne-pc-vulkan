@@ -123,6 +123,8 @@ uintptr_t runtime_pad_resolve(const char *name);
 void runtime_pad_report(void);
 uintptr_t runtime_rtc_resolve(const char *name);
 const char *runtime_file_user_dir(void);
+void runtime_file_async_sync(int sync_fd, const char *path);
+void runtime_file_drain_sync(void);
 /* A guest path ("/app0/...") as the host file it maps to: 0, or an errno. */
 int runtime_file_host_path(const char *guest,char *out,size_t size);
 /* runtime_remote.c: the game's files fetched from a phone over adb on first open (BB_APP0_ADB). */

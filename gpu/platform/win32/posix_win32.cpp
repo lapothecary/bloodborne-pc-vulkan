@@ -746,6 +746,10 @@ void ApplyWin32ThreadTopologyByName(const char* name) {
     const auto starts_with = [](const char* s, const char* p) {
         return std::strncmp(s, p, std::strlen(p)) == 0;
     };
+    static const bool fast_load_res = [] {
+        const char* env = bb_env("BB_FAST_LOAD");
+        return !env || !*env || !(env[0] == '0' && env[1] == '\0');
+    }();
     DWORD_PTR mask = 0;
     bool boost = false;
     if (std::strcmp(name, "main") == 0) {
@@ -763,7 +767,8 @@ void ApplyWin32ThreadTopologyByName(const char* name) {
                starts_with(name, "CS Filtering") ||
                starts_with(name, "MorphemeWorker") ||
                starts_with(name, "EzTaskRunner") ||
-               starts_with(name, "FD4TaskRunner")) {
+               starts_with(name, "FD4TaskRunner") ||
+               (fast_load_res && starts_with(name, "Core.Res."))) {
         mask = topo.game_workers;
         if (starts_with(name, "HavokWorker") || starts_with(name, "GXRenderThread")) {
             boost = true;

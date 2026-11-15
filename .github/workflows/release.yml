@@ -51,6 +51,10 @@ jobs:
             - **Event-Driven `1000+ Hz` Mouse Input & Lock-Free Overlay Fast-Path:**
               - **Zero-Quantum Window Event Loop:** Replaced the fixed `SDL_Delay(2)` poll sleep on `bb:window` with `SDL_WaitEventTimeout` (`4 ms` housekeeping interval), removing `2` vs `3` mouse-batch beat aliasing per frame at high refresh rates while preserving native `ChrCam` radian camera injection (`InstallLookHook`).
               - **Eliminated `imgui_mutex` Contention on Raw Mouse Motion:** Added lock-free fast-exits in `BbOverlay::HandleEvent` and `BbOverlay::UpdateTextInput` when the overlay menu is closed, preventing `1000+ Hz` `SDL_EVENT_MOUSE_MOTION` events on `bb:window` from blocking on `imgui_mutex` while `bb:Present` renders the ImGui HUD.
+            - **`4–5×` Faster Location, Warp & Respawn Loading (`BB_FAST_LOAD=1`):**
+              - **Host SIMD `zlib` Decompression Bridge (`11/11` Guest Detours, `0x03a77c0..0x03a9a95` & `0x2067850..0x2069815`):** Redirected both statically linked PS4 scalar `zlib` copies (`1.2.7` for Scaleform `.gfx` / PNG / `DLZlibReader` and `1.2.3` for all `.dcx` `DCP\0DFLT` & `DCP\0EDGE` archives) to host SIMD `zlib` (`zlib-ng` / `zlib1`) through a `0x70`-byte LP64 `GuestZStream` bridge compatible with all 11 compiler-inlined `inflateEnd` sites (`+0x40` window slot), and upgraded `DcxDfltDecompressor`'s streaming read chunk from `16 KiB` to `64 KiB` (`0x262603d`).
+              - **`500 Hz` Non-3D Loading-Screen Pacer & `Core.Res.*` Fast-Core Routing:** Temporarily lifts the guest frame-pacer cap to `500 Hz` (`2.0 ms` ticks) and bypasses redundant swapchain fence waits during non-3D loading bursts (`<= 160` draws + active `.dcx` decompression), while routing `Core.Res.PostProcessor` decompression workers onto fast `game_workers` cores — advancing FromSoftware's frame-coupled `FD4ResCap` loading state machine up to `4–5×` faster (`~11–12 s -> ~2.0–2.5 s` respawn reload) and locking back onto the exact user FPS cap the instant 3D rendering resumes.
+              - **Non-Blocking Atomic Save Flushes (`SPRJ0005`):** Moved post-rename `fsync` / `FlushFileBuffers` durability syncs onto a dedicated background worker (drained synchronously on `Exit Game` and process exit), removing `8–10` synchronous disk-flush stalls per respawn or lamp warp.
             - **Title Screen `"Exit Game"` Option:** Added a native 6th row (**`Exit Game`** / **`Выйти из игры`**, localized across all supported game languages) at the bottom of the main Title Menu (`title*.gfx` in-memory `Item_5_0` slot + `BindCommandList` hook, with full mouse hover/click, keyboard, and gamepad navigation) to save settings and exit cleanly to desktop.
             - **Accurate Thread/Pacer Telemetry:** Measured `MOMainThread` active CPU execution directly via `CLOCK_THREAD_CPUTIME_ID` / `QueryThreadCycleTime` outside pacer sleep/spin, separated `ThreadSync` barrier waits from `FpsCapSleep`, and added 5-second `Pacing` (`min/p50/p95/p99/max`, `>1.25x`/`>1.5x`, `PresPace`, `SimDt`) and `Input` cadence diagnostics to `[HUD Telemetry]`.
             - **Previously in `v1.1.4`:** DirectVk `Stage A`/`Stage B` command stream overhaul (`decommission_pm4`), `SceneOcclusionCuller` 2.0 (`27–41%` G-Buffer culling at `0.00 ms` `Stage A` cost), and `123` native vectorized GLSL 460 shaders (`opt35`).
@@ -93,6 +97,7 @@ jobs:
             mingw-w64-clang-x86_64-boost
             mingw-w64-clang-x86_64-robin-map
             mingw-w64-clang-x86_64-xxhash
+            mingw-w64-clang-x86_64-zlib
             mingw-w64-clang-x86_64-zydis
             mingw-w64-clang-x86_64-python
 

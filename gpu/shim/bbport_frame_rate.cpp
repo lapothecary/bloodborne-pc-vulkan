@@ -16,6 +16,7 @@
 // in 30 FPS frames. Durations the game converts from 30 FPS frames into seconds stay as they are:
 // what counts them down uses the real time.
 #include "common/types.h"
+#include "bbport_fast_load.h"
 #include "bbport_frame_rate.h"
 #include "bbport_guest_code.h"
 #include "bbport_toggles.h"
@@ -217,11 +218,28 @@ u64 PS4_SYSV_ABI PacerWait(u64 pacer, std::uint32_t reset_flag) {
         }
     }
 
+    static u64 prev_pacer_draws = 0;
+    static bool was_loading_burst = false;
+    const u64 cur_draws = BbStats::draws.load(std::memory_order_relaxed);
+    const u64 frame_draws = (cur_draws >= prev_pacer_draws) ? (cur_draws - prev_pacer_draws) : 0ull;
+    prev_pacer_draws = cur_draws;
+    const bool loading_burst = BbFastLoad::UpdateFrameAndCheckBurst(entry_ns, frame_draws);
+    if (was_loading_burst && !loading_burst) {
+        pacer_epoch.fetch_add(1, std::memory_order_relaxed);
+    }
+    was_loading_burst = loading_burst;
+
     const float target_s = live ? live->shortest : 0.0f;
-    const u64 period_ns =
+    u64 period_ns =
         (target_s > 0.0f && std::isfinite(target_s))
             ? static_cast<u64>(std::llround(double(target_s) * 1'000'000'000.0))
             : 0ull;
+    if (loading_burst) {
+        // Advance the game's resource / Param / ChrAsm state machine at 500 Hz (2.0 ms/step)
+        // during active .dcx loading screens instead of sleeping 11.7..16.6 ms per step.
+        constexpr u64 kFastLoadPeriodNs = 2'000'000ull;
+        period_ns = (period_ns == 0ull) ? kFastLoadPeriodNs : std::min<u64>(period_ns, kFastLoadPeriodNs);
+    }
     const u8 reset_273 = *reinterpret_cast<const u8*>(pacer + 0x273);
     const u64 epoch = pacer_epoch.load(std::memory_order_relaxed);
     bool did_wait = false;

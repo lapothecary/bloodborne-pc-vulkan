@@ -18,6 +18,8 @@
 #include <share.h>
 #include <sys/stat.h>
 
+#include "bb_env.h"
+
 namespace {
 
 // The C declarations (bbport_posix_c.h is C only).
@@ -280,14 +282,30 @@ int bb_fsync(int fd) {
     return FlushFileBuffers(reinterpret_cast<HANDLE>(_get_osfhandle(fd))) ? 0 : (errno = EIO, -1);
 }
 
+int bb_fsync_path(const char* path) {
+    if (!path || !*path) return 0;
+    const HANDLE h = CreateFileW(Wide(path).c_str(), GENERIC_WRITE,
+                                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                 nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    FlushFileBuffers(h);
+    CloseHandle(h);
+    return 0;
+}
+
 int bb_ftruncate(int fd, int64_t size) {
     const errno_t error = _chsize_s(fd, size);
     return error ? (errno = error, -1) : 0;
 }
 
 int bb_rename(const char* from, const char* to) {
-    if (!MoveFileExW(Wide(from).c_str(), Wide(to).c_str(),
-                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+    static const bool fast_load = [] {
+        const char* env = bb_env("BB_FAST_LOAD");
+        return !env || !*env || !(env[0] == '0' && env[1] == '\0');
+    }();
+    const DWORD flags = fast_load ? MOVEFILE_REPLACE_EXISTING
+                                  : (MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+    if (!MoveFileExW(Wide(from).c_str(), Wide(to).c_str(), flags)) {
         SetErrnoFromWin32();
         return -1;
     }

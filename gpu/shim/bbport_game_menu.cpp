@@ -27,6 +27,8 @@
 #include <SDL3/SDL.h>
 #include <fmt/format.h>
 
+extern "C" void runtime_file_drain_sync(void);
+
 namespace BbGameMenu {
 namespace {
 
@@ -2837,6 +2839,7 @@ void* PS4_SYSV_ABI AddHook(void* menu, void* pair, void* function, void* out) {
 
 void* PS4_SYSV_ABI ExitGameFactory(void* out, void* /*arg*/) {
     BbSettings::Save();
+    runtime_file_drain_sync();
     std::printf("Game menu: Exit Game selected by user\n");
     std::fflush(stdout);
     std::fflush(stderr);

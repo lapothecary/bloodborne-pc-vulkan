@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include "bb_env.h"
+
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
@@ -858,6 +860,11 @@ inline void ApplyProcessThreadTopology() {
         const int draw_rec_tid = g_draw_rec_tid.load(std::memory_order_relaxed);
         const int vk_rec_tid = g_vk_recorder_tid.load(std::memory_order_relaxed);
 
+        static const bool fast_load_res = [] {
+            const char* env = bb_env("BB_FAST_LOAD");
+            return !env || !*env || !(env[0] == '0' && env[1] == '\0');
+        }();
+
         if (is_main_tid) {
             target_mask = &topo.game_main;
             boost_prio = true;
@@ -879,7 +886,8 @@ inline void ApplyProcessThreadTopology() {
                    starts_with(comm, "FD4JobWorker") ||
                    starts_with(comm, "GXRenderThread") ||
                    starts_with(comm, "Battle Worker") ||
-                   starts_with(comm, "CS Filtering")) {
+                   starts_with(comm, "CS Filtering") ||
+                   (fast_load_res && starts_with(comm, "Core.Res."))) {
             target_mask = &topo.game_workers;
             if (starts_with(comm, "HavokWorker") || starts_with(comm, "GXRenderThread")) {
                 boost_prio = true;

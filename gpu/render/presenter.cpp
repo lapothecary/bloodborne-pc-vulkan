@@ -10,6 +10,7 @@
 
 #include <vk_mem_alloc.h>
 
+#include "bbport_fast_load.h"
 #include "bbport_frame_rate.h"
 #include "bbport_game_menu.h"
 #include "bbport_overlay.h"
@@ -666,7 +667,9 @@ bool Presenter::PresentImage(Frame* frame, vk::Image source, bool last) {
     const bool blank = frame == &blank_frame;
     if (!blank && last && !source) {
         const u64 period_ns =
-            BbFrameRate::PresentPacingEnabled() ? BbFrameRate::TargetPeriodNs() : 0ull;
+            (BbFrameRate::PresentPacingEnabled() && !BbFastLoad::IsLoadingBurstActive())
+                ? BbFrameRate::TargetPeriodNs()
+                : 0ull;
         const auto pmode = swapchain.GetPresentMode();
         if (period_ns > 0 && pmode != vk::PresentModeKHR::eFifo &&
             pmode != vk::PresentModeKHR::eFifoRelaxed) {
