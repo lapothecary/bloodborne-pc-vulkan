@@ -26,6 +26,7 @@
 #include "core/memory.h"
 #include "cp/command_processor.h"
 #include "cp/cp_packets.h"
+#include "render/direct_shaders.h"
 #include "render/gcn_to_vk.h"
 #include "render/pipeline.h"
 #include "render/rasterizer.h"
@@ -2007,17 +2008,15 @@ void MtNotePsoBail(PipelineCache::MtPsoFailKind fail_kind, bool unsafe_pso,
 }
 
 [[nodiscard]] constexpr bool IsStageACoalescerShader(u64 vs_hash, u64 ps_hash) noexcept {
-    // Keep Stage A specialized batchers (`LightTileBatcher`, `VsmShadowMemo` blur, `VfxUiBatcher`)
-    // on Stage A where draw coalescing / shadow-face elision reduces GPU draw overhead.
+    // Keep Stage A specialized batchers (`LightTileBatcher` and `VsmShadowMemo` blur) on Stage A
+    // where tile coalescing / shadow-face elision eliminates whole GPU passes. Scaleform UI and
+    // non-tessellated `GXFfx` quad command lists (`0x24042a9b`, `0xe94b5b06`, `0xa400228b`,
+    // `0x41ae600f`) compile directly on `GXWorker:1..5` (hardware tessellation `LsHs` lists are
+    // already filtered to Stage A by `stage_enable.raw != Vs`).
     if (vs_hash == 0x000000008747a367ULL) { // LightTileBatcher
         return true;
     }
     if (vs_hash == 0x000000000b0acf50ULL && ps_hash == 0x000000000f61fd27ULL) { // VSM blur
-        return true;
-    }
-    if (vs_hash == 0x0000000024042a9bULL || vs_hash == 0x00000000e94b5b06ULL ||
-        vs_hash == 0x00000000a400228bULL || vs_hash == 0x000000004cd21a0fULL ||
-        vs_hash == 0x0000000041ae600fULL) { // VfxUiBatcher (Scaleform + GXFfx quad/tess)
         return true;
     }
     return false;
@@ -2594,6 +2593,39 @@ struct MtDecodedPkt {
     }
 }
 
+[[nodiscard]] bool IsAttachmentlessDummyIndirectDrawPrePso(const Gcn::Regs& regs) noexcept {
+    // Hoisted pre-PSO check mirroring `Rasterizer::DrawIndirect` (`rasterizer.cpp:3173`): when
+    // `ps_program == 0` (so `fs_info == nullptr` and `key.mrt_mask == 0`), depth/stencil are
+    // disabled/unbound, and `vs_program` is the attachmentless dummy indirect VS `0x89cda9e4`
+    // (`!uses_dma`, no written buffers/images), skip `SelectGraphicsPipelineMt` altogether so
+    // unspecialized dummy user-data never triggers `SpecMiss` (`bail_pso: spec`).
+    if (regs.stage_enable.raw != u32(Gcn::ShaderStageEnable::VgtStages::Vs) ||
+        regs.vgt_strmout_config.raw != 0u) {
+        return false;
+    }
+    if (regs.stage_enable.IsStageEnabled(static_cast<u32>(Shader::HwStage::Fragment)) &&
+        regs.ps_program.Address<VAddr>() != 0ULL) {
+        return false;
+    }
+    const bool has_ds =
+        (regs.depth_control.depth_enable && regs.depth_buffer.DepthValid()) ||
+        (regs.depth_control.stencil_enable && regs.depth_buffer.StencilValid());
+    if (has_ds) {
+        return false;
+    }
+    const VAddr vs_base = regs.vs_program.Address<VAddr>();
+    if (vs_base == 0ULL) {
+        return false;
+    }
+    DirectShaders::Snapshot direct_snap;
+    if (DirectShaders::TryLookup(vs_base, direct_snap, /*is_worker=*/true) &&
+        direct_snap.cpu_immutable != 0) {
+        return direct_snap.shader_hash == 0x89cda9e4ull;
+    }
+    const auto* bin = Gcn::DirectBinaryInfo(reinterpret_cast<const u32*>(vs_base));
+    return bin && bin->shader_hash == 0x89cda9e4ull;
+}
+
 [[nodiscard]] bool IsAttachmentlessDummyIndirectDraw(const Gcn::Regs& regs,
                                                      const GraphicsPipeline* pso,
                                                      const Shader::Info* vs_st,
@@ -2872,6 +2904,9 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
                     (dp.is_indirect && force_indirect_guard && IndirectGuard::DrawEnabled())) {
                     MtNoteBail(MtBailReason::Pkt, cur_guest_frame);
                     return false;
+                }
+                if (dp.is_indirect && IsAttachmentlessDummyIndirectDrawPrePso(sregs)) {
+                    break;
                 }
                 PipelineCache::MtPsoFailKind pso_fail = PipelineCache::MtPsoFailKind::None;
                 const GraphicsPipeline* pso =
@@ -3696,6 +3731,11 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
                 const auto& cur_ts = cur_plan.target_summary;
                 const u32 num_instances = rregs.num_instances.NumInstances();
                 if (dp.is_indirect || (rregs.num_indices != 0u && num_instances != 0u)) {
+                    if (dp.is_indirect && IsAttachmentlessDummyIndirectDrawPrePso(rregs)) {
+                        cur += dp.pkt_words;
+                        rem -= dp.pkt_words;
+                        continue;
+                    }
                     PipelineCache::MtPsoFailKind p2_fail = PipelineCache::MtPsoFailKind::None;
                     const GraphicsPipeline* pso =
                         rasterizer.GetPipelineCache().SelectGraphicsPipelineMt(

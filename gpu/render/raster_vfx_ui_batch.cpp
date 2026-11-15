@@ -562,8 +562,32 @@ void VfxUiBatcher::RecomputeLargeStagingBounds() noexcept {
     large_active_count = active;
 }
 
+void VfxUiBatcher::WipeStagingShadow() noexcept {
+    ++coarse_wipe_bias;
+    if (large_active_count != 0u) {
+        large_staging.fill(CpuStagingSlot{});
+        large_min_va = ~VAddr{0};
+        large_max_va = 0;
+        large_active_count = 0;
+    }
+}
+
+void VfxUiBatcher::WakeStagingShadow(u64 cur_frame) noexcept {
+    if (!shadow_awake || cur_frame > last_shadow_active_frame + kShadowSleepFrames) {
+        WipeStagingShadow();
+        shadow_awake = true;
+    }
+    last_shadow_active_frame = cur_frame;
+}
+
 void VfxUiBatcher::NoteStageACpuCopyBatch(const u32* raw_regions, u32 count) noexcept {
-    if (!raw_regions || count == 0u || count > 32u || !Enabled()) {
+    if (!shadow_awake || !raw_regions || count == 0u || count > 32u || !Enabled()) [[likely]] {
+        return;
+    }
+    const u64 cur_frame = BbStats::frame_number.load(std::memory_order_relaxed);
+    if (cur_frame > last_shadow_active_frame + kShadowSleepFrames) {
+        shadow_awake = false;
+        WipeStagingShadow();
         return;
     }
     for (u32 i = 0; i < count; ++i) {
@@ -620,10 +644,15 @@ void VfxUiBatcher::NoteStageACpuCopyBatch(const u32* raw_regions, u32 count) noe
 }
 
 void VfxUiBatcher::InvalidateCpuShadow(VAddr addr, u64 size) noexcept {
-    if (!addr || size == 0u) {
+    if (!shadow_awake || !addr || size == 0u) [[likely]] {
         return;
     }
-    VideoCore::DirectBuffers::ClearCpuImmutableRange(addr, size);
+    const u64 cur_frame = BbStats::frame_number.load(std::memory_order_relaxed);
+    if (cur_frame > last_shadow_active_frame + kShadowSleepFrames) {
+        shadow_awake = false;
+        WipeStagingShadow();
+        return;
+    }
     const VAddr end = (size > (~0ULL - addr)) ? ~0ULL : (addr + size);
     const u64 span = end - addr;
 
@@ -685,6 +714,32 @@ const u8* VfxUiBatcher::ResolveCpuReadableRange(Rasterizer& rasterizer, VAddr ad
         VideoCore::DirectBuffers::IsTransientAuxCpuRing(addr, byte_size)) {
         return reinterpret_cast<const u8*>(addr);
     }
+    if (byte_size <= LightTileBatcher::kMaxShadowBytes && rasterizer.light_tile_batcher) {
+        if (const u8* sh =
+                rasterizer.light_tile_batcher->LookupCpuShadow(addr, static_cast<u32>(byte_size))) {
+            return sh;
+        }
+    }
+    if (VideoCore::DirectBuffers::IsCpuReadableImmutableRange(addr, byte_size)) {
+        return reinterpret_cast<const u8*>(addr);
+    }
+    if (!VideoCore::DirectBuffers::OverlapsNativeOwnedRange(addr, byte_size)) {
+        if (!rasterizer.PendingWriteOverlaps(addr, byte_size) &&
+            IsReadableCpuSourceRange(addr, byte_size)) {
+            return reinterpret_cast<const u8*>(addr);
+        }
+        return nullptr;
+    }
+
+    // Dynamic native-owned `GXGnmBuffer`: consult Stage-A `CopyBufferBatch` staging shadow (or
+    // wake the shadow cleanly if it was asleep so subsequent draws have fresh staging).
+    const u64 cur_frame = BbStats::frame_number.load(std::memory_order_relaxed);
+    if (!shadow_awake || cur_frame > last_shadow_active_frame + kShadowSleepFrames) {
+        WakeStagingShadow(cur_frame);
+        return nullptr;
+    }
+    last_shadow_active_frame = cur_frame;
+
     u32 best_use = 0u;
     const u8* best_ptr = nullptr;
     if (byte_size <= kSmallStagingMaxBytes) {
@@ -735,24 +790,7 @@ const u8* VfxUiBatcher::ResolveCpuReadableRange(Rasterizer& rasterizer, VAddr ad
             }
         }
     }
-    if (best_ptr) {
-        return best_ptr;
-    }
-    if (byte_size <= LightTileBatcher::kMaxShadowBytes && rasterizer.light_tile_batcher) {
-        if (const u8* sh =
-                rasterizer.light_tile_batcher->LookupCpuShadow(addr, static_cast<u32>(byte_size))) {
-            return sh;
-        }
-    }
-    if (VideoCore::DirectBuffers::IsCpuReadableImmutableRange(addr, byte_size)) {
-        return reinterpret_cast<const u8*>(addr);
-    }
-    if (!VideoCore::DirectBuffers::OverlapsNativeOwnedRange(addr, byte_size) &&
-        !rasterizer.PendingWriteOverlaps(addr, byte_size) &&
-        IsReadableCpuSourceRange(addr, byte_size)) {
-        return reinterpret_cast<const u8*>(addr);
-    }
-    return nullptr;
+    return best_ptr;
 }
 
 bool VfxUiBatcher::TryBatchDraw(Rasterizer& rasterizer, const GraphicsPipeline* pipeline,
@@ -938,6 +976,9 @@ bool VfxUiBatcher::TryBatchDraw(Rasterizer& rasterizer, const GraphicsPipeline* 
             Flush(rasterizer);
         }
         return false;
+    }
+    if (cand_mode == Mode::FfxTintBaked) {
+        WakeStagingShadow(BbStats::frame_number.load(std::memory_order_relaxed));
     }
 
     StageBChunks raw_chunks{};

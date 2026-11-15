@@ -137,6 +137,7 @@ struct Image {
         u32 vo_surface : 1;
     } usage{};
     bool scene_proxy = false; ///< SceneTargets holds a reduced-size proxy of it
+    bool immutable_mips_zeroed = false; ///< Multi-mip DirectImmutable VkImage tail mips zero-initialized
     bool prompt_icon_checked = false; ///< IconOf already evaluated since last CpuDirty/GpuDirty/GPU copy
     u8 prompt_icon = 0;       ///< one of the game's key guide icons (BbPrompts::IconOf + 1)
     u8 prompt_atlas = 0;      ///< one of the HUD's icon atlases (BbPrompts::AtlasOf + 1)

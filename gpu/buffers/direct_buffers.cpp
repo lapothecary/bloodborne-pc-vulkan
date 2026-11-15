@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <cstring>
 #include <mutex>
 #include <span>
@@ -184,6 +185,14 @@ std::array<std::atomic<u64>, kNativeOwnedWords> g_native_owned_4b{};
 // (`has_initial_data != 0` and never GPU-written/retired), allowing Stage-A VfxUiBatcher to read
 // static quad index/vertex buffers directly from guest RAM in 2 ns without touching Stage-B locks.
 std::array<std::atomic<u64>, kNativeOwnedWords> g_cpu_immutable_4b{};
+// Phase 4.6: Two-level L2 summary filter over `g_cpu_immutable_4b` (32 KiB BSS, +0 B static TLS):
+// 1 bit = 64 KiB (`256` words of `g_cpu_immutable_4b`), 1 u64 word = 4 MiB of guest VA space.
+constexpr u32 kCpuImmutableL2BlockWordsShift = 8u; // 256 x 256 B words = 64 KiB per L2 bit
+constexpr u64 kCpuImmutableL2BlockWords = 1ULL << kCpuImmutableL2BlockWordsShift;
+constexpr size_t kCpuImmutableL2Words =
+    kNativeOwnedWords >> (kCpuImmutableL2BlockWordsShift + 6u); // 4,096 u64 words (16 GiB)
+std::array<std::atomic<u64>, kCpuImmutableL2Words> g_cpu_immutable_l2_64k{};
+std::mutex g_cpu_immutable_l2_mutex;
 
 // N1.2 / N1.2c: 262,144-slot (32,768 sets x 8 ways + 4-set linear probe = 32 candidate ways per
 // address, 4 MiB BSS) Murmur3-avalanched lock-free ExactBufferTable keyed by exact
@@ -225,6 +234,11 @@ void SetActiveCaches(BufferCache* buf_cache, TextureCache* tex_cache) noexcept {
             }
         }
         for (auto& word : g_native_owned_4b) {
+            if (word.load(std::memory_order_relaxed) != 0ULL) {
+                word.store(0ULL, std::memory_order_relaxed);
+            }
+        }
+        for (auto& word : g_cpu_immutable_l2_64k) {
             if (word.load(std::memory_order_relaxed) != 0ULL) {
                 word.store(0ULL, std::memory_order_relaxed);
             }
@@ -722,14 +736,23 @@ void ClearNativeOwnedRange(VAddr addr, u64 byte_size) noexcept {
     const u64 lo_mask = ~0ULL << (first_bit & 63ULL);
     const u64 hi_mask = ~0ULL >> (63ULL - (last_bit & 63ULL));
     if (first_word == last_word) {
-        g_native_owned_4b[first_word].fetch_and(~(lo_mask & hi_mask), std::memory_order_release);
+        const u64 mask = lo_mask & hi_mask;
+        if ((g_native_owned_4b[first_word].load(std::memory_order_relaxed) & mask) != 0ULL) {
+            g_native_owned_4b[first_word].fetch_and(~mask, std::memory_order_release);
+        }
         return;
     }
-    g_native_owned_4b[first_word].fetch_and(~lo_mask, std::memory_order_release);
-    for (u64 w = first_word + 1ULL; w < last_word; ++w) {
-        g_native_owned_4b[w].store(0ULL, std::memory_order_release);
+    if ((g_native_owned_4b[first_word].load(std::memory_order_relaxed) & lo_mask) != 0ULL) {
+        g_native_owned_4b[first_word].fetch_and(~lo_mask, std::memory_order_release);
     }
-    g_native_owned_4b[last_word].fetch_and(~hi_mask, std::memory_order_release);
+    for (u64 w = first_word + 1ULL; w < last_word; ++w) {
+        if (g_native_owned_4b[w].load(std::memory_order_relaxed) != 0ULL) {
+            g_native_owned_4b[w].store(0ULL, std::memory_order_release);
+        }
+    }
+    if ((g_native_owned_4b[last_word].load(std::memory_order_relaxed) & hi_mask) != 0ULL) {
+        g_native_owned_4b[last_word].fetch_and(~hi_mask, std::memory_order_release);
+    }
 }
 
 bool IsNativeOwnedAddress(VAddr addr) noexcept {
@@ -801,6 +824,28 @@ void MarkCpuImmutableRange(VAddr addr, u64 byte_size) noexcept {
     const u64 last_word = last_bit >> 6;
     const u64 lo_mask = ~0ULL << (first_bit & 63ULL);
     const u64 hi_mask = ~0ULL >> (63ULL - (last_bit & 63ULL));
+
+    const u64 first_blk = first_word >> kCpuImmutableL2BlockWordsShift;
+    const u64 last_blk = last_word >> kCpuImmutableL2BlockWordsShift;
+    const u64 first_l2 = first_blk >> 6;
+    const u64 last_l2 = last_blk >> 6;
+    const u64 l2_lo_mask = ~0ULL << (first_blk & 63ULL);
+    const u64 l2_hi_mask = ~0ULL >> (63ULL - (last_blk & 63ULL));
+
+    std::scoped_lock lk{g_cpu_immutable_l2_mutex};
+    // Publish L2 summary bits BEFORE setting `g_cpu_immutable_4b` so concurrent
+    // `ClearCpuImmutableRange` calls never skip a live 64 KiB block.
+    if (first_l2 == last_l2) {
+        g_cpu_immutable_l2_64k[first_l2].fetch_or(l2_lo_mask & l2_hi_mask,
+                                                  std::memory_order_acq_rel);
+    } else {
+        g_cpu_immutable_l2_64k[first_l2].fetch_or(l2_lo_mask, std::memory_order_acq_rel);
+        for (u64 l2 = first_l2 + 1ULL; l2 < last_l2; ++l2) {
+            g_cpu_immutable_l2_64k[l2].fetch_or(~0ULL, std::memory_order_acq_rel);
+        }
+        g_cpu_immutable_l2_64k[last_l2].fetch_or(l2_hi_mask, std::memory_order_acq_rel);
+    }
+
     if (first_word == last_word) {
         g_cpu_immutable_4b[first_word].fetch_or(lo_mask & hi_mask, std::memory_order_release);
         return;
@@ -836,15 +881,85 @@ void ClearCpuImmutableRange(VAddr addr, u64 byte_size) noexcept {
     const u64 last_word = last_bit >> 6;
     const u64 lo_mask = ~0ULL << (first_bit & 63ULL);
     const u64 hi_mask = ~0ULL >> (63ULL - (last_bit & 63ULL));
-    if (first_word == last_word) {
-        g_cpu_immutable_4b[first_word].fetch_and(~(lo_mask & hi_mask), std::memory_order_release);
-        return;
+
+    const u64 first_blk = first_word >> kCpuImmutableL2BlockWordsShift;
+    const u64 last_blk = last_word >> kCpuImmutableL2BlockWordsShift;
+    const u64 first_l2 = first_blk >> 6;
+    const u64 last_l2 = last_blk >> 6;
+
+    for (u64 l2 = first_l2; l2 <= last_l2; ++l2) {
+        u64 l2_mask = ~0ULL;
+        if (l2 == first_l2) {
+            l2_mask &= (~0ULL << (first_blk & 63ULL));
+        }
+        if (l2 == last_l2) {
+            l2_mask &= (~0ULL >> (63ULL - (last_blk & 63ULL)));
+        }
+        u64 l2_bits = g_cpu_immutable_l2_64k[l2].load(std::memory_order_acquire) & l2_mask;
+        if (l2_bits == 0ULL) {
+            continue;
+        }
+        while (l2_bits != 0ULL) {
+            const u32 b = static_cast<u32>(std::countr_zero(l2_bits));
+            l2_bits &= (l2_bits - 1ULL);
+
+            const u64 blk = (l2 << 6) | static_cast<u64>(b);
+            const u64 blk_w0 = blk << kCpuImmutableL2BlockWordsShift;
+            const u64 blk_w1 = blk_w0 + kCpuImmutableL2BlockWords - 1ULL;
+            const u64 cw0 = std::max(first_word, blk_w0);
+            const u64 cw1 = std::min(last_word, blk_w1);
+
+            for (u64 w = cw0; w <= cw1; ++w) {
+                u64 w_mask = ~0ULL;
+                if (w == first_word) {
+                    w_mask &= lo_mask;
+                }
+                if (w == last_word) {
+                    w_mask &= hi_mask;
+                }
+                if (w_mask == ~0ULL) {
+                    if (g_cpu_immutable_4b[w].load(std::memory_order_relaxed) != 0ULL) {
+                        g_cpu_immutable_4b[w].store(0ULL, std::memory_order_release);
+                    }
+                } else {
+                    if ((g_cpu_immutable_4b[w].load(std::memory_order_relaxed) & w_mask) != 0ULL) {
+                        g_cpu_immutable_4b[w].fetch_and(~w_mask, std::memory_order_release);
+                    }
+                }
+            }
+
+            // Fast lockless pre-check: only attempt L2 bit demotion if all 256 words appear 0.
+            bool any_nonzero = false;
+            const bool whole_blk_cleared =
+                cw0 == blk_w0 && cw1 == blk_w1 &&
+                (cw0 > first_word || lo_mask == ~0ULL) &&
+                (cw1 < last_word || hi_mask == ~0ULL);
+            if (!whole_blk_cleared) {
+                for (u64 w = blk_w0; w <= blk_w1; ++w) {
+                    if (g_cpu_immutable_4b[w].load(std::memory_order_relaxed) != 0ULL) {
+                        any_nonzero = true;
+                        break;
+                    }
+                }
+            }
+            if (!any_nonzero) {
+                if (std::unique_lock lk{g_cpu_immutable_l2_mutex, std::try_to_lock};
+                    lk.owns_lock()) {
+                    bool still_empty = true;
+                    for (u64 w = blk_w0; w <= blk_w1; ++w) {
+                        if (g_cpu_immutable_4b[w].load(std::memory_order_acquire) != 0ULL) {
+                            still_empty = false;
+                            break;
+                        }
+                    }
+                    if (still_empty) {
+                        g_cpu_immutable_l2_64k[l2].fetch_and(~(1ULL << b),
+                                                             std::memory_order_acq_rel);
+                    }
+                }
+            }
+        }
     }
-    g_cpu_immutable_4b[first_word].fetch_and(~lo_mask, std::memory_order_release);
-    for (u64 w = first_word + 1ULL; w < last_word; ++w) {
-        g_cpu_immutable_4b[w].store(0ULL, std::memory_order_release);
-    }
-    g_cpu_immutable_4b[last_word].fetch_and(~hi_mask, std::memory_order_release);
 }
 
 bool IsCpuReadableImmutableRange(VAddr addr, u64 byte_size) noexcept {
@@ -863,6 +978,35 @@ bool IsCpuReadableImmutableRange(VAddr addr, u64 byte_size) noexcept {
         1ULL;
     const u64 first_word = first_bit >> 6;
     const u64 last_word = last_bit >> 6;
+
+    const u64 first_blk = first_word >> kCpuImmutableL2BlockWordsShift;
+    const u64 last_blk = last_word >> kCpuImmutableL2BlockWordsShift;
+    const u64 first_l2 = first_blk >> 6;
+    const u64 last_l2 = last_blk >> 6;
+    const u64 l2_lo_mask = ~0ULL << (first_blk & 63ULL);
+    const u64 l2_hi_mask = ~0ULL >> (63ULL - (last_blk & 63ULL));
+    if (first_l2 == last_l2) {
+        const u64 want_l2 = l2_lo_mask & l2_hi_mask;
+        if ((g_cpu_immutable_l2_64k[first_l2].load(std::memory_order_acquire) & want_l2) !=
+            want_l2) {
+            return false;
+        }
+    } else {
+        if ((g_cpu_immutable_l2_64k[first_l2].load(std::memory_order_acquire) & l2_lo_mask) !=
+            l2_lo_mask) {
+            return false;
+        }
+        for (u64 l2 = first_l2 + 1ULL; l2 < last_l2; ++l2) {
+            if (g_cpu_immutable_l2_64k[l2].load(std::memory_order_acquire) != ~0ULL) {
+                return false;
+            }
+        }
+        if ((g_cpu_immutable_l2_64k[last_l2].load(std::memory_order_acquire) & l2_hi_mask) !=
+            l2_hi_mask) {
+            return false;
+        }
+    }
+
     const u64 lo_mask = ~0ULL << (first_bit & 63ULL);
     const u64 hi_mask = ~0ULL >> (63ULL - (last_bit & 63ULL));
     if (first_word == last_word) {

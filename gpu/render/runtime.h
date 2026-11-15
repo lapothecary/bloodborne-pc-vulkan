@@ -11,6 +11,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <vector>
 
 #include "buffers/buffer.h"
 #include "common/types.h"
@@ -108,6 +109,7 @@ public:
                       const VideoCore::SubresourceRange& dst_range);
     void ClearImage(VideoCore::Image* dst, const VideoCore::SubresourceRange& range,
                     const vk::ClearValue& value);
+    void ZeroInitializeImage(VideoCore::Image* dst, std::optional<u32> skip_full_mip = std::nullopt);
     void ClearDepthStencilImage(VideoCore::Image* dst, const VideoCore::SubresourceRange& range,
                                 vk::ImageAspectFlags aspect,
                                 const vk::ClearDepthStencilValue& value);
@@ -175,6 +177,8 @@ private:
     Scheduler& scheduler;
     std::unique_ptr<VideoCore::ImageBlitter> blitter;
     StagingBufferPool staging_pool;
+    std::unique_ptr<VideoCore::Buffer> zero_clear_buffer;
+    std::vector<std::unique_ptr<VideoCore::Buffer>> retired_zero_clear_buffers;
     AccessTracker accesses;
     VideoCore::Image::Barriers image_barriers;
     vk::PipelineStageFlags2 pending_stages{};       ///< of accesses since the last barrier

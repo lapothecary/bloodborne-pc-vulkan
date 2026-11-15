@@ -248,10 +248,13 @@ void VsmShadowMemo::DrainRetiredRanges() noexcept {
 }
 
 void VsmShadowMemo::InvalidateOverlappingMemory(VAddr addr, u64 byte_size) noexcept {
-    if (!addr || byte_size == 0u) {
+    if (!addr || byte_size == 0u || tracked_va_max == 0u) {
         return;
     }
     const VAddr end = (byte_size > (~0ULL - addr)) ? ~0ULL : (addr + byte_size);
+    if (end <= tracked_va_min || addr >= tracked_va_max) {
+        return;
+    }
     auto overlaps = [&](VAddr base, u64 span) noexcept {
         if (!base || span == 0u) {
             return false;
@@ -307,6 +310,7 @@ void VsmShadowMemo::MarkKnownVsmBase(VAddr base_va) noexcept {
     if (!found) {
         known_vsm_bases[known_vsm_cursor & (known_vsm_bases.size() - 1u)] = base_va;
         ++known_vsm_cursor;
+        NoteTrackedRange(base_va, 4ULL);
     }
     for (auto& f : faces) {
         if (f.allocated && (f.base_va == base_va || f.slice_va == base_va)) {
@@ -463,6 +467,9 @@ void VsmShadowMemo::EnrichFaceKey(FaceEntry& f, const VsmTargetKey& key) noexcep
             }
         }
     }
+    const u64 span = f.slice_bytes ? f.slice_bytes : (u64(f.dim) * u64(f.dim) * 4ULL);
+    NoteTrackedRange(f.slice_va, span);
+    NoteTrackedRange(f.base_va, span * u64(f.slice + 1u));
 }
 
 u32 VsmShadowMemo::GetOrAllocateFaceIndex(const VsmTargetKey& key, u64 cur_frame) noexcept {
@@ -543,6 +550,9 @@ void VsmShadowMemo::SetScratchLink(const VsmTargetKey& scratch_key, u32 face_idx
     dst.slice_va = scratch_key.slice_va;
     dst.dim = scratch_key.dim;
     dst.last_frame = cur_frame;
+    const u64 span = u64(dst.dim) * u64(dst.dim) * 4ULL;
+    NoteTrackedRange(dst.slice_va, span);
+    NoteTrackedRange(dst.base_va, span * u64(dst.slice + 1u));
 }
 
 const VsmShadowMemo::ScratchLink* VsmShadowMemo::FindScratchLink(
@@ -568,7 +578,7 @@ void VsmShadowMemo::EmitClearColorNow(Rasterizer& rasterizer,
     if (rasterizer.RunInOrder(&BbCp::Tasks::DirectVkClearColorTask, &args, sizeof(args),
                               BbToggle::PipelinedMemoryWrites, false)) {
         if (args.dst_va && args.byte_size) {
-            rasterizer.NotePendingGpuWrite(args.dst_va, args.byte_size);
+            rasterizer.NotePendingGpuWrite(args.dst_va, args.byte_size, false);
         }
     }
 }
@@ -579,7 +589,7 @@ void VsmShadowMemo::EmitClearDepthNow(Rasterizer& rasterizer,
     if (rasterizer.RunInOrder(&BbCp::Tasks::DirectVkClearDepthStencilTask, &args, sizeof(args),
                               BbToggle::PipelinedMemoryWrites, false)) {
         if (args.dst_va && args.dst_byte_size) {
-            rasterizer.NotePendingGpuWrite(args.dst_va, args.dst_byte_size);
+            rasterizer.NotePendingGpuWrite(args.dst_va, args.dst_byte_size, false);
         }
     }
 }

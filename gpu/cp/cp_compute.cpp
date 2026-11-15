@@ -248,7 +248,7 @@ CommandProcessor::Step CommandProcessor::Compute(Work& work, Level& level, const
                         std::memcpy(&reg, body + 2u + i * 6u, sizeof(reg));
                         if (reg.dst_va && reg.byte_size) {
                             if (queued) {
-                                rasterizer->NotePendingGpuWrite(reg.dst_va, reg.byte_size);
+                                rasterizer->NotePendingGpuWrite(reg.dst_va, reg.byte_size, false);
                             }
                             rasterizer->NoteCopyIntoMemory(reg.dst_va, reg.byte_size);
                         }
@@ -263,7 +263,7 @@ CommandProcessor::Step CommandProcessor::Compute(Work& work, Level& level, const
                     if (rasterizer->RunInOrder(&Tasks::DirectVkFillTask, body + 2u,
                                                sizeof(DirectVk::FillArgs),
                                                BbToggle::PipelinedMemoryWrites, false)) {
-                        rasterizer->NotePendingGpuWrite(args.dst_va, args.byte_size);
+                        rasterizer->NotePendingGpuWrite(args.dst_va, args.byte_size, false);
                     }
                     rasterizer->NoteCopyIntoMemory(args.dst_va, args.byte_size);
                 }
@@ -276,7 +276,7 @@ CommandProcessor::Step CommandProcessor::Compute(Work& work, Level& level, const
                         if (rasterizer->RunInOrder(&Tasks::DirectVkClearColorTask, body + 2u,
                                                    sizeof(DirectVk::ClearColorArgs),
                                                    BbToggle::PipelinedMemoryWrites, false)) {
-                            rasterizer->NotePendingGpuWrite(args.dst_va, args.byte_size);
+                            rasterizer->NotePendingGpuWrite(args.dst_va, args.byte_size, false);
                         }
                     }
                 }
@@ -294,7 +294,7 @@ CommandProcessor::Step CommandProcessor::Compute(Work& work, Level& level, const
                             sizeof(DirectVk::CopyTextureRegionArgs),
                             BbToggle::PipelinedMemoryWrites, false);
                         if (args.dst_va && args.dst_byte_size && queued) {
-                            rasterizer->NotePendingGpuWrite(args.dst_va, args.dst_byte_size);
+                            rasterizer->NotePendingGpuWrite(args.dst_va, args.dst_byte_size, false);
                         }
                     }
                 }
@@ -312,7 +312,7 @@ CommandProcessor::Step CommandProcessor::Compute(Work& work, Level& level, const
                         sizeof(DirectVk::UploadTextureArgs),
                         BbToggle::PipelinedMemoryWrites, false);
                     if (args.dst_va && args.dst_byte_size && queued) {
-                        rasterizer->NotePendingGpuWrite(args.dst_va, args.dst_byte_size);
+                        rasterizer->NotePendingGpuWrite(args.dst_va, args.dst_byte_size, false);
                     }
                 }
             } else if (vk_op == DirectVk::Op::DispatchDirect && body_words == 5u) {

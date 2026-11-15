@@ -46,6 +46,7 @@ public:
     static constexpr size_t kLargeStagingSlots = 32u;
     static constexpr u32 kCoarseShift = 18u;          // 256 KiB coarse invalidation granule
     static constexpr size_t kCoarseBuckets = 262144u; // covers 64 GiB directly (`1 MiB` table)
+    static constexpr u64 kShadowSleepFrames = 8ULL;   // sleep staging shadow when FfxTintBaked/native-staging idle
     static constexpr size_t kStageBWords =
         Gcn::RegDirty::StageBNumChunks * Gcn::RegDirty::StageBChunkWords;
 
@@ -203,6 +204,8 @@ private:
     }
 
     void RecomputeLargeStagingBounds() noexcept;
+    void WipeStagingShadow() noexcept;
+    void WakeStagingShadow(u64 cur_frame) noexcept;
 
     [[nodiscard]] const u8* ResolveCpuReadableRange(Rasterizer& rasterizer, VAddr addr,
                                                     u64 byte_size) noexcept;
@@ -216,6 +219,8 @@ private:
     u32 staging_clock = 0;
     u32 coarse_clock = 0;
     u32 coarse_wipe_bias = 0;
+    bool shadow_awake = false;
+    u64 last_shadow_active_frame = 0;
 
     OpenBatch open{};
     bool flushing = false;

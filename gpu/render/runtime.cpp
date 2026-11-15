@@ -798,6 +798,122 @@ void Runtime::ClearImage(VideoCore::Image* dst, const VideoCore::SubresourceRang
     MarkCopied(dst, VideoCore::ImageFlagBits::GpuModified);
 }
 
+void Runtime::ZeroInitializeImage(VideoCore::Image* dst, std::optional<u32> skip_full_mip) {
+    if (!dst || dst->info.resources.levels == 0 || dst->info.resources.layers == 0) {
+        return;
+    }
+    SetBackingSamples(dst, dst->info.num_samples, false);
+    scheduler.EndRendering();
+    const TransferMark mark{*this, "image zero init", *dst};
+    const bool is_3d = DimensionOf(dst->info.type) == vk::ImageType::e3D;
+    const u32 levels = dst->info.resources.levels;
+    const u32 layers = is_3d ? 1u : dst->info.resources.layers;
+
+    if (dst->info.props.is_depth) {
+        if (Transit(dst, Layout::eTransferDstOptimal, Stage::eClear, AccessBit::eTransferWrite)) {
+            FlushImageBarriers();
+        }
+        const vk::ClearDepthStencilValue zero_ds{0.0f, 0u};
+        const vk::ImageSubresourceRange vk_range{dst->aspect_mask, 0u, levels, 0u, layers};
+        scheduler.Record([image = dst->GetImage(), zero_ds, vk_range](vk::CommandBuffer cmdbuf) {
+            cmdbuf.clearDepthStencilImage(image, Layout::eTransferDstOptimal, zero_ds, vk_range);
+        });
+        return;
+    }
+
+    if (!dst->info.props.is_block) {
+        if (Transit(dst, Layout::eTransferDstOptimal, Stage::eClear, AccessBit::eTransferWrite)) {
+            FlushImageBarriers();
+        }
+        const vk::ClearColorValue zero_color{};
+        const vk::ImageSubresourceRange vk_range{
+            dst->aspect_mask & vk::ImageAspectFlagBits::eColor, 0u, levels, 0u, layers};
+        scheduler.Record([image = dst->GetImage(), zero_color, vk_range](vk::CommandBuffer cmdbuf) {
+            cmdbuf.clearColorImage(image, Layout::eTransferDstOptimal, zero_color, vk_range);
+        });
+        return;
+    }
+
+    // Block-compressed formats (`BC1..BC7`, where `VUID-vkCmdClearColorImage-image-00007` forbids
+    // `vkCmdClearColorImage` and `0xFFFF` in uninitialized `BC6H` VRAM decodes to `NaN`): copy
+    // zeroes from a persistent `DEVICE_LOCAL` `zero_clear_buffer` across all unskipped mips.
+    const auto block = vk::blockExtent(dst->info.pixel_format);
+    const u32 block_size = vk::blockSize(dst->info.pixel_format);
+    const vk::ImageAspectFlags aspect = dst->aspect_mask & ~vk::ImageAspectFlagBits::eStencil;
+    constexpr u64 kDefaultZeroBufBytes = 16ULL << 20; // 16 MiB covers up to 4096x4096 BC7/BC6H
+
+    boost::container::small_vector<vk::BufferImageCopy, 32> regions;
+    u64 max_region_bytes = 0;
+    for (u32 m = 0; m < levels; ++m) {
+        if (skip_full_mip && *skip_full_mip == m && layers == 1u) {
+            continue;
+        }
+        const u32 mw = std::max(1u, dst->info.size.width >> m);
+        const u32 mh = std::max(1u, dst->info.size.height >> m);
+        const u32 md = is_3d ? std::max(1u, dst->info.size.depth >> m) : 1u;
+        const u32 w_blocks = (mw + block[0] - 1u) / block[0];
+        const u32 h_blocks = (mh + block[1] - 1u) / block[1];
+        const u64 mip_slice_bytes =
+            u64(w_blocks) * u64(h_blocks) * u64(md) * u64(block_size);
+        if (layers > 1u && mip_slice_bytes * u64(layers) > kDefaultZeroBufBytes) {
+            max_region_bytes = std::max(max_region_bytes, mip_slice_bytes);
+            for (u32 l = 0; l < layers; ++l) {
+                regions.push_back(vk::BufferImageCopy{
+                    .bufferOffset = 0,
+                    .bufferRowLength = 0,
+                    .bufferImageHeight = 0,
+                    .imageSubresource = {aspect, m, l, 1u},
+                    .imageOffset = {0, 0, 0},
+                    .imageExtent = {mw, mh, md},
+                });
+            }
+        } else {
+            max_region_bytes = std::max(max_region_bytes, mip_slice_bytes * u64(layers));
+            regions.push_back(vk::BufferImageCopy{
+                .bufferOffset = 0,
+                .bufferRowLength = 0,
+                .bufferImageHeight = 0,
+                .imageSubresource = {aspect, m, 0u, layers},
+                .imageOffset = {0, 0, 0},
+                .imageExtent = {mw, mh, md},
+            });
+        }
+    }
+
+    if (regions.empty() || max_region_bytes == 0) {
+        if (Transit(dst, Layout::eTransferDstOptimal, Stage::eCopy, AccessBit::eTransferWrite)) {
+            FlushImageBarriers();
+        }
+        return;
+    }
+
+    if (!zero_clear_buffer || zero_clear_buffer->SizeBytes() < max_region_bytes) {
+        if (zero_clear_buffer) {
+            retired_zero_clear_buffers.push_back(std::move(zero_clear_buffer));
+        }
+        const u64 alloc_bytes =
+            std::max<u64>(kDefaultZeroBufBytes, std::bit_ceil(max_region_bytes));
+        zero_clear_buffer = std::make_unique<VideoCore::Buffer>(
+            instance, VAddr{0}, alloc_bytes, VideoCore::MemoryType::DeviceLocal, "ZeroClearBuffer");
+        FillBuffer(zero_clear_buffer.get(), 0, alloc_bytes, 0u);
+    }
+
+    bool needs_flush =
+        Transit(dst, Layout::eTransferDstOptimal, Stage::eCopy, AccessBit::eTransferWrite);
+    needs_flush |= IsBufferAccessed(zero_clear_buffer.get(), 0, max_region_bytes);
+    if (needs_flush) {
+        FlushBarriers();
+    }
+    scheduler.Record([src_buf = zero_clear_buffer->Handle(), image = dst->GetImage(),
+                      copies = scheduler.RecordData(std::span<const vk::BufferImageCopy>{
+                          regions.data(), regions.size()})](vk::CommandBuffer cmdbuf) {
+        cmdbuf.copyBufferToImage(src_buf, image, Layout::eTransferDstOptimal, u32(copies.size()),
+                                 copies.data());
+    });
+    AccessBuffer(zero_clear_buffer.get(), 0, max_region_bytes, Stage::eCopy,
+                 AccessBit::eTransferRead);
+}
+
 void Runtime::ClearDepthStencilImage(VideoCore::Image* dst,
                                      const VideoCore::SubresourceRange& range,
                                      vk::ImageAspectFlags aspect,

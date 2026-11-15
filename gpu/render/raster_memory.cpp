@@ -1421,14 +1421,22 @@ void Rasterizer::DirectUploadTextureSubresource(const DirectUploadTextureArgs& a
         return;
     }
 
-    const bool full_single_subres =
-        dst_img.info.resources.levels == 1 && dst_img.info.resources.layers == 1 &&
+    const bool full_cur_mip =
         args.offset_x == 0 && args.offset_y == 0 && z_off == 0 &&
         ext_w == dst_mip_w && ext_h == dst_mip_h && ext_d == dst_mip_d;
+    const bool full_single_subres =
+        dst_img.info.resources.levels == 1 && dst_img.info.resources.layers == 1 && full_cur_mip;
     if (is_immutable_asset) {
         // Guest `dst_va` of a DirectImmutable asset was never populated with CPU-tiled texels
         // (it holds zeroes); never run a CPU untile/upload pass from `dst_va` over the VkImage.
         dst_img.flags &= ~VideoCore::ImageFlagBits::Dirty;
+        if (dst_img.info.resources.levels > 1 && !dst_img.immutable_mips_zeroed) {
+            dst_img.immutable_mips_zeroed = true;
+            runtime.ZeroInitializeImage(
+                &dst_img, (full_cur_mip && dst_img.info.resources.layers == 1)
+                              ? std::optional<u32>{mip}
+                              : std::nullopt);
+        }
     } else if (!full_single_subres && True(dst_img.flags & VideoCore::ImageFlagBits::Dirty)) {
         texture_cache.UpdateImage(dst_id);
     }

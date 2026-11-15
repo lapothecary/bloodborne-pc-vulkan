@@ -101,7 +101,8 @@ struct TopologyMasks {
     cpu_set_t gpu_comm;     // bb:GpuComm / Stage A (dedicated #1 physical core in CCD1, sharing L3 with DrawRec & VkRecorder)
     cpu_set_t draw_rec;     // bb:DrawRec / Stage B (dedicated #2 physical core in CCD1, sharing L3 with GpuComm & VkRecorder)
     cpu_set_t vk_recorder;  // bb:VkRecorder (dedicated #3 physical core in CCD1, sharing L3 with GpuComm & DrawRec)
-    cpu_set_t game_workers; // HavokWorker*, CSChrThread*, CSClothThread*, SpCloth*, GXRender*, GXWorker*
+    cpu_set_t game_workers; // HavokWorker*, CSChrThread*, CSClothThread*, SpCloth*, GXRender*
+    cpu_set_t gx_workers;   // GXWorker* (CCD1 `topo.gpu` on Multi-CCD when BB_MT_DIRECT_VK!=0, else `game_workers`)
     cpu_set_t gpu;          // bb:Resolve*, bb:TexBind, bb:VkRecorder1+, bb:Present, driver helper threads
     cpu_set_t helper;       // bb:Copy*, bb:DrawScan, EzWorkPool*, Core.Res.*, FMOD*, NGX/CUDA/SDL helpers
     int best_main_cpu = -1;
@@ -181,6 +182,7 @@ inline const TopologyMasks& GetTopology() {
         CPU_ZERO(&none.draw_rec);
         CPU_ZERO(&none.vk_recorder);
         CPU_ZERO(&none.game_workers);
+        CPU_ZERO(&none.gx_workers);
         CPU_ZERO(&none.gpu);
         CPU_ZERO(&none.helper);
 
@@ -473,6 +475,14 @@ inline const TopologyMasks& GetTopology() {
                 result.draw_rec = result.gpu;
                 result.vk_recorder = result.gpu;
             }
+            const char* env_mt = std::getenv("BB_MT_DIRECT_VK");
+            const bool mt_direct_vk =
+                !env_mt || env_mt[0] == '\0' || std::strtol(env_mt, nullptr, 10) != 0;
+            if (mt_direct_vk && CPU_COUNT(&result.gpu) >= 4) {
+                result.gx_workers = result.gpu;
+            } else {
+                result.gx_workers = result.game_workers;
+            }
         } else {
             // Single L3 domain: check if Hybrid P-Core + E-Core (Intel 12th-15th Gen) or
             // Homogeneous (Ryzen 5/7, 5800X3D/7800X3D/9800X3D, Intel 6c/8c, Steam Deck).
@@ -524,7 +534,7 @@ inline const TopologyMasks& GetTopology() {
                 } else {
                     result.game_main = p_cores;
                 }
-                if (p_phys_cores >= 6) {
+                if (p_phys_cores >= 8) {
                     pick_best_core(result.game_workers, &result.best_gpu_comm_cpu,
                                    &result.best_gpu_comm_sibling);
                     if (result.best_gpu_comm_cpu >= 0) {
@@ -538,19 +548,15 @@ inline const TopologyMasks& GetTopology() {
                     } else {
                         result.gpu_comm = result.game_workers;
                     }
-                    if (p_phys_cores >= 8) {
-                        pick_best_core(result.game_workers, &result.best_draw_rec_cpu,
-                                       &result.best_draw_rec_sibling);
-                        if (result.best_draw_rec_cpu >= 0) {
-                            CPU_ZERO(&result.draw_rec);
-                            CPU_SET(result.best_draw_rec_cpu, &result.draw_rec);
-                            for (int s = 0; s < 256; ++s) {
-                                if (CPU_ISSET(s, &cpus[result.best_draw_rec_cpu].siblings)) {
-                                    CPU_CLR(s, &result.game_workers);
-                                }
+                    pick_best_core(result.game_workers, &result.best_draw_rec_cpu,
+                                   &result.best_draw_rec_sibling);
+                    if (result.best_draw_rec_cpu >= 0) {
+                        CPU_ZERO(&result.draw_rec);
+                        CPU_SET(result.best_draw_rec_cpu, &result.draw_rec);
+                        for (int s = 0; s < 256; ++s) {
+                            if (CPU_ISSET(s, &cpus[result.best_draw_rec_cpu].siblings)) {
+                                CPU_CLR(s, &result.game_workers);
                             }
-                        } else {
-                            result.draw_rec = result.game_workers;
                         }
                     } else {
                         result.draw_rec = result.game_workers;
@@ -577,16 +583,18 @@ inline const TopologyMasks& GetTopology() {
                     result.draw_rec = result.game_workers;
                     result.vk_recorder = result.game_workers;
                 }
+                result.gx_workers = result.game_workers;
                 result.gpu = result.game_workers;
                 result.helper = e_cores;
             } else if (total_phys_cores >= 6) {
                 // =============================================================================
                 // CASE 3: Single-L3 Homogeneous CPU with >= 6 Physical Cores
                 // (e.g. Ryzen 5 5600X/7600X, Ryzen 7 5800X3D/7800X3D/9800X3D, Intel 6c/8c).
-                // - MOMainThread gets #1 physical core (SMT sibling idle).
-                // - bb:GpuComm gets #2 physical core (SMT sibling idle, >= 6 physical cores).
-                // - When >= 8 physical cores (5800X3D/7800X3D/9800X3D), bb:DrawRec gets #3
-                //   physical core (SMT sibling idle, 5 physical cores = 10 threads left for workers).
+                // - MOMainThread gets #1 physical core (SMT sibling idle; 5 physical cores = 10
+                //   threads left on 6-core CPUs so workers and RHI are never starved).
+                // - When >= 8 physical cores (5800X3D/7800X3D/9800X3D), bb:GpuComm gets #2 and
+                //   bb:DrawRec gets #3 physical core (SMT siblings idle, 5 physical cores = 10
+                //   threads left for workers).
                 // - When >= 10 physical cores, bb:VkRecorder also gets #4 physical core.
                 // =============================================================================
                 pick_best_core(allowed, &result.best_main_cpu, &result.best_main_sibling);
@@ -602,20 +610,20 @@ inline const TopologyMasks& GetTopology() {
                 } else {
                     result.game_main = allowed;
                 }
-                pick_best_core(result.game_workers, &result.best_gpu_comm_cpu,
-                               &result.best_gpu_comm_sibling);
-                if (result.best_gpu_comm_cpu >= 0) {
-                    CPU_ZERO(&result.gpu_comm);
-                    CPU_SET(result.best_gpu_comm_cpu, &result.gpu_comm);
-                    for (int s = 0; s < 256; ++s) {
-                        if (CPU_ISSET(s, &cpus[result.best_gpu_comm_cpu].siblings)) {
-                            CPU_CLR(s, &result.game_workers);
-                        }
-                    }
-                } else {
-                    result.gpu_comm = result.game_workers;
-                }
                 if (total_phys_cores >= 8) {
+                    pick_best_core(result.game_workers, &result.best_gpu_comm_cpu,
+                                   &result.best_gpu_comm_sibling);
+                    if (result.best_gpu_comm_cpu >= 0) {
+                        CPU_ZERO(&result.gpu_comm);
+                        CPU_SET(result.best_gpu_comm_cpu, &result.gpu_comm);
+                        for (int s = 0; s < 256; ++s) {
+                            if (CPU_ISSET(s, &cpus[result.best_gpu_comm_cpu].siblings)) {
+                                CPU_CLR(s, &result.game_workers);
+                            }
+                        }
+                    } else {
+                        result.gpu_comm = result.game_workers;
+                    }
                     pick_best_core(result.game_workers, &result.best_draw_rec_cpu,
                                    &result.best_draw_rec_sibling);
                     if (result.best_draw_rec_cpu >= 0) {
@@ -630,6 +638,7 @@ inline const TopologyMasks& GetTopology() {
                         result.draw_rec = result.game_workers;
                     }
                 } else {
+                    result.gpu_comm = result.game_workers;
                     result.draw_rec = result.game_workers;
                 }
                 if (total_phys_cores >= 10) {
@@ -649,6 +658,7 @@ inline const TopologyMasks& GetTopology() {
                 } else {
                     result.vk_recorder = result.game_workers;
                 }
+                result.gx_workers = result.game_workers;
                 result.gpu = result.game_workers;
                 result.helper = result.game_workers;
             } else {
@@ -662,17 +672,19 @@ inline const TopologyMasks& GetTopology() {
                 result.draw_rec = allowed;
                 result.vk_recorder = allowed;
                 result.game_workers = allowed;
+                result.gx_workers = allowed;
                 result.gpu = allowed;
                 result.helper = allowed;
             }
         }
 
-        char main_str[64], gcomm_str[64], drec_str[64], vkrec_str[64], work_str[64], gpu_str[64], help_str[64];
+        char main_str[64], gcomm_str[64], drec_str[64], vkrec_str[64], work_str[64], gxw_str[64], gpu_str[64], help_str[64];
         FormatCpuList(result.game_main, main_str, sizeof(main_str));
         FormatCpuList(result.gpu_comm, gcomm_str, sizeof(gcomm_str));
         FormatCpuList(result.draw_rec, drec_str, sizeof(drec_str));
         FormatCpuList(result.vk_recorder, vkrec_str, sizeof(vkrec_str));
         FormatCpuList(result.game_workers, work_str, sizeof(work_str));
+        FormatCpuList(result.gx_workers, gxw_str, sizeof(gxw_str));
         FormatCpuList(result.gpu, gpu_str, sizeof(gpu_str));
         FormatCpuList(result.helper, help_str, sizeof(help_str));
         std::printf("CPU Topology (%d L3 domain%s, %d phys cores): "
@@ -680,13 +692,13 @@ inline const TopologyMasks& GetTopology() {
                     "GpuComm/StageA=[%s] (SMT %d idle), "
                     "DrawRec/StageB=[%s] (SMT %d idle), "
                     "VkRecorder=[%s] (SMT %d idle), "
-                    "Game/Havok/GX=[%s], Vulkan RHI=[%s], Helpers/IO=[%s]\n",
+                    "Game/Havok=[%s], GXWorker=[%s], Vulkan RHI=[%s], Helpers/IO=[%s]\n",
                     domain_count, domain_count == 1 ? "" : "s", total_phys_cores,
                     main_str, result.best_main_sibling,
                     gcomm_str, result.best_gpu_comm_sibling,
                     drec_str, result.best_draw_rec_sibling,
                     vkrec_str, result.best_vk_rec_sibling,
-                    work_str, gpu_str, help_str);
+                    work_str, gxw_str, gpu_str, help_str);
         std::fflush(stdout);
         return result;
     }();
@@ -859,13 +871,14 @@ inline void ApplyProcessThreadTopology() {
         } else if (vk_rec_tid > 0 && tid == vk_rec_tid) {
             target_mask = &topo.vk_recorder;
             boost_prio = true;
+        } else if (starts_with(comm, "GXWorker")) {
+            target_mask = &topo.gx_workers;
         } else if (starts_with(comm, "HavokWorker") ||
                    starts_with(comm, "CSChrThread") ||
                    starts_with(comm, "CSClothThread") ||
                    starts_with(comm, "SpClothVertex") ||
                    starts_with(comm, "FD4JobWorker") ||
                    starts_with(comm, "GXRenderThread") ||
-                   starts_with(comm, "GXWorker") ||
                    starts_with(comm, "Battle Worker") ||
                    starts_with(comm, "CS Filtering")) {
             target_mask = &topo.game_workers;

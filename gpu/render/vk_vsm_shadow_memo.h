@@ -156,6 +156,18 @@ private:
     void DrainRetiredRanges() noexcept;
     void InvalidateOverlappingMemory(VAddr addr, u64 byte_size) noexcept;
     void MarkKnownVsmBase(VAddr base_va) noexcept;
+    void NoteTrackedRange(VAddr base, u64 span) noexcept {
+        if (!base || span == 0u) {
+            return;
+        }
+        const VAddr end = (span > (~0ULL - base)) ? ~0ULL : (base + span);
+        if (base < tracked_va_min) {
+            tracked_va_min = base;
+        }
+        if (end > tracked_va_max) {
+            tracked_va_max = end;
+        }
+    }
 
     [[nodiscard]] s32 FindFaceIndex(const VsmTargetKey& key) const noexcept;
     [[nodiscard]] u32 GetOrAllocateFaceIndex(const VsmTargetKey& key, u64 cur_frame) noexcept;
@@ -180,6 +192,8 @@ private:
     std::array<ScratchLink, kMaxScratchLinks> scratch_links{};
     std::array<VAddr, 32> known_vsm_bases{};
     u32 known_vsm_cursor = 0;
+    VAddr tracked_va_min = ~0ULL;
+    VAddr tracked_va_max = 0ULL;
 
     PendingFace pending_face{};
     VsmTargetKey passthrough_target{};

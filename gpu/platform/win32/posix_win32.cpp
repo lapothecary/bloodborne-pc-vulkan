@@ -391,6 +391,7 @@ struct Win32TopologyMasks {
     DWORD_PTR draw_rec = 0;
     DWORD_PTR vk_recorder = 0;
     DWORD_PTR game_workers = 0;
+    DWORD_PTR gx_workers = 0;
     DWORD_PTR gpu = 0;
     DWORD_PTR helper = 0;
 };
@@ -620,6 +621,11 @@ const Win32TopologyMasks& GetWin32Topology() {
             if (res.helper == 0) {
                 res.helper = res.gpu;
             }
+            const char* env_mt = bb_env("BB_MT_DIRECT_VK");
+            const bool mt_direct_vk =
+                !env_mt || env_mt[0] == '\0' || std::strtol(env_mt, nullptr, 10) != 0;
+            res.gx_workers =
+                (mt_direct_vk && __builtin_popcountll(res.gpu) >= 4) ? res.gpu : res.game_workers;
         } else {
             // Single L3 domain: check Intel Hybrid P+E (`max_eff > min_eff`) vs Homogeneous (`>= 6` cores).
             DWORD_PTR p_mask = 0, e_mask = 0;
@@ -650,7 +656,7 @@ const Win32TopologyMasks& GetWin32Topology() {
                 // Main + Game Workers + Vulkan RHI stay strictly on P-cores; Helpers/IO/Audio run on E-cores.
                 if (p_phys >= 6 && best_p != size_t(-1)) {
                     res.game_main = cores[best_p].primary; // SMT sibling left idle
-                    const size_t gcomm_p = (p_phys >= 6) ? second_p : size_t(-1);
+                    const size_t gcomm_p = (p_phys >= 8) ? second_p : size_t(-1);
                     const size_t drec_p = (p_phys >= 8) ? third_p : size_t(-1);
                     if (gcomm_p != size_t(-1)) {
                         res.gpu_comm = cores[gcomm_p].primary; // SMT sibling left idle
@@ -668,6 +674,7 @@ const Win32TopologyMasks& GetWin32Topology() {
                     res.game_main = p_mask;
                     res.game_workers = p_mask;
                 }
+                res.gx_workers = res.game_workers;
                 res.gpu = res.game_workers;
                 if (res.gpu_comm == 0) {
                     res.gpu_comm = res.gpu;
@@ -682,15 +689,12 @@ const Win32TopologyMasks& GetWin32Topology() {
             } else {
                 // CASE 3: Single-L3 Homogeneous CPU with >= 6 Physical Cores
                 // (e.g. Ryzen 5 5600X/7600X, Ryzen 7 5800X3D/7800X3D/9800X3D, Intel 6c/8c).
-                // Core 0 primary -> Main game thread; Core 1 -> GpuComm (>= 6 cores);
-                // Core 2 -> DrawRec (>= 8 cores).
+                // Core 0 primary -> Main game thread; Core 1 -> GpuComm (>= 8 cores);
+                // Core 2 -> DrawRec (>= 8 cores) so 6-core CPUs keep 5 full physical cores.
                 res.game_main = cores[0].primary;
                 size_t start_w = 1;
-                if (cores.size() >= 6) {
-                    res.gpu_comm = cores[1].primary;
-                    start_w = 2;
-                }
                 if (cores.size() >= 8) {
+                    res.gpu_comm = cores[1].primary;
                     res.draw_rec = cores[2].primary;
                     start_w = 3;
                 }
@@ -701,6 +705,7 @@ const Win32TopologyMasks& GetWin32Topology() {
                 for (size_t i = start_w; i < cores.size(); ++i) {
                     res.game_workers |= cores[i].mask;
                 }
+                res.gx_workers = res.game_workers;
                 res.gpu = res.game_workers;
                 if (res.gpu_comm == 0) {
                     res.gpu_comm = res.gpu;
@@ -716,11 +721,12 @@ const Win32TopologyMasks& GetWin32Topology() {
         }
 
         std::printf("GPU: Win32 thread topology: %zu physical cores across %zu L3 domains "
-                    "(main=%#llx, gpu_comm=%#llx, workers=%#llx, gpu=%#llx, helper=%#llx)\n",
+                    "(main=%#llx, gpu_comm=%#llx, workers=%#llx, gx_workers=%#llx, gpu=%#llx, helper=%#llx)\n",
                     cores.size(), domains.size(),
                     static_cast<unsigned long long>(res.game_main),
                     static_cast<unsigned long long>(res.gpu_comm),
                     static_cast<unsigned long long>(res.game_workers),
+                    static_cast<unsigned long long>(res.gx_workers),
                     static_cast<unsigned long long>(res.gpu),
                     static_cast<unsigned long long>(res.helper));
         std::fflush(stdout);
@@ -745,13 +751,14 @@ void ApplyWin32ThreadTopologyByName(const char* name) {
     if (std::strcmp(name, "main") == 0) {
         mask = topo.game_main;
         boost = true;
+    } else if (starts_with(name, "GXWorker")) {
+        mask = topo.gx_workers ? topo.gx_workers : topo.game_workers;
     } else if (starts_with(name, "HavokWorker") ||
                starts_with(name, "CSChrThread") ||
                starts_with(name, "CSClothThread") ||
                starts_with(name, "SpClothVertex") ||
                starts_with(name, "FD4JobWorker") ||
                starts_with(name, "GXRenderThread") ||
-               starts_with(name, "GXWorker") ||
                starts_with(name, "Battle Worker") ||
                starts_with(name, "CS Filtering") ||
                starts_with(name, "MorphemeWorker") ||

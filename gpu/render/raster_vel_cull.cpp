@@ -173,7 +173,14 @@ bool ObjectVelocityCuller::IsSilhouetteMaskActive() noexcept {
 }
 
 void ObjectVelocityCuller::InvalidateCpuShadow(VAddr addr, u64 size) noexcept {
-    if (!addr || size == 0u) {
+    if (!shadow_awake || !addr || size == 0u) [[likely]] {
+        return;
+    }
+    const u64 cur_frame = BbStats::frame_number.load(std::memory_order_relaxed);
+    if (cur_frame > last_stage_a_active_frame + kShadowSleepFrames) {
+        shadow_awake = false;
+        ++coarse_wipe_bias;
+        pair_memo.fill(PairMemoEntry{});
         return;
     }
     const VAddr end = (size > (~0ULL - addr)) ? ~0ULL : (addr + size);
@@ -245,7 +252,14 @@ void ObjectVelocityCuller::InvalidateCpuShadow(VAddr addr, u64 size) noexcept {
 }
 
 void ObjectVelocityCuller::NoteStageACpuCopyBatch(const u32* raw_regions, u32 count) noexcept {
-    if (!raw_regions || count == 0u || count > 32u || !Enabled()) {
+    if (!shadow_awake || !raw_regions || count == 0u || count > 32u || !Enabled()) [[likely]] {
+        return;
+    }
+    const u64 cur_frame = BbStats::frame_number.load(std::memory_order_relaxed);
+    if (cur_frame > last_stage_a_active_frame + kShadowSleepFrames) {
+        shadow_awake = false;
+        ++coarse_wipe_bias;
+        pair_memo.fill(PairMemoEntry{});
         return;
     }
     for (u32 i = 0; i < count; ++i) {
@@ -482,6 +496,14 @@ bool ObjectVelocityCuller::TryCullDraw(Rasterizer& rasterizer, const GraphicsPip
         rasterizer.liverpool->pipe_dirty.reset) {
         return false;
     }
+
+    const u64 cur_frame = BbStats::frame_number.load(std::memory_order_relaxed);
+    if (!shadow_awake || cur_frame > last_stage_a_active_frame + kShadowSleepFrames) {
+        ++coarse_wipe_bias;
+        pair_memo.fill(PairMemoEntry{});
+        shadow_awake = true;
+    }
+    last_stage_a_active_frame = cur_frame;
 
     const auto& vs = pipeline->GetStage(Shader::SwStage::Vertex);
     const u64 vs_hash = vs.pgm_hash;

@@ -126,6 +126,7 @@ void Rasterizer::NoteStageACpuCopyBatch(const u32* raw_regions, u32 count) noexc
             DirectCopyRegion reg{};
             std::memcpy(&reg, raw_regions + i * 6u, sizeof(reg));
             if (reg.dst_va && reg.byte_size) {
+                VideoCore::DirectBuffers::ClearCpuImmutableRange(reg.dst_va, reg.byte_size);
                 VsmShadowMemo::NoteBufferWriteGlobal(reg.dst_va, reg.byte_size);
             }
         }
@@ -142,6 +143,9 @@ void Rasterizer::NoteStageACpuCopyBatch(const u32* raw_regions, u32 count) noexc
 }
 
 void Rasterizer::InvalidateStageACpuShadow(VAddr addr, u64 size) noexcept {
+    if (addr && size != 0u) {
+        VideoCore::DirectBuffers::ClearCpuImmutableRange(addr, size);
+    }
     VsmShadowMemo::NoteBufferWriteGlobal(addr, size);
     if (light_tile_batcher && OnStageA()) {
         light_tile_batcher->InvalidateCpuShadow(addr, size);
