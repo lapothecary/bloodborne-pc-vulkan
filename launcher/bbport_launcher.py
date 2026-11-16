@@ -764,6 +764,8 @@ class LauncherWindow(Adw.ApplicationWindow):
         self.process = None
         self.stream = None
         self.fsr411_build = None  # tools/fsr4cap/build_assets.sh while it runs
+        self.shader_bake_proc = None
+        self.shader_bake_cancelled = False
         self._update_info = None
         self._update_busy = False
         self.build()
@@ -858,6 +860,7 @@ class LauncherWindow(Adw.ApplicationWindow):
         self.update_game_status()
         self.update_user_status()
         self.update_upscaler_status()
+        self.update_shader_bake_status()
 
     def on_sidebar_row_selected(self, _listbox, row):
         if row is not None and hasattr(row, "_page_name"):
@@ -879,11 +882,14 @@ class LauncherWindow(Adw.ApplicationWindow):
         self.launch_button.set_label(tr("Остановить") if running else tr("Запустить"))
         self.launch_button.remove_css_class("destructive-action" if not running else "suggested-action")
         self.launch_button.add_css_class("destructive-action" if running else "suggested-action")
-        # The game and an FSR 4.1.1 build do not run together (both want the GPU, the build
-        # replaces the assets the game reads).
-        self.launch_button.set_sensitive(self.fsr411_build is None)
+        # The game and an FSR 4.1.1 / manual shader bake do not run together.
+        self.launch_button.set_sensitive(self.fsr411_build is None and self.shader_bake_proc is None)
         if hasattr(self, "fsr411_button"):
-            self.fsr411_button.set_sensitive(not running)
+            self.fsr411_button.set_sensitive(not running and self.shader_bake_proc is None)
+        if hasattr(self, "shader_bake_btn"):
+            self.shader_bake_btn.set_sensitive(not running)
+        if hasattr(self, "clear_cache_btn"):
+            self.clear_cache_btn.set_sensitive(not running and self.shader_bake_proc is None)
 
     # --- sidebar pages -------------------------------------------------------------------
 
@@ -1135,6 +1141,33 @@ class LauncherWindow(Adw.ApplicationWindow):
             active=self.settings.get("native_shaders", True))
         perf.add(self.native_shaders_row)
         page.add(perf)
+
+        shader_group = Adw.PreferencesGroup(
+            title=tr("Предкомпиляция и кэш шейдеров Vulkan (0% → 100%, Zero-Stutter)"),
+            description=tr(
+                "Недостающие шейдеры тихо допекаются сами в фоне во время игры (~10–15% ЦП, без потери FPS). "
+                "Здесь можно вручную запечь сразу все 2 880 шейдеров (~1.5–2 мин) или очистить кэш"))
+        self.shader_bake_row = Adw.ActionRow(title=tr("Статус кэша шейдеров Vulkan"))
+        self.clear_cache_btn = Gtk.Button(label=tr("Очистить кэш"), valign=Gtk.Align.CENTER)
+        self.clear_cache_btn.connect("clicked", self.on_clear_shader_cache)
+        self.shader_bake_row.add_suffix(self.clear_cache_btn)
+        self.shader_bake_btn = Gtk.Button(label=tr("Запечь все шейдеры"), valign=Gtk.Align.CENTER)
+        self.shader_bake_btn.add_css_class("suggested-action")
+        self.shader_bake_btn.connect("clicked", self.on_shader_bake_clicked)
+        self.shader_bake_row.add_suffix(self.shader_bake_btn)
+        shader_group.add(self.shader_bake_row)
+
+        self.shader_progress_row = Adw.PreferencesRow(activatable=False, selectable=False)
+        pbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6,
+                       margin_top=10, margin_bottom=10, margin_start=14, margin_end=14)
+        self.shader_progress_bar = Gtk.ProgressBar(show_text=True, hexpand=True)
+        self.shader_progress_bar.set_fraction(0.0)
+        self.shader_progress_bar.set_text("0%")
+        pbox.append(self.shader_progress_bar)
+        self.shader_progress_row.set_child(pbox)
+        self.shader_progress_row.set_visible(False)
+        shader_group.add(self.shader_progress_row)
+        page.add(shader_group)
 
         dev = Adw.PreferencesGroup(
             title=tr("Для разработчика и диагностики"),
@@ -2590,6 +2623,7 @@ class LauncherWindow(Adw.ApplicationWindow):
         self.reload_from_ini()
         self.update_launch_button()
         self.update_game_status()
+        self.update_shader_bake_status()
         self.append_log(tr("\n— игра завершилась (код {}) —\n").format(status))
         if status != 0 and not stopped_by_user:
             self.switch_page("log")
@@ -2601,7 +2635,186 @@ class LauncherWindow(Adw.ApplicationWindow):
             self.stop_game()
         if self.fsr411_build:
             self.stop_fsr411_build()
+        if self.shader_bake_proc:
+            self.stop_shader_bake()
         return False
+
+    # --- Vulkan Full-Game Shader & PSO Pre-Baker (0% -> 100%) ------------------------------
+
+    def shader_cache_stats(self):
+        cache_dir = self.user_dir() / "cache"
+        if not cache_dir.is_dir():
+            return 0, 0.0
+        count = 0
+        total_bytes = 0
+        try:
+            for root_p, _dirs, files in os.walk(cache_dir):
+                for fn in files:
+                    try:
+                        total_bytes += os.path.getsize(os.path.join(root_p, fn))
+                        count += 1
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+        return count, total_bytes / (1024.0 * 1024.0)
+
+    def update_shader_bake_status(self, subtitle_override=None):
+        baking = self.shader_bake_proc is not None
+        if hasattr(self, "shader_bake_btn"):
+            self.shader_bake_btn.set_label(tr("Отменить") if baking else tr("Запечь все шейдеры"))
+            self.shader_bake_btn.remove_css_class("suggested-action" if baking else "destructive-action")
+            self.shader_bake_btn.add_css_class("destructive-action" if baking else "suggested-action")
+        if hasattr(self, "shader_progress_row"):
+            self.shader_progress_row.set_visible(baking)
+        if not hasattr(self, "shader_bake_row"):
+            return
+        if subtitle_override is not None:
+            self.shader_bake_row.set_subtitle(subtitle_override)
+            return
+        if baking:
+            return
+        count, mib = self.shader_cache_stats()
+        if count == 0:
+            self.shader_bake_row.set_subtitle(
+                tr("Кэш шейдеров пуст — запечётся автоматически в фоне при входе в игру (или нажмите «Запечь все шейдеры»)"))
+        elif count >= 8000:
+            self.shader_bake_row.set_subtitle(
+                tr("✓ Кэш готов: {} файлов • {:.1f} МБ (все шейдеры предкомпилированы)").format(count, mib))
+        else:
+            self.shader_bake_row.set_subtitle(
+                tr("Частичный кэш: {} файлов • {:.1f} МБ — остальное допечётся в фоне в игре или по кнопке «Запечь все шейдеры»").format(count, mib))
+
+    def on_clear_shader_cache(self, _btn):
+        if self.process is not None or self.shader_bake_proc is not None:
+            self.toasts.add_toast(Adw.Toast(title=tr(
+                "Сначала закройте запущенную игру перед компиляцией или очисткой кэша шейдеров")))
+            return
+        cache_dir = self.user_dir() / "cache"
+        if cache_dir.is_dir():
+            for child in list(cache_dir.iterdir()):
+                try:
+                    if child.is_dir():
+                        shutil.rmtree(child, ignore_errors=True)
+                    else:
+                        child.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        self.update_shader_bake_status()
+        self.toasts.add_toast(Adw.Toast(title=tr("Кэш шейдеров очищен (сохранения не затронуты)")))
+
+    def on_shader_bake_clicked(self, _btn):
+        if self.shader_bake_proc is not None:
+            self.stop_shader_bake()
+            return
+        if self.process is not None:
+            self.toasts.add_toast(Adw.Toast(title=tr(
+                "Сначала закройте запущенную игру перед компиляцией или очисткой кэша шейдеров")))
+            return
+        self.store()
+        gdir = self.game_dir()
+        if not (gdir / "eboot.bin").is_file():
+            self.switch_page("game")
+            self.toasts.add_toast(Adw.Toast(title=tr(
+                "Укажите папку игры с eboot.bin во вкладке «Игра, Звук и Моды»")))
+            return
+        probe_bin = binaries_dir() / "bb-probe"
+        if not probe_bin.is_file():
+            probe_bin = PORT_DIR / "out" / "bb-probe"
+        if not probe_bin.is_file():
+            self.alert("bb-probe", f"Missing binary: {probe_bin}")
+            return
+
+        env = game_environment(self.settings)
+        launcher = Gio.SubprocessLauncher.new(
+            Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_MERGE)
+        launcher.set_environ([f"{k}={v}" for k, v in env.items()])
+        launcher.set_cwd(str(PORT_DIR))
+        cmd = ["setsid", str(probe_bin), "--bake-shaders", str(gdir), str(self.user_dir())]
+        try:
+            self.shader_bake_proc = launcher.spawnv(cmd)
+        except GLib.Error as error:
+            self.toasts.add_toast(Adw.Toast(title=tr("Не удалось запустить: {}").format(error.message)))
+            return
+
+        self.shader_bake_cancelled = False
+        self.shader_progress_bar.set_fraction(0.0)
+        self.shader_progress_bar.set_text("0%")
+        self.append_log(f"\n=== Vulkan Shader Pre-Bake: {gdir} -> {self.user_dir() / 'cache'} ===\n")
+        self.update_shader_bake_status(
+            tr("Подготовка Vulkan и сканирование архивов .shaderbnd.dcx…"))
+        self.update_launch_button()
+
+        stream = Gio.DataInputStream.new(self.shader_bake_proc.get_stdout_pipe())
+        stream.read_line_async(GLib.PRIORITY_DEFAULT, None, self.on_shader_bake_line)
+        self.shader_bake_proc.wait_async(None, self.on_shader_bake_done)
+
+    def on_shader_bake_line(self, stream, result):
+        try:
+            line, _length = stream.read_line_finish_utf8(result)
+        except GLib.Error:
+            return
+        if line is None:
+            return
+        self.append_log(line + "\n")
+        if self.shader_bake_proc is not None:
+            m_prog = re.search(
+                r"\[BB-BAKE\]\s+PROGRESS\s+pct=(\d+)\s+done=(\d+)\s+total=(\d+)\s+spv_built=(\d+)\s+cached=(\d+)\s+pso=(\d+)\s+phase=(\S+)",
+                line,
+            )
+            if m_prog:
+                pct, done_n, total_n, built_n, cached_n, pso_n, phase = m_prog.groups()
+                pct_i = max(0, min(100, int(pct)))
+                self.shader_progress_bar.set_fraction(pct_i / 100.0)
+                msg = tr("{}% — {} / {} шейдеров (новых: {}, кэш: {}, PSO: {}, этап: {})").format(
+                    pct_i, done_n, total_n, built_n, cached_n, pso_n, phase)
+                self.shader_progress_bar.set_text(msg)
+                self.shader_bake_row.set_subtitle(msg)
+            else:
+                m_done = re.search(
+                    r"\[BB-BAKE\]\s+DONE\s+elapsed_s=([\d.]+)\s+programs=(\d+).*?cs_pso=(\d+)\s+gfx_pso=(\d+)\s+cache_mib=([\d.]+)",
+                    line,
+                )
+                if m_done:
+                    el, progs, cs_n, gfx_n, mib_s = m_done.groups()
+                    self._last_bake_summary = tr(
+                        "✓ Готово за {:.1f} с: {} программ, {} CS + {} GFX PSO ({:.1f} МБ)"
+                    ).format(float(el), progs, cs_n, gfx_n, float(mib_s))
+        stream.read_line_async(GLib.PRIORITY_DEFAULT, None, self.on_shader_bake_line)
+
+    def stop_shader_bake(self):
+        if not self.shader_bake_proc:
+            return
+        self.shader_bake_cancelled = True
+        pid = int(self.shader_bake_proc.get_identifier())
+        try:
+            os.killpg(pid, signal.SIGTERM)
+        except OSError:
+            self.shader_bake_proc.force_exit()
+
+    def on_shader_bake_done(self, process, result):
+        try:
+            process.wait_finish(result)
+        except GLib.Error:
+            pass
+        status = process.get_exit_status() if process.get_if_exited() else -1
+        cancelled = self.shader_bake_cancelled
+        self.shader_bake_cancelled = False
+        self.shader_bake_proc = None
+        summary = getattr(self, "_last_bake_summary", None)
+        self._last_bake_summary = None
+        self.update_launch_button()
+        if status == 0:
+            self.update_shader_bake_status(summary)
+            if summary:
+                self.toasts.add_toast(Adw.Toast(title=summary, timeout=6))
+        elif cancelled:
+            self.update_shader_bake_status()
+            self.toasts.add_toast(Adw.Toast(title=tr("Компиляция шейдеров отменена")))
+        else:
+            err = tr("Ошибка компиляции шейдеров (код {}) — подробности во вкладке «Журнал»").format(status)
+            self.update_shader_bake_status(err)
+            self.toasts.add_toast(Adw.Toast(title=err, timeout=8))
 
     # --- FSR 4.1.1 from the user's DLL -----------------------------------------------------
 

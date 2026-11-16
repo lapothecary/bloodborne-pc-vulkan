@@ -88,6 +88,8 @@ int bbgpu_camera_look(float yaw, float pitch);
 int bbgpu_rebuild_shader_caches(void);
 /* One cache directory (RebuildCaches' child where there is no fork: bb-probe --rebuild-shader-cache). */
 int bbgpu_rebuild_shader_cache(const char *dir);
+/* Full-game multi-threaded Vulkan shader & PSO pre-baker (0% -> 100% progress on stdout). */
+int bbgpu_bake_shaders(const char *game_dir, const char *user_dir);
 int bbgpu_predict_shaders_test(const char *cache_dir, const char *pack, const char *game_dir,
                                const char *out_dir, int jobs);
 int bbgpu_merge_shader_metas(const char *cache_dir, const char *pack, const char *game_dir,

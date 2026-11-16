@@ -617,6 +617,34 @@ EN = {
         "Please close the running game first before installing an update",
     "Обновление установлено! Перезапуск лаунчера…": "Update installed! Restarting Launcher…",
     "Ошибка обновления: {}": "Update failed: {}",
+    "Предкомпиляция и кэш шейдеров Vulkan (0% → 100%, Zero-Stutter)":
+        "Vulkan Shader Cache & Pre-Compilation (0% → 100%, Zero-Stutter)",
+    "Недостающие шейдеры тихо допекаются сами в фоне во время игры (~10–15% ЦП, без потери FPS). Здесь можно вручную запечь сразу все 2 880 шейдеров (~1.5–2 мин) или очистить кэш":
+        "Missing shaders automatically pre-bake silently in the background while playing (~10–15% CPU, zero FPS impact). You can also pre-bake all 2,880 shaders upfront here (~1.5–2 min) or clear the cache",
+    "Статус кэша шейдеров Vulkan": "Vulkan shader cache status",
+    "Запечь все шейдеры": "Bake All Shaders",
+    "Очистить кэш": "Clear Cache",
+    "Кэш шейдеров пуст — запечётся автоматически в фоне при входе в игру (или нажмите «Запечь все шейдеры»)":
+        "Shader cache is empty — will pre-bake silently in the background in-game (or click 'Bake All Shaders')",
+    "✓ Кэш готов: {} файлов • {:.1f} МБ (все шейдеры предкомпилированы)":
+        "✓ Cache ready: {} files • {:.1f} MB (all shaders pre-compiled)",
+    "Частичный кэш: {} файлов • {:.1f} МБ — остальное допечётся в фоне в игре или по кнопке «Запечь все шейдеры»":
+        "Partial cache: {} files • {:.1f} MB — remaining shaders pre-bake in-game or via 'Bake All Shaders'",
+    "Сначала закройте запущенную игру перед компиляцией или очисткой кэша шейдеров":
+        "Please close the running game first before baking or clearing the shader cache",
+    "Укажите папку игры с eboot.bin во вкладке «Игра, Звук и Моды»":
+        "Please select the game folder containing eboot.bin in the 'Game, Audio & Mods' tab",
+    "Кэш шейдеров очищен (сохранения не затронуты)":
+        "Shader cache cleared (save data untouched)",
+    "Подготовка Vulkan и сканирование архивов .shaderbnd.dcx…":
+        "Initializing Vulkan and scanning .shaderbnd.dcx archives…",
+    "{}% — {} / {} шейдеров (новых: {}, кэш: {}, PSO: {}, этап: {})":
+        "{}% — {} / {} shaders (built: {}, cached: {}, PSO: {}, stage: {})",
+    "✓ Готово за {:.1f} с: {} программ, {} CS + {} GFX PSO ({:.1f} МБ)":
+        "✓ Baked in {:.1f}s: {} programs, {} CS + {} GFX PSOs ({:.1f} MB)",
+    "Ошибка компиляции шейдеров (код {}) — подробности во вкладке «Журнал»":
+        "Shader bake failed (code {}) — see the 'Log' tab for details",
+    "Компиляция шейдеров отменена": "Shader compilation cancelled",
 }
 
 PT_BR = {

@@ -302,6 +302,13 @@ inline std::atomic<std::uint32_t> mouse_ev_per_poll_min{0xFFFFFFFFu}, mouse_ev_p
 inline std::atomic<std::uint32_t> frame_number{0};
 inline std::atomic<std::uint32_t> guest_frame_number{1};
 inline std::atomic<std::uint64_t> preupload_bytes{0};
+/// [BB-HITCH] Real-time first-hit / shader / PSO / asset hitch telemetry (0 ns overhead on normal frames).
+inline std::atomic<std::uint64_t> hitch_spv_sync_ns{0}, hitch_spv_sync_count{0};
+inline std::atomic<std::uint64_t> hitch_pso_sync_ns{0}, hitch_pso_sync_count{0};
+inline std::atomic<std::uint64_t> hitch_pso_async_count{0};
+/// Polite invisible background shader auto-baker telemetry (Title Screen / gameplay).
+inline std::atomic<bool> shader_autobake_active{false};
+inline std::atomic<std::uint32_t> shader_autobake_done{0}, shader_autobake_total{0};
 /// Device memory allocated (VMA blocks, arena residency) and freed, bytes.
 inline std::atomic<std::uint64_t> device_alloc_bytes{0}, device_free_bytes{0};
 /// Memory statistics: registered images (their guest size) and how many; the buffer cache's VRAM

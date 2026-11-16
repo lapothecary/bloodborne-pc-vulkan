@@ -1098,6 +1098,26 @@ void Menu() {
     }
 
     ImGui::SeparatorText(BbSettings::MenuText("Other", "Прочее"));
+    {
+        const bool baking = BbStats::shader_autobake_active.load(std::memory_order_relaxed);
+        const std::uint32_t done_n = BbStats::shader_autobake_done.load(std::memory_order_relaxed);
+        const std::uint32_t total_n = BbStats::shader_autobake_total.load(std::memory_order_relaxed);
+        if (baking && total_n > 0) {
+            const float frac = std::clamp(float(done_n) / float(total_n), 0.0f, 1.0f);
+            ImGui::TextColored(
+                ImVec4(0.45f, 0.80f, 1.0f, 1.0f),
+                BbSettings::MenuText("Vulkan Shaders: Background Auto-Bake %u%% (%u / %u)",
+                                     "Шейдеры Vulkan: фоновая предкомпиляция %u%% (%u / %u)"),
+                unsigned(frac * 100.0f), done_n, total_n);
+            ImGui::ProgressBar(frac, ImVec2(-1.0f, 0.0f));
+        } else if (total_n > 0) {
+            ImGui::TextColored(
+                ImVec4(0.45f, 0.90f, 0.55f, 1.0f),
+                BbSettings::MenuText("Vulkan Shaders: 100%% Ready (%u pre-compiled)",
+                                     "Шейдеры Vulkan: 100%% готовы (%u предкомпилировано)"),
+                done_n);
+        }
+    }
     Checkbox(BbSettings::MenuText("Debug & Pipeline Telemetry Overlay (FPS / DirectVk Stats)",
                                   "Оверлей телеметрии и отладки (FPS / Статистика DirectVk)"),
              s.show_fps);

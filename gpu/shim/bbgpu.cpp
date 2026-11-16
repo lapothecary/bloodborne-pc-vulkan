@@ -42,6 +42,8 @@
 #include "core/signals.h"
 #include "sdl_window.h"
 #include "render/rasterizer.h"
+#include "render/scheduler.h"
+#include "vulkan/instance.h"
 
 extern "C" {
 // runtime_memory.c
@@ -598,6 +600,91 @@ extern "C" int bbgpu_rebuild_shader_caches(void) {
 extern "C" int bbgpu_rebuild_shader_cache(const char* dir) {
     (void)dir;
     return 0;
+}
+
+namespace {
+std::string ReadSerialFromSfo(const std::filesystem::path& game_dir) {
+    const auto sfo_path = game_dir / "sce_sys" / "param.sfo";
+    FILE* f = std::fopen(sfo_path.string().c_str(), "rb");
+    if (!f) {
+        return "CUSA03173";
+    }
+    std::vector<u8> buf(16384);
+    const size_t n = std::fread(buf.data(), 1, buf.size(), f);
+    std::fclose(f);
+    if (n < 20 || std::memcmp(buf.data(), "\0PSF", 4) != 0) {
+        return "CUSA03173";
+    }
+    u32 key_off = 0, data_off = 0, count = 0;
+    std::memcpy(&key_off, buf.data() + 8, 4);
+    std::memcpy(&data_off, buf.data() + 12, 4);
+    std::memcpy(&count, buf.data() + 16, 4);
+    for (u32 i = 0; i < count && 20u + (i + 1u) * 16u <= n; ++i) {
+        const u8* ent = buf.data() + 20u + i * 16u;
+        u16 k_rel = 0;
+        u32 d_len = 0, d_rel = 0;
+        std::memcpy(&k_rel, ent + 0, 2);
+        std::memcpy(&d_len, ent + 4, 4);
+        std::memcpy(&d_rel, ent + 12, 4);
+        if (key_off + k_rel < n &&
+            std::strcmp(reinterpret_cast<const char*>(buf.data() + key_off + k_rel), "TITLE_ID") == 0 &&
+            data_off + d_rel + d_len <= n && d_len > 0) {
+            std::string id(reinterpret_cast<const char*>(buf.data() + data_off + d_rel),
+                           strnlen(reinterpret_cast<const char*>(buf.data() + data_off + d_rel), d_len));
+            if (!id.empty()) {
+                return id;
+            }
+        }
+    }
+    return "CUSA03173";
+}
+} // namespace
+
+extern "C" int bbgpu_bake_shaders(const char* game_dir_cstr, const char* user_dir_cstr) {
+    if (!game_dir_cstr || !*game_dir_cstr) {
+        std::fprintf(stderr, "[BB-BAKE] ERROR: empty game_dir\n");
+        return 1;
+    }
+    const std::filesystem::path game_dir{game_dir_cstr};
+    if (user_dir_cstr && *user_dir_cstr) {
+#ifdef _WIN32
+        _putenv_s("BB_GPU_USER_DIR", user_dir_cstr);
+#else
+        setenv("BB_GPU_USER_DIR", user_dir_cstr, 1);
+#endif
+    }
+    BbSettings::Load();
+    const std::string serial = ReadSerialFromSfo(game_dir);
+    Game::Select(serial.c_str());
+    Common::ElfInfo::Instance().Set(serial, "Bloodborne", 0x04508001u, 0);
+    Core::Signals::Instance();
+
+    Vulkan::Instance instance(EmulatorSettings.GetGpuId(), false);
+    Vulkan::Scheduler scheduler(instance);
+    const std::array<u32, 2> families = {instance.GetGraphicsQueueFamilyIndex(),
+                                         instance.GetReadbackQueueFamilyIndex()};
+    const bool shared = static_cast<bool>(instance.GetReadbackQueue());
+    const vk::BufferCreateInfo probe_ci = {
+        .flags =
+            vk::BufferCreateFlagBits::eSparseBinding | vk::BufferCreateFlagBits::eSparseResidency,
+        .size = u64{1} << 32,
+        .usage = vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst |
+                 vk::BufferUsageFlagBits::eUniformBuffer | vk::BufferUsageFlagBits::eStorageBuffer |
+                 vk::BufferUsageFlagBits::eIndexBuffer | vk::BufferUsageFlagBits::eVertexBuffer |
+                 vk::BufferUsageFlagBits::eIndirectBuffer |
+                 vk::BufferUsageFlagBits::eShaderDeviceAddress,
+        .sharingMode = shared ? vk::SharingMode::eConcurrent : vk::SharingMode::eExclusive,
+        .queueFamilyIndexCount = shared ? 2u : 0u,
+        .pQueueFamilyIndices = shared ? families.data() : nullptr,
+    };
+    const vk::DeviceBufferMemoryRequirements req_info = {.pCreateInfo = &probe_ci};
+    const auto reqs = instance.GetDevice().getBufferMemoryRequirements(req_info).memoryRequirements;
+    const u64 block_size =
+        Common::AlignUp(std::max<u64>(reqs.alignment, u64{16384}), reqs.alignment);
+    const u32 sparse_page_shift = static_cast<u32>(std::bit_width(block_size) - 1);
+
+    Vulkan::PipelineCache cache(instance, scheduler, nullptr, sparse_page_shift);
+    return cache.BakeAllGameShaders(game_dir);
 }
 
 extern "C" int bbgpu_predict_shaders_test(const char* cache_dir, const char* pack,

@@ -772,8 +772,22 @@ void PipelineCache::WarmUp() {
         }
     }
 
+    // Phase 3B: Preload any standalone pre-baked ShaderMeta entries (from --bake-shaders) that are
+    // not yet referenced by a PipelineKey so all ~2,880 game shaders sit warm in program_cache.
+    Store().ForEachBlob(BbCache::BlobType::ShaderMeta, [&](std::vector<u8>&& data) {
+        try {
+            Serialization::Archive meta_ar{std::move(data)};
+            const Shader::Info* out_info = nullptr;
+            vk::ShaderModule out_mod{};
+            Shader::RuntimeInfo out_rt{};
+            std::optional<Shader::Gcn::FetchShaderData> out_fetch{};
+            PreloadStage(meta_ar, out_info, out_mod, out_rt, out_fetch);
+        } catch (const std::exception&) {
+        }
+    });
+
     if ((!had_driver_cache || driver_cache_dirty.load(std::memory_order_relaxed)) &&
-        total_items > 0) {
+        (total_items > 0 || !program_cache.empty())) {
         SaveDriverPipelineCache();
     }
 
@@ -833,6 +847,7 @@ void PipelineCache::WarmUp() {
 }
 
 void PipelineCache::Sync() {
+    StopBackgroundAutoBake();
     if (driver_cache_dirty.load(std::memory_order_relaxed)) {
         SaveDriverPipelineCache();
     }

@@ -96,8 +96,11 @@ struct PipelineSelection {
     std::optional<Shader::Gcn::FetchShaderData> fetch_shader{};
     GraphicsPipelineKey graphics_key{};
     bool motion = false;
+    bool async_probe = false;
+    bool async_spv_miss = false;
     DrawIndirectParams draw_indirect_params{};
     struct PrepWorker* worker{}; ///< set: read-only selection for a draw-preparation worker
+    struct AsyncCompileCtx* async_ctx{}; ///< set: background SPV+PSO compilation worker context
 };
 
 /// A draw-preparation worker's own program state (see vk_draw_prep.h).
@@ -242,6 +245,9 @@ public:
         return profile;
     }
 
+    /// Full-game multi-threaded shader & PSO pre-baker ("0% -> 100%" from dvdroot_ps4/shader/*.shaderbnd.dcx).
+    int BakeAllGameShaders(const std::filesystem::path& game_dir);
+
 private:
     bool RefreshGraphicsKey(PipelineSelection& sel);
     bool RefreshGraphicsStages(PipelineSelection& sel);
@@ -255,6 +261,10 @@ private:
     vk::ShaderModule CompileModule(Shader::Info& info, Shader::RuntimeInfo& runtime_info,
                                    std::span<const u32> code, size_t perm_idx,
                                    Shader::Backend::Bindings& binding);
+    vk::ShaderModule CompileModuleRaw(Shader::Pools& use_pools, Shader::Info& info,
+                                      Shader::RuntimeInfo& runtime_info, std::span<const u32> code,
+                                      size_t perm_idx, Shader::Backend::Bindings& binding,
+                                      std::vector<u32>* out_raw_spv, std::vector<u32>* out_opt_spv);
     const Shader::RuntimeInfo& BuildRuntimeInfo(PipelineSelection& sel, Shader::HwStage stage,
                                                 Shader::SwStage l_stage);
 
@@ -300,6 +310,8 @@ private:
     /// instead of the game standing still for the driver (18 ms a pipeline on a GTX 1060, 1-4 s
     /// hitches on a first session). Other passes (one-time renders) compile at once.
     struct PendingPipeline;
+    struct AsyncSpvJob;
+    struct AutoBakeReadyStage;
     /// Per render target (its address): the frames in a row draws went to it.
     struct TargetStreak {
         u32 last_frame = ~0u;
@@ -309,7 +321,25 @@ private:
     bool AsyncSkippable(const PipelineSelection& sel, bool indirect);
     const GraphicsPipeline* CompileInBackground(const PipelineSelection& sel);
     const GraphicsPipeline* FinishPipeline(const GraphicsPipelineKey& key, PendingPipeline& job);
+    void DrainCompletedAsyncSpvJobs();
+    bool QueueAsyncSpvJob(DrawIndirectParams params, bool indirect);
+    Result GetProgramAsyncWorker(PipelineSelection& sel, Shader::HwStage hw_stage,
+                                 Shader::SwStage sw_stage, const Shader::ShaderParams& params,
+                                 Shader::Backend::Bindings& binding);
+    void StartBackgroundAutoBake();
+    void StopBackgroundAutoBake();
+    void DrainAutoBakeReadyStages();
     tsl::robin_map<GraphicsPipelineKey, std::shared_ptr<PendingPipeline>> pending_graphics;
+    tsl::robin_map<u64, std::shared_ptr<AsyncSpvJob>> pending_spv_jobs;
+    std::mutex async_spv_mutex;
+    std::vector<std::shared_ptr<AsyncSpvJob>> completed_spv_jobs;
+    std::atomic<bool> has_completed_spv{false};
+    std::mutex autobake_mutex;
+    std::vector<std::shared_ptr<AutoBakeReadyStage>> autobake_ready;
+    std::atomic<bool> autobake_has_ready{false};
+    std::atomic<bool> autobake_stop{false};
+    std::thread autobake_thread;
+    u32 last_autobake_drain_frame = ~0u;
     std::unordered_map<u64, TargetStreak> target_streaks;
 
     /// Block 4 (BB_FAST_SELECT, default on): 2,048-entry (512 sets x 4 ways) direct Stage A

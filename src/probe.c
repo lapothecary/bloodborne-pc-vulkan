@@ -448,6 +448,18 @@ int main(int argc, char **argv) {
                                            strtoull(argv[6], NULL, 16));
     if (argc == 3 && !strcmp(argv[1], "--rebuild-shader-cache"))
         return bbgpu_rebuild_shader_cache(argv[2]);
+    if (argc == 4 && !strcmp(argv[1], "--bake-shaders")) {
+        struct sigaction sa_bake = {0};
+        sa_bake.sa_sigaction = fault;
+        sa_bake.sa_flags = SA_SIGINFO;
+        sigemptyset(&sa_bake.sa_mask);
+        sigaction(SIGSEGV, &sa_bake, NULL);
+        sigaction(SIGBUS, &sa_bake, NULL);
+        gpu_enabled = 1;
+        int rc = bbgpu_bake_shaders(argv[2], argv[3]);
+        fflush(NULL);
+        _exit(rc);
+    }
     if (argc == 9 && !strcmp(argv[1], "--merge-shader-metas"))
         return bbgpu_merge_shader_metas(argv[2], argv[3], argv[4], argv[5], argv[6], argv[7], atoi(argv[8]));
 #ifndef _WIN32
@@ -495,6 +507,11 @@ int main(int argc, char **argv) {
         runtime_content_configure(values);
     }
     if (app0) {
+#ifdef _WIN32
+        if (!getenv("BB_GAME_DIR")) _putenv_s("BB_GAME_DIR", app0);
+#else
+        setenv("BB_GAME_DIR", app0, 0);
+#endif
         runtime_file_configure(app0, user_dir ? user_dir : "user");
         char sfo[4096], id[16]="";
         snprintf(sfo,sizeof(sfo),"%s/sce_sys/param.sfo",app0);

@@ -15,6 +15,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import shutil
 import signal
 import subprocess
@@ -947,6 +948,8 @@ class AdwLauncherWindow:
         self.current_page = "display"
         self._update_info = None
         self._update_busy = False
+        self.shader_bake_proc = None
+        self.shader_bake_cancelled = False
 
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -1055,6 +1058,7 @@ class AdwLauncherWindow:
         self.update_game_status()
         self.update_user_status()
         self.update_upscaler_status()
+        self.update_shader_bake_status()
 
     def _on_canvas_resize(self, event):
         w = max(560, event.width)
@@ -1380,6 +1384,31 @@ class AdwLauncherWindow:
             active=self.settings.get("native_shaders", True),
             on_change=lambda _v: self.store(),
         )
+
+        shader_grp = AdwPreferencesGroup(
+            page,
+            title="Vulkan Shader Cache & Pre-Compilation (0% → 100%, Zero-Stutter)",
+            description="Missing shaders automatically pre-bake silently in the background while playing (~10–15% CPU, zero FPS impact). You can also pre-bake all 2,880 shaders upfront here (~1.5–2 min) or clear the cache",
+        )
+        self.shader_bake_row = AdwRowBase(
+            shader_grp,
+            title="Vulkan shader cache status",
+            subtitle="Checking shader cache…",
+        )
+        self.shader_bake_btn = make_flat_btn(self.shader_bake_row.right, "Bake All Shaders", self.on_shader_bake_clicked)
+        self.shader_bake_btn.configure(bg=ACCENT_BLUE, activebackground=ACCENT_BLUE_HOV)
+        self.shader_bake_btn.pack(side=tk.RIGHT, padx=(6, 0))
+        self.clear_cache_btn = make_flat_btn(self.shader_bake_row.right, "Clear Cache", self.on_clear_shader_cache)
+        self.clear_cache_btn.pack(side=tk.RIGHT)
+
+        self.shader_prog_wrap = tk.Frame(shader_grp.card, bg=BG_CARD, padx=16, pady=10)
+        self.shader_prog_canvas = tk.Canvas(
+            self.shader_prog_wrap, height=18, bg="#222222", highlightthickness=1, highlightbackground="#3a3a3a"
+        )
+        self.shader_prog_canvas.pack(fill=tk.X, expand=True)
+        self._shader_prog_pct = 0
+        self._shader_prog_txt = "0%"
+        self.shader_prog_canvas.bind("<Configure>", lambda _e: self._draw_shader_progress())
 
         dev = AdwPreferencesGroup(
             page,
@@ -2020,11 +2049,17 @@ class AdwLauncherWindow:
 
     def update_launch_button(self):
         running = self.process is not None
+        baking = self.shader_bake_proc is not None
         self.play_btn.configure(
             text="   Stop   " if running else "   Play   ",
             bg=ACCENT_RED if running else ACCENT_BLUE,
             activebackground="#c01820" if running else ACCENT_BLUE_HOV,
+            state="disabled" if baking else "normal",
         )
+        if hasattr(self, "shader_bake_btn"):
+            self.shader_bake_btn.configure(state="disabled" if running else "normal")
+        if hasattr(self, "clear_cache_btn"):
+            self.clear_cache_btn.configure(state="disabled" if (running or baking) else "normal")
 
     # --- Two-Way Persistence (bbport.ini <-> Launcher.py <-> Bloodborne.exe) ------------
 
@@ -2432,6 +2467,7 @@ class AdwLauncherWindow:
                 self.process = None
                 self.reload_from_ini(force=True)
                 self.update_launch_button()
+                self.update_shader_bake_status()
                 self.append_log(f"\n— the game exited (code {code}) —\n")
                 if code != 0 and not stopped:
                     self.switch_page("log")
@@ -2439,6 +2475,206 @@ class AdwLauncherWindow:
             self.root.after(0, on_done)
 
         threading.Thread(target=reader, daemon=True).start()
+
+    # --- Vulkan Full-Game Shader & PSO Pre-Baker (0% -> 100%) ---------------------------
+
+    def shader_cache_stats(self):
+        cache_dir = self.user_dir() / "cache"
+        if not cache_dir.is_dir():
+            return 0, 0.0
+        count = 0
+        total_bytes = 0
+        try:
+            for root_p, _dirs, files in os.walk(cache_dir):
+                for fn in files:
+                    try:
+                        total_bytes += os.path.getsize(os.path.join(root_p, fn))
+                        count += 1
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+        return count, total_bytes / (1024.0 * 1024.0)
+
+    def _draw_shader_progress(self):
+        if not hasattr(self, "shader_prog_canvas"):
+            return
+        c = self.shader_prog_canvas
+        c.delete("all")
+        w = max(1, c.winfo_width())
+        h = max(1, c.winfo_height())
+        pct = max(0, min(100, int(self._shader_prog_pct)))
+        fill_w = int(round((w * pct) / 100.0))
+        if fill_w > 0:
+            c.create_rectangle(0, 0, fill_w, h, fill=ACCENT_BLUE, outline="")
+        c.create_text(w // 2, h // 2, text=self._shader_prog_txt, fill=FG_TITLE, font=("Segoe UI", 8, "bold"))
+
+    def update_shader_bake_status(self, subtitle_override=None):
+        baking = self.shader_bake_proc is not None
+        if hasattr(self, "shader_bake_btn"):
+            self.shader_bake_btn.configure(
+                text="Cancel" if baking else "Bake All Shaders",
+                bg=ACCENT_RED if baking else ACCENT_BLUE,
+                activebackground="#c01820" if baking else ACCENT_BLUE_HOV,
+            )
+        if hasattr(self, "shader_prog_wrap"):
+            if baking:
+                if not self.shader_prog_wrap.winfo_ismapped():
+                    self.shader_prog_wrap.pack(fill=tk.X)
+                self._draw_shader_progress()
+            else:
+                self.shader_prog_wrap.pack_forget()
+        if not hasattr(self, "shader_bake_row"):
+            return
+        if subtitle_override is not None:
+            self.shader_bake_row.set_subtitle(subtitle_override)
+            return
+        if baking:
+            return
+        count, mib = self.shader_cache_stats()
+        if count == 0:
+            self.shader_bake_row.set_subtitle(
+                "Shader cache is empty — will pre-bake silently in-game (or click 'Bake All Shaders')"
+            )
+        elif count >= 8000:
+            self.shader_bake_row.set_subtitle(
+                f"✓ Cache ready: {count:,} files  •  {mib:.1f} MB (all shaders pre-compiled)"
+            )
+        else:
+            self.shader_bake_row.set_subtitle(
+                f"Partial cache: {count:,} files  •  {mib:.1f} MB — remaining shaders pre-bake in-game or via 'Bake All Shaders'"
+            )
+
+    def on_clear_shader_cache(self):
+        if self.process is not None or self.shader_bake_proc is not None:
+            return
+        cache_dir = self.user_dir() / "cache"
+        if cache_dir.is_dir():
+            for child in list(cache_dir.iterdir()):
+                with contextlib.suppress(OSError):
+                    if child.is_dir():
+                        shutil.rmtree(child, ignore_errors=True)
+                    else:
+                        child.unlink(missing_ok=True)
+        self.update_shader_bake_status()
+
+    def on_shader_bake_clicked(self):
+        if self.shader_bake_proc is not None:
+            self.stop_shader_bake()
+            return
+        if self.process is not None:
+            messagebox.showwarning("Bloodborne PC Vulkan", "Please close the running game first.")
+            return
+        self.store()
+        gdir = self.game_dir()
+        if not (gdir / "eboot.bin").is_file():
+            self.switch_page("game")
+            messagebox.showwarning(
+                "Bloodborne PC Vulkan",
+                "Please select your Bloodborne game folder containing eboot.bin first.",
+            )
+            return
+        exe = "bb-probe.exe" if sys.platform == "win32" else "bb-probe"
+        probe_bin = None
+        for d in ("bin", "out"):
+            cand = PORT_DIR / d / exe
+            if cand.is_file():
+                probe_bin = cand
+                break
+        if not probe_bin:
+            messagebox.showerror("Bloodborne PC Vulkan", f"Missing {exe} in bin/ or out/.")
+            return
+
+        env = dict(os.environ)
+        env["BB_CONFIG"] = str(INI_FILE)
+        env["BB_GAME_DIR"] = str(gdir)
+        env["BB_NATIVE_SHADERS"] = "1" if self.settings.get("native_shaders", True) else "0"
+        cmd = [str(probe_bin), "--bake-shaders", str(gdir), str(self.user_dir())]
+        try:
+            self.shader_bake_proc = subprocess.Popen(
+                cmd, env=env, cwd=str(PORT_DIR),
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                creationflags=NO_WINDOW,
+            )
+        except OSError as err:
+            messagebox.showerror("Bloodborne PC Vulkan", f"Could not start shader baker: {err}")
+            return
+
+        self.shader_bake_cancelled = False
+        self._shader_prog_pct = 0
+        self._shader_prog_txt = "0%"
+        self.append_log(f"\n=== Vulkan Shader Pre-Bake: {gdir} -> {self.user_dir() / 'cache'} ===\n")
+        self.update_shader_bake_status("Initializing Vulkan and scanning .shaderbnd.dcx archives…")
+        self.update_launch_button()
+
+        def reader():
+            proc = self.shader_bake_proc
+            last_summary = None
+            if proc and proc.stdout:
+                for raw in proc.stdout:
+                    line = raw.decode("utf-8", errors="replace")
+                    self.append_log(line)
+                    m_prog = re.search(
+                        r"\[BB-BAKE\]\s+PROGRESS\s+pct=(\d+)\s+done=(\d+)\s+total=(\d+)\s+spv_built=(\d+)\s+cached=(\d+)\s+pso=(\d+)\s+phase=(\S+)",
+                        line,
+                    )
+                    if m_prog:
+                        pct, done_n, total_n, built_n, cached_n, pso_n, phase = m_prog.groups()
+                        pct_i = max(0, min(100, int(pct)))
+                        msg = f"{pct_i}% — {done_n} / {total_n} shaders (built: {built_n}, cached: {cached_n}, PSO: {pso_n}, stage: {phase})"
+
+                        def ui_upd(p=pct_i, m=msg):
+                            if self.shader_bake_proc is None:
+                                return
+                            self._shader_prog_pct = p
+                            self._shader_prog_txt = f"{p}%  ({phase})"
+                            self._draw_shader_progress()
+                            self.shader_bake_row.set_subtitle(m)
+
+                        self.root.after(0, ui_upd)
+                    else:
+                        m_done = re.search(
+                            r"\[BB-BAKE\]\s+DONE\s+elapsed_s=([\d.]+)\s+programs=(\d+).*?cs_pso=(\d+)\s+gfx_pso=(\d+)\s+cache_mib=([\d.]+)",
+                            line,
+                        )
+                        if m_done:
+                            el, progs, cs_n, gfx_n, mib_s = m_done.groups()
+                            last_summary = (
+                                f"✓ Baked in {float(el):.1f}s: {progs} programs, "
+                                f"{cs_n} CS + {gfx_n} GFX PSOs ({float(mib_s):.1f} MB)"
+                            )
+            code = proc.wait() if proc else -1
+
+            def on_done():
+                cancelled = self.shader_bake_cancelled
+                self.shader_bake_cancelled = False
+                self.shader_bake_proc = None
+                self.update_launch_button()
+                if code == 0:
+                    self.update_shader_bake_status(last_summary)
+                elif cancelled:
+                    self.update_shader_bake_status()
+                else:
+                    self.update_shader_bake_status(
+                        f"⚠ Shader bake failed (code {code}) — see the 'Log' tab for details"
+                    )
+
+            self.root.after(0, on_done)
+
+        threading.Thread(target=reader, daemon=True).start()
+
+    def stop_shader_bake(self):
+        if not self.shader_bake_proc:
+            return
+        self.shader_bake_cancelled = True
+        with contextlib.suppress(OSError):
+            if sys.platform == "win32":
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(self.shader_bake_proc.pid)],
+                    creationflags=NO_WINDOW, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+            else:
+                self.shader_bake_proc.terminate()
 
     def stop_game(self):
         if not self.process:
@@ -2458,6 +2694,8 @@ class AdwLauncherWindow:
         self.store()
         if self.process:
             self.stop_game()
+        if self.shader_bake_proc:
+            self.stop_shader_bake()
         self.root.destroy()
 
 

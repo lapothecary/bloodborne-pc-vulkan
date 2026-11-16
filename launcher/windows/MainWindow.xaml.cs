@@ -20,6 +20,7 @@ public partial class MainWindow : Window
     private readonly Store store = new();
     private string language = "ru";
     private Process? game;
+    private Process? shaderBaker;
     private readonly StringBuilder log = new();
     private List<(string Index, string Name, bool Best)>? gpus;
     /// The switches other settings follow (enabled_by), in the section shown.
@@ -98,6 +99,17 @@ public partial class MainWindow : Window
         ["is_primary"] = (", основной", ", primary"),
         ["first_pad"] = ("Авто (первый подключённый)", "Auto (the first connected)"),
         ["not_connected"] = ("{0} (не подключён)", "{0} (not connected)"),
+        ["bake_group"] = ("Предкомпиляция и кэш шейдеров Vulkan (0% → 100%, Zero-Stutter)",
+                          "Vulkan Shader Cache & Pre-Compilation (0% → 100%, Zero-Stutter)"),
+        ["bake_title"] = ("Статус кэша шейдеров Vulkan", "Vulkan shader cache status"),
+        ["bake_desc"] = ("Недостающие шейдеры тихо допекаются сами в фоне во время игры (~10–15% ЦП). Здесь можно вручную запечь сразу все 2 880 шейдеров или очистить кэш.",
+                         "Missing shaders automatically pre-bake silently in the background while playing (~10–15% CPU). You can also pre-bake all 2,880 shaders here or clear the cache."),
+        ["bake_btn"] = ("Запечь все шейдеры", "Bake All Shaders"),
+        ["bake_cancel"] = ("Отменить", "Cancel"),
+        ["bake_clear"] = ("Очистить кэш", "Clear Cache"),
+        ["bake_empty"] = ("Кэш пуст — запечётся в фоне в игре или нажмите «Запечь все шейдеры»",
+                          "Cache is empty — will pre-bake silently in-game or click 'Bake All Shaders'"),
+        ["bake_ready"] = ("✓ Кэш готов: {0} файлов • {1:F1} МБ", "✓ Cache ready: {0} files • {1:F1} MB"),
     };
 
     public MainWindow()
@@ -268,6 +280,15 @@ public partial class MainWindow : Window
                 dependents.Add((card, by));
         }
         UpdateDependents();
+        if ((string?)section["id"] == "performance")
+        {
+            Items.Children.Add(new TextBlock
+            {
+                Text = T("bake_group"), FontSize = 14, FontWeight = FontWeights.SemiBold,
+                Margin = new Thickness(2, 22, 0, 8),
+            });
+            Items.Children.Add(BuildShaderBakeCard());
+        }
     }
 
     private void UpdateDependents()
@@ -1083,4 +1104,155 @@ public partial class MainWindow : Window
     }
 
     private void OnCopyLog(object sender, RoutedEventArgs e) => Clipboard.SetText(log.ToString());
+
+    private FrameworkElement BuildShaderBakeCard()
+    {
+        string UserDir() => store.Get("user_dir") is { Length: > 0 } u ? u : Path.Combine(Store.DataDir, "user");
+        var statusNote = new TextBlock { FontSize = 12, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 4, 0, 0) };
+        statusNote.SetResourceReference(TextBlock.ForegroundProperty, "AccentTextFillColorPrimaryBrush");
+        var bar = new ProgressBar { Minimum = 0, Maximum = 100, Height = 8, Margin = new Thickness(0, 8, 0, 0), Visibility = Visibility.Collapsed };
+
+        var bakeBtn = new Button { Padding = new Thickness(14, 6, 14, 6), Margin = new Thickness(8, 0, 0, 0) };
+        bakeBtn.SetResourceReference(StyleProperty, "AccentButtonStyle");
+        var clearBtn = new Button { Content = T("bake_clear"), Padding = new Thickness(12, 6, 12, 6) };
+
+        void RefreshStatus(string? overrideText = null)
+        {
+            var baking = shaderBaker is not null;
+            bakeBtn.Content = baking ? T("bake_cancel") : T("bake_btn");
+            clearBtn.IsEnabled = !baking && game is null;
+            bakeBtn.IsEnabled = game is null;
+            bar.Visibility = baking ? Visibility.Visible : Visibility.Collapsed;
+            if (overrideText is not null)
+            {
+                statusNote.Text = overrideText;
+                return;
+            }
+            if (baking)
+                return;
+            var cacheDir = Path.Combine(UserDir(), "cache");
+            long bytes = 0;
+            int files = 0;
+            if (Directory.Exists(cacheDir))
+            {
+                foreach (var f in Directory.EnumerateFiles(cacheDir, "*", SearchOption.AllDirectories))
+                {
+                    try { bytes += new FileInfo(f).Length; files++; } catch (IOException) { }
+                }
+            }
+            statusNote.Text = files == 0 ? T("bake_empty") : string.Format(T("bake_ready"), files, bytes / (1024.0 * 1024.0));
+        }
+
+        clearBtn.Click += (_, _) =>
+        {
+            if (game is not null || shaderBaker is not null) return;
+            var cacheDir = Path.Combine(UserDir(), "cache");
+            if (Directory.Exists(cacheDir))
+            {
+                try { Directory.Delete(cacheDir, recursive: true); } catch (IOException) { }
+            }
+            RefreshStatus();
+        };
+
+        bakeBtn.Click += (_, _) =>
+        {
+            if (shaderBaker is not null)
+            {
+                try { shaderBaker.Kill(entireProcessTree: true); } catch (Exception) { }
+                return;
+            }
+            if (GameProblem() is { } problem)
+            {
+                MessageBox.Show(this, problem, "Bloodborne", MessageBoxButton.OK, MessageBoxImage.Warning);
+                return;
+            }
+            var probeExe = Path.Combine(Store.PackageDir, "bin", "bb-probe.exe");
+            if (!File.Exists(probeExe))
+                probeExe = Path.Combine(Store.PackageDir, "out", "bb-probe.exe");
+            if (!File.Exists(probeExe))
+            {
+                MessageBox.Show(this, $"Missing bb-probe.exe: {probeExe}", "Bloodborne", MessageBoxButton.OK, MessageBoxImage.Error);
+                return;
+            }
+            store.Save();
+            bar.Value = 0;
+            var psi = new ProcessStartInfo(probeExe)
+            {
+                WorkingDirectory = Store.PackageDir, UseShellExecute = false, CreateNoWindow = true,
+                RedirectStandardOutput = true, RedirectStandardError = true,
+                StandardOutputEncoding = Encoding.UTF8, StandardErrorEncoding = Encoding.UTF8,
+            };
+            psi.ArgumentList.Add("--bake-shaders");
+            psi.ArgumentList.Add(store.Get("game_dir"));
+            psi.ArgumentList.Add(UserDir());
+            shaderBaker = new Process { StartInfo = psi, EnableRaisingEvents = true };
+            void HandleLine(string? line)
+            {
+                if (line is null) return;
+                AddLine(line);
+                if (line.Contains("[BB-BAKE] PROGRESS") || line.Contains("[BB-BAKE] DONE"))
+                {
+                    Dispatcher.BeginInvoke(() =>
+                    {
+                        var pctIdx = line.IndexOf("pct=", StringComparison.Ordinal);
+                        if (pctIdx >= 0)
+                        {
+                            var rest = line[(pctIdx + 4)..];
+                            var sp = rest.IndexOf(' ');
+                            if (int.TryParse(sp > 0 ? rest[..sp] : rest, out var p))
+                                bar.Value = Math.Clamp(p, 0, 100);
+                        }
+                        statusNote.Text = line.Replace("[BB-BAKE] ", "");
+                    });
+                }
+            }
+            shaderBaker.OutputDataReceived += (_, ev) => HandleLine(ev.Data);
+            shaderBaker.ErrorDataReceived += (_, ev) => HandleLine(ev.Data);
+            shaderBaker.Exited += (_, _) => Dispatcher.BeginInvoke(() =>
+            {
+                shaderBaker?.Dispose();
+                shaderBaker = null;
+                RefreshStatus();
+            });
+            try
+            {
+                shaderBaker.Start();
+                shaderBaker.BeginOutputReadLine();
+                shaderBaker.BeginErrorReadLine();
+                RefreshStatus("0%...");
+            }
+            catch (Exception err)
+            {
+                shaderBaker = null;
+                MessageBox.Show(this, err.Message, "Bloodborne", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+        };
+
+        RefreshStatus();
+        var left = new StackPanel { VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 16, 0) };
+        left.Children.Add(new TextBlock { Text = T("bake_title"), FontSize = 14, TextWrapping = TextWrapping.Wrap });
+        left.Children.Add(new TextBlock { Text = T("bake_desc"), FontSize = 12, TextWrapping = TextWrapping.Wrap, Opacity = 0.72, Margin = new Thickness(0, 2, 0, 0) });
+        left.Children.Add(statusNote);
+        left.Children.Add(bar);
+
+        var right = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
+        right.Children.Add(clearBtn);
+        right.Children.Add(bakeBtn);
+
+        var grid = new Grid();
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        Grid.SetColumn(right, 1);
+        grid.Children.Add(left);
+        grid.Children.Add(right);
+
+        var card = new Border
+        {
+            Child = grid, Padding = new Thickness(16, 12, 16, 12), Margin = new Thickness(0, 0, 0, 12),
+            CornerRadius = new CornerRadius(6), BorderThickness = new Thickness(1),
+        };
+        card.SetResourceReference(Border.BackgroundProperty, "CardBackgroundFillColorDefaultBrush");
+        card.SetResourceReference(Border.BorderBrushProperty, "CardStrokeColorDefaultBrush");
+        return card;
+    }
 }

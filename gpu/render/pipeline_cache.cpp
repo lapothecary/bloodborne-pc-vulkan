@@ -22,6 +22,7 @@
 #include "bbport_settings.h"
 #include "bbport_toggles.h"
 #include "buffers/buffer_cache.h"
+#include "buffers/direct_buffers.h"
 #include "common/hash.h"
 #include "common/io_file.h"
 #include "common/path_util.h"
@@ -300,6 +301,46 @@ struct PipelineCache::PendingPipeline {
     GraphicsPipeline::SerializationSupport sdata{};
 };
 
+struct AsyncCompileCtx {
+    struct StageSnap {
+        bool valid = false;
+        VAddr pgm_base = 0;
+        u64 hash = 0;
+        std::array<u32, Gcn::NUM_USER_DATA> user_data{};
+        std::vector<u32> code;
+    };
+    struct BuiltStage {
+        HwStage hw_stage{};
+        SwStage sw_stage{};
+        u64 hash = 0;
+        VAddr pgm_base = 0;
+        size_t assumed_perm = 0;
+        Shader::Info info;
+        Shader::StageSpecialization spec;
+        vk::ShaderModule module;
+        std::vector<u32> raw_spv;
+        std::vector<u32> opt_spv;
+    };
+    std::array<StageSnap, 8> stages{};
+    std::vector<u32> vs_copy_code;
+    u64 vs_copy_hash = 0;
+    std::deque<std::vector<u32>> owned_blobs; // CUE / FetchShader copies referenced by user_data
+    std::deque<Shader::Info> owned_infos;     // Stable Info clones for hits/builds during worker key refresh
+    std::deque<BuiltStage> built_stages;
+    bool failed = false;
+};
+
+struct PipelineCache::AsyncSpvJob {
+    u64 sig = 0;
+    Gcn::Regs regs_copy{};
+    DrawIndirectParams params{};
+    AsyncCompileCtx ctx{};
+    GraphicsPipelineKey key{};
+    std::unique_ptr<GraphicsPipeline> pipeline;
+    GraphicsPipeline::SerializationSupport sdata{};
+    bool ok = false;
+};
+
 using Gcn::RegDirty;
 
 struct PipelineCache::FastSelect {
@@ -461,23 +502,40 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
       profile{MakeProfile(instance_, sparse_page_shift)} {
     fast = std::make_unique<FastSelect>();
     mt_fast = std::make_unique<MtFastPsoTable>();
-    sel.regs = &liverpool->regs;
+    sel.regs = liverpool ? &liverpool->regs : nullptr;
     WarmUp();
 
     const char* async_env = std::getenv("BB_ASYNC_PIPELINES");
     if (!(async_env && async_env[0] == '0') && instance.IsVertexInputDynamicState()) {
         const char* thr_env = std::getenv("BB_ASYNC_PIPELINE_THREADS");
+        const u32 default_threads = std::clamp(std::thread::hardware_concurrency() / 3u, 2u, 8u);
         const u32 threads = std::max(
-            thr_env && *thr_env ? u32(std::strtoul(thr_env, nullptr, 10)) : 2u,
+            thr_env && *thr_env ? u32(std::strtoul(thr_env, nullptr, 10)) : default_threads,
             1u);
         compiler = std::make_unique<PipelineCompiler>(threads);
         std::printf("[bb_vulkan] V4.2 Async PipelineCompiler prewarmed with %u worker threads\n",
                     threads);
     }
+    if (liverpool != nullptr && EmulatorSettings.IsPipelineCacheEnabled()) {
+        StartBackgroundAutoBake();
+    }
 }
 
 PipelineCache::~PipelineCache() {
+    StopBackgroundAutoBake();
     compiler.reset();
+    {
+        std::scoped_lock lk{async_spv_mutex};
+        for (auto& job : completed_spv_jobs) {
+            for (auto& bs : job->ctx.built_stages) {
+                if (bs.module) {
+                    instance.GetDevice().destroyShaderModule(bs.module);
+                }
+            }
+        }
+        completed_spv_jobs.clear();
+        pending_spv_jobs.clear();
+    }
     if (driver_cache_dirty.load(std::memory_order_relaxed)) {
         SaveDriverPipelineCache();
     }
@@ -542,8 +600,11 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(PipelineSelection& se
         // The copy shader (the VS program) moves the GS ring's vertices to the outputs.
         DirectShaders::Snapshot copy_snap;
         const VAddr copy_base = regs.vs_program.Address<VAddr>();
-        if (DirectShaders::TryLookup(copy_base, copy_snap, sel.worker != nullptr) &&
-            copy_snap.cpu_immutable != 0) {
+        if (sel.async_ctx && !sel.async_ctx->vs_copy_code.empty()) {
+            gs.vs_copy = sel.async_ctx->vs_copy_code;
+            gs.vs_copy_hash = sel.async_ctx->vs_copy_hash;
+        } else if (DirectShaders::TryLookup(copy_base, copy_snap, sel.worker != nullptr) &&
+                   copy_snap.cpu_immutable != 0) {
             gs.vs_copy = std::span<const u32>{reinterpret_cast<const u32*>(copy_base),
                                               copy_snap.code_dwords};
             gs.vs_copy_hash = copy_snap.shader_hash;
@@ -1541,6 +1602,11 @@ void PipelineCache::PrintFastSelectStats() {
 
 void PipelineCache::NoteDrawTarget(const Gcn::Regs& regs) {
     const u32 frame = BbStats::frame_number.load(std::memory_order_relaxed);
+    if (frame != last_autobake_drain_frame &&
+        autobake_has_ready.load(std::memory_order_relaxed)) [[unlikely]] {
+        last_autobake_drain_frame = frame;
+        DrainAutoBakeReadyStages();
+    }
     const u64 quick_key =
         (u64(regs.color_buffers[0].base_address) << 32) ^
         (u64(regs.depth_buffer.z_read_base) << 8) ^
@@ -1610,15 +1676,27 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
 
 const GraphicsPipeline* PipelineCache::SelectGraphicsPipelineFull(const DrawIndirectParams params,
                                                                   bool indirect) {
+    DrainCompletedAsyncSpvJobs();
     sel.draw_indirect_params = params;
-    if (!RefreshGraphicsKey(sel)) {
+    const bool skippable = AsyncSkippable(sel, indirect);
+    if (skippable) {
+        sel.async_probe = true;
+        sel.async_spv_miss = false;
+        const bool probe_ok = RefreshGraphicsKey(sel);
+        sel.async_probe = false;
+        if (!probe_ok) {
+            if (sel.async_spv_miss) {
+                QueueAsyncSpvJob(params, indirect);
+            }
+            return nullptr;
+        }
+    } else if (!RefreshGraphicsKey(sel)) {
         return nullptr;
     }
     if (const auto found = graphics_pipelines.find(sel.graphics_key);
         found != graphics_pipelines.end()) {
         return found->second.get();
     }
-    const bool skippable = AsyncSkippable(sel, indirect);
     if (const auto pending = pending_graphics.find(sel.graphics_key);
         pending != pending_graphics.end()) {
         const std::shared_ptr<PendingPipeline> job = pending->second;
@@ -1632,8 +1710,25 @@ const GraphicsPipeline* PipelineCache::SelectGraphicsPipelineFull(const DrawIndi
                 // A pass that is not drawn every frame needs it now: the wait is compile time.
                 const auto start = std::chrono::steady_clock::now();
                 job->cv.wait(lk, [&] { return job->done; });
+                const u64 wait_ns = u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                            std::chrono::steady_clock::now() - start)
+                                            .count());
                 AddCompileTime(start);
                 ++async_waited;
+                BbStats::hitch_pso_sync_ns.fetch_add(wait_ns, std::memory_order_relaxed);
+                BbStats::hitch_pso_sync_count.fetch_add(1, std::memory_order_relaxed);
+                if (wait_ns >= 1'500'000ull) {
+                    const u64 vs_h = sel.infos[0] ? sel.infos[0]->pgm_hash : 0ull;
+                    const u64 ps_h = sel.infos[1] ? sel.infos[1]->pgm_hash : 0ull;
+                    std::printf(
+                        "[BB-HITCH][PSO-WAIT] frame=%u %.2f ms key=%#llx vs=%#llx ps=%#llx draws=%llu\n",
+                        BbStats::frame_number.load(std::memory_order_relaxed),
+                        double(wait_ns) / 1e6,
+                        static_cast<unsigned long long>(std::hash<GraphicsPipelineKey>{}(sel.graphics_key)),
+                        static_cast<unsigned long long>(vs_h),
+                        static_cast<unsigned long long>(ps_h),
+                        static_cast<unsigned long long>(last_frame_draws));
+                }
             }
         }
         pending_graphics.erase(sel.graphics_key);
@@ -1643,6 +1738,7 @@ const GraphicsPipeline* PipelineCache::SelectGraphicsPipelineFull(const DrawIndi
         return CompileInBackground(sel);
     }
 
+    const auto sync_t0 = std::chrono::steady_clock::now();
     const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(sel.graphics_key);
     LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x}", pipeline_hash);
     CompileTimer timer;
@@ -1653,6 +1749,28 @@ const GraphicsPipeline* PipelineCache::SelectGraphicsPipelineFull(const DrawIndi
                                                     sel.modules, sdata, false);
     PipelineStore::SaveGraphics(sel.graphics_key, pipeline_hash, sdata);
     NoteDriverPipelineCacheDirty();
+    const u64 sync_ns = u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - sync_t0)
+                                .count());
+    BbStats::hitch_pso_sync_ns.fetch_add(sync_ns, std::memory_order_relaxed);
+    BbStats::hitch_pso_sync_count.fetch_add(1, std::memory_order_relaxed);
+    if (sync_ns >= 1'500'000ull || last_frame_draws >= 250) {
+        const u64 vs_h = sel.infos[0] ? sel.infos[0]->pgm_hash : 0ull;
+        const u64 ps_h = sel.infos[1] ? sel.infos[1]->pgm_hash : 0ull;
+        const u64 target = sel.regs ? DrawTarget(*sel.regs) : 0ull;
+        const auto st_it = target_streaks.find(target);
+        const u32 st_frames = (target != 0 && st_it != target_streaks.end()) ? st_it->second.frames : 0u;
+        std::printf(
+            "[BB-HITCH][PSO-SYNC] frame=%u %.2f ms key=%#llx vs=%#llx ps=%#llx depth=%u idx=%u "
+            "ind=%u streak=%u target=%#llx draws=%llu\n",
+            BbStats::frame_number.load(std::memory_order_relaxed), double(sync_ns) / 1e6,
+            static_cast<unsigned long long>(pipeline_hash), static_cast<unsigned long long>(vs_h),
+            static_cast<unsigned long long>(ps_h),
+            sel.regs ? unsigned(bool(sel.regs->depth_control.depth_enable)) : 0u,
+            sel.regs ? unsigned(sel.regs->num_indices) : 0u, unsigned(indirect), st_frames,
+            static_cast<unsigned long long>(target),
+            static_cast<unsigned long long>(last_frame_draws));
+    }
     sel.fetch_shader.reset();
     const GraphicsPipeline* result = built.get();
     {
@@ -1678,6 +1796,7 @@ const GraphicsPipeline* PipelineCache::CompileInBackground(const PipelineSelecti
     pending_graphics.emplace(selection.graphics_key, job);
     ++async_started;
     ++g_bb_compiles;
+    BbStats::hitch_pso_async_count.fetch_add(1, std::memory_order_relaxed);
     compiler->Submit([this, job, key = selection.graphics_key, infos = selection.infos,
                       runtime_infos = selection.runtime_infos, fetch = selection.fetch_shader,
                       modules = selection.modules]() mutable {
@@ -2160,26 +2279,33 @@ bool PipelineCache::AsyncSkippable(const PipelineSelection& selection, bool indi
             async_started = async_skipped = async_waited = 0;
         }
     }
-    if (last_frame_draws < 300) {
+    if (last_frame_draws < 150) {
         return false;
     }
     // A full-screen pass (one triangle or quad without depth testing: lighting, fog, post-processing)
     // waits for its pipeline: going without one for a frame left whole frames grey. So does an
-    // indirect draw (its size unknown here). 3D depth-tested geometry (including 6-index blood decals
-    // and hit sparks) may compile asynchronously without stalling the frame.
+    // indirect draw (its size unknown here). 3D depth-tested geometry (including first-frame world
+    // spawn, 6-index blood decals and hit sparks) may compile asynchronously without stalling the frame.
     constexpr u32 FullScreenIndices = 12;
-    if (indirect || (!selection.regs->depth_control.depth_enable &&
-                     selection.regs->num_indices <= FullScreenIndices)) {
+    const bool has_depth =
+        bool(selection.regs->depth_control.depth_enable) &&
+        (selection.regs->depth_buffer.DepthValid() || selection.regs->depth_buffer.StencilValid());
+    if (indirect || (!has_depth && !selection.regs->depth_control.depth_enable &&
+                     selection.regs->num_indices <= FullScreenIndices &&
+                     !selection.regs->blend_control[0].enable)) {
         return false;
     }
-    // A pass drawn every frame: its render target drawn to in each of the last 8 frames (the
-    // scene, the output, shadow maps, half-size and depth-only passes alike). A one-time render
-    // (a face baked for a character, a texture made once) goes to a target new or used now and
-    // then: compiled at once.
-    constexpr u32 PerFrameStreak = 8;
+    if (has_depth) {
+        return true;
+    }
+    // A pass drawn every frame: its render target drawn to in each of the last frames. A one-time
+    // render without depth (a face baked for a character, a texture made once at streak <= 1)
+    // compiles at once so baked atlases never miss their draw; recurring/blended offscreen targets
+    // (such as character Blood Paint RTT masks and HUD elements) compile asynchronously once active.
+    const u32 min_streak = selection.regs->blend_control[0].enable ? 2u : 8u;
     const u64 target = DrawTarget(*selection.regs);
     const auto streak = target_streaks.find(target);
-    return target != 0 && streak != target_streaks.end() && streak->second.frames >= PerFrameStreak;
+    return target != 0 && streak != target_streaks.end() && streak->second.frames >= min_streak;
 }
 
 const ComputePipeline* PipelineCache::GetComputePipeline() {
@@ -2188,8 +2314,9 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
     }
     const auto [it, is_new] = compute_pipelines.try_emplace(compute_key);
     if (is_new) {
-        LOG_INFO(Render_Vulkan, "Compiling compute pipeline {:#x}",
-                 std::hash<ComputePipelineKey>{}(compute_key));
+        const auto sync_t0 = std::chrono::steady_clock::now();
+        const u64 cs_key_hash = std::hash<ComputePipelineKey>{}(compute_key);
+        LOG_INFO(Render_Vulkan, "Compiling compute pipeline {:#x}", cs_key_hash);
         CompileTimer timer;
         ComputePipeline::SerializationSupport sdata{};
         it.value() = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile,
@@ -2197,6 +2324,18 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
                                                        sel.modules[0], sdata, false);
         PipelineStore::SaveCompute(compute_key, sdata);
         NoteDriverPipelineCacheDirty();
+        const u64 sync_ns = u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    std::chrono::steady_clock::now() - sync_t0)
+                                    .count());
+        BbStats::hitch_pso_sync_ns.fetch_add(sync_ns, std::memory_order_relaxed);
+        BbStats::hitch_pso_sync_count.fetch_add(1, std::memory_order_relaxed);
+        if (sync_ns >= 1'000'000ull || last_frame_draws >= 250) {
+            std::printf("[BB-HITCH][CS-SYNC] frame=%u %.2f ms key=%#llx cs=%#llx draws=%llu\n",
+                        BbStats::frame_number.load(std::memory_order_relaxed),
+                        double(sync_ns) / 1e6, static_cast<unsigned long long>(cs_key_hash),
+                        static_cast<unsigned long long>(sel.infos[0] ? sel.infos[0]->pgm_hash : 0ull),
+                        static_cast<unsigned long long>(last_frame_draws));
+        }
     }
     return it->second.get();
 }
@@ -2392,8 +2531,19 @@ bool PipelineCache::RefreshGraphicsStages(PipelineSelection& sel) {
         Shader::ShaderParams params{.user_data = pgm->user_data};
         Program* direct_pgm = nullptr;
         DirectShaders::Snapshot direct_snap;
-        if (DirectShaders::TryLookup(pgm_base, direct_snap, sel.worker != nullptr) &&
-            direct_snap.cpu_immutable != 0) {
+        if (sel.async_ctx) {
+            if (in >= sel.async_ctx->stages.size() || !sel.async_ctx->stages[in].valid) {
+                not_a_program = true;
+                key.stage_hashes[out] = 0;
+                sel.infos[out] = nullptr;
+                return false;
+            }
+            const auto& snap = sel.async_ctx->stages[in];
+            params.user_data = snap.user_data;
+            params.code = snap.code;
+            params.hash = snap.hash;
+        } else if (DirectShaders::TryLookup(pgm_base, direct_snap, sel.worker != nullptr) &&
+                   direct_snap.cpu_immutable != 0) {
             if (copy) {
                 const VAddr copy_base = copy->Address<VAddr>();
                 DirectShaders::Snapshot copy_snap;
@@ -2566,16 +2716,18 @@ bool PipelineCache::RefreshComputeKey() {
     return true;
 }
 
-vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::RuntimeInfo& runtime_info,
-                                              std::span<const u32> code, size_t perm_idx,
-                                              Shader::Backend::Bindings& binding) {
+vk::ShaderModule PipelineCache::CompileModuleRaw(Shader::Pools& use_pools, Shader::Info& info,
+                                                 Shader::RuntimeInfo& runtime_info,
+                                                 std::span<const u32> code, size_t perm_idx,
+                                                 Shader::Backend::Bindings& binding,
+                                                 std::vector<u32>* out_raw_spv,
+                                                 std::vector<u32>* out_opt_spv) {
     LOG_INFO(Render_Vulkan, "Compiling {} shader {:#x} {}", info.hw_stage, info.pgm_hash,
              perm_idx != 0 ? "(permutation)" : "");
     DumpShader(code, info.pgm_hash, info.hw_stage, perm_idx, "bin");
-    CompileTimer timer;
 
-    // BB_SHADER_CAPTURE: the inputs as they were, for the record.
-    const bool capture = BbShaderCapture::Enabled();
+    // BB_SHADER_CAPTURE: only on the main GPU thread (`&use_pools == &pools`).
+    const bool capture = (&use_pools == &pools) && BbShaderCapture::Enabled();
     std::optional<Shader::Info> in_info;
     const auto in_runtime_info = runtime_info;
     const auto in_binding = binding;
@@ -2583,18 +2735,26 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
         in_info.emplace(info);
         BbShaderCapture::Begin();
     }
-    const auto ir_program = Shader::TranslateProgram(code, pools, info, runtime_info, profile);
+    const auto ir_program = Shader::TranslateProgram(code, use_pools, info, runtime_info, profile);
     auto spv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, ir_program, binding);
     if (capture) {
         BbShaderCapture::Write(*in_info, in_runtime_info, profile, in_binding, code, perm_idx, spv,
                                info, binding);
     }
     if (Shader::Backend::SPIRV::SpirvOptEnabled()) {
-        PipelineStore::SaveShaderBinary(std::vector<u32>{spv}, info.pgm_hash, perm_idx);
+        if (out_raw_spv) {
+            *out_raw_spv = spv;
+        } else {
+            PipelineStore::SaveShaderBinary(std::vector<u32>{spv}, info.pgm_hash, perm_idx);
+        }
         Shader::Backend::SPIRV::OptimizeSPIRV(spv, info.pgm_hash);
         DumpShader(spv, info.pgm_hash, info.hw_stage, perm_idx, "spv");
         const vk::ShaderModule module = CompileSPV(spv, instance.GetDevice());
-        PipelineStore::SaveOptShaderBinary(std::move(spv), info.pgm_hash, perm_idx);
+        if (out_opt_spv) {
+            *out_opt_spv = std::move(spv);
+        } else {
+            PipelineStore::SaveOptShaderBinary(std::move(spv), info.pgm_hash, perm_idx);
+        }
         SetObjectName(instance.GetDevice(), module,
                       GetShaderName(info.hw_stage, info.pgm_hash, perm_idx));
         return module;
@@ -2602,9 +2762,41 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
     DumpShader(spv, info.pgm_hash, info.hw_stage, perm_idx, "spv");
 
     const vk::ShaderModule module = CompileSPV(spv, instance.GetDevice());
-    PipelineStore::SaveShaderBinary(std::move(spv), info.pgm_hash, perm_idx);
+    if (out_raw_spv) {
+        *out_raw_spv = std::move(spv);
+    } else {
+        PipelineStore::SaveShaderBinary(std::move(spv), info.pgm_hash, perm_idx);
+    }
     SetObjectName(instance.GetDevice(), module, GetShaderName(info.hw_stage, info.pgm_hash, perm_idx));
     return module;
+}
+
+vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::RuntimeInfo& runtime_info,
+                                              std::span<const u32> code, size_t perm_idx,
+                                              Shader::Backend::Bindings& binding) {
+    const auto spv_t0 = std::chrono::steady_clock::now();
+    struct SpvHitchScope {
+        std::chrono::steady_clock::time_point t0;
+        const Shader::Info& info;
+        size_t perm;
+        u64 draws_hint;
+        ~SpvHitchScope() {
+            const u64 ns = u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                   std::chrono::steady_clock::now() - t0)
+                                   .count());
+            BbStats::hitch_spv_sync_ns.fetch_add(ns, std::memory_order_relaxed);
+            BbStats::hitch_spv_sync_count.fetch_add(1, std::memory_order_relaxed);
+            if (ns >= 1'000'000ull || draws_hint >= 250) {
+                std::printf(
+                    "[BB-HITCH][SPV-SYNC] frame=%u %.2f ms stage=%u hash=%#llx perm=%zu draws=%llu\n",
+                    BbStats::frame_number.load(std::memory_order_relaxed), double(ns) / 1e6,
+                    unsigned(info.hw_stage), static_cast<unsigned long long>(info.pgm_hash), perm,
+                    static_cast<unsigned long long>(draws_hint));
+            }
+        }
+    } spv_hitch{spv_t0, info, perm_idx, last_frame_draws};
+    CompileTimer timer;
+    return CompileModuleRaw(pools, info, runtime_info, code, perm_idx, binding, nullptr, nullptr);
 }
 
 PipelineCache::Result PipelineCache::LookUpProgram(PipelineSelection& sel,
@@ -2677,6 +2869,9 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
                                                 const Shader::ShaderParams& params,
                                                 Shader::Backend::Bindings& binding,
                                                 Program* direct_program) {
+    if (sel.async_ctx) {
+        return GetProgramAsyncWorker(sel, hw_stage, sw_stage, params, binding);
+    }
     auto runtime_info = BuildRuntimeInfo(sel, hw_stage, sw_stage);
     if (sel.worker) {
         return LookUpProgram(sel, runtime_info, params, binding, hw_stage, direct_program);
@@ -2686,6 +2881,10 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
     if (!resolved) {
         const auto found = program_cache.find(params.hash); // this thread is the only writer
         if (found == program_cache.end()) {
+            if (sel.async_probe) {
+                sel.async_spv_miss = true;
+                return {};
+            }
             auto new_program = std::make_unique<Program>(hw_stage, sw_stage, params);
             const auto start = binding;
             const auto module =
@@ -2753,12 +2952,25 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
         program.last_used = perm_idx;
         info.AddBindings(binding);
     } else {
+        if (sel.async_probe) {
+            sel.async_spv_miss = true;
+            return {};
+        }
         perm_idx = modules.size();
         auto new_info = Shader::Info(hw_stage, sw_stage, params);
         const auto module = CompileModule(new_info, runtime_info, params.code, perm_idx, binding);
         std::unique_lock lk{programs_mutex};
-        if (new_info.uses_paged_buffers && !info.uses_paged_buffers) {
-            info.uses_paged_buffers = true;
+        const bool richer_resources =
+            new_info.buffers.size() > info.buffers.size() ||
+            new_info.images.size() > info.images.size() ||
+            new_info.samplers.size() > info.samplers.size();
+        if (richer_resources || (new_info.uses_paged_buffers && !info.uses_paged_buffers)) {
+            if (richer_resources) {
+                static_cast<Shader::InfoPersistent&>(info) =
+                    static_cast<const Shader::InfoPersistent&>(new_info);
+                info.srt_info = new_info.srt_info;
+            }
+            info.uses_paged_buffers |= new_info.uses_paged_buffers;
             info.buffers = new_info.buffers;
             program.info_template = std::make_unique<Shader::Info>(info);
             if (!modules.empty() && modules[0].spec.Valid()) {
@@ -2806,6 +3018,427 @@ void PipelineCache::DumpShader(std::span<const u32> code, u64 hash, HwStage stag
     const auto filename = fmt::format("{}.{}", GetShaderName(stage, hash, perm_idx), ext);
     const auto file = IOFile{dump_dir / filename, FileAccessMode::Create};
     file.WriteSpan(code);
+}
+
+PipelineCache::Result PipelineCache::GetProgramAsyncWorker(PipelineSelection& sel, HwStage hw_stage,
+                                                           SwStage sw_stage,
+                                                           const Shader::ShaderParams& params,
+                                                           Shader::Backend::Bindings& binding) {
+    auto& ctx = *sel.async_ctx;
+    const u32 st_idx = static_cast<u32>(hw_stage);
+    const VAddr true_pgm_base =
+        (st_idx < ctx.stages.size() && ctx.stages[st_idx].valid) ? ctx.stages[st_idx].pgm_base
+                                                                 : params.Base();
+    auto runtime_info = BuildRuntimeInfo(sel, hw_stage, sw_stage);
+
+    // 1. Check if an earlier pass inside this same worker job already built an identical spec.
+    for (auto& bs : ctx.built_stages) {
+        if (bs.hash == params.hash && bs.hw_stage == hw_stage && bs.sw_stage == sw_stage) {
+            Shader::Info cand_info = bs.info;
+            cand_info.pgm_base = true_pgm_base;
+            cand_info.user_data = params.user_data;
+            cand_info.RefreshFlatBuf();
+            if (cand_info.has_fetch_shader &&
+                !FetchCodeDecodes(
+                    Shader::Gcn::GetFetchShaderCode(cand_info, cand_info.fetch_shader_sgpr_base))) {
+                ctx.failed = true;
+                return {};
+            }
+            auto cand_spec = Shader::StageSpecialization(cand_info, runtime_info, profile, binding);
+            if (bs.spec == cand_spec) {
+                cand_info.AddBindings(binding);
+                auto& stored = ctx.owned_infos.emplace_back(std::move(cand_info));
+                return {&stored, bs.module, std::move(cand_spec.fetch_shader_data),
+                        HashCombine(params.hash, bs.assumed_perm)};
+            }
+        }
+    }
+
+    // 2. Check existing program_cache under shared_lock (read-only, zero mutation of Program).
+    size_t existing_mod_count = 0;
+    {
+        std::shared_lock lk{programs_mutex};
+        if (const auto found = program_cache.find(params.hash); found != program_cache.end()) {
+            const Program* prog = found->second.get();
+            existing_mod_count = prog->modules.size();
+            const Shader::Info& tmpl = prog->info_template ? *prog->info_template : prog->info;
+            Shader::Info local_info = tmpl;
+            local_info.pgm_base = true_pgm_base;
+            local_info.user_data = params.user_data;
+            local_info.RefreshFlatBuf();
+            if (local_info.has_fetch_shader &&
+                !FetchCodeDecodes(Shader::Gcn::GetFetchShaderCode(
+                    local_info, local_info.fetch_shader_sgpr_base))) {
+                ctx.failed = true;
+                return {};
+            }
+            auto spec = Shader::StageSpecialization(local_info, runtime_info, profile, binding);
+            const auto it = std::ranges::find(prog->modules, spec, &Program::Module::spec);
+            if (it != prog->modules.end()) {
+                const size_t perm_idx = static_cast<size_t>(std::distance(prog->modules.begin(), it));
+                local_info.AddBindings(binding);
+                auto& stored = ctx.owned_infos.emplace_back(std::move(local_info));
+                return {&stored, it->module, std::move(spec.fetch_shader_data),
+                        HashCombine(params.hash, perm_idx)};
+            }
+        }
+    }
+
+    // 3. Miss: compile GCN -> SPIR-V -> spirv_opt -> VkShaderModule on worker's private Pools!
+    size_t extra_for_hash = 0;
+    for (const auto& bs : ctx.built_stages) {
+        if (bs.hash == params.hash) {
+            ++extra_for_hash;
+        }
+    }
+    const size_t assumed_perm = existing_mod_count + extra_for_hash;
+
+    thread_local std::unique_ptr<Shader::Pools> tls_worker_pools;
+    if (!tls_worker_pools) {
+        tls_worker_pools = std::make_unique<Shader::Pools>();
+    }
+
+    Shader::Info new_info(hw_stage, sw_stage, params);
+    new_info.pgm_base = true_pgm_base;
+    if (new_info.has_fetch_shader) {
+        const u32* fetch =
+            Shader::Gcn::GetFetchShaderCode(new_info, new_info.fetch_shader_sgpr_base);
+        if (!FetchCodeDecodes(fetch)) {
+            ctx.failed = true;
+            return {};
+        }
+    }
+    const auto start_bnd = binding;
+    std::vector<u32> raw_spv;
+    std::vector<u32> opt_spv;
+    const vk::ShaderModule mod = CompileModuleRaw(
+        *tls_worker_pools, new_info, runtime_info, params.code, assumed_perm, binding, &raw_spv,
+        Shader::Backend::SPIRV::SpirvOptEnabled() ? &opt_spv : nullptr);
+    auto spec = Shader::StageSpecialization(new_info, runtime_info, profile, start_bnd);
+    auto fetch_copy = spec.fetch_shader_data;
+    auto& built = ctx.built_stages.emplace_back(AsyncCompileCtx::BuiltStage{
+        .hw_stage = hw_stage,
+        .sw_stage = sw_stage,
+        .hash = params.hash,
+        .pgm_base = true_pgm_base,
+        .assumed_perm = assumed_perm,
+        .info = std::move(new_info),
+        .spec = std::move(spec),
+        .module = mod,
+        .raw_spv = std::move(raw_spv),
+        .opt_spv = std::move(opt_spv),
+    });
+    return {&built.info, mod, std::move(fetch_copy), HashCombine(params.hash, assumed_perm)};
+}
+
+void PipelineCache::DrainCompletedAsyncSpvJobs() {
+    if (!has_completed_spv.load(std::memory_order_acquire)) [[likely]] {
+        return;
+    }
+    std::vector<std::shared_ptr<AsyncSpvJob>> done_jobs;
+    {
+        std::scoped_lock lk{async_spv_mutex};
+        done_jobs.swap(completed_spv_jobs);
+        has_completed_spv.store(false, std::memory_order_relaxed);
+    }
+    for (auto& job : done_jobs) {
+        pending_spv_jobs.erase(job->sig);
+        if (!job->ok) {
+            for (auto& bs : job->ctx.built_stages) {
+                if (bs.module) {
+                    instance.GetDevice().destroyShaderModule(bs.module);
+                }
+            }
+            continue;
+        }
+        bool perm_mismatch = false;
+        for (auto& bs : job->ctx.built_stages) {
+            size_t actual_perm = 0;
+            auto found = program_cache.find(bs.hash);
+            if (found == program_cache.end()) {
+                Shader::ShaderParams dummy_params{
+                    .user_data = std::span<const u32, Gcn::NUM_USER_DATA>{
+                        job->ctx.stages[static_cast<u32>(bs.hw_stage)].user_data},
+                    .code = {},
+                    .hash = bs.hash,
+                };
+                auto new_prog = std::make_unique<Program>(bs.hw_stage, bs.sw_stage, dummy_params);
+                new_prog->info = bs.info;
+                new_prog->info.pgm_base = bs.pgm_base;
+                bs.spec.info = &new_prog->info;
+                actual_perm = 0;
+                if (!bs.raw_spv.empty()) {
+                    PipelineStore::SaveShaderBinary(std::move(bs.raw_spv), bs.hash, 0);
+                }
+                if (!bs.opt_spv.empty()) {
+                    PipelineStore::SaveOptShaderBinary(std::move(bs.opt_spv), bs.hash, 0);
+                }
+                PipelineStore::SaveShaderMeta(new_prog->info, bs.spec, HashCombine(bs.hash, 0), 0);
+                new_prog->AddPermut(bs.module, std::move(bs.spec));
+                bs.module = nullptr;
+                new_prog->info_template = std::make_unique<Shader::Info>(new_prog->info);
+                Program* raw_prog = new_prog.get();
+                {
+                    std::unique_lock lk{programs_mutex};
+                    program_cache.emplace(bs.hash, std::move(new_prog));
+                }
+                DirectShaders::NoteProgramCreated(bs.hash, raw_prog);
+                DirectShaders::AttachProgramToSlot(bs.pgm_base, bs.hash, raw_prog);
+            } else {
+                Program& prog = *found.value();
+                if (!prog.info_template) {
+                    std::unique_lock lk{programs_mutex};
+                    prog.info_template = std::make_unique<Shader::Info>(prog.info);
+                }
+                const auto existing_it =
+                    std::ranges::find(prog.modules, bs.spec, &Program::Module::spec);
+                if (existing_it != prog.modules.end()) {
+                    actual_perm = static_cast<size_t>(std::distance(prog.modules.begin(), existing_it));
+                    if (bs.module) {
+                        instance.GetDevice().destroyShaderModule(bs.module);
+                        bs.module = nullptr;
+                    }
+                } else {
+                    actual_perm = prog.modules.size();
+                    std::unique_lock lk{programs_mutex};
+                    const bool richer_resources =
+                        bs.info.buffers.size() > prog.info.buffers.size() ||
+                        bs.info.images.size() > prog.info.images.size() ||
+                        bs.info.samplers.size() > prog.info.samplers.size();
+                    if (richer_resources ||
+                        (bs.info.uses_paged_buffers && !prog.info.uses_paged_buffers)) {
+                        if (richer_resources) {
+                            static_cast<Shader::InfoPersistent&>(prog.info) =
+                                static_cast<const Shader::InfoPersistent&>(bs.info);
+                            prog.info.srt_info = bs.info.srt_info;
+                        }
+                        prog.info.uses_paged_buffers |= bs.info.uses_paged_buffers;
+                        prog.info.buffers = bs.info.buffers;
+                        prog.info_template = std::make_unique<Shader::Info>(prog.info);
+                        if (!prog.modules.empty() && prog.modules[0].spec.Valid()) {
+                            PipelineStore::SaveShaderMeta(prog.info, prog.modules[0].spec,
+                                                          HashCombine(bs.hash, 0), 0);
+                        }
+                    }
+                    bs.spec.info = &prog.info;
+                    if (!bs.raw_spv.empty()) {
+                        PipelineStore::SaveShaderBinary(std::move(bs.raw_spv), bs.hash, actual_perm);
+                    }
+                    if (!bs.opt_spv.empty()) {
+                        PipelineStore::SaveOptShaderBinary(std::move(bs.opt_spv), bs.hash, actual_perm);
+                    }
+                    PipelineStore::SaveShaderMeta(bs.info, bs.spec,
+                                                  HashCombine(bs.hash, actual_perm), actual_perm);
+                    prog.AddPermut(bs.module, std::move(bs.spec));
+                    bs.module = nullptr;
+                }
+                DirectShaders::AttachProgramToSlot(bs.pgm_base, bs.hash, &prog);
+            }
+            if (actual_perm != bs.assumed_perm) {
+                const u64 expected_stage_hash = HashCombine(bs.hash, bs.assumed_perm);
+                if (job->key.stage_hashes[static_cast<u32>(bs.sw_stage)] == expected_stage_hash) {
+                    perm_mismatch = true;
+                }
+            }
+        }
+        if (!perm_mismatch && job->pipeline) {
+            if (!graphics_pipelines.contains(job->key)) {
+                const u64 pso_hash = std::hash<GraphicsPipelineKey>{}(job->key);
+                PipelineStore::SaveGraphics(job->key, pso_hash, job->sdata);
+                NoteDriverPipelineCacheDirty();
+                std::unique_lock gr_lk{graphics_pipelines_mutex};
+                graphics_pipelines.insert_or_assign(job->key, std::move(job->pipeline));
+            }
+        }
+    }
+}
+
+bool PipelineCache::QueueAsyncSpvJob(DrawIndirectParams params, bool indirect) {
+    (void)indirect;
+    if (!sel.regs) {
+        return false;
+    }
+    if (!compiler) {
+        const char* env = std::getenv("BB_ASYNC_PIPELINE_THREADS");
+        const u32 threads = std::max(
+            env && *env ? u32(std::strtoul(env, nullptr, 10))
+                        : std::clamp(std::thread::hardware_concurrency() / 3u, 2u, 8u),
+            1u);
+        compiler = std::make_unique<PipelineCompiler>(threads);
+    }
+
+    const auto& regs = *sel.regs;
+    VAddr cue_base = 0, cue_end = 0;
+    VideoCore::DirectBuffers::GetTransientCueHeapBounds(cue_base, cue_end);
+
+    auto job = std::make_shared<AsyncSpvJob>();
+    job->regs_copy = regs;
+    job->params = params;
+
+    u64 sig = HashCombine(u64(regs.stage_enable.raw), u64(regs.primitive_type));
+    sig = HashCombine(sig, (u64(std::bit_cast<u32>(regs.depth_control)) << 32) |
+                               u64(regs.color_target_mask.raw));
+    sig = HashCombine(sig, u64(std::bit_cast<u32>(regs.blend_control[0])));
+    sig = HashCombine(sig, (u64(params.vertex_sgpr_offset) << 32) | u64(params.instance_sgpr_offset));
+
+    const auto snap_one_stage = [&](HwStage hw) -> bool {
+        const u32 in = static_cast<u32>(hw);
+        if (!regs.stage_enable.IsStageEnabled(in)) {
+            return true;
+        }
+        const auto* pgm = regs.ProgramForStage(in);
+        const VAddr pgm_base = pgm ? pgm->Address<VAddr>() : 0;
+        if (pgm_base == 0) {
+            return true;
+        }
+        auto& snap = job->ctx.stages[in];
+        DirectShaders::Snapshot direct_snap;
+        if (DirectShaders::TryLookup(pgm_base, direct_snap, /*is_worker=*/false) &&
+            direct_snap.cpu_immutable != 0) {
+            snap.code.assign(reinterpret_cast<const u32*>(pgm_base),
+                             reinterpret_cast<const u32*>(pgm_base) + direct_snap.code_dwords);
+            snap.hash = direct_snap.shader_hash;
+        } else {
+            if (!LooksLikeProgram(reinterpret_cast<const u32*>(pgm_base), hw, true)) {
+                return false;
+            }
+            const auto p = Gcn::GetParams(*pgm);
+            if (!program_cache.contains(p.hash) && !ProgramDecodes(p, hw)) {
+                return false;
+            }
+            snap.code.assign(p.code.begin(), p.code.end());
+            snap.hash = p.hash;
+        }
+        snap.pgm_base = pgm_base;
+        snap.user_data = pgm->user_data;
+        snap.valid = true;
+
+        sig = HashCombine(sig, snap.hash);
+        for (u32 u = 0; u < Gcn::NUM_USER_DATA; ++u) {
+            sig = HashCombine(sig, u64(snap.user_data[u]));
+        }
+
+        // Snapshot CUE EUD tables and FetchShader code referenced by aligned 64-bit user_data
+        // SGPR pairs (s[0:1], s[2:3], ..., s[14:15]) so the background worker never races with CUE reuse.
+        for (u32 i = 0; i + 1 < Gcn::NUM_USER_DATA; i += 2) {
+            const VAddr raw_ptr =
+                (VAddr(snap.user_data[i]) | (VAddr(snap.user_data[i + 1]) << 32)) &
+                0xFFFFFFFFFFFFULL;
+            if (raw_ptr == 0) {
+                continue;
+            }
+            if (cue_base != 0 && raw_ptr >= cue_base && raw_ptr < cue_end && (raw_ptr & 3ULL) == 0) {
+                const size_t copy_bytes =
+                    static_cast<size_t>(std::min<u64>(cue_end - raw_ptr, 1024ULL)) & ~size_t(3);
+                if (copy_bytes >= 16) {
+                    const u32* src = reinterpret_cast<const u32*>(raw_ptr);
+                    auto& blob =
+                        job->ctx.owned_blobs.emplace_back(src, src + (copy_bytes / sizeof(u32)));
+                    const uintptr_t host_ptr = reinterpret_cast<uintptr_t>(blob.data());
+                    snap.user_data[i] = static_cast<u32>(host_ptr);
+                    snap.user_data[i + 1] = static_cast<u32>(host_ptr >> 32);
+                }
+            } else if ((hw == HwStage::Vertex || hw == HwStage::Export || hw == HwStage::Local) &&
+                       raw_ptr >= 0x100000ULL && raw_ptr < (1ULL << 40) && (raw_ptr & 3ULL) == 0) {
+                const u32* fptr = reinterpret_cast<const u32*>(raw_ptr);
+                if (FetchCodeDecodes(fptr)) {
+                    const u32* pc = fptr;
+                    for (u32 ins = 0; ins < 256; ++ins) {
+                        if (GcnIsa::Decode(pc).opcode == GcnIsa::Opcode::S_SETPC_B64) {
+                            break;
+                        }
+                    }
+                    auto& blob = job->ctx.owned_blobs.emplace_back(fptr, pc);
+                    const uintptr_t host_ptr = reinterpret_cast<uintptr_t>(blob.data());
+                    snap.user_data[i] = static_cast<u32>(host_ptr);
+                    snap.user_data[i + 1] = static_cast<u32>(host_ptr >> 32);
+                }
+            }
+        }
+        return true;
+    };
+
+    static constexpr HwStage kSnapStages[] = {HwStage::Fragment, HwStage::Vertex, HwStage::Geometry,
+                                              HwStage::Hull,     HwStage::Export, HwStage::Local};
+    for (HwStage hw : kSnapStages) {
+        if (!snap_one_stage(hw)) {
+            return false;
+        }
+    }
+    if (regs.stage_enable.IsStageEnabled(static_cast<u32>(HwStage::Geometry))) {
+        const VAddr copy_base = regs.vs_program.Address<VAddr>();
+        if (copy_base == 0) {
+            return false;
+        }
+        DirectShaders::Snapshot copy_snap;
+        if (DirectShaders::TryLookup(copy_base, copy_snap, /*is_worker=*/false) &&
+            copy_snap.cpu_immutable != 0) {
+            job->ctx.vs_copy_code.assign(
+                reinterpret_cast<const u32*>(copy_base),
+                reinterpret_cast<const u32*>(copy_base) + copy_snap.code_dwords);
+            job->ctx.vs_copy_hash = copy_snap.shader_hash;
+        } else {
+            if (!LooksLikeProgram(reinterpret_cast<const u32*>(copy_base), HwStage::Vertex, true)) {
+                return false;
+            }
+            const auto cp = Gcn::GetParams(regs.vs_program);
+            job->ctx.vs_copy_code.assign(cp.code.begin(), cp.code.end());
+            job->ctx.vs_copy_hash = cp.hash;
+        }
+        sig = HashCombine(sig, job->ctx.vs_copy_hash);
+    }
+
+    job->sig = sig;
+    if (pending_spv_jobs.contains(sig)) {
+        ++async_skipped;
+        return true;
+    }
+    pending_spv_jobs.emplace(sig, job);
+    ++async_started;
+    ++async_skipped;
+    ++g_bb_compiles;
+    BbStats::hitch_pso_async_count.fetch_add(1, std::memory_order_relaxed);
+
+    compiler->Submit([this, job]() mutable {
+        PipelineSelection wsel{};
+        wsel.regs = &job->regs_copy;
+        wsel.draw_indirect_params = job->params;
+        wsel.async_ctx = &job->ctx;
+
+        bool key_ok = false;
+        sigjmp_buf recover;
+        if (sigsetjmp(recover, 0) == 0) {
+            runtime_fault_recover = &recover;
+            key_ok = RefreshGraphicsKey(wsel) && !job->ctx.failed;
+            runtime_fault_recover = nullptr;
+        } else {
+            runtime_fault_recover = nullptr;
+            key_ok = false;
+        }
+
+        if (key_ok) {
+            job->key = wsel.graphics_key;
+            bool already_built = false;
+            {
+                std::shared_lock gr_lk{graphics_pipelines_mutex};
+                already_built = graphics_pipelines.contains(wsel.graphics_key);
+            }
+            if (!already_built) {
+                job->pipeline = std::make_unique<GraphicsPipeline>(
+                    instance, scheduler, desc_heap, profile, wsel.graphics_key, *pipeline_cache,
+                    wsel.infos, wsel.runtime_infos, wsel.fetch_shader, wsel.modules, job->sdata,
+                    false);
+            }
+            job->ok = true;
+        }
+
+        {
+            std::scoped_lock lk{async_spv_mutex};
+            completed_spv_jobs.push_back(std::move(job));
+            has_completed_spv.store(true, std::memory_order_release);
+        }
+    });
+    return true;
 }
 
 } // namespace Vulkan

@@ -220,6 +220,10 @@ u64 PS4_SYSV_ABI PacerWait(u64 pacer, std::uint32_t reset_flag) {
 
     static u64 prev_pacer_draws = 0;
     static bool was_loading_burst = false;
+    static u64 prev_hitch_spv_ns = 0, prev_hitch_spv_cnt = 0;
+    static u64 prev_hitch_pso_ns = 0, prev_hitch_pso_cnt = 0, prev_hitch_pso_bg = 0;
+    static u64 prev_hitch_imgs = 0, prev_hitch_img_bytes = 0, prev_hitch_buf_bytes = 0;
+    static u64 prev_hitch_rdbk = 0, prev_hitch_faults = 0, prev_hitch_gpu_wait_ns = 0;
     const u64 cur_draws = BbStats::draws.load(std::memory_order_relaxed);
     const u64 frame_draws = (cur_draws >= prev_pacer_draws) ? (cur_draws - prev_pacer_draws) : 0ull;
     prev_pacer_draws = cur_draws;
@@ -228,6 +232,64 @@ u64 PS4_SYSV_ABI PacerWait(u64 pacer, std::uint32_t reset_flag) {
         pacer_epoch.fetch_add(1, std::memory_order_relaxed);
     }
     was_loading_burst = loading_burst;
+
+    {
+        const u64 cur_spv_ns = BbStats::hitch_spv_sync_ns.load(std::memory_order_relaxed);
+        const u64 cur_spv_cnt = BbStats::hitch_spv_sync_count.load(std::memory_order_relaxed);
+        const u64 cur_pso_ns = BbStats::hitch_pso_sync_ns.load(std::memory_order_relaxed);
+        const u64 cur_pso_cnt = BbStats::hitch_pso_sync_count.load(std::memory_order_relaxed);
+        const u64 cur_pso_bg = BbStats::hitch_pso_async_count.load(std::memory_order_relaxed);
+        const u64 cur_imgs = BbStats::images_registered.load(std::memory_order_relaxed);
+        const u64 cur_img_b = BbStats::image_upload_bytes.load(std::memory_order_relaxed);
+        const u64 cur_buf_b = BbStats::buffer_upload_bytes.load(std::memory_order_relaxed);
+        const u64 cur_rdbk = BbStats::readbacks.load(std::memory_order_relaxed);
+        const u64 cur_faults = BbStats::tracker_faults_total.load(std::memory_order_relaxed);
+        const u64 cur_gpu_w = BbStats::sync_recording_ns.load(std::memory_order_relaxed) +
+                              BbStats::tick_wait_ns.load(std::memory_order_relaxed) +
+                              BbStats::present_wait_ns.load(std::memory_order_relaxed);
+
+        if (!loading_burst && frame_draws >= 250 && pacer_prev_exit_ns != 0 &&
+            entry_ns >= pacer_prev_exit_ns) {
+            const u64 wall_ns = entry_ns - pacer_prev_exit_ns;
+            if (wall_ns >= 20'000'000ull && wall_ns < 5'000'000'000ull) [[unlikely]] {
+                const u64 cpu_ns = (have_entry_cpu && pacer_prev_exit_cpu_ns != 0 &&
+                                    entry_cpu_ns >= pacer_prev_exit_cpu_ns)
+                                       ? (entry_cpu_ns - pacer_prev_exit_cpu_ns)
+                                       : 0ull;
+                const u64 wait_ns = (wall_ns > cpu_ns) ? (wall_ns - cpu_ns) : 0ull;
+                std::printf(
+                    "[BB-HITCH][FRAME] frame=%u wall=%.2f ms (main_cpu=%.2f ms, main_wait=%.2f ms "
+                    "| spv_sync=%.2f ms [%llu], pso_sync=%.2f ms [%llu], pso_bg=%llu | tex_new=%llu "
+                    "[%.2f MiB], buf_up=%.2f MiB, rdbk=%llu, faults=%llu, gpu_wait=%.2f ms | "
+                    "draws=%llu)\n",
+                    BbStats::frame_number.load(std::memory_order_relaxed), double(wall_ns) / 1e6,
+                    double(cpu_ns) / 1e6, double(wait_ns) / 1e6,
+                    double(cur_spv_ns - prev_hitch_spv_ns) / 1e6,
+                    static_cast<unsigned long long>(cur_spv_cnt - prev_hitch_spv_cnt),
+                    double(cur_pso_ns - prev_hitch_pso_ns) / 1e6,
+                    static_cast<unsigned long long>(cur_pso_cnt - prev_hitch_pso_cnt),
+                    static_cast<unsigned long long>(cur_pso_bg - prev_hitch_pso_bg),
+                    static_cast<unsigned long long>(cur_imgs - prev_hitch_imgs),
+                    double(cur_img_b - prev_hitch_img_bytes) / (1024.0 * 1024.0),
+                    double(cur_buf_b - prev_hitch_buf_bytes) / (1024.0 * 1024.0),
+                    static_cast<unsigned long long>(cur_rdbk - prev_hitch_rdbk),
+                    static_cast<unsigned long long>(cur_faults - prev_hitch_faults),
+                    double(cur_gpu_w - prev_hitch_gpu_wait_ns) / 1e6,
+                    static_cast<unsigned long long>(frame_draws));
+            }
+        }
+        prev_hitch_spv_ns = cur_spv_ns;
+        prev_hitch_spv_cnt = cur_spv_cnt;
+        prev_hitch_pso_ns = cur_pso_ns;
+        prev_hitch_pso_cnt = cur_pso_cnt;
+        prev_hitch_pso_bg = cur_pso_bg;
+        prev_hitch_imgs = cur_imgs;
+        prev_hitch_img_bytes = cur_img_b;
+        prev_hitch_buf_bytes = cur_buf_b;
+        prev_hitch_rdbk = cur_rdbk;
+        prev_hitch_faults = cur_faults;
+        prev_hitch_gpu_wait_ns = cur_gpu_w;
+    }
 
     const float target_s = live ? live->shortest : 0.0f;
     u64 period_ns =
