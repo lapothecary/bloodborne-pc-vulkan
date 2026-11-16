@@ -533,51 +533,7 @@ static void pack_matrix15(uint8_t out[5],int tx,int ty) {
     out[3]=(uint8_t)(v>>8);
     out[4]=(uint8_t)v;
 }
-/* Reverses the item rows' depths of the ControllSetting layout in `buf` (an uncompressed GFX). */
-static int fix_option_layout(uint8_t *buf,size_t size) {
-    if (size<16 || memcmp(buf,"GFX",3)) return 0;
-    const size_t rect=(5+4*(buf[8]>>3)+7)/8, first=8+rect+4;
-    static const char wanted[]="OptionSetting_fla._Option_ItemList_71";
-    unsigned code; size_t body,len,next;
-    long sprite=-1;
-    for (size_t at=first; swf_tag(buf,at,size,&code,&body,&len,&next) && code; at=next) {
-        if (code!=76 || len<2) continue;          /* SymbolClass: ids and class names */
-        size_t p=body+2;
-        for (unsigned i=0,n=buf[body] | buf[body+1]<<8; i<n && p+2<next; ++i) {
-            unsigned id=buf[p] | buf[p+1]<<8;
-            const char *name=(const char *)buf+p+2;
-            if (!memchr(name,0,next-p-2)) return 0;
-            if (!strcmp(name,wanted)) sprite=id;
-            p+=2+strlen(name)+1;
-        }
-    }
-    if (sprite<0) return 0;
-    for (size_t at=first; swf_tag(buf,at,size,&code,&body,&len,&next) && code; at=next) {
-        if (code!=39 || len<4 || (buf[body] | buf[body+1]<<8)!=sprite) continue;
-        /* The items' depths as placed (frame 0), Item_0_0 .. Item_6_0. */
-        unsigned depth[7]={0};
-        size_t inner,ilen,inext;
-        unsigned c;
-        for (size_t t=body+4; swf_tag(buf,t,next,&c,&inner,&ilen,&inext) && c && c!=1; t=inext) {
-            if (c!=26 && c!=70) continue;
-            const char *name=swf_place_name(buf+inner,c,ilen);
-            const uint8_t *d=swf_depth(buf,c,inner,ilen);
-            if (name && d && !strncmp(name,"Item_",5) && name[5]>='0' && name[5]<='6' && !strcmp(name+6,"_0"))
-                depth[name[5]-'0']=d[0] | d[1]<<8;
-        }
-        for (int i=0;i<7;++i) if (!depth[i] || (i && depth[i]<=depth[i-1])) return 0;
-        for (size_t t=body+4; swf_tag(buf,t,next,&c,&inner,&ilen,&inext) && c; t=inext) {
-            uint8_t *d=swf_depth(buf,c,inner,ilen);
-            if (!d) continue;
-            const unsigned v=d[0] | d[1]<<8;
-            for (int i=0;i<7;++i) {
-                if (v==depth[i]) { d[0]=depth[6-i]&0xff; d[1]=depth[6-i]>>8; break; }
-            }
-        }
-        return 1;
-    }
-    return 0;
-}
+int runtime_patch_optionsetting_gfx(const uint8_t *src,size_t size,uint8_t **out_buf,size_t *out_size);
 /* Appends a 6th row slot (`Item_5_0`) to `Top.CommandList` in `title*.gfx` so all 6 Title Menu
  * items (`Continue`, `Load Game`, `New Game`, `System`, `Log In` / `Information`, `Exit Game`)
  * render simultaneously without scrolling. */
@@ -693,17 +649,17 @@ static int menu_layout_file(const char *guest,int host) {
     if (pread(host,buf,(size_t)s.st_size,0)!=s.st_size) { free(buf); return host; }
     uint8_t *write_buf=buf;
     size_t write_size=(size_t)s.st_size;
+    uint8_t *patched=NULL;
+    size_t patched_size=0;
     if (is_option) {
-        if (!fix_option_layout(buf,write_size)) { free(buf); return host; }
+        if (!runtime_patch_optionsetting_gfx(buf,write_size,&patched,&patched_size)) { free(buf); return host; }
     } else {
-        uint8_t *patched=NULL;
-        size_t patched_size=0;
         if (!fix_title_layout(buf,write_size,&patched,&patched_size)) { free(buf); return host; }
-        free(buf);
-        buf=patched;
-        write_buf=patched;
-        write_size=patched_size;
     }
+    free(buf);
+    buf=patched;
+    write_buf=patched;
+    write_size=patched_size;
     int fixed=memfd_create(is_option ? "optionsetting.gfx" : "title.gfx",MFD_CLOEXEC);
     if (fixed<0 || write(fixed,write_buf,write_size)!=(ssize_t)write_size || lseek(fixed,0,SEEK_SET)) {
         if (fixed>=0) close(fixed);
@@ -714,7 +670,7 @@ static int menu_layout_file(const char *guest,int host) {
     if (is_option) {
         static int told_opt;
         if (!__atomic_exchange_n(&told_opt,1,__ATOMIC_RELAXED))
-            printf("Runtime: %s: the settings rows stack downwards (pop-up lists cover the rows below)\n",guest);
+            printf("Runtime: %s: expanded System (7 rows) & Controls/Display/Effects (11 rows + gothic ScrollBarV) to [32..1048]\n",guest);
     } else {
         static int told_title;
         if (!__atomic_exchange_n(&told_title,1,__ATOMIC_RELAXED))

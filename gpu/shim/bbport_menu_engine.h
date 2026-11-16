@@ -2,6 +2,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include "common/types.h"
@@ -89,10 +90,15 @@ inline constexpr u64 BindCommandList      = 0x1bea820; // (out_step, menu, cmd_l
 inline constexpr u64 TitleMenuBindRet     = 0x1b4adb8; // Return VMA of BindCommandList call inside TitleMenuBuilder
 
 // Scaleform GFx MovieClip (`0x60`-byte wrapper) & Value operations
+inline constexpr u64 SetMovieClipPosition = 0x1acb8c0; // (GFxMovieClip* mc, int x, int y)
+inline constexpr u64 SetMovieClipScale    = 0x1acba50; // (GFxMovieClip* mc, float scale_x, float scale_y)
 inline constexpr u64 GetSubMovieClip      = 0x1adb220; // (GFxMovieClip* out, const GFxMovieClip* parent, const char* fmt, ...)
 inline constexpr u64 LookupChildPath      = 0x1f6c8a0; // (GFxValueHolder* out, const GFxValueHolder* parent, const String* path)
 inline constexpr u64 SetMovieClipVisible  = 0x1adb7f0; // vtable+0x08 on GFxMovieClip: (GFxMovieClip* mc, bool visible)
 inline constexpr u64 SetMovieClipIntText  = 0x1ad9e90; // (GFxMovieClip* mc_plus_8, int value)
+inline constexpr u64 ScrollBarVInit       = 0x1adbd20; // (ScrollBarV* self, const GFxMovieClip* clip, int visible_rows)
+inline constexpr u64 ScrollBarVSetScroll  = 0x1adc580; // (ScrollBarV* self, int scroll_index)
+inline constexpr u64 ScrollBarVSetTotal   = 0x1adc670; // (ScrollBarV* self, int total_items)
 inline constexpr u64 MovieClipBaseVtable  = 0x539a070; // Base vtable (+0x10) restored on stack GFxMovieClip destruction
 
 // Scaleform `ListComponent` (`0x2b8` bytes)
@@ -133,6 +139,15 @@ inline constexpr u64 GetHorizontalStep    = 0x1adfdd0; // (const u8* input) -> i
 inline constexpr u64 IsConfirmPressed     = 0x1adfec0; // (const u8* input) -> bool
 inline constexpr u64 IsLeftPressed        = 0x1ae0890; // (const u8* input) -> bool
 inline constexpr u64 IsRightPressed       = 0x1ae0970; // (const u8* input) -> bool
+
+// GameDataMan, CSOptionsData (`0x80`B at `userdata0010 + 0x04`), and FrpgSaveLoadMan
+inline constexpr u64 GameDataManPtr          = 0x553b130; // GameDataMan** (+0x48 = CSOptionsData*)
+inline constexpr u64 FrpgSaveLoadManPtr      = 0x5556678; // FrpgSaveLoadMan** (+0x1548 = req_save_sys, +0x1554 = save_state)
+inline constexpr u64 DeserializeOptionsData  = 0x14ef0b0; // (CSOptionsData* self, DLStream* stream) -> int
+inline constexpr u64 CommitPageToOptions     = 0x14ef550; // (CSOptionsData* dst, const OptionPageSettings* src)
+inline constexpr u64 CopyOptionsToPage       = 0x14ef730; // (const CSOptionsData* src, OptionPageSettings* dst)
+inline constexpr u64 NotifyOptionPageChanged = 0x1b23ee0; // (OptionPage* page) -> invokes [page + 0xea0] -> CommitPageToOptions
+inline constexpr u64 RequestSaveSystemData   = 0x156d8a0; // (bool skip_profile, bool clear_only, bool arg)
 } // namespace Vma
 
 // ============================================================================
@@ -197,7 +212,103 @@ inline constexpr std::size_t kRootMovieClip    = 0xdf0; // GFxMovieClip for page
 inline constexpr std::size_t kRowsVectorBegin  = 0xe58; // OptionRowEntry* begin (stride 0x90)
 inline constexpr std::size_t kRowsVectorEnd    = 0xe60; // OptionRowEntry* end
 inline constexpr std::size_t kRowEntryStride   = 0x090; // {Text name[0x40], Text help[0x40], void* row_widget, u64 flags}
+inline constexpr std::size_t kOnChangeCallback = 0xea0; // Functor invoked by NotifyOptionPageChanged (0x1b23ee0)
+inline constexpr std::size_t kPageSettings     = 0xeb0; // Inline OptionPageSettings working copy
 } // namespace OptionPageLayout
+
+/// Decompiled `CSOptionsData` (`0x80` bytes stored verbatim at `SPRJ0005/userdata0010 + 0x04..+0x83`
+/// after `u32 version = 0x1a` at `+0x00`, and pointed to by `(*0x553b130) + 0x48`).
+/// Verified instruction-for-instruction against `InitDefaults` (`0x14eeaa4`), `Deserialize` (`0x14ef0b0`),
+/// `CommitPageToOptions` (`0x14ef550`), and `CopyOptionsToPage` (`0x14ef730`).
+struct CSOptionsData {
+    u8 camera_speed        = 5;  // +0x00: Game.Option.Control.RotSpeed (0..10, default 5)
+    u8 pad_vibration       = 10; // +0x01: Game.Option.Control.Rumble (0..10, default 10)
+    u8 brightness          = 5;  // +0x02: Game.Option.Disp.Brightness (0..10, default 5)
+    u8 sound_type          = 2;  // +0x03: Game.Option.Sound.SoundType (0..2, default 2)
+    u8 music_volume        = 7;  // +0x04: Game.Option.Sound.MusicVol (0..10, default 7; read live at 0x17f4e83)
+    u8 se_volume           = 7;  // +0x05: Game.Option.Sound.SeVol (0..10, default 7)
+    u8 voice_volume        = 7;  // +0x06: Game.Option.Sound.VoiceVol (0..10, default 7)
+    u8 hud_display         = 1;  // +0x07: internal HUD flag (default 1, untouched by menu)
+    u8 blood_expression    = 1;  // +0x08: Game.Option.Disp.Blood (0 = Off, 1 = On; default 1)
+    u8 subtitles           = 1;  // +0x09: Game.Option.Disp.Subtitle (0 = Off, 1 = On; default 1)
+    u8 camera_up_down      = 1;  // +0x0a: Game.Option.Control.RotUD (1 = Normal, 0 = Inverted; default 1)
+    u8 camera_left_right   = 1;  // +0x0b: Game.Option.Control.RotLR (1 = Normal, 0 = Inverted; default 1)
+    u8 auto_target         = 0;  // +0x0c: Auto-Target Switch (0 = Off, 1 = On; default 0)
+    u8 camera_auto_adjust  = 1;  // +0x0d: Camera Wall Auto-Adjust (0 = Off, 1 = On; default 1)
+    u8 unk_0e              = 0;  // +0x0e
+    u8 unk_0f              = 0;  // +0x0f
+    u8 network_region      = 0;  // +0x10: Matching Regions (0 = Local, 1 = Worldwide; default 0)
+    u8 player_name_display = 1;  // +0x11: Player Name Display (0 = Character Name, 1 = Online ID; default 1)
+    u8 unk_12              = 0;  // +0x12
+    u8 unk_13              = 0;  // +0x13: cleared to 0 on Deserialize
+    u8 pad_14[4]           = {}; // +0x14..+0x17
+    s32 text_language      = -1; // +0x18: Text language index in GAME_LANGUAGES (0..20, or -1 = system default)
+    s32 voice_language     = -1; // +0x1c: Voice language index in GAME_LANGUAGES (0..7, or -1 = system default)
+    char16_t password[9]   = {}; // +0x20..+0x31: Network password (up to 8 UTF-16LE code units + NUL at +0x30)
+    u8 reserved_32[0x4e]   = {}; // +0x32..+0x7f
+};
+static_assert(sizeof(CSOptionsData) == 0x80);
+static_assert(offsetof(CSOptionsData, music_volume) == 0x04);
+static_assert(offsetof(CSOptionsData, blood_expression) == 0x08);
+static_assert(offsetof(CSOptionsData, camera_up_down) == 0x0a);
+static_assert(offsetof(CSOptionsData, camera_auto_adjust) == 0x0d);
+static_assert(offsetof(CSOptionsData, network_region) == 0x10);
+static_assert(offsetof(CSOptionsData, player_name_display) == 0x11);
+static_assert(offsetof(CSOptionsData, text_language) == 0x18);
+static_assert(offsetof(CSOptionsData, voice_language) == 0x1c);
+static_assert(offsetof(CSOptionsData, password) == 0x20);
+
+/// Working-copy layout inside `OptionPage + 0xeb0` (`OptionPageSettings`, mapped by `0x14ef550` / `0x14ef730`).
+/// Note that `CSOptionsData::hud_display` (`+0x07`) is omitted here, shifting `+0x08..+0x1c` down by 1 / 4 bytes!
+namespace OptionPageSettingsLayout {
+inline constexpr std::size_t kCameraSpeed       = 0x00; // u8 -> CSOptionsData + 0x00
+inline constexpr std::size_t kPadVibration      = 0x01; // u8 -> CSOptionsData + 0x01
+inline constexpr std::size_t kBrightness        = 0x02; // u8 -> CSOptionsData + 0x02
+inline constexpr std::size_t kSoundType         = 0x03; // u8 -> CSOptionsData + 0x03
+inline constexpr std::size_t kMusicVolume       = 0x04; // u8 -> CSOptionsData + 0x04
+inline constexpr std::size_t kSeVolume          = 0x05; // u8 -> CSOptionsData + 0x05
+inline constexpr std::size_t kVoiceVolume       = 0x06; // u8 -> CSOptionsData + 0x06
+inline constexpr std::size_t kBloodExpression   = 0x07; // u8 -> CSOptionsData + 0x08
+inline constexpr std::size_t kSubtitles         = 0x08; // u8 -> CSOptionsData + 0x09
+inline constexpr std::size_t kCameraUpDown      = 0x09; // u8 -> CSOptionsData + 0x0a
+inline constexpr std::size_t kCameraLeftRight   = 0x0a; // u8 -> CSOptionsData + 0x0b
+inline constexpr std::size_t kAutoTarget        = 0x0b; // u8 -> CSOptionsData + 0x0c
+inline constexpr std::size_t kCameraAutoAdjust  = 0x0c; // u8 -> CSOptionsData + 0x0d
+inline constexpr std::size_t kNetworkRegion     = 0x0f; // u8 -> CSOptionsData + 0x10
+inline constexpr std::size_t kPlayerNameDisplay = 0x10; // u8 -> CSOptionsData + 0x11
+inline constexpr std::size_t kTextLanguage      = 0x14; // s32 -> CSOptionsData + 0x18
+inline constexpr std::size_t kVoiceLanguage     = 0x18; // s32 -> CSOptionsData + 0x1c
+inline constexpr std::size_t kPasswordString    = 0x20; // DLBasicString<char16_t> -> CSOptionsData + 0x20
+} // namespace OptionPageSettingsLayout
+
+/// Offsets inside `FrpgSaveLoadMan` (`*0x5556678`).
+namespace FrpgSaveLoadManLayout {
+inline constexpr std::size_t kActiveSaveSlot        = 0x1490; // s32 (-1 on Title Screen, 0..9 in-game)
+inline constexpr std::size_t kRequestSaveSlot       = 0x1547; // u8
+inline constexpr std::size_t kRequestSaveSystemData = 0x1548; // u8 (polled at 0x193fa3a when save_state == 0)
+inline constexpr std::size_t kRequestSaveSystemArg  = 0x1549; // u8
+inline constexpr std::size_t kSaveState             = 0x1554; // u32 (0 = Idle, 1..3 = SLSession active)
+inline constexpr std::size_t kSaveEnabled           = 0x1578; // u8 (1 once system save initialized)
+} // namespace FrpgSaveLoadManLayout
+
+/// Offsets inside FromSoftware's native `ScrollBarV` (`0x178` bytes, initialized by `0x1adbd20`,
+/// updated by `0x1adc580` / `0x1adc670` on `Sprite 91` `ScrollBarV`).
+namespace ScrollBarVLayout {
+inline constexpr std::size_t kRootClip      = 0x000; // GFxMovieClip for ScrollBarV root
+inline constexpr std::size_t kArrowUpClip   = 0x058; // GFxMovieClip for "ArrowUp" (d=3, y=-2.5)
+inline constexpr std::size_t kBarClip       = 0x0b0; // GFxMovieClip for "Bar" (d=5, x=10.1, y=-1.1, sy=0.96720886)
+inline constexpr std::size_t kArrowDownClip = 0x108; // GFxMovieClip for "ArrowDown" (d=1, x=-0.9, y=334.3)
+inline constexpr std::size_t kBarOriginY    = 0x160; // float: initial Bar._y (-1.1f)
+inline constexpr std::size_t kBarOriginX    = 0x164; // float: initial Bar._x (10.1f)
+inline constexpr std::size_t kTrackSpanY    = 0x168; // float: ArrowDown._y - Bar._y (335.4f)
+inline constexpr std::size_t kScrollIndex   = 0x16c; // int32_t: current top/scroll index
+inline constexpr std::size_t kTotalItems    = 0x170; // int32_t: total item count
+inline constexpr std::size_t kVisibleRows   = 0x174; // int32_t: visible row count
+inline constexpr float kNativeBarX          = 10.1f;
+inline constexpr float kNativeBarOriginY    = -1.1f;
+inline constexpr float kNativeTrackSpanY    = 335.4f;
+inline constexpr float kNativeBarScaleY     = 0.96720886f;
+} // namespace ScrollBarVLayout
 
 // ============================================================================
 // 4. Clean C++20 Methods Operating on Scaleform GFx MovieClips
@@ -210,6 +321,18 @@ inline void SetVisible(u8* mc, bool visible) {
     if (!vtbl || !inner) return;
     auto fn = *reinterpret_cast<void (PS4_SYSV_ABI**)(void*, int)>(vtbl + 0x08);
     if (fn) fn(mc, visible ? 1 : 0);
+}
+
+inline void SetPosition(u8* mc, u64 image_base, int x, int y) {
+    if (!mc || !image_base || !*reinterpret_cast<void**>(mc + 0x18)) return;
+    using Fn = void (PS4_SYSV_ABI*)(void*, int, int);
+    reinterpret_cast<Fn>(image_base + Vma::SetMovieClipPosition)(mc, x, y);
+}
+
+inline void SetScale(u8* mc, u64 image_base, float scale_x, float scale_y) {
+    if (!mc || !image_base || !*reinterpret_cast<void**>(mc + 0x18)) return;
+    using Fn = void (PS4_SYSV_ABI*)(void*, float, float);
+    reinterpret_cast<Fn>(image_base + Vma::SetMovieClipScale)(mc, scale_x, scale_y);
 }
 
 inline void DestroyClip(u8* mc, u64 image_base) {
@@ -227,6 +350,50 @@ inline void DestroyClip(u8* mc, u64 image_base) {
         *reinterpret_cast<u64*>(mc + 0x40) = 0;
     }
     *reinterpret_cast<u32*>(mc + 0x48) = 0;
+}
+
+inline void SyncPortScrollBar(u8* page_root_mc, u64 image_base, int scroll, int visible_slots,
+                              int total_items) {
+    if (!page_root_mc || !image_base || !*reinterpret_cast<void**>(page_root_mc + 0x18)) return;
+    using GetSubFn = void* (PS4_SYSV_ABI*)(void*, const void*, const char*, ...);
+    auto get_sub = reinterpret_cast<GetSubFn>(image_base + Vma::GetSubMovieClip);
+
+    GFxMovieClip sb_mc{};
+    get_sub(sb_mc.Raw(), page_root_mc, "PortScrollBarV");
+    const bool scrollable = total_items > visible_slots && visible_slots > 0;
+    SetVisible(sb_mc.Raw(), scrollable);
+    if (!scrollable || !sb_mc.self_ref) {
+        DestroyClip(sb_mc.Raw(), image_base);
+        return;
+    }
+
+    const int max_scroll = std::max(1, total_items - visible_slots);
+    const int clamped_scroll = std::clamp(scroll, 0, max_scroll);
+    const float thumb_frac = std::clamp(float(visible_slots) / float(total_items), 0.10f, 1.0f);
+    const float scale_y = thumb_frac * ScrollBarVLayout::kNativeBarScaleY;
+    const float travel = ScrollBarVLayout::kNativeTrackSpanY * (1.0f - thumb_frac);
+    const int bar_y = int(std::lround(ScrollBarVLayout::kNativeBarOriginY +
+                                      travel * (float(clamped_scroll) / float(max_scroll))));
+
+    GFxMovieClip bar_mc{};
+    get_sub(bar_mc.Raw(), sb_mc.Raw(), "Bar");
+    SetPosition(bar_mc.Raw(), image_base, int(ScrollBarVLayout::kNativeBarX), bar_y);
+    SetScale(bar_mc.Raw(), image_base, 1.0f, scale_y);
+    DestroyClip(bar_mc.Raw(), image_base);
+
+    GFxMovieClip up_mc{};
+    get_sub(up_mc.Raw(), sb_mc.Raw(), "GothicUp");
+    SetScale(up_mc.Raw(), image_base, 0.95f / 1.62f, 1.0f);
+    SetVisible(up_mc.Raw(), clamped_scroll > 0);
+    DestroyClip(up_mc.Raw(), image_base);
+
+    GFxMovieClip down_mc{};
+    get_sub(down_mc.Raw(), sb_mc.Raw(), "GothicDown");
+    SetScale(down_mc.Raw(), image_base, 0.95f / 1.62f, 1.0f);
+    SetVisible(down_mc.Raw(), clamped_scroll < max_scroll);
+    DestroyClip(down_mc.Raw(), image_base);
+
+    DestroyClip(sb_mc.Raw(), image_base);
 }
 
 template <typename Fn>

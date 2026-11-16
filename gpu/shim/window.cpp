@@ -11,6 +11,7 @@
 #include "sdl_window.h"
 #include "bbport_cursor.h"
 #include "bbport_frame_rate.h"
+#include "bbport_game_menu.h"
 #include "bbport_overlay.h"
 #include "bbport_settings.h"
 #include "bbport_toggles.h"
@@ -346,12 +347,17 @@ bool WindowSDL::PollEvents() {
                 refreshed_pointer = true;
             }
         }
+        if (event.type == SDL_EVENT_MOUSE_MOTION ||
+            event.type == SDL_EVENT_MOUSE_BUTTON_DOWN ||
+            event.type == SDL_EVENT_MOUSE_BUTTON_UP ||
+            event.type == SDL_EVENT_MOUSE_WHEEL) {
+            last_mouse_motion_ms = SDL_GetTicks();
+        }
         if (FilteredByModule(&event, window)) {
             continue;
         }
         if (event.type == SDL_EVENT_MOUSE_MOTION) {
-            const u64 ev_ticks = SDL_GetTicks();
-            last_mouse_motion_ms = ev_ticks;
+            const u64 ev_ticks = last_mouse_motion_ms;
             // Just taken: the pointer's jump into relative mode is not a turn of the camera.
             if (mouse_captured.load(std::memory_order_relaxed) && ev_ticks >= capture_settle_ms) {
                 {
@@ -476,6 +482,7 @@ bool WindowSDL::PollEvents() {
         case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
             // In the log: a session that ends here was closed, not lost to a crash.
             if (is_open) {
+                BbGameMenu::FlushPendingSaves();
                 std::printf("Window: closed (%s): the game ends\n",
                             event.type == SDL_EVENT_QUIT ? "quit" : "close button");
             }
@@ -599,12 +606,12 @@ void WindowSDL::ApplyWindowMode(int mode, s32 target_w, s32 target_h) {
 void WindowSDL::UpdateCursor() {
     const bool fullscreen = (SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN) != 0 ||
                             applied_window_mode == BbSettings::WindowModeBorderless;
-    // In a game menu (pointer_shown) it also goes after 1.5 s without moving, so that the tail of a
-    // closing menu does not leave it hanging over the game; any motion brings it back.
+    // Keep the cursor visible the entire time a game menu (`pointer_shown`) or settings overlay is
+    // open (`InMenu()` immediately clears `pointer_shown` on the exact frame the menu closes).
     const u64 idle = SDL_GetTicks() - last_mouse_motion_ms;
     const bool hide = !BbOverlay::MenuOpen() &&
                       (mouse_captured.load(std::memory_order_relaxed) ||
-                        (pointer_shown ? idle > 1500 : (fullscreen || idle > 3000)));
+                       (!pointer_shown && (fullscreen || idle > 3000)));
     if (hide != cursor_hidden) {
         cursor_hidden = hide;
         hide ? SDL_HideCursor() : SDL_ShowCursor();

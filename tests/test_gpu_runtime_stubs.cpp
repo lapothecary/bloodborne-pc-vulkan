@@ -54,6 +54,7 @@ int runtime_pad_prompt(const char*, int, char*, int) { return 0; }
 int runtime_file_host_path(const char*, char*, size_t) { return -1; }
 const char* runtime_file_user_dir() { return "user"; }
 int runtime_savedata_active_slot(char*, size_t) { return -1; }
+int runtime_savedata_sync_options(const void*) { return 1; }
 void runtime_set_flight_recorder(void (*)(const char*, const char*)) {}
 void runtime_flight_record(const char*, const char*) {}
 void runtime_file_drain_sync() {}

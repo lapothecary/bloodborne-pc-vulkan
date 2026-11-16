@@ -411,10 +411,11 @@ public partial class MainWindow : Window
     private Border NumberCard(JsonObject item, string key)
     {
         var isFloat = (string?)item["type"] == "float";
+        var useSlider = isFloat || (bool?)item["slider"] == true;
         double min = (double?)item["min"] ?? 0, max = (double?)item["max"] ?? 100, step = (double?)item["step"] ?? 1;
         double.TryParse(store.Get(key), NumberStyles.Float, CultureInfo.InvariantCulture, out var value);
         var format = isFloat ? "0.00" : "0";
-        if (!isFloat)
+        if (!useSlider)
         {
             // Whole numbers (the FPS limit): typed.
             var box = new TextBox { Text = value.ToString(format, CultureInfo.InvariantCulture), Width = 90 };
@@ -1029,11 +1030,15 @@ public partial class MainWindow : Window
             var code = game?.ExitCode ?? 0;
             game?.Dispose();
             game = null;
+            store.Load();
             AddLine(string.Format(T("exited"), code));
             UpdatePlayButton();
             UpdateGameStatus();
-            if ((Sections.SelectedItem as ListBoxItem)?.Tag as string == "trophies")
+            var activeTag = (Sections.SelectedItem as ListBoxItem)?.Tag as string;
+            if (activeTag == "trophies")
                 BuildTrophies(); // what this session unlocked
+            else if (shownSection is not null && activeTag != "log")
+                BuildSection(shownSection);
         });
         try
         {

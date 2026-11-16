@@ -22,6 +22,7 @@ import time
 from pathlib import Path
 from bbport_assets import fsr411_problem
 from bbport_i18n import language, set_language, tr
+import bbport_updater
 
 import gi
 
@@ -209,6 +210,48 @@ LANGUAGES = [("Английский", "1"), ("Английский (Велико
              ("Китайский (упрощённый)", "11"), ("Китайский (традиционный)", "10"),
              ("Финский", "12"), ("Шведский", "13"), ("Датский", "14"), ("Норвежский", "15")]
 
+GAME_LANG_CODES = [
+    "jajp", "engb", "frfr", "itit", "dede", "eses", "esar", "ptbr", "enus", "nlnl", "plpl",
+    "ruru", "dadk", "nono", "fifi", "svse", "trtr", "ptpt", "zhtw", "kokr", "zhcn",
+]
+GAME_TEXT_LANGUAGES = [
+    ("Авто (по языку системы)", "auto"),
+    ("Английский (США)", "enus"),
+    ("Английский (Великобритания)", "engb"),
+    ("Русский", "ruru"),
+    ("Японский", "jajp"),
+    ("Французский", "frfr"),
+    ("Немецкий", "dede"),
+    ("Итальянский", "itit"),
+    ("Испанский", "eses"),
+    ("Испанский (Латинская Америка)", "esar"),
+    ("Португальский (Бразилия)", "ptbr"),
+    ("Португальский", "ptpt"),
+    ("Польский", "plpl"),
+    ("Нидерландский", "nlnl"),
+    ("Датский", "dadk"),
+    ("Норвежский", "nono"),
+    ("Финский", "fifi"),
+    ("Шведский", "svse"),
+    ("Турецкий", "trtr"),
+    ("Корейский", "kokr"),
+    ("Китайский (традиционный)", "zhtw"),
+    ("Китайский (упрощённый)", "zhcn"),
+]
+GAME_VOICE_LANGUAGES = [
+    ("Авто (по языку системы)", "auto"),
+    ("Английский (Великобритания)", "engb"),
+    ("Японский", "jajp"),
+    ("Французский", "frfr"),
+    ("Немецкий", "dede"),
+    ("Итальянский", "itit"),
+    ("Испанский", "eses"),
+    ("Испанский (Латинская Америка)", "esar"),
+    ("Португальский (Бразилия)", "ptbr"),
+]
+NETWORK_REGIONS = [("Локальный", "local"), ("Весь мир", "worldwide")]
+PLAYER_NAME_MODES = [("Сетевой идентификатор (Online ID)", "online_id"), ("Имя персонажа", "character")]
+
 _DEFAULT_GAME_DIR = os.environ.get("BB_GAME_DIR", "") or (
     str(PORT_DIR / "CUSA03173") if (PORT_DIR / "CUSA03173").is_dir() else str(PORT_DIR.parent / "CUSA03173")
 )
@@ -285,6 +328,23 @@ INI_DEFAULTS = {
     "mouse_sensitivity": "1.00",
     "mouse_invert_y": "0",
     "camera_follow_mode": "balanced",
+    "bgm_volume": "7",
+    "se_volume": "7",
+    "voice_volume": "7",
+    "blood_expression": "1",
+    "subtitles": "1",
+    "game_brightness": "5",
+    "camera_speed": "5",
+    "pad_vibration": "10",
+    "camera_invert_x": "0",
+    "camera_invert_y": "0",
+    "auto_target": "0",
+    "camera_auto_adjust": "1",
+    "network_region": "local",
+    "player_name_display": "online_id",
+    "network_password": "",
+    "game_text_language": "auto",
+    "game_voice_language": "auto",
     **{key: "1" if default else "0" for key, _, default, *_ in EFFECTS + REMASTER_ENHANCEMENTS},
 }
 
@@ -324,8 +384,47 @@ def ini_mtime_ns():
         return 0
 
 
+def read_userdata0010_defaults():
+    """Seeds native CSOptionsData values from an existing SPRJ0005/userdata0010 before bbport.ini overrides."""
+    import struct
+    savedata_root = DATA_DIR / "user" / "savedata"
+    if not savedata_root.is_dir():
+        return {}
+    for cand in sorted(savedata_root.glob("*/*/SPRJ0005/userdata0010")):
+        try:
+            raw = cand.read_bytes()
+        except OSError:
+            continue
+        if len(raw) < 0x84 or struct.unpack_from("<I", raw, 0)[0] != 0x1A:
+            continue
+        opt = raw[4:0x84]
+        text_idx, voice_idx = struct.unpack_from("<ii", opt, 0x18)
+        pw_raw = opt[0x20:0x30].decode("utf-16-le", errors="ignore").split("\x00", 1)[0]
+        return {
+            "camera_speed": str(min(10, opt[0x00])),
+            "pad_vibration": str(min(10, opt[0x01])),
+            "game_brightness": str(min(10, opt[0x02])),
+            "bgm_volume": str(min(10, opt[0x04])),
+            "se_volume": str(min(10, opt[0x05])),
+            "voice_volume": str(min(10, opt[0x06])),
+            "blood_expression": "1" if opt[0x08] else "0",
+            "subtitles": "1" if opt[0x09] else "0",
+            "camera_invert_y": "1" if opt[0x0A] == 0 else "0",
+            "camera_invert_x": "1" if opt[0x0B] == 0 else "0",
+            "auto_target": "1" if opt[0x0C] else "0",
+            "camera_auto_adjust": "1" if opt[0x0D] else "0",
+            "network_region": "worldwide" if opt[0x10] == 1 else "local",
+            "player_name_display": "character" if opt[0x11] == 0 else "online_id",
+            "network_password": pw_raw,
+            "game_text_language": GAME_LANG_CODES[text_idx] if 0 <= text_idx < len(GAME_LANG_CODES) else "auto",
+            "game_voice_language": GAME_LANG_CODES[voice_idx] if 0 <= voice_idx < 8 else "auto",
+        }
+    return {}
+
+
 def load_ini():
     values = dict(INI_DEFAULTS)
+    values.update(read_userdata0010_defaults())
     lines = []
     try:
         lines = ini_path().read_text(encoding='utf-8').splitlines()
@@ -665,9 +764,12 @@ class LauncherWindow(Adw.ApplicationWindow):
         self.process = None
         self.stream = None
         self.fsr411_build = None  # tools/fsr4cap/build_assets.sh while it runs
+        self._update_info = None
+        self._update_busy = False
         self.build()
         self.connect("close-request", self.on_close)
         GLib.timeout_add_seconds(1, self.check_ini_reload)
+        GLib.timeout_add(1200, lambda: (self.on_check_update(silent=True), False)[1])
 
     def build(self):
         """(Re)creates the window's content in the current launcher language."""
@@ -686,6 +788,11 @@ class LauncherWindow(Adw.ApplicationWindow):
         self.launch_button.add_css_class("pill")
         self.launch_button.connect("clicked", self.on_launch)
         header.pack_end(self.launch_button)
+
+        self.update_header_btn = Gtk.Button(label=tr("Обновления"))
+        self.update_header_btn.add_css_class("pill")
+        self.update_header_btn.connect("clicked", self.on_header_update_clicked)
+        header.pack_end(self.update_header_btn)
         toolbar.add_top_bar(header)
 
         main_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, hexpand=True, vexpand=True)
@@ -727,7 +834,7 @@ class LauncherWindow(Adw.ApplicationWindow):
             ("engine", tr("Движок и Отладка"), "utilities-system-monitor-symbolic",
              self.build_engine_page()),
             ("controls", tr("Управление"), "input-gaming-symbolic", self.build_controls_page()),
-            ("game", tr("Игра и Моды"), "folder-symbolic", self.build_game_page()),
+            ("game", tr("Игра, Звук и Моды"), "folder-symbolic", self.build_game_page()),
             ("online", tr("Онлайн"), "network-workgroup-symbolic", self.build_online_page()),
             ("log", tr("Журнал"), "utilities-terminal-symbolic", self.build_log_page()),
         ]
@@ -828,6 +935,15 @@ class LauncherWindow(Adw.ApplicationWindow):
         screen.add(self.window_mode_row)
         self.hdr_row = Adw.SwitchRow(title=tr("Разрешить HDR"), active=self.settings["hdr"])
         screen.add(self.hdr_row)
+        self.game_brightness_row = Adw.SpinRow.new_with_range(0, 10, 1)
+        self.game_brightness_row.set_title(tr("Яркость в игре"))
+        self.game_brightness_row.set_subtitle(
+            tr("Внутриигровая яркость (0–10, синхронизируется с System → Brightness и userdata0010)"))
+        self.game_brightness_row.set_value(int(self.ini.get("game_brightness", "5") or 5))
+        self.game_brightness_row.connect(
+            "notify::value",
+            lambda *_: None if getattr(self, "_reloading_ini", False) else self.store())
+        screen.add(self.game_brightness_row)
         page.add(screen)
 
         frames = Adw.PreferencesGroup(
@@ -1093,6 +1209,54 @@ class LauncherWindow(Adw.ApplicationWindow):
         mouse_rows_sensitive()
         page.add(device_group)
 
+        native_cam = Adw.PreferencesGroup(
+            title=tr("Камера, захват цели и вибрация (в игре)"),
+            description=tr("Нативные параметры System → Controls (синхронизируются с игрой и userdata0010 на лету)"))
+        self.camera_speed_row = Adw.SpinRow.new_with_range(0, 10, 1)
+        self.camera_speed_row.set_title(tr("Скорость камеры"))
+        self.camera_speed_row.set_subtitle(tr("Скорость вращения камеры геймпада и прицела (0–10)"))
+        self.camera_speed_row.set_value(int(self.ini.get("camera_speed", "5") or 5))
+        native_cam.add(self.camera_speed_row)
+
+        self.pad_vibration_row = Adw.SpinRow.new_with_range(0, 10, 1)
+        self.pad_vibration_row.set_title(tr("Вибрация геймпада"))
+        self.pad_vibration_row.set_subtitle(tr("Сила вибрации контроллера (0 — выкл, 10 — макс.)"))
+        self.pad_vibration_row.set_value(int(self.ini.get("pad_vibration", "10") or 10))
+        native_cam.add(self.pad_vibration_row)
+
+        self.camera_invert_x_row = Adw.SwitchRow(
+            title=tr("Инверсия камеры по горизонтали (ось X)"),
+            active=self.ini.get("camera_invert_x", "0") == "1")
+        native_cam.add(self.camera_invert_x_row)
+
+        self.camera_invert_y_row = Adw.SwitchRow(
+            title=tr("Инверсия камеры по вертикали (ось Y)"),
+            active=self.ini.get("camera_invert_y", "0") == "1")
+        native_cam.add(self.camera_invert_y_row)
+
+        self.auto_target_row = Adw.SwitchRow(
+            title=tr("Автозахват новой цели"),
+            subtitle=tr("Автоматически переключать прицел на ближайшего врага при гибели текущей цели"),
+            active=self.ini.get("auto_target", "0") == "1")
+        native_cam.add(self.auto_target_row)
+
+        self.camera_auto_adjust_row = Adw.SwitchRow(
+            title=tr("Автообход стен камерой"),
+            subtitle=tr("Автоматическая коррекция камеры возле стен и препятствий"),
+            active=self.ini.get("camera_auto_adjust", "1") != "0")
+        native_cam.add(self.camera_auto_adjust_row)
+
+        for r, sig in (
+            (self.camera_speed_row, "notify::value"),
+            (self.pad_vibration_row, "notify::value"),
+            (self.camera_invert_x_row, "notify::active"),
+            (self.camera_invert_y_row, "notify::active"),
+            (self.auto_target_row, "notify::active"),
+            (self.camera_auto_adjust_row, "notify::active"),
+        ):
+            r.connect(sig, lambda *_: None if getattr(self, "_reloading_ini", False) else self.store())
+        page.add(native_cam)
+
         bindings = Adw.PreferencesGroup(title=tr("Назначение клавиш и кнопок"))
         for kind, title, icon in (("key", tr("Клавиатура и мышь"), "input-keyboard-symbolic"),
                                   ("pad", tr("Геймпад"), "input-gaming-symbolic")):
@@ -1117,6 +1281,26 @@ class LauncherWindow(Adw.ApplicationWindow):
 
     def build_game_page(self):
         page = Adw.PreferencesPage()
+
+        upd_group = Adw.PreferencesGroup(
+            title=tr("Обновление порта (GitHub Releases • SHA-256)"),
+            description=tr(
+                "Обновление в 1 клик с github.com/lapothecary/bloodborne-pc-vulkan. "
+                "Сохранения (user/savedata), bbport.ini и моды не затрагиваются"))
+        init_fp = bbport_updater.local_core_fingerprint(PORT_DIR)
+        self.update_status_row = Adw.ActionRow(
+            title=tr("Статус установленной сборки"),
+            subtitle=tr("Локальный SHA-256: {}… • Нажмите «Проверить» для сверки с GitHub Releases").format(init_fp))
+        self.check_update_btn = Gtk.Button(label=tr("Проверить"), valign=Gtk.Align.CENTER)
+        self.check_update_btn.connect("clicked", lambda _b: self.on_check_update(silent=False))
+        self.update_status_row.add_suffix(self.check_update_btn)
+        self.install_update_btn = Gtk.Button(label=tr("Обновить сейчас"), valign=Gtk.Align.CENTER)
+        self.install_update_btn.add_css_class("suggested-action")
+        self.install_update_btn.set_sensitive(False)
+        self.install_update_btn.connect("clicked", lambda _b: self.on_install_update())
+        self.update_status_row.add_suffix(self.install_update_btn)
+        upd_group.add(self.update_status_row)
+        page.add(upd_group)
 
         game = Adw.PreferencesGroup(
             title=tr("Игра и язык"),
@@ -1151,6 +1335,25 @@ class LauncherWindow(Adw.ApplicationWindow):
 
         self.language_row = combo_row(tr("Язык системы"), None, LANGUAGES, self.settings["language"])
         game.add(self.language_row)
+        init_tlang = self.ini.get("game_text_language", "auto")
+        if init_tlang not in [v for _, v in GAME_TEXT_LANGUAGES]:
+            init_tlang = "auto"
+        self.game_text_lang_row = combo_row(
+            tr("Язык текста в игре"), None, GAME_TEXT_LANGUAGES, init_tlang)
+        self.game_text_lang_row.connect(
+            "notify::selected",
+            lambda *_: None if getattr(self, "_reloading_ini", False) else self.store())
+        game.add(self.game_text_lang_row)
+
+        init_vlang = self.ini.get("game_voice_language", "auto")
+        if init_vlang not in [v for _, v in GAME_VOICE_LANGUAGES]:
+            init_vlang = "auto"
+        self.game_voice_lang_row = combo_row(
+            tr("Язык озвучки в игре"), None, GAME_VOICE_LANGUAGES, init_vlang)
+        self.game_voice_lang_row.connect(
+            "notify::selected",
+            lambda *_: None if getattr(self, "_reloading_ini", False) else self.store())
+        game.add(self.game_voice_lang_row)
 
         for key, title, default, subtitle in EFFECTS:
             if key == "skip_intro":
@@ -1166,6 +1369,49 @@ class LauncherWindow(Adw.ApplicationWindow):
             active=self.settings.get("skip_network_choice", True))
         game.add(self.skip_network_row)
         page.add(game)
+
+        env_group = Adw.PreferencesGroup(
+            title=tr("Звук, субтитры и окружение (в игре)"),
+            description=tr("Нативные параметры System → Environment (меняются в игре на лету и сразу пишутся в userdata0010)"))
+        self.bgm_volume_row = Adw.SpinRow.new_with_range(0, 10, 1)
+        self.bgm_volume_row.set_title(tr("Громкость музыки (Music)"))
+        self.bgm_volume_row.set_subtitle(tr("Громкость фоновой музыки и боссов (0–10)"))
+        self.bgm_volume_row.set_value(int(self.ini.get("bgm_volume", "7") or 7))
+        env_group.add(self.bgm_volume_row)
+
+        self.se_volume_row = Adw.SpinRow.new_with_range(0, 10, 1)
+        self.se_volume_row.set_title(tr("Звуковые эффекты (Sound Effects)"))
+        self.se_volume_row.set_subtitle(tr("Громкость ударов, шагов, выстрелов и окружения (0–10)"))
+        self.se_volume_row.set_value(int(self.ini.get("se_volume", "7") or 7))
+        env_group.add(self.se_volume_row)
+
+        self.voice_volume_row = Adw.SpinRow.new_with_range(0, 10, 1)
+        self.voice_volume_row.set_title(tr("Громкость голоса (Voice)"))
+        self.voice_volume_row.set_subtitle(tr("Громкость диалогов персонажей (0–10)"))
+        self.voice_volume_row.set_value(int(self.ini.get("voice_volume", "7") or 7))
+        env_group.add(self.voice_volume_row)
+
+        self.subtitles_row = Adw.SwitchRow(
+            title=tr("Субтитры"),
+            subtitle=tr("Отображать субтитры диалогов внизу экрана"),
+            active=self.ini.get("subtitles", "1") != "0")
+        env_group.add(self.subtitles_row)
+
+        self.blood_row = Adw.SwitchRow(
+            title=tr("Отображение крови"),
+            subtitle=tr("Брызги и следы крови на одежде и оружии"),
+            active=self.ini.get("blood_expression", "1") != "0")
+        env_group.add(self.blood_row)
+
+        for r, sig in (
+            (self.bgm_volume_row, "notify::value"),
+            (self.se_volume_row, "notify::value"),
+            (self.voice_volume_row, "notify::value"),
+            (self.subtitles_row, "notify::active"),
+            (self.blood_row, "notify::active"),
+        ):
+            r.connect(sig, lambda *_: None if getattr(self, "_reloading_ini", False) else self.store())
+        page.add(env_group)
 
         self.mods_group = Adw.PreferencesGroup(
             title=tr("Моды"), description=tr(
@@ -1203,6 +1449,107 @@ class LauncherWindow(Adw.ApplicationWindow):
         self.refresh_patches()
         page.add(self.patches_group)
         return page
+
+    def on_header_update_clicked(self, _button):
+        self.switch_page("game")
+        if self._update_info and self._update_info.get("ok") and not self._update_info.get("up_to_date"):
+            self.on_install_update()
+        else:
+            self.on_check_update(silent=False)
+
+    def on_check_update(self, silent=False):
+        if self._update_busy:
+            return
+        self._update_busy = True
+        if not silent:
+            self.update_status_row.set_subtitle(tr("Сверка SHA-256 с последним релизом на GitHub…"))
+            self.check_update_btn.set_sensitive(False)
+
+        def work():
+            res = bbport_updater.check_for_update(PORT_DIR)
+
+            def done():
+                self._update_busy = False
+                self.check_update_btn.set_sensitive(True)
+                self._update_info = res
+                if not res.get("ok"):
+                    if not silent:
+                        err = GLib.markup_escape_text(res.get("error", "Error"))
+                        self.update_status_row.set_subtitle(f"⚠ {err}")
+                    return False
+                tag = res.get("tag", "latest")
+                l_hash = res.get("local_short_hash", "")
+                r_hash = res.get("remote_short_hash", "")
+                size_mb = (res.get("archive_size") or 0) / (1024 * 1024)
+                if res.get("up_to_date"):
+                    self.update_status_row.set_subtitle(
+                        tr("✓ Установлена актуальная сборка ({} • SHA-256: {}… совпадает)").format(tag, r_hash))
+                    self.install_update_btn.set_sensitive(False)
+                    self.update_header_btn.set_label(tr("✓ Актуально ({})").format(tag))
+                    self.update_header_btn.remove_css_class("suggested-action")
+                else:
+                    size_txt = f" ({size_mb:.1f} MB)" if size_mb > 0 else ""
+                    self.update_status_row.set_subtitle(
+                        tr("⬇ Доступна свежая сборка на GitHub: {}{} • Локальный {}… → Новый {}…").format(
+                            tag, size_txt, l_hash, r_hash))
+                    self.install_update_btn.set_sensitive(True)
+                    self.update_header_btn.set_label(tr("⬇ Обновить ({})").format(tag))
+                    self.update_header_btn.add_css_class("suggested-action")
+                return False
+
+            GLib.idle_add(done)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_install_update(self):
+        if self._update_busy:
+            return
+        if self.process is not None:
+            self.toasts.add_toast(Adw.Toast(
+                title=tr("Сначала закройте запущенную игру перед установкой обновления")))
+            return
+        info = self._update_info
+        if not info or not info.get("ok") or info.get("up_to_date"):
+            self.on_check_update(silent=False)
+            return
+
+        self._update_busy = True
+        self.check_update_btn.set_sensitive(False)
+        self.install_update_btn.set_sensitive(False)
+        self.update_header_btn.set_sensitive(False)
+
+        def progress(frac, msg):
+            pct = int(round(frac * 100))
+            escaped = GLib.markup_escape_text(f"[{pct}%] {msg}")
+            GLib.idle_add(lambda: (self.update_status_row.set_subtitle(escaped), False)[1])
+
+        def work():
+            res = bbport_updater.download_and_apply_update(PORT_DIR, info, progress_cb=progress)
+
+            def done():
+                self._update_busy = False
+                self.check_update_btn.set_sensitive(True)
+                self.update_header_btn.set_sensitive(True)
+                if not res.get("ok"):
+                    self.install_update_btn.set_sensitive(True)
+                    err = res.get("error", "Error")
+                    self.update_status_row.set_subtitle(
+                        GLib.markup_escape_text(tr("Ошибка обновления: {}").format(err)))
+                    self.toasts.add_toast(Adw.Toast(title=tr("Ошибка обновления: {}").format(err)))
+                    return False
+                if res.get("restarting_external"):
+                    os._exit(0)
+                self.update_status_row.set_subtitle(tr("Обновление установлено! Перезапуск лаунчера…"))
+                GLib.timeout_add(350, self._restart_self_posix)
+                return False
+
+            GLib.idle_add(done)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _restart_self_posix(self):
+        os.execv(sys.executable, [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]])
+        return False
 
     def on_ui_language(self, row, _param):
         choice = combo_value(row)
@@ -1465,6 +1812,8 @@ class LauncherWindow(Adw.ApplicationWindow):
             line for line in (selected, tr("Выбранный берётся, как только подключится")) if line))
 
     def store(self):
+        if getattr(self, "_reloading_ini", False):
+            return
         s = self.settings
         s["gamepad"] = combo_value(self.gamepad_row)
         s["gamepad_name"] = self.gamepad_row.names[self.gamepad_row.get_selected()]
@@ -1536,6 +1885,23 @@ class LauncherWindow(Adw.ApplicationWindow):
             "mouse_sensitivity": f"{self.mouse_sensitivity_row.get_value():.2f}",
             "mouse_invert_y": "1" if self.mouse_invert_row.get_active() else "0",
             "camera_follow_mode": combo_value(self.camera_follow_row),
+            "bgm_volume": str(int(self.bgm_volume_row.get_value())),
+            "se_volume": str(int(self.se_volume_row.get_value())),
+            "voice_volume": str(int(self.voice_volume_row.get_value())),
+            "blood_expression": "1" if self.blood_row.get_active() else "0",
+            "subtitles": "1" if self.subtitles_row.get_active() else "0",
+            "game_brightness": str(int(self.game_brightness_row.get_value())),
+            "camera_speed": str(int(self.camera_speed_row.get_value())),
+            "pad_vibration": str(int(self.pad_vibration_row.get_value())),
+            "camera_invert_x": "1" if self.camera_invert_x_row.get_active() else "0",
+            "camera_invert_y": "1" if self.camera_invert_y_row.get_active() else "0",
+            "auto_target": "1" if self.auto_target_row.get_active() else "0",
+            "camera_auto_adjust": "1" if self.camera_auto_adjust_row.get_active() else "0",
+            "network_region": combo_value(self.network_region_row),
+            "player_name_display": combo_value(self.player_name_row),
+            "network_password": self.bell_password_row.get_text().strip()[:8],
+            "game_text_language": combo_value(self.game_text_lang_row),
+            "game_voice_language": combo_value(self.game_voice_lang_row),
             **{key: "1" if row.get_active() else "0" for key, row in self.effect_rows.items()},
         })
         save_ini(self.ini, self.ini_lines)
@@ -1640,6 +2006,33 @@ class LauncherWindow(Adw.ApplicationWindow):
             norm_cm = {"0": "original", "1": "balanced", "2": "locked"}.get(raw_cm, raw_cm)
             select_combo(self.camera_follow_row,
                          norm_cm if norm_cm in ("original", "balanced", "locked") else "balanced")
+            for row, key, default in (
+                (self.bgm_volume_row, "bgm_volume", 7),
+                (self.se_volume_row, "se_volume", 7),
+                (self.voice_volume_row, "voice_volume", 7),
+                (self.game_brightness_row, "game_brightness", 5),
+                (self.camera_speed_row, "camera_speed", 5),
+                (self.pad_vibration_row, "pad_vibration", 10),
+            ):
+                try:
+                    row.set_value(int(self.ini.get(key, str(default)) or default))
+                except ValueError:
+                    pass
+            self.blood_row.set_active(self.ini.get("blood_expression", "1") != "0")
+            self.subtitles_row.set_active(self.ini.get("subtitles", "1") != "0")
+            self.camera_invert_x_row.set_active(self.ini.get("camera_invert_x", "0") in ("1", "true", "on", "inverted"))
+            self.camera_invert_y_row.set_active(self.ini.get("camera_invert_y", "0") in ("1", "true", "on", "inverted"))
+            self.auto_target_row.set_active(self.ini.get("auto_target", "0") not in ("0", "false", "off"))
+            self.camera_auto_adjust_row.set_active(self.ini.get("camera_auto_adjust", "1") not in ("0", "false", "off"))
+            raw_reg = self.ini.get("network_region", "local").strip().lower()
+            select_combo(self.network_region_row, "worldwide" if raw_reg in ("1", "worldwide", "global") else "local")
+            raw_pnd = self.ini.get("player_name_display", "online_id").strip().lower()
+            select_combo(self.player_name_row, "character" if raw_pnd in ("0", "character") else "online_id")
+            pw_val = self.ini.get("network_password", "")[:8]
+            if self.bell_password_row.get_text() != pw_val:
+                self.bell_password_row.set_text(pw_val)
+            select_combo(self.game_text_lang_row, self.ini.get("game_text_language", "auto"))
+            select_combo(self.game_voice_lang_row, self.ini.get("game_voice_language", "auto"))
             for kind, name in self.control_rows:
                 self.show_control(kind, name)
             self.update_upscaler_status()
@@ -1858,6 +2251,37 @@ class LauncherWindow(Adw.ApplicationWindow):
         self.test_rows = []
         self.connection_group = connection
         page.add(connection)
+
+        ingame_net = Adw.PreferencesGroup(
+            title=tr("Внутриигровой подбор и колокол (System → Network)"),
+            description=tr("Нативные параметры сети Bloodborne (синхронизируются с System → Network и userdata0010)"))
+        raw_reg = self.ini.get("network_region", "local").strip().lower()
+        init_reg = "worldwide" if raw_reg in ("1", "worldwide", "global") else "local"
+        self.network_region_row = combo_row(
+            tr("Регион подбора игроков"), None, NETWORK_REGIONS, init_reg)
+        self.network_region_row.connect(
+            "notify::selected",
+            lambda *_: None if getattr(self, "_reloading_ini", False) else self.store())
+        ingame_net.add(self.network_region_row)
+
+        raw_pnd = self.ini.get("player_name_display", "online_id").strip().lower()
+        init_pnd = "character" if raw_pnd in ("0", "character") else "online_id"
+        self.player_name_row = combo_row(
+            tr("Отображение имени игрока"), None, PLAYER_NAME_MODES, init_pnd)
+        self.player_name_row.connect(
+            "notify::selected",
+            lambda *_: None if getattr(self, "_reloading_ini", False) else self.store())
+        ingame_net.add(self.player_name_row)
+
+        self.bell_password_row = Adw.EntryRow(
+            title=tr("Пароль призыва колокола (до 8 символов)"),
+            text=self.ini.get("network_password", "")[:8])
+        self.bell_password_row.connect(
+            "apply",
+            lambda *_: None if getattr(self, "_reloading_ini", False) else self.store())
+        ingame_net.add(self.bell_password_row)
+        page.add(ingame_net)
+
         self.pool_row.connect("notify::selected", self.on_pool_changed)
         self.on_pool_changed()
         return page

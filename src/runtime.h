@@ -133,6 +133,9 @@ int runtime_remote_fetch(const char *host);
 int runtime_remote_size(const char *host,int64_t *size);
 /* The character save the game uses: its slot (userdataNNNN, 0..9) and host folder; -1 before any. */
 int runtime_savedata_active_slot(char *dir, size_t size);
+/* Persists the 128-byte CSOptionsData block directly into SPRJ0005/userdata0010 (+0x04..+0x83).
+ * Returns 1 when synced (or no save exists yet), 0 when SPRJ0005 is currently mounted by SLSession. */
+int runtime_savedata_sync_options(const void *options_128);
 /* Lock-free crash black-box flight recorder callback registered by bbgpu. */
 void runtime_set_flight_recorder(void (*fn)(const char *category, const char *detail));
 void runtime_flight_record(const char *category, const char *detail);

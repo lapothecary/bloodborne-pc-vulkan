@@ -42,6 +42,13 @@ else:
 SCRIPTS_DIR = PORT_DIR / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
+LAUNCHER_MOD_DIR = PORT_DIR / "launcher"
+if str(LAUNCHER_MOD_DIR) not in sys.path:
+    sys.path.insert(0, str(LAUNCHER_MOD_DIR))
+try:
+    import bbport_updater
+except ImportError:
+    bbport_updater = None
 
 DATA_DIR = Path(os.environ.get("BB_DATA_DIR") or PORT_DIR)
 INI_FILE = Path(os.environ.get("BB_CONFIG") or DATA_DIR / "bbport.ini")
@@ -252,6 +259,48 @@ CAMERA_FOLLOW_CHOICES = [
      "Zero-lag 1:1 character lock without spring inertia (hotkey: F4)"),
 ]
 
+GAME_LANG_CODES = [
+    "jajp", "engb", "frfr", "itit", "dede", "eses", "esar", "ptbr", "enus", "nlnl", "plpl",
+    "ruru", "dadk", "nono", "fifi", "svse", "trtr", "ptpt", "zhtw", "kokr", "zhcn",
+]
+GAME_TEXT_LANGUAGES = [
+    ("Auto (Follow system language)", "auto"),
+    ("English (US)", "enus"),
+    ("English (UK)", "engb"),
+    ("Russian", "ruru"),
+    ("Japanese", "jajp"),
+    ("French", "frfr"),
+    ("German", "dede"),
+    ("Italian", "itit"),
+    ("Spanish (Spain)", "eses"),
+    ("Spanish (Latin America)", "esar"),
+    ("Portuguese (Brazil)", "ptbr"),
+    ("Portuguese (Portugal)", "ptpt"),
+    ("Polish", "plpl"),
+    ("Dutch", "nlnl"),
+    ("Danish", "dadk"),
+    ("Norwegian", "nono"),
+    ("Finnish", "fifi"),
+    ("Swedish", "svse"),
+    ("Turkish", "trtr"),
+    ("Korean", "kokr"),
+    ("Chinese (Traditional)", "zhtw"),
+    ("Chinese (Simplified)", "zhcn"),
+]
+GAME_VOICE_LANGUAGES = [
+    ("Auto (Follow system language)", "auto"),
+    ("English (UK)", "engb"),
+    ("Japanese", "jajp"),
+    ("French", "frfr"),
+    ("German", "dede"),
+    ("Italian", "itit"),
+    ("Spanish (Spain)", "eses"),
+    ("Spanish (Latin America)", "esar"),
+    ("Portuguese (Brazil)", "ptbr"),
+]
+NETWORK_REGIONS = [("Local", "local"), ("Worldwide", "worldwide")]
+PLAYER_NAME_MODES = [("Online ID", "online_id"), ("Character Name", "character")]
+
 
 def discover_game_dir():
     env_dir = os.environ.get("BB_GAME_DIR", "")
@@ -346,6 +395,23 @@ INI_DEFAULTS = {
     "mouse_sensitivity": "1.00",
     "mouse_invert_y": "0",
     "camera_follow_mode": "balanced",
+    "bgm_volume": "7",
+    "se_volume": "7",
+    "voice_volume": "7",
+    "blood_expression": "1",
+    "subtitles": "1",
+    "game_brightness": "5",
+    "camera_speed": "5",
+    "pad_vibration": "10",
+    "camera_invert_x": "0",
+    "camera_invert_y": "0",
+    "auto_target": "0",
+    "camera_auto_adjust": "1",
+    "network_region": "local",
+    "player_name_display": "online_id",
+    "network_password": "",
+    "game_text_language": "auto",
+    "game_voice_language": "auto",
     **{key: "1" if default else "0" for key, _, default, *_ in EFFECTS + REMASTER_ENHANCEMENTS},
 }
 
@@ -380,8 +446,46 @@ def ini_mtime_ns():
         return 0
 
 
+def read_userdata0010_defaults():
+    import struct
+    savedata_root = DATA_DIR / "user" / "savedata"
+    if not savedata_root.is_dir():
+        return {}
+    for cand in sorted(savedata_root.glob("*/*/SPRJ0005/userdata0010")):
+        try:
+            raw = cand.read_bytes()
+        except OSError:
+            continue
+        if len(raw) < 0x84 or struct.unpack_from("<I", raw, 0)[0] != 0x1A:
+            continue
+        opt = raw[4:0x84]
+        text_idx, voice_idx = struct.unpack_from("<ii", opt, 0x18)
+        pw_raw = opt[0x20:0x30].decode("utf-16-le", errors="ignore").split("\x00", 1)[0]
+        return {
+            "camera_speed": str(min(10, opt[0x00])),
+            "pad_vibration": str(min(10, opt[0x01])),
+            "game_brightness": str(min(10, opt[0x02])),
+            "bgm_volume": str(min(10, opt[0x04])),
+            "se_volume": str(min(10, opt[0x05])),
+            "voice_volume": str(min(10, opt[0x06])),
+            "blood_expression": "1" if opt[0x08] else "0",
+            "subtitles": "1" if opt[0x09] else "0",
+            "camera_invert_y": "1" if opt[0x0A] == 0 else "0",
+            "camera_invert_x": "1" if opt[0x0B] == 0 else "0",
+            "auto_target": "1" if opt[0x0C] else "0",
+            "camera_auto_adjust": "1" if opt[0x0D] else "0",
+            "network_region": "worldwide" if opt[0x10] == 1 else "local",
+            "player_name_display": "character" if opt[0x11] == 0 else "online_id",
+            "network_password": pw_raw,
+            "game_text_language": GAME_LANG_CODES[text_idx] if 0 <= text_idx < len(GAME_LANG_CODES) else "auto",
+            "game_voice_language": GAME_LANG_CODES[voice_idx] if 0 <= voice_idx < 8 else "auto",
+        }
+    return {}
+
+
 def load_ini():
     values = dict(INI_DEFAULTS)
+    values.update(read_userdata0010_defaults())
     lines = []
     try:
         lines = INI_FILE.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -841,10 +945,13 @@ class AdwLauncherWindow:
         self.page_frames = {}
         self.page_titles = {}
         self.current_page = "display"
+        self._update_info = None
+        self._update_busy = False
 
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.after(1000, self.check_ini_reload)
+        self.root.after(1200, lambda: self.on_check_update(silent=True))
 
     def _build_ui(self):
         # 1. Top HeaderBar (matching Screenshot 2)
@@ -869,7 +976,14 @@ class AdwLauncherWindow:
             bg=ACCENT_BLUE, fg=FG_TITLE, activebackground=ACCENT_BLUE_HOV, activeforeground=FG_TITLE,
             relief="flat", bd=0, padx=16, pady=5, font=("Segoe UI", 10, "bold"), cursor="hand2"
         )
-        self.play_btn.pack(side=tk.RIGHT, padx=16, pady=9)
+        self.play_btn.pack(side=tk.RIGHT, padx=(8, 16), pady=9)
+
+        self.update_hdr_btn = tk.Button(
+            header, text=" ⟳ Check Update ", command=self.on_header_update_clicked,
+            bg="#363636", fg=FG_TITLE, activebackground="#454545", activeforeground=FG_TITLE,
+            relief="flat", bd=0, padx=12, pady=5, font=("Segoe UI", 9, "bold"), cursor="hand2"
+        )
+        self.update_hdr_btn.pack(side=tk.RIGHT, padx=(0, 4), pady=9)
 
         tk.Frame(self.root, bg="#363636", height=1).pack(fill=tk.X, side=tk.TOP)
 
@@ -911,7 +1025,7 @@ class AdwLauncherWindow:
             ("effects", "Graphics Effects", "☾", self.build_effects_page),
             ("engine", "Engine and Debug", "⚙", self.build_engine_page),
             ("controls", "Controls", "🎮", self.build_controls_page),
-            ("game", "Game and Mods", "📁", self.build_game_page),
+            ("game", "Game, Audio & Mods", "📁", self.build_game_page),
             ("online", "Online", "🌐", self.build_online_page),
             ("log", "Log", ">_", self.build_log_page),
         ]
@@ -1031,6 +1145,14 @@ class AdwLauncherWindow:
         )
         self.hdr_row = AdwSwitchRow(
             screen, title="Allow HDR", active=self.settings["hdr"], on_change=lambda _v: self.store()
+        )
+        self.game_brightness_row = AdwSpinRow(
+            screen,
+            title="In-game brightness",
+            subtitle="Native Bloodborne brightness (0–10, synced live with System → Brightness and userdata0010)",
+            min_v=0, max_v=10, step=1, digits=0,
+            value=int(self.ini.get("game_brightness", "5") or 5),
+            on_change=lambda _v: self.store(),
         )
 
         frames = AdwPreferencesGroup(
@@ -1345,6 +1467,54 @@ class AdwLauncherWindow:
             on_change=lambda _v: self.store(),
         )
 
+        native_cam = AdwPreferencesGroup(
+            page,
+            title="In-Game Camera, Lock-On, and Vibration",
+            description="Native System → Controls settings (synced live with the game and userdata0010)",
+        )
+        self.camera_speed_row = AdwSpinRow(
+            native_cam,
+            title="Camera sensitivity",
+            subtitle="Gamepad and lock-on camera rotation speed (0–10)",
+            min_v=0, max_v=10, step=1, digits=0,
+            value=int(self.ini.get("camera_speed", "5") or 5),
+            on_change=lambda _v: self.store(),
+        )
+        self.pad_vibration_row = AdwSpinRow(
+            native_cam,
+            title="Controller vibration",
+            subtitle="Controller vibration strength (0 off, 10 strongest)",
+            min_v=0, max_v=10, step=1, digits=0,
+            value=int(self.ini.get("pad_vibration", "10") or 10),
+            on_change=lambda _v: self.store(),
+        )
+        self.camera_invert_x_row = AdwSwitchRow(
+            native_cam,
+            title="Invert horizontal camera (X-axis)",
+            active=self.ini.get("camera_invert_x", "0") in ("1", "true", "on", "inverted"),
+            on_change=lambda _v: self.store(),
+        )
+        self.camera_invert_y_row = AdwSwitchRow(
+            native_cam,
+            title="Invert vertical camera (Y-axis)",
+            active=self.ini.get("camera_invert_y", "0") in ("1", "true", "on", "inverted"),
+            on_change=lambda _v: self.store(),
+        )
+        self.auto_target_row = AdwSwitchRow(
+            native_cam,
+            title="Auto-target switch",
+            subtitle="Automatically lock onto a nearby enemy when the current target dies",
+            active=self.ini.get("auto_target", "0") not in ("0", "false", "off"),
+            on_change=lambda _v: self.store(),
+        )
+        self.camera_auto_adjust_row = AdwSwitchRow(
+            native_cam,
+            title="Camera wall auto-adjust",
+            subtitle="Automatically adjust camera angle around walls and obstacles",
+            active=self.ini.get("camera_auto_adjust", "1") not in ("0", "false", "off"),
+            on_change=lambda _v: self.store(),
+        )
+
         kb_group = AdwPreferencesGroup(
             page,
             title="Keyboard and Mouse Bindings",
@@ -1377,6 +1547,23 @@ class AdwLauncherWindow:
     # --- Page 6: Game and Mods ----------------------------------------------------------
 
     def build_game_page(self, page):
+        upd_group = AdwPreferencesGroup(
+            page,
+            title="Port Updates (GitHub Releases • SHA-256 Verified)",
+            description="One-click update from github.com/lapothecary/bloodborne-pc-vulkan. Saves (user/savedata), bbport.ini, and mods are preserved.",
+        )
+        init_fp = bbport_updater.local_core_fingerprint(PORT_DIR) if bbport_updater else "unknown"
+        self.update_row = AdwRowBase(
+            upd_group,
+            title="Current build status",
+            subtitle=f"Local binary SHA-256: {init_fp}…  •  Click 'Check' to compare against GitHub Releases",
+        )
+        self.install_update_btn = make_flat_btn(self.update_row.right, "Update Now", self.on_install_update)
+        self.install_update_btn.pack(side=tk.RIGHT, padx=(6, 0))
+        self.install_update_btn.configure(state="disabled")
+        self.check_update_btn = make_flat_btn(self.update_row.right, "Check", lambda: self.on_check_update(silent=False))
+        self.check_update_btn.pack(side=tk.RIGHT)
+
         game = AdwPreferencesGroup(
             page,
             title="Game and Language",
@@ -1398,6 +1585,20 @@ class AdwLauncherWindow:
             current=self.ini.get("language") or str(self.settings.get("language", "1")),
             on_change=lambda _v: self.store(),
         )
+        self.game_text_lang_row = AdwComboRow(
+            game,
+            title="In-game text language",
+            choices=GAME_TEXT_LANGUAGES,
+            current=self.ini.get("game_text_language", "auto"),
+            on_change=lambda _v: self.store(),
+        )
+        self.game_voice_lang_row = AdwComboRow(
+            game,
+            title="In-game voice language",
+            choices=GAME_VOICE_LANGUAGES,
+            current=self.ini.get("game_voice_language", "auto"),
+            on_change=lambda _v: self.store(),
+        )
 
         for key, title, default, subtitle in EFFECTS:
             if key == "skip_intro":
@@ -1415,6 +1616,50 @@ class AdwLauncherWindow:
             title="Skip 'Play Online / Play Offline' prompt",
             subtitle="Opens the main menu directly in offline mode (game patch)",
             active=self.ini.get("skip_network_choice", "1" if self.settings.get("skip_network_choice", True) else "0") != "0",
+            on_change=lambda _v: self.store(),
+        )
+
+        env_group = AdwPreferencesGroup(
+            page,
+            title="Audio, Subtitles, and Environment (In-Game)",
+            description="Native System → Environment settings (applied live in-game and persisted immediately to userdata0010)",
+        )
+        self.bgm_volume_row = AdwSpinRow(
+            env_group,
+            title="Music volume",
+            subtitle="Background and boss music volume (0–10)",
+            min_v=0, max_v=10, step=1, digits=0,
+            value=int(self.ini.get("bgm_volume", "7") or 7),
+            on_change=lambda _v: self.store(),
+        )
+        self.se_volume_row = AdwSpinRow(
+            env_group,
+            title="Sound effects volume",
+            subtitle="Weapons, footsteps, gunfire, and ambient SFX volume (0–10)",
+            min_v=0, max_v=10, step=1, digits=0,
+            value=int(self.ini.get("se_volume", "7") or 7),
+            on_change=lambda _v: self.store(),
+        )
+        self.voice_volume_row = AdwSpinRow(
+            env_group,
+            title="Voice volume",
+            subtitle="Character dialogue voice volume (0–10)",
+            min_v=0, max_v=10, step=1, digits=0,
+            value=int(self.ini.get("voice_volume", "7") or 7),
+            on_change=lambda _v: self.store(),
+        )
+        self.subtitles_row = AdwSwitchRow(
+            env_group,
+            title="Subtitles",
+            subtitle="Show dialogue subtitles at the bottom of the screen",
+            active=self.ini.get("subtitles", "1") != "0",
+            on_change=lambda _v: self.store(),
+        )
+        self.blood_row = AdwSwitchRow(
+            env_group,
+            title="Blood effects",
+            subtitle="Blood splatter and stains on hunter attire and weapons",
+            active=self.ini.get("blood_expression", "1") != "0",
             on_change=lambda _v: self.store(),
         )
 
@@ -1517,6 +1762,34 @@ class AdwLauncherWindow:
             title="UPnP (forward port on router automatically)",
             subtitle="Disable when using Tailscale or another VPN",
             active=self.settings.get("online_upnp", True),
+            on_change=lambda _v: self.store(),
+        )
+
+        ingame_net = AdwPreferencesGroup(
+            page,
+            title="In-Game Matchmaking & Bell Settings (System → Network)",
+            description="Native Bloodborne network options (synced with System → Network and userdata0010)",
+        )
+        raw_reg = self.ini.get("network_region", "local").strip().lower()
+        self.network_region_row = AdwComboRow(
+            ingame_net,
+            title="Matching regions",
+            choices=NETWORK_REGIONS,
+            current="worldwide" if raw_reg in ("1", "worldwide", "global") else "local",
+            on_change=lambda _v: self.store(),
+        )
+        raw_pnd = self.ini.get("player_name_display", "online_id").strip().lower()
+        self.player_name_row = AdwComboRow(
+            ingame_net,
+            title="Player name display",
+            choices=PLAYER_NAME_MODES,
+            current="character" if raw_pnd in ("0", "character") else "online_id",
+            on_change=lambda _v: self.store(),
+        )
+        self.bell_password_row = AdwEntryRow(
+            ingame_net,
+            title="Bell password matching (up to 8 characters)",
+            text=self.ini.get("network_password", "")[:8],
             on_change=lambda _v: self.store(),
         )
 
@@ -1818,6 +2091,23 @@ class AdwLauncherWindow:
             "mouse_sensitivity": f"{self.mouse_sensitivity_row.get_value():.2f}",
             "mouse_invert_y": "1" if self.mouse_invert_row.get_active() else "0",
             "camera_follow_mode": self.camera_follow_row.get_value(),
+            "bgm_volume": str(int(round(self.bgm_volume_row.get_value()))),
+            "se_volume": str(int(round(self.se_volume_row.get_value()))),
+            "voice_volume": str(int(round(self.voice_volume_row.get_value()))),
+            "blood_expression": "1" if self.blood_row.get_active() else "0",
+            "subtitles": "1" if self.subtitles_row.get_active() else "0",
+            "game_brightness": str(int(round(self.game_brightness_row.get_value()))),
+            "camera_speed": str(int(round(self.camera_speed_row.get_value()))),
+            "pad_vibration": str(int(round(self.pad_vibration_row.get_value()))),
+            "camera_invert_x": "1" if self.camera_invert_x_row.get_active() else "0",
+            "camera_invert_y": "1" if self.camera_invert_y_row.get_active() else "0",
+            "auto_target": "1" if self.auto_target_row.get_active() else "0",
+            "camera_auto_adjust": "1" if self.camera_auto_adjust_row.get_active() else "0",
+            "network_region": self.network_region_row.get_value(),
+            "player_name_display": self.player_name_row.get_value(),
+            "network_password": self.bell_password_row.get_text().strip()[:8],
+            "game_text_language": self.game_text_lang_row.get_value(),
+            "game_voice_language": self.game_voice_lang_row.get_value(),
             **{key: "1" if row.get_active() else "0" for key, row in self.effect_rows.items()},
         })
         save_ini(self.ini, self.ini_lines)
@@ -1901,6 +2191,29 @@ class AdwLauncherWindow:
             self.camera_follow_row.set_value(
                 norm_cm if norm_cm in ("original", "balanced", "locked") else "balanced"
             )
+            for row, key, default in (
+                (self.bgm_volume_row, "bgm_volume", 7),
+                (self.se_volume_row, "se_volume", 7),
+                (self.voice_volume_row, "voice_volume", 7),
+                (self.game_brightness_row, "game_brightness", 5),
+                (self.camera_speed_row, "camera_speed", 5),
+                (self.pad_vibration_row, "pad_vibration", 10),
+            ):
+                with contextlib.suppress(ValueError):
+                    row.set_value(int(self.ini.get(key, str(default)) or default))
+            self.blood_row.set_active(self.ini.get("blood_expression", "1") != "0")
+            self.subtitles_row.set_active(self.ini.get("subtitles", "1") != "0")
+            self.camera_invert_x_row.set_active(self.ini.get("camera_invert_x", "0") in ("1", "true", "on", "inverted"))
+            self.camera_invert_y_row.set_active(self.ini.get("camera_invert_y", "0") in ("1", "true", "on", "inverted"))
+            self.auto_target_row.set_active(self.ini.get("auto_target", "0") not in ("0", "false", "off"))
+            self.camera_auto_adjust_row.set_active(self.ini.get("camera_auto_adjust", "1") not in ("0", "false", "off"))
+            raw_reg = self.ini.get("network_region", "local").strip().lower()
+            self.network_region_row.set_value("worldwide" if raw_reg in ("1", "worldwide", "global") else "local")
+            raw_pnd = self.ini.get("player_name_display", "online_id").strip().lower()
+            self.player_name_row.set_value("character" if raw_pnd in ("0", "character") else "online_id")
+            self.bell_password_row.set_text(self.ini.get("network_password", "")[:8])
+            self.game_text_lang_row.set_value(self.ini.get("game_text_language", "auto"))
+            self.game_voice_lang_row.set_value(self.ini.get("game_voice_language", "auto"))
             for kind, name in self.control_rows:
                 self.show_control(kind, name)
             self.update_game_status()
@@ -1918,6 +2231,113 @@ class AdwLauncherWindow:
                 self.log_text.delete("1.0", f"{lines - MAX_LOG_LINES}.0")
             self.log_text.see(tk.END)
         self.root.after(0, _do)
+
+    def on_header_update_clicked(self):
+        self.switch_page("game")
+        if self._update_info and self._update_info.get("ok") and not self._update_info.get("up_to_date"):
+            self.on_install_update()
+        else:
+            self.on_check_update(silent=False)
+
+    def on_check_update(self, silent=False):
+        if not bbport_updater or self._update_busy:
+            return
+        self._update_busy = True
+        if not silent:
+            self.update_row.set_subtitle("Checking latest release & SHA-256 on GitHub…")
+            self.check_update_btn.configure(state="disabled")
+
+        def work():
+            res = bbport_updater.check_for_update(PORT_DIR)
+
+            def done():
+                self._update_busy = False
+                self.check_update_btn.configure(state="normal")
+                self._update_info = res
+                if not res.get("ok"):
+                    if not silent:
+                        self.update_row.set_subtitle(f"⚠ {res.get('error', 'Update check failed')}")
+                    return
+                tag = res.get("tag", "latest")
+                l_hash = res.get("local_short_hash", "")
+                r_hash = res.get("remote_short_hash", "")
+                size_mb = (res.get("archive_size") or 0) / (1024 * 1024)
+                if res.get("up_to_date"):
+                    self.update_row.set_subtitle(
+                        f"✓ Up to date ({tag}  •  SHA-256: {r_hash}… verified)"
+                    )
+                    self.install_update_btn.configure(state="disabled", bg="#3a3a3a")
+                    self.update_hdr_btn.configure(
+                        text=f" ✓ {tag} Latest ", bg="#363636", activebackground="#454545"
+                    )
+                else:
+                    size_txt = f" ({size_mb:.1f} MB)" if size_mb > 0 else ""
+                    self.update_row.set_subtitle(
+                        f"⬇ New build available on GitHub: {tag}{size_txt}  •  Local {l_hash}… → Remote {r_hash}…"
+                    )
+                    self.install_update_btn.configure(
+                        state="normal", bg="#268040", activebackground="#2f9e4f"
+                    )
+                    self.update_hdr_btn.configure(
+                        text=f" ⬇ Update ({tag}) ", bg="#268040", activebackground="#2f9e4f"
+                    )
+
+            self.root.after(0, done)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_install_update(self):
+        if not bbport_updater or self._update_busy:
+            return
+        if self.process is not None:
+            messagebox.showwarning(
+                "Bloodborne PC Vulkan",
+                "Please close the running game first before installing an update.",
+            )
+            return
+        info = self._update_info
+        if not info or not info.get("ok") or info.get("up_to_date"):
+            self.on_check_update(silent=False)
+            return
+
+        self._update_busy = True
+        self.check_update_btn.configure(state="disabled")
+        self.install_update_btn.configure(state="disabled")
+        self.update_hdr_btn.configure(text=" ⟳ Updating… ", state="disabled")
+
+        def progress(frac, msg):
+            pct = int(round(frac * 100))
+            self.root.after(0, lambda: self.update_row.set_subtitle(f"[{pct}%] {msg}"))
+
+        def work():
+            res = bbport_updater.download_and_apply_update(PORT_DIR, info, progress_cb=progress)
+
+            def done():
+                self._update_busy = False
+                self.check_update_btn.configure(state="normal")
+                self.update_hdr_btn.configure(state="normal")
+                if not res.get("ok"):
+                    self.install_update_btn.configure(state="normal")
+                    self.update_hdr_btn.configure(text=" ⬇ Retry Update ")
+                    err = res.get("error", "Unknown error")
+                    self.update_row.set_subtitle(f"⚠ Update failed: {err}")
+                    messagebox.showerror("Update Failed", err)
+                    return
+                if res.get("restarting_external"):
+                    with contextlib.suppress(Exception):
+                        self.root.destroy()
+                    os._exit(0)
+                self.update_row.set_subtitle("✓ Update installed! Restarting Launcher…")
+                self.root.after(350, self._restart_self_posix)
+
+            self.root.after(0, done)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _restart_self_posix(self):
+        with contextlib.suppress(Exception):
+            self.root.destroy()
+        os.execv(sys.executable, [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]])
 
     def on_copy_log(self):
         txt = self.log_text.get("1.0", tk.END)

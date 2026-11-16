@@ -9,6 +9,10 @@
 #include <unistd.h>
 #include "gpu/shim/bbport_settings.h"
 
+namespace BbFrameRate {
+void SetLimit(int) {}
+} // namespace BbFrameRate
+
 static std::string Read(const char* path) {
     std::ifstream file(path);
     std::stringstream text;
@@ -17,7 +21,7 @@ static std::string Read(const char* path) {
 }
 
 int main() {
-    assert(!BbSettings::IsHotEffect(6)); // SSR resizes resources on restart.
+    assert(BbSettings::IsHotEffect(6));  // SSR now switches live in-game too.
     assert(BbSettings::IsHotEffect(7));  // Bloom still switches live.
     assert(!BbSettings::IsHotEffect(8)); // Startup intros.
     char path[] = "/tmp/bbport-settings-test-XXXXXX";
@@ -61,6 +65,47 @@ int main() {
     s.menu_language_chosen = false;
     BbSettings::Load();
     assert(s.menu_language == BbSettings::MenuLanguage::Russian && s.menu_language_chosen);
+
+    // Native Bloodborne CSOptionsData settings round-trip through bbport.ini & live external reload.
+    s.bgm_volume = 0;
+    s.se_volume = 4;
+    s.voice_volume = 9;
+    s.blood_expression = false;
+    s.subtitles = true;
+    s.game_brightness = 6;
+    s.camera_speed = 8;
+    s.pad_vibration = 3;
+    s.camera_invert_x = true;
+    s.camera_invert_y = false;
+    s.auto_target = true;
+    s.camera_auto_adjust = false;
+    s.network_region = 1;
+    s.player_name_display = 0;
+    BbSettings::SetNetworkPassword("hunt1234extra");
+    s.game_text_language = BbSettings::ParseGameLanguageCode("ruru");
+    s.game_voice_language = BbSettings::ParseGameLanguageCode("engb", BbSettings::GameVoiceLanguageCount);
+    s.native_chosen_mask = 0x1ffffu;
+    BbSettings::Save();
+    assert(!BbSettings::ReloadExternalIfModified());
+
+    const std::string saved_native = Read(path);
+    assert(saved_native.find("bgm_volume=0\n") != std::string::npos);
+    assert(saved_native.find("network_region=worldwide\n") != std::string::npos);
+    assert(saved_native.find("player_name_display=character\n") != std::string::npos);
+    assert(saved_native.find("network_password=hunt1234\n") != std::string::npos);
+    assert(saved_native.find("game_text_language=ruru\n") != std::string::npos);
+    assert(saved_native.find("game_voice_language=engb\n") != std::string::npos);
+
+    s.bgm_volume = 5;
+    BbSettings::Load();
+    assert(s.bgm_volume == 0 && s.se_volume == 4 && s.voice_volume == 9);
+    assert(!s.blood_expression && s.subtitles && s.game_brightness == 6);
+    assert(s.camera_speed == 8 && s.pad_vibration == 3 && s.camera_invert_x && !s.camera_invert_y);
+    assert(s.auto_target && !s.camera_auto_adjust);
+    assert(s.network_region == 1 && s.player_name_display == 0);
+    assert(BbSettings::GetNetworkPassword() == "hunt1234");
+    assert(s.game_text_language == 11 && s.game_voice_language == 1);
+
     unlink(path);
-    std::puts("PASS: settings save keeps other keys, menu position, menu language");
+    std::puts("PASS: settings save keeps other keys, menu position, menu language, and native CSOptionsData");
 }

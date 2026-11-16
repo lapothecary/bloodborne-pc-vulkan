@@ -392,6 +392,53 @@ static void rw_timeouts(void) {
     assert(rw_unlock(&f.lock)==0);
     fixture_destroy(&f);
 }
+#include <unistd.h>
+static void option_scrollbar_layout(void) {
+    const char *game_root="/home/kekw3/Documents/BloodBorne/CUSA03173";
+    if (access("/home/kekw3/Documents/BloodBorne/CUSA03173/dvdroot_ps4/menu/optionsetting.gfx",R_OK)!=0) return;
+    runtime_file_mount("/app0",game_root);
+    const int64_t fd=runtime_file_open("/app0/dvdroot_ps4/menu/optionsetting.gfx",0,0);
+    assert(fd>=3);
+    uint8_t *buf=malloc(65536);
+    assert(buf!=NULL);
+    const int64_t n=runtime_file_read((int)fd,buf,65536);
+    assert(runtime_file_close((int)fd)==0);
+    assert(n>35000 && n<45000);
+    const uint32_t flen=(uint32_t)buf[4] | ((uint32_t)buf[5]<<8) | ((uint32_t)buf[6]<<16) | ((uint32_t)buf[7]<<24);
+    assert(flen==(uint32_t)n);
+    /* Walk top-level SWF tags to verify exact structural integrity up to End tag (code == 0). */
+    const size_t rect=(5+4*(buf[8]>>3)+7)/8;
+    size_t at=8+rect+4;
+    unsigned code=999;
+    while (at+2<=(size_t)n) {
+        const unsigned h=(unsigned)buf[at] | ((unsigned)buf[at+1]<<8);
+        code=h>>6;
+        size_t len=h&0x3fu, body=at+2;
+        if (len==0x3fu) {
+            assert(body+4<=(size_t)n);
+            len=(size_t)buf[body] | ((size_t)buf[body+1]<<8) | ((size_t)buf[body+2]<<16) | ((size_t)buf[body+3]<<24);
+            body+=4;
+        }
+        assert(body+len<=(size_t)n);
+        at=body+len;
+        if (code==0) break;
+    }
+    assert(code==0 && at==(size_t)n);
+    /* Verify 11-row + Defaults ControllSetting (`Item_10_0`, `Item_11_0`), 7-row System Top (`Item_6_0` x2),
+     * full-height `PortScrollBarV` (1), and gothic arrows (`GothicUp` / `GothicDown`). */
+    int port_hits=0, item6_hits=0, item10_hits=0, item11_hits=0, up_hits=0, dn_hits=0;
+    for (int64_t i=0;i+16<=n;++i) {
+        if (!memcmp(buf+i,"PortScrollBarV",15)) ++port_hits;
+        if (!memcmp(buf+i,"Item_6_0",9)) ++item6_hits;
+        if (!memcmp(buf+i,"Item_10_0",10)) ++item10_hits;
+        if (!memcmp(buf+i,"Item_11_0",10)) ++item11_hits;
+        if (!memcmp(buf+i,"GothicUp",9)) ++up_hits;
+        if (!memcmp(buf+i,"GothicDown",11)) ++dn_hits;
+    }
+    assert(port_hits==1 && item6_hits==2 && item10_hits==1 && item11_hits==1 && up_hits==1 && dn_hits==1);
+    free(buf);
+    puts("PASS: optionsetting.gfx expands System (7 slots) and Controls/Display/Effects (11 slots + gothic ScrollBarV) to [32..1048]");
+}
 int main(int argc,char **argv) {
     runtime_start(0); assert(runtime_resolve("bzQExy189ZI#q#q",0)==0);
     runtime_start(1);
@@ -419,7 +466,7 @@ int main(int argc,char **argv) {
     if (argc>1 && !strcmp(argv[1],"--rwlock-concurrency")) { rw_concurrency(); return 0; }
     if (argc>1 && !strcmp(argv[1],"--rwlock-timeouts")) { rw_timeouts(); return 0; }
     libc_support(); posix_mutexes(); wall_time(); exit_handlers(); guards(); mutexes(); direct_memory(); write_traps(); memory_primitives();
-    rw_lifecycle(); rw_concurrency(); rw_timeouts();
+    rw_lifecycle(); rw_concurrency(); rw_timeouts(); option_scrollbar_layout();
     puts("PASS: callback lifecycle, guard ABI, mutex errors, shared direct memory, memory primitives, resolver scope");
     return 0;
 }

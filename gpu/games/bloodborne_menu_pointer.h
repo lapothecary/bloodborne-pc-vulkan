@@ -15,7 +15,15 @@ void Install();
 /// (or `fallback` if `list` was not the last updated list).
 int PostHoverCursor(const void* list, int fallback);
 
-/// Current pointer X position in 1920x1080 stage coordinates.
+/// Current pointer X/Y position in 1920x1080 stage coordinates.
 float PointerX();
+float PointerY();
+bool PointerActive();
+bool LeftMouseHeld();
+bool ConsumePendingClick();
+int TakeWheelSteps();
+void NoteMenuActive();
+void LockHoverAtCurrentPointer();
+bool MoveListCursor(void* list_component, int target_index);
 
 } // namespace BbMenuPointer

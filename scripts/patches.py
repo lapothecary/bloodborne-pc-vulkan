@@ -239,11 +239,12 @@ def language_writes(settings, elf):
         print(f'Patches: game_text_language={text} is not one of the game\'s languages')
         text='auto'
     if voice!='auto' and (voice not in GAME_LANGUAGES or GAME_LANGUAGES.index(voice)>=VOICE_COUNT):
-        print(f'Patches: game_voice_language={voice} has no voice files')
+        print(f'Patches: game_voice_language={voice} is not one of the game\'s voice languages')
         voice='auto'
-    text_map=[GAME_LANGUAGES.index(text)]*21 if text!='auto' else list(range(21))
-    voice_map=([GAME_LANGUAGES.index(voice)]*21 if voice!='auto'
-               else [i if i<VOICE_COUNT else ENGLISH for i in range(21)])
+    # Unlock all 21 text languages and 8 voice languages across all sell regions so both
+    # bbport.ini (CSOptionsData sync) and the in-game System -> Language menu switch freely.
+    text_map=list(range(21))
+    voice_map=[i if i<VOICE_COUNT else ENGLISH for i in range(21)]
     writes=[(site,struct.pack('<21i',*text_map)) for site in TEXT_TABLES]
     writes+=[(site,struct.pack('<21i',*voice_map)) for site in VOICE_TABLES]
     print(f'Patches: game languages: text {text}, voice {voice} (any sell region)')

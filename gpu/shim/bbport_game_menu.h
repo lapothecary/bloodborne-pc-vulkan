@@ -15,6 +15,9 @@ void PatchImage(unsigned char* image, std::uint64_t size);
 /// Applies what the player changed on the port's pages (each presented frame).
 void Poll();
 
+/// Immediately flushes debounced Display settings, bbport.ini, and userdata0010 (window close / exit).
+void FlushPendingSaves();
+
 /// True while a keybind row in the native System menu is waiting for key/mouse input.
 bool CapturesInput();
 
@@ -23,4 +26,7 @@ bool InCaptureCooldown();
 
 /// Window thread: notifies the Controls capture loop of a mouse wheel scroll (+1 Up, -1 Down).
 void NotifyWheelCapture(int dir);
+
+/// True while a scrollable custom options page (Controls/Display/Effects) is active with no popup open.
+bool DirectWheelScrollActive();
 } // namespace BbGameMenu

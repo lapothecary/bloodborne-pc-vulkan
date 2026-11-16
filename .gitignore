@@ -30,6 +30,8 @@ __pycache__/
 /user/
 /logs/
 bbport.ini
+.bbport-version.json
+/.update_tmp/
 mods.json
 patches.json
 last_run.log

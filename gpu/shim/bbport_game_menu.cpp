@@ -28,6 +28,7 @@
 #include <fmt/format.h>
 
 extern "C" void runtime_file_drain_sync(void);
+extern "C" int runtime_savedata_sync_options(const void* options_128);
 
 namespace BbGameMenu {
 namespace {
@@ -98,7 +99,7 @@ struct Layout {
     u32 title, subtitle; ///< StaticText ids in the layout (0: none)
     std::size_t rows;
 };
-constexpr Layout ControlsLayout{0x4934065, 113020, 0, 6}; // "ControllSetting"
+constexpr Layout ControlsLayout{0x4934065, 113020, 0, 11}; // "ControllSetting" (expanded to 11 rows)
 constexpr u32 TextName = 0xc8, TextHelp = 0xc9; // SP_menu text / SP_one-line help
 constexpr u32 ControlsItem = 110000;            // "Controls" in the System menu: Keybinds follow it
 constexpr u32 ScreenSoundItem = 110001;         // "Screen/Sound" in the System menu: Display/Effects follow it
@@ -288,8 +289,8 @@ constexpr std::size_t DynamicLength = 128;
 struct DynamicText {
     char16_t english[DynamicLength]{}, russian[DynamicLength]{};
 };
-constexpr u32 OutputSlots = 12;   ///< BbSettings::OutputList
-constexpr int ControlsSlotCount = 6; ///< all 6 visible rows in Controls scroll across all items
+constexpr u32 OutputSlots = 12;    ///< BbSettings::OutputList
+constexpr int ControlsSlotCount = 11; ///< all 11 visible rows in Controls scroll across all 35 items
 constexpr int FirstControlSettingItem = BbSettings::KeyActionCount;
 constexpr int ItemMouseSpeed = FirstControlSettingItem + 0;
 constexpr int ItemVibration = FirstControlSettingItem + 1;
@@ -301,10 +302,10 @@ constexpr int ItemAutoTarget = FirstControlSettingItem + 6;
 constexpr int ItemCameraAdjust = FirstControlSettingItem + 7;
 constexpr int TotalControlsItems = BbSettings::KeyActionCount + 8; ///< 27 keybinds + Mouse Speed + Camera Follow + 6 native settings
 constexpr int MaxControlsScroll = TotalControlsItems - ControlsSlotCount;
-constexpr int DisplaySlotCount = 6; ///< all 6 visible rows in Display scroll across 11 items
+constexpr int DisplaySlotCount = 11; ///< all 11 Display settings fit on a single screen (0 scroll)
 constexpr int TotalDisplayItems = 11;
 constexpr int MaxDisplayScroll = TotalDisplayItems - DisplaySlotCount;
-constexpr int EffectsSlotCount = 6; ///< all 6 visible rows in Effects scroll across 11 items
+constexpr int EffectsSlotCount = 11; ///< all 11 Effects settings fit on a single screen (0 scroll)
 constexpr int TotalEffectsItems = 11;
 constexpr int MaxEffectsScroll = TotalEffectsItems - EffectsSlotCount;
 constexpr int MaxChoicesPerSlot = 16;
@@ -1222,6 +1223,287 @@ void RefreshControlsPage() {
     for (int slot = 0; slot < ControlsSlotCount; ++slot) {
         UpdateSlotRowDisplay(slot_rows[slot], slot);
     }
+    BbMenuEngine::SyncPortScrollBar(
+        active_controls_page + BbMenuEngine::OptionPageLayout::kRootMovieClip, image_base,
+        controls_scroll, ControlsSlotCount, TotalControlsItems);
+}
+
+// ---- Unified Native CSOptionsData <-> bbport.ini <-> SPRJ0005/userdata0010 Sync ----
+std::mutex native_options_mutex;
+BbMenuEngine::CSOptionsData pending_native_options{};
+std::atomic<bool> native_options_dirty{false};
+std::atomic<long long> native_options_dirty_ms{0};
+std::atomic<bool> native_options_bootstrapped{false};
+std::atomic<long long> last_external_ini_poll_ms{0};
+
+BbMenuEngine::CSOptionsData* ActiveSystemOptions() {
+    if (!image_base) return nullptr;
+    u8* const gdm = *reinterpret_cast<u8* const*>(image_base + BbMenuEngine::Vma::GameDataManPtr);
+    if (!gdm) return nullptr;
+    return *reinterpret_cast<BbMenuEngine::CSOptionsData**>(gdm + 0x48);
+}
+
+void RequestNativeSaveFlag() {
+    if (!image_base) return;
+    u8* const slm = *reinterpret_cast<u8* const*>(image_base + BbMenuEngine::Vma::FrpgSaveLoadManPtr);
+    if (!slm) return;
+    if (slm[BbMenuEngine::FrpgSaveLoadManLayout::kSaveEnabled] != 0) {
+        slm[BbMenuEngine::FrpgSaveLoadManLayout::kRequestSaveSystemArg] = 0;
+        slm[BbMenuEngine::FrpgSaveLoadManLayout::kRequestSaveSystemData] = 1;
+    }
+}
+
+std::string PasswordToUtf8(const char16_t pw[9]) {
+    std::string out;
+    for (int i = 0; i < 8 && pw[i] != 0; ++i) {
+        const u32 c = u32(pw[i]);
+        if (c < 0x80) {
+            out.push_back(char(c));
+        } else if (c < 0x800) {
+            out.push_back(char(0xc0 | (c >> 6)));
+            out.push_back(char(0x80 | (c & 0x3f)));
+        } else {
+            out.push_back(char(0xe0 | (c >> 12)));
+            out.push_back(char(0x80 | ((c >> 6) & 0x3f)));
+            out.push_back(char(0x80 | (c & 0x3f)));
+        }
+    }
+    return out;
+}
+
+void Utf8ToPassword(const std::string& utf8, char16_t out[9]) {
+    std::memset(out, 0, sizeof(char16_t) * 9);
+    const std::u16string wide = Utf16(utf8.c_str());
+    const std::size_t n = std::min<std::size_t>(wide.size(), 8);
+    for (std::size_t i = 0; i < n; ++i) {
+        out[i] = wide[i];
+    }
+    out[8] = 0;
+}
+
+void QueueNativeOptionsDiskSync(const BbMenuEngine::CSOptionsData& opt) {
+    {
+        std::scoped_lock lock{native_options_mutex};
+        pending_native_options = opt;
+    }
+    native_options_dirty_ms.store(NowSteadyMs(), std::memory_order_relaxed);
+    native_options_dirty.store(true, std::memory_order_release);
+}
+
+bool FlushNativeOptionsDiskSync(bool wait_if_busy) {
+    if (!native_options_dirty.load(std::memory_order_acquire)) {
+        return true;
+    }
+    BbMenuEngine::CSOptionsData snap{};
+    if (const auto* live = ActiveSystemOptions()) {
+        snap = *live;
+    } else {
+        std::scoped_lock lock{native_options_mutex};
+        snap = pending_native_options;
+    }
+    const int tries = wait_if_busy ? 40 : 1;
+    for (int attempt = 0; attempt < tries; ++attempt) {
+        if (runtime_savedata_sync_options(&snap)) {
+            native_options_dirty.store(false, std::memory_order_release);
+            return true;
+        }
+        if (wait_if_busy) {
+            SDL_Delay(10);
+        }
+    }
+    return false;
+}
+
+constexpr u32 kAllNonLangNativeBits =
+    BbSettings::Values::NativeBgmVolume | BbSettings::Values::NativeSeVolume |
+    BbSettings::Values::NativeVoiceVolume | BbSettings::Values::NativeBloodExpression |
+    BbSettings::Values::NativeSubtitles | BbSettings::Values::NativeGameBrightness |
+    BbSettings::Values::NativeCameraSpeed | BbSettings::Values::NativePadVibration |
+    BbSettings::Values::NativeCameraInvertX | BbSettings::Values::NativeCameraInvertY |
+    BbSettings::Values::NativeAutoTarget | BbSettings::Values::NativeCameraAutoAdjust |
+    BbSettings::Values::NativeNetworkRegion | BbSettings::Values::NativePlayerNameDisplay |
+    BbSettings::Values::NativeNetworkPassword;
+
+/// Reconciles bbport.ini and CSOptionsData on startup / save load:
+/// keys already present in bbport.ini override userdata0010; keys absent on first upgrade adopt userdata0010.
+void ReconcileNativeOptionsOnLoad(BbMenuEngine::CSOptionsData* opt) {
+    if (!opt) return;
+    auto& s = BbSettings::Get();
+    const u32 mask = s.native_chosen_mask.load(std::memory_order_relaxed);
+    bool modified_opt = false;
+
+    auto sync_u8 = [&](u32 bit, std::atomic<int>& setting, u8& field, int lo, int hi) {
+        if (mask & bit) {
+            const u8 wanted = u8(std::clamp(setting.load(std::memory_order_relaxed), lo, hi));
+            if (field != wanted) {
+                field = wanted;
+                modified_opt = true;
+            }
+        } else {
+            setting.store(std::clamp(int(field), lo, hi), std::memory_order_relaxed);
+        }
+    };
+    auto sync_bool = [&](u32 bit, std::atomic<bool>& setting, u8& field, bool inverted) {
+        if (mask & bit) {
+            const bool b = setting.load(std::memory_order_relaxed);
+            const u8 wanted = inverted ? (b ? 0 : 1) : (b ? 1 : 0);
+            if (field != wanted) {
+                field = wanted;
+                modified_opt = true;
+            }
+        } else {
+            setting.store(inverted ? (field == 0) : (field != 0), std::memory_order_relaxed);
+        }
+    };
+
+    sync_u8(BbSettings::Values::NativeBgmVolume, s.bgm_volume, opt->music_volume, 0, 10);
+    sync_u8(BbSettings::Values::NativeSeVolume, s.se_volume, opt->se_volume, 0, 10);
+    sync_u8(BbSettings::Values::NativeVoiceVolume, s.voice_volume, opt->voice_volume, 0, 10);
+    sync_bool(BbSettings::Values::NativeBloodExpression, s.blood_expression, opt->blood_expression, false);
+    sync_bool(BbSettings::Values::NativeSubtitles, s.subtitles, opt->subtitles, false);
+    sync_u8(BbSettings::Values::NativeGameBrightness, s.game_brightness, opt->brightness, 0, 10);
+    sync_u8(BbSettings::Values::NativeCameraSpeed, s.camera_speed, opt->camera_speed, 0, 10);
+    sync_u8(BbSettings::Values::NativePadVibration, s.pad_vibration, opt->pad_vibration, 0, 10);
+    sync_bool(BbSettings::Values::NativeCameraInvertX, s.camera_invert_x, opt->camera_left_right, true);
+    sync_bool(BbSettings::Values::NativeCameraInvertY, s.camera_invert_y, opt->camera_up_down, true);
+    sync_bool(BbSettings::Values::NativeAutoTarget, s.auto_target, opt->auto_target, false);
+    sync_bool(BbSettings::Values::NativeCameraAutoAdjust, s.camera_auto_adjust, opt->camera_auto_adjust, false);
+    sync_u8(BbSettings::Values::NativeNetworkRegion, s.network_region, opt->network_region, 0, 1);
+    sync_u8(BbSettings::Values::NativePlayerNameDisplay, s.player_name_display, opt->player_name_display, 0, 1);
+
+    if (mask & BbSettings::Values::NativeNetworkPassword) {
+        char16_t wanted_pw[9]{};
+        Utf8ToPassword(BbSettings::GetNetworkPassword(), wanted_pw);
+        if (std::memcmp(opt->password, wanted_pw, sizeof(wanted_pw)) != 0) {
+            std::memcpy(opt->password, wanted_pw, sizeof(wanted_pw));
+            modified_opt = true;
+        }
+    } else {
+        BbSettings::SetNetworkPassword(PasswordToUtf8(opt->password));
+    }
+
+    if ((mask & BbSettings::Values::NativeGameTextLanguage) && s.game_text_language.load() >= 0) {
+        const s32 wanted = std::clamp(s.game_text_language.load(), 0, BbSettings::GameLanguageCount - 1);
+        if (opt->text_language != wanted) {
+            opt->text_language = wanted;
+            modified_opt = true;
+        }
+    } else if (!(mask & BbSettings::Values::NativeGameTextLanguage) &&
+               opt->text_language >= 0 && opt->text_language < BbSettings::GameLanguageCount) {
+        s.game_text_language.store(opt->text_language, std::memory_order_relaxed);
+    }
+
+    if ((mask & BbSettings::Values::NativeGameVoiceLanguage) && s.game_voice_language.load() >= 0) {
+        const s32 wanted = std::clamp(s.game_voice_language.load(), 0, BbSettings::GameVoiceLanguageCount - 1);
+        if (opt->voice_language != wanted) {
+            opt->voice_language = wanted;
+            modified_opt = true;
+        }
+    } else if (!(mask & BbSettings::Values::NativeGameVoiceLanguage) &&
+               opt->voice_language >= 0 && opt->voice_language < BbSettings::GameVoiceLanguageCount) {
+        s.game_voice_language.store(opt->voice_language, std::memory_order_relaxed);
+    }
+
+    const u32 all_bits = kAllNonLangNativeBits |
+                         BbSettings::Values::NativeGameTextLanguage |
+                         BbSettings::Values::NativeGameVoiceLanguage;
+    const bool adopted_new_keys = (mask & all_bits) != all_bits;
+    s.native_chosen_mask.fetch_or(all_bits, std::memory_order_relaxed);
+    native_options_bootstrapped.store(true, std::memory_order_release);
+
+    if (adopted_new_keys) {
+        BbSettings::Save();
+    }
+    if (modified_opt) {
+        QueueNativeOptionsDiskSync(*opt);
+    }
+}
+
+/// Applies external Launcher edits from bbport.ini directly into live CSOptionsData in RAM.
+void ApplySettingsToLiveNativeOptions(BbMenuEngine::CSOptionsData* opt) {
+    if (!opt) return;
+    const auto& s = BbSettings::Get();
+    opt->music_volume = u8(std::clamp(s.bgm_volume.load(), 0, 10));
+    opt->se_volume = u8(std::clamp(s.se_volume.load(), 0, 10));
+    opt->voice_volume = u8(std::clamp(s.voice_volume.load(), 0, 10));
+    opt->blood_expression = s.blood_expression.load() ? 1 : 0;
+    opt->subtitles = s.subtitles.load() ? 1 : 0;
+    opt->brightness = u8(std::clamp(s.game_brightness.load(), 0, 10));
+    opt->camera_speed = u8(std::clamp(s.camera_speed.load(), 0, 10));
+    opt->pad_vibration = u8(std::clamp(s.pad_vibration.load(), 0, 10));
+    opt->camera_left_right = s.camera_invert_x.load() ? 0 : 1;
+    opt->camera_up_down = s.camera_invert_y.load() ? 0 : 1;
+    opt->auto_target = s.auto_target.load() ? 1 : 0;
+    opt->camera_auto_adjust = s.camera_auto_adjust.load() ? 1 : 0;
+    opt->network_region = u8(std::clamp(s.network_region.load(), 0, 1));
+    opt->player_name_display = u8(std::clamp(s.player_name_display.load(), 0, 1));
+    Utf8ToPassword(BbSettings::GetNetworkPassword(), opt->password);
+    if (s.game_text_language.load() >= 0) {
+        opt->text_language = std::clamp(s.game_text_language.load(), 0, BbSettings::GameLanguageCount - 1);
+    }
+    if (s.game_voice_language.load() >= 0) {
+        opt->voice_language = std::clamp(s.game_voice_language.load(), 0, BbSettings::GameVoiceLanguageCount - 1);
+    }
+    if (in_controls_page.load(std::memory_order_relaxed) && active_game_settings) {
+        active_game_settings[0x0] = opt->camera_speed;
+        active_game_settings[0x1] = opt->pad_vibration;
+        active_game_settings[0x9] = opt->camera_up_down;
+        active_game_settings[0xa] = opt->camera_left_right;
+        active_game_settings[0xb] = opt->auto_target;
+        active_game_settings[0xc] = opt->camera_auto_adjust;
+        RefreshControlsPage();
+    }
+    QueueNativeOptionsDiskSync(*opt);
+}
+
+/// Captures any in-game OptionPage commit (Environment, Brightness, Controls, Language, Network)
+/// into BbSettings (bbport.ini -> Launcher) and queues immediate persistence to userdata0010.
+void CaptureNativeOptionsFromGame(const BbMenuEngine::CSOptionsData& opt,
+                                  const BbMenuEngine::CSOptionsData* prev_opt) {
+    auto& s = BbSettings::Get();
+    s.bgm_volume.store(std::clamp(int(opt.music_volume), 0, 10), std::memory_order_relaxed);
+    s.se_volume.store(std::clamp(int(opt.se_volume), 0, 10), std::memory_order_relaxed);
+    s.voice_volume.store(std::clamp(int(opt.voice_volume), 0, 10), std::memory_order_relaxed);
+    s.blood_expression.store(opt.blood_expression != 0, std::memory_order_relaxed);
+    s.subtitles.store(opt.subtitles != 0, std::memory_order_relaxed);
+    s.game_brightness.store(std::clamp(int(opt.brightness), 0, 10), std::memory_order_relaxed);
+    s.camera_speed.store(std::clamp(int(opt.camera_speed), 0, 10), std::memory_order_relaxed);
+    s.pad_vibration.store(std::clamp(int(opt.pad_vibration), 0, 10), std::memory_order_relaxed);
+    s.camera_invert_x.store(opt.camera_left_right == 0, std::memory_order_relaxed);
+    s.camera_invert_y.store(opt.camera_up_down == 0, std::memory_order_relaxed);
+    s.auto_target.store(opt.auto_target != 0, std::memory_order_relaxed);
+    s.camera_auto_adjust.store(opt.camera_auto_adjust != 0, std::memory_order_relaxed);
+    s.network_region.store(std::clamp(int(opt.network_region), 0, 1), std::memory_order_relaxed);
+    s.player_name_display.store(std::clamp(int(opt.player_name_display), 0, 1), std::memory_order_relaxed);
+    BbSettings::SetNetworkPassword(PasswordToUtf8(opt.password));
+
+    if (!prev_opt || opt.text_language != prev_opt->text_language) {
+        s.game_text_language.store(
+            (opt.text_language >= 0 && opt.text_language < BbSettings::GameLanguageCount)
+                ? int(opt.text_language)
+                : -1,
+            std::memory_order_relaxed);
+    }
+    if (!prev_opt || opt.voice_language != prev_opt->voice_language) {
+        s.game_voice_language.store(
+            (opt.voice_language >= 0 && opt.voice_language < BbSettings::GameVoiceLanguageCount)
+                ? int(opt.voice_language)
+                : -1,
+            std::memory_order_relaxed);
+    }
+
+    s.native_chosen_mask.fetch_or(
+        kAllNonLangNativeBits | BbSettings::Values::NativeGameTextLanguage |
+            BbSettings::Values::NativeGameVoiceLanguage,
+        std::memory_order_relaxed);
+    BbSettings::Save();
+    QueueNativeOptionsDiskSync(opt);
+    RequestNativeSaveFlag();
+}
+
+void CommitActiveControlsNativeSettings() {
+    if (!active_controls_page || !image_base) return;
+    Game<void (PS4_SYSV_ABI*)(void*)>(BbMenuEngine::Vma::NotifyOptionPageChanged)(active_controls_page);
 }
 
 void ApplyControlsSlotChoiceIndex(u8* row, int slot, int choice_idx) {
@@ -1235,14 +1517,22 @@ void ApplyControlsSlotChoiceIndex(u8* row, int slot, int choice_idx) {
         return;
     }
     const int idx = std::clamp(choice_idx, 0, 1);
+    bool native_changed = false;
     if (item_idx == ItemCameraX && active_game_settings) {
         active_game_settings[0xa] = idx == 0 ? 1 : 0; // 1 = Normal, 0 = Inverted
+        native_changed = true;
     } else if (item_idx == ItemCameraY && active_game_settings) {
         active_game_settings[0x9] = idx == 0 ? 1 : 0; // 1 = Normal, 0 = Inverted
+        native_changed = true;
     } else if (item_idx == ItemAutoTarget && active_game_settings) {
         active_game_settings[0xb] = idx == 1 ? 1 : 0; // 1 = On, 0 = Off
+        native_changed = true;
     } else if (item_idx == ItemCameraAdjust && active_game_settings) {
         active_game_settings[0xc] = idx == 1 ? 1 : 0; // 1 = On, 0 = Off
+        native_changed = true;
+    }
+    if (native_changed) {
+        CommitActiveControlsNativeSettings();
     }
     RefreshSlotTexts(slot);
     UpdateSlotRowDisplay(row, slot);
@@ -1305,6 +1595,10 @@ void StepSlotSetting(u8* row, int slot, int delta, bool wrap) {
         changed = true;
     }
     if (changed) {
+        if (item_idx == ItemVibration || item_idx == ItemCameraSens ||
+            (item_idx >= ItemCameraX && item_idx <= ItemCameraAdjust)) {
+            CommitActiveControlsNativeSettings();
+        }
         if (is_slider) {
             PlayMenuSliderSound();
         } else {
@@ -1863,6 +2157,9 @@ void RefreshDisplayPage() {
     for (int slot = 0; slot < DisplaySlotCount; ++slot) {
         UpdateDisplaySlotRowDisplay(display_slot_rows[slot], slot);
     }
+    BbMenuEngine::SyncPortScrollBar(
+        active_display_page + BbMenuEngine::OptionPageLayout::kRootMovieClip, image_base,
+        display_scroll, DisplaySlotCount, TotalDisplayItems);
 }
 
 void InitDisplayPage(void* page) {
@@ -1881,6 +2178,9 @@ void InitDisplayPage(void* page) {
             UpdateDisplaySlotRowDisplay(display_slot_rows[slot], slot);
         }
     }
+    BbMenuEngine::SyncPortScrollBar(
+        active_display_page + BbMenuEngine::OptionPageLayout::kRootMovieClip, image_base,
+        display_scroll, DisplaySlotCount, TotalDisplayItems);
 }
 
 void ApplyDisplaySlotChoiceIndex(u8* row, int slot, int choice_idx) {
@@ -2193,6 +2493,9 @@ void RefreshEffectsPage() {
     for (int slot = 0; slot < EffectsSlotCount; ++slot) {
         UpdateEffectsSlotRowDisplay(effects_slot_rows[slot], slot);
     }
+    BbMenuEngine::SyncPortScrollBar(
+        active_effects_page + BbMenuEngine::OptionPageLayout::kRootMovieClip, image_base,
+        effects_scroll, EffectsSlotCount, TotalEffectsItems);
 }
 
 void InitEffectsPage(void* page) {
@@ -2211,6 +2514,9 @@ void InitEffectsPage(void* page) {
             UpdateEffectsSlotRowDisplay(effects_slot_rows[slot], slot);
         }
     }
+    BbMenuEngine::SyncPortScrollBar(
+        active_effects_page + BbMenuEngine::OptionPageLayout::kRootMovieClip, image_base,
+        effects_scroll, EffectsSlotCount, TotalEffectsItems);
 }
 
 void ApplyEffectsSlotChoiceIndex(u8* row, int slot, int choice_idx) {
@@ -2376,10 +2682,15 @@ void PS4_SYSV_ABI ControlsContentHook(void* page, u8* game_settings) {
             UpdateSlotRowDisplay(slot_rows[slot], slot);
         }
     }
+    BbMenuEngine::SyncPortScrollBar(
+        active_controls_page + BbMenuEngine::OptionPageLayout::kRootMovieClip, image_base,
+        controls_scroll, ControlsSlotCount, TotalControlsItems);
 }
 
 using OptionsPageNavigateFn = void (PS4_SYSV_ABI*)(u8*, u8*, float);
 OptionsPageNavigateFn options_page_navigate_original = nullptr;
+std::atomic<long long> last_direct_wheel_ms{0};
+const u8* scrollbar_drag_page = nullptr;
 
 bool AnySlotPopupOpen(u8* const* rows, int slot_count) {
     for (int s = 0; s < slot_count; ++s) {
@@ -2392,21 +2703,132 @@ bool AnySlotPopupOpen(u8* const* rows, int slot_count) {
 
 void HandleScrollablePageNavigate(u8* page, u8* input, float frame_time, int slot_count, int max_scroll,
                                   int& scroll, bool& wrapped_from_top, const int* first_val_ptr, u8** rows,
-                                  void (*refresh_fn)(), void (*sync_sliders_fn)(int)) {
+                                  int total_items, void (*refresh_fn)(), void (*sync_sliders_fn)(int)) {
     const bool popup_was_open = AnySlotPopupOpen(rows, slot_count);
+    if (popup_was_open) {
+        scrollbar_drag_page = nullptr;
+    }
+
+    if (!popup_was_open && max_scroll > 0) {
+        last_direct_wheel_ms.store(NowSteadyMs(), std::memory_order_relaxed);
+        if (const int wheel = BbMenuPointer::TakeWheelSteps(); wheel != 0) {
+            BbMenuPointer::LockHoverAtCurrentPointer();
+            int cur_sel = GetSelectedPageRow(page);
+            bool changed = false;
+            int rem = -wheel; // +down, -up
+            if (rem < 0 && cur_sel == slot_count) {
+                // Step off Defaults back onto the last visible setting row first.
+                cur_sel = slot_count - 1;
+                *reinterpret_cast<int*>(page + 0xae8) = -1;
+                *reinterpret_cast<int*>(page + 0xae4) = cur_sel;
+                BbMenuPointer::MoveListCursor(page + 0xa70, cur_sel);
+                ++rem;
+                changed = true;
+            }
+            if (rem != 0) {
+                const int next_scroll = std::clamp(scroll + rem, 0, max_scroll);
+                const int used = next_scroll - scroll;
+                if (used != 0) {
+                    scroll = next_scroll;
+                    rem -= used;
+                    changed = true;
+                }
+            }
+            if (rem != 0) {
+                const int next_sel = std::clamp(cur_sel + rem, 0, slot_count);
+                if (next_sel != cur_sel) {
+                    *reinterpret_cast<int*>(page + 0xae8) = -1;
+                    *reinterpret_cast<int*>(page + 0xae4) = next_sel;
+                    BbMenuPointer::MoveListCursor(page + 0xa70, next_sel);
+                    changed = true;
+                }
+            }
+            if (changed) {
+                wrapped_from_top = false;
+                refresh_fn();
+                PlayMenuStepSound();
+            }
+        }
+
+        if (!BbMenuPointer::LeftMouseHeld()) {
+            scrollbar_drag_page = nullptr;
+        } else if (BbMenuPointer::PointerActive()) {
+            const float px = BbMenuPointer::PointerX();
+            const float py = BbMenuPointer::PointerY();
+            // Full-height PortScrollBarV in ControllSetting (Sprite 138 at stage_y = 206.7,
+            // local y = -48.7, sy = 1.62 -> stage_y = 158.0, track span = 536 px).
+            constexpr float sb_y = 158.0f;
+            constexpr float track_top = sb_y + 8.0f;
+            constexpr float track_h = 536.0f;
+            constexpr float track_bot = track_top + track_h;
+            const bool over_sb_x = (px >= 1396.0f && px <= 1446.0f);
+            if (scrollbar_drag_page == page) {
+                BbMenuPointer::ConsumePendingClick();
+                const float ratio = std::clamp((py - track_top) / track_h, 0.0f, 1.0f);
+                const int next_scroll = std::clamp(int(std::lround(ratio * float(max_scroll))), 0, max_scroll);
+                if (next_scroll != scroll) {
+                    scroll = next_scroll;
+                    wrapped_from_top = false;
+                    refresh_fn();
+                    PlayMenuStepSound();
+                }
+                BbMenuEngine::SyncPortScrollBar(
+                    page + BbMenuEngine::OptionPageLayout::kRootMovieClip, image_base,
+                    scroll, slot_count, total_items);
+                return;
+            }
+            if (over_sb_x && py >= sb_y - 24.0f && py <= track_bot + 32.0f &&
+                BbMenuPointer::ConsumePendingClick()) {
+                if (py < track_top) {
+                    if (scroll > 0) {
+                        --scroll;
+                        wrapped_from_top = false;
+                        refresh_fn();
+                        PlayMenuStepSound();
+                    }
+                } else if (py > track_bot) {
+                    if (scroll < max_scroll) {
+                        ++scroll;
+                        wrapped_from_top = false;
+                        refresh_fn();
+                        PlayMenuStepSound();
+                    }
+                } else {
+                    scrollbar_drag_page = page;
+                    const float ratio = std::clamp((py - track_top) / track_h, 0.0f, 1.0f);
+                    const int next_scroll = std::clamp(int(std::lround(ratio * float(max_scroll))), 0, max_scroll);
+                    if (next_scroll != scroll) {
+                        scroll = next_scroll;
+                        wrapped_from_top = false;
+                        refresh_fn();
+                        PlayMenuStepSound();
+                    }
+                }
+                BbMenuEngine::SyncPortScrollBar(
+                    page + BbMenuEngine::OptionPageLayout::kRootMovieClip, image_base,
+                    scroll, slot_count, total_items);
+                return;
+            }
+        }
+    }
+
     const int pre_sel = GetSelectedPageRow(page);
     options_page_navigate_original(page, input, frame_time);
     if (!ValidateActivePageRows(page, slot_count, first_val_ptr, rows)) {
         return;
     }
+    BbMenuEngine::SyncPortScrollBar(
+        page + BbMenuEngine::OptionPageLayout::kRootMovieClip, image_base,
+        scroll, slot_count, total_items);
     if (popup_was_open || AnySlotPopupOpen(rows, slot_count)) {
         return;
     }
     const int hover_sel = BbMenuPointer::PostHoverCursor(page + 0xa70, pre_sel);
     int new_sel = GetSelectedPageRow(page);
     if (pre_sel == slot_count && hover_sel >= 0 && hover_sel < slot_count && new_sel == slot_count) {
-        // Mouse pointer moved from the Defaults button onto one of the 6 list rows: activate that row.
+        // Mouse pointer or wheel moved from Defaults onto one of the list rows: activate that row.
         *reinterpret_cast<int*>(page + 0xae8) = -1;
+        *reinterpret_cast<int*>(page + 0xae4) = hover_sel;
         new_sel = hover_sel;
         wrapped_from_top = false;
         Game<void (PS4_SYSV_ABI*)(void*)>(UpdatePageHelpBar)(page);
@@ -2484,6 +2906,12 @@ void SyncAllEffectsSliders(int new_sel) {
 }
 
 void PS4_SYSV_ABI OptionsPageNavigateHook(u8* page, u8* input, float frame_time) {
+    BbMenuPointer::NoteMenuActive();
+    static const u8* last_option_page = nullptr;
+    if (page != last_option_page) {
+        last_option_page = page;
+        BbMenuPointer::TakeWheelSteps();
+    }
     if (page == active_controls_page) {
         if (!ValidateActivePageRows(page, ControlsSlotCount, &values[FirstSlot], slot_rows)) {
             active_controls_page = nullptr;
@@ -2500,7 +2928,7 @@ void PS4_SYSV_ABI OptionsPageNavigateHook(u8* page, u8* input, float frame_time)
             }
             HandleScrollablePageNavigate(page, input, frame_time, ControlsSlotCount, MaxControlsScroll,
                                          controls_scroll, controls_wrapped_from_top, &values[FirstSlot],
-                                         slot_rows, &RefreshControlsPage, &SyncAllControlsSliders);
+                                         slot_rows, TotalControlsItems, &RefreshControlsPage, &SyncAllControlsSliders);
             if (ValidateActivePageRows(page, ControlsSlotCount, &values[FirstSlot], slot_rows)) {
                 const int new_sel = GetSelectedControlsRow();
                 const int new_idx = std::clamp(controls_scroll + std::max(0, new_sel), 0, TotalControlsItems - 1);
@@ -2520,7 +2948,7 @@ void PS4_SYSV_ABI OptionsPageNavigateHook(u8* page, u8* input, float frame_time)
         } else {
             HandleScrollablePageNavigate(page, input, frame_time, DisplaySlotCount, MaxDisplayScroll,
                                          display_scroll, display_wrapped_from_top, &values[FirstDisplaySlot],
-                                         display_slot_rows, &RefreshDisplayPage, &SyncAllDisplaySliders);
+                                         display_slot_rows, TotalDisplayItems, &RefreshDisplayPage, &SyncAllDisplaySliders);
             return;
         }
     }
@@ -2531,10 +2959,11 @@ void PS4_SYSV_ABI OptionsPageNavigateHook(u8* page, u8* input, float frame_time)
         } else {
             HandleScrollablePageNavigate(page, input, frame_time, EffectsSlotCount, MaxEffectsScroll,
                                          effects_scroll, effects_wrapped_from_top, &values[FirstEffectsSlot],
-                                         effects_slot_rows, &RefreshEffectsPage, &SyncAllEffectsSliders);
+                                         effects_slot_rows, TotalEffectsItems, &RefreshEffectsPage, &SyncAllEffectsSliders);
             return;
         }
     }
+    scrollbar_drag_page = nullptr;
     options_page_navigate_original(page, input, frame_time);
 }
 
@@ -2643,8 +3072,9 @@ u64 PS4_SYSV_ABI RowInputHook(u8* row, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, d
                 active_game_settings[0x1] = 10; // Controller Vibration
                 active_game_settings[0x9] = 1;  // Camera Y-Axis (1 = Normal)
                 active_game_settings[0xa] = 1;  // Camera X-Axis (1 = Normal)
-                active_game_settings[0xb] = 1;  // Auto Target Switch (1 = On)
+                active_game_settings[0xb] = 0;  // Auto Target Switch (0 = Off, matching CSOptionsData::InitDefaults)
                 active_game_settings[0xc] = 1;  // Camera Auto-Adjust (1 = On)
+                CommitActiveControlsNativeSettings();
             }
             RefreshControlsPage();
             return 0;
@@ -2772,10 +3202,32 @@ u64 PS4_SYSV_ABI RowInputHook(u8* row, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, d
 using LookupFn = const char16_t* (PS4_SYSV_ABI*)(void*, u32, u32, u32);
 using AddFn = void* (PS4_SYSV_ABI*)(void*, void*, void*, void*);
 using BindCommandListFn = void* (PS4_SYSV_ABI*)(void*, void*, void*);
+using DeserializeOptionsFn = int (PS4_SYSV_ABI*)(BbMenuEngine::CSOptionsData*, void*);
+using CommitPageToOptionsFn = void (PS4_SYSV_ABI*)(BbMenuEngine::CSOptionsData*, const void*);
 LookupFn lookup_original = nullptr;
 AddFn add_original = nullptr;
 BindCommandListFn bind_command_list_original = nullptr;
+DeserializeOptionsFn deserialize_options_original = nullptr;
+CommitPageToOptionsFn commit_page_to_options_original = nullptr;
 std::atomic<const void*> screen_sound_text{nullptr};
+
+int PS4_SYSV_ABI DeserializeOptionsHook(BbMenuEngine::CSOptionsData* self, void* stream) {
+    const int res = deserialize_options_original(self, stream);
+    ReconcileNativeOptionsOnLoad(self);
+    return res;
+}
+
+void PS4_SYSV_ABI CommitPageToOptionsHook(BbMenuEngine::CSOptionsData* dst, const void* src) {
+    BbMenuEngine::CSOptionsData prev{};
+    const bool had_dst = (dst != nullptr);
+    if (had_dst) {
+        prev = *dst;
+    }
+    commit_page_to_options_original(dst, src);
+    if (had_dst) {
+        CaptureNativeOptionsFromGame(*dst, &prev);
+    }
+}
 
 const char16_t* PS4_SYSV_ABI LookupHook(void* repository, u32 table, u32 category, u32 id) {
     if (OurText(id)) {
@@ -2910,8 +3362,7 @@ void* PS4_SYSV_ABI AddHook(void* menu, void* pair, void* function, void* out) {
 }
 
 void* PS4_SYSV_ABI ExitGameFactory(void* out, void* /*arg*/) {
-    BbSettings::Save();
-    runtime_file_drain_sync();
+    BbGameMenu::FlushPendingSaves();
     std::printf("Game menu: Exit Game selected by user\n");
     std::fflush(stdout);
     std::fflush(stderr);
@@ -3041,7 +3492,13 @@ void PatchImage(unsigned char* image, std::uint64_t size) {
                reinterpret_cast<void*>(&RowInputHook), reinterpret_cast<void**>(&row_input_original), cursor) &&
         Detour(image, BindCommandList, AddPageItemPrologue, sizeof(AddPageItemPrologue),
                reinterpret_cast<void*>(&BindCommandListHook),
-               reinterpret_cast<void**>(&bind_command_list_original), cursor);
+               reinterpret_cast<void**>(&bind_command_list_original), cursor) &&
+        Detour(image, BbMenuEngine::Vma::DeserializeOptionsData, AddPageItemPrologue,
+               sizeof(AddPageItemPrologue), reinterpret_cast<void*>(&DeserializeOptionsHook),
+               reinterpret_cast<void**>(&deserialize_options_original), cursor) &&
+        Detour(image, BbMenuEngine::Vma::CommitPageToOptions, AddPageItemPrologue,
+               sizeof(AddPageItemPrologue), reinterpret_cast<void*>(&CommitPageToOptionsHook),
+               reinterpret_cast<void**>(&commit_page_to_options_original), cursor);
     mprotect(stubs, page, PROT_READ | PROT_EXEC);
     std::printf("Game menu: %s (Title Exit Game + unified Controls + %zu pages in System)\n",
                 ok ? "the port's pages are in" : "hooks failed, off", pages.size());
@@ -3069,81 +3526,127 @@ void NotifyWheelCapture(int dir) {
     }
 }
 
+bool DirectWheelScrollActive() {
+    return NowSteadyMs() - last_direct_wheel_ms.load(std::memory_order_relaxed) < 150;
+}
+
+bool CommitDebouncedDisplaySettings(BbSettings::Values& s, bool force) {
+    if (!display_heavy_dirty.load(std::memory_order_acquire)) {
+        return false;
+    }
+    if (!force && NowSteadyMs() - display_heavy_dirty_ms.load(std::memory_order_relaxed) < 100) {
+        return false;
+    }
+    display_heavy_dirty.store(false, std::memory_order_release);
+    const int aspect = std::clamp(disp_aspect, 0, BbSettings::AspectCount - 1);
+    const auto chosen_out = BbSettings::PackSize(MenuOutput(aspect, disp_output_idx));
+    if (chosen_out != s.output_res.load()) {
+        s.output_res_auto = false;
+        s.output_res = chosen_out;
+    }
+    s.aspect = aspect;
+
+    int target_upscaler = BbSettings::UpscalerOff;
+    int target_dlss_preset = s.dlss_preset.load();
+    const int target_preset = std::clamp(disp_upscale_preset, int(BbSettings::NativeAA), int(BbSettings::UltraPerformance));
+    const bool target_fxaa = (disp_aa_mode == AaFxaa);
+
+    if (disp_upscaler_choice == DispUpOff) {
+        target_upscaler = BbSettings::UpscalerOff;
+        if (disp_aa_mode == AaDlaa) {
+            target_dlss_preset = 11;
+        } else if (disp_aa_mode == AaDlaaCnn) {
+            target_dlss_preset = 6;
+        }
+    } else {
+        switch (disp_upscaler_choice) {
+        case DispUpDlss4:
+            target_upscaler = BbSettings::UpscalerDlss;
+            target_dlss_preset = 11;
+            break;
+        case DispUpDlss45M:
+            target_upscaler = BbSettings::UpscalerDlss;
+            target_dlss_preset = 13;
+            break;
+        case DispUpDlss45L:
+            target_upscaler = BbSettings::UpscalerDlss;
+            target_dlss_preset = 12;
+            break;
+        case DispUpDlss3:
+            target_upscaler = BbSettings::UpscalerDlss;
+            target_dlss_preset = 6;
+            break;
+        case DispUpFsr4:
+            target_upscaler = BbSettings::UpscalerFsr4;
+            break;
+        case DispUpFsr411:
+            target_upscaler = BbSettings::UpscalerFsr411;
+            break;
+        case DispUpFsr31:
+        default:
+            target_upscaler = BbSettings::UpscalerFsr3;
+            break;
+        }
+    }
+
+    s.aa_mode = disp_aa_mode;
+    s.aa_mode_chosen = true;
+    s.upscaler = UpscalerAvailable(target_upscaler) ? target_upscaler : int(BbSettings::UpscalerFsr3);
+    s.dlss_preset = target_dlss_preset;
+    s.preset = target_preset;
+    s.effects[GameAaEffectIdx] = target_fxaa;
+    values[FirstEffect + GameAaEffectIdx] = target_fxaa ? 1 : 0;
+    applied[FirstEffect + GameAaEffectIdx] = target_fxaa ? 1 : 0;
+    bytes[FirstEffect + GameAaEffectIdx] = u8(target_fxaa ? 1 : 0);
+    BbGuestHooks::ApplyGameEffects();
+    return true;
+}
+
+void FlushPendingSaves() {
+    auto& s = BbSettings::Get();
+    if (values_valid && CommitDebouncedDisplaySettings(s, true)) {
+        BbSettings::Save();
+    } else {
+        BbSettings::Save();
+    }
+    if (auto* opt = ActiveSystemOptions()) {
+        QueueNativeOptionsDiskSync(*opt);
+    }
+    FlushNativeOptionsDiskSync(true);
+    runtime_file_drain_sync();
+}
+
 void Poll() {
+    const long long now_ms = NowSteadyMs();
+    if (!native_options_bootstrapped.load(std::memory_order_acquire) && image_base != 0) {
+        u8* const slm = *reinterpret_cast<u8* const*>(image_base + BbMenuEngine::Vma::FrpgSaveLoadManPtr);
+        if (slm && slm[BbMenuEngine::FrpgSaveLoadManLayout::kSaveEnabled] != 0) {
+            if (auto* opt = ActiveSystemOptions()) {
+                ReconcileNativeOptionsOnLoad(opt);
+            }
+        }
+    }
+
+    if (now_ms - last_external_ini_poll_ms.load(std::memory_order_relaxed) >= 400) {
+        last_external_ini_poll_ms.store(now_ms, std::memory_order_relaxed);
+        if (BbSettings::ReloadExternalIfModified()) {
+            BbGuestHooks::ApplyGameEffects();
+            if (auto* opt = ActiveSystemOptions()) {
+                ApplySettingsToLiveNativeOptions(opt);
+            }
+        }
+    }
+
+    if (native_options_dirty.load(std::memory_order_acquire) &&
+        now_ms - native_options_dirty_ms.load(std::memory_order_relaxed) >= 150) {
+        FlushNativeOptionsDiskSync(false);
+    }
+
     if (!values_valid) {
         return;
     }
     auto& s = BbSettings::Get();
-    bool saved = false;
-
-    // Apply debounced Display changes (Aspect Ratio, Resolution, Anti-Aliasing, Upscaler, Upscaler Mode)
-    // once the user has rested for 100 ms, so stepping through choices feels instant without double-recreating.
-    if (display_heavy_dirty.load(std::memory_order_acquire) &&
-        NowSteadyMs() - display_heavy_dirty_ms.load(std::memory_order_relaxed) >= 100) {
-        display_heavy_dirty.store(false, std::memory_order_release);
-        const int aspect = std::clamp(disp_aspect, 0, BbSettings::AspectCount - 1);
-        const auto chosen_out = BbSettings::PackSize(MenuOutput(aspect, disp_output_idx));
-        if (chosen_out != s.output_res.load()) {
-            s.output_res_auto = false;
-            s.output_res = chosen_out;
-        }
-        s.aspect = aspect;
-
-        int target_upscaler = BbSettings::UpscalerOff;
-        int target_dlss_preset = s.dlss_preset.load();
-        const int target_preset = std::clamp(disp_upscale_preset, int(BbSettings::NativeAA), int(BbSettings::UltraPerformance));
-        const bool target_fxaa = (disp_aa_mode == AaFxaa);
-
-        if (disp_upscaler_choice == DispUpOff) {
-            target_upscaler = BbSettings::UpscalerOff;
-            if (disp_aa_mode == AaDlaa) {
-                target_dlss_preset = 11;
-            } else if (disp_aa_mode == AaDlaaCnn) {
-                target_dlss_preset = 6;
-            }
-        } else {
-            switch (disp_upscaler_choice) {
-            case DispUpDlss4:
-                target_upscaler = BbSettings::UpscalerDlss;
-                target_dlss_preset = 11;
-                break;
-            case DispUpDlss45M:
-                target_upscaler = BbSettings::UpscalerDlss;
-                target_dlss_preset = 13;
-                break;
-            case DispUpDlss45L:
-                target_upscaler = BbSettings::UpscalerDlss;
-                target_dlss_preset = 12;
-                break;
-            case DispUpDlss3:
-                target_upscaler = BbSettings::UpscalerDlss;
-                target_dlss_preset = 6;
-                break;
-            case DispUpFsr4:
-                target_upscaler = BbSettings::UpscalerFsr4;
-                break;
-            case DispUpFsr411:
-                target_upscaler = BbSettings::UpscalerFsr411;
-                break;
-            case DispUpFsr31:
-            default:
-                target_upscaler = BbSettings::UpscalerFsr3;
-                break;
-            }
-        }
-
-        s.aa_mode = disp_aa_mode;
-        s.aa_mode_chosen = true;
-        s.upscaler = UpscalerAvailable(target_upscaler) ? target_upscaler : int(BbSettings::UpscalerFsr3);
-        s.dlss_preset = target_dlss_preset;
-        s.preset = target_preset;
-        s.effects[GameAaEffectIdx] = target_fxaa;
-        values[FirstEffect + GameAaEffectIdx] = target_fxaa ? 1 : 0;
-        applied[FirstEffect + GameAaEffectIdx] = target_fxaa ? 1 : 0;
-        bytes[FirstEffect + GameAaEffectIdx] = u8(target_fxaa ? 1 : 0);
-        BbGuestHooks::ApplyGameEffects();
-        saved = true;
-    }
+    bool saved = CommitDebouncedDisplaySettings(s, false);
 
     // Apply Effects page toggles immediately.
     int now_values[FieldCount];

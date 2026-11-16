@@ -123,7 +123,9 @@ def main() -> None:
         "--specpath", str(pyi_work),
         "--paths", str(root),
         "--paths", str(root / "scripts"),
+        "--paths", str(root / "launcher"),
         "--hidden-import", "run",
+        "--hidden-import", "bbport_updater",
     ]
     for mod in hidden_modules:
         pyi_cmd.extend(["--hidden-import", mod])
@@ -151,6 +153,8 @@ def main() -> None:
         if src.is_file():
             shutil.copy2(src, stage / fname)
     shutil.copy2(root / "Launcher.py", stage / "launcher" / "bbport_launcher_win.py")
+    if (root / "launcher" / "bbport_updater.py").is_file():
+        shutil.copy2(root / "launcher" / "bbport_updater.py", stage / "launcher" / "bbport_updater.py")
     readme_win = root / "packaging" / "windows" / "README-Windows.txt"
     if readme_win.is_file():
         shutil.copy2(readme_win, stage / "README-Windows.txt")
@@ -270,9 +274,25 @@ def main() -> None:
         shutil.copy2(dlss_lic, stage / "NVIDIA-DLSS-LICENSE.txt")
     print("=== Bundled NVIDIA DLSS 4.5 / DLAA 4 Bridge: bin/bbport_dlss.dll + bin/nvngx_dlss.dll ===", flush=True)
 
-    # 5. Create zip archive + sha256
+    # 5. Write .bbport-version.json, create zip archive + sha256 + windows-manifest.json
+    sys.path.insert(0, str(root / "launcher"))
+    import bbport_updater
+
+    tag_name = os.environ.get("GITHUB_REF_NAME") or "v1.1.5"
+    git_sha = os.environ.get("GITHUB_SHA") or ""
+    bbport_updater.write_build_manifest(
+        archive_path=Path(""),
+        manifest_out_path=Path(""),
+        version_out_path=stage / ".bbport-version.json",
+        stage_root=stage,
+        tag=tag_name,
+        commit=git_sha,
+        is_windows=True,
+    )
+
     zip_path = root / "bloodborne-pc-vulkan-windows-x86_64-prebuilt.zip"
     sha_path = root / "bloodborne-pc-vulkan-windows-x86_64-prebuilt.zip.sha256"
+    manifest_path = root / "windows-manifest.json"
     if zip_path.exists():
         zip_path.unlink()
 
@@ -285,6 +305,15 @@ def main() -> None:
 
     digest = hashlib.sha256(zip_path.read_bytes()).hexdigest()
     sha_path.write_text(f"{digest}  {zip_path.name}\n", encoding="utf-8")
+    bbport_updater.write_build_manifest(
+        archive_path=zip_path,
+        manifest_out_path=manifest_path,
+        version_out_path=stage / ".bbport-version.json",
+        stage_root=stage,
+        tag=tag_name,
+        commit=git_sha,
+        is_windows=True,
+    )
     size_mb = zip_path.stat().st_size / (1024 * 1024)
     print(f"=== Successfully packaged {zip_path.name} ({size_mb:.2f} MB), SHA256={digest} ===", flush=True)
 

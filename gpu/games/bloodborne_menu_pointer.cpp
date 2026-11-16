@@ -164,7 +164,7 @@ public:
     void SetVisible(bool visible) {
         const Addr vtable = Field<Addr>(bytes, 0);
         const Addr set = vtable ? Get<Addr>(vtable + 8) : 0;
-        if (DisplayObject() && IsGameFunction(set)) {
+        if (DisplayObject() && set >= At(0x1000) && set < At(CodeEnd)) {
             using Fn = void(PS4_SYSV_ABI*)(void*, int);
             reinterpret_cast<Fn>(set)(bytes, visible ? 1 : 0);
         }
@@ -404,6 +404,59 @@ public:
         return now == index;
     }
 
+    bool MakeScrollBar(Value& out) {
+        const Addr prov = Field<Addr>(c, Provider);
+        const Addr vtbl = prov ? Get<Addr>(prov) : 0;
+        const Addr fn = vtbl ? Get<Addr>(vtbl + 0x28) : 0;
+        if (fn < At(0x1000) || fn >= At(CodeEnd)) {
+            return false;
+        }
+        using Fn = void(PS4_SYSV_ABI*)(void*, void*);
+        reinterpret_cast<Fn>(fn)(out.Raw(), reinterpret_cast<void*>(prov));
+        return out.DisplayObject() != 0;
+    }
+
+    void ScrollLinesTo(int target_scroll) {
+        const int count = Field<std::int32_t>(c, Count);
+        const int lines = Field<std::int32_t>(c, Lines);
+        if (count <= lines || lines <= 0) {
+            return;
+        }
+        target_scroll = std::clamp(target_scroll, 0, count - lines);
+        const int cur_scroll = Field<std::int32_t>(c, Scroll);
+        const int delta = target_scroll - cur_scroll;
+        if (delta == 0) {
+            return;
+        }
+        using ScrollBy = void(PS4_SYSV_ABI*)(std::uint8_t*, int, int);
+        using SetCursor = std::int32_t(PS4_SYSV_ABI*)(std::uint8_t*, int);
+        using HideCursors = void(PS4_SYSV_ABI*)(std::uint8_t*);
+        reinterpret_cast<ScrollBy>(At(ScrollByFn))(c, 0, delta);
+        const int new_scroll = Field<std::int32_t>(c, Scroll);
+        const int before = CursorIndex();
+        const int clamped = std::clamp(before, new_scroll, std::min(count - 1, new_scroll + lines - 1));
+        reinterpret_cast<HideCursors>(At(HideCursorsFn))(c);
+        if (clamped != before) {
+            reinterpret_cast<SetCursor>(At(SetCursorFn))(c, clamped);
+            CursorMoved(CursorIndex());
+        } else {
+            if (MakerReady()) {
+                const std::uint64_t rel_slot = std::uint64_t(std::uint32_t(clamped - new_scroll)) << 32;
+                Value item, cursor;
+                MakeItem(rel_slot, item);
+                item.Child(reinterpret_cast<const char*>(At(CursorName)), cursor);
+                cursor.SetVisible(true);
+            }
+            CursorMoved(clamped);
+        }
+    }
+
+    void ScrollLinesBy(int delta_lines) {
+        if (delta_lines != 0) {
+            ScrollLinesTo(Field<std::int32_t>(c, Scroll) + delta_lines);
+        }
+    }
+
 private:
     bool MakerReady() {
         provider = Field<Addr>(c, Provider);
@@ -559,20 +612,82 @@ Seen& GetSeen(const std::uint8_t* list, float x, float y, bool& just_opened) {
 
 std::atomic<const void*> last_updated_list{nullptr};
 std::atomic<int> last_post_hover_cursor{-1};
+std::atomic<std::int64_t> direct_list_wheel_ms{0};
 
 /// The game's list update (0x1acff30) is about to run for `component`.
 void PS4_SYSV_ABI OnListUpdate(std::uint64_t, const Core::GuestRegisterSnapshot* registers) {
     auto* component = reinterpret_cast<std::uint8_t*>(registers->rdi);
     const auto* input = reinterpret_cast<const std::uint8_t*>(registers->rsi);
-    if (!component || !input || !*input || InputBlocked()) {
+    if (!component || InputBlocked()) {
+        return;
+    }
+    // Refresh `list_focus_ms` even when `*input == 0` (e.g. while a sub-widget or modal row holds
+    // focus inside an open page) so `InMenu()` never drops and steals the mouse cursor mid-menu.
+    list_focus_ms.store(NowMs(), std::memory_order_relaxed);
+    if (!input || !*input) {
         return;
     }
     List list{component};
     last_updated_list.store(component, std::memory_order_relaxed);
     last_post_hover_cursor.store(list.CursorIndex(), std::memory_order_relaxed);
-    list_focus_ms.store(NowMs(), std::memory_order_relaxed);
+
+    const int count = Field<std::int32_t>(component, Count);
+    const int lines = Field<std::int32_t>(component, Lines);
+    const int per_line = Field<std::int32_t>(component, PerLine);
+
+    const auto sync_list_scrollbar_arrows = [&]() {
+        if (count > lines && lines > 0 && per_line == 1) {
+            Value sb;
+            if (list.MakeScrollBar(sb)) {
+                const int line_scroll = Field<std::int32_t>(component, Scroll);
+                const int max_line_scroll = std::max(1, count - lines);
+                Value up_v, down_v;
+                sb.Child("GothicUp", up_v);
+                up_v.SetVisible(line_scroll > 0);
+                sb.Child("GothicDown", down_v);
+                down_v.SetVisible(line_scroll < max_line_scroll);
+            }
+        }
+    };
+    sync_list_scrollbar_arrows();
+
     if (BbOverlay::CapturesInput() || BbGameMenu::CapturesInput() ||
-        BbGameMenu::InCaptureCooldown() || !pointer_in.load(std::memory_order_relaxed)) {
+        BbGameMenu::InCaptureCooldown()) {
+        return;
+    }
+
+    // Direct 0-latency mouse-wheel navigation for ALL vertical single-column lists (`lines > 1`),
+    // both scrollable (`count > lines`: popups, inventory) and single-screen (`count <= lines`:
+    // `System`, `Display`, `Effects`, `Environment`, `Language`, `Brightness`, `Network`, Title),
+    // independent of `pointer_in` (works even without prior motion or on multi-monitor setups).
+    if (!BbGameMenu::DirectWheelScrollActive() && lines > 1 && per_line == 1 && count > 1) {
+        direct_list_wheel_ms.store(NowMs(), std::memory_order_relaxed);
+        if (const int w = wheel_steps.exchange(0, std::memory_order_relaxed); w != 0) {
+            if (count > lines) {
+                const int prev_scroll = Field<std::int32_t>(component, Scroll);
+                list.ScrollLinesBy(-w);
+                const int after_scroll = Field<std::int32_t>(component, Scroll);
+                if (after_scroll == prev_scroll) {
+                    const int cur = list.CursorIndex();
+                    const int next = std::clamp(cur - w, 0, count - 1);
+                    const int rel = std::clamp(next - after_scroll, 0, lines - 1);
+                    list.MoveTo(next, std::uint64_t(std::uint32_t(rel)) << 32);
+                }
+                sync_list_scrollbar_arrows();
+            } else {
+                const int cur = list.CursorIndex();
+                const int next = std::clamp(cur - w, 0, count - 1);
+                list.MoveTo(next, std::uint64_t(std::uint32_t(next)) << 32);
+            }
+            last_post_hover_cursor.store(list.CursorIndex(), std::memory_order_relaxed);
+            wheel_or_nav_ms.store(NowMs(), std::memory_order_relaxed);
+            nav_anchor_x.store(pointer_x.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            nav_anchor_y.store(pointer_y.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            nav_hover_locked.store(true, std::memory_order_relaxed);
+        }
+    }
+
+    if (!pointer_in.load(std::memory_order_relaxed)) {
         return;
     }
     const float x = pointer_x.load(std::memory_order_relaxed);
@@ -580,6 +695,52 @@ void PS4_SYSV_ABI OnListUpdate(std::uint64_t, const Core::GuestRegisterSnapshot*
     bool just_opened = false;
     Seen& s = GetSeen(component, x, y, just_opened);
     const bool clicked = TakeClick();
+
+    // Scrollbar click/drag for native multi-row lists (`SelectRow` pop-up dropdowns, inventory).
+    static const std::uint8_t* sb_drag_list = nullptr;
+    if (!left_held.load(std::memory_order_relaxed)) {
+        sb_drag_list = nullptr;
+    }
+    if (!BbGameMenu::DirectWheelScrollActive() && count > lines && lines > 0 && per_line == 1) {
+        const int max_line_scroll = std::max(1, count - lines);
+        Value sb;
+        if (list.MakeScrollBar(sb)) {
+            const Addr sb_obj = sb.DisplayObject();
+            Rect sb_rect{};
+            if (sb_obj && Shown(sb_obj) && StageBounds(sb_obj, sb_rect)) {
+                const float track_y1 = sb_rect.y1 + 16.0f;
+                const float track_y2 = sb_rect.y2 - 16.0f;
+                const float track_h = std::max(1.0f, track_y2 - track_y1);
+                if (sb_drag_list == component && left_held.load(std::memory_order_relaxed)) {
+                    click.store(false, std::memory_order_relaxed);
+                    const float ratio = std::clamp((y - track_y1) / track_h, 0.0f, 1.0f);
+                    list.ScrollLinesTo(
+                        std::clamp(int(std::lround(ratio * float(max_line_scroll))), 0, max_line_scroll));
+                    last_post_hover_cursor.store(list.CursorIndex(), std::memory_order_relaxed);
+                    sync_list_scrollbar_arrows();
+                    return;
+                }
+                const bool over_sb = x >= sb_rect.x1 - 18.0f && x <= sb_rect.x2 + 18.0f &&
+                                     y >= sb_rect.y1 - 12.0f && y <= sb_rect.y2 + 12.0f;
+                if (clicked && over_sb && click.exchange(false, std::memory_order_relaxed)) {
+                    nav_hover_locked.store(false, std::memory_order_relaxed);
+                    if (y < track_y1) {
+                        list.ScrollLinesBy(-1);
+                    } else if (y > track_y2) {
+                        list.ScrollLinesBy(+1);
+                    } else {
+                        sb_drag_list = component;
+                        const float ratio = std::clamp((y - track_y1) / track_h, 0.0f, 1.0f);
+                        list.ScrollLinesTo(std::clamp(
+                            int(std::lround(ratio * float(max_line_scroll))), 0, max_line_scroll));
+                    }
+                    last_post_hover_cursor.store(list.CursorIndex(), std::memory_order_relaxed);
+                    sync_list_scrollbar_arrows();
+                    return;
+                }
+            }
+        }
+    }
 
     if (list.IsSpinner()) {
         // One value shown: a click on its left half goes left, on the right half right.
@@ -735,6 +896,12 @@ int OnEvent(const void* sdl_event, void* sdl_window) {
     case SDL_EVENT_WINDOW_MOUSE_LEAVE:
         pointer_in.store(false, std::memory_order_relaxed);
         return 0;
+    case SDL_EVENT_KEY_DOWN:
+        if (event.key.key == SDLK_ESCAPE || event.key.key == SDLK_RETURN ||
+            event.key.key == SDLK_KP_ENTER) {
+            wheel_steps.store(0, std::memory_order_relaxed);
+        }
+        return 0;
     default:
         break;
     }
@@ -763,6 +930,7 @@ int OnEvent(const void* sdl_event, void* sdl_window) {
             click_ms.store(NowMs(), std::memory_order_relaxed);
             click.store(true, std::memory_order_relaxed);
         } else if (event.button.button == SDL_BUTTON_RIGHT) {
+            wheel_steps.store(0, std::memory_order_relaxed);
             presses.fetch_or(BackButton(), std::memory_order_relaxed);
         }
         return 1;
@@ -861,7 +1029,12 @@ void OnPad(std::uint32_t* buttons, const std::uint8_t* sticks) {
             holding = next;
             until_ms = now + PressMs;
             repeat_ms = now + RepeatDelayMs;
-        } else if (const int w = wheel_steps.load(std::memory_order_relaxed); w != 0) {
+        } else if (const int w =
+                       (BbGameMenu::DirectWheelScrollActive() ||
+                        now - direct_list_wheel_ms.load(std::memory_order_relaxed) < 150)
+                           ? 0
+                           : wheel_steps.load(std::memory_order_relaxed);
+                   w != 0) {
             wheel_steps.store(w > 0 ? w - 1 : w + 1, std::memory_order_relaxed);
             holding = w > 0 ? Up : Down;
             until_ms = now + PressMs;
@@ -915,6 +1088,57 @@ int PostHoverCursor(const void* list, int fallback) {
 
 float PointerX() {
     return pointer_x.load(std::memory_order_relaxed);
+}
+
+float PointerY() {
+    return pointer_y.load(std::memory_order_relaxed);
+}
+
+bool PointerActive() {
+    return pointer_in.load(std::memory_order_relaxed);
+}
+
+bool LeftMouseHeld() {
+    return left_held.load(std::memory_order_relaxed);
+}
+
+bool ConsumePendingClick() {
+    return click.exchange(false, std::memory_order_relaxed);
+}
+
+int TakeWheelSteps() {
+    return wheel_steps.exchange(0, std::memory_order_relaxed);
+}
+
+void NoteMenuActive() {
+    list_focus_ms.store(NowMs(), std::memory_order_relaxed);
+}
+
+void LockHoverAtCurrentPointer() {
+    wheel_or_nav_ms.store(NowMs(), std::memory_order_relaxed);
+    nav_anchor_x.store(pointer_x.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    nav_anchor_y.store(pointer_y.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    nav_hover_locked.store(true, std::memory_order_relaxed);
+}
+
+bool MoveListCursor(void* list_component, int target_index) {
+    if (!list_component) {
+        return false;
+    }
+    auto* comp = static_cast<std::uint8_t*>(list_component);
+    const int count = Field<std::int32_t>(comp, Count);
+    if (count <= 0) {
+        return false;
+    }
+    const int clamped = std::clamp(target_index, 0, count - 1);
+    const int line_scroll = Field<std::int32_t>(comp, Scroll);
+    const int lines = std::max(1, Field<std::int32_t>(comp, Lines));
+    const int rel = std::clamp(clamped - line_scroll, 0, lines - 1);
+    List list{comp};
+    const bool ok = list.MoveTo(clamped, std::uint64_t(std::uint32_t(rel)) << 32);
+    last_updated_list.store(comp, std::memory_order_relaxed);
+    last_post_hover_cursor.store(list.CursorIndex(), std::memory_order_relaxed);
+    return ok;
 }
 
 } // namespace BbMenuPointer

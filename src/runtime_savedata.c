@@ -105,6 +105,49 @@ void runtime_savedata_configure(const char *title) {
     bloodborne_sound_hack();
 }
 
+int runtime_savedata_sync_options(const void *options_128) {
+    if (!options_128) return 1;
+    pthread_mutex_lock(&lock);
+    for (int i=0;i<SLOTS;++i) {
+        if (slots[i].used && strstr(slots[i].host,"SPRJ0005")) {
+            pthread_mutex_unlock(&lock);
+            return 0; /* SLSession currently holds SPRJ0005 mounted; caller retries once unmounted. */
+        }
+    }
+    char cur_title[16];
+    snprintf(cur_title,sizeof(cur_title),"%s",title_id);
+    char users[700];
+    snprintf(users,sizeof(users),"%s/savedata",runtime_file_user_dir());
+    DIR *dir=opendir(users);
+    if (!dir) {
+        pthread_mutex_unlock(&lock);
+        return 1;
+    }
+    static const char *const bb_ids[]={"CUSA00207","CUSA00208","CUSA00299","CUSA00900","CUSA01363","CUSA03014","CUSA03023","CUSA03173","CUSA03179"};
+    for (struct dirent *e; (e=readdir(dir));) {
+        if (e->d_name[0]=='.') continue;
+        for (size_t t=0;t<sizeof(bb_ids)/sizeof(*bb_ids);++t) {
+            if (strcmp(cur_title,"UNKNOWN") && strcmp(cur_title,bb_ids[t])) continue;
+            char path[1100];
+            snprintf(path,sizeof(path),"%s/%s/%s/SPRJ0005/userdata0010",users,e->d_name,bb_ids[t]);
+            FILE *f=fopen(path,"r+b");
+            if (!f) continue;
+            uint32_t ver=0;
+            uint8_t cur[0x80];
+            if (fread(&ver,1,4,f)==4 && ver==0x1au && fread(cur,1,0x80,f)==0x80) {
+                if (memcmp(cur,options_128,0x80)!=0 && !fseek(f,4,SEEK_SET)) {
+                    (void)fwrite(options_128,1,0x80,f);
+                    fflush(f);
+                }
+            }
+            fclose(f);
+        }
+    }
+    closedir(dir);
+    pthread_mutex_unlock(&lock);
+    return 1;
+}
+
 static int make_dirs(const char *path) {
     char buffer[700];
     snprintf(buffer,sizeof(buffer),"%s",path);

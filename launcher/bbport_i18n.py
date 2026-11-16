@@ -552,6 +552,71 @@ EN = {
     "Дебаг-оверлей (компактный FPS)": "Debug overlay (compact FPS)",
     "Подробный дебаг (CPU и GPU)": "Detailed debug (CPU & GPU breakdown)",
     "Хоткей режима следования камеры": "Cycle camera follow mode (hotkey)",
+    "Игра, Звук и Моды": "Game, Audio & Mods",
+    "Яркость в игре": "In-game brightness",
+    "Внутриигровая яркость (0–10, синхронизируется с System → Brightness и userdata0010)":
+        "Native in-game brightness (0–10, synced live with System → Brightness and userdata0010)",
+    "Камера, захват цели и вибрация (в игре)": "In-Game Camera, Lock-On, and Vibration",
+    "Нативные параметры System → Controls (синхронизируются с игрой и userdata0010 на лету)":
+        "Native System → Controls settings (synced live with the game and userdata0010)",
+    "Скорость камеры": "Camera sensitivity",
+    "Скорость вращения камеры геймпада и прицела (0–10)": "Gamepad and lock-on camera rotation speed (0–10)",
+    "Вибрация геймпада": "Controller vibration",
+    "Сила вибрации контроллера (0 — выкл, 10 — макс.)": "Controller vibration strength (0 off, 10 strongest)",
+    "Инверсия камеры по горизонтали (ось X)": "Invert horizontal camera (X-axis)",
+    "Инверсия камеры по вертикали (ось Y)": "Invert vertical camera (Y-axis)",
+    "Автозахват новой цели": "Auto-target switch",
+    "Автоматически переключать прицел на ближайшего врага при гибели текущей цели":
+        "Automatically lock onto a nearby enemy when the current target dies",
+    "Автообход стен камерой": "Camera wall auto-adjust",
+    "Автоматическая коррекция камеры возле стен и препятствий":
+        "Automatically adjust camera angle around walls and obstacles",
+    "Звук, субтитры и окружение (в игре)": "Audio, Subtitles, and Environment (In-Game)",
+    "Нативные параметры System → Environment (меняются в игре на лету и сразу пишутся в userdata0010)":
+        "Native System → Environment settings (applied live in-game and persisted to userdata0010)",
+    "Громкость музыки (Music)": "Music volume",
+    "Громкость фоновой музыки и боссов (0–10)": "Background and boss music volume (0–10)",
+    "Звуковые эффекты (Sound Effects)": "Sound effects volume",
+    "Громкость ударов, шагов, выстрелов и окружения (0–10)": "Weapons, footsteps, gunfire, and ambient SFX volume (0–10)",
+    "Громкость голоса (Voice)": "Voice volume",
+    "Громкость диалогов персонажей (0–10)": "Character dialogue voice volume (0–10)",
+    "Субтитры": "Subtitles",
+    "Отображать субтитры диалогов внизу экрана": "Show dialogue subtitles at the bottom of the screen",
+    "Отображение крови": "Blood effects",
+    "Брызги и следы крови на одежде и оружии": "Blood splatter and stains on hunter attire and weapons",
+    "Язык текста в игре": "In-game text language",
+    "Язык озвучки в игре": "In-game voice language",
+    "Авто (по языку системы)": "Auto (follow system language)",
+    "Внутриигровой подбор и колокол (System → Network)": "In-Game Matchmaking & Bell Settings (System → Network)",
+    "Нативные параметры сети Bloodborne (синхронизируются с System → Network и userdata0010)":
+        "Native Bloodborne network options (synced with System → Network and userdata0010)",
+    "Регион подбора игроков": "Matching regions",
+    "Локальный": "Local",
+    "Весь мир": "Worldwide",
+    "Отображение имени игрока": "Player name display",
+    "Имя персонажа": "Character name",
+    "Сетевой идентификатор (Online ID)": "Online ID",
+    "Пароль призыва колокола (до 8 символов)": "Bell password matching (up to 8 characters)",
+    "Обновления": "Check Update",
+    "Обновление порта (GitHub Releases • SHA-256)": "Port Updates (GitHub Releases • SHA-256 Verified)",
+    "Обновление в 1 клик с github.com/lapothecary/bloodborne-pc-vulkan. Сохранения (user/savedata), bbport.ini и моды не затрагиваются":
+        "One-click update from github.com/lapothecary/bloodborne-pc-vulkan. Saves (user/savedata), bbport.ini, and mods are preserved",
+    "Статус установленной сборки": "Current build status",
+    "Локальный SHA-256: {}… • Нажмите «Проверить» для сверки с GitHub Releases":
+        "Local binary SHA-256: {}… • Click 'Check' to compare against GitHub Releases",
+    "Проверить": "Check",
+    "Обновить сейчас": "Update Now",
+    "Сверка SHA-256 с последним релизом на GitHub…": "Checking latest release & SHA-256 on GitHub…",
+    "✓ Установлена актуальная сборка ({} • SHA-256: {}… совпадает)":
+        "✓ Up to date ({} • SHA-256: {}… verified)",
+    "⬇ Доступна свежая сборка на GitHub: {}{} • Локальный {}… → Новый {}…":
+        "⬇ New build available on GitHub: {}{} • Local {}… → Remote {}…",
+    "⬇ Обновить ({})": "⬇ Update ({})",
+    "✓ Актуально ({})": "✓ {} Latest",
+    "Сначала закройте запущенную игру перед установкой обновления":
+        "Please close the running game first before installing an update",
+    "Обновление установлено! Перезапуск лаунчера…": "Update installed! Restarting Launcher…",
+    "Ошибка обновления: {}": "Update failed: {}",
 }
 
 PT_BR = {

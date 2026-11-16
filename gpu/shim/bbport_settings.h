@@ -220,6 +220,45 @@ struct Values {
     /// True Black / OLED Contrast De-Haze & Vibrance in Yebis2 3D LUT pass (ps_ed4c7668_lut3d.frag).
     std::atomic<bool> true_black_hdr{true};
 
+    // --- Native Bloodborne System Options (CSOptionsData <-> bbport.ini <-> Launcher) -----------
+    enum NativeMaskBit : std::uint32_t {
+        NativeBgmVolume         = 1u << 0,
+        NativeSeVolume          = 1u << 1,
+        NativeVoiceVolume       = 1u << 2,
+        NativeBloodExpression   = 1u << 3,
+        NativeSubtitles         = 1u << 4,
+        NativeGameBrightness    = 1u << 5,
+        NativeCameraSpeed       = 1u << 6,
+        NativePadVibration      = 1u << 7,
+        NativeCameraInvertX     = 1u << 8,
+        NativeCameraInvertY     = 1u << 9,
+        NativeAutoTarget        = 1u << 10,
+        NativeCameraAutoAdjust  = 1u << 11,
+        NativeNetworkRegion     = 1u << 12,
+        NativePlayerNameDisplay = 1u << 13,
+        NativeNetworkPassword   = 1u << 14,
+        NativeGameTextLanguage  = 1u << 15,
+        NativeGameVoiceLanguage = 1u << 16,
+    };
+    /// Bitmask of native keys explicitly loaded from bbport.ini (fields absent on first upgrade adopt userdata0010).
+    std::atomic<std::uint32_t> native_chosen_mask{0};
+    std::atomic<int> bgm_volume{7};           ///< 0..10 (CSOptionsData::music_volume, default 7)
+    std::atomic<int> se_volume{7};            ///< 0..10 (CSOptionsData::se_volume, default 7)
+    std::atomic<int> voice_volume{7};         ///< 0..10 (CSOptionsData::voice_volume, default 7)
+    std::atomic<bool> blood_expression{true}; ///< On/Off (CSOptionsData::blood_expression, default 1)
+    std::atomic<bool> subtitles{true};        ///< On/Off (CSOptionsData::subtitles, default 1)
+    std::atomic<int> game_brightness{5};      ///< 0..10 (CSOptionsData::brightness, default 5)
+    std::atomic<int> camera_speed{5};         ///< 0..10 (CSOptionsData::camera_speed, default 5)
+    std::atomic<int> pad_vibration{10};       ///< 0..10 (CSOptionsData::pad_vibration, default 10)
+    std::atomic<bool> camera_invert_x{false}; ///< true = Inverted (CSOptionsData::camera_left_right == 0)
+    std::atomic<bool> camera_invert_y{false}; ///< true = Inverted (CSOptionsData::camera_up_down == 0)
+    std::atomic<bool> auto_target{false};     ///< On/Off (CSOptionsData::auto_target, default 0)
+    std::atomic<bool> camera_auto_adjust{true}; ///< On/Off (CSOptionsData::camera_auto_adjust, default 1)
+    std::atomic<int> network_region{0};       ///< 0 = Local, 1 = Worldwide (CSOptionsData::network_region)
+    std::atomic<int> player_name_display{1};  ///< 0 = Character Name, 1 = Online ID (CSOptionsData::player_name_display)
+    std::atomic<int> game_text_language{-1};  ///< -1 = auto, or 0..20 index in GAME_LANGUAGES
+    std::atomic<int> game_voice_language{-1}; ///< -1 = auto, or 0..7 index in GAME_LANGUAGES
+
     /// Startup settings for the explicit BB_RENDER_RES compatibility patch only.
     int startup_preset = NativeAA;
     int startup_upscaler = UpscalerFsr3;
@@ -248,6 +287,18 @@ int RenderPreset();
 bool ResolutionNeedsRestart();
 /// Writes the file (menu changes).
 void Save();
+/// Reloads bbport.ini if modified externally (e.g. live from the Launcher while the game is running).
+bool ReloadExternalIfModified();
+
+/// In-game network bell password (up to 8 UTF-16/UTF-8 characters; CSOptionsData::password).
+std::string GetNetworkPassword();
+void SetNetworkPassword(const std::string& password);
+
+/// Language code table (`jajp`..`zhcn`, matching scripts/patches.py GAME_LANGUAGES).
+inline constexpr int GameLanguageCount = 21;
+inline constexpr int GameVoiceLanguageCount = 8;
+const char* GameLanguageCode(int index);
+int ParseGameLanguageCode(const std::string& code, int max_count = GameLanguageCount);
 
 /// Render resolution divisor of a preset (1.0 native, 1.5 quality, ...).
 float PresetScale(int preset);

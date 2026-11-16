@@ -22,7 +22,9 @@ jobs:
 
       - name: Package prebuilt Linux x86_64 archive
         run: |
+          python3 launcher/bbport_updater.py --write-version .bbport-version.json
           tar --exclude='__pycache__' -czf bloodborne-pc-vulkan-linux-x86_64-prebuilt.tar.gz \
+            .bbport-version.json \
             play.sh launcher.sh run.sh Launcher.py run.py bin \
             scripts patches launcher \
             out/bb-probe out/bb-gpu-capabilities \
@@ -30,6 +32,10 @@ jobs:
             out/gpu/libbbgpu.so out/gpu/libbbnet20.so \
             fsr4_shaders
           sha256sum bloodborne-pc-vulkan-linux-x86_64-prebuilt.tar.gz > bloodborne-pc-vulkan-linux-x86_64-prebuilt.tar.gz.sha256
+          python3 launcher/bbport_updater.py --write-manifest \
+            bloodborne-pc-vulkan-linux-x86_64-prebuilt.tar.gz \
+            linux-manifest.json \
+            .bbport-version.json
 
       - name: Create or Update GitHub Release (Linux x86_64)
         uses: softprops/action-gh-release@v2
@@ -63,12 +69,21 @@ jobs:
               - Fixed FLVER model & texture-list teardown order (`sub_21cda20`, `sub_21c6410`), eliminated 5 post-`Release` texture/surface Use-After-Free reads across `02_GX_GraphicsFramework`, converted all shared `GXResource` / worker-task / `DLRefString` reference counters to `ACQ_REL` atomics, and synchronized `GXResourceMemoryTracker`, `GXNamedResourceMap`, and skinning tables — eliminating rare `GFX` heap corruption crashes (`DLRegularHeap::free` / `GXWorker` `GXGnmCommandBufferWrapper`) when crossing sector streaming boundaries (e.g. exiting Iosefka's Clinic or descending stairs into new areas).
             - **Universal Windows & Linux Crash "Black Box" (`logs/crash-YYYYMMDD_HHMMSS.log`):**
               - Built a cross-platform engine crash reporter (`0 B` `PT_TLS`, `0.000 ms` render overhead) that writes a standalone `logs/crash-YYYYMMDD_HHMMSS.log` report on both Windows and Linux with `.pdb`-free C++20 `dantelion_gx` + `eboot.bin` + `DbgHelp`/`dladdr` hybrid `RBP`+`RSP` stack traces, all 16 annotated CPU registers, automatic FromSoftware `DLHeapManager` / `DLRegularHeap` corrupted chunk-header detection + hex/ASCII memory dumps, and a lock-free 128-event Flight Recorder (recent `.dcx`/`.flver`/save activity and player `XYZ`).
+            - **One-Click Launcher Auto-Updater with SHA-256 Verification (Windows & Linux):**
+              - Added a built-in **Check Update / Update Now** system (`launcher/bbport_updater.py`, HeaderBar badge + `Game, Audio & Mods` panel) that verifies local binary & archive SHA-256 digests against GitHub Releases (`linux-manifest.json` / `windows-manifest.json` + `.sha256` sidecars) — catching both new version tags and same-tag hotfix rebuilds, verifying the downloaded archive byte-for-byte before extraction, preserving `user/savedata`, `bbport.ini`, and `mods/`, swapping locked Windows `.exe`/`.dll` binaries cleanly, and auto-restarting the Launcher in 1 click.
+            - **Unified Monolithic Persistence (`userdata0010` ↔ `CSOptionsData` ↔ `bbport.ini` ↔ Launchers):**
+              - Exposed all 17 native Bloodborne `System` settings (`Music`, `SFX`, and `Voice` volumes, `Subtitles`, `Blood`, `Brightness`, `Camera Sensitivity`, `Controller Vibration`, `Camera X/Y Invert`, `Auto-Target`, `Camera Auto-Adjust`, `Text/Voice Language`, `Matching Regions`, `Player Name Display`, and `Bell Password`) in the GUI Launchers with live two-way sync while the game is running.
+              - Fixed instant disk persistence to `SPRJ0005/userdata0010` (so volume/brightness/language changes survive immediate window `[X]` / `Alt+F4` closes without backing out to the Title Screen), fixed the 6 native `System -> Controls` rows (`NotifyOptionPageChanged`), flushed debounced `Display` settings on window close, and unlocked region-free switching in `System -> Language`.
+            - **Expanded Scaleform `System` & Options Menu Layouts, Gothic `ScrollBarV` & `0-ms` Wheel Navigation:**
+              - Rebuilt `optionsetting.gfx` on load (`src/runtime_option_layout.c`) into a clean two-tier layout: a compact `[151.70 .. 893.65]` frame showing all 7 `System` tabs at once without scrolling (matching `Environment`, `Language`, `Brightness`, and `Network`), and a full-height `[32 .. 1048]` 11-row frame fitting all 11 `Display` and 11 `Effects` options on one screen plus an antique bronze/gold `ScrollBarV` for the 35-item `Controls` list.
+              - Disabled the 1.5s cursor auto-hide inside menus and unified instant `0-ms` mouse-wheel row navigation across all vertical menus without scroll carry-over on `Esc`.
             - **Button Prompt Primary-Slot & Mouse Side-Button Fix:** Single-action HUD prompts now prioritize your **Primary (`Slot 1`)** key over secondary `+Alt Key` mouse bindings (so `E, Mouse 4` shows `[E]`), and fixed `Mouse 4` / `Mouse 5` (`X1`/`X2`) and chord (`⇧`) highlights on mouse icons.
             - **Accurate Thread/Pacer Telemetry:** Measured `MOMainThread` active CPU execution directly via `CLOCK_THREAD_CPUTIME_ID` / `QueryThreadCycleTime` outside pacer sleep/spin, separated `ThreadSync` barrier waits from `FpsCapSleep`, and added 5-second `Pacing` (`min/p50/p95/p99/max`, `>1.25x`/`>1.5x`, `PresPace`, `SimDt`) and `Input` cadence diagnostics to `[HUD Telemetry]`.
             - **Previously in `v1.1.4`:** DirectVk `Stage A`/`Stage B` command stream overhaul (`decommission_pm4`), `SceneOcclusionCuller` 2.0 (`27–41%` G-Buffer culling at `0.00 ms` `Stage A` cost), and `123` native vectorized GLSL 460 shaders (`opt35`).
           files: |
             bloodborne-pc-vulkan-linux-x86_64-prebuilt.tar.gz
             bloodborne-pc-vulkan-linux-x86_64-prebuilt.tar.gz.sha256
+            linux-manifest.json
 
   release-windows:
     runs-on: windows-latest
@@ -137,6 +152,9 @@ jobs:
             rm -f build_win32_gpu/include/bbgpu/shaders/*.h build_win32_gpu/include/bbgpu/shaders/*.spv
             find build_win32_gpu/CMakeFiles/bb-probe.dir -name "*.obj" -delete || true
             rm -f build_win32_gpu/CMakeFiles/bbgpu.dir/shim/*.obj build_win32_gpu/CMakeFiles/bbgpu.dir/games/*.obj build_win32_gpu/CMakeFiles/bbgpu.dir/gcn/*.obj build_win32_gpu/CMakeFiles/bbgpu.dir/textures/*.obj build_win32_gpu/CMakeFiles/bbgpu.dir/platform/gnm/*.obj build_win32_gpu/CMakeFiles/bbgpu.dir/platform/win32/*.obj build_win32_gpu/CMakeFiles/bbgpu.dir/platform/avplayer/*.obj build_win32_gpu/CMakeFiles/bbgpu.dir/platform/videoout/*.obj build_win32_gpu/CMakeFiles/bbgpu.dir/buffers/*.obj build_win32_gpu/CMakeFiles/bbgpu.dir/render/*.obj build_win32_gpu/CMakeFiles/bbgpu.dir/cp/*.obj build_win32_gpu/CMakeFiles/bbgpu.dir/vulkan/*.obj build_win32_gpu/CMakeFiles/bbgpu.dir/shader/backend/spirv/*.obj build_win32_gpu/CMakeFiles/bbgpu.dir/upscale/*.obj build_win32_gpu/libbbgpu.a build_win32_gpu/bb-probe.exe build_win32_gpu/libbbgpu.dll build_win32_gpu/bb-gpu-capabilities.exe
+            if ! grep -q "runtime_option_layout.c" build_win32_gpu/build.ninja; then
+              cmake -S gpu -B build_win32_gpu -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBB_LTO=OFF -DBB_PGO=off -DBB_NET=OFF > cmake_win32.log 2>&1
+            fi
           else
             rm -rf build_win32_gpu
             if ! cmake -S gpu -B build_win32_gpu -G Ninja \
@@ -174,3 +192,4 @@ jobs:
           files: |
             bloodborne-pc-vulkan-windows-x86_64-prebuilt.zip
             bloodborne-pc-vulkan-windows-x86_64-prebuilt.zip.sha256
+            windows-manifest.json

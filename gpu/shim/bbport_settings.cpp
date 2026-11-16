@@ -156,6 +156,22 @@ std::array<std::string, KeyActionCount> key_bindings = [] {
     return arr;
 }();
 
+std::mutex net_pw_mutex;
+std::string network_password_str;
+std::atomic<long long> last_known_ini_mtime_ns{0};
+
+constexpr const char* kGameLanguages[GameLanguageCount] = {
+    "jajp", "engb", "frfr", "itit", "dede", "eses", "esar", "ptbr", "enus", "nlnl", "plpl",
+    "ruru", "dadk", "nono", "fifi", "svse", "trtr", "ptpt", "zhtw", "kokr", "zhcn",
+};
+
+long long CurrentIniMtimeNs(const char* path) {
+    std::error_code ec;
+    const auto ft = std::filesystem::last_write_time(path, ec);
+    if (ec) return 0;
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(ft.time_since_epoch()).count();
+}
+
 const char* Path() {
     const char* env = std::getenv("BB_CONFIG");
     return env && env[0] ? env : "bbport.ini";
@@ -292,6 +308,57 @@ void Set(Values& v, const std::string& key, const std::string& value) {
         v.ssr_quality = (value != "0" && value != "false" && value != "off");
     } else if (key == "true_black_hdr") {
         v.true_black_hdr = (value != "0" && value != "false" && value != "off");
+    } else if (key == "bgm_volume") {
+        v.bgm_volume = std::clamp(i, 0, 10);
+        v.native_chosen_mask.fetch_or(Values::NativeBgmVolume, std::memory_order_relaxed);
+    } else if (key == "se_volume") {
+        v.se_volume = std::clamp(i, 0, 10);
+        v.native_chosen_mask.fetch_or(Values::NativeSeVolume, std::memory_order_relaxed);
+    } else if (key == "voice_volume") {
+        v.voice_volume = std::clamp(i, 0, 10);
+        v.native_chosen_mask.fetch_or(Values::NativeVoiceVolume, std::memory_order_relaxed);
+    } else if (key == "blood_expression") {
+        v.blood_expression = (value != "0" && value != "false" && value != "off");
+        v.native_chosen_mask.fetch_or(Values::NativeBloodExpression, std::memory_order_relaxed);
+    } else if (key == "subtitles") {
+        v.subtitles = (value != "0" && value != "false" && value != "off");
+        v.native_chosen_mask.fetch_or(Values::NativeSubtitles, std::memory_order_relaxed);
+    } else if (key == "game_brightness") {
+        v.game_brightness = std::clamp(i, 0, 10);
+        v.native_chosen_mask.fetch_or(Values::NativeGameBrightness, std::memory_order_relaxed);
+    } else if (key == "camera_speed") {
+        v.camera_speed = std::clamp(i, 0, 10);
+        v.native_chosen_mask.fetch_or(Values::NativeCameraSpeed, std::memory_order_relaxed);
+    } else if (key == "pad_vibration") {
+        v.pad_vibration = std::clamp(i, 0, 10);
+        v.native_chosen_mask.fetch_or(Values::NativePadVibration, std::memory_order_relaxed);
+    } else if (key == "camera_invert_x") {
+        v.camera_invert_x = (value == "1" || value == "true" || value == "on" || value == "inverted");
+        v.native_chosen_mask.fetch_or(Values::NativeCameraInvertX, std::memory_order_relaxed);
+    } else if (key == "camera_invert_y") {
+        v.camera_invert_y = (value == "1" || value == "true" || value == "on" || value == "inverted");
+        v.native_chosen_mask.fetch_or(Values::NativeCameraInvertY, std::memory_order_relaxed);
+    } else if (key == "auto_target") {
+        v.auto_target = (value != "0" && value != "false" && value != "off");
+        v.native_chosen_mask.fetch_or(Values::NativeAutoTarget, std::memory_order_relaxed);
+    } else if (key == "camera_auto_adjust") {
+        v.camera_auto_adjust = (value != "0" && value != "false" && value != "off");
+        v.native_chosen_mask.fetch_or(Values::NativeCameraAutoAdjust, std::memory_order_relaxed);
+    } else if (key == "network_region") {
+        v.network_region = (value == "1" || value == "worldwide" || value == "global") ? 1 : 0;
+        v.native_chosen_mask.fetch_or(Values::NativeNetworkRegion, std::memory_order_relaxed);
+    } else if (key == "player_name_display") {
+        v.player_name_display = (value == "0" || value == "character") ? 0 : 1;
+        v.native_chosen_mask.fetch_or(Values::NativePlayerNameDisplay, std::memory_order_relaxed);
+    } else if (key == "network_password") {
+        SetNetworkPassword(value);
+        v.native_chosen_mask.fetch_or(Values::NativeNetworkPassword, std::memory_order_relaxed);
+    } else if (key == "game_text_language") {
+        v.game_text_language = ParseGameLanguageCode(value, GameLanguageCount);
+        v.native_chosen_mask.fetch_or(Values::NativeGameTextLanguage, std::memory_order_relaxed);
+    } else if (key == "game_voice_language") {
+        v.game_voice_language = ParseGameLanguageCode(value, GameVoiceLanguageCount);
+        v.native_chosen_mask.fetch_or(Values::NativeGameVoiceLanguage, std::memory_order_relaxed);
     } else {
         for (int k = 0; k < KeyActionCount; ++k) {
             if (key == kKeyDefs[k].ini_key ||
@@ -352,7 +419,7 @@ void SetKeyBinding(int action, const std::string& value) {
     }
 }
 
-std::string FormatKeyBinding(const std::string& raw, bool russian) {
+std::string FormatKeyBinding(const std::string& raw, bool /*russian*/) {
     auto trim = [](std::string s) {
         const auto a = s.find_first_not_of(" \t");
         if (a == std::string::npos) return std::string{};
@@ -409,6 +476,59 @@ void ResetKeyBindingsToDefault() {
     v.mouse_look = true;
     v.mouse_invert_y = false;
     v.mouse_sensitivity = 1.0f;
+}
+
+std::string GetNetworkPassword() {
+    std::scoped_lock lock{net_pw_mutex};
+    return network_password_str;
+}
+
+void SetNetworkPassword(const std::string& password) {
+    std::string trimmed = password;
+    const auto first = trimmed.find_first_not_of(" \t\r\n");
+    if (first != std::string::npos) {
+        trimmed = trimmed.substr(first, trimmed.find_last_not_of(" \t\r\n") - first + 1);
+    } else {
+        trimmed.clear();
+    }
+    // Truncate cleanly at <= 8 UTF-8 code points so it fits CSOptionsData::password[9].
+    std::size_t bytes = 0;
+    int chars = 0;
+    while (bytes < trimmed.size() && chars < 8) {
+        const unsigned char c = static_cast<unsigned char>(trimmed[bytes]);
+        const std::size_t step = (c < 0x80) ? 1 : ((c & 0xe0) == 0xc0) ? 2 : ((c & 0xf0) == 0xe0) ? 3 : 4;
+        if (bytes + step > trimmed.size()) break;
+        bytes += step;
+        ++chars;
+    }
+    trimmed.resize(bytes);
+    std::scoped_lock lock{net_pw_mutex};
+    network_password_str = std::move(trimmed);
+}
+
+const char* GameLanguageCode(int index) {
+    if (index < 0 || index >= GameLanguageCount) {
+        return "auto";
+    }
+    return kGameLanguages[index];
+}
+
+int ParseGameLanguageCode(const std::string& code, int max_count) {
+    if (code.empty() || code == "auto" || code == "-1") {
+        return -1;
+    }
+    const int limit = std::clamp(max_count, 0, GameLanguageCount);
+    for (int idx = 0; idx < limit; ++idx) {
+        if (code == kGameLanguages[idx]) {
+            return idx;
+        }
+    }
+    char* end = nullptr;
+    const long numeric = std::strtol(code.c_str(), &end, 10);
+    if (end && *end == '\0' && numeric >= 0 && numeric < limit) {
+        return int(numeric);
+    }
+    return -1;
 }
 
 namespace {
@@ -559,6 +679,7 @@ void Load() {
             Set(v, text.substr(0, eq), text.substr(eq + 1));
         }
         std::fclose(file);
+        last_known_ini_mtime_ns.store(CurrentIniMtimeNs(Path()), std::memory_order_relaxed);
         std::printf("Settings: %s\n", Path());
     }
     // Environment overrides (scripts, A/B tests).
@@ -767,6 +888,34 @@ void Save() {
     put("contact_shadows", flag(v.contact_shadows.load()));
     put("ssr_quality", flag(v.ssr_quality.load()));
     put("true_black_hdr", flag(v.true_black_hdr.load()));
+    const std::uint32_t nmask = v.native_chosen_mask.load(std::memory_order_relaxed);
+    if (nmask & Values::NativeBgmVolume) put("bgm_volume", std::to_string(std::clamp(v.bgm_volume.load(), 0, 10)));
+    if (nmask & Values::NativeSeVolume) put("se_volume", std::to_string(std::clamp(v.se_volume.load(), 0, 10)));
+    if (nmask & Values::NativeVoiceVolume) put("voice_volume", std::to_string(std::clamp(v.voice_volume.load(), 0, 10)));
+    if (nmask & Values::NativeBloodExpression) put("blood_expression", flag(v.blood_expression.load()));
+    if (nmask & Values::NativeSubtitles) put("subtitles", flag(v.subtitles.load()));
+    if (nmask & Values::NativeGameBrightness) put("game_brightness", std::to_string(std::clamp(v.game_brightness.load(), 0, 10)));
+    if (nmask & Values::NativeCameraSpeed) put("camera_speed", std::to_string(std::clamp(v.camera_speed.load(), 0, 10)));
+    if (nmask & Values::NativePadVibration) put("pad_vibration", std::to_string(std::clamp(v.pad_vibration.load(), 0, 10)));
+    if (nmask & Values::NativeCameraInvertX) put("camera_invert_x", flag(v.camera_invert_x.load()));
+    if (nmask & Values::NativeCameraInvertY) put("camera_invert_y", flag(v.camera_invert_y.load()));
+    if (nmask & Values::NativeAutoTarget) put("auto_target", flag(v.auto_target.load()));
+    if (nmask & Values::NativeCameraAutoAdjust) put("camera_auto_adjust", flag(v.camera_auto_adjust.load()));
+    if (nmask & Values::NativeNetworkRegion) {
+        put("network_region", v.network_region.load() == 1 ? "worldwide" : "local");
+    }
+    if (nmask & Values::NativePlayerNameDisplay) {
+        put("player_name_display", v.player_name_display.load() == 0 ? "character" : "online_id");
+    }
+    if (nmask & Values::NativeNetworkPassword) {
+        put("network_password", GetNetworkPassword());
+    }
+    if (nmask & Values::NativeGameTextLanguage) {
+        put("game_text_language", GameLanguageCode(v.game_text_language.load()));
+    }
+    if (nmask & Values::NativeGameVoiceLanguage) {
+        put("game_voice_language", GameLanguageCode(v.game_voice_language.load()));
+    }
     for (int k = 0; k < KeyActionCount; ++k) {
         put(kKeyDefs[k].ini_key, GetKeyBinding(k));
     }
@@ -816,9 +965,46 @@ void Save() {
     }
     if (!ok || ec) {
         std::printf("Settings: cannot write %s\n", Path());
-    } else if (runtime_pad_reload_bindings) {
+    } else {
+        last_known_ini_mtime_ns.store(CurrentIniMtimeNs(Path()), std::memory_order_relaxed);
+        if (runtime_pad_reload_bindings) {
+            runtime_pad_reload_bindings();
+        }
+    }
+}
+
+bool ReloadExternalIfModified() {
+    const long long mtime = CurrentIniMtimeNs(Path());
+    if (mtime == 0 || mtime == last_known_ini_mtime_ns.load(std::memory_order_relaxed)) {
+        return false;
+    }
+    FILE* file = std::fopen(Path(), "r");
+    if (!file) {
+        return false;
+    }
+    auto& v = Get();
+    char line[512];
+    while (std::fgets(line, sizeof(line), file)) {
+        std::string text{line};
+        text.erase(text.find_last_not_of(" \t\r\n") + 1);
+        const auto eq = text.find('=');
+        if (text.empty() || text[0] == '#' || eq == std::string::npos) {
+            continue;
+        }
+        std::string key = text.substr(0, eq);
+        key.erase(key.find_last_not_of(" \t") + 1);
+        key.erase(0, key.find_first_not_of(" \t"));
+        std::string val = text.substr(eq + 1);
+        val.erase(0, val.find_first_not_of(" \t"));
+        Set(v, key, val);
+    }
+    std::fclose(file);
+    last_known_ini_mtime_ns.store(mtime, std::memory_order_relaxed);
+    BbFrameRate::SetLimit(v.fps_limit.load());
+    if (runtime_pad_reload_bindings) {
         runtime_pad_reload_bindings();
     }
+    return true;
 }
 
 float PresetScale(int preset) {
