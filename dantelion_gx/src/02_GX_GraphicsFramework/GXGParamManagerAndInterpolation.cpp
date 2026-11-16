@@ -4462,11 +4462,6 @@ bool GXSurfaceTexture_CreateTexture2DAndViews(
     }
 
     if (hr == 0) {
-        if (__sync_fetch_and_add(&pNewSurf->m_refCount10, -1) == 1 && pNewSurf != nullptr) {
-            DLAllocator* pAlloc = pNewSurf->m_pAllocator08;
-            pNewSurf->m_pVTable00[0](pNewSurf);
-            pAlloc->m_pVTable->Free(pAlloc, pNewSurf);
-        }
         pThis->m_pitchOrSize58 = pNewSurf ? pNewSurf->m_pitchOrSize2C : 0;
 
         if (!pThis->m_pSurface40) {
@@ -4494,6 +4489,14 @@ bool GXSurfaceTexture_CreateTexture2DAndViews(
                 pDevice = **reinterpret_cast<void***>(GX_VMA(0x55406c8ULL));
                 hr = sub_2166b60(pDevice, &pThis->m_pRtvOrDsvView50, pThis->m_pSurface40, &tvDesc, 0);
             }
+        }
+    }
+
+    if (pNewSurf != nullptr) {
+        if (__sync_fetch_and_add(&pNewSurf->m_refCount10, -1) == 1) {
+            DLAllocator* pAlloc = pNewSurf->m_pAllocator08;
+            pNewSurf->m_pVTable00[0](pNewSurf);
+            pAlloc->m_pVTable->Free(pAlloc, pNewSurf);
         }
     }
 

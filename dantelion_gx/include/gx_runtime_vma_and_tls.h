@@ -29,6 +29,7 @@
 extern "C" {
 __attribute__((visibility("hidden"))) extern uintptr_t g_eboot_live_slide;
 __attribute__((visibility("hidden"))) extern uint32_t  g_win32_guest_tls_teb_offset;
+__attribute__((visibility("hidden"))) extern volatile uint32_t g_gx_resource_tracker_spinlock;
 __attribute__((visibility("hidden"))) extern uint8_t   g_gx_offline_scratch[0x10000];
 __attribute__((visibility("hidden"))) extern uint8_t   g_gx_offline_tls_area[0x4000];
 #if !defined(GX_HOST_PROVIDES_CYG_PROFILE)
@@ -36,6 +37,17 @@ __attribute__((weak, no_instrument_function)) void __cyg_profile_func_enter(void
 __attribute__((weak, no_instrument_function)) void __cyg_profile_func_exit(void*, void*) noexcept {}
 #endif
 }
+
+struct GXResourceTrackerLockGuard {
+    __attribute__((no_instrument_function)) GXResourceTrackerLockGuard() noexcept {
+        while (__atomic_exchange_n(&g_gx_resource_tracker_spinlock, 1u, __ATOMIC_ACQUIRE) != 0u) {
+            __builtin_ia32_pause();
+        }
+    }
+    __attribute__((no_instrument_function)) ~GXResourceTrackerLockGuard() noexcept {
+        __atomic_store_n(&g_gx_resource_tracker_spinlock, 0u, __ATOMIC_RELEASE);
+    }
+};
 
 __attribute__((no_instrument_function)) static inline uintptr_t gx_resolve_vma(uintptr_t vma) noexcept {
     const uintptr_t slide = g_eboot_live_slide;

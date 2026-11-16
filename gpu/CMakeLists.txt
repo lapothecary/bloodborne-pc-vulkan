@@ -489,3 +489,9 @@ add_executable(srt-walker-fault-test EXCLUDE_FROM_ALL ../tests/test_srt_walker_f
 target_include_directories(srt-walker-fault-test PRIVATE . shim ${SHADER_INCLUDE} third_party/gcn/include third_party/half/include)
 target_compile_options(srt-walker-fault-test PRIVATE -UNDEBUG -Wall -Wextra)
 target_link_libraries(srt-walker-fault-test PRIVATE bbgpu)
+
+add_executable(crash-blackbox-test EXCLUDE_FROM_ALL ../tests/test_crash_blackbox.cpp
+    ../tests/test_gpu_runtime_stubs.cpp)
+target_include_directories(crash-blackbox-test PRIVATE .. . shim)
+target_compile_options(crash-blackbox-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+target_link_libraries(crash-blackbox-test PRIVATE bbgpu)

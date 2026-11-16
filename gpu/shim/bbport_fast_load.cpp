@@ -6,6 +6,7 @@
 #include "bbport_fast_load.h"
 
 #include "bb_env.h"
+#include "bbport_crash_blackbox.h"
 #include "bbport_frame_rate.h"
 #include "bbport_guest_code_hooks.h"
 #include "common/types.h"
@@ -44,6 +45,11 @@ void PS4_SYSV_ABI HostZlibBridgeFree(void* opaque, void* address) noexcept {
     }
     auto* bridge = static_cast<HostZlibBridgeState*>(address);
     if (bridge->magic == kHostZlibBridgeMagic) {
+        if (bridge->host_strm.total_out >= 65536u) {
+            BbCrashBlackBox::RecordEventFmt("DCX", "inflated %lu KiB -> %lu KiB",
+                                            static_cast<unsigned long>(bridge->host_strm.total_in >> 10),
+                                            static_cast<unsigned long>(bridge->host_strm.total_out >> 10));
+        }
         bridge->magic = 0;
         ::inflateEnd(&bridge->host_strm);
         delete bridge;

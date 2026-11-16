@@ -192,6 +192,14 @@ PRESENT_MODES = [
 # choice labels stay short, so the selected one is shown in full.
 DRAW_PIPE = [("Авто", "", "Включён при 8 и более потоках процессора"), ("Включён", "1"),
              ("Выключен", "0", "Стабильнее, но медленнее")]
+CAMERA_FOLLOW_MODES = [
+    ("Оригинал (PS4)", "original",
+     "Классическая плавная инерция камеры Bloodborne с точной коррекцией под любой FPS (хоткей: F4)"),
+    ("Баланс", "balanced",
+     "По умолчанию: отзывчивая пружина следования с лёгким отдалением на спринте и 1:1 обзором мыши (хоткей: F4)"),
+    ("Жёсткая (1:1)", "locked",
+     "Жёсткая привязка 1:1 к персонажу без отставания (хоткей: F4)"),
+]
 # The game's text languages (dvdroot_ps4/msg) by the PS4 system language code (#249).
 LANGUAGES = [("Английский", "1"), ("Английский (Великобритания)", "18"), ("Русский", "8"),
              ("Японский", "0"), ("Французский", "2"), ("Испанский", "3"),
@@ -276,6 +284,7 @@ INI_DEFAULTS = {
     "mouse_look": "1",
     "mouse_sensitivity": "1.00",
     "mouse_invert_y": "0",
+    "camera_follow_mode": "balanced",
     **{key: "1" if default else "0" for key, _, default, *_ in EFFECTS + REMASTER_ENHANCEMENTS},
 }
 
@@ -577,6 +586,9 @@ CONTROLS = [
     ("look_down", "Камера вниз", "K", None),
     ("look_left", "Камера влево", "J", None),
     ("look_right", "Камера вправо", "L", None),
+    ("hotkey.debug", "Дебаг-оверлей (компактный FPS)", "F8", None),
+    ("hotkey.additional_debug", "Подробный дебаг (CPU и GPU)", "F9", None),
+    ("hotkey.camera_follow", "Хоткей режима следования камеры", "F4", None),
 ]
 
 
@@ -1064,6 +1076,16 @@ class LauncherWindow(Adw.ApplicationWindow):
         self.mouse_invert_row = Adw.SwitchRow(title=tr("Инвертировать мышь по вертикали"),
                                               active=self.ini.get("mouse_invert_y") == "1")
         device_group.add(self.mouse_invert_row)
+        raw_cam_mode = self.ini.get("camera_follow_mode", "balanced").strip().lower()
+        norm_cam_mode = {"0": "original", "1": "balanced", "2": "locked"}.get(raw_cam_mode, raw_cam_mode)
+        if norm_cam_mode not in ("original", "balanced", "locked"):
+            norm_cam_mode = "balanced"
+        self.camera_follow_row = combo_row(
+            tr("Режим следования камеры"), None, CAMERA_FOLLOW_MODES, norm_cam_mode)
+        self.camera_follow_row.connect(
+            "notify::selected",
+            lambda *_: None if getattr(self, "_reloading_ini", False) else self.store())
+        device_group.add(self.camera_follow_row)
         def mouse_rows_sensitive(*_):
             for row in (self.mouse_sensitivity_row, self.mouse_invert_row):
                 row.set_sensitive(self.mouse_look_row.get_active())
@@ -1325,7 +1347,8 @@ class LauncherWindow(Adw.ApplicationWindow):
 
     def show_control(self, kind, name):
         row, default = self.control_rows[(kind, name)]
-        value = self.ini.get(f"{kind}.{name}")
+        ini_key = name if "." in name else f"{kind}.{name}"
+        value = self.ini.get(ini_key)
         if value is None:
             row.set_subtitle(tr("{} (по умолчанию)").format(default) if default else tr("не назначено"))
         else:
@@ -1333,7 +1356,8 @@ class LauncherWindow(Adw.ApplicationWindow):
 
     def set_control(self, kind, name, value):
         """value: the binding, or None for the default."""
-        self.ini[f"{kind}.{name}"] = value
+        ini_key = name if "." in name else f"{kind}.{name}"
+        self.ini[ini_key] = value
         self.show_control(kind, name)
         self.store()
 
@@ -1511,6 +1535,7 @@ class LauncherWindow(Adw.ApplicationWindow):
             "mouse_look": "1" if self.mouse_look_row.get_active() else "0",
             "mouse_sensitivity": f"{self.mouse_sensitivity_row.get_value():.2f}",
             "mouse_invert_y": "1" if self.mouse_invert_row.get_active() else "0",
+            "camera_follow_mode": combo_value(self.camera_follow_row),
             **{key: "1" if row.get_active() else "0" for key, row in self.effect_rows.items()},
         })
         save_ini(self.ini, self.ini_lines)
@@ -1611,6 +1636,10 @@ class LauncherWindow(Adw.ApplicationWindow):
             except ValueError:
                 pass
             self.mouse_invert_row.set_active(self.ini.get("mouse_invert_y") == "1")
+            raw_cm = self.ini.get("camera_follow_mode", "balanced").strip().lower()
+            norm_cm = {"0": "original", "1": "balanced", "2": "locked"}.get(raw_cm, raw_cm)
+            select_combo(self.camera_follow_row,
+                         norm_cm if norm_cm in ("original", "balanced", "locked") else "balanced")
             for kind, name in self.control_rows:
                 self.show_control(kind, name)
             self.update_upscaler_status()

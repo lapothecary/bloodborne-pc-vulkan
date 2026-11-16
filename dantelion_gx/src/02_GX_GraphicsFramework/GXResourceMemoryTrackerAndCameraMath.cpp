@@ -28,6 +28,8 @@
 #include <algorithm>
 #include <immintrin.h>
 
+extern "C" __attribute__((visibility("hidden"))) volatile uint32_t g_gx_resource_tracker_spinlock = 0u;
+
 namespace FromSoftware {
 namespace GX {
 
@@ -270,6 +272,7 @@ void GXResourceMemoryTracker_UnregisterShader(GXResourceMemoryTracker* self, GXT
     }
     uint32_t bytes = shader->vptr->GetShaderBinarySize(shader);
     if (bytes != 0) {
+        GXResourceTrackerLockGuard lockGuard{};
         self->shaderBytes -= bytes;
         self->shaderMegabytes = static_cast<float>(self->shaderBytes) * kBytesToMegabytes;
         --self->shaderCount;
@@ -287,6 +290,7 @@ void GXResourceMemoryTracker_UnregisterTextureSubType(GXResourceMemoryTracker* s
     }
     uint32_t bytes = tex->textureBytes;
     uint8_t flags = tex->textureFlags;
+    GXResourceTrackerLockGuard lockGuard{};
     if ((flags & 3u) == 3u) {
         self->texType3Bytes -= bytes;
         self->texType3Megabytes = static_cast<float>(self->texType3Bytes) * kBytesToMegabytes;
@@ -307,11 +311,15 @@ void GXResourceMemoryTracker_UnregisterTextureSubType(GXResourceMemoryTracker* s
 }
 
 static inline void GXResourceBucket_Remove(GXTrackedResourceBucket* bucket, GXTrackedResource* res) {
+    if (res == nullptr) {
+        return;
+    }
+    const uint32_t bytes = res->vptr->GetGpuMemoryBytes(res);
+    GXResourceTrackerLockGuard lockGuard{};
     for (void** it = bucket->vec.begin; it != bucket->vec.end; ++it) {
         if (*it == res) {
             std::memmove(it, it + 1, static_cast<size_t>((bucket->vec.end - (it + 1)) * sizeof(void*)));
             --bucket->vec.end;
-            uint32_t bytes = res->vptr->GetGpuMemoryBytes(res);
             bucket->counter.totalBytes -= bytes;
             bucket->counter.totalMegabytes = static_cast<float>(bucket->counter.totalBytes) * kBytesToMegabytes;
             --bucket->counter.count;
@@ -355,6 +363,7 @@ void GXResourceMemoryTracker_RegisterShader(GXResourceMemoryTracker* self, GXTra
     }
     uint32_t bytes = shader->vptr->GetShaderBinarySize(shader);
     if (bytes != 0) {
+        GXResourceTrackerLockGuard lockGuard{};
         self->shaderBytes += bytes;
         self->shaderMegabytes = static_cast<float>(self->shaderBytes) * kBytesToMegabytes;
         ++self->shaderCount;
@@ -372,6 +381,7 @@ void GXResourceMemoryTracker_RegisterTextureSubType(GXResourceMemoryTracker* sel
     }
     uint32_t bytes = tex->textureBytes;
     uint8_t flags = tex->textureFlags;
+    GXResourceTrackerLockGuard lockGuard{};
     if ((flags & 3u) == 3u) {
         self->texType3Bytes += bytes;
         self->texType3Megabytes = static_cast<float>(self->texType3Bytes) * kBytesToMegabytes;
@@ -399,13 +409,14 @@ static inline void GXResourceBucket_Add(
     if (res == nullptr) {
         return;
     }
+    const uint32_t bytes = res->vptr->GetGpuMemoryBytes(res);
+    GXResourceTrackerLockGuard lockGuard{};
     if (bucket->vec.end == bucket->vec.cap) {
         size_t curSize = static_cast<size_t>(bucket->vec.end - bucket->vec.begin);
         size_t newCap = std::max<size_t>(curSize + 1, curSize + curSize / 2);
         reallocateFn(&bucket->vec, newCap);
     }
     *bucket->vec.end++ = res;
-    uint32_t bytes = res->vptr->GetGpuMemoryBytes(res);
     bucket->counter.totalBytes += bytes;
     bucket->counter.totalMegabytes = static_cast<float>(bucket->counter.totalBytes) * kBytesToMegabytes;
     ++bucket->counter.count;
@@ -488,6 +499,7 @@ static inline void GXResourceMemoryTracker_ShrinkBucketVector(
 }
 
 void GXResourceMemoryTracker_ClearAllVectors(GXResourceMemoryTracker* self) {
+    GXResourceTrackerLockGuard lockGuard{};
     GXResourceMemoryTracker_ShrinkBucketVector(&self->buckets[0].vec, DLVectorPtr_MoveAssignType0);
     GXResourceMemoryTracker_ShrinkBucketVector(&self->buckets[1].vec, DLVectorPtr_MoveAssignType1);
     GXResourceMemoryTracker_ShrinkBucketVector(&self->buckets[2].vec, DLVectorPtr_MoveAssignType2);

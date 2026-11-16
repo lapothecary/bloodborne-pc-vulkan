@@ -400,6 +400,16 @@ void Key(Canvas& c, std::string_view label, float cx, float cy, float hw, float 
 /// A mouse, the bound button lit: Left, Right, Middle, X1, X2, Wheel Up, Wheel Down; Move: none
 /// lit, arrows at its sides (the camera).
 void Mouse(Canvas& c, std::string_view button) {
+    std::string_view chord_prefix{};
+    std::string_view core = button;
+    if (core.starts_with("\xe2\x87\xa7")) { // UTF-8 "⇧" (Shift chord, e.g. R2 "⇧Left")
+        chord_prefix = "\xe2\x87\xa7";
+        core.remove_prefix(3);
+    } else if (const std::size_t plus = core.rfind('+'); plus != std::string_view::npos) {
+        chord_prefix = core.substr(0, plus + 1);
+        core.remove_prefix(plus + 1);
+    }
+
     constexpr float cx = 64, cy = 66, hw = 33, hh = 50, r = 31, stroke = 5;
     const auto body = [&](float x, float y) { return RoundRect(x, y, cx, cy, hw, hh, r); };
     c.Paint(Fill, [&](float x, float y) { return Cover(body(x, y)); });
@@ -407,31 +417,33 @@ void Mouse(Canvas& c, std::string_view button) {
     const auto lit = [&](auto&& region) {
         c.Paint(Accent, [&](float x, float y) { return std::min(Cover(body(x, y) + stroke), region(x, y)); });
     };
-    if (button == "Left") {
+    if (core == "Left") {
         lit([&](float x, float y) { return std::min(Cover(x - cx), Cover(y - split)); });
-    } else if (button == "Right") {
+    } else if (core == "Right") {
         lit([&](float x, float y) { return std::min(Cover(cx - x), Cover(y - split)); });
     }
     // The buttons' lines.
     c.Paint(Frame, [&](float x, float y) { return Cover(Segment(x, y, cx, cy - hh + 2, cx, split, 2.0f)); });
     c.Paint(Frame, [&](float x, float y) { return Cover(Segment(x, y, cx - hw, split, cx + hw, split, 2.0f)); });
     // The wheel.
-    const bool wheel = button == "Middle" || button == "Wheel Up" || button == "Wheel Down";
+    const bool wheel = core == "Middle" || core == "Wheel Up" || core == "Wheel Down";
     c.Paint(Fill, [&](float x, float y) { return Cover(Segment(x, y, cx, 28, cx, 46, 7.5f)); });
     c.Paint(wheel ? Accent : Frame, [&](float x, float y) {
         const float d = Segment(x, y, cx, 28, cx, 46, 5.5f);
         return wheel ? Cover(d) : Cover(std::abs(d + 1.25f) - 1.25f);
     });
-    if (button == "Wheel Up" || button == "Wheel Down") {
-        const bool up = button == "Wheel Up";
+    if (core == "Wheel Up" || core == "Wheel Down") {
+        const bool up = core == "Wheel Up";
         Text(c, up ? "\xe2\x96\xb2" : "\xe2\x96\xbc", cx, 90, 26, 20, Accent);
+    } else if (!chord_prefix.empty()) {
+        Text(c, chord_prefix, cx, 90, 44, chord_prefix == "\xe2\x87\xa7" ? 28.0f : 18.0f, Accent);
     }
-    if (button == "X1" || button == "X2") {
-        const float y = button == "X1" ? 92 : 74; // X1 back (lower), X2 forward
+    if (core == "X1" || core == "X2" || core == "4" || core == "5") {
+        const float y = (core == "X1" || core == "4") ? 92 : 74; // X1/4 back (lower), X2/5 forward
         c.Paint(Accent, [&](float x, float yy) { return Cover(RoundRect(x, yy, cx - hw + 1, y, 6, 8, 4)); });
     }
     c.Paint(Frame, [&](float x, float y) { return Cover(std::abs(body(x, y) + stroke * 0.5f) - stroke * 0.5f); });
-    if (button == "Move") {
+    if (core == "Move") {
         Text(c, "\xe2\x86\x90", 14, cy, 24, 22, Ink);
         Text(c, "\xe2\x86\x92", 114, cy, 24, 22, Ink);
     }

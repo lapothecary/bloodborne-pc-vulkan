@@ -89,19 +89,24 @@ int runtime_pad_prompt(const char *name, int prefer_mouse, char *label, int size
             if (keyboard_b.keys[i]>=MOUSE_KEY) { if (mouse<0) { mouse=keyboard_b.keys[i]; mouse_mod=keyboard_b.mods[i]; } }
             else if (key<0) { key=keyboard_b.keys[i]; key_mod=keyboard_b.mods[i]; }
         }
+        /* Primary slot (`keys[0]`) decides for single-input prompts (`prefer_mouse != 0`): if the
+         * player bound a keyboard key in Slot 1 (e.g. `E, Mouse 4`), show `[E]`, not the alt mouse
+         * button. Multi-key clusters (`prefer_mouse == 0`, D-Pad `[3/4]`) still prefer keyboard keys. */
+        const int primary_is_mouse = keyboard_b.key_count > 0 && keyboard_b.keys[0] >= MOUSE_KEY;
+        const int use_mouse = mouse >= 0 && ((look && prefer_mouse && primary_is_mouse) || key < 0);
         /* A chord's modifier as a prefix: Shift as its arrow (R2: "⇧Left"). */
         char prefix[16]="";
-        const int mod=mouse>=0 && ((look && prefer_mouse) || key<0) ? mouse_mod : key_mod;
+        const int mod=use_mouse ? mouse_mod : key_mod;
         if (mod>=0) {
             if (mod==SDL_SCANCODE_LSHIFT || mod==SDL_SCANCODE_RSHIFT) snprintf(prefix,sizeof prefix,"\xe2\x87\xa7");
             else { key_label(mod,prefix,(int)sizeof(prefix)-1); strcat(prefix,"+"); }
         }
-        /* With mouse look the hand is on the mouse: its button first (R1: Left), unless a key
-           cluster is drawn (prefer_mouse 0: the d-pad's keys, not the wheel). */
-        if (mouse>=0 && ((look && prefer_mouse) || key<0)) {
+        if (use_mouse) {
             for (size_t i=0;i<sizeof(mouse_keys)/sizeof(*mouse_keys);++i)
-                if (mouse_keys[i].code==mouse)
+                if (mouse_keys[i].code==mouse) {
                     snprintf(label,size,"%s%s",prefix,mouse_keys[i].name+(strncmp(mouse_keys[i].name,"Mouse ",6) ? 0 : 6));
+                    break;
+                }
             return 'M';
         }
         if (key<0) return 0;

@@ -45,7 +45,19 @@ struct ShaderManifestInfo {
     std::uint32_t max_cb_dwords;
 };
 
+struct HostSymbolMatch {
+    const char* name;
+    const char* module_name;
+    std::uint64_t ps4_vma;
+    std::uint32_t ps4_size;
+    std::uintptr_t host_func_addr;
+    std::uintptr_t host_offset;
+    bool via_near_stub;
+};
+
 void PatchImage(unsigned char* image, std::uint64_t size);
+bool ResolveHostAddress(std::uintptr_t addr, HostSymbolMatch* out) noexcept;
+bool ResolveGuestVma(std::uint64_t vma, HostSymbolMatch* out) noexcept;
 Telemetry ReadTelemetry() noexcept;
 CameraBridgeState ReadCameraBridge() noexcept;
 bool QueryShaderManifest(std::uint64_t pgm_hash, std::uint32_t crc32, std::uint32_t code_bytes,

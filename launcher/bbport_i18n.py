@@ -539,6 +539,19 @@ EN = {
         "True Black / OLED Contrast De-Haze and Vibrance",
     "Убирает серую пелену (подъём чёрного под старые LCD 2015 года) после 3D LUT с мягкой S-кривой контраста и подчёркиванием оттенков крови и огня":
         "Removes the 2015 PS4 LCD washed-out grey black floor after 3D LUT grading with a smooth S-contrast curve and blood/fire vibrance boost",
+    "Режим следования камеры": "Camera follow mode",
+    "Оригинал (PS4)": "Original (PS4)",
+    "Баланс": "Balanced",
+    "Жёсткая (1:1)": "Locked (Rigid 1:1)",
+    "Классическая плавная инерция камеры Bloodborne с точной коррекцией под любой FPS (хоткей: F4)":
+        "Authentic Bloodborne camera inertia scaled smoothly to any FPS (hotkey: F4)",
+    "По умолчанию: отзывчивая пружина следования с лёгким отдалением на спринте и 1:1 обзором мыши (хоткей: F4)":
+        "Default: responsive spring follow with subtle sprint pull-back and 1:1 mouse look (hotkey: F4)",
+    "Жёсткая привязка 1:1 к персонажу без отставания (хоткей: F4)":
+        "Zero-lag 1:1 character lock without spring inertia (hotkey: F4)",
+    "Дебаг-оверлей (компактный FPS)": "Debug overlay (compact FPS)",
+    "Подробный дебаг (CPU и GPU)": "Detailed debug (CPU & GPU breakdown)",
+    "Хоткей режима следования камеры": "Cycle camera follow mode (hotkey)",
 }
 
 PT_BR = {
@@ -815,6 +828,19 @@ PT_BR = {
     "Крестовина вправо (оружие правой руки)": "Direcional Direito (Arma da Mão Direita)",
     "Options (меню; в меню игры Escape — «назад», Круг)":
         "Options (Menu Principal; nos menus Escape volta / Círculo)",
+    "Режим следования камеры": "Modo de seguimento da câmera",
+    "Оригинал (PS4)": "Original (PS4)",
+    "Баланс": "Equilibrado",
+    "Жёсткая (1:1)": "Fixo (Rígido 1:1)",
+    "Классическая плавная инерция камеры Bloodborne с точной коррекцией под любой FPS (хоткей: F4)":
+        "Inércia suave original de Bloodborne escalada continuamente para qualquer FPS (atalho: F4)",
+    "По умолчанию: отзывчивая пружина следования с лёгким отдалением на спринте и 1:1 обзором мыши (хоткей: F4)":
+        "Padrão: mola responsiva com afastamento suave na corrida e visão 1:1 no mouse (atalho: F4)",
+    "Жёсткая привязка 1:1 к персонажу без отставания (хоткей: F4)":
+        "Fixação rígida 1:1 ao personagem sem atraso (atalho: F4)",
+    "Дебаг-оверлей (компактный FPS)": "Overlay de debug (FPS compacto)",
+    "Подробный дебаг (CPU и GPU)": "Debug detalhado (CPU e GPU)",
+    "Хоткей режима следования камеры": "Alternar modo de câmera (atalho)",
 }
 
 
@@ -1159,6 +1185,19 @@ ZH_CN = {
     "Крестовина вправо (оружие правой руки)": "方向键右（切换右手武器）",
     "Options (меню; в меню игры Escape — «назад», Круг)":
         "Options（主菜单；在菜单内按 Escape 为返回 / 圆圈键）",
+    "Режим следования камеры": "视角跟随模式",
+    "Оригинал (PS4)": "原版惯性 (PS4)",
+    "Баланс": "均衡",
+    "Жёсткая (1:1)": "完全锁定 (1:1 刚性)",
+    "Классическая плавная инерция камеры Bloodborne с точной коррекцией под любой FPS (хоткей: F4)":
+        "《血源诅咒》原版镜头平滑惯性，针对任意高帧率精准缩放（热键：F4）",
+    "По умолчанию: отзывчивая пружина следования с лёгким отдалением на спринте и 1:1 обзором мыши (хоткей: F4)":
+        "默认：高响应弹簧跟随，冲刺平滑微拉远且鼠标 1:1 零延迟视角（热键：F4）",
+    "Жёсткая привязка 1:1 к персонажу без отставания (хоткей: F4)":
+        "镜头与角色 1:1 刚性绑定，零延迟跟随（热键：F4）",
+    "Дебаг-оверлей (компактный FPS)": "简洁性能监控覆盖层 (FPS)",
+    "Подробный дебаг (CPU и GPU)": "详细性能剖析覆盖层 (CPU 与 GPU)",
+    "Хоткей режима следования камеры": "切换视角跟随模式（热键）",
 }
 
 

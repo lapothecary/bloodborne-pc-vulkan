@@ -238,6 +238,18 @@ CONTROLS = [
     ("look_down", "Camera Down", "K", None),
     ("look_left", "Camera Left", "J", None),
     ("look_right", "Camera Right", "L", None),
+    ("hotkey.debug", "Debug Overlay (Compact FPS)", "F8", None),
+    ("hotkey.additional_debug", "Detailed Debug (CPU & GPU Breakdown)", "F9", None),
+    ("hotkey.camera_follow", "Cycle Camera Follow Mode (Hotkey)", "F4", None),
+]
+
+CAMERA_FOLLOW_CHOICES = [
+    ("Original (PS4)", "original",
+     "Authentic Bloodborne camera inertia scaled smoothly to any FPS (hotkey: F4)"),
+    ("Balanced", "balanced",
+     "Default: responsive spring follow with subtle sprint pull-back and 1:1 mouse look (hotkey: F4)"),
+    ("Locked (Rigid 1:1)", "locked",
+     "Zero-lag 1:1 character lock without spring inertia (hotkey: F4)"),
 ]
 
 
@@ -333,6 +345,7 @@ INI_DEFAULTS = {
     "mouse_look": "1",
     "mouse_sensitivity": "1.00",
     "mouse_invert_y": "0",
+    "camera_follow_mode": "balanced",
     **{key: "1" if default else "0" for key, _, default, *_ in EFFECTS + REMASTER_ENHANCEMENTS},
 }
 
@@ -1320,6 +1333,17 @@ class AdwLauncherWindow:
             active=self.ini.get("mouse_invert_y") == "1",
             on_change=lambda _v: self.store(),
         )
+        raw_cam_mode = self.ini.get("camera_follow_mode", "balanced").strip().lower()
+        norm_cam_mode = {"0": "original", "1": "balanced", "2": "locked"}.get(raw_cam_mode, raw_cam_mode)
+        if norm_cam_mode not in ("original", "balanced", "locked"):
+            norm_cam_mode = "balanced"
+        self.camera_follow_row = AdwComboRow(
+            device_group,
+            title="Camera follow mode",
+            choices=CAMERA_FOLLOW_CHOICES,
+            current=norm_cam_mode,
+            on_change=lambda _v: self.store(),
+        )
 
         kb_group = AdwPreferencesGroup(
             page,
@@ -1577,14 +1601,16 @@ class AdwLauncherWindow:
 
     def show_control(self, kind, name):
         row, default = self.control_rows[(kind, name)]
-        val = self.ini.get(f"{kind}.{name}")
+        ini_key = name if "." in name else f"{kind}.{name}"
+        val = self.ini.get(ini_key)
         if val is None:
             row.set_subtitle(f"{default} (default)" if default else "Unbound")
         else:
             row.set_subtitle(val or "Unbound")
 
     def set_control(self, kind, name, value):
-        self.ini[f"{kind}.{name}"] = value
+        ini_key = name if "." in name else f"{kind}.{name}"
+        self.ini[ini_key] = value
         self.show_control(kind, name)
         self.store()
 
@@ -1791,6 +1817,7 @@ class AdwLauncherWindow:
             "mouse_look": "1" if self.mouse_look_row.get_active() else "0",
             "mouse_sensitivity": f"{self.mouse_sensitivity_row.get_value():.2f}",
             "mouse_invert_y": "1" if self.mouse_invert_row.get_active() else "0",
+            "camera_follow_mode": self.camera_follow_row.get_value(),
             **{key: "1" if row.get_active() else "0" for key, row in self.effect_rows.items()},
         })
         save_ini(self.ini, self.ini_lines)
@@ -1869,6 +1896,11 @@ class AdwLauncherWindow:
             with contextlib.suppress(ValueError):
                 self.mouse_sensitivity_row.set_value(float(self.ini.get("mouse_sensitivity", "1.00")))
             self.mouse_invert_row.set_active(self.ini.get("mouse_invert_y") == "1")
+            raw_cm = self.ini.get("camera_follow_mode", "balanced").strip().lower()
+            norm_cm = {"0": "original", "1": "balanced", "2": "locked"}.get(raw_cm, raw_cm)
+            self.camera_follow_row.set_value(
+                norm_cm if norm_cm in ("original", "balanced", "locked") else "balanced"
+            )
             for kind, name in self.control_rows:
                 self.show_control(kind, name)
             self.update_game_status()

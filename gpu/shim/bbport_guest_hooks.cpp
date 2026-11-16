@@ -7,6 +7,8 @@
 #include "bbport_toggles.h"
 #include "bbport_fx_init_clear.h"
 #include "bbport_effect_flags.h"
+#include "bbport_camera_follow.h"
+#include "bbport_crash_blackbox.h"
 #include "platform/gnm/gnm.h"
 #include "../../dantelion_gx/include/gx_direct_vulkan.h"
 
@@ -1601,6 +1603,13 @@ bool InstallStickProbe() {
 /// by that much each update (does writing the angle turn it?).
 constexpr u64 CameraUpdate = 0x143ac60;
 constexpr unsigned char CameraUpdateCode[6] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57};
+constexpr u64 CameraPivotSite = BbCameraFollow::kPivotSiteVma;
+constexpr u64 CameraPivotResume = BbCameraFollow::kPivotResumeVma;
+constexpr unsigned char CameraPivotCode[9] = {0xc4, 0xc1, 0x78, 0x29, 0x85, 0x90, 0x00, 0x00, 0x00};
+
+BbCameraFollow::RuntimeState g_cam_follow_state{};
+bool g_re_camera_enabled = false;
+
 void PS4_SYSV_ABI CameraEntry(u8* camera) {
     static const bool watch_angle = [] {
         const char* env = std::getenv("BB_RE_WATCH_CAMANGLE");
@@ -1626,6 +1635,91 @@ void PS4_SYSV_ABI CameraEntry(u8* camera) {
         std::printf("RE camera %p: angles %.3f %.3f\n", static_cast<void*>(camera),
                     *reinterpret_cast<float*>(camera + 0x140), *reinterpret_cast<float*>(camera + 0x144));
     }
+}
+
+void PS4_SYSV_ABI CameraFollowEntryHook(u8* camera, u8* /*chr*/, float dt) {
+    if (g_re_camera_enabled) {
+        CameraEntry(camera);
+    }
+    const bool mouse_look = BbSettings::Get().mouse_look.load(std::memory_order_relaxed);
+    const int mode = BbSettings::Get().camera_follow_mode.load(std::memory_order_relaxed);
+    g_cam_follow_state.PreUpdate(camera, dt, mouse_look, mode);
+}
+
+void PS4_SYSV_ABI CameraFollowPivotHook(u8* camera, const float* prev_pivot_rebased, float* xmm_area) {
+    if (xmm_area) {
+        BbCrashBlackBox::UpdatePlayerPosition(xmm_area[0], xmm_area[1], xmm_area[2]);
+    }
+    const int mode = BbSettings::Get().camera_follow_mode.load(std::memory_order_relaxed);
+    g_cam_follow_state.ComputePivot(camera, prev_pivot_rebased, xmm_area, mode);
+}
+
+bool InstallCameraFollowHooks() {
+    if (const char* env = std::getenv("BB_CAMERA_FOLLOW_HOOK"); env && env[0] == '0') {
+        return false;
+    }
+    const u64 entry_addr = ImageBase + CameraUpdate;
+    const u64 pivot_addr = ImageBase + CameraPivotSite;
+    if (std::memcmp(reinterpret_cast<const void*>(entry_addr), CameraUpdateCode, sizeof(CameraUpdateCode)) != 0 ||
+        std::memcmp(reinterpret_cast<const void*>(pivot_addr), CameraPivotCode, sizeof(CameraPivotCode)) != 0) {
+        return false;
+    }
+
+    // 1. Entry detour at 0x143ac60 (rdi = cam, rsi = chr, xmm0 = dt)
+    Emitter e_entry;
+    e_entry.SaveVolatile();
+    e_entry.SaveXmm();
+    e_entry.CallAbs(reinterpret_cast<const void*>(&CameraFollowEntryHook));
+    e_entry.RestoreXmm();
+    e_entry.RestoreVolatile();
+    e_entry.Bytes({0x55, 0x48, 0x89, 0xe5, 0x41, 0x57}); // push rbp; mov rbp, rsp; push r15
+    e_entry.JmpAbs(entry_addr + sizeof(CameraUpdateCode));
+
+    // 2. Pivot smoothing detour at 0x143ba73 -> 0x143bab1 (62-byte block)
+    Emitter e_pivot;
+    e_pivot.SaveVolatile();
+    e_pivot.SaveXmm();
+    e_pivot.Bytes({0x4c, 0x89, 0xef});                         // mov rdi, r13 (cam)
+    e_pivot.Bytes({0x48, 0x8d, 0xb5, 0xa0, 0xfd, 0xff, 0xff}); // lea rsi, [rbp - 0x260] (rebased prev pivot)
+    e_pivot.Bytes({0x48, 0x89, 0xe2});                         // mov rdx, rsp (SaveXmm area: [0]=xmm0, [64]=xmm4)
+    e_pivot.CallAbs(reinterpret_cast<const void*>(&CameraFollowPivotHook));
+    e_pivot.RestoreXmm();
+    e_pivot.RestoreVolatile();
+    e_pivot.Bytes({0x41, 0x8a, 0x9d, 0x3c, 0x01, 0x00, 0x00}); // mov bl, byte [r13 + 0x13c] (live at 0x143bcd0)
+    e_pivot.JmpAbs(ImageBase + CameraPivotResume);
+
+    const u64 entry_stub = PlaceStub(e_entry);
+    const u64 pivot_stub = PlaceStub(e_pivot);
+    std::uint32_t entry_rel = 0;
+    std::uint32_t pivot_rel = 0;
+    if (!entry_stub || !pivot_stub ||
+        !Rel32To(entry_addr + 5, entry_stub, entry_rel) ||
+        !Rel32To(pivot_addr + 5, pivot_stub, pivot_rel)) {
+        return false;
+    }
+
+    const long page_size = sysconf(_SC_PAGESIZE);
+    {
+        void* page = reinterpret_cast<void*>(entry_addr & ~u64(page_size - 1));
+        const std::size_t span = (entry_addr + sizeof(CameraUpdateCode)) - reinterpret_cast<u64>(page);
+        mprotect(page, span, PROT_READ | PROT_WRITE | PROT_EXEC);
+        reinterpret_cast<u8*>(entry_addr)[0] = 0xcc;
+        reinterpret_cast<u8*>(entry_addr)[5] = 0x90;
+        mprotect(page, span, Core::GuestCodeProtection());
+        WriteJumpOverTrap(entry_addr, 0xe9, entry_rel);
+    }
+    {
+        void* page = reinterpret_cast<void*>(pivot_addr & ~u64(page_size - 1));
+        const std::size_t span = (pivot_addr + sizeof(CameraPivotCode)) - reinterpret_cast<u64>(page);
+        mprotect(page, span, PROT_READ | PROT_WRITE | PROT_EXEC);
+        reinterpret_cast<u8*>(pivot_addr)[0] = 0xcc;
+        for (std::size_t i = 5; i < sizeof(CameraPivotCode); ++i) {
+            reinterpret_cast<u8*>(pivot_addr)[i] = 0x90;
+        }
+        mprotect(page, span, Core::GuestCodeProtection());
+        WriteJumpOverTrap(pivot_addr, 0xe9, pivot_rel);
+    }
+    return true;
 }
 
 bool InstallCameraProbe() {
@@ -2005,6 +2099,16 @@ void Install(RangeCallback on_gpu_range_allocated) {
                         look_installed.load() ? "on (the mouse turns the camera itself)"
                                               : "not available (the mouse drives the right stick)");
         }
+        g_re_camera_enabled = [] {
+            const char* env = std::getenv("BB_RE_CAMERA");
+            return env && env[0] == '1';
+        }();
+        const bool cam_follow_ok = InstallCameraFollowHooks();
+        std::printf("Guest hooks: 3-mode camera follow physics %s (default mode: %s)\n",
+                    cam_follow_ok ? "on (Original PS4 / Balanced / Locked 1:1)"
+                                  : "off",
+                    BbSettings::CameraFollowModeName(
+                        BbSettings::Get().camera_follow_mode.load(std::memory_order_relaxed)));
         if (const char* env = std::getenv("BB_RE_ADVANCE"); env && env[0] == '1') {
             std::printf("Guest hooks: UI advance probe %s\n", InstallEntryProbe(0x20f00) ? "on" : "not installed");
         }
@@ -2018,7 +2122,7 @@ void Install(RangeCallback on_gpu_range_allocated) {
                 p = *end ? end + 1 : end;
             }
         }
-        if (const char* env = std::getenv("BB_RE_CAMERA"); env && env[0] == '1') {
+        if (g_re_camera_enabled && !cam_follow_ok) {
             std::printf("Guest hooks: camera probe %s\n", InstallCameraProbe() ? "on" : "not installed");
         }
         if (const char* env = std::getenv("BB_RE_CAMSTICK"); env && env[0] == '1') {

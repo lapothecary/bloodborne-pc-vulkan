@@ -408,7 +408,25 @@ bool WindowSDL::PollEvents() {
         }
         // F3: the frame rate limit 30 on and off (the cinematic of Laurence hangs above 30 FPS).
         if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat && event.key.key == SDLK_F3) {
-            BbFrameRate::SetLimit(BbFrameRate::Limit() == 30 ? 0 : 30);
+            const int next_limit = BbFrameRate::Limit() == 30 ? 0 : 30;
+            BbFrameRate::SetLimit(next_limit);
+            char msg[128];
+            if (next_limit == 30) {
+                std::snprintf(msg, sizeof(msg), "%s",
+                              BbSettings::MenuText("FPS Limit: 30 FPS (Cutscene Safe)",
+                                                   "Лимит FPS: 30 FPS (катсцены)"));
+            } else {
+                const int cfg_fps = BbSettings::Get().fps_limit.load(std::memory_order_relaxed);
+                if (cfg_fps > 0) {
+                    std::snprintf(msg, sizeof(msg),
+                                  BbSettings::MenuText("FPS Limit: %d FPS", "Лимит FPS: %d FPS"),
+                                  cfg_fps);
+                } else {
+                    std::snprintf(msg, sizeof(msg), "%s",
+                                  BbSettings::MenuText("FPS Limit: Uncapped", "Лимит FPS: Без лимита"));
+                }
+            }
+            BbOverlay::ShowToast(msg);
             continue;
         }
         if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat && event.key.key == SDLK_F1 &&

@@ -1164,8 +1164,44 @@ struct YebisRegistrySync {
     }
 
     void PushLocked(bool is_rt, void* ctx, void* resource) noexcept {
+        for (uint32_t i = 0; i < pending_count; ++i) {
+            if (pending[i].is_rt == is_rt && pending[i].ctx == ctx &&
+                pending[i].resource == resource) {
+                return;
+            }
+        }
         if (pending_count < kMaxPending) {
             pending[pending_count++] = {is_rt, ctx, resource};
+        }
+    }
+
+    void FlushPendingForResourceLocked(bool is_rt, void* ctx, void* resource) noexcept {
+        bool found = false;
+        uint32_t dst = 0;
+        for (uint32_t i = 0; i < pending_count; ++i) {
+            if (pending[i].is_rt == is_rt && pending[i].ctx == ctx &&
+                pending[i].resource == resource) {
+                found = true;
+            } else {
+                pending[dst++] = pending[i];
+            }
+        }
+        pending_count = dst;
+        if (found) {
+            if (!IsInBeginEnd()) {
+                if (is_rt) {
+                    (void)sub_bb5e40_impl(ctx, resource);
+                } else {
+                    (void)sub_bb5f10_impl(ctx, resource);
+                }
+            } else {
+                uint8_t* self = reinterpret_cast<uint8_t*>(ctx);
+                if (is_rt) {
+                    (void)sub_2610760(self + 0x18, resource);
+                } else {
+                    (void)sub_2610840(self + 0x18, resource);
+                }
+            }
         }
     }
 
@@ -1282,6 +1318,7 @@ int32_t sub_bb5c90(
     void* regPair[3] = {nullptr, nullptr, nullptr};
     {
         YebisSpinGuard lk{g_yebis_reg_sync};
+        g_yebis_reg_sync.FlushPendingForResourceLocked(false, this_ctx, pGnmTexture);
         hr = sub_2610430(self + 0x18, pGnmTexture, regPair);
     }
     sub_10883f0(pGnmTexture, oldFmt);
@@ -1330,6 +1367,7 @@ int32_t sub_bb5ae0(
     void* regPair[3] = {nullptr, nullptr, nullptr};
     {
         YebisSpinGuard lk{g_yebis_reg_sync};
+        g_yebis_reg_sync.FlushPendingForResourceLocked(false, this_ctx, pGnmTexture);
         hr = sub_2610430(self + 0x18, pGnmTexture, regPair);
     }
     sub_10883f0(pGnmTexture, oldFmt);
@@ -1378,6 +1416,7 @@ int32_t sub_bb5930(
     void* regPair[3] = {nullptr, nullptr, nullptr};
     {
         YebisSpinGuard lk{g_yebis_reg_sync};
+        g_yebis_reg_sync.FlushPendingForResourceLocked(false, this_ctx, pGnmTexture);
         hr = sub_2610430(self + 0x18, pGnmTexture, regPair);
     }
     sub_10883f0(pGnmTexture, oldFmt);
@@ -1425,6 +1464,7 @@ int32_t sub_bb5790(
     void* regPair[3] = {nullptr, nullptr, nullptr};
     {
         YebisSpinGuard lk{g_yebis_reg_sync};
+        g_yebis_reg_sync.FlushPendingForResourceLocked(false, this_ctx, pGnmTexture);
         hr = sub_2610430(self + 0x18, pGnmTexture, regPair);
     }
     sub_10883f0(pGnmTexture, oldFmt);
@@ -1471,6 +1511,7 @@ int32_t sub_bb5600(
     void* regPair[3] = {nullptr, nullptr, nullptr};
     {
         YebisSpinGuard lk{g_yebis_reg_sync};
+        g_yebis_reg_sync.FlushPendingForResourceLocked(false, this_ctx, pGnmTexture);
         hr = sub_2610430(self + 0x18, pGnmTexture, regPair);
     }
     sub_10883f0(pGnmTexture, oldFmt);
@@ -1522,6 +1563,7 @@ int32_t sub_bb5430(
     void* regPair[3] = {nullptr, nullptr, nullptr};
     {
         YebisSpinGuard lk{g_yebis_reg_sync};
+        g_yebis_reg_sync.FlushPendingForResourceLocked(false, this_ctx, pGnmTexture);
         hr = sub_2610430(self + 0x18, pGnmTexture, regPair);
     }
     sub_10883f0(pGnmTexture, oldFmt);
@@ -1578,6 +1620,7 @@ int32_t sub_bb5290(
     void* regPair[3] = {nullptr, nullptr, nullptr};
     {
         YebisSpinGuard lk{g_yebis_reg_sync};
+        g_yebis_reg_sync.FlushPendingForResourceLocked(true, this_ctx, pGnmRenderTarget);
         hr = sub_26105f0(self + 0x18, pGnmRenderTarget, regPair);
     }
     sub_1086540(pGnmRenderTarget, oldFmt);
@@ -1638,6 +1681,7 @@ int32_t sub_bb5080(
     int32_t hr = 0;
     {
         YebisSpinGuard lk{g_yebis_reg_sync};
+        g_yebis_reg_sync.FlushPendingForResourceLocked(false, this_ctx, pGnmTexture);
         hr = sub_2610430(self + 0x18, pGnmTexture, regPair);
     }
     sub_10883f0(pGnmTexture, oldFmt);
@@ -1698,6 +1742,7 @@ int32_t sub_bb4f60(
     int32_t hr = 0;
     {
         YebisSpinGuard lk{g_yebis_reg_sync};
+        g_yebis_reg_sync.FlushPendingForResourceLocked(false, this_ctx, pGnmTexture);
         hr = sub_2610430(self + 0x18, pGnmTexture, regPair);
     }
     sub_10883f0(pGnmTexture, oldFmt);

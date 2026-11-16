@@ -1353,7 +1353,7 @@ void sub_21c7890(void* mat_list, void* inspector) {
 
             auto* wstr_obj = *reinterpret_cast<uint8_t**>(wstr_holder);
             if (wstr_obj != nullptr) {
-                if (--(*reinterpret_cast<int32_t*>(wstr_obj + 0x38)) == 0) {
+                if (__atomic_sub_fetch(reinterpret_cast<int32_t*>(wstr_obj + 0x38), 1, __ATOMIC_ACQ_REL) == 0) {
                     void* wstr_alloc = g_wstr_allocator_5540e10;
                     if (*reinterpret_cast<uint64_t*>(wstr_obj + 0x20) >= 8) {
                         void* str_buf = *reinterpret_cast<void**>(wstr_obj + 0x08);
@@ -2074,6 +2074,19 @@ void sub_21c6410(void* self) {
     *reinterpret_cast<uint32_t*>(s + 0x204) = 0;
     *reinterpret_cast<uint32_t*>(s + 0x208) = 0;
 
+    // Must release material references BEFORE destroying `lod_arr`/`slots` (+0x2b8)
+    // and `sub_21cda20(s + 0x268)` (matches original PS4 eboot.bin 0x21c6410 order).
+    void** mat_cur = *reinterpret_cast<void***>(s + 0x220);
+    if (mat_cur != *reinterpret_cast<void***>(s + 0x228)) {
+        for (; mat_cur != *reinterpret_cast<void***>(s + 0x228); ++mat_cur) {
+            void* elem = *mat_cur;
+            auto* vtbl = *reinterpret_cast<uintptr_t**>(elem);
+            reinterpret_cast<void (*)(void*)>(vtbl[0x48 / 8])(elem);
+        }
+        mat_cur = *reinterpret_cast<void***>(s + 0x220);
+    }
+    *reinterpret_cast<void***>(s + 0x228) = mat_cur;
+
     uint8_t out_iter[24] = {};
     void* vec_end   = *reinterpret_cast<void**>(s + 0x288);
     void* vec_begin = *reinterpret_cast<void**>(s + 0x280);
@@ -2113,7 +2126,7 @@ void sub_21c6410(void* self) {
     sub_21cda20(s + 0x268);
     *reinterpret_cast<void**>(s + 0x210) = g_vtable_53b6eb0;
 
-    void** mat_cur = *reinterpret_cast<void***>(s + 0x220);
+    mat_cur = *reinterpret_cast<void***>(s + 0x220);
     if (mat_cur != *reinterpret_cast<void***>(s + 0x228)) {
         for (; mat_cur != *reinterpret_cast<void***>(s + 0x228); ++mat_cur) {
             void* elem = *mat_cur;

@@ -77,6 +77,14 @@ LONG CALLBACK DispatchException(EXCEPTION_POINTERS* pointers) {
         sig = SIGFPE;
         info.si_addr = record->ExceptionAddress;
         break;
+    case EXCEPTION_DATATYPE_MISALIGNMENT:
+        sig = SIGBUS;
+        info.si_addr = record->ExceptionAddress;
+        break;
+    case 0xC0000374UL: // STATUS_HEAP_CORRUPTION (ntdll host heap check)
+        sig = SIGABRT;
+        info.si_addr = record->ExceptionAddress;
+        break;
     default:
         return EXCEPTION_CONTINUE_SEARCH;
     }

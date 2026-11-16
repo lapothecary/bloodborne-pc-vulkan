@@ -166,5 +166,19 @@ int main(void) {
     assert(!mouse_key_down(MOUSE_WHEEL_DOWN));
     mouse_wheel_step(1140000,0,0);
     assert(mouse_key_down(MOUSE_WHEEL_DOWN) && wheel_pending[1]==0);
+    /* Primary slot wins over alt mouse slot (`E, Mouse 4` -> `'K'` `"E"`), and `Mouse 4` resolves to `"X1"`. */
+    {
+        char lbl[32]={0};
+        prompt_device=2;
+        mouse_look=1;
+        bindings_ready=1;
+        bindings[IN_CROSS].key_count=2;
+        bindings[IN_CROSS].keys[0]=SDL_SCANCODE_E; bindings[IN_CROSS].mods[0]=-1;
+        bindings[IN_CROSS].keys[1]=MOUSE_KEY+SDL_BUTTON_X1; bindings[IN_CROSS].mods[1]=-1;
+        assert(runtime_pad_prompt("cross",1,lbl,sizeof lbl)=='K' && !strcmp(lbl,"E"));
+        bindings[IN_CROSS].keys[0]=MOUSE_KEY+SDL_BUTTON_X1; bindings[IN_CROSS].mods[0]=-1;
+        bindings[IN_CROSS].keys[1]=SDL_SCANCODE_E; bindings[IN_CROSS].mods[1]=-1;
+        assert(runtime_pad_prompt("cross",1,lbl,sizeof lbl)=='M' && !strcmp(lbl,"X1"));
+    }
     puts("PASS: pad ABI, debug camera chord, left/right clicks, SDL touch coordinates, overlay capture, controls, mouse");
 }

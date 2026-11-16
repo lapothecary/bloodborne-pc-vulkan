@@ -142,6 +142,7 @@ void runtime_re_watch_now(uint64_t address);
 void runtime_thread_attach_main(void) {
     GuestThread *t=runtime_thread_current();
     snprintf(t->name,sizeof(t->name),"main");
+    pthread_setname_np(pthread_self(),"main");
 #ifdef _WIN32
     bb_win32_set_thread_name("main");
 #endif

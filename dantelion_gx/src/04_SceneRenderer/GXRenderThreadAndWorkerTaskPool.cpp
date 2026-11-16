@@ -71,9 +71,13 @@ void GXDeferredReleaseQueue_CtorWithParent(void* self, void* parent) {
     *reinterpret_cast<uint64_t*>(base + 0x10) = reinterpret_cast<uint64_t>(parent);
     if (parent != nullptr) {
         auto* pbase = static_cast<uint8_t*>(parent);
-        uint32_t ref_cnt = *reinterpret_cast<uint32_t*>(pbase + 0x08);
-        if (ref_cnt != 0) {
-            *reinterpret_cast<uint32_t*>(pbase + 0x08) = ref_cnt + 1;
+        auto* ref_ptr = reinterpret_cast<uint32_t*>(pbase + 0x08);
+        uint32_t ref_cnt = __atomic_load_n(ref_ptr, __ATOMIC_RELAXED);
+        while (ref_cnt != 0) {
+            if (__atomic_compare_exchange_n(
+                    ref_ptr, &ref_cnt, ref_cnt + 1u, true, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+                break;
+            }
         }
         reinterpret_cast<FnVoidPtr>(GX_VMA(0x21ba300ULL))(self);
     }

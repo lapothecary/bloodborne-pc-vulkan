@@ -1561,8 +1561,8 @@ void sub_21d24e0(void* self) {
     // Release ref-counted object at dir+0x2660
     auto* obj2660 = *reinterpret_cast<uint8_t**>(dir + 0x2660);
     if (obj2660 != nullptr) {
-        int32_t oldRef = *reinterpret_cast<int32_t*>(obj2660 + 0x08);
-        *reinterpret_cast<int32_t*>(obj2660 + 0x08) = oldRef - 1;
+        int32_t oldRef = __atomic_fetch_sub(
+            reinterpret_cast<int32_t*>(obj2660 + 0x08), 1, __ATOMIC_ACQ_REL);
         if (oldRef <= 1) {
             auto* vt = *reinterpret_cast<void***>(obj2660);
             reinterpret_cast<void(*)(void*)>(vt[0])(obj2660);

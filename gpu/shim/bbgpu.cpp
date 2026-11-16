@@ -1,4 +1,5 @@
 #include "bbport_write_log.h"
+#include "bbport_crash_blackbox.h"
 #include "bbport_fast_load.h"
 #include "bbport_frame_rate.h"
 #include "bbport_game_menu.h"
@@ -462,6 +463,7 @@ extern "C" int bbgpu_init(const BbGpuConfig* config) {
 }
 
 extern "C" void bbgpu_register_kernel(void) {
+    BbCrashBlackBox::Initialize();
     Core::Loader::SymbolsResolver resolver;
     BbKernel::RegisterEventQueue(&resolver);
     BbAvPlayer::RegisterLib(&resolver);
@@ -492,11 +494,14 @@ extern "C" int bbgpu_handle_fault(void* ucontext, void* address) {
 }
 
 extern "C" void bbgpu_patch_image(unsigned char* image, uint64_t size) {
+    BbCrashBlackBox::SetGuestImage(image, size);
     BbGnmHooks::PatchImage(image, size);
     BbGameMenu::PatchImage(image, size);
     BbFrameRate::PatchImage(image, size);
     BbGoldenEngine::PatchImage(image, size);
     BbFastLoad::PatchImage(image, size);
+    BbCrashBlackBox::RecordEventFmt("BOOT", "Guest image patched (base=%p, size=0x%llx)",
+                                    static_cast<void*>(image), static_cast<unsigned long long>(size));
 }
 
 extern "C" unsigned bbgpu_symbol_count(void) {

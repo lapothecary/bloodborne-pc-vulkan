@@ -5,6 +5,7 @@
 #ifndef BBGPU_H
 #define BBGPU_H
 #include <stdint.h>
+#include <stddef.h>
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -26,6 +27,11 @@ uintptr_t bbgpu_resolve(const char *scoped_nid);
 int bbgpu_handle_fault(void *ucontext, void *address);
 /* BB_WRITE_LOG=1: prints the logged GPU-side writes to guest memory near the fault. */
 void bbgpu_dump_guest_writes(void *ucontext);
+/* Universal Linux + Windows Crash Black-Box (`stderr` + `logs/crash-YYYYMMDD_HHMMSS.log`). */
+void bbgpu_write_crash_blackbox(int sig, const void *fault_addr, void *ucontext_ptr,
+                                const void *guest_image, uint64_t guest_size);
+void bbgpu_flight_record(const char *category, const char *detail);
+int bbgpu_resolve_code_address(uintptr_t addr, char *out_buf, size_t out_size);
 /* Keyboard text entry through the game window (IME dialog). begin returns 0 when
  * no window exists; poll returns 0 typing, 1 confirmed, 2 cancelled (UTF-8 text). */
 int bbgpu_text_input_begin(const char *initial_utf8, const char *prompt_utf8);

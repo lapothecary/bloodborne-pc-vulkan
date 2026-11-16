@@ -2193,12 +2193,16 @@ void sub_21b9f90(void* self) {
 
     uint8_t* ref_obj = *reinterpret_cast<uint8_t**>(base + 0x10);
     if (ref_obj != nullptr) {
-        const int32_t refs = *reinterpret_cast<const int32_t*>(ref_obj + 0x08);
-        if (refs != 0) {
-            *reinterpret_cast<int32_t*>(ref_obj + 0x08) = refs - 1;
-            if (refs <= 1) {
-                auto* vtbl = *reinterpret_cast<void (***)(void*)>(ref_obj);
-                vtbl[0](ref_obj);
+        auto* ref_ptr = reinterpret_cast<int32_t*>(ref_obj + 0x08);
+        int32_t refs = __atomic_load_n(ref_ptr, __ATOMIC_RELAXED);
+        while (refs != 0) {
+            if (__atomic_compare_exchange_n(
+                    ref_ptr, &refs, refs - 1, true, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+                if (refs <= 1) {
+                    auto* vtbl = *reinterpret_cast<void (***)(void*)>(ref_obj);
+                    vtbl[0](ref_obj);
+                }
+                break;
             }
         }
     }

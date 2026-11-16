@@ -204,6 +204,11 @@ static int32_t mount(int32_t user, const char *title, const DirName *dir, uint32
     pthread_mutex_unlock(&lock);
     printf("Runtime: save data '%s' mounted at %s (%s%s)\n",dir->data,result->point.data,
            exists ? "existing" : "created",(mode & MODE_RDONLY) ? ", read-only" : "");
+    {
+        char ev[128];
+        snprintf(ev,sizeof(ev),"%s -> %s%s",dir->data,result->point.data,(mode & MODE_RDONLY) ? " (ro)" : " (rw)");
+        runtime_flight_record("SAVE_MNT",ev);
+    }
     return 0;
 }
 static ABI int32_t save_mount(const Mount1 *m, MountResult *result) {
@@ -225,6 +230,7 @@ static ABI int32_t save_umount(const MountPoint *point) {
     int slot=slot_of(point);
     if (slot>=0) { runtime_file_unmount(point->data); slots[slot].used=0; }
     pthread_mutex_unlock(&lock);
+    if (slot>=0) runtime_flight_record("SAVE_UMNT", point->data);
     return slot>=0 ? 0 : ERR_NOT_FOUND;
 }
 static ABI int32_t save_set_param(const MountPoint *point, uint32_t type, const void *buffer, uint64_t size) {

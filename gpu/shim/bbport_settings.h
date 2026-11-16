@@ -20,6 +20,12 @@ inline bool IsFsr4(int upscaler) {
 }
 enum Preset : int { NativeAA = 0, Quality, Balanced, Performance, UltraPerformance, PresetCount };
 enum WindowMode : int { WindowModeFullscreen = 0, WindowModeBorderless = 1, WindowModeWindowed = 2, WindowModeCount };
+enum CameraFollowMode : int {
+    CameraFollowOriginal = 0,
+    CameraFollowBalanced = 1,
+    CameraFollowLocked = 2,
+    CameraFollowCount
+};
 enum DebugView : int { DebugNone = 0, DebugReactive = 1, DebugMotion = 2, DebugViewCount };
 enum class MenuLanguage { English, Russian };
 
@@ -82,6 +88,7 @@ enum KeyAction : int {
     KeyLookRight,
     KeyDebug,
     KeyAdditionalDebug,
+    KeyCameraFollow,
     KeyActionCount
 };
 
@@ -194,6 +201,8 @@ struct Values {
     std::atomic<bool> mouse_look{true};
     std::atomic<bool> mouse_invert_y{false};
     std::atomic<float> mouse_sensitivity{1.0f};
+    /// Camera follow physics mode: 0 = Original (PS4), 1 = Balanced (default), 2 = Locked (Rigid 1:1).
+    std::atomic<int> camera_follow_mode{CameraFollowBalanced};
     /// DLSS model preset: 11 = DLSS 4 Transformer (Preset K), 0 = DLSS 3 CNN Default.
     std::atomic<int> dlss_preset{11};
     /// Forced anisotropic filtering on scene textures: 16, 8, 4, or 1/0 (game default).
@@ -246,5 +255,6 @@ const char* PresetName(int preset);
 const char* UpscalerName(int upscaler);
 const char* AaModeName(int aa);
 const char* WindowModeName(int mode);
+const char* CameraFollowModeName(int mode);
 
 } // namespace BbSettings

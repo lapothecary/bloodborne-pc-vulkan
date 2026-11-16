@@ -227,15 +227,22 @@ bool GXDepthStencilResource_CreateFromDesc(
         pThis->m_pGnmTexture = pNewTex;
         if (pNewTex) __sync_fetch_and_add(&pNewTex->m_refCount, 1);
     }
-    if (err != 0) return false;
+    if (err != 0) {
+        if (pNewTex && __sync_fetch_and_add(&pNewTex->m_refCount, -1) == 1) {
+            void* pAlloc = pNewTex->m_pAllocator;
+            (*reinterpret_cast<void(**)(void*)>(pNewTex->m_vptr))(pNewTex);
+            (*reinterpret_cast<void(**)(void*, void*)>(*reinterpret_cast<uintptr_t*>(pAlloc) + 0x70))(pAlloc, pNewTex);
+        }
+        return false;
+    }
+
+    pThis->m_byteSize = pNewTex ? pNewTex->m_byteSize : 0;
 
     if (pNewTex && __sync_fetch_and_add(&pNewTex->m_refCount, -1) == 1) {
         void* pAlloc = pNewTex->m_pAllocator;
         (*reinterpret_cast<void(**)(void*)>(pNewTex->m_vptr))(pNewTex);
         (*reinterpret_cast<void(**)(void*, void*)>(*reinterpret_cast<uintptr_t*>(pAlloc) + 0x70))(pAlloc, pNewTex);
     }
-
-    pThis->m_byteSize = pNewTex ? pNewTex->m_byteSize : 0;
 
     // Allocate read-write DSV array (+0x60) and read-only DSV array (+0x68)
     void* pAlloc = *reinterpret_cast<void**>(GX_VMA(0x5540680ULL));
@@ -369,20 +376,23 @@ void GXDepthStencilResource_ReleaseViewsAndTexture(GXDepthStencilResource* pThis
             reinterpret_cast<uint8_t*>(pGlobal) + 0x650);
         if (ppTrackerOwner) {
             uint8_t* pTracker = reinterpret_cast<uint8_t*>(*ppTrackerOwner);
-            void** pBegin = *reinterpret_cast<void***>(pTracker + 0xB0);
-            void** pEnd   = *reinterpret_cast<void***>(pTracker + 0xB8);
-            for (void** it = pBegin; it != pEnd; ++it) {
-                if (*it == pThis) {
-                    std::memmove(it, it + 1, reinterpret_cast<uint8_t*>(pEnd) - reinterpret_cast<uint8_t*>(it + 1));
-                    *reinterpret_cast<void***>(pTracker + 0xB8) = pEnd - 1;
-                    auto fnGetByteSize = reinterpret_cast<uint32_t(*)(GXDepthStencilResource*)>(pThis->m_vptr[12]); // +0x60
-                    uint32_t sz = fnGetByteSize(pThis);
-                    uint32_t totalBytes = *reinterpret_cast<uint32_t*>(pTracker + 0xD4) - sz;
-                    *reinterpret_cast<uint32_t*>(pTracker + 0xD4) = totalBytes;
-                    *reinterpret_cast<float*>(pTracker + 0xD8) =
-                        static_cast<float>(totalBytes) * (1.0f / 1048576.0f);
-                    *reinterpret_cast<uint32_t*>(pTracker + 0xD0) -= 1;
-                    break;
+            if (pTracker) {
+                auto fnGetByteSize = reinterpret_cast<uint32_t(*)(GXDepthStencilResource*)>(pThis->m_vptr[12]); // +0x60
+                const uint32_t sz = fnGetByteSize(pThis);
+                GXResourceTrackerLockGuard lockGuard{};
+                void** pBegin = *reinterpret_cast<void***>(pTracker + 0xB0);
+                void** pEnd   = *reinterpret_cast<void***>(pTracker + 0xB8);
+                for (void** it = pBegin; it != pEnd; ++it) {
+                    if (*it == pThis) {
+                        std::memmove(it, it + 1, reinterpret_cast<uint8_t*>(pEnd) - reinterpret_cast<uint8_t*>(it + 1));
+                        *reinterpret_cast<void***>(pTracker + 0xB8) = pEnd - 1;
+                        uint32_t totalBytes = *reinterpret_cast<uint32_t*>(pTracker + 0xD4) - sz;
+                        *reinterpret_cast<uint32_t*>(pTracker + 0xD4) = totalBytes;
+                        *reinterpret_cast<float*>(pTracker + 0xD8) =
+                            static_cast<float>(totalBytes) * (1.0f / 1048576.0f);
+                        *reinterpret_cast<uint32_t*>(pTracker + 0xD0) -= 1;
+                        break;
+                    }
                 }
             }
         }

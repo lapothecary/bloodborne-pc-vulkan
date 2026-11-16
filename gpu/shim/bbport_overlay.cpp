@@ -85,7 +85,21 @@ std::atomic<bool> prompt_active{false};
 std::mutex banner_mutex;
 std::string banner_text;
 std::atomic<bool> banner_active{false};
+std::mutex toast_mutex;
+std::string toast_text;
+std::atomic<long long> toast_until_ns{0};
 std::string prompt_title, prompt_text;
+
+bool ToastActiveNow() {
+    const long long until = toast_until_ns.load(std::memory_order_relaxed);
+    if (until <= 0) {
+        return false;
+    }
+    const long long now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                              std::chrono::steady_clock::now().time_since_epoch())
+                              .count();
+    return now < until;
+}
 
 // Present rate for the FPS counter.
 std::chrono::steady_clock::time_point last_present{};
@@ -923,6 +937,23 @@ void Menu() {
         ImGui::BeginDisabled(!s.mouse_look);
         Slider(BbSettings::MenuText("Mouse sensitivity", "Чувствительность мыши"), s.mouse_sensitivity, 0.10f, 4.00f);
         ImGui::EndDisabled();
+        const char* cam_modes[] = {
+            BbSettings::MenuText("Original (PS4)", "Оригинал (PS4)"),
+            BbSettings::MenuText("Balanced", "Баланс"),
+            BbSettings::MenuText("Locked (Rigid 1:1)", "Жёсткая (1:1)")};
+        int cam_mode = std::clamp(s.camera_follow_mode.load(std::memory_order_relaxed),
+                                  0, BbSettings::CameraFollowCount - 1);
+        if (ImGui::Combo(BbSettings::MenuText("Camera follow mode", "Следование камеры"), &cam_mode,
+                         cam_modes, BbSettings::CameraFollowCount)) {
+            Store(s.camera_follow_mode, cam_mode, true);
+        }
+        Hint(BbSettings::MenuText(
+            "Original (PS4): authentic Bloodborne camera inertia scaled smoothly to any FPS. "
+            "Balanced: responsive substepped spring follow with subtle sprint pull-back and 1:1 mouse look. "
+            "Locked (Rigid 1:1): zero-lag 1:1 character lock. Hotkey: F4.",
+            "Оригинал (PS4): классическая плавная инерция Bloodborne с коррекцией под любой FPS. "
+            "Баланс: отзывчивая пружина следования с лёгким отдалением на спринте и 1:1 обзором мыши. "
+            "Жёсткая (1:1): жёсткая привязка 1:1 без отставания. Горячая клавиша: F4."));
         ImGui::Spacing();
 
         if (rebinding_action >= 0 && SDL_WasInit(SDL_INIT_VIDEO)) {
@@ -3289,6 +3320,26 @@ bool TryHandleDebugHotkeys(const SDL_Event& event) {
     if (BbGameMenu::CapturesInput() || BbGameMenu::InCaptureCooldown()) {
         return false;
     }
+    if (MatchesHotkeyBinding(BbSettings::KeyCameraFollow, event)) {
+        auto& s = BbSettings::Get();
+        const int cur = std::clamp(s.camera_follow_mode.load(std::memory_order_relaxed),
+                                   0, BbSettings::CameraFollowCount - 1);
+        const int next = (cur + 1) % BbSettings::CameraFollowCount;
+        s.camera_follow_mode.store(next, std::memory_order_relaxed);
+        BbSettings::Save();
+        const char* mode_label =
+            next == BbSettings::CameraFollowOriginal
+                ? BbSettings::MenuText("Original (PS4)", "Оригинал (PS4)")
+                : next == BbSettings::CameraFollowBalanced
+                      ? BbSettings::MenuText("Balanced", "Баланс")
+                      : BbSettings::MenuText("Locked (Rigid 1:1)", "Жёсткая (1:1)");
+        char msg[160];
+        std::snprintf(msg, sizeof(msg),
+                      BbSettings::MenuText("Camera Follow: %s", "Следование камеры: %s"),
+                      mode_label);
+        ShowToast(msg);
+        return true;
+    }
     const bool match_add = MatchesHotkeyBinding(BbSettings::KeyAdditionalDebug, event);
     const bool match_dbg = MatchesHotkeyBinding(BbSettings::KeyDebug, event) ||
                            (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat && event.key.key == SDLK_F10);
@@ -3458,9 +3509,26 @@ void SetBanner(const char* text) {
     banner_active = text != nullptr && text[0] != 0;
 }
 
+void ShowToast(const char* text, float duration_sec) {
+    if (!text || !text[0] || !(duration_sec > 0.0f)) {
+        toast_until_ns.store(0, std::memory_order_relaxed);
+        return;
+    }
+    {
+        std::scoped_lock lock{toast_mutex};
+        toast_text = text;
+    }
+    const auto until = std::chrono::steady_clock::now() +
+                       std::chrono::duration_cast<std::chrono::nanoseconds>(
+                           std::chrono::duration<float>(duration_sec));
+    toast_until_ns.store(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(until.time_since_epoch()).count(),
+        std::memory_order_release);
+}
+
 bool Visible() {
     return initialized && (menu_open || prompt_active || banner_active ||
-                           BbSettings::Get().show_fps);
+                           ToastActiveNow() || BbSettings::Get().show_fps);
 }
 
 bool MenuOpen() {
@@ -3548,6 +3616,33 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
         draw->AddRectFilled({at.x - 24.0f, at.y - 12.0f}, {at.x + size.x + 24.0f, at.y + size.y + 12.0f},
                             IM_COL32(0, 0, 0, 170), 6.0f);
         draw->AddText(at, IM_COL32(230, 220, 200, 255), text.c_str());
+    }
+    if (const long long until = toast_until_ns.load(std::memory_order_acquire); until > 0) {
+        const long long now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                     now.time_since_epoch())
+                                     .count();
+        const float rem_sec = float(double(until - now_ns) * 1e-9);
+        if (rem_sec > 0.0f) {
+            std::string text;
+            {
+                std::scoped_lock toast_lock{toast_mutex};
+                text = toast_text;
+            }
+            const float alpha = std::clamp(rem_sec / 0.45f, 0.0f, 1.0f);
+            const ImVec2 size = ImGui::CalcTextSize(text.c_str());
+            auto* draw = ImGui::GetForegroundDrawList();
+            const float pad_x = 22.0f * base_scale;
+            const float pad_y = 11.0f * base_scale;
+            const ImVec2 at{(io.DisplaySize.x - size.x) * 0.5f, io.DisplaySize.y * 0.075f};
+            const ImVec2 p0{at.x - pad_x, at.y - pad_y};
+            const ImVec2 p1{at.x + size.x + pad_x, at.y + size.y + pad_y};
+            draw->AddRectFilled(p0, p1, IM_COL32(14, 12, 10, int(215.0f * alpha)), 7.0f * base_scale);
+            draw->AddRect(p0, p1, IM_COL32(184, 152, 92, int(210.0f * alpha)), 7.0f * base_scale, 0,
+                          1.5f * base_scale);
+            draw->AddText(at, IM_COL32(238, 228, 206, int(255.0f * alpha)), text.c_str());
+        } else {
+            toast_until_ns.store(0, std::memory_order_relaxed);
+        }
     }
     ImGui::Render();
 

@@ -880,9 +880,69 @@ bool ShouldInstallEntry(const GXDecompiledFunctionEntry& e, u64 size,
     return true;
 }
 
+struct SortedHostSymbol {
+    std::uintptr_t host_addr;
+    std::uint64_t ps4_vma;
+    std::uint32_t ps4_size;
+    const char* name;
+    const char* module_name;
+};
+
+constexpr std::size_t kMaxSortedHostSymbols = kGXDecompiledFunctionCount + 8;
+SortedHostSymbol g_sorted_host_syms[kMaxSortedHostSymbols]{};
+std::atomic<std::size_t> g_sorted_host_sym_count{0};
+std::atomic<std::uintptr_t> g_near_stubs_base{0};
+std::atomic<std::uintptr_t> g_near_stubs_end{0};
+std::atomic<bool> g_host_sym_init_lock{false};
+
+void EnsureHostSymbolTable() noexcept {
+    if (g_sorted_host_sym_count.load(std::memory_order_acquire) != 0) {
+        return;
+    }
+    if (g_host_sym_init_lock.exchange(true, std::memory_order_acq_rel)) {
+        return;
+    }
+    std::size_t count = 0;
+    for (std::size_t i = 0; i < kGXDecompiledFunctionCount; ++i) {
+        const auto& e = kGXDecompiledFunctions[i];
+        if (!e.func_ptr) continue;
+        g_sorted_host_syms[count++] = SortedHostSymbol{
+            .host_addr   = reinterpret_cast<std::uintptr_t>(e.func_ptr),
+            .ps4_vma     = e.vma,
+            .ps4_size    = e.size,
+            .name        = e.name,
+            .module_name = e.module_name,
+        };
+    }
+    const SortedHostSymbol extras[] = {
+        {reinterpret_cast<std::uintptr_t>(&BbSafeFixedBlockPool_AllocateNode), 0x0263b8b0ULL, 256u, "BbSafeFixedBlockPool_AllocateNode", "bb_golden_engine"},
+        {reinterpret_cast<std::uintptr_t>(&BbSafeFixedBlockPool_FreeNode),     0x0263b9b0ULL, 144u, "BbSafeFixedBlockPool_FreeNode",     "bb_golden_engine"},
+        {reinterpret_cast<std::uintptr_t>(&BbSafeFixedBlockPool_GetFreeBytes), 0x0263ba40ULL, 128u, "BbSafeFixedBlockPool_GetFreeBytes", "bb_golden_engine"},
+        {reinterpret_cast<std::uintptr_t>(&BbSafeFixedBlockPool_Finalize),     0x0263bc40ULL, 128u, "BbSafeFixedBlockPool_Finalize",     "bb_golden_engine"},
+    };
+    for (const auto& ex : extras) {
+        if (count < kMaxSortedHostSymbols) {
+            g_sorted_host_syms[count++] = ex;
+        }
+    }
+    std::sort(g_sorted_host_syms, g_sorted_host_syms + count,
+              [](const SortedHostSymbol& a, const SortedHostSymbol& b) noexcept {
+                  return a.host_addr < b.host_addr;
+              });
+    // Deduplicate identical host_addr entries if any alias exists
+    std::size_t unique_count = 0;
+    for (std::size_t i = 0; i < count; ++i) {
+        if (unique_count == 0 || g_sorted_host_syms[i].host_addr != g_sorted_host_syms[unique_count - 1].host_addr) {
+            g_sorted_host_syms[unique_count++] = g_sorted_host_syms[i];
+        }
+    }
+    g_sorted_host_sym_count.store(unique_count, std::memory_order_release);
+}
+
 } // namespace
 
 void PatchImage(unsigned char* image, u64 size) {
+    EnsureHostSymbolTable();
     g_eboot_live_slide = reinterpret_cast<uintptr_t>(image);
 #if defined(_WIN32)
     g_win32_guest_tls_teb_offset = 0x1480u + 8u * static_cast<std::uint32_t>(bb_guest_tls_slot());
@@ -1016,6 +1076,9 @@ void PatchImage(unsigned char* image, u64 size) {
     }
 
     ::mprotect(stubs, alloc_bytes, PROT_READ | PROT_EXEC);
+    g_near_stubs_base.store(reinterpret_cast<std::uintptr_t>(stubs), std::memory_order_release);
+    g_near_stubs_end.store(reinterpret_cast<std::uintptr_t>(stubs) + installed * kSlotSize,
+                           std::memory_order_release);
     std::printf("[bb_vulkan] Golden Engine C++20: installed %zu / %zu native C++ functions, redirected %zu skipped host symbols to guest, %u manifest shaders active (slide=0x%llx, filter=%s)\n",
                 installed, kGXDecompiledFunctionCount, redirected,
                 GXShaderLibrary_GetTotalShaderCount(),
@@ -1088,6 +1151,86 @@ bool QueryShaderManifest(std::uint64_t pgm_hash, std::uint32_t crc32, std::uint3
 
 std::uint32_t GetShaderManifestCount() noexcept {
     return GXShaderLibrary_GetTotalShaderCount();
+}
+
+bool ResolveHostAddress(std::uintptr_t addr, HostSymbolMatch* out) noexcept {
+    if (!addr) {
+        return false;
+    }
+    EnsureHostSymbolTable();
+    bool via_stub = false;
+    const std::uintptr_t stub_lo = g_near_stubs_base.load(std::memory_order_acquire);
+    const std::uintptr_t stub_hi = g_near_stubs_end.load(std::memory_order_acquire);
+    if (stub_lo != 0 && addr >= stub_lo && addr < stub_hi) {
+        const auto* slot = reinterpret_cast<const std::uint8_t*>(addr & ~static_cast<std::uintptr_t>(15));
+        if (slot[0] == 0xff && slot[1] == 0x25) {
+            std::uintptr_t target = 0;
+            std::memcpy(&target, slot + 6, sizeof(target));
+            if (target != 0) {
+                addr = target;
+                via_stub = true;
+            }
+        }
+    }
+
+    const std::size_t count = g_sorted_host_sym_count.load(std::memory_order_acquire);
+    if (count == 0) {
+        return false;
+    }
+    // Binary search for largest host_addr <= addr
+    std::size_t lo = 0;
+    std::size_t hi = count;
+    while (lo < hi) {
+        const std::size_t mid = lo + ((hi - lo) >> 1);
+        if (g_sorted_host_syms[mid].host_addr <= addr) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    if (lo == 0) {
+        return false;
+    }
+    const std::size_t idx = lo - 1;
+    const SortedHostSymbol& hit = g_sorted_host_syms[idx];
+    const std::uintptr_t diff = addr - hit.host_addr;
+    const std::uintptr_t next_gap =
+        (idx + 1 < count) ? (g_sorted_host_syms[idx + 1].host_addr - hit.host_addr) : ~std::uintptr_t{0};
+    const std::uintptr_t size_bound = std::max<std::uintptr_t>(
+        static_cast<std::uintptr_t>(hit.ps4_size) * 8u + 1024u, 2048u);
+    const std::uintptr_t max_span = (next_gap <= 32768u) ? next_gap : std::min<std::uintptr_t>(next_gap, size_bound);
+    if (diff >= max_span) {
+        return false;
+    }
+    if (out) {
+        out->name           = hit.name;
+        out->module_name    = hit.module_name;
+        out->ps4_vma        = hit.ps4_vma;
+        out->ps4_size       = hit.ps4_size;
+        out->host_func_addr = hit.host_addr;
+        out->host_offset    = diff;
+        out->via_near_stub  = via_stub;
+    }
+    return true;
+}
+
+bool ResolveGuestVma(std::uint64_t vma, HostSymbolMatch* out) noexcept {
+    for (std::size_t i = 0; i < kGXDecompiledFunctionCount; ++i) {
+        const auto& e = kGXDecompiledFunctions[i];
+        if (vma >= e.vma && vma < e.vma + std::max<std::uint32_t>(e.size, 1u)) {
+            if (out) {
+                out->name           = e.name;
+                out->module_name    = e.module_name;
+                out->ps4_vma        = e.vma;
+                out->ps4_size       = e.size;
+                out->host_func_addr = reinterpret_cast<std::uintptr_t>(e.func_ptr);
+                out->host_offset    = static_cast<std::uintptr_t>(vma - e.vma);
+                out->via_near_stub  = false;
+            }
+            return true;
+        }
+    }
+    return false;
 }
 
 } // namespace BbGoldenEngine

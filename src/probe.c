@@ -37,6 +37,7 @@ typedef struct { uint64_t target, kind, value, addend; } Reloc;
 static char (*names)[128];
 static uint64_t import_count;
 static unsigned char *image;
+static uint64_t image_mapped_size;
 static size_t page_size;
 typedef struct { uint64_t base, size, init, tls_address, tls_memsz, tls_filesz, tls_module; } LinkedModule;
 static LinkedModule modules[16];
@@ -218,8 +219,9 @@ static void patch_guest_tls(const Segment *segments, uint64_t ns) {
 }
 #endif
 static void fault(int sig, siginfo_t *info, void *context) {
+    void *fault_addr = info ? info->si_addr : NULL;
     /* GPU page tracking (write-protected guest pages) is resolved first. */
-    if (gpu_enabled && sig == SIGSEGV && bbgpu_handle_fault(context, info->si_addr)) return;
+    if (gpu_enabled && sig == SIGSEGV && bbgpu_handle_fault(context, fault_addr)) return;
     /* A speculative guest memory read (runtime_memory.c) failed: resume its recovery point. */
     if ((sig == SIGSEGV || sig == SIGBUS) && runtime_fault_recover) {
         sigjmp_buf *recover = runtime_fault_recover;
@@ -230,87 +232,12 @@ static void fault(int sig, siginfo_t *info, void *context) {
         pthread_sigmask(SIG_UNBLOCK, &unblock, NULL);
         siglongjmp(*recover, 1);
     }
-    /* The process is terminating: dladdr/snprintf are acceptable here. */
-    ucontext_t *uc = context;
-    uintptr_t rip = (uintptr_t)uc->uc_mcontext.gregs[REG_RIP];
-    char line[512];
-    Dl_info where;
-    if (rip - (uintptr_t)image < 0x10000000)
-        snprintf(line, sizeof(line), "Guest fault (signal %d) at guest offset 0x%lx, address %p\n",
-                 sig, (unsigned long)(rip - (uintptr_t)image), info->si_addr);
-    else if (dladdr((void *)rip, &where) && where.dli_fname)
-        snprintf(line, sizeof(line), "Host fault (signal %d) in %s+0x%lx (%s), address %p\n", sig, where.dli_fname,
-                 (unsigned long)(rip - (uintptr_t)where.dli_fbase), where.dli_sname ? where.dli_sname : "?", info->si_addr);
-    else
-        snprintf(line, sizeof(line), "Fault (signal %d) at RIP %p, address %p\n", sig, (void *)rip, info->si_addr);
-    { ssize_t written_=write(2, line, strlen(line)); (void)written_; }
-#ifdef _WIN32
-    {
-        char mem[256];
-        bb_win32_describe_address(info->si_addr, mem, sizeof(mem));
-        char out[320];
-        const int n = snprintf(out, sizeof(out), "  the address: %s\n", mem);
-        ssize_t written_=write(2, out, (size_t)n); (void)written_;
-        const greg_t *g = uc->uc_mcontext.gregs;
-        const int m = snprintf(out, sizeof(out), "  rax %llx rbx %llx rcx %llx rdx %llx rsi %llx rdi %llx r8 %llx r9 %llx\n",
-                               (unsigned long long)g[REG_RAX], (unsigned long long)g[REG_RBX], (unsigned long long)g[REG_RCX],
-                               (unsigned long long)g[REG_RDX], (unsigned long long)g[REG_RSI], (unsigned long long)g[REG_RDI],
-                               (unsigned long long)g[REG_R8], (unsigned long long)g[REG_R9]);
-        written_=write(2, out, (size_t)m); (void)written_;
-    }
-#endif
-    /* A guest fault: its thread and the game's call chain (return addresses along rbp, read with
-     * process_vm_readv so a broken chain cannot fault again). */
-    if (rip - (uintptr_t)image < 0x10000000) {
-        char thread[32] = "?";
-        pthread_getname_np(pthread_self(), thread, sizeof(thread));
-        int at = snprintf(line, sizeof(line), "  thread %s; calls:", thread);
-        uintptr_t rbp = (uintptr_t)uc->uc_mcontext.gregs[REG_RBP];
-        for (int i = 0; i < 12 && rbp && at < (int)sizeof(line) - 24; ++i) {
-            uintptr_t frame[2] = {0, 0};
-            struct iovec local = {frame, sizeof(frame)}, remote = {(void *)rbp, sizeof(frame)};
-            if (process_vm_readv(getpid(), &local, 1, &remote, 1, 0) != (ssize_t)sizeof(frame)) break;
-            if (frame[1] - (uintptr_t)image >= 0x10000000) break;
-            at += snprintf(line + at, sizeof(line) - at, " +0x%lx", (unsigned long)(frame[1] - (uintptr_t)image));
-            if (frame[0] <= rbp) break;
-            rbp = frame[0];
-        }
-        snprintf(line + at, sizeof(line) - at, "\n");
-        { ssize_t written_=write(2, line, strlen(line)); (void)written_; }
-    }
+    /* Universal Linux & Windows Crash Black-Box: writes full hybrid stacktrace, 16 GPRs,
+     * FromSoftware DLRegularHeap chunk corruption check, and 128-event Flight Recorder
+     * simultaneously to stderr AND `logs/crash-YYYYMMDD_HHMMSS.log`. */
+    bbgpu_write_crash_blackbox(sig, fault_addr, context, image, image_mapped_size);
     { void runtime_re_watch_report(void); runtime_re_watch_report(); }
     if (gpu_enabled) bbgpu_dump_guest_writes(context);
-    /* Outside the image and any shared object (generated code, a freed mapping): the mapping
-     * from /proc/self/maps, and the thread. */
-    if (rip - (uintptr_t)image >= 0x10000000 && !(dladdr((void *)rip, &where) && where.dli_fname)) {
-        char thread[32] = "?";
-        pthread_getname_np(pthread_self(), thread, sizeof(thread));
-        snprintf(line, sizeof(line), "  thread %s; mapping of RIP: ", thread);
-        { ssize_t written_=write(2, line, strlen(line)); (void)written_; }
-        FILE *maps = fopen("/proc/self/maps", "r");
-        int found = 0;
-        while (maps && fgets(line, sizeof(line), maps)) {
-            unsigned long from, to;
-            if (sscanf(line, "%lx-%lx", &from, &to) == 2 && rip >= from && rip < to) {
-                ssize_t written_=write(2, line, strlen(line)); (void)written_;
-                found = 1;
-                break;
-            }
-        }
-        if (maps) fclose(maps);
-        if (!found) { ssize_t written_=write(2, "none\n", 5); (void)written_; }
-    }
-    /* Host call chain (frames with unwind info; guest frames end it). */
-    void *frames[32];
-    int depth = backtrace(frames, 32);
-    for (int i = 2; i < depth; ++i) {
-        if (dladdr(frames[i], &where) && where.dli_fname)
-            snprintf(line, sizeof(line), "  #%d %s+0x%lx (%s)\n", i, where.dli_fname,
-                     (unsigned long)((uintptr_t)frames[i] - (uintptr_t)where.dli_fbase), where.dli_sname ? where.dli_sname : "?");
-        else
-            snprintf(line, sizeof(line), "  #%d %p\n", i, frames[i]);
-        ssize_t written_=write(2, line, strlen(line)); (void)written_;
-    }
     _exit(128 + sig);
 }
 static uintptr_t exe_base;
@@ -585,6 +512,7 @@ int main(int argc, char **argv) {
     struct sigaction sa = {0}; sa.sa_sigaction = fault; sa.sa_flags = SA_SIGINFO;
     sigemptyset(&sa.sa_mask);
     sigaction(SIGSEGV, &sa, NULL); sigaction(SIGILL, &sa, NULL); sigaction(SIGBUS, &sa, NULL);
+    sigaction(SIGFPE, &sa, NULL); sigaction(SIGABRT, &sa, NULL);
     Dl_info self_info;
     if (dladdr((void *)main,&self_info)) exe_base=(uintptr_t)self_info.dli_fbase;
 #ifndef _WIN32
@@ -693,6 +621,7 @@ int main(int argc, char **argv) {
         }
     }
     image = allocate(round_page(size));
+    image_mapped_size = size;
     if (fread(image, 1, size, f) != size || fgetc(f) != EOF) fail("incorrect memory image size");
     fclose(f);
     if (!cpu_only) {

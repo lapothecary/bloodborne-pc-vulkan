@@ -250,6 +250,7 @@ def _load_saved_launcher_and_ini(env, data):
             "mouse_look=1\n"
             "mouse_sensitivity=1.00\n"
             "mouse_invert_y=0\n"
+            "camera_follow_mode=balanced\n"
             "skip_intro=1\n"
             "skip_network_choice=1\n"
         )

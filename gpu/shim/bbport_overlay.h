@@ -30,6 +30,8 @@ void UpdateTextInput(SDL_Window* window);
 bool Visible();
 /// A line of text over the game until called with null (bbgpu_overlay_banner).
 void SetBanner(const char* text);
+/// Brief timed OSD toast notification near the top of the screen (e.g. F4 camera / F3 FPS hotkeys).
+void ShowToast(const char* text, float duration_sec = 2.2f);
 
 /// Present thread: draws into `view` (layout ColorAttachmentOptimal).
 void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent);

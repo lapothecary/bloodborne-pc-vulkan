@@ -221,9 +221,17 @@ static inline void GXAttachTexturePreviewAdapter(uint8_t* pBuilder, uintptr_t la
         *reinterpret_cast<uint64_t*>(pAdapter + 0x18) = 0ULL;
         *reinterpret_cast<void**>(pAdapter + 0x10) = pTexRes;
         if (pTexRes != nullptr) {
-            uint32_t rc = *reinterpret_cast<uint32_t*>(pTexRes + 0x08);
-            if (rc != 0u) {
-                *reinterpret_cast<uint32_t*>(pTexRes + 0x08) = rc + 1u;
+            uint32_t rc = __atomic_load_n(reinterpret_cast<uint32_t*>(pTexRes + 0x08), __ATOMIC_RELAXED);
+            while (rc != 0u) {
+                if (__atomic_compare_exchange_n(
+                        reinterpret_cast<uint32_t*>(pTexRes + 0x08),
+                        &rc,
+                        rc + 1u,
+                        true,
+                        __ATOMIC_ACQ_REL,
+                        __ATOMIC_RELAXED)) {
+                    break;
+                }
             }
             auto pfnInitPreview = reinterpret_cast<void (*)(void*)>(GX_VMA(0x21ba300ULL));
             pfnInitPreview(pAdapter);
@@ -1753,8 +1761,7 @@ static inline void GXDevice_HeapFreeBlock(void* pHeap, void* pPtr) {
 }
 
 static inline void GXDevice_ReleaseSimpleRef8(uint8_t* pObj) {
-    int32_t oldRc = *reinterpret_cast<int32_t*>(pObj + 0x08);
-    *reinterpret_cast<int32_t*>(pObj + 0x08) = oldRc - 1;
+    int32_t oldRc = __atomic_fetch_sub(reinterpret_cast<int32_t*>(pObj + 0x08), 1, __ATOMIC_ACQ_REL);
     if (oldRc <= 1) {
         void (**vtbl)(void*) = *reinterpret_cast<void (***)(void*)>(pObj);
         vtbl[0](pObj);
@@ -2764,7 +2771,7 @@ bool GXDevice_CreateAndInitializeSingleton(uint8_t* pInitParams) {
             };
             reinterpret_cast<void (*)(void*, const void*, uint32_t, uint32_t)>(GX_VMA(0x219f130ULL))(pDS, &dsDesc, 0u, 0u);
             pDS = *reinterpret_cast<uint8_t**>(pOut + 0x70);
-            ++(*reinterpret_cast<uint32_t*>(pDS + 0x08));
+            __atomic_add_fetch(reinterpret_cast<uint32_t*>(pDS + 0x08), 1u, __ATOMIC_ACQ_REL);
             (*reinterpret_cast<void (***)(void*, const void*)>(pDS))[16](pDS, reinterpret_cast<const void*>(GX_VMA(0x49c2e02ULL))); // *0x80
         }
 
@@ -2776,7 +2783,7 @@ bool GXDevice_CreateAndInitializeSingleton(uint8_t* pInitParams) {
                 *reinterpret_cast<void**>(pOut + 0x58),
                 0u); // *0x98
             pRT = *reinterpret_cast<uint8_t**>(pOut + 0x68);
-            ++(*reinterpret_cast<uint32_t*>(pRT + 0x08));
+            __atomic_add_fetch(reinterpret_cast<uint32_t*>(pRT + 0x08), 1u, __ATOMIC_ACQ_REL);
             (*reinterpret_cast<void (***)(void*, const void*)>(pRT))[16](pRT, reinterpret_cast<const void*>(GX_VMA(0x49c2e22ULL))); // *0x80
         }
 
@@ -2795,7 +2802,7 @@ bool GXDevice_CreateAndInitializeSingleton(uint8_t* pInitParams) {
                 0ULL,
                 0ULL);
             pDepthR32F = *reinterpret_cast<uint8_t**>(pOut + 0x78);
-            ++(*reinterpret_cast<uint32_t*>(pDepthR32F + 0x08));
+            __atomic_add_fetch(reinterpret_cast<uint32_t*>(pDepthR32F + 0x08), 1u, __ATOMIC_ACQ_REL);
         }
     }
 
@@ -3048,7 +3055,7 @@ bool GXDevice_CreateAndInitializeSingleton(uint8_t* pInitParams) {
             }
             (*reinterpret_cast<uint8_t***>(pDevice + 0x238))[idx] = pTex;
             uint8_t* pStored = (*reinterpret_cast<uint8_t***>(pDevice + 0x238))[idx];
-            ++(*reinterpret_cast<uint32_t*>(pStored + 0x08));
+            __atomic_add_fetch(reinterpret_cast<uint32_t*>(pStored + 0x08), 1u, __ATOMIC_ACQ_REL);
         }
     }
 
@@ -3099,7 +3106,7 @@ bool GXDevice_CreateAndInitializeSingleton(uint8_t* pInitParams) {
             }
             *reinterpret_cast<void**>(pDevice + 0x248) = pDefSamp;
             if (pDefSamp != nullptr) {
-                ++(*reinterpret_cast<uint32_t*>(pDefSamp + 0x08));
+                __atomic_add_fetch(reinterpret_cast<uint32_t*>(pDefSamp + 0x08), 1u, __ATOMIC_ACQ_REL);
             }
         }
     }
@@ -3449,8 +3456,8 @@ void GXDevice_BaseDtor(uint8_t* pDevice) {
     // 6. Release default sampler state (+0x248)
     uint8_t* pSampler = *reinterpret_cast<uint8_t**>(pDevice + 0x248);
     if (pSampler != nullptr) {
-        int32_t oldRef = *reinterpret_cast<int32_t*>(pSampler + 0x08);
-        *reinterpret_cast<int32_t*>(pSampler + 0x08) = oldRef - 1;
+        int32_t oldRef = __atomic_fetch_sub(
+            reinterpret_cast<int32_t*>(pSampler + 0x08), 1, __ATOMIC_ACQ_REL);
         if (oldRef <= 1) {
             void (**vtable)(void*) = *reinterpret_cast<void (***)(void*)>(pSampler);
             vtable[0](pSampler);

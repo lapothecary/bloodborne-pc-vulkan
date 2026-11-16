@@ -228,6 +228,11 @@ const char* TranslateForCurrentGameLang(const char* en) {
         {"True Black & Vibrance", "Noir profond (OLED) & Vibrance", "Negro puro (OLED) y viveza", "Tiefschwarz (OLED) & Brillanz", "Nero puro (OLED) e vividezza", "Preto puro (OLED) e vivacidade", "Głęboka czerń (OLED) i nasycenie", "トゥルーブラック (OLED) & 彩度", "트루 블랙 (OLED) 및 채도", "纯黑去雾 (OLED) 与色彩鲜艳度"},
         {"Debug", "Debug", "Depuración", "Debug", "Debug", "Debug", "Debug", "デバッグ", "디버그", "调试信息"},
         {"Additional Debug", "Debug détaillé", "Depuración detallada", "Erweitertes Debug", "Debug dettagliato", "Debug detalhado", "Szczegółowy debug", "詳細デバッグ", "상세 디버그", "详细调试信息"},
+        {"Camera Follow Hotkey", "Raccourci suivi caméra", "Atajo seguimiento cámara", "Kamera-Folgemodus-Taste", "Tasto modalità telecamera", "Atalho modo de câmera", "Skrót trybu kamery", "カメラ追従切替キー", "카메라 추적 전환 키", "视角跟随切换热键"},
+        {"Camera Follow Mode", "Suivi de la caméra", "Seguimiento de cámara", "Kamera-Folgemodus", "Inseguimento telecamera", "Seguimento da câmera", "Śledzenie kamery", "カメラ追従モード", "카메라 추적 모드", "视角跟随模式"},
+        {"Original (PS4)", "Original (PS4)", "Original (PS4)", "Original (PS4)", "Originale (PS4)", "Original (PS4)", "Oryginalny (PS4)", "オリジナル (PS4)", "오리지널 (PS4)", "原版惯性 (PS4)"},
+        {"Balanced", "Équilibré", "Equilibrado", "Ausgewogen", "Bilanciato", "Equilibrado", "Zbalansowany", "バランス", "밸런스", "均衡"},
+        {"Locked (Rigid 1:1)", "Verrouillé (Rigide 1:1)", "Fijo (Rígido 1:1)", "Fixiert (Starr 1:1)", "Bloccato (Rigido 1:1)", "Fixo (Rígido 1:1)", "Sztywny (1:1)", "固定 (リジッド 1:1)", "고정 (1:1 직결)", "完全锁定 (1:1 刚性)"},
         {"Exit Game", "Quitter le jeu", "Salir del juego", "Spiel beenden", "Esci dal gioco", "Sair do jogo", "Wyjdź z gry", "ゲームを終了", "게임 종료", "退出游戏"},
         {"Exit Bloodborne and return to desktop.", "Quitter Bloodborne et revenir au bureau.", "Salir de Bloodborne y volver al escritorio.", "Bloodborne beenden und zum Desktop zurückkehren.", "Esci da Bloodborne e torna al desktop.", "Sair de Bloodborne e voltar para a área de trabalho.", "Zamknij Bloodborne i wróć do pulpitu.", "Bloodborneを終了してデスクトップに戻ります。", "Bloodborne을 종료하고 바탕 화면으로 돌아갑니다.", "退出《血源诅咒》并返回桌面。"},
     };
@@ -289,11 +294,12 @@ constexpr int FirstControlSettingItem = BbSettings::KeyActionCount;
 constexpr int ItemMouseSpeed = FirstControlSettingItem + 0;
 constexpr int ItemVibration = FirstControlSettingItem + 1;
 constexpr int ItemCameraSens = FirstControlSettingItem + 2;
-constexpr int ItemCameraX = FirstControlSettingItem + 3;
-constexpr int ItemCameraY = FirstControlSettingItem + 4;
-constexpr int ItemAutoTarget = FirstControlSettingItem + 5;
-constexpr int ItemCameraAdjust = FirstControlSettingItem + 6;
-constexpr int TotalControlsItems = BbSettings::KeyActionCount + 7; ///< 26 keybinds + Mouse Speed + 6 native settings
+constexpr int ItemCameraFollow = FirstControlSettingItem + 3;
+constexpr int ItemCameraX = FirstControlSettingItem + 4;
+constexpr int ItemCameraY = FirstControlSettingItem + 5;
+constexpr int ItemAutoTarget = FirstControlSettingItem + 6;
+constexpr int ItemCameraAdjust = FirstControlSettingItem + 7;
+constexpr int TotalControlsItems = BbSettings::KeyActionCount + 8; ///< 27 keybinds + Mouse Speed + Camera Follow + 6 native settings
 constexpr int MaxControlsScroll = TotalControlsItems - ControlsSlotCount;
 constexpr int DisplaySlotCount = 6; ///< all 6 visible rows in Display scroll across 11 items
 constexpr int TotalDisplayItems = 11;
@@ -959,6 +965,24 @@ void RefreshSlotTexts(int slot) {
         return;
     }
 
+    if (item_idx == ItemCameraFollow) {
+        SetDynamic(name_id, "Camera Follow Mode", "Следование камеры");
+        SetDynamic(help_id,
+                   "Camera follow inertia: Original (PS4), Balanced (spring + subtle sprint pull-back), or Locked (1:1). Hotkey: F4",
+                   "Плавность следования камеры: Оригинал (PS4), Баланс (пружина + плавный спринт) или Жёсткая (1:1). Клавиша: F4");
+        const int mode = std::clamp(
+            BbSettings::Get().camera_follow_mode.load(std::memory_order_relaxed),
+            0, BbSettings::CameraFollowCount - 1);
+        const char* en = mode == BbSettings::CameraFollowOriginal   ? "Original (PS4)"
+                         : mode == BbSettings::CameraFollowBalanced ? "Balanced"
+                                                                    : "Locked (Rigid 1:1)";
+        const char* ru = mode == BbSettings::CameraFollowOriginal   ? "Оригинал (PS4)"
+                         : mode == BbSettings::CameraFollowBalanced ? "Баланс"
+                                                                    : "Жёсткая (1:1)";
+        SetDynamic(val_id, en, ru);
+        return;
+    }
+
     if (item_idx == ItemCameraX) {
         SetDynamic(name_id, "Camera X-Axis", "Камера по оси X");
         SetDynamic(help_id, "Horizontal camera rotation direction (Left/Right to toggle)",
@@ -1136,7 +1160,14 @@ void BuildControlsSlotChoices(int slot, std::vector<u32>& out_choices, int& out_
         SetDynamic(id, en, ru);
         out_choices.push_back(id);
     };
-    if (item_idx == ItemCameraX) {
+    if (item_idx == ItemCameraFollow) {
+        add_choice("Original (PS4)", "Оригинал (PS4)");
+        add_choice("Balanced", "Баланс");
+        add_choice("Locked (Rigid 1:1)", "Жёсткая (1:1)");
+        out_selected_idx = std::clamp(
+            BbSettings::Get().camera_follow_mode.load(std::memory_order_relaxed),
+            0, BbSettings::CameraFollowCount - 1);
+    } else if (item_idx == ItemCameraX) {
         add_choice("Normal", "Обычная");
         add_choice("Inverted", "Инверсия");
         out_selected_idx = (active_game_settings && active_game_settings[0xa] == 0) ? 1 : 0;
@@ -1158,7 +1189,7 @@ void BuildControlsSlotChoices(int slot, std::vector<u32>& out_choices, int& out_
 void UpdateSlotRowDisplay(u8* row, int slot) {
     if (!row) return;
     const int item_idx = std::clamp(controls_scroll + slot, 0, TotalControlsItems - 1);
-    if (item_idx >= ItemCameraX) {
+    if (item_idx >= ItemCameraFollow) {
         std::vector<u32> choice_ids;
         int selected_idx = 0;
         BuildControlsSlotChoices(slot, choice_ids, selected_idx);
@@ -1195,6 +1226,14 @@ void RefreshControlsPage() {
 
 void ApplyControlsSlotChoiceIndex(u8* row, int slot, int choice_idx) {
     const int item_idx = std::clamp(controls_scroll + slot, 0, TotalControlsItems - 1);
+    if (item_idx == ItemCameraFollow) {
+        const int m = std::clamp(choice_idx, 0, BbSettings::CameraFollowCount - 1);
+        BbSettings::Get().camera_follow_mode.store(m, std::memory_order_relaxed);
+        BbSettings::Save();
+        RefreshSlotTexts(slot);
+        UpdateSlotRowDisplay(row, slot);
+        return;
+    }
     const int idx = std::clamp(choice_idx, 0, 1);
     if (item_idx == ItemCameraX && active_game_settings) {
         active_game_settings[0xa] = idx == 0 ? 1 : 0; // 1 = Normal, 0 = Inverted
@@ -1238,6 +1277,18 @@ void StepSlotSetting(u8* row, int slot, int delta, bool wrap) {
         sens = wrap ? (sens + 11) % 11 : std::clamp(sens, 0, 10);
         if (sens != cur) {
             active_game_settings[0x0] = u8(sens);
+            changed = true;
+        }
+    } else if (item_idx == ItemCameraFollow) {
+        auto& s = BbSettings::Get();
+        const int cur = std::clamp(s.camera_follow_mode.load(std::memory_order_relaxed),
+                                   0, BbSettings::CameraFollowCount - 1);
+        int next = cur + delta;
+        next = wrap ? (next + BbSettings::CameraFollowCount) % BbSettings::CameraFollowCount
+                    : std::clamp(next, 0, BbSettings::CameraFollowCount - 1);
+        if (next != cur) {
+            s.camera_follow_mode.store(next, std::memory_order_relaxed);
+            BbSettings::Save();
             changed = true;
         }
     } else if (item_idx == ItemCameraX && active_game_settings) {
@@ -2584,7 +2635,9 @@ u64 PS4_SYSV_ABI RowInputHook(u8* row, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, d
             for (int k = 0; k < BbSettings::KeyActionCount; ++k) {
                 BbSettings::SetKeyBinding(k, BbSettings::GetKeyActionDef(k).default_val);
             }
-            SetMouseSpeedStep(5);
+            BbSettings::Get().camera_follow_mode.store(BbSettings::CameraFollowBalanced,
+                                                       std::memory_order_relaxed);
+            SetMouseSpeedStep(5); // also saves bbport.ini
             if (active_game_settings) {
                 active_game_settings[0x0] = 5;  // Camera Sensitivity
                 active_game_settings[0x1] = 10; // Controller Vibration
@@ -2656,6 +2709,25 @@ u64 PS4_SYSV_ABI RowInputHook(u8* row, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, d
                 }
             }
             return 0;
+        }
+        if (item_idx == ItemCameraFollow) {
+            // 3-choice Camera Follow Mode row: supports both native pop-up dropdown (Confirm) and quick Left/Right step.
+            SyncSlotSliderWidget(row, slot, is_focused);
+            if (row[0x3c0] != 0) {
+                const u64 res = row_input_original(row, a1, a2, a3, a4, a5, frame_time);
+                if (row[0x3c0] == 0) {
+                    ApplyControlsSlotChoiceIndex(row, slot, values[FirstSlot + slot]);
+                }
+                return res;
+            }
+            if (is_focused && in != 0 && capturing_action.load(std::memory_order_relaxed) < 0 && !InCaptureCooldown()) {
+                const int step = HorizontalMenuStep(in);
+                if (step != 0) {
+                    StepSlotSetting(row, slot, step, false);
+                    return 0;
+                }
+            }
+            return row_input_original(row, a1, a2, a3, a4, a5, frame_time);
         }
         // Camera & Target 2-choice toggle row (ItemCameraX..ItemCameraAdjust): uses <| Normal / Inverted |> ComboBox arrows.
         SyncSlotSliderWidget(row, slot, is_focused);

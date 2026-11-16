@@ -696,8 +696,8 @@ void* sub_21ce1b0(void* outIter, void* vec, void* last,
             for (auto** cur = pBegin; cur != pLast; ++cur) {
                 uint8_t* obj = *cur;
                 if (obj != nullptr) {
-                    int32_t oldRef = *reinterpret_cast<int32_t*>(obj + 0x08);
-                    *reinterpret_cast<int32_t*>(obj + 0x08) = oldRef - 1;
+                    int32_t oldRef = __atomic_fetch_sub(
+                        reinterpret_cast<int32_t*>(obj + 0x08), 1, __ATOMIC_ACQ_REL);
                     if (oldRef <= 1) {
                         auto* vtbl = *reinterpret_cast<uintptr_t**>(obj);
                         reinterpret_cast<void (*)(void*)>(vtbl[0])(obj);
@@ -716,8 +716,8 @@ void* sub_21ce1b0(void* outIter, void* vec, void* last,
                 uint8_t* newObj = *src;
                 if (oldObj != newObj) {
                     if (oldObj != nullptr) {
-                        int32_t oldRef = *reinterpret_cast<int32_t*>(oldObj + 0x08);
-                        *reinterpret_cast<int32_t*>(oldObj + 0x08) = oldRef - 1;
+                        int32_t oldRef = __atomic_fetch_sub(
+                            reinterpret_cast<int32_t*>(oldObj + 0x08), 1, __ATOMIC_ACQ_REL);
                         if (oldRef <= 1) {
                             auto* vtbl = *reinterpret_cast<uintptr_t**>(oldObj);
                             reinterpret_cast<void (*)(void*)>(vtbl[0])(oldObj);
@@ -727,7 +727,8 @@ void* sub_21ce1b0(void* outIter, void* vec, void* last,
                     }
                     *dst = newObj;
                     if (newObj != nullptr) {
-                        ++(*reinterpret_cast<int32_t*>(newObj + 0x08));
+                        __atomic_add_fetch(
+                            reinterpret_cast<int32_t*>(newObj + 0x08), 1, __ATOMIC_ACQ_REL);
                     }
                 }
             }
@@ -737,8 +738,8 @@ void* sub_21ce1b0(void* outIter, void* vec, void* last,
             for (auto** cur = dst; cur != pEnd; ++cur) {
                 uint8_t* obj = *cur;
                 if (obj != nullptr) {
-                    int32_t oldRef = *reinterpret_cast<int32_t*>(obj + 0x08);
-                    *reinterpret_cast<int32_t*>(obj + 0x08) = oldRef - 1;
+                    int32_t oldRef = __atomic_fetch_sub(
+                        reinterpret_cast<int32_t*>(obj + 0x08), 1, __ATOMIC_ACQ_REL);
                     if (oldRef <= 1) {
                         auto* vtbl = *reinterpret_cast<uintptr_t**>(obj);
                         reinterpret_cast<void (*)(void*)>(vtbl[0])(obj);
@@ -842,7 +843,7 @@ bool sub_21cdcd0(void* self, const void* flverContainer, void* textureResolver) 
 
             uint8_t* slotBase = *reinterpret_cast<uint8_t**>(s + 0x50);
             uint8_t* slot = slotBase + slotByteOff;
-            ++(*reinterpret_cast<int32_t*>(slot + 0x08));
+            __atomic_add_fetch(reinterpret_cast<int32_t*>(slot + 0x08), 1, __ATOMIC_ACQ_REL);
 
             uint64_t strLen = 0;
             if (*reinterpret_cast<const uint16_t*>(utf8Buf) != 0) {
@@ -853,8 +854,8 @@ bool sub_21cdcd0(void* self, const void* flverContainer, void* textureResolver) 
             uint8_t* oldTex = *reinterpret_cast<uint8_t**>(slot + 0x50);
             if (oldTex != resolvedTex) {
                 if (oldTex != nullptr) {
-                    int32_t oldRef = *reinterpret_cast<int32_t*>(oldTex + 0x08);
-                    *reinterpret_cast<int32_t*>(oldTex + 0x08) = oldRef - 1;
+                    int32_t oldRef = __atomic_fetch_sub(
+                        reinterpret_cast<int32_t*>(oldTex + 0x08), 1, __ATOMIC_ACQ_REL);
                     if (oldRef <= 1) {
                         auto* vtbl = *reinterpret_cast<uintptr_t**>(oldTex);
                         reinterpret_cast<void (*)(void*)>(vtbl[0])(oldTex);
@@ -863,13 +864,14 @@ bool sub_21cdcd0(void* self, const void* flverContainer, void* textureResolver) 
                 }
                 *reinterpret_cast<uint8_t**>(slot + 0x50) = resolvedTex;
                 if (resolvedTex != nullptr) {
-                    ++(*reinterpret_cast<int32_t*>(resolvedTex + 0x08));
+                    __atomic_add_fetch(
+                        reinterpret_cast<int32_t*>(resolvedTex + 0x08), 1, __ATOMIC_ACQ_REL);
                 }
             }
 
             uint8_t* tempSlotPtr = slot;
             if (tempSlotPtr != nullptr) {
-                ++(*reinterpret_cast<int32_t*>(slot + 0x08));
+                __atomic_add_fetch(reinterpret_cast<int32_t*>(slot + 0x08), 1, __ATOMIC_ACQ_REL);
             }
 
             auto** vBegin = *reinterpret_cast<uint8_t***>(s + 0x18);
@@ -895,7 +897,8 @@ bool sub_21cdcd0(void* self, const void* flverContainer, void* textureResolver) 
                     uint8_t* elem = (*reinterpret_cast<uint8_t***>(s + 0x18))[relIdx];
                     *vEnd = elem;
                     if (elem != nullptr) {
-                        ++(*reinterpret_cast<int32_t*>(elem + 0x08));
+                        __atomic_add_fetch(
+                            reinterpret_cast<int32_t*>(elem + 0x08), 1, __ATOMIC_ACQ_REL);
                     }
                 }
             } else {
@@ -914,15 +917,16 @@ bool sub_21cdcd0(void* self, const void* flverContainer, void* textureResolver) 
                 if (vEnd != nullptr) {
                     *vEnd = tempSlotPtr;
                     if (tempSlotPtr != nullptr) {
-                        ++(*reinterpret_cast<int32_t*>(tempSlotPtr + 0x08));
+                        __atomic_add_fetch(
+                            reinterpret_cast<int32_t*>(tempSlotPtr + 0x08), 1, __ATOMIC_ACQ_REL);
                     }
                 }
             }
             *reinterpret_cast<uint8_t***>(s + 0x20) += 1;
 
             if (tempSlotPtr != nullptr) {
-                int32_t oldRef = *reinterpret_cast<int32_t*>(tempSlotPtr + 0x08);
-                *reinterpret_cast<int32_t*>(tempSlotPtr + 0x08) = oldRef - 1;
+                int32_t oldRef = __atomic_fetch_sub(
+                    reinterpret_cast<int32_t*>(tempSlotPtr + 0x08), 1, __ATOMIC_ACQ_REL);
                 if (oldRef <= 1) {
                     auto* vtbl = *reinterpret_cast<uintptr_t**>(tempSlotPtr);
                     reinterpret_cast<void (*)(void*)>(vtbl[0])(tempSlotPtr);
@@ -983,7 +987,16 @@ void sub_21cda20(void* self) {
     auto* s = static_cast<uint8_t*>(self);
     *reinterpret_cast<uintptr_t*>(s + 0x00) = GX_VMA(0x53b6f20ULL);
 
+    // Must release vector references to `slots` BEFORE freeing `slots` (+0x50)
+    // (matches original PS4 eboot.bin 0x21cda20 order; prevents Use-After-Free
+    //  writes to `slot + 0x08` on GFX heap 0x805699e68).
     uint64_t iterOut[4] = {};
+    void* vecEnd1 = *reinterpret_cast<void**>(s + 0x20);
+    sub_21ce1b0(iterOut, s + 0x10,
+                vecEnd1,
+                0, 0, 0, 0, 0,
+                *reinterpret_cast<void**>(s + 0x18),
+                0, 0, vecEnd1);
 
     uint8_t* slots = *reinterpret_cast<uint8_t**>(s + 0x50);
     if (slots != nullptr) {
@@ -1021,8 +1034,8 @@ void sub_21cda20(void* self) {
         for (auto** cur = vBegin; cur != vEnd; ++cur) {
             uint8_t* obj = *cur;
             if (obj != nullptr) {
-                int32_t oldRef = *reinterpret_cast<int32_t*>(obj + 0x08);
-                *reinterpret_cast<int32_t*>(obj + 0x08) = oldRef - 1;
+                int32_t oldRef = __atomic_fetch_sub(
+                    reinterpret_cast<int32_t*>(obj + 0x08), 1, __ATOMIC_ACQ_REL);
                 if (oldRef <= 1) {
                     auto* vtbl = *reinterpret_cast<uintptr_t**>(obj);
                     reinterpret_cast<void (*)(void*)>(vtbl[0])(obj);
@@ -1161,8 +1174,8 @@ void sub_21cd750(void* self) {
         for (auto** cur = vBegin; cur != vEnd; ++cur) {
             uint8_t* obj = *cur;
             if (obj != nullptr) {
-                int32_t oldRef = *reinterpret_cast<int32_t*>(obj + 0x08);
-                *reinterpret_cast<int32_t*>(obj + 0x08) = oldRef - 1;
+                int32_t oldRef = __atomic_fetch_sub(
+                    reinterpret_cast<int32_t*>(obj + 0x08), 1, __ATOMIC_ACQ_REL);
                 if (oldRef <= 1) {
                     auto* vtbl = *reinterpret_cast<uintptr_t**>(obj);
                     reinterpret_cast<void (*)(void*)>(vtbl[0])(obj);
@@ -1200,8 +1213,8 @@ void sub_21cd670(void* self) {
         for (auto** cur = vBegin; cur != vEnd; ++cur) {
             uint8_t* obj = *cur;
             if (obj != nullptr) {
-                int32_t oldRef = *reinterpret_cast<int32_t*>(obj + 0x08);
-                *reinterpret_cast<int32_t*>(obj + 0x08) = oldRef - 1;
+                int32_t oldRef = __atomic_fetch_sub(
+                    reinterpret_cast<int32_t*>(obj + 0x08), 1, __ATOMIC_ACQ_REL);
                 if (oldRef <= 1) {
                     auto* vtbl = *reinterpret_cast<uintptr_t**>(obj);
                     reinterpret_cast<void (*)(void*)>(vtbl[0])(obj);
@@ -2086,9 +2099,13 @@ void sub_21cb5d0(void* updaterPtr, void* jobScheduler) {
     *reinterpret_cast<uint32_t*>(updater + 0x614) = 0u;
 
     int32_t workerCount = *reinterpret_cast<const int32_t*>(sched + 0x08);
-    uint64_t entryQwords = static_cast<uint64_t>(
-        *reinterpret_cast<uint8_t**>(updater + 0x18) -
-        *reinterpret_cast<uint8_t**>(updater + 0x10)) >> 3;
+    uint64_t entryQwords = 0ULL;
+    {
+        SkinningEntriesLockGuard lockGuard{};
+        entryQwords = static_cast<uint64_t>(
+            *reinterpret_cast<uint8_t**>(updater + 0x18) -
+            *reinterpret_cast<uint8_t**>(updater + 0x10)) >> 3;
+    }
     int32_t totalEntries = static_cast<int32_t>(static_cast<uint32_t>(entryQwords) * 0xCCCCCCCDu);
     int32_t divisor      = workerCount * 2;
     int32_t chunkSize    = totalEntries / divisor;
@@ -2840,10 +2857,12 @@ void sub_21ca3d0(void* self, uint32_t segHeapBlocks, uint32_t biHeapBytes) {
 // 50. 0x21ca340 (129 B) - GXSkinningClearJob_Execute
 // ============================================================================
 void sub_21ca340(void* jobSelf) {
+    SkinningEntriesLockGuard lockGuard{};
     auto* job     = static_cast<uint8_t*>(jobSelf);
     auto* updater = *reinterpret_cast<uint8_t**>(job + 0x08);
     uint8_t* cur  = *reinterpret_cast<uint8_t**>(updater + 0x10);
-    if (cur != *reinterpret_cast<uint8_t**>(updater + 0x18)) {
+    uint8_t* end  = *reinterpret_cast<uint8_t**>(updater + 0x18);
+    if (cur != end) {
         void* biHeap = updater + 0x508;
         do {
             auto freeBlock = [&](void* blk) {
@@ -2855,7 +2874,7 @@ void sub_21ca340(void* jobSelf) {
             freeBlock(*reinterpret_cast<void**>(cur + 0x10));
             freeBlock(*reinterpret_cast<void**>(cur + 0x08));
             cur += 0x28;
-        } while (cur != *reinterpret_cast<uint8_t**>(updater + 0x18));
+        } while (cur != end);
         cur = *reinterpret_cast<uint8_t**>(updater + 0x10);
     }
     *reinterpret_cast<uint8_t**>(updater + 0x18) = cur;
@@ -2875,24 +2894,30 @@ void sub_21ca290(void* jobSelf, const int32_t* rangePair, uint32_t flag) {
     uint64_t byteOff = static_cast<uint64_t>(idx) * 40ULL + 0x20ULL;
 
     do {
-        uint8_t* vBegin = *reinterpret_cast<uint8_t**>(updater + 0x10);
-        uint8_t* vEnd   = *reinterpret_cast<uint8_t**>(updater + 0x18);
-        uint64_t totalEntries = static_cast<uint64_t>((vEnd - vBegin) >> 3) * 0xCCCCCCCCCCCCCCCDULL;
-        if (totalEntries <= static_cast<uint64_t>(idx)) {
-            break;
+        void* target      = nullptr;
+        void* dst0        = nullptr;
+        const void* prev0 = nullptr;
+        void* dst1        = nullptr;
+        const void* prev1 = nullptr;
+        {
+            SkinningEntriesLockGuard lockGuard{};
+            uint8_t* vBegin = *reinterpret_cast<uint8_t**>(updater + 0x10);
+            uint8_t* vEnd   = *reinterpret_cast<uint8_t**>(updater + 0x18);
+            uint64_t totalEntries = static_cast<uint64_t>((vEnd - vBegin) >> 3) * 0xCCCCCCCCCCCCCCCDULL;
+            if (totalEntries <= static_cast<uint64_t>(idx)) {
+                break;
+            }
+            uint8_t* entryOff20 = vBegin + byteOff;
+            target = *reinterpret_cast<void**>(entryOff20 - 0x20);
+            dst0   = *reinterpret_cast<void**>(entryOff20 - 0x18);
+            dst1   = *reinterpret_cast<void**>(entryOff20 - 0x10);
+            prev0  = *reinterpret_cast<const void**>(entryOff20 - 0x08);
+            prev1  = *reinterpret_cast<const void**>(entryOff20 + 0x00);
         }
 
-        uint8_t* entryOff20 = vBegin + byteOff;
-        void* dst1 = *reinterpret_cast<void**>(entryOff20 - 0x10);
         if (dst1 != nullptr) {
-            void* target      = *reinterpret_cast<void**>(entryOff20 - 0x20);
-            const void* prev1 = *reinterpret_cast<const void**>(entryOff20 + 0x00);
             reinterpret_cast<FnExecuteTargetSkinning>(GX_VMA(0x21c8c50ULL))(target, dst1, prev1, flag);
         }
-
-        void* target      = *reinterpret_cast<void**>(entryOff20 - 0x20);
-        void* dst0        = *reinterpret_cast<void**>(entryOff20 - 0x18);
-        const void* prev0 = *reinterpret_cast<const void**>(entryOff20 - 0x08);
         reinterpret_cast<FnExecuteTargetSkinning>(GX_VMA(0x21c8c50ULL))(target, dst0, prev0, flag);
 
         ++idx;

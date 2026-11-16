@@ -141,6 +141,10 @@ constexpr KeyActionDef kKeyDefs[KeyActionCount] = {
      "Open or switch to detailed CPU & GPU breakdown (default: F9)",
      "Открыть или переключить на подробный дебаг CPU и GPU (по умолч.: F9)",
      "F9"},
+    {"hotkey.camera_follow", "Camera Follow Hotkey", "Хоткей режима камеры",
+     "Cycle camera follow mode: Original (PS4) / Balanced / Locked (1:1) (default: F4)",
+     "Переключить режим слежения камеры: Оригинал (PS4) / Баланс / Жёсткий (1:1) (по умолч.: F4)",
+     "F4"},
 };
 
 std::mutex key_mutex;
@@ -264,6 +268,14 @@ void Set(Values& v, const std::string& key, const std::string& value) {
         v.mouse_invert_y = i != 0;
     } else if (key == "mouse_sensitivity") {
         v.mouse_sensitivity = Clamp(f, 0.05f, 20.0f);
+    } else if (key == "camera_follow_mode") {
+        if (value == "original" || value == "ps4" || value == "0") {
+            v.camera_follow_mode = CameraFollowOriginal;
+        } else if (value == "balanced" || value == "lop" || value == "1") {
+            v.camera_follow_mode = CameraFollowBalanced;
+        } else if (value == "locked" || value == "rigid" || value == "2") {
+            v.camera_follow_mode = CameraFollowLocked;
+        }
     } else if (key == "dlss_preset") {
         v.dlss_preset = (i == 0 || i == 5 || i == 6 || (i >= 10 && i <= 13)) ? i : 11;
     } else if (key == "anisotropic") {
@@ -564,6 +576,7 @@ void Load() {
         {"BB_FRAME_GEN", "frame_generation"},       {"BB_UI_UPSCALE", "ui_upscale"},
         {"BB_SSAO_QUALITY", "ssao_quality"},        {"BB_CONTACT_SHADOWS", "contact_shadows"},
         {"BB_SSR_QUALITY", "ssr_quality"},          {"BB_TRUE_BLACK_HDR", "true_black_hdr"},
+        {"BB_CAMERA_FOLLOW", "camera_follow_mode"},
     };
     // Frame generation is hidden in the menu until its artifacts are fixed: only BB_FRAME_GEN turns
     // it on, a saved setting does not.
@@ -745,6 +758,7 @@ void Save() {
     put("mouse_look", flag(v.mouse_look));
     put("mouse_invert_y", flag(v.mouse_invert_y));
     put("mouse_sensitivity", fixed(v.mouse_sensitivity, 2));
+    put("camera_follow_mode", CameraFollowModeName(v.camera_follow_mode.load()));
     put("dlss_preset", std::to_string(v.dlss_preset.load()));
     put("anisotropic", std::to_string(v.anisotropic.load()));
     put("fps_limit", std::to_string(v.fps_limit.load()));
@@ -831,6 +845,11 @@ const char* AaModeName(int aa) {
 const char* WindowModeName(int mode) {
     static constexpr const char* names[WindowModeCount] = {"fullscreen", "borderless", "windowed"};
     return names[std::clamp(mode, 0, WindowModeCount - 1)];
+}
+
+const char* CameraFollowModeName(int mode) {
+    static constexpr const char* names[CameraFollowCount] = {"original", "balanced", "locked"};
+    return names[std::clamp(mode, 0, CameraFollowCount - 1)];
 }
 
 } // namespace BbSettings

@@ -93,6 +93,28 @@ void runtime_file_unmount(const char *guest) {
 }
 static char user_root[512]="user";
 const char *runtime_file_user_dir(void) { return user_root; }
+static void (*flight_recorder_hook)(const char *category, const char *detail);
+void runtime_set_flight_recorder(void (*fn)(const char *category, const char *detail)) {
+    __atomic_store_n(&flight_recorder_hook, fn, __ATOMIC_RELEASE);
+}
+void runtime_flight_record(const char *category, const char *detail) {
+    void (*fn)(const char *, const char *) = __atomic_load_n(&flight_recorder_hook, __ATOMIC_ACQUIRE);
+    if (fn) fn(category, detail);
+}
+static int is_interesting_asset_path(const char *guest) {
+    if (!guest || !*guest) return 0;
+    if (!strncmp(guest, "/savedata", 9)) return 1;
+    const size_t n = strlen(guest);
+    static const char *const exts[] = {
+        ".dcx", ".bnd", ".chrbnd", ".objbnd", ".partsbnd", ".mapbnd", ".texbnd",
+        ".tpfbhd", ".flver", ".hkx", ".gfx", ".param", ".fmg", ".msb", ".fev", ".fsb"
+    };
+    for (size_t i = 0; i < sizeof(exts) / sizeof(exts[0]); ++i) {
+        const size_t k = strlen(exts[i]);
+        if (n >= k && !strcasecmp(guest + n - k, exts[i])) return 1;
+    }
+    return 0;
+}
 /* bbport: the character's save the game is using (userdata0000..userdata0009, one per character;
  * userdata0010 holds the system data): the last such file it opened. Loading a character reads
  * its file and the game then writes only that one. Kept per host folder, for the BBSC kit's
@@ -409,6 +431,7 @@ static int commit_file(const File *f) {
             return -e;
         }
         runtime_file_async_sync(sfd,f->commit);
+        runtime_flight_record("SAVE_SYNC", f->path);
         return 0;
     }
     int e=fsync(f->host) ? errno : 0;
@@ -420,6 +443,7 @@ static int commit_file(const File *f) {
         return -e;
     }
     sync_directory(f->commit);
+    runtime_flight_record("SAVE_SYNC", f->path);
     return 0;
 }
 /* The game's option pages (menu/optionsetting.gfx, Scaleform): the ControllSetting layout
@@ -752,6 +776,9 @@ static int64_t do_open(const char *guest,int flags,int mode) {
     snprintf(files[fd].path,sizeof(files[fd].path),"%s",guest);
     ++opens;
     pthread_mutex_unlock(&lock);
+    if (!dir && is_interesting_asset_path(guest)) {
+        runtime_flight_record(save_path(guest) ? (temp ? "SAVE_WR" : "SAVE_RD") : "FILE_OPEN", guest);
+    }
     if (audio_trace() && strstr(guest,"sound/")) printf("Audio trace: open(%s) -> fd %d, %lld bytes\n",guest,fd,(long long)s.st_size);
     const char *mod_trace=bb_env("BB_MOD_TRACE"), *mod_root=bb_env("BB_MODS_DIR");
     if (mod_trace && mod_trace[0]=='1' && mod_root) {

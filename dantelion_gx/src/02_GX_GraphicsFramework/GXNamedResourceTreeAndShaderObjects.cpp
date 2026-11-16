@@ -34,6 +34,20 @@
 namespace Bloodborne {
 namespace GX {
 
+namespace {
+static volatile uint32_t g_namedResMapSpinLock = 0u;
+struct GXNamedMapSpinLockGuard {
+    GXNamedMapSpinLockGuard() noexcept {
+        while (__atomic_exchange_n(&g_namedResMapSpinLock, 1u, __ATOMIC_ACQUIRE) != 0u) {
+            __builtin_ia32_pause();
+        }
+    }
+    ~GXNamedMapSpinLockGuard() noexcept {
+        __atomic_store_n(&g_namedResMapSpinLock, 0u, __ATOMIC_RELEASE);
+    }
+};
+} // namespace
+
 // Forward declarations
 struct GXResourceBase;
 struct GXDeviceContext;
@@ -395,8 +409,10 @@ void GXNamedResourceMap_Destroy(GXNamedResourceMap* pThis) {
     while (pCur != pThis->m_pHead) {
         GXResourceBase* pRes = pCur->m_payload.m_pResource;
         if (pRes) {
-            int32_t oldRef = *reinterpret_cast<int32_t*>(reinterpret_cast<uint8_t*>(pRes) + 0x08);
-            *reinterpret_cast<int32_t*>(reinterpret_cast<uint8_t*>(pRes) + 0x08) = oldRef - 1;
+            int32_t oldRef = __atomic_fetch_sub(
+                reinterpret_cast<int32_t*>(reinterpret_cast<uint8_t*>(pRes) + 0x08),
+                1,
+                __ATOMIC_ACQ_REL);
             if (oldRef <= 1) {
                 using DtorFn = void (*)(GXResourceBase*);
                 void** pResVtbl = *reinterpret_cast<void***>(pRes);
@@ -533,26 +549,35 @@ GXResourceBase* GXNamedResourceMap_FindByNameCaseInsensitive(
     uint64_t copyLen = (rawLen < 0x1Fu) ? rawLen : 0x1Fu;
     sub_27cba30(&searchKey, name, copyLen);
 
-    GXNamedResourceTreeNode* pHead = pThis->m_pHead;
-    GXNamedResourceTreeNode* pBest = pHead;
-    GXNamedResourceTreeNode* pCur  = pHead->m_pParent;
+    GXResourceBase* pFoundRes = nullptr;
+    bool foundInLocal = false;
+    {
+        GXNamedMapSpinLockGuard mapLock{};
+        GXNamedResourceTreeNode* pHead = pThis->m_pHead;
+        GXNamedResourceTreeNode* pBest = pHead;
+        GXNamedResourceTreeNode* pCur  = pHead->m_pParent;
 
-    while (pCur->m_isNil == 0) {
-        const wchar_t* pNodeStr = GXFixedWString_GetPtr(&pCur->m_key);
-        const wchar_t* pKeyStr  = GXFixedWString_GetPtr(&searchKey);
-        if (GXCompareWideStringsCaseInsensitive(pNodeStr, pKeyStr) < 0) {
-            pCur = pCur->m_pRight;
-        } else {
-            pBest = pCur;
-            pCur  = pCur->m_pLeft;
+        while (pCur->m_isNil == 0) {
+            const wchar_t* pNodeStr = GXFixedWString_GetPtr(&pCur->m_key);
+            const wchar_t* pKeyStr  = GXFixedWString_GetPtr(&searchKey);
+            if (GXCompareWideStringsCaseInsensitive(pNodeStr, pKeyStr) < 0) {
+                pCur = pCur->m_pRight;
+            } else {
+                pBest = pCur;
+                pCur  = pCur->m_pLeft;
+            }
         }
-    }
 
-    if (pBest != pThis->m_pHead) {
-        const wchar_t* pKeyStr  = GXFixedWString_GetPtr(&searchKey);
-        const wchar_t* pBestStr = GXFixedWString_GetPtr(&pBest->m_key);
-        if (GXCompareWideStringsCaseInsensitive(pKeyStr, pBestStr) < 0) {
-            pBest = pThis->m_pHead;
+        if (pBest != pThis->m_pHead) {
+            const wchar_t* pKeyStr  = GXFixedWString_GetPtr(&searchKey);
+            const wchar_t* pBestStr = GXFixedWString_GetPtr(&pBest->m_key);
+            if (GXCompareWideStringsCaseInsensitive(pKeyStr, pBestStr) < 0) {
+                pBest = pThis->m_pHead;
+            }
+        }
+        if (pBest != pThis->m_pHead) {
+            foundInLocal = true;
+            pFoundRes = pBest->m_payload.m_pResource;
         }
     }
 
@@ -569,8 +594,8 @@ GXResourceBase* GXNamedResourceMap_FindByNameCaseInsensitive(
     searchKey.m_length18 = 0;
     searchKey.m_data08.m_inlineBuf[0] = L'\0';
 
-    if (pBest != pThis->m_pHead) {
-        return pBest->m_payload.m_pResource;
+    if (foundInLocal) {
+        return pFoundRes;
     }
 
     if (!localOnly && pThis->m_pParentMap) {
@@ -634,6 +659,10 @@ bool GXNamedResourceMap_UnregisterAndEraseByName(
     uint64_t copyLen = (rawLen < 0x1Fu) ? rawLen : 0x1Fu;
     sub_27cba30(&searchKey, name, copyLen);
 
+    GXResourceBase* pDestroyResOutsideLock = nullptr;
+    void* pReleaseCBufOutsideLock = nullptr;
+    {
+    GXNamedMapSpinLockGuard mapLock{};
     GXNamedResourceTreeNode* pHead = pThis->m_pHead;
     GXNamedResourceTreeNode* pTarget = pHead;
     GXNamedResourceTreeNode* pCur = pHead->m_pParent;
@@ -682,12 +711,12 @@ bool GXNamedResourceMap_UnregisterAndEraseByName(
         uint32_t resBytes = reinterpret_cast<GetByteSizeFn>(pResVtbl[0x68 / 8])(pRes);
         pThis->m_totalBytes -= resBytes;
 
-        int32_t oldRef = *reinterpret_cast<int32_t*>(reinterpret_cast<uint8_t*>(pRes) + 0x08);
-        *reinterpret_cast<int32_t*>(reinterpret_cast<uint8_t*>(pRes) + 0x08) = oldRef - 1;
+        int32_t oldRef = __atomic_fetch_sub(
+            reinterpret_cast<int32_t*>(reinterpret_cast<uint8_t*>(pRes) + 0x08),
+            1,
+            __ATOMIC_ACQ_REL);
         if (oldRef <= 1) {
-            using DtorFn = void (*)(GXResourceBase*);
-            pResVtbl = *reinterpret_cast<void***>(pRes);
-            reinterpret_cast<DtorFn>(pResVtbl[0])(pRes);
+            pDestroyResOutsideLock = pRes;
         }
     }
 
@@ -877,7 +906,7 @@ check_rebalance:
 
     // Destroy node payload, key, and deallocate node
     if (pTarget->m_payload.m_pColorScaleCBuf) {
-        CGBufferGnm_Release(pTarget->m_payload.m_pColorScaleCBuf);
+        pReleaseCBufOutsideLock = pTarget->m_payload.m_pColorScaleCBuf;
         pTarget->m_payload.m_pColorScaleCBuf = nullptr;
     }
     if (pTarget->m_key.m_capacity20 >= 8) {
@@ -899,6 +928,16 @@ check_rebalance:
 
     if (pThis->m_nodeCount != 0) {
         pThis->m_nodeCount--;
+    }
+    } // unlock GXNamedMapSpinLockGuard before invoking external resource destructors
+
+    if (pDestroyResOutsideLock) {
+        using DtorFn = void (*)(GXResourceBase*);
+        void** pResVtbl = *reinterpret_cast<void***>(pDestroyResOutsideLock);
+        reinterpret_cast<DtorFn>(pResVtbl[0])(pDestroyResOutsideLock);
+    }
+    if (pReleaseCBufOutsideLock) {
+        CGBufferGnm_Release(pReleaseCBufOutsideLock);
     }
     return true;
 }
@@ -962,6 +1001,9 @@ bool GXNamedResourceMap_RegisterResourceByName(
     kvPair.m_payload70.m_pColorScaleCBuf = nullptr;
     kvPair.m_payload70.m_reserved38 = 0;
 
+    bool bInserted = false;
+    {
+    GXNamedMapSpinLockGuard mapLock{};
     GXNamedResourceTreeNode* pHead = pThis->m_pHead;
     GXNamedResourceTreeNode* pCur = pHead->m_pParent;
     GXNamedResourceTreeNode* pWhere = pHead;
@@ -977,7 +1019,6 @@ bool GXNamedResourceMap_RegisterResourceByName(
 
     GXNamedResourceTreeNode* pPred = pWhere;
     bool insertLeft = true;
-    bool bInserted = false;
     GXNamedResourceTreeIter insIter = {nullptr, nullptr, nullptr};
 
     if (lastCmp >= 0) {
@@ -987,7 +1028,7 @@ bool GXNamedResourceMap_RegisterResourceByName(
     if (pWhere == pHead->m_pLeft) {
         GXNamedResourceTree_InsertNode(&insIter, pTreeBase, true, pWhere, &kvPair);
         bInserted = true;
-        goto cleanup_kv;
+        goto finish_insert_locked;
     }
     if (pWhere->m_isNil != 0) {
         pPred = pWhere->m_pRight;
@@ -1021,7 +1062,19 @@ check_pred:
         }
     }
 
-cleanup_kv:
+finish_insert_locked:
+    if (bInserted) {
+        using GetByteSizeFn = uint32_t (*)(GXResourceBase*);
+        void** pResVtbl = *reinterpret_cast<void***>(pResource);
+        uint32_t resBytes = reinterpret_cast<GetByteSizeFn>(pResVtbl[0x68 / 8])(pResource);
+        pThis->m_totalBytes += resBytes;
+        __atomic_add_fetch(
+            reinterpret_cast<int32_t*>(reinterpret_cast<uint8_t*>(pResource) + 0x08),
+            1,
+            __ATOMIC_ACQ_REL);
+    }
+    } // unlock GXNamedMapSpinLockGuard
+
     if (kvPair.m_payload70.m_pColorScaleCBuf) {
         CGBufferGnm_Release(kvPair.m_payload70.m_pColorScaleCBuf);
         kvPair.m_payload70.m_pColorScaleCBuf = nullptr;
@@ -1039,15 +1092,7 @@ cleanup_kv:
     kvPair.m_key00.m_length18 = 0;
     kvPair.m_key00.m_data08.m_inlineBuf[0] = L'\0';
 
-    if (bInserted) {
-        using GetByteSizeFn = uint32_t (*)(GXResourceBase*);
-        void** pResVtbl = *reinterpret_cast<void***>(pResource);
-        uint32_t resBytes = reinterpret_cast<GetByteSizeFn>(pResVtbl[0x68 / 8])(pResource);
-        pThis->m_totalBytes += resBytes;
-        (*reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(pResource) + 0x08))++;
-        return true;
-    }
-    return false;
+    return bInserted;
 }
 
 // ----------------------------------------------------------------------------
@@ -1376,6 +1421,10 @@ static inline void GXResourceMemoryTracker_UnregisterTextureBucket(
     uint8_t* pTracker = *ppTracker;
     if (!pTracker) return;
 
+    using GetByteSizeFn = uint32_t(*)(GXTextureResource*);
+    const uint32_t texBytes = reinterpret_cast<GetByteSizeFn>(pThis->m_vptr[0x60 / 8])(pThis);
+
+    GXResourceTrackerLockGuard lockGuard{};
     auto** pBeginSlot = reinterpret_cast<GXTextureResource***>(pTracker + vecBeginOffset);
     auto** pEndSlot   = reinterpret_cast<GXTextureResource***>(pTracker + vecEndOffset);
     GXTextureResource** it  = *pBeginSlot;
@@ -1389,8 +1438,6 @@ static inline void GXResourceMemoryTracker_UnregisterTextureBucket(
             }
             *pEndSlot = reinterpret_cast<GXTextureResource**>(
                 reinterpret_cast<uint8_t*>(*pEndSlot) - sizeof(void*));
-            using GetByteSizeFn = uint32_t(*)(GXTextureResource*);
-            uint32_t texBytes = reinterpret_cast<GetByteSizeFn>(pThis->m_vptr[0x60 / 8])(pThis);
             uint32_t* pTotalBytes = reinterpret_cast<uint32_t*>(pTracker + bytesOffset);
             float*    pTotalMiB   = reinterpret_cast<float*>(pTracker + mibOffset);
             uint32_t* pCount      = reinterpret_cast<uint32_t*>(pTracker + countOffset);
@@ -1493,7 +1540,6 @@ bool GXCubeTextureResource_CreateCubeTexture(
     CGTextureGnmRef_Assign(pThis->m_pGnmTexture, pNewTex);
 
     if (err == 0) {
-        CGTextureGnmRef_ReleaseRaw(pNewTex);
         pThis->m_byteSize = pNewTex ? pNewTex->m_byteSize : 0;
         if (pThis->m_pGnmTexture) {
             uint32_t srvDesc[6] = { format, 9, 0, mipLevels, 0, 6 };
@@ -1504,6 +1550,9 @@ bool GXCubeTextureResource_CreateCubeTexture(
         } else {
             err = 5;
         }
+    }
+    if (pNewTex) {
+        CGTextureGnmRef_ReleaseRaw(pNewTex);
     }
 
     pGlobal = *reinterpret_cast<uint8_t**>(GX_VMA(0x55406c8ULL));
@@ -1808,7 +1857,6 @@ bool GXTexture2DResource_Create2DTexture(
     CGTextureGnmRef_Assign(pThis->m_pGnmTexture, pNewTex);
 
     if (err == 0) {
-        CGTextureGnmRef_ReleaseRaw(pNewTex);
         pThis->m_byteSize = pNewTex ? pNewTex->m_byteSize : 0;
         uint32_t actualMips = mipLevels;
         if (actualMips == 0) {
@@ -1841,6 +1889,9 @@ bool GXTexture2DResource_Create2DTexture(
                     pDev, &pThis->m_pUav, pThis->m_pGnmTexture, uavDesc, nullptr);
             }
         }
+    }
+    if (pNewTex) {
+        CGTextureGnmRef_ReleaseRaw(pNewTex);
     }
 
     pGlobal = *reinterpret_cast<uint8_t**>(GX_VMA(0x55406c8ULL));
@@ -1969,7 +2020,8 @@ static inline void GXShaderResource_TrackerUnregisterVirtual(GXShaderResource* p
     uint8_t* pTracker = *ppTracker;
     using GetByteSizeFn = uint32_t(*)(GXShaderResource*);
     uint32_t sz = reinterpret_cast<GetByteSizeFn>(pThis->m_vptr[0x10 / 8])(pThis);
-    if (sz != 0) {
+    if (pTracker && sz != 0) {
+        GXResourceTrackerLockGuard lockGuard{};
         uint32_t* pBytes = reinterpret_cast<uint32_t*>(pTracker + 0x180);
         float*    pMiB   = reinterpret_cast<float*>(pTracker + 0x184);
         uint32_t* pCount = reinterpret_cast<uint32_t*>(pTracker + 0x17C);
@@ -1990,7 +2042,8 @@ static inline void GXShaderResource_TrackerUnregisterDirect(
     if (!ppTracker || !pThis) return;
     uint8_t* pTracker = *ppTracker;
     uint32_t sz = fnGetByteSize(pThis);
-    if (sz != 0) {
+    if (pTracker && sz != 0) {
+        GXResourceTrackerLockGuard lockGuard{};
         uint32_t* pBytes = reinterpret_cast<uint32_t*>(pTracker + 0x180);
         float*    pMiB   = reinterpret_cast<float*>(pTracker + 0x184);
         uint32_t* pCount = reinterpret_cast<uint32_t*>(pTracker + 0x17C);
@@ -2010,7 +2063,8 @@ static inline void GXShaderResource_TrackerRegisterVirtual(GXShaderResource* pTh
     uint8_t* pTracker = *ppTracker;
     using GetByteSizeFn = uint32_t(*)(GXShaderResource*);
     uint32_t sz = reinterpret_cast<GetByteSizeFn>(pThis->m_vptr[0x10 / 8])(pThis);
-    if (sz != 0) {
+    if (pTracker && sz != 0) {
+        GXResourceTrackerLockGuard lockGuard{};
         uint32_t* pBytes = reinterpret_cast<uint32_t*>(pTracker + 0x180);
         float*    pMiB   = reinterpret_cast<float*>(pTracker + 0x184);
         uint32_t* pCount = reinterpret_cast<uint32_t*>(pTracker + 0x17C);

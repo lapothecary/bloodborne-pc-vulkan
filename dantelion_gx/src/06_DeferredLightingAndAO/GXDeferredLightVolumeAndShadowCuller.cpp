@@ -345,8 +345,8 @@ void sub_2296aa0(void* pSelf) {
 
     uint8_t* pObj78a0 = *reinterpret_cast<uint8_t**>(selfBytes + 0x78a0);
     if (pObj78a0 != nullptr) {
-        int32_t oldCount = *reinterpret_cast<int32_t*>(pObj78a0 + 0x08);
-        *reinterpret_cast<int32_t*>(pObj78a0 + 0x08) = oldCount - 1;
+        int32_t oldCount = __atomic_fetch_sub(
+            reinterpret_cast<int32_t*>(pObj78a0 + 0x08), 1, __ATOMIC_ACQ_REL);
         if (oldCount <= 1) {
             void* vtbl = *reinterpret_cast<void**>(pObj78a0);
             (*reinterpret_cast<void (**)(void*)>(vtbl))(pObj78a0);
@@ -421,8 +421,8 @@ void sub_2296130(void* pSelf) {
 
     uint8_t* pObj78a0 = *reinterpret_cast<uint8_t**>(selfBytes + 0x78a0);
     if (pObj78a0 != nullptr) {
-        int32_t oldCount = *reinterpret_cast<int32_t*>(pObj78a0 + 0x08);
-        *reinterpret_cast<int32_t*>(pObj78a0 + 0x08) = oldCount - 1;
+        int32_t oldCount = __atomic_fetch_sub(
+            reinterpret_cast<int32_t*>(pObj78a0 + 0x08), 1, __ATOMIC_ACQ_REL);
         if (oldCount <= 1) {
             void* vtbl = *reinterpret_cast<void**>(pObj78a0);
             (*reinterpret_cast<void (**)(void*)>(vtbl))(pObj78a0);
@@ -686,7 +686,7 @@ void sub_2295770(void* pVec, size_t newCapacity) {
                 uint8_t* pItem = *pSrc;
                 *pDst = pItem;
                 if (pItem != nullptr) {
-                    ++(*reinterpret_cast<uint32_t*>(pItem + 0x08));
+                    __atomic_add_fetch(reinterpret_cast<uint32_t*>(pItem + 0x08), 1u, __ATOMIC_ACQ_REL);
                 }
             }
             ++pDst;
@@ -698,7 +698,7 @@ void sub_2295770(void* pVec, size_t newCapacity) {
         for (uint8_t** pCur = pOldBegin; pCur != pOldEnd; ++pCur) {
             uint8_t* pItem = *pCur;
             if (pItem != nullptr) {
-                if (--(*reinterpret_cast<uint32_t*>(pItem + 0x08)) == 0) {
+                if (__atomic_sub_fetch(reinterpret_cast<uint32_t*>(pItem + 0x08), 1u, __ATOMIC_ACQ_REL) == 0u) {
                     void* pItemAlloc = sub_207b720(pItem);
                     void* itemVtbl = *reinterpret_cast<void**>(pItem);
                     (*reinterpret_cast<void (**)(void*)>(itemVtbl))(pItem);
@@ -823,7 +823,7 @@ bool sub_22953f0(void* pSelf, void* pListener) {
                 uint8_t* pNextObj = pCur[0];
                 if (pPrevObj != pNextObj) {
                     if (pPrevObj != nullptr) {
-                        if (--(*reinterpret_cast<uint32_t*>(pPrevObj + 0x08)) == 0) {
+                        if (__atomic_sub_fetch(reinterpret_cast<uint32_t*>(pPrevObj + 0x08), 1u, __ATOMIC_ACQ_REL) == 0u) {
                             void* pAlloc = sub_207b720(pPrevObj);
                             void* vtbl = *reinterpret_cast<void**>(pPrevObj);
                             (*reinterpret_cast<void (**)(void*)>(vtbl))(pPrevObj);
@@ -835,7 +835,7 @@ bool sub_22953f0(void* pSelf, void* pListener) {
                     }
                     pCur[-1] = pNextObj;
                     if (pNextObj != nullptr) {
-                        ++(*reinterpret_cast<uint32_t*>(pNextObj + 0x08));
+                        __atomic_add_fetch(reinterpret_cast<uint32_t*>(pNextObj + 0x08), 1u, __ATOMIC_ACQ_REL);
                     }
                 }
                 ++pCur;
@@ -843,7 +843,7 @@ bool sub_22953f0(void* pSelf, void* pListener) {
             pEnd = *reinterpret_cast<uint8_t***>(selfBytes + 0x20);
             uint8_t* pTailObj = pEnd[-1];
             if (pTailObj != nullptr) {
-                if (--(*reinterpret_cast<uint32_t*>(pTailObj + 0x08)) == 0) {
+                if (__atomic_sub_fetch(reinterpret_cast<uint32_t*>(pTailObj + 0x08), 1u, __ATOMIC_ACQ_REL) == 0u) {
                     void* pAlloc = sub_207b720(pTailObj);
                     void* vtbl = *reinterpret_cast<void**>(pTailObj);
                     (*reinterpret_cast<void (**)(void*)>(vtbl))(pTailObj);
@@ -879,7 +879,7 @@ bool sub_2295260(void* pSelf, void* pListener) {
     }
 
     uint8_t* pLisBytes = static_cast<uint8_t*>(pListener);
-    ++(*reinterpret_cast<uint32_t*>(pLisBytes + 0x08));
+    __atomic_add_fetch(reinterpret_cast<uint32_t*>(pLisBytes + 0x08), 1u, __ATOMIC_ACQ_REL);
 
     uint8_t** pCap = *reinterpret_cast<uint8_t***>(selfBytes + 0x28);
     if (pEnd == pCap) {
@@ -896,11 +896,11 @@ bool sub_2295260(void* pSelf, void* pListener) {
 
     if (pEnd != nullptr) {
         *pEnd = pLisBytes;
-        ++(*reinterpret_cast<uint32_t*>(pLisBytes + 0x08));
+        __atomic_add_fetch(reinterpret_cast<uint32_t*>(pLisBytes + 0x08), 1u, __ATOMIC_ACQ_REL);
     }
     *reinterpret_cast<uint8_t***>(selfBytes + 0x20) = pEnd + 1;
 
-    if (--(*reinterpret_cast<uint32_t*>(pLisBytes + 0x08)) == 0) {
+    if (__atomic_sub_fetch(reinterpret_cast<uint32_t*>(pLisBytes + 0x08), 1u, __ATOMIC_ACQ_REL) == 0u) {
         void* pAlloc = sub_207b720(pLisBytes);
         void* vtbl = *reinterpret_cast<void**>(pLisBytes);
         (*reinterpret_cast<void (**)(void*)>(vtbl))(pLisBytes);
@@ -923,7 +923,7 @@ void sub_2295190(void* pSelf) {
         for (uint8_t** pCur = pBegin; pCur != pEnd; ++pCur) {
             uint8_t* pItem = *pCur;
             if (pItem != nullptr) {
-                if (--(*reinterpret_cast<uint32_t*>(pItem + 0x08)) == 0) {
+                if (__atomic_sub_fetch(reinterpret_cast<uint32_t*>(pItem + 0x08), 1u, __ATOMIC_ACQ_REL) == 0u) {
                     void* pAlloc = sub_207b720(pItem);
                     void* vtbl = *reinterpret_cast<void**>(pItem);
                     (*reinterpret_cast<void (**)(void*)>(vtbl))(pItem);
@@ -957,7 +957,7 @@ void sub_22950e0(void* pSelf) {
         for (uint8_t** pCur = pBegin; pCur != pEnd; ++pCur) {
             uint8_t* pItem = *pCur;
             if (pItem != nullptr) {
-                if (--(*reinterpret_cast<uint32_t*>(pItem + 0x08)) == 0) {
+                if (__atomic_sub_fetch(reinterpret_cast<uint32_t*>(pItem + 0x08), 1u, __ATOMIC_ACQ_REL) == 0u) {
                     void* pAlloc = sub_207b720(pItem);
                     void* vtbl = *reinterpret_cast<void**>(pItem);
                     (*reinterpret_cast<void (**)(void*)>(vtbl))(pItem);
@@ -1799,13 +1799,13 @@ bool sub_2293390(void* pSelf, void* pItem) {
     }
 
     uint8_t* itemBytes = static_cast<uint8_t*>(pItem);
-    ++(*reinterpret_cast<uint32_t*>(itemBytes + 0x08));
+    __atomic_add_fetch(reinterpret_cast<uint32_t*>(itemBytes + 0x08), 1u, __ATOMIC_ACQ_REL);
     void* localHolder = itemBytes;
     sub_2948240(selfBytes, &localHolder);
 
     uint8_t* pHeld = static_cast<uint8_t*>(localHolder);
     if (pHeld != nullptr) {
-        if (--(*reinterpret_cast<uint32_t*>(pHeld + 0x08)) == 0) {
+        if (__atomic_sub_fetch(reinterpret_cast<uint32_t*>(pHeld + 0x08), 1u, __ATOMIC_ACQ_REL) == 0u) {
             void* pAlloc = sub_207b720(pHeld);
             void* vtbl = *reinterpret_cast<void**>(pHeld);
             (*reinterpret_cast<void (**)(void*)>(vtbl))(pHeld);
