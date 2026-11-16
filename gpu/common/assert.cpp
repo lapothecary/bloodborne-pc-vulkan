@@ -2,7 +2,9 @@
 // bbport: GPU-side check failures stop the port with exit code 23.
 #include <cstdio>
 #include <cstdlib>
+#include <fcntl.h>
 #include <stdexcept>
+#include <sys/stat.h>
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include <execinfo.h>
@@ -34,6 +36,14 @@ void assert_fail_impl() {
     std::fputs("Assertion call stack:\n", stderr);
     backtrace_symbols_fd(frames, depth, STDERR_FILENO);
     std::fputs("STOP: GPU library assertion failed (see GPU log above)\n", stderr);
+    ::mkdir("logs", 0755);
+    const int log_fd = ::open("logs/crash-assert.log", O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    if (log_fd >= 0) {
+        const char hdr[] = "STOP: GPU library assertion failed\nAssertion call stack:\n";
+        (void)::write(log_fd, hdr, sizeof(hdr) - 1);
+        backtrace_symbols_fd(frames, depth, log_fd);
+        ::close(log_fd);
+    }
     std::_Exit(23);
 }
 

@@ -287,6 +287,7 @@ private:
     Shader::Profile profile{};
     Shader::Pools pools;
     tsl::robin_map<size_t, std::unique_ptr<Program>> program_cache;
+    std::vector<std::unique_ptr<Shader::Info>> retired_info_templates;
     std::function<void(VAddr, u64)> program_memory_sync;
     std::function<void(VAddr, u64)> program_write_sync;
     /// Program addresses synchronized without making them whole, and when (GPU command thread).
