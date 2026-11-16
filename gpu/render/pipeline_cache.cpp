@@ -3318,8 +3318,32 @@ bool PipelineCache::QueueAsyncSpvJob(DrawIndirectParams params, bool indirect) {
             sig = HashCombine(sig, u64(snap.user_data[u]));
         }
 
-        // Snapshot CUE EUD tables and FetchShader code referenced by aligned 64-bit user_data
-        // SGPR pairs (s[0:1], s[2:3], ..., s[14:15]) so the background worker never races with CUE reuse.
+        // Determine the exact FetchShader SGPR pair (if any) from cached Info or S_SWAPPC_B64
+        // so we never call FetchCodeDecodes / GcnIsa::Decode on V#/EUD data tables (e.g. s[4:5]).
+        bool has_fetch = false;
+        u32 fetch_sgpr = ~0u;
+        if (const auto found = program_cache.find(snap.hash);
+            found != program_cache.end() && found->second) {
+            has_fetch = found->second->info.has_fetch_shader;
+            fetch_sgpr = found->second->info.fetch_shader_sgpr_base;
+        } else if (hw == HwStage::Vertex || hw == HwStage::Export || hw == HwStage::Local) {
+            const u32* pc = snap.code.data();
+            const u32* end = pc + std::min<size_t>(snap.code.size(), 64);
+            while (pc < end) {
+                const auto inst = GcnIsa::Decode(pc);
+                if (inst.opcode == GcnIsa::Opcode::S_ENDPGM) {
+                    break;
+                }
+                if (inst.opcode == GcnIsa::Opcode::S_SWAPPC_B64) {
+                    has_fetch = true;
+                    fetch_sgpr = inst.src[0].code;
+                    break;
+                }
+            }
+        }
+
+        // Snapshot CUE EUD tables and the exact FetchShader code referenced by aligned 64-bit
+        // user_data SGPR pairs so the background worker never races with CUE reuse.
         for (u32 i = 0; i + 1 < Gcn::NUM_USER_DATA; i += 2) {
             const VAddr raw_ptr =
                 (VAddr(snap.user_data[i]) | (VAddr(snap.user_data[i + 1]) << 32)) &
@@ -3327,28 +3351,38 @@ bool PipelineCache::QueueAsyncSpvJob(DrawIndirectParams params, bool indirect) {
             if (raw_ptr == 0) {
                 continue;
             }
-            if (cue_base != 0 && raw_ptr >= cue_base && raw_ptr < cue_end && (raw_ptr & 3ULL) == 0) {
+            if (has_fetch && i == fetch_sgpr) {
+                if (raw_ptr < 0x100000ULL || raw_ptr >= (1ULL << 40) || (raw_ptr & 3ULL) != 0) {
+                    return false;
+                }
+                const u32* fptr = reinterpret_cast<const u32*>(raw_ptr);
+                if (program_write_sync) {
+                    program_write_sync(raw_ptr, 256);
+                }
+                if (!FetchCodeDecodes(fptr)) {
+                    SyncProgramMemory(raw_ptr, 4096);
+                    if (!FetchCodeDecodes(fptr)) {
+                        return false;
+                    }
+                }
+                const u32* pc = fptr;
+                for (u32 ins = 0; ins < 256; ++ins) {
+                    if (GcnIsa::Decode(pc).opcode == GcnIsa::Opcode::S_SETPC_B64) {
+                        break;
+                    }
+                }
+                auto& blob = job->ctx.owned_blobs.emplace_back(fptr, pc);
+                const uintptr_t host_ptr = reinterpret_cast<uintptr_t>(blob.data());
+                snap.user_data[i] = static_cast<u32>(host_ptr);
+                snap.user_data[i + 1] = static_cast<u32>(host_ptr >> 32);
+            } else if (cue_base != 0 && raw_ptr >= cue_base && raw_ptr < cue_end &&
+                       (raw_ptr & 3ULL) == 0) {
                 const size_t copy_bytes =
                     static_cast<size_t>(std::min<u64>(cue_end - raw_ptr, 1024ULL)) & ~size_t(3);
                 if (copy_bytes >= 16) {
                     const u32* src = reinterpret_cast<const u32*>(raw_ptr);
                     auto& blob =
                         job->ctx.owned_blobs.emplace_back(src, src + (copy_bytes / sizeof(u32)));
-                    const uintptr_t host_ptr = reinterpret_cast<uintptr_t>(blob.data());
-                    snap.user_data[i] = static_cast<u32>(host_ptr);
-                    snap.user_data[i + 1] = static_cast<u32>(host_ptr >> 32);
-                }
-            } else if ((hw == HwStage::Vertex || hw == HwStage::Export || hw == HwStage::Local) &&
-                       raw_ptr >= 0x100000ULL && raw_ptr < (1ULL << 40) && (raw_ptr & 3ULL) == 0) {
-                const u32* fptr = reinterpret_cast<const u32*>(raw_ptr);
-                if (FetchCodeDecodes(fptr)) {
-                    const u32* pc = fptr;
-                    for (u32 ins = 0; ins < 256; ++ins) {
-                        if (GcnIsa::Decode(pc).opcode == GcnIsa::Opcode::S_SETPC_B64) {
-                            break;
-                        }
-                    }
-                    auto& blob = job->ctx.owned_blobs.emplace_back(fptr, pc);
                     const uintptr_t host_ptr = reinterpret_cast<uintptr_t>(blob.data());
                     snap.user_data[i] = static_cast<u32>(host_ptr);
                     snap.user_data[i + 1] = static_cast<u32>(host_ptr >> 32);
