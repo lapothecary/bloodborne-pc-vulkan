@@ -36,7 +36,11 @@ void assert_fail_impl() {
     std::fputs("Assertion call stack:\n", stderr);
     backtrace_symbols_fd(frames, depth, STDERR_FILENO);
     std::fputs("STOP: GPU library assertion failed (see GPU log above)\n", stderr);
+#ifdef _WIN32
+    ::mkdir("logs");
+#else
     ::mkdir("logs", 0755);
+#endif
     const int log_fd = ::open("logs/crash-assert.log", O_CREAT | O_WRONLY | O_TRUNC, 0644);
     if (log_fd >= 0) {
         const char hdr[] = "STOP: GPU library assertion failed\nAssertion call stack:\n";
