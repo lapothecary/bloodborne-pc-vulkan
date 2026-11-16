@@ -264,7 +264,8 @@ private:
     vk::ShaderModule CompileModuleRaw(Shader::Pools& use_pools, Shader::Info& info,
                                       Shader::RuntimeInfo& runtime_info, std::span<const u32> code,
                                       size_t perm_idx, Shader::Backend::Bindings& binding,
-                                      std::vector<u32>* out_raw_spv, std::vector<u32>* out_opt_spv);
+                                      std::vector<u32>* out_raw_spv, std::vector<u32>* out_opt_spv,
+                                      bool runtime_fast_opt = false);
     const Shader::RuntimeInfo& BuildRuntimeInfo(PipelineSelection& sel, Shader::HwStage stage,
                                                 Shader::SwStage l_stage);
 

@@ -42,9 +42,17 @@ struct SpirvOptStats {
 /// 0 = software FragmentBarycentricKHR).
 [[nodiscard]] bool HwInterpEnabled() noexcept;
 
+/// Ensures any Vertex Shader SPIR-V module declaring `Output vec4 cldist_attr0` writes all 4
+/// components (inserting `OpStore %cldist_attr0 vec4(1.0)` on entry when only `.xy` were stored),
+/// healing pre-fix cached shaders in `< 2 us` so Fragment `cldist_attr0 < 0` never reads garbage.
+bool EnsureClipDistanceInitializedInSpv(std::vector<u32>& spv);
+
 /// Runs SPIRV-Tools RegisterPerformancePasses() (-O) targeting Vulkan 1.3.
-/// On failure, logs a warning and leaves `spv` unmodified.
-bool OptimizeSPIRV(std::vector<u32>& spv, u64 pgm_hash = 0);
+/// When `sync_fast_path` is true (synchronous Stage A fallback on large shaders >= 1800 words),
+/// runs the O(N) HwInterp / NativeShader / FastFp passes in <0.1 ms and defers the heavy O(N^2)
+/// SPIRV-Tools SSA passes to a background worker (`*out_deferred_heavy = true`).
+bool OptimizeSPIRV(std::vector<u32>& spv, u64 pgm_hash = 0, bool sync_fast_path = false,
+                   bool* out_deferred_heavy = nullptr);
 
 /// Atomically snapshots and resets accumulated optimization counters.
 [[nodiscard]] SpirvOptStats GetAndResetSpirvOptStats() noexcept;

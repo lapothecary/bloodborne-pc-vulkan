@@ -1578,10 +1578,136 @@ bool HwInterpEnabled() noexcept {
     return enabled;
 }
 
-bool OptimizeSPIRV(std::vector<u32>& spv, u64 pgm_hash) {
+bool EnsureClipDistanceInitializedInSpv(std::vector<u32>& spv) {
+    if (spv.size() < 8 || spv[0] != kSpirvMagic) {
+        return false;
+    }
+    u32 entry_func = 0;
+    u32 cldist_name_id = 0;
+    u32 cldist_var = 0;
+    u32 cldist_ptr_type = 0;
+    u32 f32_type = 0;
+    u32 f32vec4_type = 0;
+    size_t first_func_idx = 0;
+    u32 stored_mask = 0;
+    std::unordered_set<u32> int32_types;
+    std::unordered_map<u32, u32> const_u32;
+
+    for (size_t i = 5; i < spv.size();) {
+        const u32 wc = spv[i] >> 16;
+        const u32 op = spv[i] & 0xFFFFu;
+        if (wc == 0 || i + wc > spv.size()) {
+            return false;
+        }
+        if (op == 15u && wc >= 4u && spv[i + 1] == 0u) { // OpEntryPoint Vertex %main
+            entry_func = spv[i + 2];
+        } else if (op == 5u && wc >= 5u && entry_func != 0u) { // OpName %id "cldist_attr0"
+            if (MatchSpvLiteralString(&spv[i + 2], wc - 2u, "cldist_attr0")) {
+                cldist_name_id = spv[i + 1];
+            }
+        } else if (op == 21u && wc >= 4u && spv[i + 2] == 32u) { // OpTypeInt 32
+            if (cldist_name_id == 0u) {
+                return false; // OpName section already ended without cldist_attr0
+            }
+            int32_types.insert(spv[i + 1]);
+        } else if (op == 22u && wc >= 3u && spv[i + 2] == 32u) { // OpTypeFloat 32
+            if (cldist_name_id == 0u) {
+                return false;
+            }
+            f32_type = spv[i + 1];
+        } else if (op == 23u && wc >= 4u && spv[i + 2] == f32_type && spv[i + 3] == 4u) {
+            f32vec4_type = spv[i + 1];
+        } else if (op == 43u && wc == 4u && int32_types.contains(spv[i + 1]) && spv[i + 3] < 4u) {
+            const_u32[spv[i + 2]] = spv[i + 3];
+        } else if (op == 59u && wc >= 4u && spv[i + 3] == 3u && spv[i + 2] == cldist_name_id) {
+            cldist_ptr_type = spv[i + 1];
+            cldist_var = spv[i + 2];
+        } else if (op == 54u && first_func_idx == 0u) { // First OpFunction
+            if (cldist_var == 0u || entry_func == 0u || f32_type == 0u || f32vec4_type == 0u) {
+                return false;
+            }
+            first_func_idx = i;
+        } else if (op == 65u && wc == 5u && cldist_var != 0u && spv[i + 3] == cldist_var) {
+            if (const auto it = const_u32.find(spv[i + 4]); it != const_u32.end()) {
+                stored_mask |= (1u << it->second);
+            }
+        } else if (op == 62u && wc >= 3u && cldist_var != 0u && spv[i + 1] == cldist_var) {
+            stored_mask = 0xFu;
+        }
+        i += wc;
+    }
+
+    if (first_func_idx == 0u || cldist_var == 0u || (stored_mask & 0xFu) == 0xFu) {
+        return false;
+    }
+
+    bool ptr_ok = false;
+    for (size_t i = 5; i < first_func_idx;) {
+        const u32 wc = spv[i] >> 16;
+        const u32 op = spv[i] & 0xFFFFu;
+        if (op == 32u && wc == 4u && spv[i + 1] == cldist_ptr_type && spv[i + 2] == 3u &&
+            spv[i + 3] == f32vec4_type) {
+            ptr_ok = true;
+            break;
+        }
+        i += wc;
+    }
+    if (!ptr_ok) {
+        return false;
+    }
+
+    size_t insert_store_idx = 0;
+    bool in_entry = false;
+    for (size_t i = first_func_idx; i < spv.size();) {
+        const u32 wc = spv[i] >> 16;
+        const u32 op = spv[i] & 0xFFFFu;
+        if (op == 54u && wc >= 5u) {
+            in_entry = (spv[i + 2] == entry_func);
+        } else if (in_entry && op == 248u) { // Entry OpLabel of %main
+            size_t j = i + wc;
+            while (j < spv.size()) {
+                const u32 jwc = spv[j] >> 16;
+                const u32 jop = spv[j] & 0xFFFFu;
+                if (jwc == 0 || (jop != 59u && jop != 245u)) { // Skip local OpVariable / OpPhi
+                    break;
+                }
+                j += jwc;
+            }
+            insert_store_idx = j;
+            break;
+        }
+        i += wc;
+    }
+    if (insert_store_idx == 0u) {
+        return false;
+    }
+
+    const u32 bound = spv[3];
+    const u32 one_id = bound;
+    const u32 vec4_one_id = bound + 1u;
+    spv[3] = bound + 2u;
+
+    const u32 store_words[3] = {(3u << 16) | 62u, cldist_var, vec4_one_id};
+    const u32 const_words[11] = {
+        (4u << 16) | 43u, f32_type,    one_id,      0x3F800000u,
+        (7u << 16) | 44u, f32vec4_type, vec4_one_id, one_id, one_id, one_id, one_id,
+    };
+    spv.insert(spv.begin() + static_cast<std::ptrdiff_t>(insert_store_idx), std::begin(store_words),
+               std::end(store_words));
+    spv.insert(spv.begin() + static_cast<std::ptrdiff_t>(first_func_idx), std::begin(const_words),
+               std::end(const_words));
+    return true;
+}
+
+bool OptimizeSPIRV(std::vector<u32>& spv, u64 pgm_hash, bool sync_fast_path,
+                   bool* out_deferred_heavy) {
+    if (out_deferred_heavy) {
+        *out_deferred_heavy = false;
+    }
     if (!SpirvOptEnabled() || spv.size() < 5 || spv[0] != kSpirvMagic) {
         return false;
     }
+    (void)EnsureClipDistanceInitializedInSpv(spv);
 
     const auto t0 = std::chrono::steady_clock::now();
     const size_t initial_words = spv.size();
@@ -1591,14 +1717,30 @@ bool OptimizeSPIRV(std::vector<u32>& spv, u64 pgm_hash) {
     std::vector<u32> native_buf;
     std::vector<u32> fast_fp_buf;
     const std::vector<u32>* input = &spv;
+    bool native_replaced = false;
     if (HwInterpEnabled() && ApplyHwInterpSpirvPass(*input, hw_interp_buf)) {
         input = &hw_interp_buf;
     }
     if (pgm_hash != 0 && TryReplaceWithNativeShader(pgm_hash, *input, native_buf)) {
         input = &native_buf;
+        native_replaced = true;
         g_opt_native_replaced.fetch_add(1, std::memory_order_relaxed);
     } else if (FastFpEnabled() && ApplyFastFpSpirvPass(*input, fast_fp_buf)) {
         input = &fast_fp_buf;
+    }
+
+    // Never stall Stage A or live-gameplay async PSO workers for 200-6000 ms inside SPIRV-Tools'
+    // O(N^2) 35-pass RegisterPerformancePasses() (e.g. 62 KB Blood-Splattered FLVER shaders):
+    // return the O(N) HwInterp + FastFp SPIR-V immediately (~0.1 ms); WarmUp() upgrades raw .spv
+    // to full -O opt31_*.spv across 12 threads on next startup!
+    if (sync_fast_path && !native_replaced && input->size() >= 512) {
+        if (input != &spv) {
+            spv = *input;
+        }
+        if (out_deferred_heavy) {
+            *out_deferred_heavy = true;
+        }
+        return true;
     }
 
     spvtools::Optimizer opt{SPV_ENV_VULKAN_1_3};

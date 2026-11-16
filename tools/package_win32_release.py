@@ -278,7 +278,7 @@ def main() -> None:
     sys.path.insert(0, str(root / "launcher"))
     import bbport_updater
 
-    tag_name = os.environ.get("GITHUB_REF_NAME") or "v1.1.5"
+    tag_name = os.environ.get("GITHUB_REF_NAME") or "v1.1.6"
     git_sha = os.environ.get("GITHUB_SHA") or ""
     bbport_updater.write_build_manifest(
         archive_path=Path(""),

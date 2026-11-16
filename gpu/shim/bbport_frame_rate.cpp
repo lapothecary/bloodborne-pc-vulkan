@@ -251,13 +251,13 @@ u64 PS4_SYSV_ABI PacerWait(u64 pacer, std::uint32_t reset_flag) {
         if (!loading_burst && frame_draws >= 250 && pacer_prev_exit_ns != 0 &&
             entry_ns >= pacer_prev_exit_ns) {
             const u64 wall_ns = entry_ns - pacer_prev_exit_ns;
-            if (wall_ns >= 20'000'000ull && wall_ns < 5'000'000'000ull) [[unlikely]] {
+            if (wall_ns >= 11'000'000ull && wall_ns < 5'000'000'000ull) [[unlikely]] {
                 const u64 cpu_ns = (have_entry_cpu && pacer_prev_exit_cpu_ns != 0 &&
                                     entry_cpu_ns >= pacer_prev_exit_cpu_ns)
                                        ? (entry_cpu_ns - pacer_prev_exit_cpu_ns)
                                        : 0ull;
                 const u64 wait_ns = (wall_ns > cpu_ns) ? (wall_ns - cpu_ns) : 0ull;
-                std::printf(
+                BbStats::LogHitch(
                     "[BB-HITCH][FRAME] frame=%u wall=%.2f ms (main_cpu=%.2f ms, main_wait=%.2f ms "
                     "| spv_sync=%.2f ms [%llu], pso_sync=%.2f ms [%llu], pso_bg=%llu | tex_new=%llu "
                     "[%.2f MiB], buf_up=%.2f MiB, rdbk=%llu, faults=%llu, gpu_wait=%.2f ms | "

@@ -11,6 +11,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "common/hash.h"
 #include "common/serdes.h"
 #include "core/emulator_settings.h"
 #include "render/blob_store.h"
@@ -196,7 +197,8 @@ void SavePipeline(const Key& key, const Support& sdata, u32 is_compute, const st
 /// A permutation's metadata. False when it is from another build, or a motion vertex shader:
 /// those embed session-local buffer device addresses and are translated again.
 bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
-                    Shader::StageSpecialization& spec, size_t& perm_idx) {
+                    Shader::StageSpecialization& spec, size_t& perm_idx,
+                    const Shader::Profile& profile) {
     Serialization::Reader reader{ar};
     u32 meta_version{}, binary_version{};
     reader.Read(meta_version);
@@ -212,6 +214,8 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
     reader.Read(perm_idx);
     spec.Deserialize(ar);
     info.Deserialize(ar);
+    spec.info = &info;
+    spec.NormalizeUnboundDefaults(profile);
     return !(info.hw_stage == Shader::HwStage::Vertex && spec.runtime_info.hw.vs.motion_vectors);
 }
 
@@ -394,7 +398,7 @@ bool PipelineCache::PreloadStage(Serialization::Archive& ar, const Shader::Info*
     Shader::StageSpecialization spec{};
     spec.info = &program->info;
     size_t perm_idx{};
-    if (!LoadShaderMeta(ar, program->info, spec, perm_idx)) {
+    if (!LoadShaderMeta(ar, program->info, spec, perm_idx, profile)) {
         return false;
     }
     if (profile.paged_buffers && program->info.pgm_hash == profile.buffer_copy_shader_hash &&
@@ -442,6 +446,9 @@ bool PipelineCache::PreloadStage(Serialization::Archive& ar, const Shader::Info*
                 }
                 return false;
             }
+        }
+        if (Shader::Backend::SPIRV::EnsureClipDistanceInitializedInSpv(spv)) {
+            upgraded_from_raw = !custom_native_range;
         }
         // A module the driver rejects is a damaged entry (the cache is rebuilt), not a fatal error.
         auto [result, created] = instance.GetDevice().createShaderModule(
@@ -772,19 +779,144 @@ void PipelineCache::WarmUp() {
         }
     }
 
-    // Phase 3B: Preload any standalone pre-baked ShaderMeta entries (from --bake-shaders) that are
-    // not yet referenced by a PipelineKey so all ~2,880 game shaders sit warm in program_cache.
-    Store().ForEachBlob(BbCache::BlobType::ShaderMeta, [&](std::vector<u8>&& data) {
-        try {
-            Serialization::Archive meta_ar{std::move(data)};
-            const Shader::Info* out_info = nullptr;
-            vk::ShaderModule out_mod{};
-            Shader::RuntimeInfo out_rt{};
-            std::optional<Shader::Gcn::FetchShaderData> out_fetch{};
-            PreloadStage(meta_ar, out_info, out_mod, out_rt, out_fetch);
-        } catch (const std::exception&) {
+    // Phase 3B: Parallel preload of all standalone pre-baked ShaderMeta entries (from --bake-shaders)
+    // across `num_workers` threads so all ~5,700 game + Yebis2 + Scaleform shaders sit warm in < 250 ms.
+    struct StandalonePreload {
+        std::vector<u8> raw_meta;
+        std::unique_ptr<Program> program;
+        Shader::StageSpecialization spec{};
+        size_t perm_idx = 0;
+        vk::ShaderModule module{};
+        bool ok = false;
+    };
+    std::unordered_set<u64> resident_perm_hashes;
+    resident_perm_hashes.reserve(program_cache.size() * 2 + 64);
+    for (const auto& [ph, prog] : program_cache) {
+        if (!prog) {
+            continue;
         }
+        for (size_t pi = 0; pi < prog->modules.size(); ++pi) {
+            if (prog->modules[pi].module) {
+                resident_perm_hashes.insert(HashCombine(ph, pi));
+            }
+        }
+    }
+    std::vector<StandalonePreload> standalone_metas;
+    standalone_metas.reserve(6000);
+    Store().ForEachBlob(BbCache::BlobType::ShaderMeta, [&](std::vector<u8>&& data) {
+        if (data.size() >= 24) {
+            u64 ph_comb = 0;
+            std::memcpy(&ph_comb, data.data() + 8, sizeof(u64));
+            if (resident_perm_hashes.contains(ph_comb)) {
+                return;
+            }
+        }
+        standalone_metas.push_back(StandalonePreload{.raw_meta = std::move(data)});
     });
+    if (!standalone_metas.empty()) {
+        std::atomic<size_t> next_meta{0};
+        const bool custom_native_range = Shader::Backend::SPIRV::NativeShadersCustomRange();
+        const bool spirv_opt_on = Shader::Backend::SPIRV::SpirvOptEnabled();
+        auto meta_worker = [&] {
+            for (;;) {
+                const size_t idx = next_meta.fetch_add(1, std::memory_order_relaxed);
+                if (idx >= standalone_metas.size()) {
+                    return;
+                }
+                auto& item = standalone_metas[idx];
+                try {
+                    Serialization::Archive ar{std::move(item.raw_meta)};
+                    item.program = std::make_unique<Program>();
+                    item.spec.info = &item.program->info;
+                    if (!LoadShaderMeta(ar, item.program->info, item.spec, item.perm_idx,
+                                        profile)) {
+                        continue;
+                    }
+                    const u64 pgm_hash = item.program->info.pgm_hash;
+                    std::vector<u32> spv;
+                    bool upgraded = false;
+                    if (spirv_opt_on) {
+                        if (!custom_native_range) {
+                            Store().Load(BbCache::BlobType::ShaderBinary,
+                                         OptBinaryName(pgm_hash, item.perm_idx), spv);
+                            if (!spv.empty() && (spv.size() < 5 || spv[0] != 0x07230203u)) {
+                                spv.clear();
+                            }
+                        }
+                        if (spv.empty()) {
+                            Store().Load(BbCache::BlobType::ShaderBinary,
+                                         BinaryName(pgm_hash, item.perm_idx), spv);
+                            if (spv.size() < 5 || spv[0] != 0x07230203u) {
+                                continue;
+                            }
+                            Shader::Backend::SPIRV::OptimizeSPIRV(spv, pgm_hash);
+                            upgraded = !custom_native_range;
+                        }
+                    } else {
+                        Store().Load(BbCache::BlobType::ShaderBinary,
+                                     BinaryName(pgm_hash, item.perm_idx), spv);
+                        if (spv.size() < 5 || spv[0] != 0x07230203u) {
+                            continue;
+                        }
+                    }
+                    if (Shader::Backend::SPIRV::EnsureClipDistanceInitializedInSpv(spv)) {
+                        upgraded = !custom_native_range;
+                    }
+                    auto [res, created] = instance.GetDevice().createShaderModule(
+                        {.codeSize = spv.size() * sizeof(u32), .pCode = spv.data()});
+                    if (res != vk::Result::eSuccess) {
+                        continue;
+                    }
+                    if (upgraded) {
+                        PipelineStore::SaveOptShaderBinary(std::move(spv), pgm_hash, item.perm_idx);
+                        driver_cache_dirty.store(true, std::memory_order_relaxed);
+                    }
+                    item.module = created;
+                    item.ok = true;
+                } catch (const std::exception&) {
+                }
+            }
+        };
+        std::vector<std::thread> mworkers;
+        mworkers.reserve(num_workers);
+        for (u32 t = 0; t < num_workers; ++t) {
+            mworkers.emplace_back(meta_worker);
+        }
+        for (auto& w : mworkers) {
+            w.join();
+        }
+        program_cache.reserve(program_cache.size() + standalone_metas.size());
+        for (auto& item : standalone_metas) {
+            if (!item.ok || !item.program || !item.module) {
+                continue;
+            }
+            const u64 pgm_hash = item.program->info.pgm_hash;
+            auto [it_pgm, is_new] = program_cache.try_emplace(pgm_hash);
+            if (is_new) {
+                it_pgm.value() = std::move(item.program);
+                item.spec.info = &it_pgm.value()->info;
+                it_pgm.value()->info_template =
+                    std::make_unique<Shader::Info>(it_pgm.value()->info);
+                DirectShaders::NoteProgramCreated(pgm_hash, it_pgm.value().get());
+                it_pgm.value()->InsertPermut(item.module, std::move(item.spec), item.perm_idx);
+            } else {
+                auto& existing = *it_pgm.value();
+                item.spec.info = &existing.info;
+                if (item.perm_idx < existing.modules.size() &&
+                    existing.modules[item.perm_idx].module) {
+                    instance.GetDevice().destroyShaderModule(item.module);
+                } else {
+                    const auto dup =
+                        std::ranges::find(existing.modules, item.spec, &Program::Module::spec);
+                    if (dup != existing.modules.end()) {
+                        instance.GetDevice().destroyShaderModule(item.module);
+                    } else {
+                        existing.InsertPermut(item.module, std::move(item.spec), item.perm_idx);
+                    }
+                }
+            }
+        }
+    }
 
     if ((!had_driver_cache || driver_cache_dirty.load(std::memory_order_relaxed)) &&
         (total_items > 0 || !program_cache.empty())) {

@@ -308,6 +308,7 @@ struct AsyncCompileCtx {
         u64 hash = 0;
         std::array<u32, Gcn::NUM_USER_DATA> user_data{};
         std::vector<u32> code;
+        std::vector<u32> flat_buf; // Walked synchronously on Stage A at draw time (never stale!)
     };
     struct BuiltStage {
         HwStage hw_stage{};
@@ -1721,7 +1722,7 @@ const GraphicsPipeline* PipelineCache::SelectGraphicsPipelineFull(const DrawIndi
                 if (wait_ns >= 1'500'000ull) {
                     const u64 vs_h = sel.infos[0] ? sel.infos[0]->pgm_hash : 0ull;
                     const u64 ps_h = sel.infos[1] ? sel.infos[1]->pgm_hash : 0ull;
-                    std::printf(
+                    BbStats::LogHitch(
                         "[BB-HITCH][PSO-WAIT] frame=%u %.2f ms key=%#llx vs=%#llx ps=%#llx draws=%llu\n",
                         BbStats::frame_number.load(std::memory_order_relaxed),
                         double(wait_ns) / 1e6,
@@ -1761,7 +1762,7 @@ const GraphicsPipeline* PipelineCache::SelectGraphicsPipelineFull(const DrawIndi
         const u64 target = sel.regs ? DrawTarget(*sel.regs) : 0ull;
         const auto st_it = target_streaks.find(target);
         const u32 st_frames = (target != 0 && st_it != target_streaks.end()) ? st_it->second.frames : 0u;
-        std::printf(
+        BbStats::LogHitch(
             "[BB-HITCH][PSO-SYNC] frame=%u %.2f ms key=%#llx vs=%#llx ps=%#llx depth=%u idx=%u "
             "ind=%u streak=%u target=%#llx draws=%llu\n",
             BbStats::frame_number.load(std::memory_order_relaxed), double(sync_ns) / 1e6,
@@ -2280,7 +2281,7 @@ bool PipelineCache::AsyncSkippable(const PipelineSelection& selection, bool indi
             async_started = async_skipped = async_waited = 0;
         }
     }
-    if (last_frame_draws < 150) {
+    if (last_frame_draws < 64) {
         return false;
     }
     // A full-screen pass (one triangle or quad without depth testing: lighting, fog, post-processing)
@@ -2300,10 +2301,11 @@ bool PipelineCache::AsyncSkippable(const PipelineSelection& selection, bool indi
         return true;
     }
     // A pass drawn every frame: its render target drawn to in each of the last frames. A one-time
-    // render without depth (a face baked for a character, a texture made once at streak <= 1)
-    // compiles at once so baked atlases never miss their draw; recurring/blended offscreen targets
-    // (such as character Blood Paint RTT masks and HUD elements) compile asynchronously once active.
-    const u32 min_streak = selection.regs->blend_control[0].enable ? 2u : 8u;
+    // or short-burst render without depth (a face baked for a character, or a 1..4-frame Blood Paint
+    // RTT splatter burst onto character UV masks) compiles at once (< 1 ms with runtime_fast_opt)
+    // so baked atlases and Blood Paint splatters never miss a single draw; every-frame blended
+    // targets (such as HUD elements at streak >= 8) compile asynchronously.
+    const u32 min_streak = 8u;
     const u64 target = DrawTarget(*selection.regs);
     const auto streak = target_streaks.find(target);
     return target != 0 && streak != target_streaks.end() && streak->second.frames >= min_streak;
@@ -2331,7 +2333,7 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
         BbStats::hitch_pso_sync_ns.fetch_add(sync_ns, std::memory_order_relaxed);
         BbStats::hitch_pso_sync_count.fetch_add(1, std::memory_order_relaxed);
         if (sync_ns >= 1'000'000ull || last_frame_draws >= 250) {
-            std::printf("[BB-HITCH][CS-SYNC] frame=%u %.2f ms key=%#llx cs=%#llx draws=%llu\n",
+            BbStats::LogHitch("[BB-HITCH][CS-SYNC] frame=%u %.2f ms key=%#llx cs=%#llx draws=%llu\n",
                         BbStats::frame_number.load(std::memory_order_relaxed),
                         double(sync_ns) / 1e6, static_cast<unsigned long long>(cs_key_hash),
                         static_cast<unsigned long long>(sel.infos[0] ? sel.infos[0]->pgm_hash : 0ull),
@@ -2722,7 +2724,8 @@ vk::ShaderModule PipelineCache::CompileModuleRaw(Shader::Pools& use_pools, Shade
                                                  std::span<const u32> code, size_t perm_idx,
                                                  Shader::Backend::Bindings& binding,
                                                  std::vector<u32>* out_raw_spv,
-                                                 std::vector<u32>* out_opt_spv) {
+                                                 std::vector<u32>* out_opt_spv,
+                                                 bool runtime_fast_opt) {
     LOG_INFO(Render_Vulkan, "Compiling {} shader {:#x} {}", info.hw_stage, info.pgm_hash,
              perm_idx != 0 ? "(permutation)" : "");
     DumpShader(code, info.pgm_hash, info.hw_stage, perm_idx, "bin");
@@ -2748,12 +2751,18 @@ vk::ShaderModule PipelineCache::CompileModuleRaw(Shader::Pools& use_pools, Shade
         } else {
             PipelineStore::SaveShaderBinary(std::vector<u32>{spv}, info.pgm_hash, perm_idx);
         }
-        Shader::Backend::SPIRV::OptimizeSPIRV(spv, info.pgm_hash);
+        bool deferred_heavy = false;
+        Shader::Backend::SPIRV::OptimizeSPIRV(spv, info.pgm_hash, runtime_fast_opt,
+                                              &deferred_heavy);
         DumpShader(spv, info.pgm_hash, info.hw_stage, perm_idx, "spv");
         const vk::ShaderModule module = CompileSPV(spv, instance.GetDevice());
         if (out_opt_spv) {
-            *out_opt_spv = std::move(spv);
-        } else {
+            if (!deferred_heavy) {
+                *out_opt_spv = std::move(spv);
+            } else {
+                out_opt_spv->clear();
+            }
+        } else if (!deferred_heavy) {
             PipelineStore::SaveOptShaderBinary(std::move(spv), info.pgm_hash, perm_idx);
         }
         SetObjectName(instance.GetDevice(), module,
@@ -2788,7 +2797,7 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
             BbStats::hitch_spv_sync_ns.fetch_add(ns, std::memory_order_relaxed);
             BbStats::hitch_spv_sync_count.fetch_add(1, std::memory_order_relaxed);
             if (ns >= 1'000'000ull || draws_hint >= 250) {
-                std::printf(
+                BbStats::LogHitch(
                     "[BB-HITCH][SPV-SYNC] frame=%u %.2f ms stage=%u hash=%#llx perm=%zu draws=%llu\n",
                     BbStats::frame_number.load(std::memory_order_relaxed), double(ns) / 1e6,
                     unsigned(info.hw_stage), static_cast<unsigned long long>(info.pgm_hash), perm,
@@ -2797,7 +2806,8 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
         }
     } spv_hitch{spv_t0, info, perm_idx, last_frame_draws};
     CompileTimer timer;
-    return CompileModuleRaw(pools, info, runtime_info, code, perm_idx, binding, nullptr, nullptr);
+    return CompileModuleRaw(pools, info, runtime_info, code, perm_idx, binding, nullptr, nullptr,
+                            /*runtime_fast_opt=*/true);
 }
 
 PipelineCache::Result PipelineCache::LookUpProgram(PipelineSelection& sel,
@@ -3047,9 +3057,16 @@ PipelineCache::Result PipelineCache::GetProgramAsyncWorker(PipelineSelection& se
                                                            Shader::Backend::Bindings& binding) {
     auto& ctx = *sel.async_ctx;
     const u32 st_idx = static_cast<u32>(hw_stage);
-    const VAddr true_pgm_base =
-        (st_idx < ctx.stages.size() && ctx.stages[st_idx].valid) ? ctx.stages[st_idx].pgm_base
-                                                                 : params.Base();
+    const bool has_snap = (st_idx < ctx.stages.size() && ctx.stages[st_idx].valid);
+    const VAddr true_pgm_base = has_snap ? ctx.stages[st_idx].pgm_base : params.Base();
+    struct ScopedFlatReplay {
+        explicit ScopedFlatReplay(const std::vector<u32>* buf) noexcept {
+            Shader::flat_buf_replay = (buf && !buf->empty()) ? buf : nullptr;
+        }
+        ~ScopedFlatReplay() noexcept {
+            Shader::flat_buf_replay = nullptr;
+        }
+    } flat_replay_guard{has_snap ? &ctx.stages[st_idx].flat_buf : nullptr};
     auto runtime_info = BuildRuntimeInfo(sel, hw_stage, sw_stage);
 
     // 1. Check if an earlier pass inside this same worker job already built an identical spec.
@@ -3141,7 +3158,8 @@ PipelineCache::Result PipelineCache::GetProgramAsyncWorker(PipelineSelection& se
     std::vector<u32> opt_spv;
     const vk::ShaderModule mod = CompileModuleRaw(
         *tls_worker_pools, new_info, runtime_info, params.code, assumed_perm, binding, &raw_spv,
-        Shader::Backend::SPIRV::SpirvOptEnabled() ? &opt_spv : nullptr);
+        Shader::Backend::SPIRV::SpirvOptEnabled() ? &opt_spv : nullptr,
+        /*runtime_fast_opt=*/true);
 
     Shader::StageSpecialization spec;
     if (!SafeGuestSpecEval(new_info, runtime_info, profile, start_bnd, spec)) {
@@ -3171,7 +3189,7 @@ void PipelineCache::DrainCompletedAsyncSpvJobs() {
     if (!has_completed_spv.load(std::memory_order_acquire)) [[likely]] {
         return;
     }
-    constexpr size_t kMaxDrainPerCall = 4;
+    constexpr size_t kMaxDrainPerCall = 16;
     std::vector<std::shared_ptr<AsyncSpvJob>> done_jobs;
     {
         std::scoped_lock lk{async_spv_mutex};
@@ -3200,7 +3218,6 @@ void PipelineCache::DrainCompletedAsyncSpvJobs() {
             }
             continue;
         }
-        bool perm_mismatch = false;
         for (auto& bs : job->ctx.built_stages) {
             size_t actual_perm = 0;
             auto found = program_cache.find(bs.hash);
@@ -3274,12 +3291,18 @@ void PipelineCache::DrainCompletedAsyncSpvJobs() {
             }
             if (actual_perm != bs.assumed_perm) {
                 const u64 expected_stage_hash = HashCombine(bs.hash, bs.assumed_perm);
-                if (job->key.stage_hashes[static_cast<u32>(bs.sw_stage)] == expected_stage_hash) {
-                    perm_mismatch = true;
+                const u32 sw_idx = static_cast<u32>(bs.sw_stage);
+                if (sw_idx < job->key.stage_hashes.size() &&
+                    job->key.stage_hashes[sw_idx] == expected_stage_hash) {
+                    const u64 actual_stage_hash = HashCombine(bs.hash, actual_perm);
+                    job->key.stage_hashes[sw_idx] = actual_stage_hash;
+                    if (job->pipeline) {
+                        job->pipeline->UpdateStageHash(sw_idx, actual_stage_hash);
+                    }
                 }
             }
         }
-        if (!perm_mismatch && job->pipeline) {
+        if (job->pipeline) {
             bool all_stages_bound = true;
             for (u32 s = 0; s < MaxShaderStages; ++s) {
                 const u64 ph = job->stage_pgm_hashes[s];
@@ -3349,6 +3372,9 @@ bool PipelineCache::QueueAsyncSpvJob(DrawIndirectParams params, bool indirect) {
         u32 fetch_sgpr = ~0u;
         const u32* fetch_ptr = nullptr;
         size_t fetch_dwords = 0;
+        u32 vb_sgpr_mask = 0;
+        std::array<u32, Gcn::NUM_USER_DATA> vb_max_dwords{};
+        Program* cached_prog = nullptr;
     };
     std::array<PreStage, 8> pre_stages{};
     const u32* copy_code_ptr = nullptr;
@@ -3392,8 +3418,28 @@ bool PipelineCache::QueueAsyncSpvJob(DrawIndirectParams params, bool indirect) {
 
         if (const auto found = program_cache.find(ps.hash);
             found != program_cache.end() && found->second) {
-            ps.has_fetch = found->second->info.has_fetch_shader;
-            ps.fetch_sgpr = found->second->info.fetch_shader_sgpr_base;
+            ps.cached_prog = found->second.get();
+            if (!ps.cached_prog->info_template) {
+                std::unique_lock lk{programs_mutex};
+                ps.cached_prog->info_template =
+                    std::make_unique<Shader::Info>(ps.cached_prog->info);
+            }
+            ps.has_fetch = ps.cached_prog->info.has_fetch_shader;
+            ps.fetch_sgpr = ps.cached_prog->info.fetch_shader_sgpr_base;
+            // Walk SRT descriptors synchronously RIGHT NOW on Stage A while the GFX Per-Frame
+            // Command Heap (`0x1028...`) holds this exact draw's live T#/V#/S# descriptors!
+            auto& live_info = ps.cached_prog->info;
+            live_info.pgm_base = pgm_base;
+            live_info.user_data = pgm->user_data;
+            live_info.RefreshFlatBuf();
+            // Include format/stride/type bits of walked sharps (stripping per-draw base addresses
+            // in bits [15:0]) so Vest vs Gloves with different sRGB/stride compile simultaneously!
+            u64 sharp_fmt_sig = 0x9e3779b97f4a7c15ULL;
+            for (size_t k = Gcn::NUM_USER_DATA; k < live_info.flattened_ud_buf.size(); ++k) {
+                sharp_fmt_sig =
+                    HashCombine(sharp_fmt_sig, u64(live_info.flattened_ud_buf[k] & 0xFFFF0000u));
+            }
+            sig = HashCombine(sig, sharp_fmt_sig);
         } else if (hw == HwStage::Vertex || hw == HwStage::Export) {
             const u32* pc = ps.code_ptr;
             const u32* end = pc + std::min<size_t>(ps.code_dwords, 64);
@@ -3430,13 +3476,38 @@ bool PipelineCache::QueueAsyncSpvJob(DrawIndirectParams params, bool indirect) {
             }
             const u32* pc = fptr;
             for (u32 ins = 0; ins < 256; ++ins) {
-                if (GcnIsa::Decode(pc).opcode == GcnIsa::Opcode::S_SETPC_B64) {
+                const auto finst = GcnIsa::Decode(pc);
+                if (finst.opcode == GcnIsa::Opcode::S_SETPC_B64) {
                     break;
+                }
+                if (finst.inst_class == GcnIsa::InstClass::ScalarMemRd) {
+                    const u32 b_sgpr = finst.src[0].code * 2u;
+                    if (b_sgpr + 1 < Gcn::NUM_USER_DATA) {
+                        ps.vb_sgpr_mask |= (1u << b_sgpr);
+                        ps.vb_max_dwords[b_sgpr] =
+                            std::max<u32>(ps.vb_max_dwords[b_sgpr], finst.control.smrd.offset + 4u);
+                    }
                 }
             }
             ps.fetch_ptr = fptr;
             ps.fetch_dwords = static_cast<size_t>(pc - fptr);
             sig = HashCombine(sig, XXH3_64bits(fptr, ps.fetch_dwords * sizeof(u32)));
+            // Also fold vertex-attribute V# format/swizzle dwords (dw3) into `sig` on Stage A!
+            for (u32 b = 0; b + 1 < Gcn::NUM_USER_DATA; b += 2) {
+                if (((ps.vb_sgpr_mask >> b) & 1u) == 0) {
+                    continue;
+                }
+                const VAddr vb_addr =
+                    (VAddr(pgm->user_data[b]) | (VAddr(pgm->user_data[b + 1]) << 32)) &
+                    0xFFFFFFFFFFFFULL;
+                if (vb_addr >= 0x100000ULL && vb_addr < (1ULL << 40) && (vb_addr & 3ULL) == 0) {
+                    const u32* vb_words = reinterpret_cast<const u32*>(vb_addr);
+                    const u32 ndw = std::min<u32>(ps.vb_max_dwords[b], 128u);
+                    for (u32 d = 3; d < ndw; d += 4) {
+                        sig = HashCombine(sig, u64(vb_words[d]));
+                    }
+                }
+            }
         }
     }
 
@@ -3490,6 +3561,9 @@ bool PipelineCache::QueueAsyncSpvJob(DrawIndirectParams params, bool indirect) {
         snap.hash = ps.hash;
         snap.pgm_base = ps.pgm_base;
         snap.user_data = pgm->user_data;
+        if (ps.cached_prog) {
+            snap.flat_buf = ps.cached_prog->info.flattened_ud_buf;
+        }
         snap.valid = true;
 
         for (u32 i = 0; i + 1 < Gcn::NUM_USER_DATA; i += 2) {
@@ -3505,8 +3579,20 @@ bool PipelineCache::QueueAsyncSpvJob(DrawIndirectParams params, bool indirect) {
                 const uintptr_t host_ptr = reinterpret_cast<uintptr_t>(blob.data());
                 snap.user_data[i] = static_cast<u32>(host_ptr);
                 snap.user_data[i + 1] = static_cast<u32>(host_ptr >> 32);
-            } else if (cue_base != 0 && raw_ptr >= cue_base && raw_ptr < cue_end &&
-                       (raw_ptr & 3ULL) == 0) {
+            } else if (((ps.vb_sgpr_mask >> i) & 1u) != 0 &&
+                       raw_ptr >= 0x100000ULL && raw_ptr < (1ULL << 40) && (raw_ptr & 3ULL) == 0) {
+                // Exact `PtrVertexBufferTable` (e.g. `s[4:5]` in `0x1028...` GFX Command Heap)
+                // referenced by FetchShader `s_load_dwordx4` — copy exact `vb_max_dwords[i]`.
+                const size_t ndw = std::min<size_t>(ps.vb_max_dwords[i], 256u);
+                if (ndw >= 4) {
+                    const u32* src = reinterpret_cast<const u32*>(raw_ptr);
+                    auto& blob = job->ctx.owned_blobs.emplace_back(src, src + ndw);
+                    const uintptr_t host_ptr = reinterpret_cast<uintptr_t>(blob.data());
+                    snap.user_data[i] = static_cast<u32>(host_ptr);
+                    snap.user_data[i + 1] = static_cast<u32>(host_ptr >> 32);
+                }
+            } else if (!ps.cached_prog && cue_base != 0 && raw_ptr >= cue_base &&
+                       raw_ptr < cue_end && (raw_ptr & 3ULL) == 0) {
                 const size_t copy_bytes =
                     static_cast<size_t>(std::min<u64>(cue_end - raw_ptr, 1024ULL)) & ~size_t(3);
                 if (copy_bytes >= 16) {

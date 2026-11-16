@@ -234,6 +234,12 @@ public:
         return key;
     }
 
+    void UpdateStageHash(u32 sw_stage, u64 new_hash) noexcept {
+        if (sw_stage < key.stage_hashes.size()) {
+            key.stage_hashes[sw_stage] = new_hash;
+        }
+    }
+
     /// The vertex input attributes and bindings of the fetch shader's attributes. `sharps`,
     /// when given, are their V#s as the GPU command thread read them (in the draw packet): the
     /// tables they come from may have been rewritten by a later constant engine dump by the

@@ -182,12 +182,66 @@ struct StageSpecialization {
         for (const auto& desc : desc_list) {
             auto& spec = spec_list.emplace_back();
             const auto sharp = desc.GetSharp(*info);
-            if (!sharp) {
-                binding++;
-                continue;
+            if (sharp) {
+                bitset.set(binding);
             }
-            bitset.set(binding++);
+            binding++;
+            // Always record the effective `Null()` sharp fields when `!sharp` so `spec` matches the
+            // exact default format/view/num_bindings (=1) baked into the SPIR-V module.
             func(spec, desc, sharp);
+        }
+    }
+
+    /// Populates unbound (`!bitset[b]`) buffer/image entries with the exact `Null()` defaults that
+    /// the SPIR-V emitter compiled into the module, upgrading older `.meta` files seamlessly.
+    void NormalizeUnboundDefaults(const Profile& profile) noexcept {
+        if (!info) {
+            return;
+        }
+        u32 binding = 0;
+        if (buffers.size() == info->buffers.size()) {
+            for (size_t i = 0; i < buffers.size(); ++i, ++binding) {
+                if (!bitset[binding]) {
+                    const auto& desc = info->buffers[i];
+                    const auto sharp = ::Gcn::Buffer::Null();
+                    auto& s = buffers[i];
+                    s = {};
+                    s.stride = sharp.GetStride();
+                    s.paged = IsPagedBuffer(profile.paged_buffers, sharp, info->pgm_hash,
+                                            profile.buffer_copy_shader_hash);
+                    s.is_formatted = desc.is_formatted;
+                    s.swizzle_enable = sharp.swizzle_enable;
+                    if (s.is_formatted) {
+                        s.data_format = static_cast<u32>(sharp.GetDataFmt());
+                        s.num_format = static_cast<u32>(sharp.GetNumberFmt());
+                        s.dst_select = sharp.DstSelect();
+                        s.num_conversion = sharp.GetNumberConversion();
+                    }
+                }
+            }
+        } else {
+            binding += static_cast<u32>(buffers.size());
+        }
+        if (images.size() == info->images.size()) {
+            for (size_t i = 0; i < images.size(); ++i, ++binding) {
+                if (!bitset[binding]) {
+                    const auto& desc = info->images[i];
+                    const auto sharp = ::Gcn::Image::Null(desc.is_depth);
+                    auto& s = images[i];
+                    s = {};
+                    s.type = sharp.GetViewType(desc.is_array);
+                    s.is_integer = ::Gcn::IsInteger(sharp.GetNumberFmt());
+                    s.is_storage = desc.is_written;
+                    s.is_cube = sharp.IsCube();
+                    if (s.is_storage) {
+                        s.dst_select = sharp.DstSelect();
+                    } else {
+                        s.is_srgb = sharp.GetNumberFmt() == ::Gcn::NumberFormat::Srgb;
+                    }
+                    s.num_conversion = sharp.GetNumberConversion();
+                    s.num_bindings = desc.NumBindingsDirect(sharp);
+                }
+            }
         }
     }
 

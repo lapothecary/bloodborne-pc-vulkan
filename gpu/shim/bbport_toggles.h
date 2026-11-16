@@ -5,8 +5,12 @@
 #include <atomic>
 #include <csetjmp>
 #include <chrono>
+#include <cstdarg>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
+#include <filesystem>
+#include <mutex>
 
 extern "C" std::uint64_t runtime_disabled_optimizations;
 /// Temporary experiment bits: the second number in BB_TOGGLE_FILE (runtime_memory.c).
@@ -306,6 +310,40 @@ inline std::atomic<std::uint64_t> preupload_bytes{0};
 inline std::atomic<std::uint64_t> hitch_spv_sync_ns{0}, hitch_spv_sync_count{0};
 inline std::atomic<std::uint64_t> hitch_pso_sync_ns{0}, hitch_pso_sync_count{0};
 inline std::atomic<std::uint64_t> hitch_pso_async_count{0};
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((format(printf, 1, 2)))
+#endif
+inline void LogHitch(const char* fmt, ...) {
+    char buf[1024];
+    va_list args;
+    va_start(args, fmt);
+    const int n = std::vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+    if (n <= 0) {
+        return;
+    }
+    const size_t len = static_cast<size_t>(n) < sizeof(buf) ? static_cast<size_t>(n) : sizeof(buf) - 1;
+    std::fwrite(buf, 1, len, stdout);
+    std::fflush(stdout);
+    static std::mutex file_mtx;
+    static std::FILE* hitch_fp = nullptr;
+    static bool hitch_init_tried = false;
+    std::scoped_lock lk{file_mtx};
+    if (!hitch_init_tried) {
+        hitch_init_tried = true;
+        std::error_code ec;
+        std::filesystem::create_directories("logs", ec);
+        hitch_fp = std::fopen("logs/bb_hitch.log", "a");
+        if (hitch_fp) {
+            std::fprintf(hitch_fp, "=== BB-HITCH session start ===\n");
+            std::fflush(hitch_fp);
+        }
+    }
+    if (hitch_fp) {
+        std::fwrite(buf, 1, len, hitch_fp);
+        std::fflush(hitch_fp);
+    }
+}
 /// Polite invisible background shader auto-baker telemetry (Title Screen / gameplay).
 inline std::atomic<bool> shader_autobake_active{false};
 inline std::atomic<std::uint32_t> shader_autobake_done{0}, shader_autobake_total{0};

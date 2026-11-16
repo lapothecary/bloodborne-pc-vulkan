@@ -457,7 +457,7 @@ struct SyntheticStageEnv {
     void Build(const ParsedOrbShader& sh) {
         dummy_mem.fill(0);
         const uintptr_t dummy_ptr = reinterpret_cast<uintptr_t>(dummy_mem.data());
-        const Gcn::Buffer default_cb = MakeSyntheticBuffer(dummy_ptr, 0);
+        const Gcn::Buffer default_cb = MakeSyntheticBuffer(dummy_ptr, 16);
         const Gcn::Buffer default_vb = MakeSyntheticBuffer(dummy_ptr, 16);
         const Gcn::Image default_img =
             MakeSyntheticImage(dummy_ptr, Gcn::ImageType::Color2D, false);
@@ -643,12 +643,23 @@ Shader::RuntimeInfo BuildSyntheticRuntimeInfo(const ParsedOrbShader& sh,
         return rt;
     }
 
+    bool has_fetch_slot = false;
+    for (const auto& sl : sh.slots) {
+        if (sl.usage_type == 0x12) {
+            has_fetch_slot = true;
+            break;
+        }
+    }
+
     Gcn::ShaderProgram gfx_prog{};
     std::memcpy(&gfx_prog.settings, &sh.rsrc1, 4);
     std::memcpy(reinterpret_cast<u8*>(&gfx_prog.settings) + 4, &sh.rsrc2, 4);
     const auto fill_common = [&] {
         rt.props.num_user_data = gfx_prog.settings.num_user_regs;
-        rt.props.num_input_vgprs = gfx_prog.settings.vgpr_comp_cnt;
+        rt.props.num_input_vgprs =
+            (sh.container_stage == 1 && (has_fetch_slot || !sh.vs_inputs.empty()))
+                ? 3u
+                : u32(gfx_prog.settings.vgpr_comp_cnt);
         rt.props.num_allocated_vgprs = gfx_prog.NumVgprs();
         rt.props.fp_denorm_mode32 = gfx_prog.settings.fp_denorm_mode32;
         rt.props.fp_denorm_mode16_64 = gfx_prog.settings.fp_denorm_mode64;
@@ -692,8 +703,8 @@ Shader::RuntimeInfo BuildSyntheticRuntimeInfo(const ParsedOrbShader& sh,
         }
         vs.num_outputs = num_outputs;
         vs.emulate_depth_negative_one_to_one = !instance.IsDepthClipControlSupported();
-        rt.sw.vs.step_rate_0 = 1;
-        rt.sw.vs.step_rate_1 = 1;
+        rt.sw.vs.step_rate_0 = 0;
+        rt.sw.vs.step_rate_1 = 0;
         return rt;
     }
 
@@ -758,7 +769,7 @@ Shader::RuntimeInfo BuildSyntheticRuntimeInfo(const ParsedOrbShader& sh,
                 col.data_format = Gcn::DataFormat::Format8_8_8_8;
                 col.num_format = Gcn::NumberFormat::Srgb;
             } else if (cb == 4) {
-                col.data_format = Gcn::DataFormat::Format16_16;
+                col.data_format = Gcn::DataFormat::Format10_11_11;
                 col.num_format = Gcn::NumberFormat::Float;
                 col.swizzle = kRgZeroMap;
             } else if (cb == 5) {
@@ -773,7 +784,7 @@ Shader::RuntimeInfo BuildSyntheticRuntimeInfo(const ParsedOrbShader& sh,
                 col.data_format = Gcn::DataFormat::Format8_8_8_8;
                 col.num_format = (cb == 0) ? Gcn::NumberFormat::Srgb : Gcn::NumberFormat::Unorm;
             } else {
-                col.data_format = Gcn::DataFormat::Format16_16;
+                col.data_format = Gcn::DataFormat::Format10_11_11;
                 col.num_format = Gcn::NumberFormat::Float;
                 col.swizzle = kRgZeroMap;
             }
@@ -827,6 +838,159 @@ double ComputeDirectorySizeMiB(const std::filesystem::path& dir) {
     return double(bytes) / (1024.0 * 1024.0);
 }
 
+std::filesystem::path ResolveSiblingPatchRoot(const std::filesystem::path& game_dir) {
+    std::error_code ec;
+    if (const char* penv = std::getenv("BB_PATCH_DIR"); penv && *penv) {
+        std::filesystem::path explicit_patch{
+            std::u8string_view(reinterpret_cast<const char8_t*>(penv))};
+        if (std::filesystem::exists(explicit_patch, ec)) {
+            return explicit_patch;
+        }
+    }
+    auto norm = game_dir.lexically_normal();
+    if (!norm.has_filename()) {
+        norm = norm.parent_path();
+    }
+    const auto fname = norm.filename().u8string();
+    if (!fname.empty()) {
+        std::u8string patch_name = fname;
+        patch_name += u8"-patch";
+        const auto cand = norm.parent_path() / std::filesystem::path(patch_name);
+        if (std::filesystem::exists(cand, ec)) {
+            return cand;
+        }
+    }
+    return {};
+}
+
+/// Scans `eboot.bin` (or `out/boot.bin`) for embedded `Shdr\x07` shader containers:
+///   - `00 03 E2 20` (`354` Scaleform GFx UI, internal GNM & Compute shaders -> `"gxgui"`),
+///   - `00 03 0D 20` (`Yebis2` Post-FX shaders with `col_fmt != 9` -> `"eboot_yebis"`).
+void ScanEmbeddedEbootShaders(const std::filesystem::path& game_dir,
+                              std::vector<ParsedOrbShader>& cs_list,
+                              std::vector<ParsedOrbShader>& ps_list,
+                              std::vector<ParsedOrbShader>& vs_list,
+                              std::unordered_map<u64, size_t>& cs_seen,
+                              std::unordered_map<u64, size_t>& ps_seen,
+                              std::unordered_map<u64, size_t>& vs_seen) {
+    std::error_code ec;
+    std::filesystem::path exe_path;
+    const auto patch_root = ResolveSiblingPatchRoot(game_dir);
+    if (!patch_root.empty() && std::filesystem::exists(patch_root / "eboot.bin", ec)) {
+        exe_path = patch_root / "eboot.bin";
+    } else if (std::filesystem::exists(game_dir / "eboot.bin", ec)) {
+        exe_path = game_dir / "eboot.bin";
+    } else if (std::filesystem::exists("out/boot.bin", ec)) {
+        exe_path = "out/boot.bin";
+    } else if (std::filesystem::exists("boot.bin", ec)) {
+        exe_path = "boot.bin";
+    } else {
+        return;
+    }
+    std::ifstream ef(exe_path, std::ios::binary | std::ios::ate);
+    if (!ef) {
+        return;
+    }
+    const auto fsize = ef.tellg();
+    if (fsize < 0x1000 || fsize > std::streamoff(256LL * 1024LL * 1024LL)) {
+        return;
+    }
+    std::vector<u8> exe(static_cast<size_t>(fsize));
+    ef.seekg(0);
+    if (!ef.read(reinterpret_cast<char*>(exe.data()), fsize)) {
+        return;
+    }
+
+    static constexpr u8 kShdrMagic[5] = {'S', 'h', 'd', 'r', 0x07};
+    for (size_t pos = 0x24; pos + 0x60 < exe.size();) {
+        const void* found = std::memchr(exe.data() + pos, 'S', exe.size() - pos - 0x60);
+        if (!found) {
+            break;
+        }
+        const size_t shdr = static_cast<const u8*>(found) - exe.data();
+        pos = shdr + 1;
+        if (shdr < 0x24 || std::memcmp(exe.data() + shdr, kShdrMagic, 5) != 0) {
+            continue;
+        }
+        const size_t base = shdr - 0x24;
+        const u8* p4 = exe.data() + base;
+        const bool is_scaleform_gnm =
+            (p4[0] == 0x00 && p4[1] == 0x03 && p4[2] == 0xE2 && p4[3] == 0x20);
+        const bool is_yebis =
+            (p4[0] == 0x00 && p4[1] == 0x03 && p4[2] == 0x0D && p4[3] == 0x20);
+        if (!is_scaleform_gnm && !is_yebis) {
+            continue;
+        }
+        const u8 stype = exe[shdr + 8];
+        if (stype != 1 && stype != 2 && stype != 4) {
+            continue;
+        }
+        const size_t common = shdr + 0x10;
+        const u32 shdr_off = ReadLe<u32>(exe.data() + common + 8);
+        const size_t ucode = common + size_t(shdr_off);
+        if (ucode <= common || ucode + 16 > exe.size()) {
+            continue;
+        }
+        if (is_yebis && stype == 2) {
+            const size_t body = common + 0x10;
+            if (body + 0x10 <= exe.size()) {
+                const u32 col_fmt = ReadLe<u32>(exe.data() + body + 0x0C);
+                // Bloodborne's Yebis2 configuration exclusively uses EXP_32_ABGR (4) and never
+                // touches the 2,513 duplicate EXP_FP16_ABGR (9) shaders embedded in .rodata.
+                if ((col_fmt & 0xFu) == 9u) {
+                    continue;
+                }
+            }
+        }
+        const u32 dw0 = ReadLe<u32>(exe.data() + ucode);
+        const u32 dw1 = ReadLe<u32>(exe.data() + ucode + 4);
+        if (dw0 != 0xBEEB03FFu) {
+            continue;
+        }
+        const size_t orb_off = ucode + size_t(dw1 + 1u) * 8u;
+        if (orb_off + sizeof(Gcn::BinaryInfo) > exe.size()) {
+            continue;
+        }
+        size_t end_off = orb_off + sizeof(Gcn::BinaryInfo);
+        const u32 pssl_rel = ReadLe<u32>(exe.data() + base + 0x10);
+        const size_t pssl_abs = base + 0x24 + size_t(pssl_rel);
+        if (pssl_rel > 0 && pssl_abs < base + 0x40000 && pssl_abs + 0x1C <= exe.size()) {
+            const u32 nres = std::min<u32>(ReadLe<u32>(exe.data() + pssl_abs), 256u);
+            end_off = std::max(end_off, std::min(exe.size(), pssl_abs + 0x1C + size_t(nres) * 24u));
+        }
+
+        BndShaderEntry entry{
+            .bundle = is_scaleform_gnm ? "gxgui" : "eboot_yebis",
+            .name = "eboot",
+            .stem = "eboot",
+            .ext = stype == 1 ? ".vpo" : (stype == 2 ? ".ppo" : ".cpo"),
+            .bytes = {exe.begin() + static_cast<std::ptrdiff_t>(base),
+                      exe.begin() + static_cast<std::ptrdiff_t>(end_off)},
+        };
+        ParsedOrbShader parsed{};
+        if (!ParseOrbContainer(entry, parsed)) {
+            continue;
+        }
+        if (parsed.container_stage == 1) {
+            if (!vs_seen.contains(parsed.hash)) {
+                vs_seen[parsed.hash] = vs_list.size();
+                vs_list.push_back(std::move(parsed));
+            }
+        } else if (parsed.container_stage == 2) {
+            if (!ps_seen.contains(parsed.hash)) {
+                ps_seen[parsed.hash] = ps_list.size();
+                ps_list.push_back(std::move(parsed));
+            }
+        } else if (parsed.container_stage == 4) {
+            if (!cs_seen.contains(parsed.hash)) {
+                cs_seen[parsed.hash] = cs_list.size();
+                cs_list.push_back(std::move(parsed));
+            }
+        }
+        pos = orb_off + 8;
+    }
+}
+
 } // namespace
 
 int PipelineCache::BakeAllGameShaders(const std::filesystem::path& game_dir) {
@@ -861,9 +1025,16 @@ int PipelineCache::BakeAllGameShaders(const std::filesystem::path& game_dir) {
     std::unordered_map<std::string, u64> stem_vs_hash;
     std::unordered_map<std::string, u64> stem_ps_hash;
 
+    const auto patch_root = ResolveSiblingPatchRoot(game_dir);
+    const auto patch_shader_dir =
+        patch_root.empty() ? std::filesystem::path{} : (patch_root / "dvdroot_ps4" / "shader");
     for (const char* bname : kBundles) {
-        const auto bpath = shader_dir / bname;
-        if (!std::filesystem::exists(bpath)) {
+        std::error_code bec;
+        auto bpath = shader_dir / bname;
+        if (!patch_shader_dir.empty() && std::filesystem::exists(patch_shader_dir / bname, bec)) {
+            bpath = patch_shader_dir / bname;
+        }
+        if (!std::filesystem::exists(bpath, bec)) {
             continue;
         }
         std::vector<u8> bnd_bytes;
@@ -904,6 +1075,8 @@ int PipelineCache::BakeAllGameShaders(const std::filesystem::path& game_dir) {
             }
         }
     }
+    ScanEmbeddedEbootShaders(game_dir, cs_list, ps_list, vs_list, cs_by_hash, ps_by_hash,
+                             vs_by_hash);
 
     // Link paired VS <-> PS by bundle-qualified BND4 stem so PS interpolants & VS descriptor start offsets match.
     struct PassPairEntry {
@@ -1036,24 +1209,49 @@ int PipelineCache::BakeAllGameShaders(const std::filesystem::path& game_dir) {
                 auto run_bnd = start_bnd;
                 std::vector<u32> raw_spv;
                 std::vector<u32> opt_spv;
-                vk::ShaderModule mod{};
-                bool ok = false;
-
-                sigjmp_buf recover;
-                if (sigsetjmp(recover, 0) == 0) {
-                    runtime_fault_recover = &recover;
-                    mod = CompileModuleRaw(
-                        local_pools, info, rt_info, sh.code, 0, run_bnd, &raw_spv,
-                        Shader::Backend::SPIRV::SpirvOptEnabled() ? &opt_spv : nullptr);
-                    runtime_fault_recover = nullptr;
-                    ok = static_cast<bool>(mod);
-                } else {
-                    runtime_fault_recover = nullptr;
-                    ok = false;
-                }
+                vk::ShaderModule mod = CompileModuleRaw(
+                    local_pools, info, rt_info, sh.code, 0, run_bnd, &raw_spv,
+                    Shader::Backend::SPIRV::SpirvOptEnabled() ? &opt_spv : nullptr);
+                const bool ok = static_cast<bool>(mod);
 
                 if (ok) {
                     auto spec = Shader::StageSpecialization(info, rt_info, profile, start_bnd);
+
+                    // Pre-bake secondary HDR/LDR attachment specialization (`_1`) for single-MRT
+                    // full-screen passes (SSR, Deferred PBR, PostFX) that cannot skip asynchronously.
+                    vk::ShaderModule mod1{};
+                    Shader::StageSpecialization spec1{};
+                    Shader::Info info1(hw_st, sw_st, params);
+                    std::vector<u32> raw_spv1, opt_spv1;
+                    const bool want_alt_fs =
+                        (sh.container_stage == 2) && ((sh.ps_col_fmt & ~0xFu) == 0u) &&
+                        ((sh.ps_col_fmt & 0xFu) != 0u) &&
+                        (sh.bundle == "gxrenderershader" || sh.bundle == "gxposteffect");
+                    if (want_alt_fs) {
+                        auto rt_alt = rt_info;
+                        if (sh.bundle == "gxrenderershader") {
+                            // Dual-HDR MRT0+MRT1 bound (SSR & Deferred lighting passes where cb1 is bound with export=0)
+                            auto& cb1 = rt_alt.hw.fs.color_buffers[1];
+                            cb1.data_format = Gcn::DataFormat::Format16_16_16_16;
+                            cb1.num_format = Gcn::NumberFormat::Float;
+                            cb1.export_format = Gcn::ShaderExportFormat::Zero;
+                            cb1.swizzle = Gcn::IdentityMapping;
+                        } else {
+                            // LDR RGBA8 Unorm post-FX pass
+                            auto& cb0 = rt_alt.hw.fs.color_buffers[0];
+                            cb0.data_format = Gcn::DataFormat::Format8_8_8_8;
+                            cb0.num_format = Gcn::NumberFormat::Unorm;
+                            cb0.swizzle = Gcn::IdentityMapping;
+                        }
+                        auto run_bnd1 = start_bnd;
+                        mod1 = CompileModuleRaw(
+                            local_pools, info1, rt_alt, sh.code, 1, run_bnd1, &raw_spv1,
+                            Shader::Backend::SPIRV::SpirvOptEnabled() ? &opt_spv1 : nullptr);
+                        if (mod1) {
+                            spec1 = Shader::StageSpecialization(info1, rt_alt, profile, start_bnd);
+                        }
+                    }
+
                     std::unique_ptr<ComputePipeline> built_cs;
                     ComputePipelineKey cs_key{};
                     ComputePipeline::SerializationSupport cs_sdata{};
@@ -1086,11 +1284,26 @@ int PipelineCache::BakeAllGameShaders(const std::filesystem::path& game_dir) {
                             const u64 perm_hash = HashCombine(sh.hash, 0);
                             PipelineStore::SaveShaderMeta(new_prog->info, spec, perm_hash, 0);
                             new_prog->AddPermut(mod, std::move(spec));
+                            if (mod1) {
+                                spec1.info = &new_prog->info;
+                                if (!raw_spv1.empty()) {
+                                    PipelineStore::SaveShaderBinary(std::move(raw_spv1), sh.hash, 1);
+                                }
+                                if (!opt_spv1.empty()) {
+                                    PipelineStore::SaveOptShaderBinary(std::move(opt_spv1), sh.hash, 1);
+                                }
+                                const u64 perm_hash1 = HashCombine(sh.hash, 1);
+                                PipelineStore::SaveShaderMeta(info1, spec1, perm_hash1, 1);
+                                new_prog->AddPermut(mod1, std::move(spec1));
+                            }
                             new_prog->info_template = std::make_unique<Shader::Info>(new_prog->info);
                             program_cache.emplace(sh.hash, std::move(new_prog));
                             spv_built.fetch_add(1, std::memory_order_relaxed);
                         } else {
                             instance.GetDevice().destroyShaderModule(mod);
+                            if (mod1) {
+                                instance.GetDevice().destroyShaderModule(mod1);
+                            }
                         }
                         if (built_cs && !compute_pipelines.contains(cs_key)) {
                             PipelineStore::SaveCompute(cs_key, cs_sdata);
@@ -1272,13 +1485,14 @@ void SetPoliteAutoBakeThreadPriority() {
     pthread_setschedparam(pthread_self(), SCHED_IDLE, &sp);
 #endif
 }
+
 } // namespace
 
 void PipelineCache::StartBackgroundAutoBake() {
     if (const char* env = std::getenv("BB_AUTO_BAKE"); env && env[0] == '0') {
         return;
     }
-    constexpr size_t kFullGameShaderThreshold = 2850;
+    constexpr size_t kFullGameShaderThreshold = 5500;
     if (program_cache.size() >= kFullGameShaderThreshold) {
         const u32 n = static_cast<u32>(program_cache.size());
         BbStats::shader_autobake_done.store(n, std::memory_order_relaxed);
@@ -1293,7 +1507,9 @@ void PipelineCache::StartBackgroundAutoBake() {
     if (!gdir_env || !*gdir_env) {
         return;
     }
-    const std::filesystem::path shader_dir = std::filesystem::path{gdir_env} / "dvdroot_ps4" / "shader";
+    const std::filesystem::path game_root_dir{
+        std::u8string_view(reinterpret_cast<const char8_t*>(gdir_env))};
+    const std::filesystem::path shader_dir = game_root_dir / "dvdroot_ps4" / "shader";
     std::error_code ec;
     if (!std::filesystem::exists(shader_dir, ec)) {
         return;
@@ -1317,7 +1533,7 @@ void PipelineCache::StartBackgroundAutoBake() {
     autobake_stop.store(false, std::memory_order_relaxed);
     BbStats::shader_autobake_active.store(true, std::memory_order_relaxed);
 
-    autobake_thread = std::thread([this, shader_dir, warm = std::move(warm_hashes),
+    autobake_thread = std::thread([this, game_root_dir, shader_dir, warm = std::move(warm_hashes),
                                    ps_bnd_init = std::move(ps_bindings_map)]() mutable {
         SetPoliteAutoBakeThreadPriority();
         const auto t0 = std::chrono::steady_clock::now();
@@ -1333,13 +1549,20 @@ void PipelineCache::StartBackgroundAutoBake() {
         std::unordered_map<u64, size_t> cs_seen, ps_seen, vs_seen;
         std::unordered_map<std::string, u64> stem_vs_hash, stem_ps_hash;
 
+        const auto patch_root = ResolveSiblingPatchRoot(game_root_dir);
+        const auto patch_shader_dir =
+            patch_root.empty() ? std::filesystem::path{} : (patch_root / "dvdroot_ps4" / "shader");
         for (const char* bname : kBundles) {
             if (autobake_stop.load(std::memory_order_relaxed)) {
                 BbStats::shader_autobake_active.store(false, std::memory_order_relaxed);
                 return;
             }
-            const auto bpath = shader_dir / bname;
             std::error_code bec;
+            auto bpath = shader_dir / bname;
+            if (!patch_shader_dir.empty() &&
+                std::filesystem::exists(patch_shader_dir / bname, bec)) {
+                bpath = patch_shader_dir / bname;
+            }
             if (!std::filesystem::exists(bpath, bec)) {
                 continue;
             }
@@ -1381,6 +1604,8 @@ void PipelineCache::StartBackgroundAutoBake() {
                 }
             }
         }
+        ScanEmbeddedEbootShaders(game_root_dir, cs_list, ps_list, vs_list, cs_seen, ps_seen,
+                                 vs_seen);
 
         const size_t total_all = cs_list.size() + ps_list.size() + vs_list.size();
         if (total_all == 0) {

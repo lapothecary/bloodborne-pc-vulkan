@@ -27,7 +27,7 @@ import urllib.request
 import zipfile
 
 GITHUB_REPO = "lapothecary/bloodborne-pc-vulkan"
-USER_AGENT = "BloodbornePCVulkan-Updater/1.1.5"
+USER_AGENT = "BloodbornePCVulkan-Updater/1.1.6"
 VERSION_STATE_FILE = ".bbport-version.json"
 
 LINUX_ARCHIVE = "bloodborne-pc-vulkan-linux-x86_64-prebuilt.tar.gz"
@@ -532,7 +532,7 @@ if __name__ == "__main__":
     parser.add_argument("--windows", action="store_true", help="Use Windows core file list")
     args = parser.parse_args()
 
-    tag_val = os.environ.get("GITHUB_REF_NAME") or "v1.1.5"
+    tag_val = os.environ.get("GITHUB_REF_NAME") or "v1.1.6"
     sha_val = os.environ.get("GITHUB_SHA") or ""
     if args.write_version:
         write_build_manifest(
