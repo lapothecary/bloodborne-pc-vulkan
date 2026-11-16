@@ -336,6 +336,7 @@ struct PipelineCache::AsyncSpvJob {
     DrawIndirectParams params{};
     AsyncCompileCtx ctx{};
     GraphicsPipelineKey key{};
+    std::array<u64, MaxShaderStages> stage_pgm_hashes{};
     std::unique_ptr<GraphicsPipeline> pipeline;
     GraphicsPipeline::SerializationSupport sdata{};
     bool ok = false;
@@ -3242,7 +3243,21 @@ void PipelineCache::DrainCompletedAsyncSpvJobs() {
             }
         }
         if (!perm_mismatch && job->pipeline) {
-            if (!graphics_pipelines.contains(job->key)) {
+            bool all_stages_bound = true;
+            for (u32 s = 0; s < MaxShaderStages; ++s) {
+                const u64 ph = job->stage_pgm_hashes[s];
+                if (!ph) {
+                    job->pipeline->SetStageInfo(s, nullptr);
+                    continue;
+                }
+                const auto pit = program_cache.find(ph);
+                if (pit == program_cache.end() || !pit->second) {
+                    all_stages_bound = false;
+                    break;
+                }
+                job->pipeline->SetStageInfo(s, &pit->second->info);
+            }
+            if (all_stages_bound && !graphics_pipelines.contains(job->key)) {
                 const u64 pso_hash = std::hash<GraphicsPipelineKey>{}(job->key);
                 PipelineStore::SaveGraphics(job->key, pso_hash, job->sdata);
                 NoteDriverPipelineCacheDirty();
@@ -3452,6 +3467,9 @@ bool PipelineCache::QueueAsyncSpvJob(DrawIndirectParams params, bool indirect) {
 
         if (key_ok) {
             job->key = wsel.graphics_key;
+            for (u32 s = 0; s < MaxShaderStages; ++s) {
+                job->stage_pgm_hashes[s] = wsel.infos[s] ? wsel.infos[s]->pgm_hash : 0;
+            }
             bool already_built = false;
             {
                 std::shared_lock gr_lk{graphics_pipelines_mutex};

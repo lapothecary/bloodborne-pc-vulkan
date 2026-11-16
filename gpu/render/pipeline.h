@@ -83,6 +83,10 @@ public:
         return *stages[u32(stage)];
     }
 
+    void SetStageInfo(u32 sw_stage, const Shader::Info* info) noexcept {
+        stages[sw_stage] = info;
+    }
+
     bool IsCompute() const {
         return is_compute;
     }
