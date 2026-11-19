@@ -26,7 +26,8 @@ def run_checked(cmd: list[str], label: str) -> None:
     proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
     print(proc.stdout, flush=True)
     if proc.returncode != 0:
-        tail = "\n".join(proc.stdout.splitlines()[-25:])
+        err_lines = [l for l in proc.stdout.splitlines() if any(k in l for k in ("error ", "fatal error", "LNK", "Error:"))]
+        tail = "\n".join((err_lines or proc.stdout.splitlines())[-20:])
         emit_error(f"{label} failed (exit {proc.returncode}):\n{tail}")
         sys.exit(proc.returncode)
 
