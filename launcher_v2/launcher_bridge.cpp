@@ -387,11 +387,11 @@ int LauncherBridge::CountCachedShaders(const fs::path& user_dir) const {
 std::string LauncherBridge::ReadVersionTag() const {
     const fs::path vf = ctx_.package_dir / ".bbport-version.json";
     std::ifstream f(vf);
-    if (!f) return "v1.1.6";
+    if (!f) return "v1.1.8";
     std::stringstream ss;
     ss << f.rdbuf();
     std::string tag = ExtractJsonField(ss.str(), "tag");
-    return tag.empty() ? "v1.1.6" : tag;
+    return tag.empty() ? "v1.1.8" : tag;
 }
 
 std::string LauncherBridge::BuildModsJson() const {
@@ -478,7 +478,9 @@ bool LauncherBridge::OpenSystemFolder(const std::string& which) const {
 bool LauncherBridge::LaunchGameProcess() const {
 #ifdef _WIN32
     const fs::path exe = ctx_.package_dir / "Bloodborne.exe";
-    SpawnDetached({exe.u8string().empty() ? exe.string() : std::string(reinterpret_cast<const char*>(exe.u8string().c_str())), "--play"}, ctx_.package_dir);
+    auto u8 = exe.u8string();
+    std::string exe_utf8(reinterpret_cast<const char*>(u8.data()), u8.size());
+    SpawnDetached({exe_utf8}, ctx_.package_dir);
 #else
     const fs::path sh = ctx_.package_dir / "play.sh";
     SpawnDetached({"/bin/bash", sh.string()}, ctx_.package_dir);
@@ -513,18 +515,19 @@ void LauncherBridge::StartShaderBake() {
             return std::string(reinterpret_cast<const char*>(u8.data()), u8.size());
         };
 #ifdef _WIN32
-        fs::path probe = pkg_dir / "bin" / "bb-probe.exe";
+        fs::path probe = pkg_dir / "bin" / "Bloodborne.exe";
+        if (!fs::is_regular_file(probe, ec)) probe = pkg_dir / "bin" / "bb-probe.exe";
         if (!fs::is_regular_file(probe, ec)) probe = pkg_dir / "out" / "bb-probe.exe";
 #else
-        fs::path probe = pkg_dir / "bin" / "probe";
+        fs::path probe = pkg_dir / "bin" / "bb-vulkan";
+        if (!fs::is_regular_file(probe, ec)) probe = pkg_dir / "out" / "bb-vulkan";
         if (!fs::is_regular_file(probe, ec)) probe = pkg_dir / "bin" / "bb-probe";
-        if (!fs::is_regular_file(probe, ec)) probe = pkg_dir / "out" / "probe";
         if (!fs::is_regular_file(probe, ec)) probe = pkg_dir / "out" / "bb-probe";
 #endif
         if (!fs::is_regular_file(probe, ec)) {
             std::lock_guard<std::mutex> lk(bake_mu_);
             bake_.running = false;
-            bake_.error = "bb-probe binary not found in bin/";
+            bake_.error = "Engine binary not found in bin/";
             return;
         }
 
@@ -602,7 +605,8 @@ void LauncherBridge::StartUpdateCheck() {
         std::vector<std::string> cmd;
 #ifdef _WIN32
         std::error_code ec;
-        const fs::path runner = pkg_dir / "Bloodborne.exe";
+        fs::path runner = pkg_dir / "bin" / "bb-helper.exe";
+        if (!fs::is_regular_file(runner, ec)) runner = pkg_dir / "Bloodborne.exe";
         if (fs::is_regular_file(runner, ec)) {
             cmd = {to_utf8(runner), "--run-script", to_utf8(script), "--check-json", to_utf8(pkg_dir)};
         } else {
@@ -657,7 +661,8 @@ void LauncherBridge::StartUpdateApply() {
         std::vector<std::string> cmd;
 #ifdef _WIN32
         std::error_code ec;
-        const fs::path runner = pkg_dir / "Bloodborne.exe";
+        fs::path runner = pkg_dir / "bin" / "bb-helper.exe";
+        if (!fs::is_regular_file(runner, ec)) runner = pkg_dir / "Bloodborne.exe";
         if (fs::is_regular_file(runner, ec)) {
             cmd = {to_utf8(runner), "--run-script", to_utf8(script), "--apply-json", to_utf8(pkg_dir)};
         } else {

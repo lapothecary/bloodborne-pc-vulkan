@@ -1,3 +1,4 @@
-// bbport Windows: the executable manifest (bb-probe.manifest).
+// Bloodborne PC Vulkan Windows: application icon + UTF-8 manifest.
 #include <winuser.h>
+101 ICON "../../../packaging/bbport.ico"
 CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "bb-probe.manifest"

@@ -376,7 +376,7 @@ if (WIN32)
     target_compile_options(bbatrac9 PRIVATE -w)
     add_executable(bb-probe ../src/probe.c ../src/vulkan_smoke.c ${BB_RUNTIME_SOURCES}
         platform/win32/bb-probe.rc)
-    set_target_properties(bb-probe PROPERTIES C_STANDARD 11 C_EXTENSIONS ON)
+    set_target_properties(bb-probe PROPERTIES OUTPUT_NAME "Bloodborne" C_STANDARD 11 C_EXTENSIONS ON)
     target_include_directories(bb-probe PRIVATE .. ../src)
     target_compile_options(bb-probe PRIVATE $<$<COMPILE_LANGUAGE:C>:-Wall -Wextra>)
     target_link_libraries(bb-probe PRIVATE bbgpu "${BB_GX_ENGINE_ARCHIVE}" bbgpu bbatrac9 pthread ws2_32 bcrypt dbghelp winmm onecore

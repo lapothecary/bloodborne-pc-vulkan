@@ -98,7 +98,8 @@ def main() -> None:
     root = Path(__file__).resolve().parent.parent
     os.chdir(root)
 
-    # 1. Freeze Unified Python Launcher (Bloodborne.exe + Launcher.exe) via PyInstaller
+    # 1. Freeze preparation/updater helper (bin/bb-helper.exe) via PyInstaller
+    #    During normal gameplay, native Bloodborne.exe runs solo with 0% Python in RAM!
     run_checked([sys.executable, "-m", "pip", "install", "--upgrade", "pip", "pyinstaller", "pillow"], "PIP_PYINSTALLER")
 
     hidden_modules = [
@@ -117,7 +118,7 @@ def main() -> None:
     pyi_cmd = [
         sys.executable, "-m", "PyInstaller",
         "--noconfirm", "--clean", "--log-level", "WARN", "--windowed",
-        "--name", "Bloodborne",
+        "--name", "bb-helper",
         "--icon", str(root / "packaging" / "bbport.ico"),
         "--distpath", str(pyi_dist),
         "--workpath", str(pyi_work),
@@ -133,12 +134,12 @@ def main() -> None:
     pyi_cmd.append(str(root / "run.py"))
     run_checked(pyi_cmd, "PYINSTALLER")
 
-    bbport_run_dir = pyi_dist / "Bloodborne"
-    if not (bbport_run_dir / "Bloodborne.exe").is_file():
-        emit_error(f"Bloodborne.exe was not generated in {bbport_run_dir}")
+    bb_helper_dir = pyi_dist / "bb-helper"
+    if not (bb_helper_dir / "bb-helper.exe").is_file():
+        emit_error(f"bb-helper.exe was not generated in {bb_helper_dir}")
         sys.exit(1)
 
-    # 2. Build native C++20 WebView2 Launcher (Launcher.exe) with MSVC + WebView2 NuGet SDK
+    # 2. Build native C++20 WebView2 Launcher (Launcher.exe) & zero-Python starter (Bloodborne.exe)
     import urllib.request
     wv2_dir = root / "dist_win" / "webview2_sdk"
     if not (wv2_dir / "build" / "native" / "include" / "WebView2.h").is_file():
@@ -148,7 +149,7 @@ def main() -> None:
         nupkg_path = root / "dist_win" / "webview2.nupkg"
         wv2_url = "https://www.nuget.org/api/v2/package/Microsoft.Web.WebView2/1.0.2903.40"
         print(f"=== Downloading Microsoft.Web.WebView2 SDK ({wv2_url}) ===", flush=True)
-        req = urllib.request.Request(wv2_url, headers={"User-Agent": "BloodbornePCVulkan-CI/1.1.7"})
+        req = urllib.request.Request(wv2_url, headers={"User-Agent": "BloodbornePCVulkan-CI/1.1.8"})
         with urllib.request.urlopen(req, timeout=60) as resp:
             nupkg_path.write_bytes(resp.read())
         with zipfile.ZipFile(nupkg_path, "r") as zf:
@@ -164,11 +165,12 @@ def main() -> None:
         f"-DWEBVIEW2_SDK_DIR={wv2_dir.as_posix()}",
     ], "CMAKE_LAUNCHER_V2")
     run_checked([
-        "cmake", "--build", str(launcher_build), "--config", "Release", "--target", "Launcher",
+        "cmake", "--build", str(launcher_build), "--config", "Release", "--target", "Launcher", "BloodborneStarter",
     ], "BUILD_LAUNCHER_V2")
     built_launcher_exe = launcher_build / "Release" / "Launcher.exe"
-    if not built_launcher_exe.is_file():
-        emit_error(f"Native C++20 WebView2 Launcher.exe was not generated at {built_launcher_exe}")
+    built_starter_exe = launcher_build / "Release" / "Bloodborne.exe"
+    if not built_launcher_exe.is_file() or not built_starter_exe.is_file():
+        emit_error(f"Native C++20 executables missing: Launcher={built_launcher_exe.is_file()}, Bloodborne={built_starter_exe.is_file()}")
         sys.exit(1)
 
     # 3. Assemble staging directory
@@ -180,8 +182,10 @@ def main() -> None:
     (stage / "launcher_v2").mkdir(parents=True, exist_ok=True)
     (stage / "scripts" / "bbsc_gameserver").mkdir(parents=True, exist_ok=True)
 
-    shutil.copytree(bbport_run_dir, stage, dirs_exist_ok=True)
+    # Keep frozen Python helper + _internal tucked neatly inside bin/ (spotless root!)
+    shutil.copytree(bb_helper_dir, stage / "bin", dirs_exist_ok=True)
     shutil.copy2(built_launcher_exe, stage / "Launcher.exe")
+    shutil.copy2(built_starter_exe, stage / "Bloodborne.exe")
     shutil.copytree(root / "launcher_v2" / "ui", stage / "launcher_v2" / "ui", dirs_exist_ok=True)
     for fname in ("play.bat", "run.py", "LICENSE"):
         src = root / fname
@@ -210,7 +214,7 @@ def main() -> None:
     if (root / "fsr4_shaders").is_dir():
         shutil.copytree(root / "fsr4_shaders", stage / "fsr4_shaders", dirs_exist_ok=True)
 
-    # 4. Copy & strip bb-probe.exe and bb-gpu-capabilities.exe + collect MSYS2 CLANG64 DLLs
+    # 4. Copy & strip native Bloodborne.exe engine and bb-gpu-capabilities.exe + collect MSYS2 CLANG64 DLLs
     build_gpu = root / "build_win32_gpu"
     candidates = []
     if os.environ.get("MSYS2_CLANG64_BIN"):
@@ -229,7 +233,7 @@ def main() -> None:
 
     llvm_strip = clang64_bin / "llvm-strip.exe"
 
-    for exe_name in ("bb-probe.exe", "bb-gpu-capabilities.exe"):
+    for exe_name in ("Bloodborne.exe", "bb-gpu-capabilities.exe"):
         src_exe = build_gpu / exe_name
         dst_exe = stage / "bin" / exe_name
         if not src_exe.is_file():
@@ -248,7 +252,7 @@ def main() -> None:
         if p.is_file() and p.suffix.lower() == ".dll":
             clang_dll_map[p.name.lower()] = p
 
-    queue = [stage / "bin" / "bb-probe.exe", stage / "bin" / "bb-gpu-capabilities.exe"]
+    queue = [stage / "bin" / "Bloodborne.exe", stage / "bin" / "bb-gpu-capabilities.exe"]
     seen: set[str] = {"vulkan-1.dll"}
     copied_dlls = []
     while queue:
@@ -312,7 +316,7 @@ def main() -> None:
     sys.path.insert(0, str(root / "launcher"))
     import bbport_updater
 
-    tag_name = os.environ.get("GITHUB_REF_NAME") or "v1.1.7"
+    tag_name = os.environ.get("GITHUB_REF_NAME") or "v1.1.8"
     git_sha = os.environ.get("GITHUB_SHA") or ""
     bbport_updater.write_build_manifest(
         archive_path=Path(""),

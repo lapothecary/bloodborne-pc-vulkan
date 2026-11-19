@@ -152,6 +152,8 @@ void TellMonitor(SDL_Window* window) {
 } // namespace
 
 WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}, height{height_} {
+    // Wayland taskbar icon association: matches ~/.local/share/applications/bloodborne-vulkan.desktop.
+    SDL_SetHint(SDL_HINT_APP_ID, "bloodborne-vulkan");
     // Gamepads are sampled by runtime_pad.c; their events are pumped here with the window's.
     if (!SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
         UNREACHABLE_MSG("Failed to initialize SDL video: {}", SDL_GetError());

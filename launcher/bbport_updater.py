@@ -28,7 +28,7 @@ import urllib.request
 import zipfile
 
 GITHUB_REPO = "lapothecary/bloodborne-pc-vulkan"
-USER_AGENT = "BloodbornePCVulkan-Updater/1.1.7"
+USER_AGENT = "BloodbornePCVulkan-Updater/1.1.8"
 VERSION_STATE_FILE = ".bbport-version.json"
 
 LINUX_ARCHIVE = "bloodborne-pc-vulkan-linux-x86_64-prebuilt.tar.gz"
@@ -38,14 +38,14 @@ WINDOWS_MANIFEST = "windows-manifest.json"
 
 LINUX_CORE_FILES = (
     "out/gpu/libbbgpu.so",
-    "out/bb-probe",
+    "out/bb-vulkan",
     "out/bb-launcher",
     "launcher_v2/ui/app.js",
 )
 WINDOWS_CORE_FILES = (
-    "bin/bb-probe.exe",
+    "bin/Bloodborne.exe",
+    "Bloodborne.exe",
     "Launcher.exe",
-    "run.py",
     "launcher_v2/ui/app.js",
 )
 
@@ -105,7 +105,12 @@ def local_core_fingerprint(port_dir: Path, is_windows: bool | None = None) -> st
     if is_windows is None:
         is_windows = sys.platform == "win32"
     port_dir = Path(port_dir)
-    primary = port_dir / ("bin/bb-probe.exe" if is_windows else "out/gpu/libbbgpu.so")
+    if is_windows:
+        primary = port_dir / "bin/Bloodborne.exe"
+        if not primary.is_file():
+            primary = port_dir / "bin/bb-probe.exe"
+    else:
+        primary = port_dir / "out/gpu/libbbgpu.so"
     digest = sha256_file(primary)
     return digest[:12] if digest else "unknown"
 
@@ -247,8 +252,8 @@ def check_for_update(port_dir: Path, is_windows: bool | None = None) -> dict:
     else:
         up_to_date = bool(recorded_archive_sha and recorded_archive_sha == archive_sha256)
 
-    primary_key = "bin/bb-probe.exe" if is_windows else "out/gpu/libbbgpu.so"
-    remote_fp = (remote_core.get(primary_key) or archive_sha256)[:12]
+    primary_key = "bin/Bloodborne.exe" if is_windows else "out/gpu/libbbgpu.so"
+    remote_fp = (remote_core.get(primary_key) or remote_core.get("bin/bb-probe.exe") or archive_sha256)[:12]
 
     return {
         "ok": True,
@@ -609,6 +614,7 @@ def download_and_apply_update(
             "launcher.sh",
             "run.sh",
             "bb-launcher",
+            "bb-vulkan",
             "bb-probe",
             "probe",
             "bb-gpu-capabilities",
@@ -635,17 +641,9 @@ def download_and_apply_update(
                     tmp_dst.chmod(tmp_dst.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
                 os.replace(tmp_dst, dst_item)
 
-        # Keep out/probe synced with out/bb-probe when out/probe exists in local layout.
-        bb_probe = port_dir / "out" / "bb-probe"
-        legacy_probe = port_dir / "out" / "probe"
-        if bb_probe.is_file() and (legacy_probe.is_file() or not legacy_probe.exists()):
-            tmp_p = port_dir / "out" / ".probe.upd"
-            shutil.copy2(bb_probe, tmp_p)
-            tmp_p.chmod(tmp_p.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-            os.replace(tmp_p, legacy_probe)
-
-        # Invalidate cached binary patch table so updated scripts/patches.py applies on next launch.
+        # Invalidate cached binary patch table and launch manifest so updated scripts apply cleanly.
         (port_dir / "out" / "patches.bin").unlink(missing_ok=True)
+        (port_dir / "out" / "launch_env.txt").unlink(missing_ok=True)
 
         shutil.rmtree(tmp_root, ignore_errors=True)
         report(1.0, "Update complete!")
@@ -729,7 +727,7 @@ if __name__ == "__main__":
         print("[UPD-RESULT] " + json.dumps(res, ensure_ascii=False), flush=True)
         sys.exit(0 if res.get("ok") else 1)
 
-    tag_val = os.environ.get("GITHUB_REF_NAME") or "v1.1.7"
+    tag_val = os.environ.get("GITHUB_REF_NAME") or "v1.1.8"
     sha_val = os.environ.get("GITHUB_SHA") or ""
     if args.write_version:
         write_build_manifest(

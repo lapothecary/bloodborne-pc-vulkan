@@ -3,9 +3,11 @@
 
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cwchar>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <iostream>
 #include <memory>
@@ -534,8 +536,51 @@ void OnScriptMessage(WebKitUserContentManager*,
                                         nullptr, nullptr, nullptr);
 }
 
+void EnsureLinuxWaylandDesktopIcon(const std::string& app_id,
+                                   const std::string& app_name,
+                                   const fs::path& icon_path) {
+    std::error_code ec;
+    if (!fs::is_regular_file(icon_path, ec)) return;
+    fs::path apps_dir;
+    if (const char* xdg = std::getenv("XDG_DATA_HOME"); xdg && *xdg) {
+        apps_dir = fs::path(xdg) / "applications";
+    } else if (const char* home = std::getenv("HOME"); home && *home) {
+        apps_dir = fs::path(home) / ".local" / "share" / "applications";
+    } else {
+        return;
+    }
+    fs::create_directories(apps_dir, ec);
+    const fs::path desktop_file = apps_dir / (app_id + ".desktop");
+    const std::string desired =
+        "[Desktop Entry]\n"
+        "Type=Application\n"
+        "Name=" + app_name + "\n"
+        "Icon=" + fs::weakly_canonical(icon_path, ec).string() + "\n"
+        "StartupWMClass=" + app_id + "\n"
+        "NoDisplay=true\n";
+
+    // Only rewrite if missing or icon path changed
+    {
+        std::ifstream existing(desktop_file);
+        if (existing) {
+            std::string cur((std::istreambuf_iterator<char>(existing)),
+                            std::istreambuf_iterator<char>());
+            if (cur == desired) return;
+        }
+    }
+    std::ofstream out(desktop_file, std::ios::trunc);
+    out << desired;
+}
+
 int RunLinuxWebView(bb_launcher::LauncherContext ctx, int argc, char** argv) {
+    // Set explicit Wayland app_id + auto-register .desktop icon so KDE/GNOME Wayland taskbar
+    // shows our Hunter's Mark instead of the generic yellow 'W' Wayland placeholder.
+    EnsureLinuxWaylandDesktopIcon("bloodborne-vulkan-launcher", "Bloodborne Vulkan Remaster", ctx.icon_png_path);
+    EnsureLinuxWaylandDesktopIcon("bloodborne-vulkan", "Bloodborne Vulkan Remaster", ctx.icon_png_path);
+    g_set_prgname("bloodborne-vulkan-launcher");
+
     gtk_init(&argc, &argv);
+    gdk_set_program_class("bloodborne-vulkan-launcher");
 
     AppState app;
     app.bridge = std::make_unique<bb_launcher::LauncherBridge>(ctx);

@@ -34,8 +34,28 @@ mkdir -p "$BB_GPU_USER_DIR"
 if [[ -z ${BB_FSR411_DIR:-} && ! -d fsr4_411 && -d $data/fsr4_411 ]]; then
     export BB_FSR411_DIR=$data/fsr4_411
 fi
-if [[ -z ${BB_PREBUILT:-} && ! -f build.sh && -x $out/bb-probe ]]; then
+if [[ -z ${BB_PREBUILT:-} && ! -f build.sh && ( -x $out/bb-vulkan || -x $out/bb-probe ) ]]; then
     export BB_PREBUILT=1
+fi
+# Ensure Wayland taskbar icon association for the game window (SDL_HINT_APP_ID=bloodborne-vulkan).
+if [[ -n ${HOME:-} ]]; then
+    bb_icon=""
+    for ic in "$PWD/launcher/bloodborne.png" "$PWD/packaging/bbport.png"; do
+        [[ -f $ic ]] && { bb_icon=$ic; break; }
+    done
+    if [[ -n $bb_icon ]]; then
+        bb_apps="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+        mkdir -p "$bb_apps" 2>/dev/null || true
+        cat > "$bb_apps/bloodborne-vulkan.desktop" 2>/dev/null <<EOF || true
+[Desktop Entry]
+Type=Application
+Name=Bloodborne Vulkan Remaster
+Icon=$bb_icon
+Exec=$PWD/play.sh
+StartupWMClass=bloodborne-vulkan
+NoDisplay=true
+EOF
+    fi
 fi
 if [[ -z ${BB_PREBUILT:-} && -z ${BB_IN_NIX_SHELL:-} ]] && ! { command -v pkg-config >/dev/null && pkg-config --exists vulkan sdl3; } && command -v nix-shell >/dev/null; then
     args=''; if (( $# )); then args=$(printf '%q ' "$@"); fi
@@ -230,11 +250,13 @@ if [[ -z ${BB_PREBUILT:-} && -d fsr4_shaders ]] && command -v spirv-cross >/dev/
 fi
 if [[ -n ${BB_PREBUILT:-} ]]; then
     if [[ -n ${BB_PROBE:-} ]]; then probe=$BB_PROBE
+    elif [[ -x bin/bb-vulkan ]]; then probe=bin/bb-vulkan
+    elif [[ -x out/bb-vulkan ]]; then probe=out/bb-vulkan
     elif [[ -x bin/bb-probe ]]; then probe=bin/bb-probe
     else probe=out/bb-probe; fi
 else
     bash build.sh
-    probe=${BB_PROBE:-out/bb-probe}  # BB_PROBE: a wrapper (gdb) around it
+    probe=${BB_PROBE:-out/bb-vulkan}  # BB_PROBE: a wrapper (gdb) around it
 fi
 # Online play (BB_ONLINE=1, launcher: Online; the online module gpu/bbnet): the game's own server
 # goes to the community server, summon signs to the shadNet WebAPI (scripts/online.py).
