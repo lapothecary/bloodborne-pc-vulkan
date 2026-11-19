@@ -49,16 +49,29 @@ jobs:
       - name: Create or Update GitHub Release (Linux x86_64)
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name || 'v1.1.8' }}
-          name: "Bloodborne PC Vulkan ${{ github.ref_name || 'v1.1.8' }}"
+          tag_name: ${{ github.ref_name || 'v1.1.9' }}
+          name: "Bloodborne PC Vulkan ${{ github.ref_name || 'v1.1.9' }}"
           body: |
-            ## Bloodborne PC Vulkan ${{ github.ref_name || 'v1.1.8' }} (Windows & Linux `x86_64`)
+            ## Bloodborne PC Vulkan ${{ github.ref_name || 'v1.1.9' }} (Windows & Linux `x86_64`)
 
             ### Quick Start
             - **Windows 10/11**: Extract `bloodborne-pc-vulkan-windows-x86_64-prebuilt.zip` next to your `CUSA03173` (`v1.09`) folder and run **`Bloodborne.exe`** (direct native launch) or **`Launcher.exe`** (settings, mods, online & updates).
             - **Linux**: Extract `bloodborne-pc-vulkan-linux-x86_64-prebuilt.tar.gz` next to your `CUSA03173` (`v1.09`) folder and run **`./play.sh`** (direct launch) or **`./launcher.sh`** (launcher).
 
-            ### What's New in `${{ github.ref_name || 'v1.1.8' }}` — 100% Native Single-Process `Bloodborne.exe` / `bb-vulkan` (`0%` Python in RAM) & Wayland/Windows Taskbar Icons:
+            ### What's New in `${{ github.ref_name || 'v1.1.9' }}` — Cathedral Ward (`FeedBackBlur`) Crash Fix, Multi-Thread Crash Black-Box V2 & 1-Click Updater Fix:
+            - **Fixed 100% Reproducible Crash in Cathedral Ward / Oedon Chapel (`GXFeedBackBlurRenderPass::sub_22ae030`):**
+              - Fixed a double-dereference bug in decompiled `GXSceneRenderPass_ResolveMsaaColorTargetIfRequired` (`dantelion_gx/src/06_DeferredLightingAndAO/GXFeedBackBlurRenderPass.cpp:1412`), where `pTask + 0x438` (already a `GXGnmCommandContext*`) was erroneously dereferenced a second time (`+ 0x08`) into a 16-byte `CGGnmCommandBufferWrapper*` (`vtable = 0x80535f350`) before calling `GXGnmCommandContext_CopyResource`. Whenever FeedBackBlur resolve fired in Cathedral Ward / boss areas, `EmitCopyBuffer` overwrote adjacent heap memory or vtable `0x80535f350`, crashing all active `GXWorker` threads simultaneously. Now matches PS4 `eboot.bin` (`0x22ae071..0x22ae093`) 1:1.
+              - Added defense-in-depth hardening: explicit 2nd-argument forwarding in `CGDeferredContextGnm_Init` (`0x26d57e0`) and unsigned underflow guard (`cmd_ptr > end_ptr`) in `gx_direct_vulkan::ReserveDcbDwords`.
+              - Rebuilt both Linux (`out/gpu/libbbgpu.so`) and Windows COFF64 (`dantelion_gx/build_win32/libbb_gx_engine_native.a`) native C++20 engine binaries.
+            - **Crash Black-Box V2 — Zero-Silent-Exit & Multi-Thread Crash Parking:**
+              - Fixed empty `0`-byte `crash-*.log` files when multiple `GXWorker` threads crash concurrently: secondary faulting threads now park atomically (`g_crash_owner_tid` CAS) while the first faulting thread flushes the complete report to disk.
+              - Added immediate async-signal-safe `[BB-FAULT]` stderr beacon, `std::set_terminate`, Windows `EXCEPTION_STACK_OVERFLOW` (`0xC00000FD`), `SIGABRT`, `SetUnhandledExceptionFilter`, `SetThreadStackGuarantee(64 KiB)`, and `CreateFileW` UTF-16 support for Cyrillic/Unicode paths.
+            - **Fixed 1-Click Launcher Auto-Updater (`0%` Instant Abort):**
+              - Fixed `progress_cb` argument mismatch in `launcher/bbport_updater.py --apply-json` (`(frac, detail)`) and surfaced updater error messages cleanly in `launcher_v2/ui/app.js`.
+
+            ---
+
+            ### Previous Highlights (`v1.1.8` / `v1.1.7`):
             - **Zero Python in RAM During Gameplay (`Bloodborne.exe` on Windows, `bb-vulkan` on Linux):**
               - Replaced the internal `bb-probe` executable name everywhere with **`Bloodborne.exe`** (Windows, with embedded Hunter's Mark icon) and **`bb-vulkan`** (Linux).
               - Replaced the PyInstaller Python wrapper in the Windows root with a tiny **`~130 KiB` pure C++20 native `Bloodborne.exe` starter** (`launcher_v2/bloodborne_starter.cpp`). On steady-state launches, it validates `out/launch_env.txt` in `< 5 ms`, spawns native `bin/Bloodborne.exe` directly with OS log redirection, and exits immediately — leaving **only ONE `Bloodborne.exe` process** in Task Manager with **`0%` Python in RAM**!
@@ -204,7 +217,7 @@ jobs:
       - name: Upload Windows x86_64 Asset to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name || 'v1.1.8' }}
+          tag_name: ${{ github.ref_name || 'v1.1.9' }}
           files: |
             bloodborne-pc-vulkan-windows-x86_64-prebuilt.zip
             bloodborne-pc-vulkan-windows-x86_64-prebuilt.zip.sha256

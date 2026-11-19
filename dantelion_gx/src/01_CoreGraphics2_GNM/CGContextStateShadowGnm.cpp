@@ -204,8 +204,8 @@ extern "C" void sub_26d5810(uint8_t* outer_ctx) {
 
 // VMA: 0x26d57e0 (43 B)
 // Initializes deferred context and zeroes the 0x23a8-byte shadow state at +0xb730.
-int32_t CGDeferredContextGnm_Init(uint8_t* outer_ctx, [[maybe_unused]] void* init_params) {
-    reinterpret_cast<void (*)(void*)>(&sub_2168400_bridge)(outer_ctx);
+int32_t CGDeferredContextGnm_Init(uint8_t* outer_ctx, void* init_params) {
+    reinterpret_cast<void (*)(void*, void*)>(&sub_2168400_bridge)(outer_ctx, init_params);
     std::memset(outer_ctx + 0xb730, 0, 0x23a8);
     return 0;
 }

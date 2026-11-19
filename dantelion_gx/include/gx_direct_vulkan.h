@@ -843,7 +843,7 @@ inline uint32_t* ReserveDcbDwords(void* dcb_raw, uint32_t needed_dwords) noexcep
     auto* dcb = static_cast<uint8_t*>(dcb_raw);
     uintptr_t end_ptr = *reinterpret_cast<uintptr_t*>(dcb + 0x08);
     uintptr_t cmd_ptr = *reinterpret_cast<uintptr_t*>(dcb + 0x10);
-    if (((end_ptr - cmd_ptr) >> 2) < static_cast<uintptr_t>(needed_dwords)) {
+    if (cmd_ptr > end_ptr || ((end_ptr - cmd_ptr) >> 2) < static_cast<uintptr_t>(needed_dwords)) {
         using ReserveFn = bool (*)(void*, uint32_t, void*);
         auto fn = *reinterpret_cast<ReserveFn*>(dcb + 0x18);
         if (!fn || !fn(dcb, needed_dwords, *reinterpret_cast<void**>(dcb + 0x20))) {
@@ -851,7 +851,7 @@ inline uint32_t* ReserveDcbDwords(void* dcb_raw, uint32_t needed_dwords) noexcep
         }
         end_ptr = *reinterpret_cast<uintptr_t*>(dcb + 0x08);
         cmd_ptr = *reinterpret_cast<uintptr_t*>(dcb + 0x10);
-        if (((end_ptr - cmd_ptr) >> 2) < static_cast<uintptr_t>(needed_dwords)) {
+        if (cmd_ptr > end_ptr || ((end_ptr - cmd_ptr) >> 2) < static_cast<uintptr_t>(needed_dwords)) {
             return nullptr;
         }
     }

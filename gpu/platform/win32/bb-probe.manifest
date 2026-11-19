@@ -2,7 +2,7 @@
 <!-- bbport Windows: UTF-8 as the process code page (paths and text through the C runtime are
      UTF-8, as on Linux), long paths, Windows 10+. -->
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
-  <assemblyIdentity type="win32" name="bbport.Bloodborne" version="1.1.8.0"/>
+  <assemblyIdentity type="win32" name="bbport.Bloodborne" version="1.1.9.0"/>
   <application xmlns="urn:schemas-microsoft-com:asm.v3">
     <windowsSettings>
       <activeCodePage xmlns="http://schemas.microsoft.com/SMI/2019/WindowsSettings">UTF-8</activeCodePage>

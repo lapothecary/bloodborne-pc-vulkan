@@ -94,6 +94,7 @@ std::atomic<float> g_player_z{0.0f};
 
 std::atomic<bool> g_initialized{false};
 std::atomic<bool> g_crash_in_progress{false};
+std::atomic<std::uint32_t> g_crash_owner_tid{0};
 
 #ifndef _WIN32
 // Static demangle scratch buffer (only touched while g_crash_in_progress == true)
@@ -1127,16 +1128,35 @@ void NoteFrameTick() noexcept {
 // ============================================================================
 void WriteCrashReport(int sig, const void* fault_addr, void* ucontext_ptr,
                       const void* guest_image, std::uint64_t guest_size) noexcept {
-    if (g_crash_in_progress.exchange(true, std::memory_order_acq_rel)) {
-        const char msg[] = "[BB-FAULT-REENTRANT] secondary fault during crash report\n";
+    const std::uint32_t self_tid = CurrentThreadIdFast();
+    std::uint32_t expected_owner = 0;
+    if (!g_crash_owner_tid.compare_exchange_strong(expected_owner, self_tid,
+                                                   std::memory_order_acq_rel)) {
+        // Distinguish a CONCURRENT crash on a sibling thread from a TRUE recursive
+        // fault on the primary reporting thread: a sibling thread MUST park forever so it
+        // cannot return to fault() and call _exit(139) before the primary thread finishes
+        // writing and flushing logs/crash-YYYYMMDD_HHMMSS.log!
+        if (expected_owner != self_tid) {
+            const char msg[] = "[BB-FAULT-CONCURRENT] sibling thread faulted; parking while primary writes crash log...\n";
+#ifdef _WIN32
+            ::_write(2, msg, static_cast<unsigned int>(sizeof(msg) - 1));
+            for (;;) ::Sleep(INFINITE);
+#else
+            const ssize_t w = ::write(2, msg, sizeof(msg) - 1);
+            (void)w;
+            for (;;) ::pause();
+#endif
+        }
+        const char msg[] = "[BB-FAULT-REENTRANT] secondary fault on primary crash thread\n";
 #ifdef _WIN32
         ::_write(2, msg, static_cast<unsigned int>(sizeof(msg) - 1));
 #else
         const ssize_t w = ::write(2, msg, sizeof(msg) - 1);
         (void)w;
 #endif
-        return; // Prevent re-entrancy if another thread faults simultaneously
+        return;
     }
+    g_crash_in_progress.store(true, std::memory_order_release);
 
     const auto* guest_img = static_cast<const unsigned char*>(
         guest_image ? guest_image : g_guest_image.load(std::memory_order_acquire));

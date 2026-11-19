@@ -149,7 +149,7 @@ def main() -> None:
         nupkg_path = root / "dist_win" / "webview2.nupkg"
         wv2_url = "https://www.nuget.org/api/v2/package/Microsoft.Web.WebView2/1.0.2903.40"
         print(f"=== Downloading Microsoft.Web.WebView2 SDK ({wv2_url}) ===", flush=True)
-        req = urllib.request.Request(wv2_url, headers={"User-Agent": "BloodbornePCVulkan-CI/1.1.8"})
+        req = urllib.request.Request(wv2_url, headers={"User-Agent": "BloodbornePCVulkan-CI/1.1.9"})
         with urllib.request.urlopen(req, timeout=60) as resp:
             nupkg_path.write_bytes(resp.read())
         with zipfile.ZipFile(nupkg_path, "r") as zf:
@@ -316,7 +316,7 @@ def main() -> None:
     sys.path.insert(0, str(root / "launcher"))
     import bbport_updater
 
-    tag_name = os.environ.get("GITHUB_REF_NAME") or "v1.1.8"
+    tag_name = os.environ.get("GITHUB_REF_NAME") or "v1.1.9"
     git_sha = os.environ.get("GITHUB_SHA") or ""
     bbport_updater.write_build_manifest(
         archive_path=Path(""),

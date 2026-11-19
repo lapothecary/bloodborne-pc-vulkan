@@ -1410,14 +1410,13 @@ void sub_22ae030(void* pTaskContext, void* pViewportState) {
     }
 
     uint8_t* pResolveCtx = *reinterpret_cast<uint8_t**>(pTask + 0x438);
-    uint8_t* pResolveImpl = *reinterpret_cast<uint8_t**>(pResolveCtx + 0x8);
     void* pSrcTargetObj = *reinterpret_cast<void**>(pVpState + 0x1060);
     void** pSrcVt = *reinterpret_cast<void***>(pSrcTargetObj);
     void* pSrcSurface = reinterpret_cast<FnVtableRetPtr>(pSrcVt[5])(pSrcTargetObj);
 
     pSurface = *reinterpret_cast<uint8_t**>(pTargetSlot + 0x30);
     void* pDstSurface = *reinterpret_cast<void**>(pSurface + 0x8);
-    sub_2168660(pResolveImpl, pResolveImpl + 0xb730, pSrcSurface, pDstSurface);
+    sub_2168660(pResolveCtx, pResolveCtx + 0xb730, pSrcSurface, pDstSurface);
 }
 
 // ============================================================================
