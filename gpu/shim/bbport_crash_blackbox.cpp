@@ -25,15 +25,6 @@
 #include <ctime>
 #include <exception>
 
-#include <dlfcn.h>
-#include <fcntl.h>
-#include <pthread.h>
-#include <signal.h>
-#include <sys/stat.h>
-#include <sys/uio.h>
-#include <ucontext.h>
-#include <unistd.h>
-
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -43,7 +34,18 @@
 #endif
 #include <windows.h>
 #include <io.h>
-#else
+#endif
+
+#include <dlfcn.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <signal.h>
+#include <sys/stat.h>
+#include <sys/uio.h>
+#include <ucontext.h>
+#include <unistd.h>
+
+#ifndef _WIN32
 #include <cxxabi.h>
 #include <sys/syscall.h>
 #endif
@@ -977,7 +979,7 @@ const char* SignalName(int sig) noexcept {
     }
 }
 
-void BbTerminateHandler() noexcept {
+void BbTerminateHandler() {
     if (std::exception_ptr ep = std::current_exception()) {
         try {
             std::rethrow_exception(ep);
@@ -1001,11 +1003,11 @@ void BbTerminateHandler() noexcept {
 #else
     WriteCrashReport(SIGABRT, __builtin_return_address(0), nullptr, nullptr, 0);
 #endif
-    ::_exit(134);
+    std::_Exit(134);
 }
 
 #ifdef _WIN32
-void BbWin32AbortHandler(int sig) noexcept {
+extern "C" void BbWin32AbortHandler(int sig) {
     if (g_extra_reason[0] == '\0') {
         std::snprintf(g_extra_reason, sizeof(g_extra_reason),
                       "CRT abort() / SIGABRT (%d) intercepted before Win32 __fastfail", sig);
@@ -1015,7 +1017,7 @@ void BbWin32AbortHandler(int sig) noexcept {
     ucontext_t uc{};
     BbWin32ToUcontext(&ctx, 0, &uc);
     WriteCrashReport(SIGABRT, reinterpret_cast<const void*>(ctx.Rip), &uc, nullptr, 0);
-    ::_exit(134);
+    std::_Exit(134);
 }
 
 LONG WINAPI BbWin32UnhandledExceptionFilter(EXCEPTION_POINTERS* pointers) {
@@ -1035,7 +1037,7 @@ LONG WINAPI BbWin32UnhandledExceptionFilter(EXCEPTION_POINTERS* pointers) {
         BbWin32ToUcontext(pointers->ContextRecord, err_mark, &uc);
     }
     WriteCrashReport(SIGSEGV, addr, (pointers && pointers->ContextRecord) ? &uc : nullptr, nullptr, 0);
-    ::_exit(139);
+    std::_Exit(139);
     return EXCEPTION_EXECUTE_HANDLER;
 }
 #endif
