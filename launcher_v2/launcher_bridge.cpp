@@ -622,8 +622,10 @@ void LauncherBridge::StartUpdateCheck() {
         if (rc == 0 && !last_json.empty()) {
             upd_.ok = ExtractJsonField(last_json, "ok") == "true";
             upd_.up_to_date = ExtractJsonField(last_json, "up_to_date") == "true";
-            upd_.remote_tag = ExtractJsonField(last_json, "remote_tag");
+            upd_.remote_tag = ExtractJsonField(last_json, "tag");
+            if (upd_.remote_tag.empty()) upd_.remote_tag = ExtractJsonField(last_json, "remote_tag");
             upd_.local_tag = ExtractJsonField(last_json, "local_tag");
+            if (upd_.local_tag.empty()) upd_.local_tag = ReadVersionTag();
             upd_.error = ExtractJsonField(last_json, "error");
         } else {
             upd_.ok = false;
@@ -738,7 +740,7 @@ std::string LauncherBridge::BuildStateJson() const {
     std::string lang = ReadIniValue("launcher_lang", "en");
     if (lang != "ru" && lang != "en") lang = "en";
     const bool sfx_on = ReadIniValue("launcher_sfx", "1") != "0";
-    std::string sfx_vol = ReadIniValue("launcher_sfx_vol", "0.65");
+    std::string sfx_vol = ReadIniValue("launcher_sfx_vol", "0.30");
 
     std::string online_pool = ReadIniValue("online_pool", "offline");
     bool online_upnp = ReadIniValue("online_upnp", "1") != "0";
@@ -750,7 +752,7 @@ std::string LauncherBridge::BuildStateJson() const {
        << "\"version\":\"" << JsonEscape(ReadVersionTag()) << "\","
        << "\"lang\":\"" << JsonEscape(lang) << "\","
        << "\"sfxEnabled\":" << (sfx_on ? "true" : "false") << ","
-       << "\"sfxVolume\":" << (sfx_vol.empty() ? "0.65" : sfx_vol) << ","
+       << "\"sfxVolume\":" << (sfx_vol.empty() ? "0.30" : sfx_vol) << ","
        << "\"shaderCount\":" << shaders << ","
        << "\"shaderTotal\":5761,"
        << "\"onlinePool\":\"" << JsonEscape(online_pool) << "\","

@@ -110,7 +110,7 @@
     dream: "The Hunter's Dream",
   };
 
-  let state = { lang: "en", sfxEnabled: true, sfxVolume: 0.65, gameValid: false };
+  let state = { lang: "en", sfxEnabled: true, sfxVolume: 0.30, gameValid: false };
   const sfxBuffers = {};
   let lastHoverAt = 0;
   let wizardSkipped = false;
@@ -223,7 +223,7 @@
         const src = ctx.createBufferSource();
         const gain = ctx.createGain();
         src.buffer = buf;
-        gain.gain.value = Math.max(0, Math.min(1, Number(state.sfxVolume) || 0.65));
+        gain.gain.value = Math.max(0, Math.min(1, Number(state.sfxVolume) || 0.30));
         src.connect(gain);
         if (reverbDryGain && reverbConvolver) {
           gain.connect(reverbDryGain);
@@ -307,7 +307,7 @@
 
     document.getElementById("chk-online-upnp").checked = !!state.onlineUpnp;
     document.getElementById("chk-sfx-on").checked = !!state.sfxEnabled;
-    document.getElementById("rng-sfx-vol").value = Math.round((state.sfxVolume ?? 0.65) * 100);
+    document.getElementById("rng-sfx-vol").value = Math.round((state.sfxVolume ?? 0.30) * 100);
     document.getElementById("btn-sfx").classList.toggle("muted", !state.sfxEnabled);
 
     const modsList = document.getElementById("mods-list");
@@ -526,9 +526,13 @@
     };
     document.getElementById("btn-sfx").addEventListener("click", () => toggleSfx(!state.sfxEnabled));
     document.getElementById("chk-sfx-on").addEventListener("change", (e) => toggleSfx(e.target.checked));
+    document.getElementById("rng-sfx-vol").addEventListener("input", (e) => {
+      state.sfxVolume = Number(e.target.value) / 100;
+    });
     document.getElementById("rng-sfx-vol").addEventListener("change", async (e) => {
       const v = (Number(e.target.value) / 100).toFixed(2);
       state = await window.bbInvoke("setUiPref", { sfxVolume: v });
+      renderState();
       playSfx("click");
     });
 

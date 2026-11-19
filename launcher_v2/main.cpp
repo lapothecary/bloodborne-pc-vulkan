@@ -287,7 +287,7 @@ int RunWindowsWebView(bb_launcher::LauncherContext ctx) {
     const int pos_y = (scr_h - win_h) / 2;
 
     HWND hwnd = CreateWindowExW(
-        0, wc.lpszClassName, L"Bloodborne PC Vulkan",
+        0, wc.lpszClassName, L"Bloodborne Vulkan Remaster",
         WS_POPUP | WS_MINIMIZEBOX | WS_SYSMENU | WS_CLIPCHILDREN,
         pos_x, pos_y, win_w, win_h,
         nullptr, nullptr, hinst, nullptr);
@@ -542,7 +542,7 @@ int RunLinuxWebView(bb_launcher::LauncherContext ctx, int argc, char** argv) {
 
     GtkWidget* window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
     app.window = window;
-    gtk_window_set_title(GTK_WINDOW(window), "Bloodborne PC Vulkan");
+    gtk_window_set_title(GTK_WINDOW(window), "Bloodborne Vulkan Remaster");
 
     GdkScreen* screen = gtk_widget_get_screen(window);
     if (GdkVisual* rgba = gdk_screen_get_rgba_visual(screen)) {

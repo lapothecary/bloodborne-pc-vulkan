@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Bloodborne PC Vulkan</title>
+  <title>Bloodborne Vulkan Remaster</title>
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
@@ -12,7 +12,7 @@
     <header id="titlebar" class="titlebar">
       <div class="titlebar-drag" id="titlebar-drag">
         <img src="../../launcher/bloodborne.png" alt="" class="titlebar-icon" />
-        <span class="titlebar-text">BLOODBORNE <span class="sep">/</span> PC VULKAN</span>
+        <span class="titlebar-text">BLOODBORNE VULKAN REMASTER</span>
       </div>
       <div class="titlebar-controls">
         <button id="btn-win-min" class="win-btn" title="Minimize" aria-label="Minimize">
@@ -32,16 +32,15 @@
         <div class="hero-vignette"></div>
       </div>
 
-      <!-- Slim Left Navigation Rail (layout inspired by yharnam-pc) -->
+      <!-- Slim Left Navigation Rail (Hunter's Mark IS the Home button — zero duplicate) -->
       <aside class="rail">
-        <button class="rail-brand" data-tab="home" title="Bloodborne PC Vulkan">
+        <button class="rail-brand rail-btn active" data-tab="home" data-i18n-title="nav_home">
           <img src="../../launcher/bloodborne.png" alt="Hunter's Mark" class="brand-icon" />
         </button>
 
+        <div class="rail-sep"></div>
+
         <nav class="rail-nav" aria-label="Primary">
-          <button class="rail-btn active" data-tab="home" data-i18n-title="nav_home">
-            <svg viewBox="0 0 24 24" class="ico"><path d="M12 2L14 9L19 15L15 19L12 16L9 19L5 15L10 9Z" fill="none" stroke="currentColor" stroke-width="1.6"/></svg>
-          </button>
           <button class="rail-btn" data-tab="mods" data-i18n-title="nav_mods">
             <svg viewBox="0 0 24 24" class="ico"><path d="M4 7l8-4 8 4-8 4-8-4zm0 5l8 4 8-4m-16 5l8 4 8-4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>
           </button>
@@ -72,17 +71,6 @@
             <h1 id="hero-title" class="hero-title" data-i18n="hero_ready">Ready to hunt</h1>
 
             <div class="ornament-rule"><span></span><i></i><span></span></div>
-
-            <!-- Hidden until a newer GitHub release is detected -->
-            <div id="home-update-banner" class="update-banner hidden">
-              <div class="update-banner-top">
-                <span id="home-update-text" class="update-text">Update available</span>
-                <button id="btn-home-update" class="bb-btn-mini" data-i18n="btn_update_now">Update</button>
-              </div>
-              <div id="home-update-bar-wrap" class="progress-track hidden">
-                <div id="home-update-bar" class="progress-fill"></div>
-              </div>
-            </div>
 
             <button id="btn-play" class="bb-btn-primary">
               <span class="btn-label" data-i18n="btn_play">Play</span>
@@ -256,7 +244,7 @@
                 <div class="row-sub" data-i18n="sfx_sub">Decoded locally from your sprj_main_*.fsb with gothic chamber reverb</div>
               </div>
               <div class="btn-group">
-                <input id="rng-sfx-vol" type="range" min="0" max="100" value="65" class="bb-range" />
+                <input id="rng-sfx-vol" type="range" min="0" max="100" value="30" class="bb-range" />
                 <label class="bb-switch">
                   <input id="chk-sfx-on" type="checkbox" checked />
                   <span class="slider"></span>
@@ -297,6 +285,18 @@
             <button id="btn-wiz-pick" class="bb-btn-primary wiz-btn" data-i18n="wiz_choose">Choose Game Folder</button>
             <button id="btn-wiz-skip" class="bb-btn-secondary" data-i18n="wiz_skip">Skip for now</button>
           </div>
+        </div>
+      </div>
+
+      <!-- Floating Update Plaque (top-right corner — zero layout shift on Play/buttons) -->
+      <div id="home-update-banner" class="update-plaque hidden">
+        <div class="update-plaque-top">
+          <span class="plaque-diamond">◆</span>
+          <span id="home-update-text" class="update-text">Update available</span>
+          <button id="btn-home-update" class="bb-btn-mini" data-i18n="btn_update_now">Update</button>
+        </div>
+        <div id="home-update-bar-wrap" class="progress-track hidden">
+          <div id="home-update-bar" class="progress-fill"></div>
         </div>
       </div>
 
