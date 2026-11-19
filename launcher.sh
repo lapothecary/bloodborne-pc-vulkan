@@ -14,15 +14,12 @@ fi
 export BB_PREBUILT="${BB_PREBUILT:-1}"
 export BB_DATA_DIR="${BB_DATA_DIR:-$PWD}"
 export BB_GX_MODULES="${BB_GX_MODULES:-all}"
-export BB_FPS="${BB_FPS:-uncap}"
-export BB_FPS_LIMIT="${BB_FPS_LIMIT:-0}"
-export BB_PC_MODEL="${BB_PC_MODEL:-0}"
-export BB_PREUPLOAD="${BB_PREUPLOAD:-2}"
-export BB_READBACKS="${BB_READBACKS:-0}"
-export BB_BREADCRUMBS="${BB_BREADCRUMBS:-0}"
-export BB_INDIRECT_GUARD="${BB_INDIRECT_GUARD:-0}"
-export BB_OBJECT_MOTION="${BB_OBJECT_MOTION:-0}"
-export BB_LIVE_RES="${BB_LIVE_RES:-0}"
 
-exec python3 ./launcher/bbport_launcher.py "$@"
-# Release v1.1.1
+if [[ -x ./bin/bb-launcher ]]; then
+    exec ./bin/bb-launcher "$@"
+elif [[ -x ./launcher_v2/build/bb-launcher ]]; then
+    exec ./launcher_v2/build/bb-launcher "$@"
+else
+    echo "Error: bb-launcher binary not found." >&2
+    exit 1
+fi

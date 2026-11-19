@@ -137,21 +137,55 @@ def main() -> None:
         emit_error(f"Bloodborne.exe was not generated in {bbport_run_dir}")
         sys.exit(1)
 
-    # 2. Assemble staging directory
+    # 2. Build native C++20 WebView2 Launcher (Launcher.exe) with MSVC + WebView2 NuGet SDK
+    import urllib.request
+    wv2_dir = root / "dist_win" / "webview2_sdk"
+    if not (wv2_dir / "build" / "native" / "include" / "WebView2.h").is_file():
+        if wv2_dir.exists():
+            shutil.rmtree(wv2_dir)
+        wv2_dir.mkdir(parents=True, exist_ok=True)
+        nupkg_path = root / "dist_win" / "webview2.nupkg"
+        wv2_url = "https://www.nuget.org/api/v2/package/Microsoft.Web.WebView2/1.0.2903.40"
+        print(f"=== Downloading Microsoft.Web.WebView2 SDK ({wv2_url}) ===", flush=True)
+        req = urllib.request.Request(wv2_url, headers={"User-Agent": "BloodbornePCVulkan-CI/1.1.7"})
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            nupkg_path.write_bytes(resp.read())
+        with zipfile.ZipFile(nupkg_path, "r") as zf:
+            zf.extractall(wv2_dir)
+        nupkg_path.unlink(missing_ok=True)
+
+    launcher_build = root / "dist_win" / "launcher_build"
+    if launcher_build.exists():
+        shutil.rmtree(launcher_build)
+    run_checked([
+        "cmake", "-S", str(root / "launcher_v2"), "-B", str(launcher_build),
+        "-A", "x64",
+        f"-DWEBVIEW2_SDK_DIR={wv2_dir.as_posix()}",
+    ], "CMAKE_LAUNCHER_V2")
+    run_checked([
+        "cmake", "--build", str(launcher_build), "--config", "Release", "--target", "Launcher",
+    ], "BUILD_LAUNCHER_V2")
+    built_launcher_exe = launcher_build / "Release" / "Launcher.exe"
+    if not built_launcher_exe.is_file():
+        emit_error(f"Native C++20 WebView2 Launcher.exe was not generated at {built_launcher_exe}")
+        sys.exit(1)
+
+    # 3. Assemble staging directory
     stage = root / "dist_win" / "bloodborne-pc-vulkan-windows"
     if stage.exists():
         shutil.rmtree(stage)
     (stage / "bin").mkdir(parents=True, exist_ok=True)
     (stage / "launcher").mkdir(parents=True, exist_ok=True)
+    (stage / "launcher_v2").mkdir(parents=True, exist_ok=True)
     (stage / "scripts" / "bbsc_gameserver").mkdir(parents=True, exist_ok=True)
 
     shutil.copytree(bbport_run_dir, stage, dirs_exist_ok=True)
-    shutil.copy2(stage / "Bloodborne.exe", stage / "Launcher.exe")
-    for fname in ("Launcher.py", "play.bat", "run.py", "LICENSE"):
+    shutil.copy2(built_launcher_exe, stage / "Launcher.exe")
+    shutil.copytree(root / "launcher_v2" / "ui", stage / "launcher_v2" / "ui", dirs_exist_ok=True)
+    for fname in ("play.bat", "run.py", "LICENSE"):
         src = root / fname
         if src.is_file():
             shutil.copy2(src, stage / fname)
-    shutil.copy2(root / "Launcher.py", stage / "launcher" / "bbport_launcher_win.py")
     if (root / "launcher" / "bbport_updater.py").is_file():
         shutil.copy2(root / "launcher" / "bbport_updater.py", stage / "launcher" / "bbport_updater.py")
     readme_win = root / "packaging" / "windows" / "README-Windows.txt"
@@ -277,7 +311,7 @@ def main() -> None:
     sys.path.insert(0, str(root / "launcher"))
     import bbport_updater
 
-    tag_name = os.environ.get("GITHUB_REF_NAME") or "v1.1.6"
+    tag_name = os.environ.get("GITHUB_REF_NAME") or "v1.1.7"
     git_sha = os.environ.get("GITHUB_SHA") or ""
     bbport_updater.write_build_manifest(
         archive_path=Path(""),

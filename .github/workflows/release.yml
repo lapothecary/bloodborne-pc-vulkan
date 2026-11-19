@@ -20,14 +20,23 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Build portable Linux C++20 WebView Launcher (out/bb-launcher)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libwebkit2gtk-4.1-dev pkg-config cmake ninja-build
+          cmake -S launcher_v2 -B launcher_v2/build_ci -G Ninja -DCMAKE_BUILD_TYPE=Release
+          ninja -C launcher_v2/build_ci
+          cp -f launcher_v2/build_ci/bb-launcher out/bb-launcher
+          chmod +x out/bb-launcher play.sh launcher.sh run.sh
+
       - name: Package prebuilt Linux x86_64 archive
         run: |
           python3 launcher/bbport_updater.py --write-version .bbport-version.json
           tar --exclude='__pycache__' -czf bloodborne-pc-vulkan-linux-x86_64-prebuilt.tar.gz \
             .bbport-version.json \
-            play.sh launcher.sh run.sh Launcher.py run.py bin \
-            scripts patches launcher \
-            out/bb-probe out/bb-gpu-capabilities \
+            play.sh launcher.sh run.sh run.py bin \
+            scripts patches launcher launcher_v2/ui \
+            out/bb-launcher out/bb-probe out/bb-gpu-capabilities \
             out/libbbport_dlss.so out/libnvidia-ngx-dlss.so.310.9.1 \
             out/gpu/libbbgpu.so out/gpu/libbbnet20.so \
             fsr4_shaders
@@ -40,16 +49,30 @@ jobs:
       - name: Create or Update GitHub Release (Linux x86_64)
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name || 'v1.1.6' }}
-          name: "Bloodborne PC Vulkan ${{ github.ref_name || 'v1.1.6' }}"
+          tag_name: ${{ github.ref_name || 'v1.1.7' }}
+          name: "Bloodborne PC Vulkan ${{ github.ref_name || 'v1.1.7' }}"
           body: |
-            ## Bloodborne PC Vulkan ${{ github.ref_name || 'v1.1.6' }} (Windows & Linux `x86_64`)
+            ## Bloodborne PC Vulkan ${{ github.ref_name || 'v1.1.7' }} (Windows & Linux `x86_64`)
 
             ### Quick Start
-            - **Windows 10/11**: Extract `bloodborne-pc-vulkan-windows-x86_64-prebuilt.zip` next to your `CUSA03173` (`v1.09`) folder and run **`Bloodborne.exe`** (or **`Launcher.exe`**).
-            - **Linux**: Extract `bloodborne-pc-vulkan-linux-x86_64-prebuilt.tar.gz` next to your `CUSA03173` (`v1.09`) folder and run **`./play.sh`** (or **`./launcher.sh`**).
+            - **Windows 10/11**: Extract `bloodborne-pc-vulkan-windows-x86_64-prebuilt.zip` next to your `CUSA03173` (`v1.09`) folder and run **`Bloodborne.exe`** (direct launch) or **`Launcher.exe`** (settings, mods, online & updates).
+            - **Linux**: Extract `bloodborne-pc-vulkan-linux-x86_64-prebuilt.tar.gz` next to your `CUSA03173` (`v1.09`) folder and run **`./play.sh`** (direct launch) or **`./launcher.sh`** (launcher).
 
-            ### What's New in `${{ github.ref_name || 'v1.1.6' }}` — Full-Game Vulkan Shader Pre-Baker (`5,761` Shaders) & Zero-Stutter Async Engine:
+            ### What's New in `${{ github.ref_name || 'v1.1.7' }}` — Native C++20 Gothic WebView Launcher (`~270 KiB`) & Authentic Bloodborne Menu Audio:
+            - **Brand-New Lightweight Native C++20 WebView Launcher (`WebView2` on Windows 10/11 & `WebKitGTK 4.1` on Linux):**
+              - Replaced the bulky Python Tkinter / GTK4 / WPF launchers (~36 obsolete files, `-1.21 MiB` removed) with a sleek, instant-start **`~270–450 KiB`** native C++20 frameless gothic launcher with custom rounded titlebar, embedded **Hunter's Mark** desktop icon (zero Tk feather icon!), and original Victorian-gothic backdrop artwork.
+              - Focused strictly on pre-launch essentials (no duplicate graphics clutter — all graphics, remaster shaders, camera & controls live directly inside the in-game `System` menu): **Home (`Play` + 1-click SHA-256 Update banner)**, **Mods & Patches**, **Online (`bbnet20`)**, **System & Cache (`Pre-Bake 5,761 Shaders` live progress bar, Safe-Mode Graphics Reset, Quick Folders)**, plus an automatic **First-Time Setup Wizard** when no `eboot.bin` folder is found yet.
+              - Layout & first-time setup flow inspired by [`Jgamrot/yharnam-pc`](https://github.com/Jgamrot/yharnam-pc) (`GPL-2.0`).
+            - **Authentic Bloodborne Menu Audio + Gothic Chamber Stereo Reverb (100% Legal Runtime Extraction):**
+              - Decodes Bloodborne's authentic UI audio (`CURSOL_MOVE`, `CURSOL_SELECT`, `menu_open`, `CURSOL_CANCEL`, and full-tail `CURSOL_OK` on `Play`) at runtime directly from the user's own local `dvdroot_ps4/sound/sprj_main_*.fsb` via bundled `LibAtrac9` (zero Sony/FromSoftware audio assets in the repo or release archives), processed through a Web Audio `ConvolverNode` stone-chamber stereo reverb emulating FMOD's in-game `SFX Reverb`.
+            - **Windows Release Cleanup & Polish:**
+              - Removed redundant `bbport-run.exe` (only clean `Bloodborne.exe` and native `Launcher.exe` remain).
+              - Added automatic Windows Explorer icon cache refresh (`SHChangeNotify`) after 1-click PowerShell updates.
+              - Includes all `v1.1.6` performance & stability updates (`129` native GLSL 460 shaders, 4-bucket `Front-to-Back` G-Buffer reordering, `O(1)` `Resolve0`, balanced 5-worker skinning, expanded `MicroShadow`, `5,761`-shader pre-baker + idle `bb:AutoBake`, blood-splatter fix, and clean DLSS NGX shutdown on `[X]`).
+
+            ---
+
+            ### Previous Highlights (`v1.1.6` / `v1.1.5`):
             - **Full-Game + Embedded `eboot.bin` Vulkan Shader & PSO Pre-Baker (`0% → 100%`, `5,761 / 5,761` Shaders):**
               - **Complete Shader Coverage (`5,761` Unique Programs + `423` Base PSOs):** Added a standalone native Vulkan shader pre-compiler (`bb-probe --bake-shaders` + dedicated **Vulkan Shader Cache & Pre-Compilation** `0% → 100%` progress card and safe **Clear Cache** button in all Windows & Linux Launchers). Scans all 7 `dvdroot_ps4/shader/*.shaderbnd.dcx` archives (supporting both merged `CUSA03173` and split `CUSA03173-patch` layouts) **plus** all embedded `Shdr\x07` containers inside `eboot.bin` (`354` Scaleform GFx UI / internal GNM / Compute shaders + the active `EXP_32_ABGR` Yebis 2 Post-FX bank: `CS=68 + PS=4,058 + VS=1,635 = 5,761` unique programs), synthesized with exact 1:1 hardware `RuntimeInfo` (`VS num_input_vgprs = 3`, `step_rate_0/1 = 0`, `Format10_11_11` on 6-MRT `cb=4` & 2-MRT passes, `default_cb` `stride = 16`, and dual `_0 + _1` HDR/LDR specializations).
               - **12-Thread Parallel Startup `WarmUp()` (`~292 ms`):** Parallelized `PipelineStore::WarmUp` (`Phase 3B`) across up to 12 worker threads so all `5,761` pre-baked `VkShaderModule` binaries (`opt31_*.spv`) and `423` base PSOs load in under `0.3 s` at boot.
@@ -182,7 +205,7 @@ jobs:
       - name: Upload Windows x86_64 Asset to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name || 'v1.1.6' }}
+          tag_name: ${{ github.ref_name || 'v1.1.7' }}
           files: |
             bloodborne-pc-vulkan-windows-x86_64-prebuilt.zip
             bloodborne-pc-vulkan-windows-x86_64-prebuilt.zip.sha256

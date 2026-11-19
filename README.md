@@ -24,10 +24,10 @@ Instead of translating raw PS4 GPU command buffers and unified-memory page fault
 
 ```text
 BloodBorne/
-├── CUSA03173/                   # Your unpacked Bloodborne v1.09 game folder (contains eboot.bin, dvdroot_ps4/, ...)
-└── bloodborne-pc-vulkan/        # Extracted release folder:
-    ├── Bloodborne.exe / play.sh # Direct game launch
-    ├── Launcher.exe / Launcher.py # 8-page GUI Settings Configurator
+├── CUSA03173/                      # Your unpacked Bloodborne v1.09 game folder (contains eboot.bin, dvdroot_ps4/, ...)
+└── bloodborne-pc-vulkan/           # Extracted release folder:
+    ├── Bloodborne.exe / play.sh    # Direct game launch (no launcher popup)
+    ├── Launcher.exe / launcher.sh  # Lightweight C++20 WebView Launcher (Mods, Online, Shader Pre-Bake & Updates)
     └── ...
 ```
 
@@ -35,7 +35,17 @@ BloodBorne/
 
 ---
 
-## 🆕 What's New in `v1.1.6` — Full-Game Vulkan Shader Pre-Baker & Zero-Stutter Runtime
+## 🆕 What's New in `v1.1.7` — Native C++20 Gothic WebView Launcher & Authentic Bloodborne Menu Audio
+
+* **Lightweight Native C++20 WebView Launcher (`~270–450 KiB`, `WebView2` on Windows 10/11 & `WebKitGTK 4.1` on Linux):**
+  * Replaced the legacy Python Tkinter / GTK4 / WPF launchers (`36` obsolete files, `-1.21 MiB` removed) with a fast, frameless dark-gothic C++20 WebView launcher with custom rounded titlebar, embedded **Hunter's Mark** desktop icon, and original Victorian-gothic hero artwork.
+  * Focused cleanly on the 4 true pre-launch workflows (all graphics, remaster shaders, camera & controls switch live inside the in-game `System` menu without duplication): **Home (`Play` + 1-click SHA-256 Update banner)**, **Mods & Patches**, **Online (`bbnet20`)**, **System & Cache (`Pre-Bake 5,761 Shaders` live progress bar, Safe-Mode Graphics Reset, Quick Folders)**, plus an automatic **First-Time Setup Wizard** when no folder containing `eboot.bin` is found yet.
+  * Launcher layout and first-time setup wizard architecture are adapted and refined from [`Jgamrot/yharnam-pc`](https://github.com/Jgamrot/yharnam-pc) (`GPL-2.0`).
+* **Authentic Bloodborne Menu SFX + Gothic Chamber Stereo Reverb (100% Legal Runtime Decoding):**
+  * Decodes Bloodborne's original UI sounds (`CURSOL_MOVE`, `CURSOL_SELECT`, `menu_open`, `CURSOL_CANCEL`, and full-tail `CURSOL_OK` on `Play`) at runtime directly from the user's own local `dvdroot_ps4/sound/sprj_main_*.fsb` via bundled `LibAtrac9` (zero Sony/FromSoftware audio assets in this repository or release archives), routed through a Web Audio `ConvolverNode` stone-chamber stereo reverb emulating FMOD's in-game `SFX Reverb`.
+* **Cleaner Windows Packaging:** Removed the redundant `bbport-run.exe` (only `Bloodborne.exe` and native `Launcher.exe` remain) and added automatic Windows Explorer icon cache refresh (`SHChangeNotify`) after 1-click PowerShell updates.
+
+### Highlights from `v1.1.6` — Full-Game Vulkan Shader Pre-Baker & Zero-Stutter Runtime
 
 * **Full-Game + `eboot.bin` Vulkan Shader & PSO Pre-Baker (`0% → 100%`, `5,761 / 5,761` Shaders):** Added `bb-probe --bake-shaders` and a dedicated **Vulkan Shader Cache & Pre-Compilation** (`0% → 100%` progress bar + safe **Clear Cache**) card across all Windows & Linux Launchers (`Engine and Debug` / `Performance`). Scans all 7 `dvdroot_ps4/shader/*.shaderbnd.dcx` archives **plus** all embedded `Shdr\x07` containers inside `eboot.bin` (`354` Scaleform GFx UI / internal GNM / Compute shaders + the active `EXP_32_ABGR` Yebis 2 Post-FX bank: `CS=68 + PS=4,058 + VS=1,635 = 5,761` unique programs + `423` base PSOs), loading all `5,761` modules in **`~292 ms`** at startup across 12 threads.
 * **Polite Invisible Background Auto-Baker (`bb:AutoBake`):** On game startup, automatically checks if all `5,761` shaders are already warm in `user/cache/` (`0%` CPU when warm). On a fresh install — even if you press **`PLAY`** right away without running the Launcher baker — silently pre-compiles missing shaders in the background on `1–3` OS idle-priority threads (`SCHED_IDLE` / `THREAD_PRIORITY_LOWEST`, `~10–15%` CPU) without blocking the Title Screen or impacting FPS.
@@ -190,6 +200,7 @@ BB_GX_SKIP_MIN=0x22900a0 BB_GX_SKIP_MAX=0x2292000 ./play.sh
 * **Upstream Foundation (Credit Where Credit Is Due):**
   * **[`bbport` (`deadinside28/bloodborne_pc`)](https://github.com/deadinside28/bloodborne_pc)** — Host ELF/PE loader, PS4 kernel/system runtime (`src/`), Windows native port foundation (`run.py`, MSYS2 CLANG64 build, NVAPI *Prefer Maximum Performance*), upscaler & AA bridges (`FSR 3.1`, `FSR 4`, `DLSS`, `Frame Generation`, `TAA`, `FXAA`, base `RCAS`), Ultrawide (`21:9`/`32:9`), custom output resolutions, `16×` Anisotropic Filtering, Havok cloth stiffness & base frame-pacing hooks, raw Mouse Look, cutscene skip, base in-game `Display`/`Effects` pages & pause-menu `Exit Game`, and online module (`bbnet20`).
   * **[`shadPS4` (`shadps4-emu/shadPS4`)](https://github.com/shadps4-emu/shadPS4)** — Original PS4 Vulkan video core and GCN-to-SPIR-V shader recompiler foundation (`GPL-2.0-or-later`).
+  * **[`yharnam-pc` (`Jgamrot/yharnam-pc`)](https://github.com/Jgamrot/yharnam-pc)** — Inspiration and UX layout reference (slim navigation rail, *Ready to hunt* home layout, and first-time setup wizard flow, `GPL-2.0`), adapted and rebuilt into our lightweight native C++20 WebView launcher ([`launcher_v2/`](launcher_v2)).
 * **`bloodborne-pc-vulkan` Additions ([@lapothecary](https://github.com/lapothecary)):**
   * Refactored C++20 Dantelion graphics & post-FX pipeline ([`dantelion_gx/`](dantelion_gx), [`bb_golden_engine.cpp`](gpu/shim/bb_golden_engine.cpp)), DirectVk 1.3 split VRAM allocator interception ([`direct_buffers.cpp`](gpu/buffers/direct_buffers.cpp), [`direct_textures.cpp`](gpu/textures/direct_textures.cpp)), **`129` clean vectorized GLSL 460 shaders** ([`gpu/shader/backend/spirv/native/`](gpu/shader/backend/spirv/native)), **full-game `5,761`-shader pre-baker + idle `bb:AutoBake` + `~2.5 ms` `Async SPV+PSO`** ([`shader_baker.cpp`](gpu/render/shader_baker.cpp)), 3D hardware `SceneOcclusionCuller` 2.0, **4-bucket `Front-to-Back` G-Buffer reordering**, `LightTileBatcher` / expanded `MicroShadow` / `ObjectVelocityCuller` / `VsmShadowMemo` / `VfxUiBatcher`, **`4–5×` fast loading (`BB_FAST_LOAD`)**, **dual-stage monotonic `Frame & Present Pacing` (`HookPacerWait`) + `1000+ Hz` event-driven mouse**, **`Balanced` (*Lies of P*-style) & `Locked` camera modes (`F4`)**, **high-FPS foliage wind sway & dark-base fix (`HookFoliageSway`)**, **Hunter blood-splatter fix (`cldist_attr0.zw`)**, **4 optional remaster shaders (`GTAO/SSAO`, `Contact Micro-Shadows + 12-Tap Vogel PCF`, `Adaptive SSR`, `True Black / OLED`)**, **`SMAA 1x Ultra` & `SMAA T2x`**, native **`DLAA 3/4`** presets, zero-pass fused `RCAS`, live **`window_mode`**, **`2×/4×` GPU UI super-resolution**, expanded Scaleform GFx menu engine (`System -> Controls`, `ScrollBarV`, live zero-restart switching, Title Screen `Exit Game`, [`bbport_menu_engine.h`](gpu/shim/bbport_menu_engine.h)), **8-page cross-platform GUI Launcher + 1-click SHA-256 Auto-Updater + 17-setting `CSOptionsData` two-way sync**, Crash Black Box, 21-subpass `F8`/`F9` profiler HUD, and Windows/Linux L3/CCD thread topology & NVAPI **DXGI Flip-Model** integration.
 * **License:** **[GNU General Public License v3.0](LICENSE)** (`GPL-3.0`).

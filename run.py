@@ -620,8 +620,5 @@ if __name__ == '__main__':
         sys.argv = sys.argv[2:]
         runpy.run_path(target_script, run_name='__main__')
         sys.exit(0)
-    if Path(sys.executable).stem.lower().startswith('launcher') or '--launcher' in sys.argv[1:]:
-        runpy.run_path(str(PACKAGE_DIR / 'Launcher.py'), run_name='__main__')
-        sys.exit(0)
     sys.exit(run(sys.argv[1:]))
 # Release v1.1.1

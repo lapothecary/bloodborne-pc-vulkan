@@ -28,7 +28,7 @@ import urllib.request
 import zipfile
 
 GITHUB_REPO = "lapothecary/bloodborne-pc-vulkan"
-USER_AGENT = "BloodbornePCVulkan-Updater/1.1.6"
+USER_AGENT = "BloodbornePCVulkan-Updater/1.1.7"
 VERSION_STATE_FILE = ".bbport-version.json"
 
 LINUX_ARCHIVE = "bloodborne-pc-vulkan-linux-x86_64-prebuilt.tar.gz"
@@ -39,13 +39,14 @@ WINDOWS_MANIFEST = "windows-manifest.json"
 LINUX_CORE_FILES = (
     "out/gpu/libbbgpu.so",
     "out/bb-probe",
-    "Launcher.py",
-    "launcher/bbport_launcher.py",
+    "out/bb-launcher",
+    "launcher_v2/ui/app.js",
 )
 WINDOWS_CORE_FILES = (
     "bin/bb-probe.exe",
-    "Launcher.py",
+    "Launcher.exe",
     "run.py",
+    "launcher_v2/ui/app.js",
 )
 
 PROTECTED_NAMES = {
@@ -391,6 +392,10 @@ def _build_windows_apply_ps_script(
         "Remove-Item Env:_MEIPASS2 -ErrorAction SilentlyContinue\n"
         "Remove-Item Env:PYINSTALLER_RESET_ENVIRONMENT -ErrorAction SilentlyContinue\n"
         "try {\n"
+        "    Add-Type -Namespace Win32 -Name ShellRefresh -MemberDefinition '[DllImport(\"shell32.dll\")] public static extern void SHChangeNotify(int wEventId, int uFlags, IntPtr dwItem1, IntPtr dwItem2);' -ErrorAction SilentlyContinue\n"
+        "    [Win32.ShellRefresh]::SHChangeNotify(0x08000000, 0, [IntPtr]::Zero, [IntPtr]::Zero)\n"
+        "} catch {}\n"
+        "try {\n"
         "    if ($relaunchArgs.Count -gt 0) {\n"
         "        $quotedArgs = $relaunchArgs | ForEach-Object { '\"' + ($_ -replace '\"', '\\\"') + '\"' }\n"
         "        Start-Process -FilePath $relaunchExe -ArgumentList $quotedArgs -WorkingDirectory $portDir\n"
@@ -557,9 +562,7 @@ def download_and_apply_update(
             wait_pids = [pid] + ([ppid] if ppid and ppid != pid else [])
             relaunch_exe = Path(sys.executable).resolve()
             relaunch_args: list[str] = []
-            if relaunch_exe.name.lower().startswith("python"):
-                relaunch_args = [str(port_dir / "Launcher.py")]
-            elif (port_dir / "Launcher.exe").is_file() or (staged / "Launcher.exe").is_file():
+            if (port_dir / "Launcher.exe").is_file() or (staged / "Launcher.exe").is_file():
                 relaunch_exe = port_dir / "Launcher.exe"
             else:
                 relaunch_args = ["--launcher"]
@@ -605,9 +608,7 @@ def download_and_apply_update(
             "play.sh",
             "launcher.sh",
             "run.sh",
-            "Launcher.py",
-            "bbport_launcher.py",
-            "bb-launcher.sh",
+            "bb-launcher",
             "bb-probe",
             "probe",
             "bb-gpu-capabilities",
@@ -708,9 +709,27 @@ if __name__ == "__main__":
     )
     parser.add_argument("--stage-root", default=".", help="Root directory containing packaged files")
     parser.add_argument("--windows", action="store_true", help="Use Windows core file list")
+    parser.add_argument("--check-json", metavar="PORT_DIR", help="Check GitHub release manifest and print JSON")
+    parser.add_argument("--apply-json", metavar="PORT_DIR", help="Download, verify SHA-256, and apply update; print progress lines")
     args = parser.parse_args()
 
-    tag_val = os.environ.get("GITHUB_REF_NAME") or "v1.1.6"
+    if args.check_json:
+        res = check_for_update(Path(args.check_json).resolve())
+        print(json.dumps(res, ensure_ascii=False), flush=True)
+        sys.exit(0)
+    if args.apply_json:
+        port_p = Path(args.apply_json).resolve()
+        info = check_for_update(port_p)
+        if not info.get("ok"):
+            print(json.dumps({"ok": False, "error": info.get("error", "check failed")}, ensure_ascii=False), flush=True)
+            sys.exit(1)
+        def _cb(stage, pct, detail):
+            print(f"[UPD] {int(pct)}|{stage}|{detail}", flush=True)
+        res = download_and_apply_update(port_p, info, progress_cb=_cb)
+        print("[UPD-RESULT] " + json.dumps(res, ensure_ascii=False), flush=True)
+        sys.exit(0 if res.get("ok") else 1)
+
+    tag_val = os.environ.get("GITHUB_REF_NAME") or "v1.1.7"
     sha_val = os.environ.get("GITHUB_SHA") or ""
     if args.write_version:
         write_build_manifest(

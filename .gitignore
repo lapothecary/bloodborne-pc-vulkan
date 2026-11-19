@@ -45,3 +45,6 @@ perf.data
 /*.zip
 !docs/images/*
 # Release v1.1.1
+
+launcher_v2/build/
+launcher_v2/build_ci/

@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Bloodborne PC Vulkan</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="window-frame">
+    <!-- Custom Gothic Titlebar (Linux & Windows unified, draggable) -->
+    <header id="titlebar" class="titlebar">
+      <div class="titlebar-drag" id="titlebar-drag">
+        <img src="../../launcher/bloodborne.png" alt="" class="titlebar-icon" />
+        <span class="titlebar-text">BLOODBORNE <span class="sep">/</span> PC VULKAN</span>
+      </div>
+      <div class="titlebar-controls">
+        <button id="btn-win-min" class="win-btn" title="Minimize" aria-label="Minimize">
+          <svg viewBox="0 0 12 12"><line x1="2" y1="6.5" x2="10" y2="6.5" stroke="currentColor" stroke-width="1.2"/></svg>
+        </button>
+        <button id="btn-win-close" class="win-btn close" title="Close" aria-label="Close">
+          <svg viewBox="0 0 12 12"><line x1="2.5" y1="2.5" x2="9.5" y2="9.5" stroke="currentColor" stroke-width="1.2"/><line x1="9.5" y1="2.5" x2="2.5" y2="9.5" stroke="currentColor" stroke-width="1.2"/></svg>
+        </button>
+      </div>
+    </header>
+
+    <div class="app-shell">
+      <!-- Original Gothic Hero Art Backdrop -->
+      <div id="hero-backdrop" class="hero-backdrop" aria-hidden="true">
+        <div class="hero-art"></div>
+        <div class="hero-fade"></div>
+        <div class="hero-vignette"></div>
+      </div>
+
+      <!-- Slim Left Navigation Rail (layout inspired by yharnam-pc) -->
+      <aside class="rail">
+        <button class="rail-brand" data-tab="home" title="Bloodborne PC Vulkan">
+          <img src="../../launcher/bloodborne.png" alt="Hunter's Mark" class="brand-icon" />
+        </button>
+
+        <nav class="rail-nav" aria-label="Primary">
+          <button class="rail-btn active" data-tab="home" data-i18n-title="nav_home">
+            <svg viewBox="0 0 24 24" class="ico"><path d="M12 2L14 9L19 15L15 19L12 16L9 19L5 15L10 9Z" fill="none" stroke="currentColor" stroke-width="1.6"/></svg>
+          </button>
+          <button class="rail-btn" data-tab="mods" data-i18n-title="nav_mods">
+            <svg viewBox="0 0 24 24" class="ico"><path d="M4 7l8-4 8 4-8 4-8-4zm0 5l8 4 8-4m-16 5l8 4 8-4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>
+          </button>
+          <button class="rail-btn" data-tab="online" data-i18n-title="nav_online">
+            <svg viewBox="0 0 24 24" class="ico"><circle cx="12" cy="12" r="8.5" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M3.8 12h16.4M12 3.5c2.6 2.5 2.6 14.5 0 17M12 3.5c-2.6 2.5-2.6 14.5 0 17" fill="none" stroke="currentColor" stroke-width="1.4"/></svg>
+          </button>
+          <button class="rail-btn" data-tab="system" data-i18n-title="nav_system">
+            <svg viewBox="0 0 24 24" class="ico"><circle cx="12" cy="12" r="3.2" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M12 3v2.5M12 18.5V21M3 12h2.5M18.5 12H21M5.6 5.6l1.8 1.8M16.6 16.6l1.8 1.8M18.4 5.6l-1.8 1.8M7.4 16.6l-1.8 1.8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+          </button>
+        </nav>
+
+        <div class="rail-footer">
+          <button id="btn-sfx" class="rail-mini" title="Menu SFX">♪</button>
+          <button id="btn-lang" class="rail-mini" title="Language">EN</button>
+          <span id="ver-badge" class="rail-ver">v1.1.6</span>
+        </div>
+      </aside>
+
+      <!-- Main Content Workspace -->
+      <main class="workspace">
+        <!-- TAB 1: HOME -->
+        <section id="tab-home" class="page active">
+          <div class="home-column">
+            <div class="eyebrow-row">
+              <span class="eyebrow">BLOODBORNE <span class="sep">/</span> LAUNCHER</span>
+            </div>
+
+            <h1 id="hero-title" class="hero-title" data-i18n="hero_ready">Ready to hunt</h1>
+
+            <div class="ornament-rule"><span></span><i></i><span></span></div>
+
+            <!-- Hidden until a newer GitHub release is detected -->
+            <div id="home-update-banner" class="update-banner hidden">
+              <div class="update-banner-top">
+                <span id="home-update-text" class="update-text">Update available</span>
+                <button id="btn-home-update" class="bb-btn-mini" data-i18n="btn_update_now">Update</button>
+              </div>
+              <div id="home-update-bar-wrap" class="progress-track hidden">
+                <div id="home-update-bar" class="progress-fill"></div>
+              </div>
+            </div>
+
+            <button id="btn-play" class="bb-btn-primary">
+              <span class="btn-label" data-i18n="btn_play">Play</span>
+            </button>
+
+            <div class="menu-stack">
+              <button class="bb-menu-row" data-goto="mods">
+                <span class="row-left">
+                  <span class="row-title" data-i18n="nav_mods">Mods &amp; Patches</span>
+                </span>
+                <span class="row-right">
+                  <span id="home-mods-val" class="row-meta">0</span>
+                  <span class="row-arrow">›</span>
+                </span>
+              </button>
+
+              <button class="bb-menu-row" data-goto="online">
+                <span class="row-left">
+                  <span class="row-title" data-i18n="nav_online">Online</span>
+                </span>
+                <span class="row-right">
+                  <span id="home-online-val" class="row-meta">Offline</span>
+                  <span class="row-arrow">›</span>
+                </span>
+              </button>
+
+              <button class="bb-menu-row" data-goto="system">
+                <span class="row-left">
+                  <span class="row-title" data-i18n="nav_system">System, Cache &amp; Files</span>
+                </span>
+                <span class="row-right">
+                  <span id="home-shader-val" class="row-meta">0 / 5761</span>
+                  <span class="row-arrow">›</span>
+                </span>
+              </button>
+
+              <button id="btn-pick-game-home" class="bb-menu-row">
+                <span class="row-left">
+                  <span class="row-title" data-i18n="pick_game">Game Folder (eboot.bin)</span>
+                </span>
+                <span class="row-right">
+                  <span id="home-path-val" class="row-meta path-trim">...</span>
+                  <span class="row-arrow">›</span>
+                </span>
+              </button>
+            </div>
+          </div>
+        </section>
+
+        <!-- TAB 2: MODS & PATCHES -->
+        <section id="tab-mods" class="page">
+          <div class="panel-header">
+            <div>
+              <div class="eyebrow">BLOODBORNE <span class="sep">/</span> <span data-i18n="nav_mods">Mods &amp; Patches</span></div>
+              <h2 class="page-title" data-i18n="nav_mods">Mods &amp; Patches</h2>
+            </div>
+            <button id="btn-open-mods" class="bb-btn-secondary" data-i18n="open_mods_dir">Open mods/ folder</button>
+          </div>
+          <div class="ornament-rule"><span></span><i></i><span></span></div>
+          <p class="panel-desc" data-i18n="mods_desc">Mods are staged before launch. Toggle mod folders inside mods/ without deleting files.</p>
+          <div id="mods-list" class="card-list"></div>
+        </section>
+
+        <!-- TAB 3: ONLINE -->
+        <section id="tab-online" class="page">
+          <div class="panel-header">
+            <div>
+              <div class="eyebrow">BLOODBORNE <span class="sep">/</span> <span data-i18n="nav_online">Online</span></div>
+              <h2 class="page-title" data-i18n="nav_online_title">Online (bbnet20)</h2>
+            </div>
+          </div>
+          <div class="ornament-rule"><span></span><i></i><span></span></div>
+          <p class="panel-desc" data-i18n="online_desc">Online layer inherited from bbport 0.7 (Seamless Hunt / The Hunter's Dream). Configured before launch.</p>
+
+          <div class="card-list">
+            <div class="bb-setting-row">
+              <div>
+                <div class="row-title" data-i18n="online_pool">Online Pool</div>
+                <div class="row-sub" data-i18n="online_pool_sub">Choose a community server or play offline</div>
+              </div>
+              <div id="dd-online-pool" class="bb-dropdown">
+                <button type="button" class="bb-dd-trigger" id="dd-online-trigger">
+                  <span id="dd-online-label">Offline</span>
+                  <span class="bb-dd-caret">▾</span>
+                </button>
+                <div class="bb-dd-menu" id="dd-online-menu">
+                  <button type="button" class="bb-dd-item" data-val="offline">Offline</button>
+                  <button type="button" class="bb-dd-item" data-val="seamless">Seamless Hunt (BBSC)</button>
+                  <button type="button" class="bb-dd-item" data-val="dream">The Hunter's Dream</button>
+                </div>
+              </div>
+            </div>
+
+            <div class="bb-setting-row">
+              <div>
+                <div class="row-title">UPnP Port Mapping</div>
+                <div class="row-sub" data-i18n="online_upnp_sub">Automatic UPnP port forwarding for co-op</div>
+              </div>
+              <label class="bb-switch">
+                <input id="chk-online-upnp" type="checkbox" checked />
+                <span class="slider"></span>
+              </label>
+            </div>
+          </div>
+        </section>
+
+        <!-- TAB 4: SYSTEM & CACHE -->
+        <section id="tab-system" class="page">
+          <div class="panel-header">
+            <div>
+              <div class="eyebrow">BLOODBORNE <span class="sep">/</span> <span data-i18n="nav_system">System &amp; Cache</span></div>
+              <h2 class="page-title" data-i18n="nav_system">System, Cache &amp; Files</h2>
+            </div>
+          </div>
+          <div class="ornament-rule"><span></span><i></i><span></span></div>
+
+          <div class="card-list">
+            <!-- Shader Cache + Live Pre-Baker -->
+            <div class="bb-setting-row column-row">
+              <div class="row-top-line">
+                <div>
+                  <div class="row-title" data-i18n="shader_cache_title">Vulkan Shader Cache (5,761)</div>
+                  <div id="shader-cache-sub" class="row-sub">0 / 5761</div>
+                </div>
+                <div class="btn-group">
+                  <button id="btn-bake" class="bb-btn-secondary accent" data-i18n="btn_prebake">Pre-Bake</button>
+                  <button id="btn-clear-cache" class="bb-btn-secondary danger" data-i18n="btn_clear_cache">Clear Cache</button>
+                </div>
+              </div>
+              <div id="bake-progress-wrap" class="progress-block hidden">
+                <div class="progress-track">
+                  <div id="bake-progress-bar" class="progress-fill"></div>
+                </div>
+                <div id="bake-progress-label" class="progress-meta">0%</div>
+              </div>
+            </div>
+
+            <!-- 1-Click SHA-256 Port Updates -->
+            <div class="bb-setting-row column-row">
+              <div class="row-top-line">
+                <div>
+                  <div class="row-title" data-i18n="updates_title">Port Updates (GitHub SHA-256)</div>
+                  <div id="sys-update-sub" class="row-sub" data-i18n="updates_idle">Check for new releases without losing saves or mods</div>
+                </div>
+                <div class="btn-group">
+                  <button id="btn-check-update" class="bb-btn-secondary" data-i18n="btn_check_update">Check Updates</button>
+                  <button id="btn-sys-apply-update" class="bb-btn-secondary accent hidden" data-i18n="btn_update_now">Update</button>
+                </div>
+              </div>
+              <div id="sys-update-progress-wrap" class="progress-block hidden">
+                <div class="progress-track">
+                  <div id="sys-update-bar" class="progress-fill"></div>
+                </div>
+                <div id="sys-update-progress-label" class="progress-meta">0%</div>
+              </div>
+            </div>
+
+            <!-- Safe-Mode Graphics Reset -->
+            <div class="bb-setting-row">
+              <div>
+                <div class="row-title" data-i18n="safe_reset_title">Safe-Mode Graphics Reset</div>
+                <div class="row-sub" data-i18n="safe_reset_sub">Reset resolution, upscaler &amp; remaster shaders if the game fails to start (saves stay untouched)</div>
+              </div>
+              <button id="btn-safe-reset" class="bb-btn-secondary" data-i18n="btn_safe_reset">Reset</button>
+            </div>
+
+            <!-- Bloodborne Menu SFX -->
+            <div class="bb-setting-row">
+              <div>
+                <div class="row-title" data-i18n="sfx_title">Bloodborne Menu SFX</div>
+                <div class="row-sub" data-i18n="sfx_sub">Decoded locally from your sprj_main_*.fsb with gothic chamber reverb</div>
+              </div>
+              <div class="btn-group">
+                <input id="rng-sfx-vol" type="range" min="0" max="100" value="65" class="bb-range" />
+                <label class="bb-switch">
+                  <input id="chk-sfx-on" type="checkbox" checked />
+                  <span class="slider"></span>
+                </label>
+              </div>
+            </div>
+
+            <!-- Quick Folders -->
+            <div class="bb-setting-row">
+              <div>
+                <div class="row-title" data-i18n="folders_title">Quick Folders</div>
+                <div class="row-sub" data-i18n="folders_sub">Open save data, crash logs, or change your game folder</div>
+              </div>
+              <div class="btn-group">
+                <button id="btn-open-saves" class="bb-btn-secondary" data-i18n="btn_saves">Saves</button>
+                <button id="btn-open-logs" class="bb-btn-secondary" data-i18n="btn_logs">Logs</button>
+                <button id="btn-pick-game-sys" class="bb-btn-secondary" data-i18n="btn_change_game">Game Folder</button>
+              </div>
+            </div>
+          </div>
+        </section>
+      </main>
+
+      <!-- First-Time Setup Wizard Overlay (auto-shown only if eboot.bin is not yet configured) -->
+      <div id="setup-wizard" class="setup-overlay hidden">
+        <div class="setup-art"></div>
+        <div class="setup-fade"></div>
+        <div class="setup-content">
+          <div class="eyebrow">BLOODBORNE <span class="sep">/</span> <span data-i18n="wiz_eyebrow">FIRST-TIME SETUP</span></div>
+          <h1 class="hero-title" data-i18n="wiz_title">Welcome to Yharnam</h1>
+          <div class="ornament-rule"><span></span><i></i><span></span></div>
+          <p class="panel-desc" data-i18n="wiz_desc">Point the launcher to your decrypted Bloodborne v1.09 game folder containing eboot.bin and dvdroot_ps4/. No game files are bundled with this port.</p>
+          <div class="wiz-box">
+            <div class="row-title" data-i18n="pick_game">Game Folder (eboot.bin)</div>
+            <div id="wiz-path" class="row-sub" data-i18n="wiz_no_folder">No folder selected yet</div>
+          </div>
+          <div class="wiz-actions">
+            <button id="btn-wiz-pick" class="bb-btn-primary wiz-btn" data-i18n="wiz_choose">Choose Game Folder</button>
+            <button id="btn-wiz-skip" class="bb-btn-secondary" data-i18n="wiz_skip">Skip for now</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Toast notification -->
+      <div id="toast" class="toast"></div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
