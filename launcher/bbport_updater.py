@@ -721,8 +721,9 @@ if __name__ == "__main__":
         if not info.get("ok"):
             print(json.dumps({"ok": False, "error": info.get("error", "check failed")}, ensure_ascii=False), flush=True)
             sys.exit(1)
-        def _cb(stage, pct, detail):
-            print(f"[UPD] {int(pct)}|{stage}|{detail}", flush=True)
+        def _cb(frac, detail):
+            pct = max(0, min(100, int(round(float(frac) * 100.0))))
+            print(f"[UPD] {pct}|update|{detail}", flush=True)
         res = download_and_apply_update(port_p, info, progress_cb=_cb)
         print("[UPD-RESULT] " + json.dumps(res, ensure_ascii=False), flush=True)
         sys.exit(0 if res.get("ok") else 1)

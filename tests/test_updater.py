@@ -186,6 +186,40 @@ class UpdaterTests(unittest.TestCase):
         self.assertIn("& 'robocopy.exe' @rcArgs", decoded)
         self.assertIn("Remove-Item -LiteralPath $tmpRoot -Recurse -Force", decoded)
 
+    def test_progress_cb_two_arg_contract(self):
+        with tempfile.TemporaryDirectory() as td:
+            port_dir = Path(td)
+            (port_dir / "out" / "gpu").mkdir(parents=True)
+            (port_dir / "out" / "gpu" / "libbbgpu.so").write_bytes(b"old")
+            new_so = b"new-v118"
+            arc_bytes, arc_sha = _make_tar_gz({"out/gpu/libbbgpu.so": new_so})
+            manifest = {
+                "tag": "v1.1.8",
+                "commit": "c360570",
+                "archive_name": bbport_updater.LINUX_ARCHIVE,
+                "archive_sha256": arc_sha,
+                "archive_size": len(arc_bytes),
+                "core_files": {"out/gpu/libbbgpu.so": hashlib.sha256(new_so).hexdigest()},
+            }
+            info = dict(manifest, ok=True, up_to_date=False,
+                        archive_url=f"https://github.com/{bbport_updater.GITHUB_REPO}/releases/download/v1.1.8/{bbport_updater.LINUX_ARCHIVE}")
+            events: list[tuple[int, str]] = []
+
+            def cb(frac, detail):
+                events.append((int(round(float(frac) * 100.0)), str(detail)))
+
+            def fake_urlopen(req, timeout=30.0):
+                url = req.full_url if hasattr(req, "full_url") else str(req)
+                if "linux-manifest.json" in url:
+                    return _FakeResp(json.dumps(manifest).encode("utf-8"))
+                return _FakeResp(arc_bytes)
+
+            with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+                res = bbport_updater.download_and_apply_update(port_dir, info, progress_cb=cb, is_windows=False)
+
+            self.assertTrue(res["ok"], res)
+            self.assertGreaterEqual(len(events), 4)
+            self.assertEqual(events[-1][0], 100)
 
 
 if __name__ == "__main__":

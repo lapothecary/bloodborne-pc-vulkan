@@ -400,6 +400,8 @@
     }
 
     if (updPollTimer) { clearInterval(updPollTimer); updPollTimer = null; }
+    homeBarWrap.classList.add("hidden");
+    sysProgWrap.classList.add("hidden");
 
     if (u.restartNeeded) {
       homeBanner.classList.remove("hidden");
@@ -409,6 +411,14 @@
       showToast(tr("updates_done"));
       // Exit cleanly so the detached Windows/Linux updater finishes swapping binaries and relaunches Launcher
       setTimeout(() => window.bbInvoke("quit", {}), 700);
+      return;
+    }
+
+    if (u.error) {
+      homeBanner.classList.remove("hidden");
+      homeText.textContent = u.error;
+      sysSub.textContent = u.error;
+      showToast(u.error);
       return;
     }
 
