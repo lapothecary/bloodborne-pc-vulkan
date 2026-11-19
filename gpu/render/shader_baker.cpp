@@ -1718,6 +1718,7 @@ void PipelineCache::StartBackgroundAutoBake() {
                         item->hash = sh.hash;
                         item->info = std::move(info);
                         item->spec = std::move(spec);
+                        item->spec.info = &item->info;
                         item->mod = mod;
 
                         if (sh.container_stage == 4) {
@@ -1843,6 +1844,9 @@ void PipelineCache::DrainAutoBakeReadyStages() {
         }
         DirectShaders::NoteProgramCreated(item->hash, raw_ptr);
         if (item->has_cs && item->built_cs && !compute_pipelines.contains(item->cs_key)) {
+            // Rebind ComputePipeline's stage Info pointer from temporary `item->info`
+            // (which was moved-from and is about to be freed with `batch`) to permanent `raw_ptr->info`.
+            item->built_cs->SetStageInfo(static_cast<u32>(SwStage::Compute), &raw_ptr->info);
             compute_pipelines.emplace(item->cs_key, std::move(item->built_cs));
         }
         any_committed = true;

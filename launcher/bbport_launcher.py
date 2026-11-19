@@ -1563,12 +1563,24 @@ class LauncherWindow(Adw.ApplicationWindow):
                 self._update_busy = False
                 self.check_update_btn.set_sensitive(True)
                 self.update_header_btn.set_sensitive(True)
+                if isinstance(res.get("latest_info"), dict) and res["latest_info"].get("ok"):
+                    self._update_info = res["latest_info"]
                 if not res.get("ok"):
                     self.install_update_btn.set_sensitive(True)
                     err = res.get("error", "Error")
                     self.update_status_row.set_subtitle(
                         GLib.markup_escape_text(tr("Ошибка обновления: {}").format(err)))
                     self.toasts.add_toast(Adw.Toast(title=tr("Ошибка обновления: {}").format(err)))
+                    return False
+                if res.get("already_up_to_date"):
+                    latest = res.get("latest_info") or {}
+                    tag = latest.get("tag", "latest")
+                    r_hash = latest.get("remote_short_hash", "")
+                    self.update_status_row.set_subtitle(
+                        tr("✓ Установлена актуальная сборка ({} • SHA-256: {}… совпадает)").format(tag, r_hash))
+                    self.install_update_btn.set_sensitive(False)
+                    self.update_header_btn.set_label(tr("✓ Актуально ({})").format(tag))
+                    self.update_header_btn.remove_css_class("suggested-action")
                     return False
                 if res.get("restarting_external"):
                     os._exit(0)

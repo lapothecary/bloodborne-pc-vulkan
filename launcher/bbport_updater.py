@@ -79,7 +79,8 @@ def _http_get_bytes(url: str, timeout: float = 12.0, accept: str = "*/*") -> byt
         headers={
             "User-Agent": USER_AGENT,
             "Accept": accept,
-            "Cache-Control": "no-cache",
+            "Cache-Control": "no-cache, no-store, max-age=0",
+            "Pragma": "no-cache",
         },
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -138,24 +139,31 @@ def check_for_update(port_dir: Path, is_windows: bool | None = None) -> dict:
     archive_name = WINDOWS_ARCHIVE if is_windows else LINUX_ARCHIVE
     manifest_name = WINDOWS_MANIFEST if is_windows else LINUX_MANIFEST
     base_dl = f"https://github.com/{GITHUB_REPO}/releases/latest/download"
+    bust = f"?_={int(time.time())}"
 
     local_state = read_local_state(port_dir)
     local_fp = local_core_fingerprint(port_dir, is_windows)
 
     manifest = {}
     try:
-        raw_m = _http_get_bytes(f"{base_dl}/{manifest_name}", timeout=10.0)
+        raw_m = _http_get_bytes(f"{base_dl}/{manifest_name}{bust}", timeout=10.0)
         parsed = json.loads(raw_m.decode("utf-8", errors="replace"))
         if isinstance(parsed, dict):
             manifest = parsed
     except Exception:
         manifest = {}
 
-    tag = str(manifest.get("tag") or "")
+    tag = str(manifest.get("tag") or "").strip()
     commit = str(manifest.get("commit") or "")
     archive_sha256 = str(manifest.get("archive_sha256") or "").lower()
     archive_size = int(manifest.get("archive_size") or 0)
-    archive_url = f"{base_dl}/{archive_name}"
+    # Pin download URL to the exact tag from the manifest so a floating /releases/latest/
+    # redirect can never mix an older manifest's SHA-256 with a newer tag's archive.
+    if tag and tag != "latest":
+        tag_dl = f"https://github.com/{GITHUB_REPO}/releases/download/{tag}"
+    else:
+        tag_dl = base_dl
+    archive_url = f"{tag_dl}/{archive_name}"
     published_at = str(manifest.get("published_at") or "")
     remote_core: dict[str, str] = {}
     if isinstance(manifest.get("core_files"), dict):
@@ -164,7 +172,10 @@ def check_for_update(port_dir: Path, is_windows: bool | None = None) -> dict:
     # Fallback / enrichment via .sha256 sidecar or GitHub REST API if manifest was absent.
     if not archive_sha256:
         try:
-            sha_txt = _http_get_bytes(f"{base_dl}/{archive_name}.sha256", timeout=10.0).decode(
+            sha_url = f"{tag_dl}/{archive_name}.sha256"
+            if tag_dl == base_dl:
+                sha_url += bust
+            sha_txt = _http_get_bytes(sha_url, timeout=10.0).decode(
                 "utf-8", errors="replace"
             )
             archive_sha256 = _parse_sha256_text(sha_txt)
@@ -179,11 +190,15 @@ def check_for_update(port_dir: Path, is_windows: bool | None = None) -> dict:
                 accept="application/vnd.github+json",
             )
             rel = json.loads(api_raw.decode("utf-8", errors="replace"))
-            tag = tag or str(rel.get("tag_name") or "")
+            api_tag = str(rel.get("tag_name") or "").strip()
+            if not tag and api_tag:
+                tag = api_tag
+                archive_url = f"https://github.com/{GITHUB_REPO}/releases/download/{tag}/{archive_name}"
             published_at = published_at or str(rel.get("published_at") or "")
             for asset in rel.get("assets") or []:
                 if asset.get("name") == archive_name:
-                    archive_url = str(asset.get("browser_download_url") or archive_url)
+                    if not tag or tag == api_tag:
+                        archive_url = str(asset.get("browser_download_url") or archive_url)
                     archive_size = archive_size or int(asset.get("size") or 0)
                     digest = str(asset.get("digest") or "")
                     if not archive_sha256 and digest.startswith("sha256:"):
@@ -309,13 +324,37 @@ def download_and_apply_update(
             progress_cb(max(0.0, min(1.0, frac)), msg)
 
     try:
+        report(0.01, "Checking latest GitHub release manifest…")
+        fresh = check_for_update(port_dir, is_windows=is_windows)
+        if fresh.get("ok") and fresh.get("archive_sha256"):
+            info = fresh
+            archive_name = str(info["archive_name"])
+            archive_url = str(info["archive_url"])
+            expected_sha = str(info["archive_sha256"]).lower()
+            expected_size = int(info.get("archive_size") or 0)
+            if fresh.get("up_to_date"):
+                report(1.0, "Already up to date!")
+                return {
+                    "ok": True,
+                    "already_up_to_date": True,
+                    "restarting_external": False,
+                    "latest_info": fresh,
+                }
+
         if tmp_root.exists():
             shutil.rmtree(tmp_root, ignore_errors=True)
         tmp_root.mkdir(parents=True, exist_ok=True)
         archive_path = tmp_root / archive_name
 
-        report(0.01, "Connecting to GitHub Releases…")
-        req = urllib.request.Request(archive_url, headers={"User-Agent": USER_AGENT})
+        report(0.02, "Connecting to GitHub Releases…")
+        req = urllib.request.Request(
+            archive_url,
+            headers={
+                "User-Agent": USER_AGENT,
+                "Cache-Control": "no-cache, no-store, max-age=0",
+                "Pragma": "no-cache",
+            },
+        )
         hasher = hashlib.sha256()
         downloaded = 0
         t0 = time.monotonic()
@@ -342,14 +381,24 @@ def download_and_apply_update(
         report(0.82, "Verifying SHA-256 checksum…")
         actual_sha = hasher.hexdigest().lower()
         if actual_sha != expected_sha:
-            shutil.rmtree(tmp_root, ignore_errors=True)
-            return {
-                "ok": False,
-                "error": (
-                    f"SHA-256 mismatch! Expected {expected_sha[:16]}…, "
-                    f"got {actual_sha[:16]}…. Update aborted safely."
-                ),
-            }
+            # A hotfix or new release may have finished publishing mid-download; re-fetch
+            # the manifest once over HTTPS and accept only if the fresh SHA-256 matches 1:1.
+            report(0.84, "Re-checking release manifest…")
+            recheck = check_for_update(port_dir, is_windows=is_windows)
+            if recheck.get("ok") and str(recheck.get("archive_sha256") or "").lower() == actual_sha:
+                info = recheck
+                expected_sha = actual_sha
+            else:
+                shutil.rmtree(tmp_root, ignore_errors=True)
+                tag_lbl = str((recheck if recheck.get("ok") else info).get("tag") or "latest")
+                return {
+                    "ok": False,
+                    "latest_info": recheck if recheck.get("ok") else info,
+                    "error": (
+                        f"SHA-256 mismatch ({tag_lbl})! Expected {expected_sha[:16]}…, "
+                        f"got {actual_sha[:16]}…. Update aborted safely."
+                    ),
+                }
 
         report(0.86, "Extracting verified package…")
         extract_dir = tmp_root / "extracted"
@@ -420,7 +469,7 @@ def download_and_apply_update(
             flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "DETACHED_PROCESS", 0)
             subprocess.Popen(["cmd.exe", "/c", str(bat_path)], cwd=str(port_dir), creationflags=flags)
             report(1.0, "Restarting…")
-            return {"ok": True, "restarting_external": True}
+            return {"ok": True, "restarting_external": True, "latest_info": info}
 
         report(0.94, "Installing files atomically…")
         exec_names = {
@@ -470,7 +519,7 @@ def download_and_apply_update(
 
         shutil.rmtree(tmp_root, ignore_errors=True)
         report(1.0, "Update complete!")
-        return {"ok": True, "restarting_external": False}
+        return {"ok": True, "restarting_external": False, "latest_info": info}
     except Exception as exc:
         shutil.rmtree(tmp_root, ignore_errors=True)
         return {"ok": False, "error": str(exc)}

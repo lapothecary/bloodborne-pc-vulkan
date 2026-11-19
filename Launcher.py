@@ -2351,12 +2351,24 @@ class AdwLauncherWindow:
                 self._update_busy = False
                 self.check_update_btn.configure(state="normal")
                 self.update_hdr_btn.configure(state="normal")
+                if isinstance(res.get("latest_info"), dict) and res["latest_info"].get("ok"):
+                    self._update_info = res["latest_info"]
                 if not res.get("ok"):
                     self.install_update_btn.configure(state="normal")
                     self.update_hdr_btn.configure(text=" ⬇ Retry Update ")
                     err = res.get("error", "Unknown error")
                     self.update_row.set_subtitle(f"⚠ Update failed: {err}")
                     messagebox.showerror("Update Failed", err)
+                    return
+                if res.get("already_up_to_date"):
+                    latest = res.get("latest_info") or {}
+                    tag = latest.get("tag", "latest")
+                    r_hash = latest.get("remote_short_hash", "")
+                    self.update_row.set_subtitle(f"✓ Up to date ({tag}  •  SHA-256: {r_hash}… verified)")
+                    self.install_update_btn.configure(state="disabled", bg="#3a3a3a")
+                    self.update_hdr_btn.configure(
+                        text=f" ✓ {tag} Latest ", bg="#363636", activebackground="#454545"
+                    )
                     return
                 if res.get("restarting_external"):
                     with contextlib.suppress(Exception):
