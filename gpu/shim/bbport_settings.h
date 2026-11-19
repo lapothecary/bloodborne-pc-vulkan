@@ -111,6 +111,14 @@ void ResetKeyBindingsToDefault();
 /// HUD markers and UI placement follow the output at run time (bbport_guest_hooks, the UI
 /// composition). Auto: the group of the monitor the game is on.
 enum Aspect : int { AspectAuto = 0, Aspect4x3, Aspect16x10, Aspect16x9, Aspect21x9, Aspect32x9, AspectCount };
+/// Swapchain VSync mode (live recreate via swapchain_generation, persisted as `present_mode`).
+enum VsyncMode : int {
+    VsyncFast = 0, ///< Mailbox (Fast Sync / triple-buffered: no tearing, no 2x FPS drops)
+    VsyncOn = 1,   ///< Fifo (Standard VSync)
+    VsyncOff = 2,  ///< Immediate (VSync Off: lowest latency, best for G-Sync / FreeSync)
+    VsyncModeCount = 3
+};
+const char* PresentModeKey(int vsync_mode);
 struct OutputSize {
     int width = 1920, height = 1080;
     bool operator==(const OutputSize&) const = default;
@@ -209,6 +217,11 @@ struct Values {
     std::atomic<int> anisotropic{1};
     /// Persistent FPS limit (0 = Uncapped, or 30..1000).
     std::atomic<int> fps_limit{30};
+    /// Swapchain VSync mode: 0 = Fast (Mailbox), 1 = On (Fifo), 2 = Off (Immediate).
+    std::atomic<int> vsync_mode{VsyncFast};
+    std::atomic<bool> vsync_mode_chosen{false};
+    /// Incremented whenever vsync_mode changes so Presenter recreates the swapchain live.
+    std::atomic<std::uint32_t> swapchain_generation{0};
     /// AI / SDF UI & Icon Super-Resolution (2x/4x + disk cache) for 1-mip 2D UI textures.
     std::atomic<bool> ui_upscale{false};
     /// Enhanced Multi-Scale GTAO / Low-Noise SSAO in ps_cbbca5dc.frag.

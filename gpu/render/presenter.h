@@ -107,6 +107,7 @@ private:
     Scheduler draw_scheduler;
     Scheduler present_scheduler;
     Swapchain swapchain;
+    u32 last_swapchain_generation = 0;
     Runtime runtime;
     std::unique_ptr<Rasterizer> rasterizer;
     VideoCore::TextureCache& texture_cache;

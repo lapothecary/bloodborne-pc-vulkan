@@ -656,9 +656,11 @@ bool Presenter::PresentImage(Frame* frame, vk::Image source, bool last) {
         std::scoped_lock lock{Scheduler::submit_mutex};
         swapchain.Recreate(width, height);
     };
-    // A resized window (or one minimised at the last try) needs a new swapchain.
+    // A resized window, a live VSync change, or a previously minimised surface needs a new swapchain.
+    const u32 sc_gen = BbSettings::Get().swapchain_generation.load(std::memory_order_relaxed);
     if (width != swapchain.GetWidth() || height != swapchain.GetHeight() ||
-        !swapchain.IsPresentable()) {
+        sc_gen != last_swapchain_generation || !swapchain.IsPresentable()) {
+        last_swapchain_generation = sc_gen;
         recreate();
         if (!swapchain.IsPresentable()) {
             return false;

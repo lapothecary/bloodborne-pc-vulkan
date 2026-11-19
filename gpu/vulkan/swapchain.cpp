@@ -5,6 +5,7 @@
 #include <array>
 #include <limits>
 
+#include "bbport_settings.h"
 #include "core/emulator_settings.h"
 #include "sdl_window.h"
 #include "vulkan/instance.h"
@@ -21,6 +22,18 @@ constexpr vk::SurfaceFormatKHR HdrFormat{
 };
 
 vk::PresentModeKHR RequestedPresentMode() {
+    const auto& s = BbSettings::Get();
+    if (s.vsync_mode_chosen.load(std::memory_order_relaxed) ||
+        s.swapchain_generation.load(std::memory_order_relaxed) != 0) {
+        switch (s.vsync_mode.load(std::memory_order_relaxed)) {
+        case BbSettings::VsyncOn:
+            return vk::PresentModeKHR::eFifo;
+        case BbSettings::VsyncOff:
+            return vk::PresentModeKHR::eImmediate;
+        default:
+            return vk::PresentModeKHR::eMailbox;
+        }
+    }
     const auto name = EmulatorSettings.GetPresentMode();
     if (name == "Fifo") {
         return vk::PresentModeKHR::eFifo;
@@ -197,7 +210,9 @@ void Swapchain::DestroyResources() {
 }
 
 void Swapchain::Recreate(u32 width_, u32 height_) {
-    LOG_DEBUG(Render_Vulkan, "Recreating the swapchain: {}x{}, HDR {}", width_, height_, use_hdr);
+    ChoosePresentMode();
+    LOG_DEBUG(Render_Vulkan, "Recreating the swapchain: {}x{}, HDR {}, present {}", width_,
+              height_, use_hdr, vk::to_string(present_mode));
     Create(width_, height_);
 }
 

@@ -752,6 +752,18 @@ void Menu() {
             Store(s.window_mode, wm, true);
         }
     }
+    {
+        const char* vs_labels[] = {
+            BbSettings::MenuText("Fast (Default)", "Быстрый (по умолч.)"),
+            BbSettings::MenuText("On (VSync)", "Вкл (VSync)"),
+            BbSettings::MenuText("Off (G-Sync / FreeSync)", "Выкл (G-Sync / FreeSync)")};
+        int vs = std::clamp(s.vsync_mode.load(), 0, BbSettings::VsyncModeCount - 1);
+        if (ImGui::Combo(BbSettings::MenuText("VSync", "Вертикальная синхронизация"), &vs, vs_labels, 3)) {
+            s.vsync_mode_chosen = true;
+            Store(s.vsync_mode, vs, true);
+            s.swapchain_generation.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
     Hint(BbSettings::MenuText(
         "The output frame, UI, and 3D G-Buffer resolution update on the next frame boundary "
         "(full Yebis2 post-FX buffer reallocation applies on restart). Another aspect ratio "

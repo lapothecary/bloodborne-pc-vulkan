@@ -298,6 +298,17 @@ void Set(Values& v, const std::string& key, const std::string& value) {
         v.anisotropic = (i >= 16) ? 16 : (i >= 8) ? 8 : (i >= 4) ? 4 : 0;
     } else if (key == "fps_limit") {
         v.fps_limit = (i <= 0) ? 0 : std::clamp(i, 30, 5000);
+    } else if (key == "present_mode" || key == "vsync") {
+        if (value == "fifo" || value == "on" || value == "1") {
+            v.vsync_mode = VsyncOn;
+            v.vsync_mode_chosen = true;
+        } else if (value == "immediate" || value == "off" || value == "2") {
+            v.vsync_mode = VsyncOff;
+            v.vsync_mode_chosen = true;
+        } else if (value == "mailbox" || value == "fast" || value == "auto" || value == "0") {
+            v.vsync_mode = VsyncFast;
+            v.vsync_mode_chosen = true;
+        }
     } else if (key == "ui_upscale") {
         v.ui_upscale = (value != "0" && value != "false" && value != "off");
     } else if (key == "ssao_quality") {
@@ -567,6 +578,17 @@ const char* AspectKey(int aspect) {
     return Groups[std::clamp(aspect, 0, AspectCount - 1)].key;
 }
 
+const char* PresentModeKey(int vsync_mode) {
+    switch (vsync_mode) {
+    case VsyncOn:
+        return "Fifo";
+    case VsyncOff:
+        return "Immediate";
+    default:
+        return "Mailbox";
+    }
+}
+
 OutputSize Monitor() {
     return UnpackSize(monitor.load(std::memory_order_relaxed));
 }
@@ -713,6 +735,13 @@ void Load() {
     if (const char* env = std::getenv("BB_FPS_LIMIT")) {
         if (std::atoi(env) > 0) {
             Set(v, "fps_limit", env);
+        }
+    }
+    if (!v.vsync_mode_chosen.load()) {
+        if (const char* env = std::getenv("BB_PRESENT_MODE")) {
+            if (env[0] != '\0') {
+                Set(v, "present_mode", env);
+            }
         }
     }
     if (const char* env = std::getenv("BB_WINDOW_MODE")) {
@@ -883,6 +912,7 @@ void Save() {
     put("dlss_preset", std::to_string(v.dlss_preset.load()));
     put("anisotropic", std::to_string(v.anisotropic.load()));
     put("fps_limit", std::to_string(v.fps_limit.load()));
+    put("present_mode", PresentModeKey(v.vsync_mode.load()));
     put("ui_upscale", flag(v.ui_upscale.load()));
     put("ssao_quality", flag(v.ssao_quality.load()));
     put("contact_shadows", flag(v.contact_shadows.load()));
