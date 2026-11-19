@@ -89,6 +89,9 @@ FetchShaderData Parse(const u32* code, const u32*& end) {
 } // namespace
 
 std::optional<FetchShaderData> ParseFetchShader(const Shader::Info& info) {
+    if (fetch_shader_replay) {
+        return *fetch_shader_replay;
+    }
     if (!info.has_fetch_shader) {
         return std::nullopt;
     }

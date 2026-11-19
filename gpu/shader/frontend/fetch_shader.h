@@ -77,6 +77,10 @@ struct FetchShaderData {
     bool Deserialize(Serialization::Archive& buffer);
 };
 
+/// Offline recipe pre-bake replay: if set, ParseFetchShader returns this exact FetchShaderData
+/// without dereferencing a guest fetch-shader address.
+inline thread_local const FetchShaderData* fetch_shader_replay = nullptr;
+
 /// The fetch shader's code (its address is in the user data SGPR pair at `sgpr_base`).
 const u32* GetFetchShaderCode(const Info& info, u32 sgpr_base);
 

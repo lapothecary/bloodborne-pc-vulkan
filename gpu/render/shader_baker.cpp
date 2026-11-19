@@ -32,8 +32,10 @@
 #include "render/blob_store.h"
 #include "render/direct_shaders.h"
 #include "render/pipeline_store.h"
+#include "render/recipe_catalog.h"
 #include "render/scheduler.h"
 #include "shader/backend/spirv/spirv_opt.h"
+#include "shader/frontend/fetch_shader.h"
 #include "shim/bbport_toggles.h"
 #include "vulkan/instance.h"
 
@@ -617,6 +619,58 @@ struct SyntheticStageEnv {
         }
         fetch_code[pc++] = 0xBE802000u; // s_setpc_b64 s[0:1]
     }
+
+    void ApplyRecipeOverrides(const RecipeCatalog::StageRecipe& rec) {
+        if (!rec.spec.fetch_shader_data) {
+            return;
+        }
+        const uintptr_t dummy_ptr = reinterpret_cast<uintptr_t>(dummy_mem.data());
+        const auto& attrs = rec.spec.fetch_shader_data->attributes;
+        const uintptr_t vb_ptr = reinterpret_cast<uintptr_t>(vb_table.data());
+        const u32 vb_pair[2] = {static_cast<u32>(vb_ptr), static_cast<u32>(vb_ptr >> 32)};
+        for (size_t i = 0; i < attrs.size(); ++i) {
+            const auto& attr = attrs[i];
+            if (static_cast<size_t>(attr.sgpr_base) + 1 < Gcn::NUM_USER_DATA) {
+                user_data[attr.sgpr_base] = vb_pair[0];
+                user_data[attr.sgpr_base + 1] = vb_pair[1];
+            }
+            if (static_cast<size_t>(attr.dword_offset) + 4 <= vb_table.size()) {
+                Gcn::Buffer vb = MakeSyntheticBuffer(dummy_ptr, 16);
+                if (i < rec.spec.vs_attribs.size()) {
+                    const auto& vsa = rec.spec.vs_attribs[i];
+                    switch (vsa.num_class) {
+                    case Gcn::NumberClass::Sint:
+                        vb.num_format = u64(Gcn::NumberFormat::Sint);
+                        break;
+                    case Gcn::NumberClass::Uint:
+                        vb.num_format = u64(Gcn::NumberFormat::Uint);
+                        break;
+                    default:
+                        vb.num_format = u64(Gcn::NumberFormat::Float);
+                        break;
+                    }
+                    vb.dst_sel_x = u64(vsa.dst_select.r);
+                    vb.dst_sel_y = u64(vsa.dst_select.g);
+                    vb.dst_sel_z = u64(vsa.dst_select.b);
+                    vb.dst_sel_w = u64(vsa.dst_select.a);
+                }
+                std::memcpy(&vb_table[attr.dword_offset], &vb, sizeof(vb));
+            }
+        }
+    }
+};
+
+struct ScopedRecipeReplay {
+    explicit ScopedRecipeReplay(const RecipeCatalog::StageRecipe& rec) noexcept {
+        Shader::flat_buf_replay =
+            !rec.flattened_ud_buf.empty() ? &rec.flattened_ud_buf : nullptr;
+        Shader::Gcn::fetch_shader_replay =
+            rec.spec.fetch_shader_data ? &*rec.spec.fetch_shader_data : nullptr;
+    }
+    ~ScopedRecipeReplay() noexcept {
+        Shader::flat_buf_replay = nullptr;
+        Shader::Gcn::fetch_shader_replay = nullptr;
+    }
 };
 
 Shader::RuntimeInfo BuildSyntheticRuntimeInfo(const ParsedOrbShader& sh,
@@ -1005,6 +1059,7 @@ int PipelineCache::BakeAllGameShaders(const std::filesystem::path& game_dir) {
 
     const auto cache_root = Common::FS::GetUserPath(Common::FS::PathType::CacheDir);
     CleanupObsoleteCacheFiles(cache_root);
+    RecipeCatalog::Get().Initialize();
 
     static constexpr const char* kBundles[] = {
         "gxshader.shaderbnd.dcx",         "gxgui.shaderbnd.dcx",
@@ -1282,7 +1337,7 @@ int PipelineCache::BakeAllGameShaders(const std::filesystem::path& game_dir) {
                                 PipelineStore::SaveOptShaderBinary(std::move(opt_spv), sh.hash, 0);
                             }
                             const u64 perm_hash = HashCombine(sh.hash, 0);
-                            PipelineStore::SaveShaderMeta(new_prog->info, spec, perm_hash, 0);
+                            PipelineStore::SaveShaderMeta(new_prog->info, spec, perm_hash, 0, false);
                             new_prog->AddPermut(mod, std::move(spec));
                             if (mod1) {
                                 spec1.info = &new_prog->info;
@@ -1293,7 +1348,7 @@ int PipelineCache::BakeAllGameShaders(const std::filesystem::path& game_dir) {
                                     PipelineStore::SaveOptShaderBinary(std::move(opt_spv1), sh.hash, 1);
                                 }
                                 const u64 perm_hash1 = HashCombine(sh.hash, 1);
-                                PipelineStore::SaveShaderMeta(info1, spec1, perm_hash1, 1);
+                                PipelineStore::SaveShaderMeta(info1, spec1, perm_hash1, 1, false);
                                 new_prog->AddPermut(mod1, std::move(spec1));
                             }
                             new_prog->info_template = std::make_unique<Shader::Info>(new_prog->info);
@@ -1306,7 +1361,7 @@ int PipelineCache::BakeAllGameShaders(const std::filesystem::path& game_dir) {
                             }
                         }
                         if (built_cs && !compute_pipelines.contains(cs_key)) {
-                            PipelineStore::SaveCompute(cs_key, cs_sdata);
+                            PipelineStore::SaveCompute(cs_key, cs_sdata, false);
                             compute_pipelines.emplace(cs_key, std::move(built_cs));
                             cs_pso_built.fetch_add(1, std::memory_order_relaxed);
                         }
@@ -1333,6 +1388,196 @@ int PipelineCache::BakeAllGameShaders(const std::filesystem::path& game_dir) {
     compile_batch(ps_list, "fragment", false);
     // Phase 3: Vertex Shaders (all VS -> SPIR-V using paired PS descriptor offsets)
     compile_batch(vs_list, "vertex", true);
+
+    // Phase 3.5: Pre-bake runtime shader permutations from RecipeCatalog (`data/shader_recipes.bbrc`).
+    std::atomic<size_t> recipe_perm_built{0};
+    std::atomic<size_t> recipe_pso_built{0};
+    std::unordered_map<u64, u64> perm_hash_remap;
+    {
+        const auto& stage_recipes = RecipeCatalog::Get().GetStageRecipes();
+        if (!stage_recipes.empty()) {
+            // Map every known pgm_hash -> parsed shader entry from local game archives.
+            std::unordered_map<u64, const ParsedOrbShader*> shader_by_hash;
+            shader_by_hash.reserve(cs_list.size() + ps_list.size() + vs_list.size());
+            for (const auto& s : cs_list) shader_by_hash.try_emplace(s.hash, &s);
+            for (const auto& s : ps_list) shader_by_hash.try_emplace(s.hash, &s);
+            for (const auto& s : vs_list) shader_by_hash.try_emplace(s.hash, &s);
+
+            // Snapshot already-present stage digests so we only compile genuinely missing perms.
+            std::unordered_set<u64> existing_digests;
+            for (const auto& [h, prog] : program_cache) {
+                if (!prog) continue;
+                for (const auto& m : prog->modules) {
+                    if (!m.module) continue;
+                    existing_digests.insert(RecipeCatalog::ComputeStageDigest(
+                        h, prog->info.hw_stage, prog->info.sw_stage, m.spec));
+                }
+            }
+
+            struct PendingPermJob {
+                const ParsedOrbShader* sh;
+                const RecipeCatalog::StageRecipe* rec;
+            };
+            std::vector<PendingPermJob> perm_jobs;
+            for (const auto& rec : stage_recipes) {
+                if (existing_digests.contains(rec.spec_digest)) {
+                    // Already cached: record perm_hash remap if stored at a different index.
+                    if (const auto pit = program_cache.find(rec.pgm_hash);
+                        pit != program_cache.end() && pit->second) {
+                        for (size_t i = 0; i < pit->second->modules.size(); ++i) {
+                            const auto& m = pit->second->modules[i];
+                            if (m.module &&
+                                RecipeCatalog::ComputeStageDigest(rec.pgm_hash,
+                                                                  pit->second->info.hw_stage,
+                                                                  pit->second->info.sw_stage,
+                                                                  m.spec) == rec.spec_digest) {
+                                const u64 actual_h = HashCombine(rec.pgm_hash, i);
+                                if (actual_h != rec.perm_hash) {
+                                    perm_hash_remap[rec.perm_hash] = actual_h;
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    continue;
+                }
+                const auto sit = shader_by_hash.find(rec.pgm_hash);
+                if (sit == shader_by_hash.end()) {
+                    continue;
+                }
+                perm_jobs.push_back({sit->second, &rec});
+            }
+
+            // Sort by (pgm_hash, perm_idx) so multi-perm insertions preserve deterministic ordering.
+            std::ranges::sort(perm_jobs, [](const PendingPermJob& a, const PendingPermJob& b) {
+                if (a.rec->pgm_hash != b.rec->pgm_hash) return a.rec->pgm_hash < b.rec->pgm_hash;
+                return a.rec->perm_idx < b.rec->perm_idx;
+            });
+
+            if (!perm_jobs.empty()) {
+                report_progress("recipe_perms", true);
+                std::atomic<size_t> next_job{0};
+                auto perm_worker = [&] {
+                    Shader::Pools local_pools;
+                    auto env = std::make_unique<SyntheticStageEnv>();
+                    for (;;) {
+                        const size_t jidx = next_job.fetch_add(1, std::memory_order_relaxed);
+                        if (jidx >= perm_jobs.size()) {
+                            break;
+                        }
+                        const auto& job = perm_jobs[jidx];
+                        const auto& sh = *job.sh;
+                        const auto& rec = *job.rec;
+
+                        env->Build(sh);
+                        env->ApplyRecipeOverrides(rec);
+
+                        Shader::ShaderParams params{
+                            .user_data = env->user_data,
+                            .code = sh.code,
+                            .hash = sh.hash,
+                        };
+                        auto rt_info = rec.spec.runtime_info;
+                        auto run_bnd = rec.spec.start;
+                        Shader::Info info(rec.hw_stage, rec.sw_stage, params);
+                        std::vector<u32> raw_spv;
+                        std::vector<u32> opt_spv;
+
+                        vk::ShaderModule mod{};
+                        Shader::StageSpecialization built_spec{};
+                        {
+                            ScopedRecipeReplay replay{rec};
+                            mod = CompileModuleRaw(
+                                local_pools, info, rt_info, sh.code, rec.perm_idx, run_bnd,
+                                &raw_spv,
+                                Shader::Backend::SPIRV::SpirvOptEnabled() ? &opt_spv : nullptr);
+                            if (mod) {
+                                built_spec = Shader::StageSpecialization(info, rt_info, profile,
+                                                                         rec.spec.start);
+                            }
+                        }
+                        if (!mod) {
+                            continue;
+                        }
+
+                        std::scoped_lock lk{commit_mutex};
+                        auto pit = program_cache.find(rec.pgm_hash);
+                        if (pit == program_cache.end() || !pit->second) {
+                            auto new_prog = std::make_unique<Program>(rec.hw_stage, rec.sw_stage, params);
+                            new_prog->info = std::move(info);
+                            built_spec.info = &new_prog->info;
+                            const size_t actual_idx = 0;
+                            if (!raw_spv.empty()) {
+                                PipelineStore::SaveShaderBinary(std::move(raw_spv), rec.pgm_hash,
+                                                                actual_idx);
+                            }
+                            if (!opt_spv.empty()) {
+                                PipelineStore::SaveOptShaderBinary(std::move(opt_spv), rec.pgm_hash,
+                                                                   actual_idx);
+                            }
+                            const u64 actual_ph = HashCombine(rec.pgm_hash, actual_idx);
+                            PipelineStore::SaveShaderMeta(new_prog->info, built_spec, actual_ph,
+                                                          actual_idx, false);
+                            new_prog->AddPermut(mod, std::move(built_spec));
+                            new_prog->info_template = std::make_unique<Shader::Info>(new_prog->info);
+                            program_cache.emplace(rec.pgm_hash, std::move(new_prog));
+                            if (actual_ph != rec.perm_hash) {
+                                perm_hash_remap[rec.perm_hash] = actual_ph;
+                            }
+                            recipe_perm_built.fetch_add(1, std::memory_order_relaxed);
+                            continue;
+                        }
+
+                        auto& prog = *pit->second;
+                        // Avoid duplicate specialization if another worker already added it.
+                        bool dup = false;
+                        for (size_t i = 0; i < prog.modules.size(); ++i) {
+                            if (prog.modules[i].module && prog.modules[i].spec == built_spec) {
+                                const u64 actual_ph = HashCombine(rec.pgm_hash, i);
+                                if (actual_ph != rec.perm_hash) {
+                                    perm_hash_remap[rec.perm_hash] = actual_ph;
+                                }
+                                dup = true;
+                                break;
+                            }
+                        }
+                        if (dup) {
+                            instance.GetDevice().destroyShaderModule(mod);
+                            continue;
+                        }
+
+                        const size_t actual_idx = prog.modules.size();
+                        built_spec.info = &prog.info;
+                        if (!raw_spv.empty()) {
+                            PipelineStore::SaveShaderBinary(std::move(raw_spv), rec.pgm_hash,
+                                                            actual_idx);
+                        }
+                        if (!opt_spv.empty()) {
+                            PipelineStore::SaveOptShaderBinary(std::move(opt_spv), rec.pgm_hash,
+                                                               actual_idx);
+                        }
+                        const u64 actual_ph = HashCombine(rec.pgm_hash, actual_idx);
+                        PipelineStore::SaveShaderMeta(info, built_spec, actual_ph, actual_idx,
+                                                      false);
+                        prog.AddPermut(mod, std::move(built_spec));
+                        if (actual_ph != rec.perm_hash) {
+                            perm_hash_remap[rec.perm_hash] = actual_ph;
+                        }
+                        recipe_perm_built.fetch_add(1, std::memory_order_relaxed);
+                    }
+                };
+
+                std::vector<std::thread> workers;
+                workers.reserve(num_threads);
+                for (u32 t = 0; t < num_threads; ++t) {
+                    workers.emplace_back(perm_worker);
+                }
+                for (auto& w : workers) {
+                    w.join();
+                }
+            }
+        }
+    }
 
     // Phase 4: Pre-warm driver VkPipelineCache with paired VS+PS GraphicsPipelines for core/decal/VFX passes.
     if (instance.IsVertexInputDynamicState() && !pass_pairs.empty()) {
@@ -1426,7 +1671,7 @@ int PipelineCache::BakeAllGameShaders(const std::filesystem::path& game_dir) {
                     std::scoped_lock lk{commit_mutex};
                     std::unique_lock gr_lk{graphics_pipelines_mutex};
                     if (!graphics_pipelines.contains(key)) {
-                        PipelineStore::SaveGraphics(key, pso_hash, sdata);
+                        PipelineStore::SaveGraphics(key, pso_hash, sdata, false);
                         graphics_pipelines.emplace(key, std::move(built));
                         gfx_pso_built.fetch_add(1, std::memory_order_relaxed);
                     }
@@ -1444,6 +1689,106 @@ int PipelineCache::BakeAllGameShaders(const std::filesystem::path& game_dir) {
         }
     }
 
+    // Phase 4.5: Pre-warm driver VkPipelineCache with GraphicsPipeline recipes from RecipeCatalog.
+    {
+        const auto& pso_recipes = RecipeCatalog::Get().GetGraphicsPsoRecipes();
+        if (instance.IsVertexInputDynamicState() && !pso_recipes.empty()) {
+            // Build O(1) lookup from perm_hash -> (Program*, perm_idx).
+            std::unordered_map<u64, std::pair<const Program*, size_t>> perm_lookup;
+            perm_lookup.reserve(program_cache.size() * 2);
+            for (const auto& [h, prog] : program_cache) {
+                if (!prog) continue;
+                for (size_t i = 0; i < prog->modules.size(); ++i) {
+                    if (prog->modules[i].module) {
+                        perm_lookup.try_emplace(HashCombine(h, i), prog.get(), i);
+                    }
+                }
+            }
+
+            report_progress("recipe_pso", true);
+            std::atomic<size_t> next_rec{0};
+            auto recipe_pso_worker = [&] {
+                for (;;) {
+                    const size_t ridx = next_rec.fetch_add(1, std::memory_order_relaxed);
+                    if (ridx >= pso_recipes.size()) {
+                        break;
+                    }
+                    const auto& rec = pso_recipes[ridx];
+                    GraphicsPipelineKey key = rec.key;
+                    for (auto& sh_h : key.stage_hashes) {
+                        if (sh_h != 0) {
+                            if (const auto rm = perm_hash_remap.find(sh_h);
+                                rm != perm_hash_remap.end()) {
+                                sh_h = rm->second;
+                            }
+                        }
+                    }
+                    {
+                        std::shared_lock gr_lk{graphics_pipelines_mutex};
+                        if (graphics_pipelines.contains(key)) {
+                            continue;
+                        }
+                    }
+
+                    std::array<const Shader::Info*, MaxShaderStages> infos{};
+                    std::array<Shader::RuntimeInfo, MaxShaderStages> rts{};
+                    std::array<vk::ShaderModule, MaxShaderStages> mods{};
+                    std::optional<Shader::Gcn::FetchShaderData> fetch_data{};
+                    bool all_stages_ready = true;
+                    bool has_any_stage = false;
+                    for (u32 s = 0; s < MaxShaderStages; ++s) {
+                        const u64 sh_h = key.stage_hashes[s];
+                        if (sh_h == 0) {
+                            continue;
+                        }
+                        has_any_stage = true;
+                        const auto it = perm_lookup.find(sh_h);
+                        if (it == perm_lookup.end()) {
+                            all_stages_ready = false;
+                            break;
+                        }
+                        const Program* p = it->second.first;
+                        const size_t pidx = it->second.second;
+                        infos[s] = &p->info;
+                        rts[s] = p->modules[pidx].spec.runtime_info;
+                        mods[s] = p->modules[pidx].module;
+                        if (s == static_cast<u32>(SwStage::Vertex)) {
+                            fetch_data = p->modules[pidx].spec.fetch_shader_data;
+                        }
+                    }
+                    if (!has_any_stage || !all_stages_ready) {
+                        continue;
+                    }
+
+                    GraphicsPipeline::SerializationSupport sdata = rec.sdata;
+                    auto built = std::make_unique<GraphicsPipeline>(
+                        instance, scheduler, desc_heap, profile, key, *pipeline_cache, infos, rts,
+                        fetch_data, mods, sdata, false);
+                    const u64 pso_hash = std::hash<GraphicsPipelineKey>{}(key);
+                    {
+                        std::scoped_lock lk{commit_mutex};
+                        std::unique_lock gr_lk{graphics_pipelines_mutex};
+                        if (!graphics_pipelines.contains(key)) {
+                            PipelineStore::SaveGraphics(key, pso_hash, sdata, false);
+                            graphics_pipelines.emplace(key, std::move(built));
+                            recipe_pso_built.fetch_add(1, std::memory_order_relaxed);
+                            gfx_pso_built.fetch_add(1, std::memory_order_relaxed);
+                        }
+                    }
+                }
+            };
+
+            std::vector<std::thread> workers;
+            workers.reserve(num_threads);
+            for (u32 t = 0; t < num_threads; ++t) {
+                workers.emplace_back(recipe_pso_worker);
+            }
+            for (auto& w : workers) {
+                w.join();
+            }
+        }
+    }
+
     report_progress("saving", true);
     SaveProfile();
     SaveDriverPipelineCache();
@@ -1454,9 +1799,10 @@ int PipelineCache::BakeAllGameShaders(const std::filesystem::path& game_dir) {
     const double cache_mib = ComputeDirectorySizeMiB(cache_root);
     std::printf(
         "[BB-BAKE] DONE elapsed_s=%.2f programs=%zu spv_built=%zu spv_cached=%zu cs_pso=%zu "
-        "gfx_pso=%zu cache_mib=%.2f\n",
+        "gfx_pso=%zu recipe_perms=%zu recipe_psos=%zu cache_mib=%.2f\n",
         elapsed_s, program_cache.size(), spv_built.load(), spv_cached.load(),
-        compute_pipelines.size(), graphics_pipelines.size(), cache_mib);
+        compute_pipelines.size(), graphics_pipelines.size(), recipe_perm_built.load(),
+        recipe_pso_built.load(), cache_mib);
     std::fflush(stdout);
     return 0;
 }
@@ -1465,9 +1811,12 @@ struct PipelineCache::AutoBakeReadyStage {
     HwStage hw_stage{};
     SwStage sw_stage{};
     u64 hash = 0;
+    bool is_extra_perm = false;
     Shader::Info info{};
     Shader::StageSpecialization spec{};
     vk::ShaderModule mod{};
+    std::vector<u32> raw_spv;
+    std::vector<u32> opt_spv;
     bool has_cs = false;
     ComputePipelineKey cs_key{};
     std::unique_ptr<ComputePipeline> built_cs;
@@ -1493,13 +1842,30 @@ void PipelineCache::StartBackgroundAutoBake() {
         return;
     }
     constexpr size_t kFullGameShaderThreshold = 5500;
-    if (program_cache.size() >= kFullGameShaderThreshold) {
+    std::unordered_set<u64> warm_digests;
+    warm_digests.reserve(program_cache.size() * 2 + 512);
+    for (const auto& [h, prog] : program_cache) {
+        if (!prog) continue;
+        for (const auto& m : prog->modules) {
+            if (!m.module) continue;
+            warm_digests.insert(RecipeCatalog::ComputeStageDigest(
+                h, prog->info.hw_stage, prog->info.sw_stage, m.spec));
+        }
+    }
+    size_t missing_recipe_perms = 0;
+    for (const auto& rec : RecipeCatalog::Get().GetStageRecipes()) {
+        if (!warm_digests.contains(rec.spec_digest)) {
+            ++missing_recipe_perms;
+        }
+    }
+
+    if (program_cache.size() >= kFullGameShaderThreshold && missing_recipe_perms == 0) {
         const u32 n = static_cast<u32>(program_cache.size());
         BbStats::shader_autobake_done.store(n, std::memory_order_relaxed);
         BbStats::shader_autobake_total.store(n, std::memory_order_relaxed);
         BbStats::shader_autobake_active.store(false, std::memory_order_relaxed);
-        std::printf("[bb_vulkan] Background Auto-Baker: all %zu game shaders already warm (0%% CPU)\n",
-                    program_cache.size());
+        std::printf("[bb_vulkan] Background Auto-Baker: all %zu game shaders + %zu recipe perms already warm (0%% CPU)\n",
+                    program_cache.size(), RecipeCatalog::Get().GetStageRecipes().size());
         return;
     }
 
@@ -1534,6 +1900,7 @@ void PipelineCache::StartBackgroundAutoBake() {
     BbStats::shader_autobake_active.store(true, std::memory_order_relaxed);
 
     autobake_thread = std::thread([this, game_root_dir, shader_dir, warm = std::move(warm_hashes),
+                                   warm_dig = std::move(warm_digests),
                                    ps_bnd_init = std::move(ps_bindings_map)]() mutable {
         SetPoliteAutoBakeThreadPriority();
         const auto t0 = std::chrono::steady_clock::now();
@@ -1626,11 +1993,30 @@ void PipelineCache::StartBackgroundAutoBake() {
         for (const auto& s : ps_list) already_warm_count += warm.contains(s.hash) ? 1 : 0;
         for (const auto& s : vs_list) already_warm_count += warm.contains(s.hash) ? 1 : 0;
 
-        BbStats::shader_autobake_total.store(static_cast<u32>(total_all), std::memory_order_relaxed);
+        // Check if we also have missing StageRecipe permutations from RecipeCatalog.
+        std::unordered_map<u64, const ParsedOrbShader*> shader_by_hash;
+        shader_by_hash.reserve(total_all);
+        for (const auto& s : cs_list) shader_by_hash.try_emplace(s.hash, &s);
+        for (const auto& s : ps_list) shader_by_hash.try_emplace(s.hash, &s);
+        for (const auto& s : vs_list) shader_by_hash.try_emplace(s.hash, &s);
+
+        std::vector<std::pair<const ParsedOrbShader*, const RecipeCatalog::StageRecipe*>>
+            pending_recipes;
+        for (const auto& rec : RecipeCatalog::Get().GetStageRecipes()) {
+            if (warm_dig.contains(rec.spec_digest)) {
+                continue;
+            }
+            if (const auto it = shader_by_hash.find(rec.pgm_hash); it != shader_by_hash.end()) {
+                pending_recipes.emplace_back(it->second, &rec);
+            }
+        }
+
+        const size_t total_work = total_all + pending_recipes.size();
+        BbStats::shader_autobake_total.store(static_cast<u32>(total_work), std::memory_order_relaxed);
         BbStats::shader_autobake_done.store(static_cast<u32>(already_warm_count),
                                             std::memory_order_relaxed);
 
-        if (already_warm_count >= total_all) {
+        if (already_warm_count >= total_all && pending_recipes.empty()) {
             BbStats::shader_autobake_active.store(false, std::memory_order_relaxed);
             return;
         }
@@ -1638,8 +2024,9 @@ void PipelineCache::StartBackgroundAutoBake() {
         const u32 hw_threads = std::max(1u, std::thread::hardware_concurrency());
         const u32 polite_workers = std::clamp(hw_threads / 6u, 1u, 3u);
         std::printf("[bb_vulkan] Background Auto-Baker started politely (%zu / %zu cached, "
-                    "compiling %zu remaining on %u idle-priority threads)\n",
-                    already_warm_count, total_all, total_all - already_warm_count, polite_workers);
+                    "compiling %zu base + %zu recipe perms on %u idle-priority threads)\n",
+                    already_warm_count, total_all, total_all - already_warm_count,
+                    pending_recipes.size(), polite_workers);
         std::fflush(stdout);
 
         std::mutex ps_bnd_mutex;
@@ -1736,9 +2123,9 @@ void PipelineCache::StartBackgroundAutoBake() {
                             PipelineStore::SaveOptShaderBinary(std::move(opt_spv), sh.hash, 0);
                         }
                         const u64 perm_hash = HashCombine(sh.hash, 0);
-                        PipelineStore::SaveShaderMeta(item->info, item->spec, perm_hash, 0);
+                        PipelineStore::SaveShaderMeta(item->info, item->spec, perm_hash, 0, false);
                         if (item->has_cs && item->built_cs) {
-                            PipelineStore::SaveCompute(item->cs_key, item->cs_sdata);
+                            PipelineStore::SaveCompute(item->cs_key, item->cs_sdata, false);
                         }
 
                         {
@@ -1775,13 +2162,78 @@ void PipelineCache::StartBackgroundAutoBake() {
         run_polite_phase(ps_list, false);
         run_polite_phase(vs_list, true);
 
+        // Polite RecipeCatalog permutation pass (extra runtime perms `perm >= 1`).
+        if (!pending_recipes.empty() && !autobake_stop.load(std::memory_order_relaxed)) {
+            std::atomic<size_t> next_r{0};
+            auto r_worker = [&] {
+                SetPoliteAutoBakeThreadPriority();
+                Shader::Pools local_pools;
+                auto env = std::make_unique<SyntheticStageEnv>();
+                for (;;) {
+                    if (autobake_stop.load(std::memory_order_relaxed)) {
+                        return;
+                    }
+                    const size_t ridx = next_r.fetch_add(1, std::memory_order_relaxed);
+                    if (ridx >= pending_recipes.size()) {
+                        return;
+                    }
+                    const auto& [sh_ptr, rec_ptr] = pending_recipes[ridx];
+                    const auto& sh = *sh_ptr;
+                    const auto& rec = *rec_ptr;
+                    env->Build(sh);
+                    env->ApplyRecipeOverrides(rec);
+
+                    Shader::ShaderParams params{
+                        .user_data = env->user_data,
+                        .code = sh.code,
+                        .hash = sh.hash,
+                    };
+                    auto rt_info = rec.spec.runtime_info;
+                    auto run_bnd = rec.spec.start;
+                    auto item = std::make_shared<AutoBakeReadyStage>();
+                    item->hw_stage = rec.hw_stage;
+                    item->sw_stage = rec.sw_stage;
+                    item->hash = rec.pgm_hash;
+                    item->is_extra_perm = true;
+                    item->info = Shader::Info(rec.hw_stage, rec.sw_stage, params);
+
+                    {
+                        ScopedRecipeReplay replay{rec};
+                        item->mod = CompileModuleRaw(
+                            local_pools, item->info, rt_info, sh.code, rec.perm_idx, run_bnd,
+                            &item->raw_spv,
+                            Shader::Backend::SPIRV::SpirvOptEnabled() ? &item->opt_spv : nullptr);
+                        if (item->mod) {
+                            item->spec =
+                                Shader::StageSpecialization(item->info, rt_info, profile, rec.spec.start);
+                        }
+                    }
+                    if (item->mod) {
+                        std::scoped_lock qlk{autobake_mutex};
+                        autobake_ready.push_back(std::move(item));
+                        autobake_has_ready.store(true, std::memory_order_release);
+                    }
+                    const u32 cur = done_all.fetch_add(1, std::memory_order_relaxed) + 1;
+                    BbStats::shader_autobake_done.store(cur, std::memory_order_relaxed);
+                }
+            };
+            std::vector<std::thread> rpool;
+            rpool.reserve(polite_workers);
+            for (u32 t = 0; t < polite_workers; ++t) {
+                rpool.emplace_back(r_worker);
+            }
+            for (auto& w : rpool) {
+                w.join();
+            }
+        }
+
         driver_cache_dirty.store(true, std::memory_order_relaxed);
         BbStats::shader_autobake_active.store(false, std::memory_order_relaxed);
         if (!autobake_stop.load(std::memory_order_relaxed)) {
             const double secs =
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-            std::printf("[bb_vulkan] Background Auto-Baker: 100%% COMPLETE (%zu shaders warm in %.1f s)\n",
-                        total_all, secs);
+            std::printf("[bb_vulkan] Background Auto-Baker: 100%% COMPLETE (%zu shaders + %zu recipe perms warm in %.1f s)\n",
+                        total_all, pending_recipes.size(), secs);
             std::fflush(stdout);
         }
     });
@@ -1826,6 +2278,52 @@ void PipelineCache::DrainAutoBakeReadyStages() {
     for (auto& item : batch) {
         if (!item || !item->mod) {
             continue;
+        }
+        if (item->is_extra_perm) {
+            auto pit = program_cache.find(item->hash);
+            if (pit != program_cache.end() && pit->second) {
+                auto& prog = *pit->second;
+                bool dup = false;
+                for (const auto& m : prog.modules) {
+                    if (m.module && m.spec == item->spec) {
+                        dup = true;
+                        break;
+                    }
+                }
+                if (dup) {
+                    instance.GetDevice().destroyShaderModule(item->mod);
+                    item->mod = nullptr;
+                    continue;
+                }
+                const size_t actual_idx = prog.modules.size();
+                if (!item->raw_spv.empty()) {
+                    PipelineStore::SaveShaderBinary(std::move(item->raw_spv), item->hash,
+                                                    actual_idx);
+                }
+                if (!item->opt_spv.empty()) {
+                    PipelineStore::SaveOptShaderBinary(std::move(item->opt_spv), item->hash,
+                                                       actual_idx);
+                }
+                item->spec.info = &prog.info;
+                PipelineStore::SaveShaderMeta(item->info, item->spec,
+                                              HashCombine(item->hash, actual_idx), actual_idx,
+                                              false);
+                {
+                    std::unique_lock lk{programs_mutex};
+                    prog.AddPermut(item->mod, std::move(item->spec));
+                }
+                any_committed = true;
+                continue;
+            }
+            // Program didn't exist yet: save as perm 0 and fall through to create it.
+            if (!item->raw_spv.empty()) {
+                PipelineStore::SaveShaderBinary(std::move(item->raw_spv), item->hash, 0);
+            }
+            if (!item->opt_spv.empty()) {
+                PipelineStore::SaveOptShaderBinary(std::move(item->opt_spv), item->hash, 0);
+            }
+            PipelineStore::SaveShaderMeta(item->info, item->spec, HashCombine(item->hash, 0), 0,
+                                          false);
         }
         if (program_cache.contains(item->hash)) {
             instance.GetDevice().destroyShaderModule(item->mod);

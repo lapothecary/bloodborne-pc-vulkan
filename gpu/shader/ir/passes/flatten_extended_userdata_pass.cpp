@@ -9,11 +9,15 @@
 // Reads that compute the same value (global value numbering over the pointer and offset
 // arithmetic) share a slot. A walker load from unmapped memory (a stale pointer) faults; the
 // fault handler supplies 0 for that invocation and resumes without changing shared code.
+#include <array>
 #include <atomic>
+#include <cstring>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <queue>
 #include <unordered_map>
+#include <vector>
 
 #include <boost/container/flat_map.hpp>
 #include <boost/container/small_vector.hpp>
@@ -45,12 +49,23 @@ namespace {
 
 using namespace Xbyak::util;
 
-/// All walkers live in one executable buffer. Published instructions are immutable.
+/// All walkers live in immutable executable chunks with content deduplication so repeated shader
+/// permutations (or cache reloads) never exhaust Xbyak's buffer with identical walker machine code.
 struct WalkerCode {
+    static constexpr size_t kChunkBytes = 32_MB;
+    static constexpr size_t kMaxChunks = 8;
+    static constexpr size_t kChunkSafetyMargin = 64 * 1024;
+
     std::mutex mutex;
-    Xbyak::CodeGenerator code{32_MB};
-    const u8* start{};
-    std::atomic<size_t> published_size{0};
+    bool handler_registered{false};
+    std::vector<std::unique_ptr<Xbyak::CodeGenerator>> chunks;
+    std::unique_ptr<Xbyak::CodeGenerator> scratch;
+    // Lock-free signal-handler readable chunk table.
+    std::array<const u8*, kMaxChunks> chunk_starts{};
+    std::array<std::atomic<size_t>, kMaxChunks> chunk_sizes{};
+    std::atomic<u32> chunk_count{0};
+    // Content deduplication: FNV-1a 64-bit hash -> list of (code_ptr, code_size) in published chunks.
+    std::unordered_map<u64, std::vector<std::pair<const u8*, size_t>>> dedup;
 };
 
 WalkerCode& Walkers() {
@@ -58,13 +73,31 @@ WalkerCode& Walkers() {
     return walkers;
 }
 
+u64 HashWalkerBytes(const u8* ptr, size_t size) noexcept {
+    u64 h = 14695981039346656037ULL;
+    for (size_t i = 0; i < size; ++i) {
+        h ^= ptr[i];
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
 /// Supply zero for this failed load only. Patching the shared MOV raced with other threads'
 /// fault handlers and permanently discarded valid data on later draws using the same walker.
 bool HandleFaultingWalkerLoad(void* context, void* fault_address) {
     WalkerCode& walkers = Walkers();
     const u8* const code = static_cast<const u8*>(Common::GetRip(context));
-    const size_t published_size = walkers.published_size.load(std::memory_order_acquire);
-    if (!published_size || code < walkers.start || code >= walkers.start + published_size) {
+    const u32 count_chunks = walkers.chunk_count.load(std::memory_order_acquire);
+    bool in_walker = false;
+    for (u32 i = 0; i < count_chunks; ++i) {
+        const u8* const start = walkers.chunk_starts[i];
+        const size_t published_size = walkers.chunk_sizes[i].load(std::memory_order_acquire);
+        if (published_size && code >= start && code < start + published_size) {
+            in_walker = true;
+            break;
+        }
+    }
+    if (!in_walker) {
         return false;
     }
     ZydisDecodedInstruction instruction;
@@ -98,16 +131,56 @@ bool HandleFaultingWalkerLoad(void* context, void* fault_address) {
     return true;
 }
 
-/// The walker buffer, with the fault handler registered on first use (lock held).
-Xbyak::CodeGenerator& WalkerBuffer(WalkerCode& walkers) {
-    if (!walkers.start) {
-        walkers.start = walkers.code.getCurr();
+/// Ensures at least one executable walker chunk has room for `needed` bytes (lock held).
+Xbyak::CodeGenerator& EnsureWalkerChunkLocked(WalkerCode& walkers, size_t needed, u32& chunk_idx) {
+    if (!walkers.handler_registered) {
         // After the memory tracking handler.
         constexpr u32 Priority = 2;
         Core::Signals::Instance()->RegisterAccessViolationHandler(HandleFaultingWalkerLoad,
                                                                   Priority);
+        walkers.handler_registered = true;
     }
-    return walkers.code;
+    if (!walkers.chunks.empty()) {
+        const u32 cur = static_cast<u32>(walkers.chunks.size() - 1);
+        auto& gen = *walkers.chunks[cur];
+        if (gen.getSize() + needed + WalkerCode::kChunkSafetyMargin <= WalkerCode::kChunkBytes) {
+            chunk_idx = cur;
+            return gen;
+        }
+    }
+    ASSERT_MSG(walkers.chunks.size() < WalkerCode::kMaxChunks,
+               "SRT walker executable chunks exhausted (> {} MiB unique walker code)",
+               (WalkerCode::kMaxChunks * WalkerCode::kChunkBytes) / (1024 * 1024));
+    auto next_gen = std::make_unique<Xbyak::CodeGenerator>(WalkerCode::kChunkBytes);
+    const u32 idx = static_cast<u32>(walkers.chunks.size());
+    walkers.chunk_starts[idx] = next_gen->getCode();
+    walkers.chunk_sizes[idx].store(0, std::memory_order_relaxed);
+    walkers.chunks.push_back(std::move(next_gen));
+    walkers.chunk_count.store(idx + 1, std::memory_order_release);
+    chunk_idx = idx;
+    return *walkers.chunks[idx];
+}
+
+PFN_SrtWalker RegisterWalkerCodeLocked(WalkerCode& walkers, const u8* ptr, size_t size) {
+    if (!ptr || size == 0) {
+        return nullptr;
+    }
+    const u64 digest = HashWalkerBytes(ptr, size);
+    if (const auto it = walkers.dedup.find(digest); it != walkers.dedup.end()) {
+        for (const auto& [existing_ptr, existing_size] : it->second) {
+            if (existing_size == size && std::memcmp(existing_ptr, ptr, size) == 0) {
+                return reinterpret_cast<PFN_SrtWalker>(const_cast<u8*>(existing_ptr));
+            }
+        }
+    }
+    u32 chunk_idx = 0;
+    Xbyak::CodeGenerator& c = EnsureWalkerChunkLocked(walkers, size, chunk_idx);
+    const auto* const dst = c.getCurr();
+    c.db(ptr, size);
+    c.ready();
+    walkers.chunk_sizes[chunk_idx].store(c.getSize(), std::memory_order_release);
+    walkers.dedup[digest].emplace_back(dst, size);
+    return reinterpret_cast<PFN_SrtWalker>(const_cast<u8*>(dst));
 }
 
 void DumpWalker(const Info& info, const u8* code, size_t size) {
@@ -133,12 +206,7 @@ void DumpWalker(const Info& info, const u8* code, size_t size) {
 PFN_SrtWalker RegisterWalkerCode(const u8* ptr, size_t size) {
     WalkerCode& walkers = Walkers();
     std::scoped_lock lock{walkers.mutex};
-    Xbyak::CodeGenerator& c = WalkerBuffer(walkers);
-    const auto func = c.getCurr<PFN_SrtWalker>();
-    c.db(ptr, size);
-    c.ready();
-    walkers.published_size.store(c.getSize(), std::memory_order_release);
-    return func;
+    return RegisterWalkerCodeLocked(walkers, ptr, size);
 }
 
 } // namespace Shader
@@ -711,7 +779,12 @@ InstVector CollectReads(IR::Program& program) {
 void FlattenExtendedUserdataPass(IR::Program& program) {
     WalkerCode& walkers = Walkers();
     std::scoped_lock lock{walkers.mutex};
-    WalkerBuilder builder{walkers.code};
+    if (!walkers.scratch) {
+        walkers.scratch = std::make_unique<Xbyak::CodeGenerator>(1_MB);
+    }
+    Xbyak::CodeGenerator& scratch = *walkers.scratch;
+    scratch.reset();
+    WalkerBuilder builder{scratch};
 
     const InstVector reads = CollectReads(program);
     for (IR::Inst* const read : reads) {
@@ -736,20 +809,17 @@ void FlattenExtendedUserdataPass(IR::Program& program) {
 
     Info& info = program.info;
     if (!builder.roots.empty()) {
-        Xbyak::CodeGenerator& c = WalkerBuffer(walkers);
-        info.srt_info.walker_func = c.getCurr<PFN_SrtWalker>();
         builder.next_slot = NUM_USER_DATA_REGS;
         ASSERT(builder.next_slot == info.srt_info.flattened_bufsize_dw);
         for (const auto& [sgpr, root] : builder.roots) {
             builder.Visit(IR::Value(static_cast<u32>(sgpr)), root);
         }
-        c.ret();
-        c.ready();
-        walkers.published_size.store(c.getSize(), std::memory_order_release);
-        const auto* const code = reinterpret_cast<const u8*>(info.srt_info.walker_func);
-        info.srt_info.walker_func_size = c.getCurr() - code;
+        scratch.ret();
+        const size_t walker_size = scratch.getSize();
+        info.srt_info.walker_func = RegisterWalkerCodeLocked(walkers, scratch.getCode(), walker_size);
+        info.srt_info.walker_func_size = walker_size;
         if (EmulatorSettings.IsDumpShaders()) {
-            DumpWalker(info, code, info.srt_info.walker_func_size);
+            DumpWalker(info, reinterpret_cast<const u8*>(info.srt_info.walker_func), walker_size);
         }
         info.srt_info.flattened_bufsize_dw = builder.next_slot;
     }

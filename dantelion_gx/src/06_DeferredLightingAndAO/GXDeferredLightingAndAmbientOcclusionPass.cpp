@@ -399,10 +399,24 @@ __attribute__((noinline)) void sub_229e990(void* pSelf, void* pRenderDev, void* 
         }
     }
 
-    {
+    // Live PostFX / effect toggle overrides apply ONLY to the main scene pass (`passId == 0x3e`).
+    // Secondary / planar reflection views (`passId == 0x35` from `sub_229d2b0` inside parallel
+    // `GXParallelFor` worker tasks `0x29487b0 -> 0xea8b80`, and `passId == 0x36`) intentionally
+    // zero `viewBytes[0x2968..0x296a]` and `viewBytes[0x296e]` at `eboot.bin+0x188dd60..0x188dd8b`:
+    // forcing `viewBytes[0x296e] = 1` on a parallel `passId == 0x35` view makes multiple GXWorker
+    // threads concurrently enter the non-thread-safe dynamic shadow pool allocator (`0x22a5c89 ->
+    // 0xea0a20 -> 0x2245320`), racing on `pool->used[tier]` (`[rdi+tier*4+0x100]`) past `cap`,
+    // overflowing into the adjacent GFX heap chunk and calling a null vtable slot (`0x535f3e0+0x18`).
+    // Also honor the original `ctxFlags` bit gates from `eboot.bin+0x22c5964..0x22c5989`
+    // (`0x20` for Motion Blur `0x2969`, `0x10` for Game AA `0x296a`, `0x08` for Bloom/SSAO).
+    if (passId == 0x3eu) {
         const uint32_t ctxFlags = *reinterpret_cast<const uint32_t*>(viewBytes + 0x48);
-        viewBytes[0x2969] = gx_direct_vk::IsEffectEnabled(gx_direct_vk::kEffectMotionBlur) ? 1u : 0u;
-        viewBytes[0x296a] = gx_direct_vk::IsEffectEnabled(gx_direct_vk::kEffectGameAa) ? 1u : 0u;
+        if ((ctxFlags & 0x20u) != 0u) {
+            viewBytes[0x2969] = gx_direct_vk::IsEffectEnabled(gx_direct_vk::kEffectMotionBlur) ? 1u : 0u;
+        }
+        if ((ctxFlags & 0x10u) != 0u) {
+            viewBytes[0x296a] = gx_direct_vk::IsEffectEnabled(gx_direct_vk::kEffectGameAa) ? 1u : 0u;
+        }
         viewBytes[0x296e] = gx_direct_vk::IsEffectEnabled(gx_direct_vk::kEffectDynamicShadows) ? 1u : 0u;
         if ((ctxFlags & 0x8u) != 0u) {
             const uint8_t wantBloom = gx_direct_vk::IsEffectEnabled(gx_direct_vk::kEffectBloom) ? 1u : 0u;

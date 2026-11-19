@@ -34,6 +34,7 @@
 #include "render/gcn_to_vk.h"
 #include "render/pipeline_cache.h"
 #include "render/pipeline_store.h"
+#include "render/recipe_catalog.h"
 #include "render/scheduler.h"
 #include "render/shader_capture.h"
 #include "render/vk_draw_prep.h"
@@ -538,9 +539,13 @@ PipelineCache::~PipelineCache() {
         completed_spv_jobs.clear();
         pending_spv_jobs.clear();
     }
+    if (driver_cache_save_thread.joinable()) {
+        driver_cache_save_thread.join();
+    }
     if (driver_cache_dirty.load(std::memory_order_relaxed)) {
         SaveDriverPipelineCache();
     }
+    RecipeCatalog::Get().Shutdown();
     const auto tel = DirectShaders::ReadTelemetry();
     if (tel.registered_binaries != 0 || tel.stage_a_direct_hits != 0 ||
         tel.worker_direct_hits != 0) {
@@ -1687,10 +1692,12 @@ const GraphicsPipeline* PipelineCache::SelectGraphicsPipelineFull(const DrawIndi
         const bool probe_ok = RefreshGraphicsKey(sel);
         sel.async_probe = false;
         if (!probe_ok) {
-            if (sel.async_spv_miss) {
-                QueueAsyncSpvJob(params, indirect);
+            if (sel.async_spv_miss && QueueAsyncSpvJob(params, indirect)) {
+                return nullptr;
             }
-            return nullptr;
+            if (!sel.async_spv_miss || !RefreshGraphicsKey(sel)) {
+                return nullptr;
+            }
         }
     } else if (!RefreshGraphicsKey(sel)) {
         return nullptr;
@@ -3189,7 +3196,7 @@ void PipelineCache::DrainCompletedAsyncSpvJobs() {
     if (!has_completed_spv.load(std::memory_order_acquire)) [[likely]] {
         return;
     }
-    constexpr size_t kMaxDrainPerCall = 16;
+    constexpr size_t kMaxDrainPerCall = 64;
     std::vector<std::shared_ptr<AsyncSpvJob>> done_jobs;
     {
         std::scoped_lock lk{async_spv_mutex};
@@ -3211,6 +3218,9 @@ void PipelineCache::DrainCompletedAsyncSpvJobs() {
     for (auto& job : done_jobs) {
         pending_spv_jobs.erase(job->sig);
         if (!job->ok) {
+            if (failed_spv_sigs.size() < 4096) {
+                failed_spv_sigs.insert(job->sig);
+            }
             for (auto& bs : job->ctx.built_stages) {
                 if (bs.module) {
                     instance.GetDevice().destroyShaderModule(bs.module);
@@ -3218,6 +3228,7 @@ void PipelineCache::DrainCompletedAsyncSpvJobs() {
             }
             continue;
         }
+        bool added_any = false;
         for (auto& bs : job->ctx.built_stages) {
             size_t actual_perm = 0;
             auto found = program_cache.find(bs.hash);
@@ -3250,6 +3261,7 @@ void PipelineCache::DrainCompletedAsyncSpvJobs() {
                 }
                 DirectShaders::NoteProgramCreated(bs.hash, raw_prog);
                 DirectShaders::AttachProgramToSlot(bs.pgm_base, bs.hash, raw_prog);
+                added_any = true;
             } else {
                 Program& prog = *found.value();
                 if (!prog.info_template) {
@@ -3286,6 +3298,7 @@ void PipelineCache::DrainCompletedAsyncSpvJobs() {
                                                   HashCombine(bs.hash, actual_perm), actual_perm);
                     prog.AddPermut(bs.module, std::move(bs.spec));
                     bs.module = nullptr;
+                    added_any = true;
                 }
                 DirectShaders::AttachProgramToSlot(bs.pgm_base, bs.hash, &prog);
             }
@@ -3323,7 +3336,13 @@ void PipelineCache::DrainCompletedAsyncSpvJobs() {
                 NoteDriverPipelineCacheDirty();
                 std::unique_lock gr_lk{graphics_pipelines_mutex};
                 graphics_pipelines.insert_or_assign(job->key, std::move(job->pipeline));
+                added_any = true;
             }
+        }
+        if (!added_any && failed_spv_sigs.size() < 4096) {
+            // Worker produced nothing new (e.g. spec mismatch between Stage A probe and worker
+            // replay): prevent infinite re-queue storms by allowing one Stage A sync compile.
+            failed_spv_sigs.insert(job->sig);
         }
     }
 }
@@ -3432,12 +3451,76 @@ bool PipelineCache::QueueAsyncSpvJob(DrawIndirectParams params, bool indirect) {
             live_info.pgm_base = pgm_base;
             live_info.user_data = pgm->user_data;
             live_info.RefreshFlatBuf();
-            // Include format/stride/type bits of walked sharps (stripping per-draw base addresses
-            // in bits [15:0]) so Vest vs Gloves with different sRGB/stride compile simultaneously!
+            // Hash ONLY address-independent StageSpecialization fields (zero GPU pointer bits!):
+            // hashing raw `flattened_ud_buf[k] & 0xFFFF0000u` included upper address bits of every
+            // V#/T# ring buffer (`0x1028xxxx`), breaking deduplication and causing 100k+ duplicate
+            // background compiles on repeated draws of the same material.
             u64 sharp_fmt_sig = 0x9e3779b97f4a7c15ULL;
-            for (size_t k = Gcn::NUM_USER_DATA; k < live_info.flattened_ud_buf.size(); ++k) {
-                sharp_fmt_sig =
-                    HashCombine(sharp_fmt_sig, u64(live_info.flattened_ud_buf[k] & 0xFFFF0000u));
+            for (const auto& desc : live_info.buffers) {
+                const auto sharp = desc.GetSharp(live_info);
+                u64 w = sharp ? 1ULL : 0ULL;
+                if (sharp) {
+                    w |= (u64(sharp.GetStride()) & 0x3FFFULL) << 1;
+                    w |= u64(Shader::IsPagedBuffer(profile.paged_buffers, sharp,
+                                                   live_info.pgm_hash,
+                                                   profile.buffer_copy_shader_hash))
+                         << 15;
+                    w |= u64(desc.is_formatted) << 16;
+                    w |= u64(sharp.swizzle_enable) << 17;
+                    if (desc.is_formatted) {
+                        const auto ds = sharp.DstSelect();
+                        const u64 ds_bits = u64(static_cast<u8>(ds.r)) |
+                                            (u64(static_cast<u8>(ds.g)) << 3) |
+                                            (u64(static_cast<u8>(ds.b)) << 6) |
+                                            (u64(static_cast<u8>(ds.a)) << 9);
+                        w |= (u64(static_cast<u32>(sharp.GetDataFmt())) & 0x3FULL) << 18;
+                        w |= (u64(static_cast<u32>(sharp.GetNumberFmt())) & 0xFULL) << 24;
+                        w |= (ds_bits & 0xFFFULL) << 28;
+                        w |= (u64(static_cast<u32>(sharp.GetNumberConversion())) & 0xFULL) << 40;
+                    }
+                    if (sharp.swizzle_enable) {
+                        w |= (u64(sharp.index_stride) & 0x3ULL) << 44;
+                        w |= (u64(sharp.element_size) & 0x3ULL) << 46;
+                    }
+                }
+                sharp_fmt_sig = HashCombine(sharp_fmt_sig, w);
+            }
+            for (const auto& desc : live_info.images) {
+                const auto sharp = desc.GetSharp(live_info);
+                u64 w = sharp ? 1ULL : 0ULL;
+                w |= (u64(static_cast<u32>(sharp.GetViewType(desc.is_array))) & 0xFULL) << 1;
+                w |= u64(::Gcn::IsInteger(sharp.GetNumberFmt())) << 5;
+                w |= u64(desc.is_written) << 6;
+                w |= u64(sharp.IsCube()) << 7;
+                if (desc.is_written) {
+                    const auto ds = sharp.DstSelect();
+                    const u64 ds_bits = u64(static_cast<u8>(ds.r)) |
+                                        (u64(static_cast<u8>(ds.g)) << 3) |
+                                        (u64(static_cast<u8>(ds.b)) << 6) |
+                                        (u64(static_cast<u8>(ds.a)) << 9);
+                    w |= (ds_bits & 0xFFFULL) << 8;
+                } else {
+                    w |= u64(sharp.GetNumberFmt() == ::Gcn::NumberFormat::Srgb) << 8;
+                }
+                w |= (u64(static_cast<u32>(sharp.GetNumberConversion())) & 0xFULL) << 20;
+                w |= (u64(desc.NumBindings(live_info)) & 0xFFULL) << 24;
+                sharp_fmt_sig = HashCombine(sharp_fmt_sig, w);
+            }
+            for (const auto& desc : live_info.fmasks) {
+                const auto sharp = desc.GetSharp(live_info);
+                u64 w = sharp ? 1ULL : 0ULL;
+                w |= (u64(sharp.width) & 0xFFFFULL) << 1;
+                w |= (u64(sharp.height) & 0xFFFFULL) << 17;
+                sharp_fmt_sig = HashCombine(sharp_fmt_sig, w);
+            }
+            for (const auto& desc : live_info.samplers) {
+                const auto sharp = desc.GetSharp(live_info);
+                u64 w = sharp ? 1ULL : 0ULL;
+                if (sharp) {
+                    w |= u64(sharp.force_unnormalized) << 1;
+                    w |= u64(sharp.force_degamma) << 2;
+                }
+                sharp_fmt_sig = HashCombine(sharp_fmt_sig, w);
             }
             sig = HashCombine(sig, sharp_fmt_sig);
         } else if (hw == HwStage::Vertex || hw == HwStage::Export) {
@@ -3536,7 +3619,15 @@ bool PipelineCache::QueueAsyncSpvJob(DrawIndirectParams params, bool indirect) {
 
     // Fast deduplication BEFORE any heap allocation: 400 draws of the same material in a single
     // frame collapse to 1 background job in < 10 us on Stage A.
+    if (failed_spv_sigs.contains(sig)) {
+        return false; // Fall back once to synchronous Stage A compilation
+    }
     if (pending_spv_jobs.contains(sig)) {
+        ++async_skipped;
+        return true;
+    }
+    constexpr size_t kMaxPendingSpvJobs = 128;
+    if (pending_spv_jobs.size() >= kMaxPendingSpvJobs) {
         ++async_skipped;
         return true;
     }
@@ -3604,6 +3695,13 @@ bool PipelineCache::QueueAsyncSpvJob(DrawIndirectParams params, bool indirect) {
                     snap.user_data[i + 1] = static_cast<u32>(host_ptr >> 32);
                 }
             }
+        }
+        // Keep `snap.flat_buf[0..15]` synchronized with the relocated host pointers in
+        // `snap.user_data` so `GetFetchShaderCode(info)` (which reads `info.UserData()`) never
+        // dereferences stale per-frame GFX command heap pointers on the worker thread.
+        if (!snap.flat_buf.empty()) {
+            const size_t n = std::min<size_t>(snap.flat_buf.size(), snap.user_data.size());
+            std::memcpy(snap.flat_buf.data(), snap.user_data.data(), n * sizeof(u32));
         }
     }
     if (copy_code_ptr && copy_code_dwords > 0) {

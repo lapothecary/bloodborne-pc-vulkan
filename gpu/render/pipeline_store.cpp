@@ -18,6 +18,7 @@
 #include "render/direct_shaders.h"
 #include "render/pipeline_cache.h"
 #include "render/pipeline_store.h"
+#include "render/recipe_catalog.h"
 #include "shader/backend/spirv/native_shaders.h"
 #include "shader/backend/spirv/spirv_opt.h"
 #include "shader/info.h"
@@ -230,17 +231,24 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
 
 namespace PipelineStore {
 
-void SaveCompute(const ComputePipelineKey& key, const ComputePipeline::SerializationSupport& sdata) {
+void SaveCompute(const ComputePipelineKey& key, const ComputePipeline::SerializationSupport& sdata,
+                 bool capture_recipe) {
     SavePipeline(key, sdata, 1, fmt::format("c_{:#018x}", key.value));
+    if (capture_recipe) {
+        RecipeCatalog::Get().CaptureComputePsoIfUnknown(key);
+    }
 }
 
 void SaveGraphics(const GraphicsPipelineKey& key, u64 hash,
-                  const GraphicsPipeline::SerializationSupport& sdata) {
+                  const GraphicsPipeline::SerializationSupport& sdata, bool capture_recipe) {
     SavePipeline(key, sdata, 0, fmt::format("g_{:#018x}", hash));
+    if (capture_recipe) {
+        RecipeCatalog::Get().CaptureGraphicsPsoIfUnknown(key, hash, sdata);
+    }
 }
 
 void SaveShaderMeta(const Shader::Info& info, const Shader::StageSpecialization& spec,
-                    u64 perm_hash, size_t perm_idx) {
+                    u64 perm_hash, size_t perm_idx, bool capture_recipe) {
     if (!Store().IsOpened()) {
         return;
     }
@@ -253,6 +261,9 @@ void SaveShaderMeta(const Shader::Info& info, const Shader::StageSpecialization&
     spec.Serialize(ar);
     info.Serialize(ar);
     Store().Save(BbCache::BlobType::ShaderMeta, MetaName(perm_hash), ar.TakeOff());
+    if (capture_recipe) {
+        RecipeCatalog::Get().CaptureStageIfUnknown(info, spec, perm_hash, perm_idx);
+    }
 }
 
 void SaveShaderBinary(std::vector<u32>&& spv, u64 pgm_hash, size_t perm_idx) {
@@ -370,13 +381,16 @@ bool PipelineCache::InitDriverPipelineCache(bool load_from_store, size_t* loaded
 }
 
 void PipelineCache::SaveDriverPipelineCache() {
+    std::scoped_lock lk{driver_cache_save_mutex};
     if (!pipeline_cache || !Store().IsOpened()) {
         return;
     }
+    // Clear dirty before reading the driver cache so any new PSO compiled concurrently on
+    // another thread re-marks it dirty for the next periodic flush or shutdown Sync().
+    driver_cache_dirty.store(false, std::memory_order_relaxed);
     auto [res, bytes] = instance.GetDevice().getPipelineCacheData(*pipeline_cache);
     if (res == vk::Result::eSuccess && bytes.size() >= sizeof(VkPipelineCacheHeaderVersionOne)) {
         Store().Save(BbCache::BlobType::ShaderProfile, DriverCacheBlobName(), std::move(bytes));
-        driver_cache_dirty.store(false, std::memory_order_relaxed);
         last_driver_cache_save_sec = static_cast<u32>(
             std::chrono::duration_cast<std::chrono::seconds>(
                 std::chrono::steady_clock::now().time_since_epoch())
@@ -393,9 +407,20 @@ void PipelineCache::NoteDriverPipelineCacheDirty() {
         std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::steady_clock::now().time_since_epoch())
             .count());
-    if (now_sec - last_driver_cache_save_sec >= 15) {
-        SaveDriverPipelineCache();
+    if (now_sec - last_driver_cache_save_sec < 30) {
+        return;
     }
+    if (driver_cache_save_inflight.exchange(true, std::memory_order_acq_rel)) {
+        return;
+    }
+    last_driver_cache_save_sec = now_sec;
+    if (driver_cache_save_thread.joinable()) {
+        driver_cache_save_thread.join();
+    }
+    driver_cache_save_thread = std::thread([this]() {
+        SaveDriverPipelineCache();
+        driver_cache_save_inflight.store(false, std::memory_order_release);
+    });
 }
 
 bool PipelineCache::PreloadStage(Serialization::Archive& ar, const Shader::Info*& out_info,
@@ -586,6 +611,7 @@ void PipelineCache::DropPreloaded() {
 void PipelineCache::WarmUp() {
     const auto t0 = std::chrono::steady_clock::now();
     DirectShaders::InitializeManifestLibrary();
+    RecipeCatalog::Get().Initialize();
     if (!EmulatorSettings.IsPipelineCacheEnabled()) {
         InitDriverPipelineCache(false);
         return;
@@ -982,14 +1008,56 @@ void PipelineCache::WarmUp() {
         LOG_WARNING(Render, "{} stale pipelines were found. Consider re-generating the cache",
                     num_total - num_pipelines);
     }
+
+    // Optional developer export mode (`BB_EXPORT_RECIPES=1`): exports all extra runtime shader
+    // permutations (`perm >= 1`) plus all Graphics/Compute PSO keys loaded from the local cache
+    // into `RecipeCatalog`'s capture file so `tools/merge_recipes.py` can build `data/shader_recipes.bbrc`.
+    if (const char* exp = std::getenv("BB_EXPORT_RECIPES"); exp && exp[0] == '1') {
+        auto& cat = RecipeCatalog::Get();
+        std::unordered_set<u64> pso_stage_hashes;
+        pso_stage_hashes.reserve(graphics_items.size() * 2);
+        for (const auto& gi : graphics_items) {
+            for (u64 sh_h : gi.key.stage_hashes) {
+                if (sh_h != 0) pso_stage_hashes.insert(sh_h);
+            }
+        }
+        for (const auto& [h, prog] : program_cache) {
+            if (!prog) continue;
+            for (size_t i = 0; i < prog->modules.size(); ++i) {
+                const auto& m = prog->modules[i];
+                if (!m.module) continue;
+                const u64 ph = HashCombine(h, i);
+                if (i >= 1 || pso_stage_hashes.contains(ph)) {
+                    cat.CaptureStageIfUnknown(prog->info, m.spec, ph, i);
+                }
+            }
+        }
+        for (const auto& gi : graphics_items) {
+            cat.CaptureGraphicsPsoIfUnknown(gi.key, std::hash<GraphicsPipelineKey>{}(gi.key),
+                                            gi.sdata);
+        }
+        for (const auto& ci : compute_items) {
+            cat.CaptureComputePsoIfUnknown(ci.key);
+        }
+        const auto st = cat.GetStats();
+        std::printf("[bb_vulkan] RecipeCatalog: BB_EXPORT_RECIPES captured %zu stage perms + "
+                    "%zu gfx PSOs + %zu cs PSOs -> %s\n",
+                    st.captured_stages, st.captured_gfx_psos, st.captured_cs_psos,
+                    cat.CapturePath().string().c_str());
+        std::fflush(stdout);
+    }
     Store().FinishPreload();
 }
 
 void PipelineCache::Sync() {
     StopBackgroundAutoBake();
+    if (driver_cache_save_thread.joinable()) {
+        driver_cache_save_thread.join();
+    }
     if (driver_cache_dirty.load(std::memory_order_relaxed)) {
         SaveDriverPipelineCache();
     }
+    RecipeCatalog::Get().Shutdown();
     Store().Close();
 }
 

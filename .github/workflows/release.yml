@@ -39,7 +39,7 @@ jobs:
             out/bb-launcher out/bb-vulkan out/bb-gpu-capabilities \
             out/libbbport_dlss.so out/libnvidia-ngx-dlss.so.310.9.1 \
             out/gpu/libbbgpu.so out/gpu/libbbnet20.so \
-            fsr4_shaders
+            fsr4_shaders data
           sha256sum bloodborne-pc-vulkan-linux-x86_64-prebuilt.tar.gz > bloodborne-pc-vulkan-linux-x86_64-prebuilt.tar.gz.sha256
           python3 launcher/bbport_updater.py --write-manifest \
             bloodborne-pc-vulkan-linux-x86_64-prebuilt.tar.gz \

@@ -23,11 +23,12 @@ constexpr u32 ShaderBinaryVersion = 22u; // copy shader experiment (21) reverted
 constexpr u32 ShaderMetaVersion = 7u;    // ImageResource::needs_native
 constexpr u32 PipelineKeyVersion = 5u;   // Info layout (ImageResource::needs_native)
 
-void SaveCompute(const ComputePipelineKey& key, const ComputePipeline::SerializationSupport& sdata);
+void SaveCompute(const ComputePipelineKey& key, const ComputePipeline::SerializationSupport& sdata,
+                 bool capture_recipe = true);
 void SaveGraphics(const GraphicsPipelineKey& key, u64 hash,
-                  const GraphicsPipeline::SerializationSupport& sdata);
+                  const GraphicsPipeline::SerializationSupport& sdata, bool capture_recipe = true);
 void SaveShaderMeta(const Shader::Info& info, const Shader::StageSpecialization& spec,
-                    u64 perm_hash, size_t perm_idx);
+                    u64 perm_hash, size_t perm_idx, bool capture_recipe = true);
 void SaveShaderBinary(std::vector<u32>&& spv, u64 pgm_hash, size_t perm_idx);
 void SaveOptShaderBinary(std::vector<u32>&& spv, u64 pgm_hash, size_t perm_idx);
 

@@ -213,6 +213,8 @@ def main() -> None:
         shutil.copytree(root / "patches", stage / "patches", dirs_exist_ok=True)
     if (root / "fsr4_shaders").is_dir():
         shutil.copytree(root / "fsr4_shaders", stage / "fsr4_shaders", dirs_exist_ok=True)
+    if (root / "data").is_dir():
+        shutil.copytree(root / "data", stage / "data", dirs_exist_ok=True)
 
     # 4. Copy & strip native Bloodborne.exe engine and bb-gpu-capabilities.exe + collect MSYS2 CLANG64 DLLs
     build_gpu = root / "build_win32_gpu"

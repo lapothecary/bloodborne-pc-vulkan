@@ -19,6 +19,7 @@
 #include <string>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <boost/container/small_vector.hpp>
@@ -333,6 +334,7 @@ private:
     void DrainAutoBakeReadyStages();
     tsl::robin_map<GraphicsPipelineKey, std::shared_ptr<PendingPipeline>> pending_graphics;
     tsl::robin_map<u64, std::shared_ptr<AsyncSpvJob>> pending_spv_jobs;
+    std::unordered_set<u64> failed_spv_sigs;
     std::mutex async_spv_mutex;
     std::vector<std::shared_ptr<AsyncSpvJob>> completed_spv_jobs;
     std::atomic<bool> has_completed_spv{false};
@@ -368,6 +370,9 @@ private:
     u32 stats_printed = 0;
     u64 async_started = 0, async_skipped = 0, async_waited = 0; ///< statistics
     std::atomic<bool> driver_cache_dirty{false};
+    std::atomic<bool> driver_cache_save_inflight{false};
+    std::mutex driver_cache_save_mutex;
+    std::thread driver_cache_save_thread;
     u32 last_driver_cache_save_sec = 0;
     std::unique_ptr<PipelineCompiler> compiler; ///< last: its threads are joined first
 };
