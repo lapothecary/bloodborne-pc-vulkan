@@ -112,6 +112,14 @@ Instance::~Instance() {
     if (stats_instance == this) {
         stats_instance = nullptr;
     }
+    if (device) {
+        (void)device->waitIdle();
+    }
+    // Shut down NVIDIA NGX/DLSS while VkDevice is still valid and idle (prevents
+    // nvngx_dlss.dll!NVSDK_NGX_CUDA_Shutdown1 crashing in std::atexit after vkDestroyDevice).
+    if (auto* dlss = Dlss::Get()) {
+        dlss->Shutdown();
+    }
     vmaDestroyAllocator(allocator);
 }
 

@@ -248,10 +248,19 @@ u64 PS4_SYSV_ABI PacerWait(u64 pacer, std::uint32_t reset_flag) {
                               BbStats::tick_wait_ns.load(std::memory_order_relaxed) +
                               BbStats::present_wait_ns.load(std::memory_order_relaxed);
 
+        static double hitch_ema_wall_ns = 0.0;
         if (!loading_burst && frame_draws >= 250 && pacer_prev_exit_ns != 0 &&
             entry_ns >= pacer_prev_exit_ns) {
             const u64 wall_ns = entry_ns - pacer_prev_exit_ns;
-            if (wall_ns >= 11'000'000ull && wall_ns < 5'000'000'000ull) [[unlikely]] {
+            const u64 delta_spv_cnt = cur_spv_cnt - prev_hitch_spv_cnt;
+            const u64 delta_pso_cnt = cur_pso_cnt - prev_hitch_pso_cnt;
+            const u64 adaptive_thresh_ns =
+                std::max<u64>(20'000'000ull, static_cast<u64>(hitch_ema_wall_ns * 1.85));
+            const bool is_real_hitch =
+                wall_ns < 5'000'000'000ull &&
+                (wall_ns >= adaptive_thresh_ns ||
+                 ((delta_spv_cnt > 0 || delta_pso_cnt > 0) && wall_ns >= 15'000'000ull));
+            if (is_real_hitch) [[unlikely]] {
                 const u64 cpu_ns = (have_entry_cpu && pacer_prev_exit_cpu_ns != 0 &&
                                     entry_cpu_ns >= pacer_prev_exit_cpu_ns)
                                        ? (entry_cpu_ns - pacer_prev_exit_cpu_ns)
@@ -265,9 +274,9 @@ u64 PS4_SYSV_ABI PacerWait(u64 pacer, std::uint32_t reset_flag) {
                     BbStats::frame_number.load(std::memory_order_relaxed), double(wall_ns) / 1e6,
                     double(cpu_ns) / 1e6, double(wait_ns) / 1e6,
                     double(cur_spv_ns - prev_hitch_spv_ns) / 1e6,
-                    static_cast<unsigned long long>(cur_spv_cnt - prev_hitch_spv_cnt),
+                    static_cast<unsigned long long>(delta_spv_cnt),
                     double(cur_pso_ns - prev_hitch_pso_ns) / 1e6,
-                    static_cast<unsigned long long>(cur_pso_cnt - prev_hitch_pso_cnt),
+                    static_cast<unsigned long long>(delta_pso_cnt),
                     static_cast<unsigned long long>(cur_pso_bg - prev_hitch_pso_bg),
                     static_cast<unsigned long long>(cur_imgs - prev_hitch_imgs),
                     double(cur_img_b - prev_hitch_img_bytes) / (1024.0 * 1024.0),
@@ -276,6 +285,11 @@ u64 PS4_SYSV_ABI PacerWait(u64 pacer, std::uint32_t reset_flag) {
                     static_cast<unsigned long long>(cur_faults - prev_hitch_faults),
                     double(cur_gpu_w - prev_hitch_gpu_wait_ns) / 1e6,
                     static_cast<unsigned long long>(frame_draws));
+            }
+            if (wall_ns < 200'000'000ull) {
+                hitch_ema_wall_ns = (hitch_ema_wall_ns == 0.0)
+                                        ? double(wall_ns)
+                                        : (hitch_ema_wall_ns * 0.96 + double(wall_ns) * 0.04);
             }
         }
         prev_hitch_spv_ns = cur_spv_ns;

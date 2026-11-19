@@ -2025,7 +2025,9 @@ bool Rasterizer::TryCullMicroShadowDraw(const GraphicsPipeline* pipeline,
     }
     ++stage_a_shadow_face_draw_idx;
     if (stage_a_shadow_face_draw_idx >= max_keep) {
-        BbStats::draws.fetch_sub(1, std::memory_order_relaxed);
+        if (u64 cur = BbStats::draws.load(std::memory_order_relaxed); cur > 0) {
+        BbStats::draws.compare_exchange_weak(cur, cur - 1, std::memory_order_relaxed);
+    }
         if (scene_occlusion_culler) {
             scene_occlusion_culler->stat_shadow_skipped.fetch_add(1, std::memory_order_relaxed);
         }
@@ -2424,7 +2426,9 @@ bool Rasterizer::TryCullSceneOcclusionStageA(const GraphicsPipeline* pipeline,
             if (is_skeleton) {
                 culler.stat_skel_skipped.fetch_add(1, std::memory_order_relaxed);
             }
-            BbStats::draws.fetch_sub(1, std::memory_order_relaxed);
+            if (u64 cur = BbStats::draws.load(std::memory_order_relaxed); cur > 0) {
+        BbStats::draws.compare_exchange_weak(cur, cur - 1, std::memory_order_relaxed);
+    }
             return true;
         }
         const u32 probe_mask =
@@ -2991,7 +2995,9 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
                                     culler.stat_skel_skipped.fetch_add(1,
                                                                        std::memory_order_relaxed);
                                 }
-                                BbStats::draws.fetch_sub(1, std::memory_order_relaxed);
+                                if (u64 cur = BbStats::draws.load(std::memory_order_relaxed); cur > 0) {
+        BbStats::draws.compare_exchange_weak(cur, cur - 1, std::memory_order_relaxed);
+    }
                                 return;
                             }
                             const u32 probe_mask =
