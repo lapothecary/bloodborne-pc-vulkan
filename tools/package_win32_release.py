@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Builds the Windows WPF Launcher (Bloodborne.exe), freezes the PyInstaller runner (bbport-run.exe),
+Freezes the unified Python launcher & game runner (Bloodborne.exe + Launcher.exe) via PyInstaller,
 collects MSYS2 CLANG64 runtime DLLs via PE32+ import table parsing, and packages
 bloodborne-pc-vulkan-windows-x86_64-prebuilt.zip + .sha256.
 """
@@ -97,7 +97,7 @@ def main() -> None:
     root = Path(__file__).resolve().parent.parent
     os.chdir(root)
 
-    # 1. Freeze Unified Python Launcher (Bloodborne.exe + bbport-run.exe) via PyInstaller
+    # 1. Freeze Unified Python Launcher (Bloodborne.exe + Launcher.exe) via PyInstaller
     run_checked([sys.executable, "-m", "pip", "install", "--upgrade", "pip", "pyinstaller", "pillow"], "PIP_PYINSTALLER")
 
     hidden_modules = [
@@ -147,7 +147,6 @@ def main() -> None:
 
     shutil.copytree(bbport_run_dir, stage, dirs_exist_ok=True)
     shutil.copy2(stage / "Bloodborne.exe", stage / "Launcher.exe")
-    shutil.copy2(stage / "Bloodborne.exe", stage / "bbport-run.exe")
     for fname in ("Launcher.py", "play.bat", "run.py", "LICENSE"):
         src = root / fname
         if src.is_file():
