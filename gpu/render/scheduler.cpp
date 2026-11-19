@@ -275,6 +275,9 @@ void Scheduler::BeginRendering(const RenderState& state, u8 color_dont_care_mask
 }
 
 void Scheduler::EndRendering() {
+    if (reorder_has_draws) [[unlikely]] {
+        FlushReorderBuckets();
+    }
     if (!is_rendering) {
         if (has_end_rendering_work) [[unlikely]] {
             resume_rendering = false;
@@ -539,10 +542,124 @@ void Scheduler::WaitHostCopies() {
     BbCopy::WaitAsync();
 }
 
+RecordChunk& Scheduler::CurrentBucketChunk(u32 bucket) {
+    auto& b = gbuf_reorder->buckets[bucket];
+    if (!b.current) [[unlikely]] {
+        b.current = AcquireChunk();
+    }
+    return *b.current;
+}
+
+void Scheduler::RetireBucketChunk(u32 bucket) {
+    auto& b = gbuf_reorder->buckets[bucket];
+    auto full = AcquireChunk();
+    b.current.swap(full);
+    if (full && !full->Empty()) {
+        b.chunks.push_back(std::move(full));
+    }
+}
+
+void Scheduler::EnterReorderBucket(u32 bucket) {
+    ASSERT(bucket < kNumReorderBuckets);
+    if (!gbuf_reorder) [[unlikely]] {
+        gbuf_reorder = std::make_unique<GBufReorderState>();
+        for (auto& b : gbuf_reorder->buckets) {
+            b.dyn_state.Invalidate();
+            b.push_state.InvalidateAll();
+        }
+    }
+    auto& b = gbuf_reorder->buckets[bucket];
+    if (!b.current) {
+        b.current = AcquireChunk();
+    }
+    active_reorder_bucket = bucket;
+    active_dynamic_state = &b.dyn_state;
+    reorder_has_draws = true;
+    ++gbuf_reorder->stat_draws[bucket];
+}
+
+GfxPushStateTracker& Scheduler::ActivePushStateTracker(GfxPushStateTracker& fallback) noexcept {
+    if (active_reorder_bucket < kNumReorderBuckets && gbuf_reorder) [[unlikely]] {
+        return gbuf_reorder->buckets[active_reorder_bucket].push_state;
+    }
+    return fallback;
+}
+
+void Scheduler::ConsumeReorderStats(std::array<u64, kNumReorderBuckets>& out_draws,
+                                    u64& out_flushes) noexcept {
+    if (!gbuf_reorder) {
+        out_draws.fill(0);
+        out_flushes = 0;
+        return;
+    }
+    out_draws = gbuf_reorder->stat_draws;
+    out_flushes = gbuf_reorder->stat_flushes;
+    gbuf_reorder->stat_draws.fill(0);
+    gbuf_reorder->stat_flushes = 0;
+}
+
+void Scheduler::FlushReorderBuckets() {
+    if (!reorder_has_draws || !gbuf_reorder) {
+        return;
+    }
+    reorder_has_draws = false;
+    active_reorder_bucket = kNoReorderBucket;
+    active_dynamic_state = &dynamic_state;
+
+    // Preserve strict ordering: everything already in `record_chunk` (e.g. `BeginRendering` +
+    // Draw #1) must execute before Bucket 0 (`NearOpaque`).
+    if (record_chunk && !record_chunk->Empty()) {
+        RetireChunk();
+    }
+
+    bool stamped_opaque = false;
+    for (u32 idx = 0; idx < kNumReorderBuckets; ++idx) {
+        auto& b = gbuf_reorder->buckets[idx];
+        const bool has_cur = b.current && !b.current->Empty();
+        if (!b.chunks.empty() || has_cur) {
+            if (idx < 3u && !stamped_opaque) {
+                stamped_opaque = true;
+                GpuProfiler::HudOnSubPassChange(this, BbStats::GpuSub_GBuf_WorldAndChr);
+                if (record_chunk && !record_chunk->Empty()) {
+                    RetireChunk();
+                }
+            } else if (idx == 3u) {
+                GpuProfiler::HudOnSubPassChange(this, BbStats::GpuSub_GBuf_FoliageAndCloth);
+                if (record_chunk && !record_chunk->Empty()) {
+                    RetireChunk();
+                }
+            }
+            for (auto& chunk : b.chunks) {
+                if (chunk && !chunk->Empty()) {
+                    segment_bytes += chunk->Size();
+                    full_chunks.push_back(std::move(chunk));
+                }
+            }
+            b.chunks.clear();
+            if (has_cur) {
+                segment_bytes += b.current->Size();
+                full_chunks.push_back(std::move(b.current));
+            }
+        }
+        b.dyn_state.Invalidate();
+        b.push_state.InvalidateAll();
+    }
+
+    dynamic_state.Invalidate();
+    BumpDescriptorStateEpoch();
+    ++gbuf_reorder->stat_flushes;
+}
+
 void Scheduler::KickRecording(bool force) {
     ProducerScope producer{*this, "KickRecording"};
     if (workers.empty()) {
         return;
+    }
+    if (reorder_has_draws) {
+        if (!force) {
+            return;
+        }
+        FlushReorderBuckets();
     }
     // Callers kick where nobody holds the raw command buffer: deferral resumes.
     if (direct_segment) {
@@ -722,6 +839,9 @@ void Scheduler::SyncRecording() {
 }
 
 void Scheduler::EnterDirectMode() {
+    if (reorder_has_draws) [[unlikely]] {
+        FlushReorderBuckets();
+    }
     // With submissions going out from the recording threads, the commands recorded
     // here get a segment of their own, from this thread's pool, after the segments handed over:
     // the recording threads go on with those instead of this thread waiting for them (~90 us,

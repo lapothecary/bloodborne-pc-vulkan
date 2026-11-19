@@ -2596,10 +2596,29 @@ void sub_21d0330(
     const __m128 maskXYZ = _mm_castsi128_ps(_mm_load_si128(reinterpret_cast<const __m128i*>(kMaskXYZ_4920cc0)));
     const __m128 unitW   = _mm_load_ps(kUnitW_4920cd0);
     const __m128 zeroVec = _mm_setzero_ps();
+    const __m128 negHalf = _mm_load_ps(kNegPoint05W1_4920ce0);
+    const __m128 posHalf = _mm_load_ps(kPosPoint05W1_4920cf0);
+
+    // Hoist loop-invariant pointers and pre-broadcast all 12 worldMatrix3x4 scalars once.
+    const uint8_t* const aabbTable = *reinterpret_cast<const uint8_t* const*>(model + 0x20);
+    auto* const provVt = *reinterpret_cast<void***>(boneTransformProvider);
+    const auto fnGetBoneMat = reinterpret_cast<void(*)(void*, uint32_t, float*)>(provVt[0x08 / 8]);
+
+    const __m128 w0x = _mm_set1_ps(worldMatrix3x4[0]);
+    const __m128 w0y = _mm_set1_ps(worldMatrix3x4[1]);
+    const __m128 w0z = _mm_set1_ps(worldMatrix3x4[2]);
+    const __m128 w0w = _mm_mul_ps(_mm_set1_ps(worldMatrix3x4[3]), unitW);
+    const __m128 w1x = _mm_set1_ps(worldMatrix3x4[4]);
+    const __m128 w1y = _mm_set1_ps(worldMatrix3x4[5]);
+    const __m128 w1z = _mm_set1_ps(worldMatrix3x4[6]);
+    const __m128 w1w = _mm_mul_ps(_mm_set1_ps(worldMatrix3x4[7]), unitW);
+    const __m128 w2x = _mm_set1_ps(worldMatrix3x4[8]);
+    const __m128 w2y = _mm_set1_ps(worldMatrix3x4[9]);
+    const __m128 w2z = _mm_set1_ps(worldMatrix3x4[10]);
+    const __m128 w2w = _mm_mul_ps(_mm_set1_ps(worldMatrix3x4[11]), unitW);
 
     for (uint32_t idx = 0u; idx < numSubmeshAabbs; ++idx) {
-        const uint8_t* aabbTable = *reinterpret_cast<const uint8_t* const*>(model + 0x20);
-        const float* aabbEntry   = reinterpret_cast<const float*>(aabbTable + static_cast<std::size_t>(idx) * 48u);
+        const float* aabbEntry = reinterpret_cast<const float*>(aabbTable + static_cast<std::size_t>(idx) * 48u);
 
         __m128 aabbMin = _mm_or_ps(_mm_and_ps(maskXYZ, _mm_loadu_ps(aabbEntry + 0)), unitW);
         __m128 aabbMax = _mm_or_ps(_mm_and_ps(maskXYZ, _mm_loadu_ps(aabbEntry + 4)), unitW);
@@ -2611,39 +2630,23 @@ void sub_21d0330(
 
         alignas(16) float localAabb[8];
         if (maskBits != 0xF) {
-            _mm_store_ps(localAabb + 0, _mm_load_ps(kNegPoint05W1_4920ce0));
-            _mm_store_ps(localAabb + 4, _mm_load_ps(kPosPoint05W1_4920cf0));
+            _mm_store_ps(localAabb + 0, negHalf);
+            _mm_store_ps(localAabb + 4, posHalf);
         } else {
             _mm_store_ps(localAabb + 0, aabbMin);
             _mm_store_ps(localAabb + 4, aabbMax);
         }
 
         alignas(16) float boneMat[12] = {};
-        auto* provVt = *reinterpret_cast<void***>(boneTransformProvider);
-        reinterpret_cast<void(*)(void*, uint32_t, float*)>(
-            provVt[0x08 / 8])(boneTransformProvider, idx, boneMat);
-
-        const __m128i wRow0i = _mm_loadu_si128(reinterpret_cast<const __m128i*>(worldMatrix3x4 + 0));
-        const __m128i wRow1i = _mm_loadu_si128(reinterpret_cast<const __m128i*>(worldMatrix3x4 + 4));
-        const __m128i wRow2i = _mm_loadu_si128(reinterpret_cast<const __m128i*>(worldMatrix3x4 + 8));
+        fnGetBoneMat(boneTransformProvider, idx, boneMat);
 
         const __m128 bRow0 = _mm_load_ps(boneMat + 0);
         const __m128 bRow1 = _mm_load_ps(boneMat + 4);
         const __m128 bRow2 = _mm_load_ps(boneMat + 8);
 
-        auto mulRow = [&](__m128i rowInt) -> __m128 {
-            __m128 xxxx = _mm_castsi128_ps(_mm_shuffle_epi32(rowInt, 0x00));
-            __m128 yyyy = _mm_castsi128_ps(_mm_shuffle_epi32(rowInt, 0x55));
-            __m128 zzzz = _mm_castsi128_ps(_mm_shuffle_epi32(rowInt, 0xAA));
-            __m128 wwww = _mm_castsi128_ps(_mm_shuffle_epi32(rowInt, 0xFF));
-            __m128 sum  = _mm_add_ps(_mm_mul_ps(bRow0, xxxx), _mm_mul_ps(yyyy, bRow1));
-            sum = _mm_add_ps(_mm_mul_ps(zzzz, bRow2), sum);
-            return _mm_add_ps(_mm_mul_ps(wwww, unitW), sum);
-        };
-
-        __m128 mRow0 = mulRow(wRow0i);
-        __m128 mRow1 = mulRow(wRow1i);
-        __m128 mRow2 = mulRow(wRow2i);
+        __m128 mRow0 = _mm_add_ps(w0w, _mm_add_ps(_mm_mul_ps(w0z, bRow2), _mm_add_ps(_mm_mul_ps(w0x, bRow0), _mm_mul_ps(w0y, bRow1))));
+        __m128 mRow1 = _mm_add_ps(w1w, _mm_add_ps(_mm_mul_ps(w1z, bRow2), _mm_add_ps(_mm_mul_ps(w1x, bRow0), _mm_mul_ps(w1y, bRow1))));
+        __m128 mRow2 = _mm_add_ps(w2w, _mm_add_ps(_mm_mul_ps(w2z, bRow2), _mm_add_ps(_mm_mul_ps(w2x, bRow0), _mm_mul_ps(w2y, bRow1))));
 
         // Transpose 3x4 rows (mRow0, mRow1, mRow2, unitW) into 4 columns in worldMatCols[16]
         __m128 t0 = _mm_movelh_ps(mRow0, mRow1);

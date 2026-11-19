@@ -838,11 +838,15 @@ struct SceneOcclusionCuller {
             const u64 sh_skip = stat_shadow_skipped.exchange(0, std::memory_order_relaxed);
             const u64 lt_cand = stat_light_candidates.exchange(0, std::memory_order_relaxed);
             const u64 lt_skip = stat_light_skipped.exchange(0, std::memory_order_relaxed);
-            if (cand > 0 || sh_skip > 0 || lt_cand > 0) {
+            std::array<u64, Scheduler::kNumReorderBuckets> rb_draws{};
+            u64 rb_flushes = 0;
+            scheduler.ConsumeReorderStats(rb_draws, rb_flushes);
+            if (cand > 0 || sh_skip > 0 || lt_cand > 0 || rb_flushes > 0) {
                 std::printf(
                     "[BB-CULL] 600f: GBuf occluded skipped %llu/%llu (%.1f%%, stageA %llu, "
                     "vis_off %llu, sb_fb %llu, skel %llu/%llu, probed %llu, multi %llu), Lights "
-                    "skipped %llu/%llu, MicroShadow skipped %llu\n",
+                    "skipped %llu/%llu, MicroShadow skipped %llu, GBufSort(B0=%llu B1=%llu "
+                    "B2=%llu B3=%llu flushes=%llu)\n",
                     static_cast<unsigned long long>(skip), static_cast<unsigned long long>(cand),
                     cand ? (100.0 * double(skip) / double(cand)) : 0.0,
                     static_cast<unsigned long long>(sa_skip),
@@ -854,7 +858,12 @@ struct SceneOcclusionCuller {
                     static_cast<unsigned long long>(multi_hits),
                     static_cast<unsigned long long>(lt_skip),
                     static_cast<unsigned long long>(lt_cand),
-                    static_cast<unsigned long long>(sh_skip));
+                    static_cast<unsigned long long>(sh_skip),
+                    static_cast<unsigned long long>(rb_draws[0]),
+                    static_cast<unsigned long long>(rb_draws[1]),
+                    static_cast<unsigned long long>(rb_draws[2]),
+                    static_cast<unsigned long long>(rb_draws[3]),
+                    static_cast<unsigned long long>(rb_flushes));
             }
         }
     }
@@ -1357,21 +1366,27 @@ std::pair<u32, u32> GetDrawOffsetsFromFlatUd(
     }
     return {vertex_offset, instance_offset};
 }
-} // namespace
-
-bool Rasterizer::TryCullMicroShadowDrawMt(const Gcn::Regs& regs, const GraphicsPipeline* pipeline,
-                                          bool is_indexed, MtShadowCullState& state,
-                                          u64* out_skipped) noexcept {
-    static const bool enabled = [] {
-        const char* e = std::getenv("BB_MICRO_SHADOW_CULL");
-        return !e || e[0] != '0';
-    }();
-    if (!enabled || !is_indexed || !pipeline) {
-        return false;
+// Classifies micro shadow-map draws (depth-only or 2-channel VSM moment maps <= 128x128)
+// without touching fullscreen blur quads (`0x0b0acf50` / `<= 6` indices) or CSM cascades.
+static u32 ClassifyMicroShadowLimit(const Gcn::Regs& regs, const GraphicsPipeline* pipeline,
+                                    bool is_indexed) noexcept {
+    if (!is_indexed || !pipeline || regs.num_indices <= 6u) {
+        return 0u;
     }
     const auto& vs_stage = pipeline->GetStage(Shader::SwStage::Vertex);
-    if (vs_stage.pgm_hash != 0x167daba6ull) {
-        return false;
+    if (vs_stage.pgm_hash == 0x0b0acf50ull) {
+        return 0u; // Never cull fullscreen VSM blur / copy quads
+    }
+    const auto& key = pipeline->GetGraphicsKey();
+    const bool is_legacy_shadow_vs = (vs_stage.pgm_hash == 0x167daba6ull);
+    const bool is_depth_only_shadow =
+        (key.mrt_mask == 0u) && regs.depth_control.depth_enable && regs.depth_buffer.DepthValid();
+    const bool is_vsm_2ch_shadow =
+        (key.mrt_mask == 1u) && regs.depth_control.depth_enable && regs.color_buffers[0] &&
+        (regs.color_buffers[0].GetDataFmt() == Gcn::DataFormat::Format16_16 ||
+         regs.color_buffers[0].GetDataFmt() == Gcn::DataFormat::Format32_32);
+    if (!is_legacy_shadow_vs && !is_depth_only_shadow && !is_vsm_2ch_shadow) {
+        return 0u;
     }
     const float vp_w = std::abs(regs.viewports[0].xscale) * 2.0f;
     const float vp_h = std::abs(regs.viewports[0].yscale) * 2.0f;
@@ -1381,10 +1396,35 @@ bool Rasterizer::TryCullMicroShadowDrawMt(const Gcn::Regs& regs, const GraphicsP
         s32(regs.screen_scissor.bottom_right_y) - s32(regs.screen_scissor.top_left_y);
     const bool is_32 = (vp_w > 0.0f && vp_w <= 33.0f && vp_h > 0.0f && vp_h <= 33.0f) ||
                        (sc_w > 0 && sc_w <= 32 && sc_h > 0 && sc_h <= 32);
-    const bool is_64 = !is_32 &&
-                       ((vp_w > 0.0f && vp_w <= 65.0f && vp_h > 0.0f && vp_h <= 65.0f) ||
-                        (sc_w > 0 && sc_w <= 64 && sc_h > 0 && sc_h <= 64));
-    if (!is_32 && !is_64) {
+    if (is_32) {
+        return 1u;
+    }
+    const bool is_64 = (vp_w > 0.0f && vp_w <= 65.0f && vp_h > 0.0f && vp_h <= 65.0f) ||
+                       (sc_w > 0 && sc_w <= 64 && sc_h > 0 && sc_h <= 64);
+    if (is_64) {
+        return 2u;
+    }
+    const bool is_128 = (vp_w > 0.0f && vp_w <= 129.0f && vp_h > 0.0f && vp_h <= 129.0f) ||
+                        (sc_w > 0 && sc_w <= 128 && sc_h > 0 && sc_h <= 128);
+    if (is_128 && regs.num_indices <= 180u) {
+        return 4u;
+    }
+    return 0u;
+}
+} // namespace
+
+bool Rasterizer::TryCullMicroShadowDrawMt(const Gcn::Regs& regs, const GraphicsPipeline* pipeline,
+                                          bool is_indexed, MtShadowCullState& state,
+                                          u64* out_skipped) noexcept {
+    static const bool enabled = [] {
+        const char* e = std::getenv("BB_MICRO_SHADOW_CULL");
+        return !e || e[0] != '0';
+    }();
+    if (!enabled) {
+        return false;
+    }
+    const u32 max_keep = ClassifyMicroShadowLimit(regs, pipeline, is_indexed);
+    if (max_keep == 0u) {
         return false;
     }
     const VAddr cb_addr =
@@ -1401,7 +1441,7 @@ bool Rasterizer::TryCullMicroShadowDrawMt(const Gcn::Regs& regs, const GraphicsP
         return false;
     }
     ++state.face_draw_idx;
-    if ((is_32 && state.face_draw_idx >= 1u) || (is_64 && state.face_draw_idx >= 2u)) {
+    if (state.face_draw_idx >= max_keep) {
         if (out_skipped) {
             ++(*out_skipped);
         }
@@ -1955,11 +1995,12 @@ bool Rasterizer::TryCullMicroShadowDraw(const GraphicsPipeline* pipeline,
         const char* e = std::getenv("BB_MICRO_SHADOW_CULL");
         return !e || e[0] != '0';
     }();
-    if (!enabled || !is_indexed || !pipeline) {
+    if (!enabled) {
         return false;
     }
-    const auto& vs_stage = pipeline->GetStage(Shader::SwStage::Vertex);
-    if (vs_stage.pgm_hash != 0x167daba6ull) {
+    const auto& regs = liverpool->regs;
+    const u32 max_keep = ClassifyMicroShadowLimit(regs, pipeline, is_indexed);
+    if (max_keep == 0u) {
         return false;
     }
     const u32 cur_frame = BbStats::frame_number.load(std::memory_order_relaxed);
@@ -1968,21 +2009,6 @@ bool Rasterizer::TryCullMicroShadowDraw(const GraphicsPipeline* pipeline,
         stage_a_shadow_cb_addr = 0;
         stage_a_shadow_db_addr = 0;
         stage_a_shadow_face_draw_idx = 0;
-    }
-    const auto& regs = liverpool->regs;
-    const float vp_w = std::abs(regs.viewports[0].xscale) * 2.0f;
-    const float vp_h = std::abs(regs.viewports[0].yscale) * 2.0f;
-    const s32 sc_w =
-        s32(regs.screen_scissor.bottom_right_x) - s32(regs.screen_scissor.top_left_x);
-    const s32 sc_h =
-        s32(regs.screen_scissor.bottom_right_y) - s32(regs.screen_scissor.top_left_y);
-    const bool is_32 = (vp_w > 0.0f && vp_w <= 33.0f && vp_h > 0.0f && vp_h <= 33.0f) ||
-                       (sc_w > 0 && sc_w <= 32 && sc_h > 0 && sc_h <= 32);
-    const bool is_64 = !is_32 &&
-                       ((vp_w > 0.0f && vp_w <= 65.0f && vp_h > 0.0f && vp_h <= 65.0f) ||
-                        (sc_w > 0 && sc_w <= 64 && sc_h > 0 && sc_h <= 64));
-    if (!is_32 && !is_64) {
-        return false;
     }
     const VAddr cb_addr =
         regs.color_buffers[0]
@@ -1998,9 +2024,11 @@ bool Rasterizer::TryCullMicroShadowDraw(const GraphicsPipeline* pipeline,
         return false;
     }
     ++stage_a_shadow_face_draw_idx;
-    if ((is_32 && stage_a_shadow_face_draw_idx >= 1u) ||
-        (is_64 && stage_a_shadow_face_draw_idx >= 2u)) {
+    if (stage_a_shadow_face_draw_idx >= max_keep) {
         BbStats::draws.fetch_sub(1, std::memory_order_relaxed);
+        if (scene_occlusion_culler) {
+            scene_occlusion_culler->stat_shadow_skipped.fetch_add(1, std::memory_order_relaxed);
+        }
         return true;
     }
     return false;
@@ -2009,6 +2037,19 @@ bool Rasterizer::TryCullMicroShadowDraw(const GraphicsPipeline* pipeline,
 void Rasterizer::NoteOccCullStageACpuCopyBatch(const u32* raw_regions, u32 count) noexcept {
     if (scene_occlusion_culler) {
         scene_occlusion_culler->NoteStageACpuCopyBatch(raw_regions, count);
+    }
+}
+
+void Rasterizer::NoteLightBatchCullStats(u64 seen_tiles, u64 saved_draws) noexcept {
+    if (scene_occlusion_culler) {
+        if (seen_tiles > 0u) {
+            scene_occlusion_culler->stat_light_candidates.fetch_add(seen_tiles,
+                                                                    std::memory_order_relaxed);
+        }
+        if (saved_draws > 0u) {
+            scene_occlusion_culler->stat_light_skipped.fetch_add(saved_draws,
+                                                                 std::memory_order_relaxed);
+        }
     }
 }
 
@@ -2627,6 +2668,12 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
 
     // Block 10: Smart Unified Scene Occlusion Culling (Micro-Shadow Culling now runs on Stage A).
     s32 occ_probe_entry_idx = -1;
+    const u8* gbuf_sort_palette_ptr = nullptr;
+    u32 gbuf_sort_palette_size = 0;
+    u32 gbuf_sort_mat_byte_off = 0;
+    const u8* gbuf_sort_inst_cb_ptr = nullptr;
+    u32 gbuf_sort_inst_cb_size = 0;
+    bool gbuf_sort_is_inst_vs = false;
     if (scene_occlusion_culler) {
         auto& culler = *scene_occlusion_culler;
         culler.EnsureInit(instance);
@@ -2791,6 +2838,18 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
                 } else if (has_model_cb && !is_inst_gbuf_vs && model_base_matrix_idx == 0 &&
                            palette_size >= 640) {
                     is_skeleton = true;
+                }
+                if (palette_ptr && palette_size >= 48u) {
+                    gbuf_sort_palette_ptr = palette_ptr;
+                    gbuf_sort_palette_size = palette_size;
+                    gbuf_sort_mat_byte_off =
+                        (has_model_cb &&
+                         u64(model_base_matrix_idx) * 48ull + 48ull <= u64(palette_size))
+                            ? (model_base_matrix_idx * 48u)
+                            : 0u;
+                    gbuf_sort_inst_cb_ptr = inst_cb_ptr;
+                    gbuf_sort_inst_cb_size = inst_cb_size;
+                    gbuf_sort_is_inst_vs = is_inst_gbuf_vs;
                 }
             }
 
@@ -3073,11 +3132,10 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
         scheduler.Flush(info);
     }
     if (needs_barrier || (will_begin_pass && runtime.HasPendingBarriers())) {
+        if (scheduler.HasPendingReorderBuckets()) {
+            scheduler.FlushReorderBuckets();
+        }
         runtime.FlushBarriers();
-    }
-    EmitVertexBuffers();
-    if (is_indexed) {
-        EmitIndexBuffer();
     }
 
     ScaleToTarget(pipeline);
@@ -3224,9 +3282,210 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
         traced_inputs_frame = BbStats::gpu_frames.load(std::memory_order_relaxed);
     }
     const auto& vs_info = pipeline->GetStage(Shader::SwStage::Vertex);
+    const auto* ps_info_sort = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
     const bool jitter_eligible =
         vs_info.pgm_hash != 0x000000008747a367ULL &&
         (regs.num_indices > 6 || regs.num_instances.NumInstances() > 1);
+
+    // Step 2.2: Coarse 4-Bucket Front-to-Back G-Buffer Reordering (`Near -> Mid -> Far -> Cutout`)
+    // for hardware Hi-Z / Early-Z rejection with zero Stage A / Main overhead.
+    static const bool gbuf_sort_enabled = [] {
+        const char* env = std::getenv("BB_GBUF_SORT");
+        return !(env && env[0] == '0');
+    }();
+    u32 gbuf_reorder_bucket = Scheduler::kNoReorderBucket;
+    if (gbuf_sort_enabled && is_indexed && !will_begin_pass && !needs_barrier &&
+        !runtime.HasPendingBarriers() && scheduler.IsReorderEligible() &&
+        !FrameCapture::Active()) {
+        const auto& gkey = pipeline->GetGraphicsKey();
+        const u32 expected_mrt_mask = gkey.motion_vectors ? 0x7fu : 0x3fu;
+        const u32 expected_num_cb = gkey.motion_vectors ? 7u : 6u;
+        const auto df = regs.depth_control.depth_func;
+        const bool std_depth_func =
+            df == Gcn::CompareFunc::Less || df == Gcn::CompareFunc::LessEqual ||
+            df == Gcn::CompareFunc::Greater || df == Gcn::CompareFunc::GreaterEqual;
+        const bool order_independent_stencil =
+            !regs.depth_control.stencil_enable ||
+            (regs.depth_control.stencil_ref_func == Gcn::CompareFunc::Always &&
+             (!regs.depth_control.backface_enable ||
+              regs.depth_control.stencil_bf_func == Gcn::CompareFunc::Always));
+        if (gkey.mrt_mask == expected_mrt_mask &&
+            state.num_color_attachments == expected_num_cb && !regs.blend_control[0].enable &&
+            regs.depth_control.depth_enable && regs.depth_control.depth_write_enable &&
+            !regs.depth_render_control.depth_clear_enable &&
+            !regs.depth_render_control.stencil_clear_enable && std_depth_func &&
+            order_independent_stencil) {
+            const u64 ps_h = ps_info_sort ? ps_info_sort->pgm_hash : 0ull;
+            const bool is_cutout_ps =
+                (ps_info_sort && ps_info_sort->has_discard) || ps_h == 0x1c3953c6ull ||
+                ps_h == 0x70bb42afull || ps_h == 0xdbeccd9cull || ps_h == 0x2140da2bull ||
+                ps_h == 0x998b035eull || ps_h == 0xa89e01e9ull;
+            if (is_cutout_ps) {
+                gbuf_reorder_bucket = 3u; // Cutout / alpha-tested foliage runs after opaque Hi-Z
+            } else {
+                // Opaque 6/7-MRT geometry (`layout(early_fragment_tests) in;`): bucket by camera distance.
+                if (!gbuf_sort_palette_ptr && scene_occlusion_culler &&
+                    scene_occlusion_culler->pub_cam_valid.load(std::memory_order_relaxed)) {
+                    const u64 vs_h = vs_info.pgm_hash;
+                    const bool is_inst = (vs_h == 0x6a833138ull || vs_h == 0xecbef4c7ull);
+                    VAddr cue_base = 0;
+                    VAddr cue_end = 0;
+                    VideoCore::DirectBuffers::GetTransientCueHeapBounds(cue_base, cue_end);
+                    const PreparedStage* prep_vs = nullptr;
+                    if (draw_prepared && !BbToggle::Disabled(BbToggle::PreparedResources)) {
+                        for (u32 i = 0; i < draw_prepared->num_stages; ++i) {
+                            const auto& cand = draw_prepared->stages[i];
+                            if (&cand.program->info == &vs_info &&
+                                cand.num_buffers == vs_info.buffers.size()) {
+                                prep_vs = &cand;
+                                break;
+                            }
+                        }
+                    }
+                    const u32* const vs_flat = vs_info.FlatUserData().data();
+                    const VAddr vs_pgm_base = vs_info.ProgramBase();
+                    bool has_mcb = false;
+                    u32 m_idx = 0;
+                    for (u32 b_idx = 0; b_idx < vs_info.buffers.size(); ++b_idx) {
+                        const auto& res = vs_info.buffers[b_idx];
+                        if (res.IsSpecial()) {
+                            continue;
+                        }
+                        u32 cb_sz = 0;
+                        const u8* cb_p = nullptr;
+                        if (num_ring_stages != 0) {
+                            if (const auto* ring = FindRingBinding(vs_info, b_idx)) {
+                                cb_sz = ring->size;
+                                if (ring->address != 0 && ring->address >= cue_base &&
+                                    ring->address + cb_sz <= cue_end) {
+                                    cb_p = reinterpret_cast<const u8*>(ring->address);
+                                } else {
+                                    cb_p = (ring->ring == 0)
+                                               ? constant_ring->Data(ring->offset)
+                                               : worker_rings[ring->ring - 1]->Data(ring->offset);
+                                }
+                            }
+                        }
+                        if (!cb_p) {
+                            const Gcn::Buffer sharp =
+                                prep_vs ? prep_vs->buffer_sharps[b_idx]
+                                        : res.GetSharpDirect(vs_flat, vs_pgm_base);
+                            if (!sharp.Valid() || sharp.GetStride() != 16) {
+                                continue;
+                            }
+                            cb_sz = sharp.GetSize();
+                            const VAddr va = sharp.base_address;
+                            if (va != 0 && cb_sz != 0) {
+                                if (va >= cue_base && va + cb_sz <= cue_end) {
+                                    cb_p = reinterpret_cast<const u8*>(va);
+                                } else if (const u8* m =
+                                               direct_buffers.TryGetCpuMirrorPtr(va, cb_sz)) {
+                                    cb_p = m;
+                                } else if (!VideoCore::DirectBuffers::OverlapsNativeOwnedRange(
+                                               va, cb_sz) &&
+                                           memory->ClampRangeSize(va, cb_sz) == cb_sz) {
+                                    cb_p = reinterpret_cast<const u8*>(va);
+                                }
+                            }
+                        }
+                        if (!cb_p) {
+                            continue;
+                        }
+                        if (cb_sz == 416u && !is_inst) {
+                            std::memcpy(&m_idx, cb_p + 80u, sizeof(u32));
+                            has_mcb = true;
+                        } else if (is_inst && cb_sz >= 208u && cb_sz <= 32768u &&
+                                   (cb_sz % 208u) == 0u && !gbuf_sort_inst_cb_ptr) {
+                            gbuf_sort_inst_cb_ptr = cb_p;
+                            gbuf_sort_inst_cb_size = cb_sz;
+                            std::memcpy(&m_idx, cb_p + 80u, sizeof(u32));
+                            has_mcb = true;
+                        } else if (cb_sz >= 48u && cb_sz <= 16384u && (cb_sz % 48u) == 0u &&
+                                   !gbuf_sort_palette_ptr) {
+                            gbuf_sort_palette_ptr = cb_p;
+                            gbuf_sort_palette_size = cb_sz;
+                        }
+                    }
+                    if (gbuf_sort_palette_ptr && gbuf_sort_palette_size >= 48u) {
+                        gbuf_sort_mat_byte_off =
+                            (has_mcb && u64(m_idx) * 48ull + 48ull <= u64(gbuf_sort_palette_size))
+                                ? (m_idx * 48u)
+                                : 0u;
+                        gbuf_sort_is_inst_vs = is_inst;
+                    }
+                }
+                gbuf_reorder_bucket = 1u; // Default: MidOpaque (including origin-baked MapPieces)
+                if (scene_occlusion_culler &&
+                    scene_occlusion_culler->pub_cam_valid.load(std::memory_order_relaxed) &&
+                    gbuf_sort_palette_ptr &&
+                    u64(gbuf_sort_mat_byte_off) + 48ull <= u64(gbuf_sort_palette_size)) {
+                    const float cx =
+                        scene_occlusion_culler->pub_cam_pos[0].load(std::memory_order_relaxed);
+                    const float cy =
+                        scene_occlusion_culler->pub_cam_pos[1].load(std::memory_order_relaxed);
+                    const float cz =
+                        scene_occlusion_culler->pub_cam_pos[2].load(std::memory_order_relaxed);
+                    const float* mf =
+                        reinterpret_cast<const float*>(gbuf_sort_palette_ptr + gbuf_sort_mat_byte_off);
+                    const float wx = mf[3];
+                    const float wy = mf[7];
+                    const float wz = mf[11];
+                    if ((wx != 0.0f || wy != 0.0f || wz != 0.0f) && std::isfinite(wx) &&
+                        std::isfinite(wy) && std::isfinite(wz)) {
+                        float dx = wx - cx;
+                        float dy = wy - cy;
+                        float dz = wz - cz;
+                        float min_dist_sq = dx * dx + dy * dy + dz * dz;
+                        const u32 n_inst = regs.num_instances.NumInstances();
+                        if (gbuf_sort_is_inst_vs && n_inst > 1u && gbuf_sort_inst_cb_ptr) {
+                            const u32 check_n = std::min<u32>(n_inst, 4u);
+                            for (u32 k = 1u; k < check_n; ++k) {
+                                const u32 ioff = k * 208u + 80u;
+                                if (ioff + sizeof(u32) <= gbuf_sort_inst_cb_size) {
+                                    u32 ibone = 0u;
+                                    std::memcpy(&ibone, gbuf_sort_inst_cb_ptr + ioff, sizeof(u32));
+                                    if (u64(ibone) * 48ull + 48ull <= u64(gbuf_sort_palette_size)) {
+                                        const float* imf = reinterpret_cast<const float*>(
+                                            gbuf_sort_palette_ptr + ibone * 48u);
+                                        if ((imf[3] != 0.0f || imf[7] != 0.0f || imf[11] != 0.0f) &&
+                                            std::isfinite(imf[3]) && std::isfinite(imf[7]) &&
+                                            std::isfinite(imf[11])) {
+                                            const float idx_x = imf[3] - cx;
+                                            const float idx_y = imf[7] - cy;
+                                            const float idx_z = imf[11] - cz;
+                                            const float d2 =
+                                                idx_x * idx_x + idx_y * idx_y + idx_z * idx_z;
+                                            if (d2 < min_dist_sq) {
+                                                min_dist_sq = d2;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if (min_dist_sq < 20.0f * 20.0f) {
+                            gbuf_reorder_bucket = 0u; // NearOpaque (< 20m)
+                        } else if (min_dist_sq < 50.0f * 50.0f) {
+                            gbuf_reorder_bucket = 1u; // MidOpaque (20..50m)
+                        } else {
+                            gbuf_reorder_bucket = 2u; // FarOpaque (>= 50m)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (gbuf_reorder_bucket < Scheduler::kNumReorderBuckets) {
+        scheduler.EnterReorderBucket(gbuf_reorder_bucket);
+    } else if (scheduler.HasPendingReorderBuckets()) {
+        scheduler.FlushReorderBuckets();
+    }
+
+    EmitVertexBuffers();
+    if (is_indexed) {
+        EmitIndexBuffer();
+    }
     BeginDraw(pipeline, state, is_indexed, jitter_eligible, draw_prepared, index_offset, true);
 
     const auto& fetch_shader = pipeline->GetFetchShader();
@@ -3262,10 +3521,18 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     const u32 first_instance = instance_offset;
     if (!Breadcrumbs::Enabled() && !DynCheck::Enabled()) [[likely]] {
         const u64 cur_epoch = scheduler.DescriptorStateEpoch();
+        vk::Pipeline& tracked_pipe =
+            (gbuf_reorder_bucket < Scheduler::kNumReorderBuckets)
+                ? bound_bucket_pipeline[gbuf_reorder_bucket]
+                : bound_graphics_pipeline;
+        u64& tracked_epoch =
+            (gbuf_reorder_bucket < Scheduler::kNumReorderBuckets)
+                ? bound_bucket_epoch[gbuf_reorder_bucket]
+                : bound_graphics_epoch;
         const bool need_bind_pipeline =
-            (bound_graphics_epoch != cur_epoch) || (bound_graphics_pipeline != handle);
-        bound_graphics_pipeline = handle;
-        bound_graphics_epoch = cur_epoch;
+            (tracked_epoch != cur_epoch) || (tracked_pipe != handle);
+        tracked_pipe = handle;
+        tracked_epoch = cur_epoch;
         const s32 hw_occ_query_slot =
             (is_indexed && occ_probe_entry_idx >= 0 && scene_occlusion_culler)
                 ? scene_occlusion_culler->AllocateQuery(static_cast<u16>(occ_probe_entry_idx))
@@ -3360,6 +3627,9 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
                 cmdbuf.draw(num_indices, num_instances, first_vertex, first_instance);
             }
         });
+    }
+    if (gbuf_reorder_bucket < Scheduler::kNumReorderBuckets) {
+        scheduler.LeaveReorderBucket();
     }
     // BB_TRACE_SHADER with BB_GPU_PROFILE: a mark right after the traced vertex shader's draws,
     // so the profile splits their pass into the draw and what follows it unlabeled.
@@ -4959,7 +5229,8 @@ void Rasterizer::MarkPass(const GraphicsPipeline* pipeline, const RenderState& s
         ui_pass_started || (upscaler && upscaler->InUiPhase()));
     if (will_begin) {
         GpuProfiler::HudSetNextPassCat(&scheduler, subcat);
-    } else if (!state.secondary_contents) {
+    } else if (!state.secondary_contents &&
+               scheduler.ActiveReorderBucket() == Scheduler::kNoReorderBucket) {
         GpuProfiler::HudOnSubPassChange(&scheduler, subcat);
     }
     if (!profiler) {

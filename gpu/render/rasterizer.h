@@ -367,6 +367,7 @@ public:
     void NotePendingCopySrcBatch(const u32* raw_regions, u32 count) noexcept;
     void InvalidateStageACpuShadow(VAddr addr, u64 size) noexcept;
     void NoteOccCullStageACpuCopyBatch(const u32* raw_regions, u32 count) noexcept;
+    void NoteLightBatchCullStats(u64 seen_tiles, u64 saved_draws) noexcept;
     void InvalidateOccCullStageACpuShadow(VAddr addr, u64 size) noexcept;
     void InvalidateStageARtMeta() noexcept {
         stage_a_rt_meta_valid = false;
@@ -861,6 +862,8 @@ private:
                                                    u16& out_handoff);
     vk::Pipeline bound_graphics_pipeline{};
     u64 bound_graphics_epoch = 0;
+    std::array<vk::Pipeline, Scheduler::kNumReorderBuckets> bound_bucket_pipeline{};
+    std::array<u64, Scheduler::kNumReorderBuckets> bound_bucket_epoch{};
     /// The prepared sharps of `stage` in the current prepared draw, if they fit it.
     const PreparedStage* FindPreparedStage(const Shader::Info& stage) const;
     /// Whether the helper may bind textures for this pipeline at all (fixed descriptor layout,

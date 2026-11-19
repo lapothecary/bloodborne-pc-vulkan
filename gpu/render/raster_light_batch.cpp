@@ -908,6 +908,7 @@ bool LightTileBatcher::TryBatchDraw(Rasterizer& rasterizer, const GraphicsPipeli
         // Zero pixels covered: absorb this draw completely!
         BbStats::draws.fetch_sub(1, std::memory_order_relaxed);
         ++stat_tiles_empty;
+        rasterizer.NoteLightBatchCullStats(1u, 1u);
         return true;
     }
 
@@ -1329,6 +1330,8 @@ void LightTileBatcher::Flush(Rasterizer& rasterizer) {
         rasterizer.PostDraw(g.pipeline, nullptr, false, 0u, nullptr, nullptr, &draw_ovr);
         BbStats::draws.fetch_add(1, std::memory_order_relaxed);
         ++stat_batches_emitted;
+        rasterizer.NoteLightBatchCullStats(g.tile_count,
+                                           g.tile_count > 1u ? (g.tile_count - 1u) : 0u);
         prev_emitted_chunks = cur_chunks;
         any_emitted = true;
         g.Reset();

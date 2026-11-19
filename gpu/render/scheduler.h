@@ -26,6 +26,7 @@
 #include "common/assert.h"
 #include "common/unique_function.h"
 #include "render/dynamic_state.h"
+#include "render/gfx_push_state_tracker.h"
 #include "render/record_chunk.h"
 #include "render/vk_breadcrumbs.h"
 #include "vulkan/command_pool.h"
@@ -163,8 +164,45 @@ public:
     }
 
     DynamicState& GetDynamicState() {
-        return dynamic_state;
+        return *active_dynamic_state;
     }
+
+    static constexpr u32 kNumReorderBuckets = 4;
+    static constexpr u32 kNoReorderBucket = 0xFFFFFFFFu;
+
+    [[nodiscard]] u32 ActiveReorderBucket() const noexcept {
+        return active_reorder_bucket;
+    }
+
+    [[nodiscard]] bool HasPendingReorderBuckets() const noexcept {
+        return reorder_has_draws;
+    }
+
+    [[nodiscard]] bool IsReorderEligible() const noexcept {
+        return is_rendering && IsRecordingDeferred() && render_state.secondary_contents == 0u &&
+               !carried_scope && !Breadcrumbs::Enabled() && !DynCheck::Enabled();
+    }
+
+    /// Redirects subsequent `Record()` / `RecordData()` / `GetDynamicState()` / push-descriptor
+    /// emissions for a single G-Buffer draw into bucket `b` (`0=Near, 1=Mid, 2=Far, 3=Cutout`).
+    void EnterReorderBucket(u32 bucket);
+
+    /// Restores the main recording stream immediately after the single bucketed draw completes.
+    void LeaveReorderBucket() noexcept {
+        active_reorder_bucket = kNoReorderBucket;
+        active_dynamic_state = &dynamic_state;
+    }
+
+    /// Emits all pending bucketed draws in strict Front-to-Back (`0 -> 1 -> 2 -> 3`) order into
+    /// the main chunk stream and invalidates differential state for subsequent commands.
+    void FlushReorderBuckets();
+
+    /// Returns the active push-descriptor tracker (per-bucket when redirecting, fallback otherwise).
+    GfxPushStateTracker& ActivePushStateTracker(GfxPushStateTracker& fallback) noexcept;
+
+    /// Returns and resets accumulated `[B0, B1, B2, B3, flushes]` counters for `[BB-CULL]` logging.
+    void ConsumeReorderStats(std::array<u64, kNumReorderBuckets>& out_draws,
+                             u64& out_flushes) noexcept;
 
     /// Returns the current command buffer for recording on the calling thread. With threaded
     /// recording this first waits until all commands passed to Record() are recorded, then
@@ -172,6 +210,9 @@ public:
     /// KickRecording() or submission.
     [[gnu::noinline]] vk::CommandBuffer CommandBuffer() {
         ProducerScope producer{*this, "CommandBuffer"};
+        if (reorder_has_draws) [[unlikely]] {
+            FlushReorderBuckets();
+        }
         if (!workers.empty() && !direct_mode) {
             EnterDirectMode();
             direct_recordings.fetch_add(1, std::memory_order_relaxed);
@@ -602,6 +643,10 @@ private:
 
     /// Moves the full current chunk aside; a new one takes its place (swapped in: never null).
     void RetireChunk() {
+        if (active_reorder_bucket < kNumReorderBuckets) [[unlikely]] {
+            RetireBucketChunk(active_reorder_bucket);
+            return;
+        }
         ProducerScope producer{*this, "RetireChunk"};
         auto full = AcquireChunk();
         record_chunk.swap(full);
@@ -615,6 +660,9 @@ private:
     /// records on this thread while one is replaced still finds one; a null one (a build without
     /// that, issue #100: a read of RecordChunk::Capacity at address 0x20000) is replaced here.
     RecordChunk& CurrentChunk() {
+        if (active_reorder_bucket < kNumReorderBuckets) [[unlikely]] {
+            return CurrentBucketChunk(active_reorder_bucket);
+        }
         if (!record_chunk) [[unlikely]] {
             record_chunk = AcquireChunk();
         }
@@ -656,6 +704,9 @@ private:
     template <typename Func>
     void RecordOrdered(Func&& func) {
         ProducerScope producer{*this, "RecordOrdered"};
+        if (reorder_has_draws) [[unlikely]] {
+            FlushReorderBuckets();
+        }
         if (OrderedInline()) {
             func();
             return;
@@ -693,8 +744,26 @@ private:
     const Instance& instance;
     u32 crumb_stream = 0; ///< GPU breadcrumbs (vk_breadcrumbs.h)
     Semaphore work_semaphore;
+    struct ReorderBucket {
+        std::vector<std::unique_ptr<RecordChunk>> chunks;
+        std::unique_ptr<RecordChunk> current;
+        DynamicState dyn_state;
+        GfxPushStateTracker push_state;
+    };
+    struct GBufReorderState {
+        std::array<ReorderBucket, kNumReorderBuckets> buckets;
+        std::array<u64, kNumReorderBuckets> stat_draws{};
+        u64 stat_flushes{0};
+    };
+    RecordChunk& CurrentBucketChunk(u32 bucket);
+    void RetireBucketChunk(u32 bucket);
+
     CommandPool command_pool;
     DynamicState dynamic_state;
+    DynamicState* active_dynamic_state = &dynamic_state;
+    std::unique_ptr<GBufReorderState> gbuf_reorder;
+    u32 active_reorder_bucket = kNoReorderBucket;
+    bool reorder_has_draws = false;
     SubmitFunc on_submit{};
     EndRenderingFunc on_end_rendering = nullptr;
     void* on_end_rendering_ctx = nullptr;

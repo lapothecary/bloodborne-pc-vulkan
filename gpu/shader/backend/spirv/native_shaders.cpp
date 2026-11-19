@@ -134,6 +134,12 @@
 #include "bbgpu/shaders/vs_b10c4f55_vert.h"
 #include "bbgpu/shaders/vs_ddbe557e_vert.h"
 #include "bbgpu/shaders/vs_e859b6d9_vert.h"
+#include "bbgpu/shaders/ps_57f3b8c2_frag.h"
+#include "bbgpu/shaders/ps_4eb5a42f_frag.h"
+#include "bbgpu/shaders/ps_abf92450_frag.h"
+#include "bbgpu/shaders/ps_01ae5388_frag.h"
+#include "bbgpu/shaders/ps_9eb30215_frag.h"
+#include "bbgpu/shaders/ps_4baeaa00_frag.h"
 
 namespace Shader::Backend::SPIRV {
 
@@ -202,7 +208,7 @@ struct NativeShaderCandidate {
     const char* label;
 };
 
-constexpr std::array<NativeShaderCandidate, 123> kNativeRegistry{{
+constexpr std::array<NativeShaderCandidate, 129> kNativeRegistry{{
     {0x000000000f61fd27ull, PS_0F61FD27_VSM_BLUR_FRAG, "ps_0f61fd27_vsm_blur"},
     {0x000000001ae03d75ull, PS_1AE03D75_VSM_MOMENT_CLDIST_FRAG, "ps_1ae03d75_vsm_moment_cldist"},
     {0x000000001ae03d75ull, PS_1AE03D75_VSM_MOMENT_NOCLIP_FRAG, "ps_1ae03d75_vsm_moment_noclip"},
@@ -326,6 +332,12 @@ constexpr std::array<NativeShaderCandidate, 123> kNativeRegistry{{
     {0x00000000803b9d24ull, VS_803B9D24_VERT, "vs_803b9d24_gbuf_foliage_uv2"},
     {0x00000000b10c4f55ull, VS_B10C4F55_VERT, "vs_b10c4f55_gbuf_foliage_dual_skin4"},
     {0x00000000e859b6d9ull, VS_E859B6D9_VERT, "vs_e859b6d9_gbuf_foliage_inst_uv2"},
+    {0x0000000057f3b8c2ull, PS_57F3B8C2_FRAG, "ps_57f3b8c2_bloom_copy"},
+    {0x000000004eb5a42full, PS_4EB5A42F_FRAG, "ps_4eb5a42f_yebis_glare_thresh"},
+    {0x00000000abf92450ull, PS_ABF92450_FRAG, "ps_abf92450_motblur_tile_dilate"},
+    {0x0000000001ae5388ull, PS_01AE5388_FRAG, "ps_01ae5388_ssr_hiz_min4"},
+    {0x000000009eb30215ull, PS_9EB30215_FRAG, "ps_9eb30215_const_fill"},
+    {0x000000004baeaa00ull, PS_4BAEAA00_FRAG, "ps_4baeaa00_scaleform_cxform_bgra"},
 }};
 
 struct DescSlot {

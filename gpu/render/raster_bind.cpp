@@ -457,13 +457,21 @@ struct StageBVtxIdxDedup {
     vk::DeviceSize ib_resolved_offset = 0;
 };
 
-thread_local std::unique_ptr<StageBVtxIdxDedup> tls_vtx_idx_dedup;
+struct StageBVtxIdxDedupBank {
+    StageBVtxIdxDedup main;
+    std::array<StageBVtxIdxDedup, Scheduler::kNumReorderBuckets> buckets;
+};
 
-StageBVtxIdxDedup& GetVtxIdxDedup() {
+thread_local std::unique_ptr<StageBVtxIdxDedupBank> tls_vtx_idx_dedup;
+
+StageBVtxIdxDedup& GetVtxIdxDedup(u32 bucket = Scheduler::kNoReorderBucket) {
     if (!tls_vtx_idx_dedup) [[unlikely]] {
-        tls_vtx_idx_dedup = std::make_unique<StageBVtxIdxDedup>();
+        tls_vtx_idx_dedup = std::make_unique<StageBVtxIdxDedupBank>();
     }
-    return *tls_vtx_idx_dedup;
+    if (bucket < Scheduler::kNumReorderBuckets) [[unlikely]] {
+        return tls_vtx_idx_dedup->buckets[bucket];
+    }
+    return tls_vtx_idx_dedup->main;
 }
 } // namespace
 
@@ -480,7 +488,7 @@ void Rasterizer::EmitVertexBuffers() {
     const bool dynamic_input = instance.IsVertexInputDynamicState();
     const u32 num_buffers = v.num_buffers;
     if (dynamic_input && StageBFastBind()) {
-        auto& d = GetVtxIdxDedup();
+        auto& d = GetVtxIdxDedup(scheduler.ActiveReorderBucket());
         const u64 cur_epoch = scheduler.DescriptorStateEpoch();
         const bool same_epoch = (d.sched == &scheduler && d.vtx_epoch == cur_epoch);
         const bool same_layout =
@@ -1217,7 +1225,7 @@ void Rasterizer::BindIndexBuffer(u32 index_offset) {
 
 void Rasterizer::EmitIndexBuffer() {
     if (StageBFastBind()) {
-        auto& d = GetVtxIdxDedup();
+        auto& d = GetVtxIdxDedup(scheduler.ActiveReorderBucket());
         const u64 cur_epoch = scheduler.DescriptorStateEpoch();
         if (d.sched == &scheduler && d.ib_emit_epoch == cur_epoch &&
             d.ib_handle == index_bind.handle && d.ib_offset == index_bind.offset &&

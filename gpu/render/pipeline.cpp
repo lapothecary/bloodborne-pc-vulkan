@@ -251,7 +251,7 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, const Shader::PushDat
         if (!tls_tracker) [[unlikely]] {
             tls_tracker = std::make_unique<GfxPushStateTracker>();
         }
-        auto& tracker = *tls_tracker;
+        auto& tracker = scheduler.ActivePushStateTracker(*tls_tracker);
         tracker.OnDraw(&scheduler, scheduler.GraphicsDescriptorEpoch(),
                        scheduler.PushConstantsEpoch(), layout);
         const bool need_push_constants =

@@ -2107,11 +2107,12 @@ void sub_21cb5d0(void* updaterPtr, void* jobScheduler) {
             *reinterpret_cast<uint8_t**>(updater + 0x10)) >> 3;
     }
     int32_t totalEntries = static_cast<int32_t>(static_cast<uint32_t>(entryQwords) * 0xCCCCCCCDu);
-    int32_t divisor      = workerCount * 2;
-    int32_t chunkSize    = totalEntries / divisor;
+    if (totalEntries <= 0) {
+        return;
+    }
 
     bool canParallelize = false;
-    if (chunkSize >= 2) {
+    if (workerCount > 1 && totalEntries >= 2) {
         uint8_t* globalDev = *reinterpret_cast<uint8_t**>(GX_VMA(0x55406c8ULL));
         uint8_t* ctxSlot   = (globalDev[0x84] != 0u) ? (globalDev + 0x78) : (globalDev + 0x10);
         uint8_t* cmdCtx    = *reinterpret_cast<uint8_t**>(ctxSlot);
@@ -2121,9 +2122,6 @@ void sub_21cb5d0(void* updaterPtr, void* jobScheduler) {
     }
 
     if (!canParallelize) {
-        if (totalEntries <= 0) {
-            return;
-        }
         void* updateJob  = *reinterpret_cast<void**>(updater + 0x58);
         void* rawTp      = *reinterpret_cast<void**>(GX_VMA(0x56a6c28ULL));
         void* taskPool   = (g_eboot_live_slide != 0 && rawTp != nullptr) ? *reinterpret_cast<void**>(rawTp) : rawTp;
@@ -2143,58 +2141,41 @@ void sub_21cb5d0(void* updaterPtr, void* jobScheduler) {
         return;
     }
 
-    int32_t dispatchedCount = 0;
-    if (workerCount > 0) {
-        uint64_t poolStrideOff  = 0ULL;
-        uint64_t queueStrideOff = 0x18ULL;
-        int32_t curStart        = 0;
-        for (int32_t w = 0; w < workerCount; ++w) {
-            int32_t curEnd   = curStart + chunkSize;
-            void* updateJob  = *reinterpret_cast<void**>(updater + 0x58);
-            uint8_t* rawTp   = *reinterpret_cast<uint8_t**>(GX_VMA(0x56a6c28ULL));
-            uint8_t* baseTp  = (g_eboot_live_slide != 0 && rawTp != nullptr) ? *reinterpret_cast<uint8_t**>(rawTp) : rawTp;
-            uint8_t* poolPtr = baseTp + poolStrideOff;
-            auto* taskNode   = static_cast<uint8_t*>(
-                reinterpret_cast<FnAllocTaskNode>(GX_VMA(0x21b7f60ULL))(poolPtr));
-            *reinterpret_cast<void**>(taskNode + 0x08)   = updateJob;
-            *reinterpret_cast<int32_t*>(taskNode + 0x10) = curStart;
-            *reinterpret_cast<int32_t*>(taskNode + 0x14) = curEnd;
-            *reinterpret_cast<int32_t*>(taskNode + 0x18) = chunkSize;
+    // Balanced distribution across all active GXWorkers with fine work-stealing grain (`1..2`),
+    // eliminating the PS4 `totalEntries < 20` single-worker bottleneck and `50%` worker-0 tail skew.
+    int32_t activeWorkers   = (totalEntries < workerCount) ? totalEntries : workerCount;
+    int32_t baseChunk       = totalEntries / activeWorkers;
+    int32_t extraCount      = totalEntries - activeWorkers * baseChunk;
+    void* updateJob         = *reinterpret_cast<void**>(updater + 0x58);
+    uint8_t* rawTp          = *reinterpret_cast<uint8_t**>(GX_VMA(0x56a6c28ULL));
+    uint8_t* baseTp         = (g_eboot_live_slide != 0 && rawTp != nullptr) ? *reinterpret_cast<uint8_t**>(rawTp) : rawTp;
+    uint8_t* schedQueues    = *reinterpret_cast<uint8_t**>(sched + 0x00);
+    uint64_t poolStrideOff  = 0ULL;
+    uint64_t queueStrideOff = 0x18ULL;
+    int32_t curStart        = 0;
+    for (int32_t w = 0; w < activeWorkers; ++w) {
+        int32_t myCount  = baseChunk + ((w < extraCount) ? 1 : 0);
+        int32_t curEnd   = curStart + myCount;
+        int32_t myGrain  = (myCount >= 8) ? 2 : 1;
+        uint8_t* poolPtr = baseTp + poolStrideOff;
+        auto* taskNode   = static_cast<uint8_t*>(
+            reinterpret_cast<FnAllocTaskNode>(GX_VMA(0x21b7f60ULL))(poolPtr));
+        *reinterpret_cast<void**>(taskNode + 0x08)   = updateJob;
+        *reinterpret_cast<int32_t*>(taskNode + 0x10) = curStart;
+        *reinterpret_cast<int32_t*>(taskNode + 0x14) = curEnd;
+        *reinterpret_cast<int32_t*>(taskNode + 0x18) = myGrain;
 
-            uint8_t* queuePtr = *reinterpret_cast<uint8_t**>(sched + 0x00) + queueStrideOff;
-            reinterpret_cast<FnSubmitTaskNode>(GX_VMA(0xe47ab0ULL))(queuePtr, taskNode);
-            if (sched[0x68] != 0u && w == 0) {
-                *reinterpret_cast<uint8_t*>(GX_VMA(0x56a6c31ULL)) = 1u;
-            }
-            sched[0x31] = 1u;
-
-            curStart        = curEnd;
-            queueStrideOff += 0x530ULL;
-            poolStrideOff  += 0x60ULL;
+        uint8_t* queuePtr = schedQueues + queueStrideOff;
+        reinterpret_cast<FnSubmitTaskNode>(GX_VMA(0xe47ab0ULL))(queuePtr, taskNode);
+        if (sched[0x68] != 0u && w == 0) {
+            *reinterpret_cast<uint8_t*>(GX_VMA(0x56a6c31ULL)) = 1u;
         }
-        dispatchedCount = workerCount * chunkSize;
+        sched[0x31] = 1u;
+
+        curStart        = curEnd;
+        queueStrideOff += 0x530ULL;
+        poolStrideOff  += 0x60ULL;
     }
-
-    int32_t maxBatchCap = *reinterpret_cast<const int32_t*>(GX_VMA(0x513ac90ULL));
-    int32_t remCount    = totalEntries - dispatchedCount;
-    int32_t subChunk    = (remCount > maxBatchCap) ? maxBatchCap : remCount;
-
-    void* updateJob  = *reinterpret_cast<void**>(updater + 0x58);
-    void* rawTp      = *reinterpret_cast<void**>(GX_VMA(0x56a6c28ULL));
-    void* taskPool   = (g_eboot_live_slide != 0 && rawTp != nullptr) ? *reinterpret_cast<void**>(rawTp) : rawTp;
-    auto* taskNode   = static_cast<uint8_t*>(
-        reinterpret_cast<FnAllocTaskNode>(GX_VMA(0x21b7f60ULL))(taskPool));
-    *reinterpret_cast<void**>(taskNode + 0x08)   = updateJob;
-    *reinterpret_cast<int32_t*>(taskNode + 0x10) = dispatchedCount;
-    *reinterpret_cast<int32_t*>(taskNode + 0x14) = totalEntries;
-    *reinterpret_cast<int32_t*>(taskNode + 0x18) = subChunk;
-
-    uint8_t* queueBase = *reinterpret_cast<uint8_t**>(sched + 0x00) + 0x18;
-    reinterpret_cast<FnSubmitTaskNode>(GX_VMA(0xe47ab0ULL))(queueBase, taskNode);
-    if (sched[0x68] != 0u) {
-        *reinterpret_cast<uint8_t*>(GX_VMA(0x56a6c31ULL)) = 1u;
-    }
-    sched[0x31] = 1u;
 }
 
 // ============================================================================

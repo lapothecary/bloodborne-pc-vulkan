@@ -92,23 +92,30 @@ public:
         reinterpret_cast<Header*>(ring.get() + head % Capacity)->payload = payload_size;
         const bool has_resolvers = (num_resolvers != 0);
         if (has_resolvers) {
-            auto& slot = slots[(packets + 1) & SlotMask];
+            const u64 pkt_num = packets + 1;
+            auto& slot = slots[pkt_num & SlotMask];
             slot.at = head;
             slot.state.store(resolve ? SlotPending : SlotDone, std::memory_order_release);
+            if (resolve) {
+                const u64 q_idx = resolve_enqueued++;
+                resolve_queue[q_idx & SlotMask] = pkt_num;
+                resolve_published.store(resolve_enqueued, std::memory_order_release);
+            }
         }
         head += pending_size;
         published.store(head, std::memory_order_release);
         ++packets;
         BbSections::pipe_packets.store(packets, std::memory_order_relaxed);
-        if (has_resolvers) {
-            published_packets.store(packets, std::memory_order_release);
-        }
         // Single StoreLoad barrier pairing with sleeping/resolvers_sleeping seq_cst stores instead
         // of 4 separate `memory_order_seq_cst` XCHG instructions per draw packet.
         std::atomic_thread_fence(std::memory_order_seq_cst);
         if (has_resolvers && resolve && resolvers_sleeping.load(std::memory_order_relaxed)) [[unlikely]] {
             resolve_wake.fetch_add(1, std::memory_order_release);
-            resolve_wake.notify_all();
+            if (num_resolvers == 1) {
+                resolve_wake.notify_one();
+            } else {
+                resolve_wake.notify_all();
+            }
         }
         if (sleeping.load(std::memory_order_relaxed)) [[unlikely]] {
             wake.fetch_add(1, std::memory_order_release);
@@ -131,6 +138,7 @@ public:
         resolver = resolver_;
         num_resolvers = count;
         slots = std::make_unique<Slot[]>(SlotMask + 1);
+        resolve_queue = std::make_unique<u64[]>(SlotMask + 1);
         for (u32 i = 0; i < count; ++i) {
             resolvers.emplace_back([this, i](std::stop_token stop) { ResolverRun(stop, i); });
         }
@@ -391,48 +399,51 @@ private:
             if (const char* env = std::getenv("BB_RESOLVE_SPIN_US")) {
                 return std::max(0, std::atoi(env));
             }
-            return BbThreads::Available() >= 12 ? 100 : 20;
+            // Live A/B telemetry: 0 us + O(1) resolve_queue drops bb:Resolve0 from 2.44 ms/f
+            // (100 us) / 1.94 ms/f (10 us) down to 1.55 ms/f with lower Stage A time too.
+            return 0;
         }();
         static const auto spin_time = std::chrono::microseconds(spin_us);
         const bool single_worker = (num_resolvers == 1);
-        u64 single_next = 1;
+        u64 single_q = 0;
         while (!stop.stop_requested()) {
-            u64 number = single_worker ? single_next : next_claim.load(std::memory_order_relaxed);
-            if (number > published_packets.load(std::memory_order_acquire)) {
+            u64 q_idx = single_worker ? single_q : resolve_claim.load(std::memory_order_relaxed);
+            if (q_idx >= resolve_published.load(std::memory_order_acquire)) {
                 const auto spin_until =
                     spin_us > 0 ? (std::chrono::steady_clock::now() + spin_time)
                                 : std::chrono::steady_clock::time_point{};
                 for (u32 spins = 1;
-                     number > published_packets.load(std::memory_order_acquire); ++spins) {
+                     q_idx >= resolve_published.load(std::memory_order_acquire); ++spins) {
                     if (stop.stop_requested()) {
                         return;
                     }
                     __builtin_ia32_pause();
                     const bool should_sleep =
                         spin_us == 0 ? ((spins & 7u) == 0)
-                                     : (!(spins & 255u) &&
+                                     : (!(spins & 63u) &&
                                         std::chrono::steady_clock::now() >= spin_until);
                     if (should_sleep) {
                         const u32 seen = resolve_wake.load(std::memory_order_seq_cst);
                         resolvers_sleeping.fetch_add(1, std::memory_order_seq_cst);
-                        if (number > published_packets.load(std::memory_order_seq_cst) &&
+                        if (q_idx >= resolve_published.load(std::memory_order_seq_cst) &&
                             !stop.stop_requested()) {
                             resolve_wake.wait(seen, std::memory_order_seq_cst);
                         }
                         resolvers_sleeping.fetch_sub(1, std::memory_order_relaxed);
                     }
                     if (!single_worker) {
-                        number = next_claim.load(std::memory_order_relaxed);
+                        q_idx = resolve_claim.load(std::memory_order_relaxed);
                     }
                 }
                 continue;
             }
             if (single_worker) {
-                ++single_next;
-            } else if (!next_claim.compare_exchange_weak(number, number + 1,
-                                                         std::memory_order_acq_rel)) {
+                ++single_q;
+            } else if (!resolve_claim.compare_exchange_weak(q_idx, q_idx + 1,
+                                                            std::memory_order_acq_rel)) {
                 continue;
             }
+            const u64 number = resolve_queue[q_idx & SlotMask];
             auto& slot = slots[number & SlotMask];
             if (slot.state.load(std::memory_order_acquire) == SlotPending) {
                 auto* header = reinterpret_cast<Header*>(ring.get() + slot.at % Capacity);
@@ -451,11 +462,13 @@ private:
         std::atomic<u32> state{0};
     };
     std::unique_ptr<Slot[]> slots;
+    std::unique_ptr<u64[]> resolve_queue;
     Resolver resolver = nullptr;
     u32 num_resolvers = 0;
     u64 resolved_prefix = 0; ///< stage A
-    alignas(64) std::atomic<u64> published_packets{0};
-    alignas(64) std::atomic<u64> next_claim{1};
+    u64 resolve_enqueued = 0; ///< stage A
+    alignas(64) std::atomic<u64> resolve_published{0};
+    alignas(64) std::atomic<u64> resolve_claim{0};
     alignas(64) std::atomic<u32> resolve_wake{0};
     std::atomic<u32> resolvers_sleeping{0};
     std::vector<std::jthread> resolvers;

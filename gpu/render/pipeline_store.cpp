@@ -128,6 +128,13 @@ bool IsOpt35Phase5ShaderHash(u64 pgm_hash) noexcept {
     case 0x00000000e21e283aULL:
     case 0x0000000070bb42afULL:
     case 0x0000000052738b8aULL:
+    // Step 2.3 (Sub-batch 1): Bloom/Glare, MotionBlur tile dilate, SSR Hi-Z, ConstFill, Scaleform BGRA
+    case 0x0000000057f3b8c2ULL:
+    case 0x000000004eb5a42fULL:
+    case 0x00000000abf92450ULL:
+    case 0x0000000001ae5388ULL:
+    case 0x000000009eb30215ULL:
+    case 0x000000004baeaa00ULL:
         return true;
     default:
         return false;

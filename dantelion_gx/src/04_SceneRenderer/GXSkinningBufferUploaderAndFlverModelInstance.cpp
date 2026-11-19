@@ -471,8 +471,8 @@ void sub_21c8c50(void* self, const float* bone_matrices,
                             xmm0 = _mm_castsi128_ps(_mm_shuffle_epi32(_mm_castps_si128(xmm0), 0x39));
 
                             xmm4 = _mm_mul_ps(r0, xmm1);
-                            xmm4 = _mm_hadd_ps(xmm4, xmm4);
-                            xmm4 = _mm_hadd_ps(xmm4, xmm4);
+                            xmm4 = _mm_add_ps(xmm4, _mm_shuffle_ps(xmm4, xmm4, 0xB1));
+                            xmm4 = _mm_add_ps(xmm4, _mm_shuffle_ps(xmm4, xmm4, 0x4E));
                             xmm4 = _mm_div_ps(_mm_load_ps(kSimd1111_4920c90), xmm4);
 
                             xmm1 = _mm_mul_ps(xmm4, xmm1);
@@ -536,8 +536,9 @@ void sub_21c8c50(void* self, const float* bone_matrices,
 
                     if (bone_count > 0) {
                         const __m128 c_0001 = _mm_load_ps(kSimd0001_4920ca0);
+                        const float* const inv_bind_base = *reinterpret_cast<const float* const*>(model + 0x1f0);
                         for (int64_t b = 0; b < bone_count; ++b) {
-                            const auto* inv_bind = *reinterpret_cast<const float* const*>(model + 0x1f0) + b * 12;
+                            const float* inv_bind = inv_bind_base + b * 12;
                             const float* src_m = prev_bone_matrices + b * 12;
                             float* dst_m = static_cast<float*>(temp_buf) + b * 12;
 
@@ -579,8 +580,9 @@ void sub_21c8c50(void* self, const float* bone_matrices,
 
                     if (bone_count > 0) {
                         const __m128 c_0001 = _mm_load_ps(kSimd0001_4920ca0);
+                        const float* const inv_bind_base = *reinterpret_cast<const float* const*>(model + 0x1f0);
                         for (int64_t b = 0; b < bone_count; ++b) {
-                            const auto* inv_bind = *reinterpret_cast<const float* const*>(model + 0x1f0) + b * 12;
+                            const float* inv_bind = inv_bind_base + b * 12;
                             const float* src_m = bone_matrices + b * 12;
                             float* dst_m = static_cast<float*>(temp_buf) + b * 12;
 
