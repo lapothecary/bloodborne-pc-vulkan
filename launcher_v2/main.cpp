@@ -272,7 +272,7 @@ int RunWindowsWebView(bb_launcher::LauncherContext ctx) {
     wc.hInstance = hinst;
     wc.hIcon = hicon;
     wc.hIconSm = hicon;
-    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    wc.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512));
     wc.hbrBackground = CreateSolidBrush(RGB(9, 10, 13));
     wc.lpszClassName = L"BloodborneLauncherV2Wnd";
     RegisterClassExW(&wc);

@@ -12,6 +12,12 @@
 #include <vector>
 
 #ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
 #include <shellapi.h>
 #else
@@ -375,7 +381,7 @@ int LauncherBridge::CountCachedShaders(const fs::path& user_dir) const {
         if (fn.rfind("opt", 0) == 0) continue;
         ++base_spv;
     }
-    return std::min(base_spv, 5761);
+    return (std::min)(base_spv, 5761);
 }
 
 std::string LauncherBridge::ReadVersionTag() const {
