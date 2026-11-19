@@ -12,6 +12,7 @@ User data (`user/savedata`, `bbport.ini`, `launcher-win.json`, `mods/`, `mods.js
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -292,6 +293,119 @@ def _safe_extract_tar(archive_path: Path, dest_dir: Path) -> None:
             tf.extractall(dest_dir)
 
 
+def _ps_quote(value: str) -> str:
+    """Single-quote a string safely for PowerShell (handles Cyrillic, spaces, $, %, & and ')."""
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _build_windows_apply_ps_script(
+    staged: Path,
+    port_dir: Path,
+    tmp_root: Path,
+    relaunch_exe: Path,
+    relaunch_args: list[str],
+    wait_pids: list[int],
+) -> tuple[str, str]:
+    """Builds a UTF-16LE base64 PowerShell updater script that never uses cmd.exe/tasklist/find.
+
+    - Immune to Cyrillic paths (`Загрузки`), spaces, and OEM CP866 codepage corruption.
+    - Runs strictly from RAM (`-EncodedCommand`), so `.update_tmp` has zero open handles and
+      is deleted cleanly every time.
+    - Waits cleanly for both child Python PID and PyInstaller parent bootloader PID.
+    - Clears `_MEIPASS2` before relaunching `Launcher.exe` so PyInstaller starts fresh.
+    """
+    staged_s = str(staged).rstrip("\\/")
+    port_s = str(port_dir).rstrip("\\/")
+    tmp_s = str(tmp_root).rstrip("\\/")
+    patches_s = str(port_dir / "out" / "patches.bin")
+    log_s = str(port_dir / "logs" / "updater.log")
+    exe_s = str(relaunch_exe)
+    pids_literal = ", ".join(str(int(p)) for p in wait_pids if int(p) > 0)
+    args_literal = ", ".join(_ps_quote(a) for a in relaunch_args)
+
+    ps_script = (
+        "$ErrorActionPreference = 'Continue'\n"
+        f"$staged = {_ps_quote(staged_s)}\n"
+        f"$portDir = {_ps_quote(port_s)}\n"
+        f"$tmpRoot = {_ps_quote(tmp_s)}\n"
+        f"$patchesBin = {_ps_quote(patches_s)}\n"
+        f"$logPath = {_ps_quote(log_s)}\n"
+        f"$relaunchExe = {_ps_quote(exe_s)}\n"
+        f"$relaunchArgs = @({args_literal})\n"
+        f"$waitPids = @({pids_literal})\n"
+        "function Write-UpdLog([string]$msg) {\n"
+        "    try {\n"
+        "        $ld = Split-Path -Parent $logPath\n"
+        "        if ($ld -and -not (Test-Path -LiteralPath $ld)) { New-Item -ItemType Directory -Path $ld -Force | Out-Null }\n"
+        "        Add-Content -LiteralPath $logPath -Value ('[' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + '] ' + $msg) -Encoding UTF8\n"
+        "    } catch {}\n"
+        "}\n"
+        "Write-UpdLog ('Updater started; waiting for PIDs: ' + ($waitPids -join ','))\n"
+        "$deadline = [DateTime]::UtcNow.AddSeconds(20)\n"
+        "while ([DateTime]::UtcNow -lt $deadline) {\n"
+        "    $alive = $false\n"
+        "    foreach ($wp in $waitPids) {\n"
+        "        $p = Get-Process -Id $wp -ErrorAction SilentlyContinue\n"
+        "        if ($p -and -not $p.HasExited) {\n"
+        "            if ($wp -eq $waitPids[0] -or $p.ProcessName -match '^(Launcher|Bloodborne|python)') {\n"
+        "                $alive = $true\n"
+        "            }\n"
+        "        }\n"
+        "    }\n"
+        "    if (-not $alive) { break }\n"
+        "    Start-Sleep -Milliseconds 250\n"
+        "}\n"
+        "Start-Sleep -Milliseconds 250\n"
+        "$rcArgs = @($staged, $portDir, '/E', '/IS', '/IT', '/R:12', '/W:1', '/NFL', '/NDL', '/NJH', '/NJS', '/NP',\n"
+        "            '/XF', 'bbport.ini', 'launcher-win.json', 'mods.json', 'patches.json',\n"
+        "            '/XD', 'user', 'mods', 'logs', '.update_tmp')\n"
+        "$rc = 99\n"
+        "try {\n"
+        "    & 'robocopy.exe' @rcArgs | Out-Null\n"
+        "    $rc = $LASTEXITCODE\n"
+        "} catch {\n"
+        "    Write-UpdLog ('robocopy invoke error: ' + $_.Exception.Message)\n"
+        "}\n"
+        "Write-UpdLog ('robocopy exit code: ' + $rc)\n"
+        "if ($rc -ge 8) {\n"
+        "    $prot = @('bbport.ini','launcher-win.json','mods.json','patches.json','user','mods','logs','.update_tmp')\n"
+        "    Get-ChildItem -LiteralPath $staged -Recurse -File -Force | ForEach-Object {\n"
+        "        $rel = $_.FullName.Substring($staged.Length).TrimStart('\\','/')\n"
+        "        $top = ($rel -split '[\\\\/]')[0]\n"
+        "        if ($prot -contains $top -or $top -like 'CUSA*') { return }\n"
+        "        $dst = Join-Path $portDir $rel\n"
+        "        $dstDir = Split-Path -Parent $dst\n"
+        "        if ($dstDir -and -not (Test-Path -LiteralPath $dstDir)) { New-Item -ItemType Directory -Path $dstDir -Force | Out-Null }\n"
+        "        for ($try = 0; $try -lt 10; $try++) {\n"
+        "            try { Copy-Item -LiteralPath $_.FullName -Destination $dst -Force; break }\n"
+        "            catch { Start-Sleep -Milliseconds 300 }\n"
+        "        }\n"
+        "    }\n"
+        "}\n"
+        "if (Test-Path -LiteralPath $patchesBin) { Remove-Item -LiteralPath $patchesBin -Force -ErrorAction SilentlyContinue }\n"
+        "for ($try = 0; $try -lt 5; $try++) {\n"
+        "    if (-not (Test-Path -LiteralPath $tmpRoot)) { break }\n"
+        "    Remove-Item -LiteralPath $tmpRoot -Recurse -Force -ErrorAction SilentlyContinue\n"
+        "    if (Test-Path -LiteralPath $tmpRoot) { Start-Sleep -Milliseconds 250 }\n"
+        "}\n"
+        "Remove-Item Env:_MEIPASS2 -ErrorAction SilentlyContinue\n"
+        "Remove-Item Env:PYINSTALLER_RESET_ENVIRONMENT -ErrorAction SilentlyContinue\n"
+        "try {\n"
+        "    if ($relaunchArgs.Count -gt 0) {\n"
+        "        $quotedArgs = $relaunchArgs | ForEach-Object { '\"' + ($_ -replace '\"', '\\\"') + '\"' }\n"
+        "        Start-Process -FilePath $relaunchExe -ArgumentList $quotedArgs -WorkingDirectory $portDir\n"
+        "    } else {\n"
+        "        Start-Process -FilePath $relaunchExe -WorkingDirectory $portDir\n"
+        "    }\n"
+        "    Write-UpdLog ('Relaunched: ' + $relaunchExe)\n"
+        "} catch {\n"
+        "    Write-UpdLog ('Relaunch failed: ' + $_.Exception.Message)\n"
+        "}\n"
+    )
+    encoded = base64.b64encode(ps_script.encode("utf-16-le")).decode("ascii")
+    return ps_script, encoded
+
+
 def _unwrap_single_root(staged: Path) -> Path:
     entries = [p for p in staged.iterdir()]
     if len(entries) == 1 and entries[0].is_dir() and entries[0].name not in ("out", "bin", "launcher", "scripts"):
@@ -439,35 +553,50 @@ def download_and_apply_update(
         if is_windows:
             report(0.96, "Applying update & restarting Launcher…")
             pid = os.getpid()
+            ppid = os.getppid()
+            wait_pids = [pid] + ([ppid] if ppid and ppid != pid else [])
             relaunch_exe = Path(sys.executable).resolve()
+            relaunch_args: list[str] = []
             if relaunch_exe.name.lower().startswith("python"):
-                relaunch_cmd = f'start "" "{relaunch_exe}" "{port_dir / "Launcher.py"}"'
-            elif (port_dir / "Launcher.exe").is_file():
-                relaunch_cmd = f'start "" "{port_dir / "Launcher.exe"}"'
+                relaunch_args = [str(port_dir / "Launcher.py")]
+            elif (port_dir / "Launcher.exe").is_file() or (staged / "Launcher.exe").is_file():
+                relaunch_exe = port_dir / "Launcher.exe"
             else:
-                relaunch_cmd = f'start "" "{relaunch_exe}" --launcher'
+                relaunch_args = ["--launcher"]
 
-            bat_path = tmp_root / "apply_update.cmd"
-            bat_content = (
-                "@echo off\r\n"
-                "chcp 65001 >nul\r\n"
-                "setlocal\r\n"
-                f"for /L %%i in (1,1,20) do (\r\n"
-                f"    tasklist /FI \"PID eq {pid}\" 2>nul | find \"{pid}\" >nul\r\n"
-                "    if errorlevel 1 goto :copy_files\r\n"
-                "    timeout /t 1 /nobreak >nul\r\n"
-                ")\r\n"
-                ":copy_files\r\n"
-                f"robocopy \"{staged}\" \"{port_dir}\" /E /IS /IT /R:8 /W:1 "
-                "/XF bbport.ini launcher-win.json mods.json patches.json "
-                "/XD user mods logs .update_tmp >nul\r\n"
-                f"if exist \"{port_dir / 'out' / 'patches.bin'}\" del /F /Q \"{port_dir / 'out' / 'patches.bin'}\" >nul 2>&1\r\n"
-                f"{relaunch_cmd}\r\n"
-                f"rmdir /S /Q \"{tmp_root}\" >nul 2>&1\r\n"
+            _, encoded_cmd = _build_windows_apply_ps_script(
+                staged=staged,
+                port_dir=port_dir,
+                tmp_root=tmp_root,
+                relaunch_exe=relaunch_exe,
+                relaunch_args=relaunch_args,
+                wait_pids=wait_pids,
             )
-            bat_path.write_text(bat_content, encoding="utf-8")
-            flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "DETACHED_PROCESS", 0)
-            subprocess.Popen(["cmd.exe", "/c", str(bat_path)], cwd=str(port_dir), creationflags=flags)
+            sys_root = os.environ.get("SystemRoot") or r"C:\Windows"
+            ps_full = Path(sys_root) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+            ps_bin = str(ps_full) if ps_full.is_file() else "powershell.exe"
+            # IMPORTANT: Never combine CREATE_NO_WINDOW with DETACHED_PROCESS (mutually exclusive
+            # on Windows and causes console utilities to spawn a stuck black window).
+            flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            subprocess.Popen(
+                [
+                    ps_bin,
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-WindowStyle",
+                    "Hidden",
+                    "-EncodedCommand",
+                    encoded_cmd,
+                ],
+                cwd=str(port_dir.parent),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                close_fds=True,
+                creationflags=flags,
+            )
             report(1.0, "Restarting…")
             return {"ok": True, "restarting_external": True, "latest_info": info}
 

@@ -158,6 +158,35 @@ class UpdaterTests(unittest.TestCase):
             self.assertIn("SHA-256 mismatch", res["error"])
             self.assertEqual((port_dir / "out" / "gpu" / "libbbgpu.so").read_bytes(), b"original-good")
 
+    def test_windows_powershell_script_handles_cyrillic_and_no_cmd_find(self):
+        import base64
+        staged = Path(r"C:\Users\Иван O'Connor\Загрузки\bb\bloodborne-pc-vulkan-windows\.update_tmp\extracted")
+        port_dir = Path(r"C:\Users\Иван O'Connor\Загрузки\bb\bloodborne-pc-vulkan-windows")
+        tmp_root = Path(r"C:\Users\Иван O'Connor\Загрузки\bb\bloodborne-pc-vulkan-windows\.update_tmp")
+        relaunch_exe = Path(r"C:\Users\Иван O'Connor\Загрузки\bb\bloodborne-pc-vulkan-windows\Launcher.exe")
+
+        ps, encoded = bbport_updater._build_windows_apply_ps_script(
+            staged=staged,
+            port_dir=port_dir,
+            tmp_root=tmp_root,
+            relaunch_exe=relaunch_exe,
+            relaunch_args=[],
+            wait_pids=[8564, 4120],
+        )
+        decoded = base64.b64decode(encoded).decode("utf-16-le")
+        self.assertEqual(decoded, ps)
+        # Cyrillic & apostrophe escaping preserved cleanly in UTF-16LE
+        self.assertIn("Загрузки", decoded)
+        self.assertIn("O''Connor", decoded)
+        # Never invokes cmd.exe / tasklist / find / timeout
+        self.assertNotIn("tasklist", decoded)
+        self.assertNotIn("timeout ", decoded)
+        self.assertIn("Get-Process -Id $wp", decoded)
+        self.assertIn("Remove-Item Env:_MEIPASS2", decoded)
+        self.assertIn("& 'robocopy.exe' @rcArgs", decoded)
+        self.assertIn("Remove-Item -LiteralPath $tmpRoot -Recurse -Force", decoded)
+
+
 
 if __name__ == "__main__":
     unittest.main()
