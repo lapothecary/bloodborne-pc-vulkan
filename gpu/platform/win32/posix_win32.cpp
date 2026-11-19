@@ -62,6 +62,12 @@ LONG CALLBACK DispatchException(EXCEPTION_POINTERS* pointers) {
         // Page fault error code bits as Linux reports them: 2 a write, 16 an instruction fetch.
         error = record->ExceptionInformation[0] == 1 ? 2 : record->ExceptionInformation[0] == 8 ? 16 : 0;
         break;
+    case EXCEPTION_STACK_OVERFLOW:
+        sig = SIGSEGV;
+        info.si_addr = record->ExceptionAddress;
+        info.si_code = SEGV_ACCERR;
+        error = 0x10000ULL; // Marker for BbCrashBlackBox: STACK OVERFLOW (0xC00000FD)
+        break;
     case EXCEPTION_BREAKPOINT:
         sig = SIGTRAP;
         rip_adjust = 1; // Linux reports the instruction after the int3

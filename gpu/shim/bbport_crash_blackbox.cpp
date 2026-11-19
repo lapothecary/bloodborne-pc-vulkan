@@ -17,11 +17,13 @@
 #include <atomic>
 #include <cctype>
 #include <cmath>
+#include <csignal>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <exception>
 
 #include <dlfcn.h>
 #include <fcntl.h>
@@ -146,6 +148,45 @@ bool SafeReadVal(std::uintptr_t addr, T* out) noexcept {
     return SafeReadMem(addr, out, sizeof(T));
 }
 
+// Static extra reason string populated by std::terminate / Win32 UnhandledExceptionFilter
+char g_extra_reason[512]{};
+
+#ifdef _WIN32
+void Utf8ToWideStatic(const char* utf8, wchar_t* out, int out_cap) noexcept {
+    if (!out || out_cap <= 0) return;
+    out[0] = L'\0';
+    if (!utf8 || utf8[0] == '\0') return;
+    const int n = ::MultiByteToWideChar(CP_UTF8, 0, utf8, -1, out, out_cap);
+    if (n <= 0) {
+        // Fallback to ANSI if invalid UTF-8
+        ::MultiByteToWideChar(CP_ACP, 0, utf8, -1, out, out_cap);
+    }
+    out[out_cap - 1] = L'\0';
+}
+
+void DescribeWin32ModuleOffset(const void* addr, char* out, std::size_t out_cap) noexcept {
+    if (!out || out_cap == 0) return;
+    out[0] = '\0';
+    if (!addr) return;
+    HMODULE mod = nullptr;
+    if (::GetModuleHandleExA(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            static_cast<LPCSTR>(addr), &mod) &&
+        mod) {
+        char mod_path[512]{};
+        if (::GetModuleFileNameA(mod, mod_path, static_cast<DWORD>(sizeof(mod_path))) > 0) {
+            const char* slash = std::strrchr(mod_path, '\\');
+            const char* fslash = std::strrchr(mod_path, '/');
+            const char* base = (slash && (!fslash || slash > fslash)) ? (slash + 1)
+                                                                      : (fslash ? (fslash + 1) : mod_path);
+            const auto off = reinterpret_cast<std::uintptr_t>(addr) -
+                             reinterpret_cast<std::uintptr_t>(mod);
+            std::snprintf(out, out_cap, "%s+0x%llx", base, static_cast<unsigned long long>(off));
+        }
+    }
+}
+#endif
+
 struct CrashSink {
 #ifdef _WIN32
     HANDLE file_handle = INVALID_HANDLE_VALUE;
@@ -155,7 +196,9 @@ struct CrashSink {
     char file_path[1024]{};
 
     void OpenCrashLogFile() noexcept {
-        char logs_dir[896]{};
+        static char logs_dir[896]{};
+        logs_dir[0] = '\0';
+        file_path[0] = '\0';
         const char* data_dir = bb_env("BB_DATA_DIR");
         if (data_dir && data_dir[0] != '\0') {
             std::snprintf(logs_dir, sizeof(logs_dir), "%s/logs", data_dir);
@@ -175,12 +218,6 @@ struct CrashSink {
             }
         }
 
-#ifdef _WIN32
-        ::CreateDirectoryA(logs_dir, nullptr);
-#else
-        ::mkdir(logs_dir, 0755);
-#endif
-
         const std::time_t now = std::time(nullptr);
         struct tm tm_buf{};
 #ifdef _WIN32
@@ -193,16 +230,23 @@ struct CrashSink {
         std::snprintf(file_path, sizeof(file_path), "%s/crash-%s.log", logs_dir, stamp);
 
 #ifdef _WIN32
-        file_handle = ::CreateFileA(file_path, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+        static wchar_t wdir[1024]{};
+        static wchar_t wpath[1024]{};
+        Utf8ToWideStatic(logs_dir, wdir, 1024);
+        ::CreateDirectoryW(wdir, nullptr);
+        Utf8ToWideStatic(file_path, wpath, 1024);
+        file_handle = ::CreateFileW(wpath, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
                                     nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (file_handle == INVALID_HANDLE_VALUE) {
             // Fallback to current working directory `./logs`
-            ::CreateDirectoryA("logs", nullptr);
+            ::CreateDirectoryW(L"logs", nullptr);
             std::snprintf(file_path, sizeof(file_path), "logs/crash-%s.log", stamp);
-            file_handle = ::CreateFileA(file_path, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+            Utf8ToWideStatic(file_path, wpath, 1024);
+            file_handle = ::CreateFileW(wpath, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
                                         nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
         }
 #else
+        ::mkdir(logs_dir, 0755);
         file_fd = ::open(file_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
         if (file_fd < 0) {
             ::mkdir("logs", 0755);
@@ -235,7 +279,7 @@ struct CrashSink {
         __attribute__((format(printf, 2, 3)))
 #endif
     {
-        char buf[1536];
+        static char buf[1536];
         va_list ap;
         va_start(ap, fmt);
         const int n = std::vsnprintf(buf, sizeof(buf), fmt, ap);
@@ -244,6 +288,18 @@ struct CrashSink {
             const std::size_t len = std::min<std::size_t>(static_cast<std::size_t>(n), sizeof(buf) - 1);
             WriteRaw(buf, len);
         }
+    }
+
+    void FlushOnly() noexcept {
+#ifdef _WIN32
+        if (file_handle != INVALID_HANDLE_VALUE) {
+            ::FlushFileBuffers(file_handle);
+        }
+#else
+        if (file_fd >= 0) {
+            ::fsync(file_fd);
+        }
+#endif
     }
 
     void FlushAndClose() noexcept {
@@ -921,6 +977,69 @@ const char* SignalName(int sig) noexcept {
     }
 }
 
+void BbTerminateHandler() noexcept {
+    if (std::exception_ptr ep = std::current_exception()) {
+        try {
+            std::rethrow_exception(ep);
+        } catch (const std::exception& e) {
+            std::snprintf(g_extra_reason, sizeof(g_extra_reason),
+                          "Uncaught C++ exception: %s", e.what() ? e.what() : "<null>");
+        } catch (...) {
+            std::snprintf(g_extra_reason, sizeof(g_extra_reason),
+                          "Uncaught non-std C++ exception (std::terminate)");
+        }
+    } else {
+        std::snprintf(g_extra_reason, sizeof(g_extra_reason),
+                      "std::terminate() called without active exception (noexcept or joinable std::thread)");
+    }
+#ifdef _WIN32
+    CONTEXT ctx{};
+    ::RtlCaptureContext(&ctx);
+    ucontext_t uc{};
+    BbWin32ToUcontext(&ctx, 0, &uc);
+    WriteCrashReport(SIGABRT, reinterpret_cast<const void*>(ctx.Rip), &uc, nullptr, 0);
+#else
+    WriteCrashReport(SIGABRT, __builtin_return_address(0), nullptr, nullptr, 0);
+#endif
+    ::_exit(134);
+}
+
+#ifdef _WIN32
+void BbWin32AbortHandler(int sig) noexcept {
+    if (g_extra_reason[0] == '\0') {
+        std::snprintf(g_extra_reason, sizeof(g_extra_reason),
+                      "CRT abort() / SIGABRT (%d) intercepted before Win32 __fastfail", sig);
+    }
+    CONTEXT ctx{};
+    ::RtlCaptureContext(&ctx);
+    ucontext_t uc{};
+    BbWin32ToUcontext(&ctx, 0, &uc);
+    WriteCrashReport(SIGABRT, reinterpret_cast<const void*>(ctx.Rip), &uc, nullptr, 0);
+    ::_exit(134);
+}
+
+LONG WINAPI BbWin32UnhandledExceptionFilter(EXCEPTION_POINTERS* pointers) {
+    const EXCEPTION_RECORD* rec = pointers ? pointers->ExceptionRecord : nullptr;
+    const DWORD code = rec ? rec->ExceptionCode : 0;
+    const void* addr = rec ? rec->ExceptionAddress : nullptr;
+    char mod_buf[192]{};
+    DescribeWin32ModuleOffset(addr, mod_buf, sizeof(mod_buf));
+    std::snprintf(g_extra_reason, sizeof(g_extra_reason),
+                  "Unhandled Win32 Exception 0x%08lX at %s (addr=0x%llx)",
+                  static_cast<unsigned long>(code),
+                  mod_buf[0] ? mod_buf : "<unknown module>",
+                  static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(addr)));
+    ucontext_t uc{};
+    if (pointers && pointers->ContextRecord) {
+        const unsigned long long err_mark = (code == EXCEPTION_STACK_OVERFLOW) ? 0x10000ULL : 0ULL;
+        BbWin32ToUcontext(pointers->ContextRecord, err_mark, &uc);
+    }
+    WriteCrashReport(SIGSEGV, addr, (pointers && pointers->ContextRecord) ? &uc : nullptr, nullptr, 0);
+    ::_exit(139);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+#endif
+
 } // namespace
 
 // ============================================================================
@@ -929,7 +1048,14 @@ const char* SignalName(int sig) noexcept {
 void Initialize() noexcept {
     if (!g_initialized.exchange(true, std::memory_order_acq_rel)) {
         runtime_set_flight_recorder(&bbgpu_flight_record);
-        RecordEvent("INIT", "Crash Black-Box & Flight Recorder armed");
+        std::set_terminate(BbTerminateHandler);
+#ifdef _WIN32
+        ULONG stack_guarantee = 65536;
+        ::SetThreadStackGuarantee(&stack_guarantee);
+        std::signal(SIGABRT, BbWin32AbortHandler);
+        ::SetUnhandledExceptionFilter(BbWin32UnhandledExceptionFilter);
+#endif
+        RecordEvent("INIT", "Crash Black-Box V2 (terminate + Win32 SEH/SIGABRT/stack-overflow) armed");
     }
 }
 
@@ -1000,18 +1126,22 @@ void NoteFrameTick() noexcept {
 void WriteCrashReport(int sig, const void* fault_addr, void* ucontext_ptr,
                       const void* guest_image, std::uint64_t guest_size) noexcept {
     if (g_crash_in_progress.exchange(true, std::memory_order_acq_rel)) {
+        const char msg[] = "[BB-FAULT-REENTRANT] secondary fault during crash report\n";
+#ifdef _WIN32
+        ::_write(2, msg, static_cast<unsigned int>(sizeof(msg) - 1));
+#else
+        const ssize_t w = ::write(2, msg, sizeof(msg) - 1);
+        (void)w;
+#endif
         return; // Prevent re-entrancy if another thread faults simultaneously
     }
-
-    std::fflush(stdout);
-    std::fflush(stderr);
 
     const auto* guest_img = static_cast<const unsigned char*>(
         guest_image ? guest_image : g_guest_image.load(std::memory_order_acquire));
     const std::uint64_t eff_guest_size =
         guest_size ? guest_size : g_guest_image_size.load(std::memory_order_acquire);
 
-    CrashSink sink{};
+    static CrashSink sink{};
     sink.OpenCrashLogFile();
 
     const std::uint64_t crash_us = runtime_process_time_us();
@@ -1020,7 +1150,7 @@ void WriteCrashReport(int sig, const void* fault_addr, void* ucontext_ptr,
     struct tm tm_buf{};
 #ifdef _WIN32
     ::localtime_s(&tm_buf, &wall_now);
-    const char* os_name = "Windows x86-64 (Win32 VEH -> POSIX ucontext)";
+    const char* os_name = "Windows x86-64 (Win32 VEH/SEH -> Crash Black-Box V2)";
 #else
     ::localtime_r(&wall_now, &tm_buf);
     const char* os_name = "Linux x86-64";
@@ -1042,23 +1172,21 @@ void WriteCrashReport(int sig, const void* fault_addr, void* ucontext_ptr,
 
     const char* access_kind = "UNKNOWN";
     if (sig == SIGSEGV) {
-        if (err_bits & 16ULL) access_kind = "INSTRUCTION FETCH (jumped to invalid/non-exec RIP)";
+        if (err_bits & 0x10000ULL) access_kind = "STACK OVERFLOW (0xC00000FD)";
+        else if (err_bits & 16ULL) access_kind = "INSTRUCTION FETCH (jumped to invalid/non-exec RIP)";
         else if (err_bits & 2ULL) access_kind = "MEMORY WRITE";
         else access_kind = "MEMORY READ";
     }
 
-    // Discover FromSoftware heaps before printing summary & registers
-    DiscoveredHeap heaps[kMaxDiscoveredHeaps]{};
-    const std::size_t heap_count = EnumerateFromSoftwareHeaps(guest_img, heaps);
-
-    char rip_sym[256]{};
+    static char rip_sym[256]{};
+    rip_sym[0] = '\0';
     if (!ResolveCodeSymbol(rip, guest_img, eff_guest_size, rip_sym, sizeof(rip_sym))) {
         std::snprintf(rip_sym, sizeof(rip_sym), "<unmapped/unknown code @ 0x%016llx>",
                       static_cast<unsigned long long>(rip));
     }
 
     // ========================================================================
-    // 1. HEADER & AUTOMATIC HUMAN-READABLE DIAGNOSIS
+    // 1. HEADER & AUTOMATIC HUMAN-READABLE DIAGNOSIS (Flushed BEFORE heap walk)
     // ========================================================================
     sink.Printf("\n"
                 "================================================================================\n"
@@ -1070,6 +1198,9 @@ void WriteCrashReport(int sig, const void* fault_addr, void* ucontext_ptr,
     if (sink.file_path[0] != '\0') {
         sink.Printf("  Crash Log File : %s\n", sink.file_path);
     }
+    if (g_extra_reason[0] != '\0') {
+        sink.Printf("  Reason         : %s\n", g_extra_reason);
+    }
     sink.Printf("  Signal         : %s [sig=%d, access=%s, err=0x%llx]\n",
                 SignalName(sig), sig, access_kind, static_cast<unsigned long long>(err_bits));
     sink.Printf("  Fault Thread   : \"%s\" (tid=%u)\n", thread_name, tid);
@@ -1079,6 +1210,11 @@ void WriteCrashReport(int sig, const void* fault_addr, void* ucontext_ptr,
 
 #ifdef _WIN32
     {
+        char mod_off[192]{};
+        DescribeWin32ModuleOffset(reinterpret_cast<const void*>(rip), mod_off, sizeof(mod_off));
+        if (mod_off[0] != '\0') {
+            sink.Printf("  Fault Module   : %s\n", mod_off);
+        }
         char win_mem[256]{};
         bb_win32_describe_address(fault_addr, win_mem, static_cast<unsigned>(sizeof(win_mem)));
         if (win_mem[0] != '\0') {
@@ -1086,6 +1222,12 @@ void WriteCrashReport(int sig, const void* fault_addr, void* ucontext_ptr,
         }
     }
 #endif
+    sink.FlushOnly();
+
+    // Discover FromSoftware heaps in static storage (zero stack pressure)
+    static DiscoveredHeap heaps[kMaxDiscoveredHeaps]{};
+    std::memset(heaps, 0, sizeof(heaps));
+    const std::size_t heap_count = EnumerateFromSoftwareHeaps(guest_img, heaps);
 
     if (guest_img) {
         sink.Printf("  Guest Image    : base=0x%016llx, size=0x%llx\n",

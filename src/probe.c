@@ -26,6 +26,7 @@
 #include <sys/syscall.h>
 #include <sys/uio.h>
 #ifdef _WIN32
+#include <io.h>
 #include <process.h>
 #include <windows.h>
 #else
@@ -231,6 +232,37 @@ static void fault(int sig, siginfo_t *info, void *context) {
         sigaddset(&unblock, sig);
         pthread_sigmask(SIG_UNBLOCK, &unblock, NULL);
         siglongjmp(*recover, 1);
+    }
+    /* Immediate async-signal-safe beacon to fd 2 BEFORE heavy Black-Box reporting:
+     * guarantees RIP/RSP/fault_addr are always flushed to logs/<ts>.log even on stack
+     * overflow or recursive fault. */
+    {
+        static const char hex[] = "0123456789abcdef";
+        char beacon[128];
+        int p = 0;
+        const char *pfx = "\n[BB-FAULT] sig=";
+        while (*pfx) beacon[p++] = *pfx++;
+        int s = sig < 0 ? 0 : sig;
+        if (s >= 10) beacon[p++] = (char)('0' + (s / 10) % 10);
+        beacon[p++] = (char)('0' + (s % 10));
+        ucontext_t *uc = (ucontext_t *)context;
+        uint64_t vals[3] = {
+            uc ? (uint64_t)uc->uc_mcontext.gregs[REG_RIP] : 0ULL,
+            uc ? (uint64_t)uc->uc_mcontext.gregs[REG_RSP] : 0ULL,
+            (uint64_t)(uintptr_t)fault_addr
+        };
+        const char *lbls[3] = {" rip=0x", " rsp=0x", " addr=0x"};
+        for (int k = 0; k < 3; ++k) {
+            const char *l = lbls[k];
+            while (*l) beacon[p++] = *l++;
+            for (int i = 15; i >= 0; --i) beacon[p++] = hex[(vals[k] >> (i * 4)) & 15];
+        }
+        beacon[p++] = '\n';
+#ifdef _WIN32
+        (void)_write(2, beacon, (unsigned)p);
+#else
+        { ssize_t w_ = write(2, beacon, (size_t)p); (void)w_; }
+#endif
     }
     /* Universal Linux & Windows Crash Black-Box: writes full hybrid stacktrace, 16 GPRs,
      * FromSoftware DLRegularHeap chunk corruption check, and 128-event Flight Recorder
