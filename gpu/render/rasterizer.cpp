@@ -2480,39 +2480,54 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const PreparedDraw* pre
         return;
     }
     if (pipelined && FilterDrawPasses()) {
-        if (vfx_ui_batcher && vfx_ui_batcher->HasPendingDraws() &&
-            vfx_ui_batcher->CurrentPipeline() != pipeline) {
-            vfx_ui_batcher->Flush(*this);
-        }
-        if (OnStageA() && TryCullMicroShadowDraw(pipeline, is_indexed)) {
-            return;
-        }
-        if (vsm_shadow_memo &&
-            vsm_shadow_memo->TryHandleDraw(*this, pipeline, used_prepared, is_indexed,
-                                           index_offset)) {
-            return;
-        }
-        if (light_tile_batcher &&
-            light_tile_batcher->TryBatchDraw(*this, pipeline, used_prepared, is_indexed,
-                                             index_offset)) {
-            return;
-        }
-        if (object_vel_culler &&
-            object_vel_culler->TryCullDraw(*this, pipeline, is_indexed)) {
-            return;
-        }
         const bool run_stage_a_occ =
             scene_occlusion_culler && scene_occlusion_culler->stage_a_occ_cull && OnStageA();
         u16 occ_handoff = run_stage_a_occ ? kOccNoProbe : kOccStageBFallback;
-        if (run_stage_a_occ &&
-            TryCullSceneOcclusionStageA(pipeline, used_prepared, is_indexed, index_offset,
-                                        occ_handoff)) {
-            return;
-        }
-        if (vfx_ui_batcher &&
-            vfx_ui_batcher->TryBatchDraw(*this, pipeline, used_prepared, is_indexed,
-                                         index_offset)) {
-            return;
+        {
+            BB_SECTION(ACullBatch);
+            if (vfx_ui_batcher && vfx_ui_batcher->HasPendingDraws() &&
+                vfx_ui_batcher->CurrentPipeline() != pipeline) {
+                BB_SECTION(ACullVfx);
+                vfx_ui_batcher->Flush(*this);
+            }
+            {
+                BB_SECTION(ACullMicro);
+                if (OnStageA() && TryCullMicroShadowDraw(pipeline, is_indexed)) {
+                    return;
+                }
+            }
+            if (vsm_shadow_memo) {
+                BB_SECTION(ACullVsm);
+                if (vsm_shadow_memo->TryHandleDraw(*this, pipeline, used_prepared, is_indexed,
+                                                   index_offset)) {
+                    return;
+                }
+            }
+            if (light_tile_batcher) {
+                BB_SECTION(ACullLight);
+                if (light_tile_batcher->TryBatchDraw(*this, pipeline, used_prepared, is_indexed,
+                                                     index_offset)) {
+                    return;
+                }
+            }
+            if (object_vel_culler) {
+                BB_SECTION(ACullVel);
+                if (object_vel_culler->TryCullDraw(*this, pipeline, is_indexed)) {
+                    return;
+                }
+            }
+            if (run_stage_a_occ &&
+                TryCullSceneOcclusionStageA(pipeline, used_prepared, is_indexed, index_offset,
+                                            occ_handoff)) {
+                return;
+            }
+            if (vfx_ui_batcher) {
+                BB_SECTION(ACullVfx);
+                if (vfx_ui_batcher->TryBatchDraw(*this, pipeline, used_prepared, is_indexed,
+                                                 index_offset)) {
+                    return;
+                }
+            }
         }
         const bool is_display_pass_draw =
             run_stage_a_occ && camera_motion && camera_motion->Enabled() &&
@@ -2583,6 +2598,7 @@ static void NoteCrumbReads(Breadcrumbs::Crumb& crumb, const GraphicsPipeline* pi
 void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw* used_prepared,
                             bool is_indexed, u32 index_offset, u16 occ_handoff) {
     BB_SECTION(DrawRecord);
+    packet_vsharps_hash = 0;
     buffer_cache.NewPacket();
     if (DrawPipe::OnStageB()) {
         FrameCapture::Poll();
@@ -2679,6 +2695,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     u32 gbuf_sort_inst_cb_size = 0;
     bool gbuf_sort_is_inst_vs = false;
     if (scene_occlusion_culler) {
+        BB_SECTION(BOccSort);
         auto& culler = *scene_occlusion_culler;
         culler.EnsureInit(instance);
         const u32 frame_tag = culler.cur_frame.load(std::memory_order_relaxed);
@@ -2740,6 +2757,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
                     if (!has_transient_vb) {
                         vtx_buf_hash = XXH3_64bits(packet_vsharps.data(),
                                                    packet_vsharps.size() * sizeof(Gcn::Buffer));
+                        packet_vsharps_hash = vtx_buf_hash;
                     }
                 }
 
@@ -2766,39 +2784,82 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
                 }
                 const u32* const vs_flat = vs_stage.FlatUserData().data();
                 const VAddr vs_pgm_base = vs_stage.ProgramBase();
+                bool need_cam =
+                    (culler.cam_updated_frame.load(std::memory_order_relaxed) != frame_tag);
+                enum class OccBStageRole : u8 { None = 0, SceneCam, ModelCb, InstCb, Palette };
                 for (u32 b_idx = 0; b_idx < vs_stage.buffers.size(); ++b_idx) {
+                    if (!need_cam && has_model_cb && palette_ptr) {
+                        break;
+                    }
                     const auto& res = vs_stage.buffers[b_idx];
                     if (res.IsSpecial()) {
                         continue;
                     }
                     u32 cb_size = 0;
-                    const u8* cb_ptr = nullptr;
-                    if (num_ring_stages != 0) {
-                        if (const auto* ring = FindRingBinding(vs_stage, b_idx)) {
-                            cb_size = ring->size;
-                            if (ring->address != 0 &&
-                                ((ring->address >= cue_base &&
-                                  ring->address + cb_size <= cue_end) ||
-                                 (!VideoCore::DirectBuffers::OverlapsNativeOwnedRange(
-                                      ring->address, cb_size) &&
-                                  !buffer_cache.IsConstRamRange(ring->address, cb_size) &&
-                                  memory->ClampRangeSize(ring->address, cb_size) == cb_size))) {
-                                cb_ptr = reinterpret_cast<const u8*>(ring->address);
-                            } else {
-                                cb_ptr = (ring->ring == 0)
-                                             ? constant_ring->Data(ring->offset)
-                                             : worker_rings[ring->ring - 1]->Data(ring->offset);
-                            }
-                        }
-                    }
-                    if (!cb_ptr) {
-                        const Gcn::Buffer sharp =
-                            prep_vs ? prep_vs->buffer_sharps[b_idx]
-                                    : res.GetSharpDirect(vs_flat, vs_pgm_base);
+                    const RingBinding* ring =
+                        (num_ring_stages != 0) ? FindRingBinding(vs_stage, b_idx) : nullptr;
+                    Gcn::Buffer sharp{};
+                    if (ring) {
+                        cb_size = ring->size;
+                    } else {
+                        sharp = prep_vs ? prep_vs->buffer_sharps[b_idx]
+                                        : res.GetSharpDirect(vs_flat, vs_pgm_base);
                         if (!sharp.Valid() || sharp.GetStride() != 16) {
                             continue;
                         }
                         cb_size = sharp.GetSize();
+                    }
+                    // Classify by size BEFORE touching `TryGetCpuMirrorPtr` / `OverlapsNativeOwnedRange`
+                    // / `ClampRangeSize` so irrelevant material/lighting CBs cost ~1 ns!
+                    OccBStageRole role = OccBStageRole::None;
+                    if (cb_size == 864u) {
+                        if (need_cam) {
+                            role = OccBStageRole::SceneCam;
+                        }
+                    } else if (cb_size == 416u && !is_inst_gbuf_vs) {
+                        if (!has_model_cb) {
+                            role = OccBStageRole::ModelCb;
+                        }
+                    } else if (is_inst_gbuf_vs && cb_size >= 208u && cb_size <= 32768u &&
+                               (cb_size % 208u) == 0u) {
+                        if (!inst_cb_ptr) {
+                            role = OccBStageRole::InstCb;
+                        }
+                    } else if (cb_size >= 48u && cb_size <= 16384u && (cb_size % 48u) == 0u) {
+                        if (!palette_ptr) {
+                            role = OccBStageRole::Palette;
+                        }
+                    }
+                    if (role == OccBStageRole::None) {
+                        continue;
+                    }
+                    const u8* cb_ptr = nullptr;
+                    if (ring) {
+                        // NEVER read `constant_ring->Data(ring->offset)` (uncacheable WC/PCIe BAR
+                        // memory = ~5 ms/f!) when a cached CPU RAM pointer (`cueHeap`, `AuxCpuRing`,
+                        // `CpuMirrorPtr`, or mapped guest RAM) is available.
+                        if (ring->address != 0) {
+                            if ((ring->address >= cue_base &&
+                                 ring->address + cb_size <= cue_end) ||
+                                VideoCore::DirectBuffers::IsTransientAuxCpuRing(ring->address,
+                                                                                cb_size)) {
+                                cb_ptr = reinterpret_cast<const u8*>(ring->address);
+                            } else if (const u8* mirror = direct_buffers.TryGetCpuMirrorPtr(
+                                           ring->address, cb_size)) {
+                                cb_ptr = mirror;
+                            } else if (!VideoCore::DirectBuffers::OverlapsNativeOwnedRange(
+                                           ring->address, cb_size) &&
+                                       !buffer_cache.IsConstRamRange(ring->address, cb_size) &&
+                                       memory->ClampRangeSize(ring->address, cb_size) == cb_size) {
+                                cb_ptr = reinterpret_cast<const u8*>(ring->address);
+                            }
+                        }
+                        if (!cb_ptr) {
+                            cb_ptr = (ring->ring == 0)
+                                         ? constant_ring->Data(ring->offset)
+                                         : worker_rings[ring->ring - 1]->Data(ring->offset);
+                        }
+                    } else {
                         const VAddr cb_va = sharp.base_address;
                         if (cb_va != 0 && cb_size != 0) {
                             if (cb_va >= cue_base && cb_va + cb_size <= cue_end) {
@@ -2813,28 +2874,33 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
                             }
                         }
                     }
-                    if (cb_size == 864 && cb_ptr &&
-                        reinterpret_cast<const float*>(cb_ptr)[0] == 3000.0f) {
-                        culler.UpdateCameraFromSceneConstants(
-                            reinterpret_cast<const float*>(cb_ptr), frame_tag);
-                    } else if (cb_size == 416 && !is_inst_gbuf_vs) {
-                        if (cb_ptr) {
-                            std::memcpy(&model_base_matrix_idx, cb_ptr + 80, sizeof(u32));
-                            has_model_cb = true;
+                    if (!cb_ptr) {
+                        continue;
+                    }
+                    switch (role) {
+                    case OccBStageRole::SceneCam:
+                        if (reinterpret_cast<const float*>(cb_ptr)[0] == 3000.0f) {
+                            culler.UpdateCameraFromSceneConstants(
+                                reinterpret_cast<const float*>(cb_ptr), frame_tag);
+                            need_cam = false;
                         }
-                    } else if (is_inst_gbuf_vs && cb_size >= 208 && cb_size <= 32768 &&
-                               (cb_size % 208) == 0) {
-                        if (cb_ptr && !inst_cb_ptr) {
-                            inst_cb_ptr = cb_ptr;
-                            inst_cb_size = cb_size;
-                            std::memcpy(&model_base_matrix_idx, cb_ptr + 80, sizeof(u32));
-                            has_model_cb = true;
-                        }
-                    } else if (cb_size >= 48 && cb_size <= 16384 && (cb_size % 48) == 0) {
-                        if (cb_ptr && !palette_ptr) {
-                            palette_ptr = cb_ptr;
-                            palette_size = cb_size;
-                        }
+                        break;
+                    case OccBStageRole::ModelCb:
+                        std::memcpy(&model_base_matrix_idx, cb_ptr + 80, sizeof(u32));
+                        has_model_cb = true;
+                        break;
+                    case OccBStageRole::InstCb:
+                        inst_cb_ptr = cb_ptr;
+                        inst_cb_size = cb_size;
+                        std::memcpy(&model_base_matrix_idx, cb_ptr + 80, sizeof(u32));
+                        has_model_cb = true;
+                        break;
+                    case OccBStageRole::Palette:
+                        palette_ptr = cb_ptr;
+                        palette_size = cb_size;
+                        break;
+                    case OccBStageRole::None:
+                        break;
                     }
                 }
                 if (!has_model_cb && palette_size >= 640) {
@@ -3303,6 +3369,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     if (gbuf_sort_enabled && is_indexed && !will_begin_pass && !needs_barrier &&
         !runtime.HasPendingBarriers() && scheduler.IsReorderEligible() &&
         !FrameCapture::Active()) {
+        BB_SECTION(BOccSort);
         const auto& gkey = pipeline->GetGraphicsKey();
         const u32 expected_mrt_mask = gkey.motion_vectors ? 0x7fu : 0x3fu;
         const u32 expected_num_cb = gkey.motion_vectors ? 7u : 6u;
@@ -3352,34 +3419,71 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
                     const VAddr vs_pgm_base = vs_info.ProgramBase();
                     bool has_mcb = false;
                     u32 m_idx = 0;
+                    enum class SortCbRole : u8 { None = 0, ModelCb, InstCb, Palette };
                     for (u32 b_idx = 0; b_idx < vs_info.buffers.size(); ++b_idx) {
+                        if (has_mcb && gbuf_sort_palette_ptr) {
+                            break;
+                        }
                         const auto& res = vs_info.buffers[b_idx];
                         if (res.IsSpecial()) {
                             continue;
                         }
                         u32 cb_sz = 0;
-                        const u8* cb_p = nullptr;
-                        if (num_ring_stages != 0) {
-                            if (const auto* ring = FindRingBinding(vs_info, b_idx)) {
-                                cb_sz = ring->size;
-                                if (ring->address != 0 && ring->address >= cue_base &&
-                                    ring->address + cb_sz <= cue_end) {
-                                    cb_p = reinterpret_cast<const u8*>(ring->address);
-                                } else {
-                                    cb_p = (ring->ring == 0)
-                                               ? constant_ring->Data(ring->offset)
-                                               : worker_rings[ring->ring - 1]->Data(ring->offset);
-                                }
-                            }
-                        }
-                        if (!cb_p) {
-                            const Gcn::Buffer sharp =
-                                prep_vs ? prep_vs->buffer_sharps[b_idx]
-                                        : res.GetSharpDirect(vs_flat, vs_pgm_base);
+                        const RingBinding* ring =
+                            (num_ring_stages != 0) ? FindRingBinding(vs_info, b_idx) : nullptr;
+                        Gcn::Buffer sharp{};
+                        if (ring) {
+                            cb_sz = ring->size;
+                        } else {
+                            sharp = prep_vs ? prep_vs->buffer_sharps[b_idx]
+                                            : res.GetSharpDirect(vs_flat, vs_pgm_base);
                             if (!sharp.Valid() || sharp.GetStride() != 16) {
                                 continue;
                             }
                             cb_sz = sharp.GetSize();
+                        }
+                        SortCbRole role = SortCbRole::None;
+                        if (cb_sz == 416u && !is_inst) {
+                            if (!has_mcb) {
+                                role = SortCbRole::ModelCb;
+                            }
+                        } else if (is_inst && cb_sz >= 208u && cb_sz <= 32768u &&
+                                   (cb_sz % 208u) == 0u) {
+                            if (!gbuf_sort_inst_cb_ptr) {
+                                role = SortCbRole::InstCb;
+                            }
+                        } else if (cb_sz >= 48u && cb_sz <= 16384u && (cb_sz % 48u) == 0u) {
+                            if (!gbuf_sort_palette_ptr) {
+                                role = SortCbRole::Palette;
+                            }
+                        }
+                        if (role == SortCbRole::None) {
+                            continue;
+                        }
+                        const u8* cb_p = nullptr;
+                        if (ring) {
+                            if (ring->address != 0) {
+                                if ((ring->address >= cue_base &&
+                                     ring->address + cb_sz <= cue_end) ||
+                                    VideoCore::DirectBuffers::IsTransientAuxCpuRing(ring->address,
+                                                                                    cb_sz)) {
+                                    cb_p = reinterpret_cast<const u8*>(ring->address);
+                                } else if (const u8* m = direct_buffers.TryGetCpuMirrorPtr(
+                                               ring->address, cb_sz)) {
+                                    cb_p = m;
+                                } else if (!VideoCore::DirectBuffers::OverlapsNativeOwnedRange(
+                                               ring->address, cb_sz) &&
+                                           !buffer_cache.IsConstRamRange(ring->address, cb_sz) &&
+                                           memory->ClampRangeSize(ring->address, cb_sz) == cb_sz) {
+                                    cb_p = reinterpret_cast<const u8*>(ring->address);
+                                }
+                            }
+                            if (!cb_p) {
+                                cb_p = (ring->ring == 0)
+                                           ? constant_ring->Data(ring->offset)
+                                           : worker_rings[ring->ring - 1]->Data(ring->offset);
+                            }
+                        } else {
                             const VAddr va = sharp.base_address;
                             if (va != 0 && cb_sz != 0) {
                                 if (va >= cue_base && va + cb_sz <= cue_end) {
@@ -3397,17 +3501,15 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
                         if (!cb_p) {
                             continue;
                         }
-                        if (cb_sz == 416u && !is_inst) {
+                        if (role == SortCbRole::ModelCb) {
                             std::memcpy(&m_idx, cb_p + 80u, sizeof(u32));
                             has_mcb = true;
-                        } else if (is_inst && cb_sz >= 208u && cb_sz <= 32768u &&
-                                   (cb_sz % 208u) == 0u && !gbuf_sort_inst_cb_ptr) {
+                        } else if (role == SortCbRole::InstCb) {
                             gbuf_sort_inst_cb_ptr = cb_p;
                             gbuf_sort_inst_cb_size = cb_sz;
                             std::memcpy(&m_idx, cb_p + 80u, sizeof(u32));
                             has_mcb = true;
-                        } else if (cb_sz >= 48u && cb_sz <= 16384u && (cb_sz % 48u) == 0u &&
-                                   !gbuf_sort_palette_ptr) {
+                        } else if (role == SortCbRole::Palette) {
                             gbuf_sort_palette_ptr = cb_p;
                             gbuf_sort_palette_size = cb_sz;
                         }
@@ -3490,116 +3592,119 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
 
     EmitVertexBuffers();
     if (is_indexed) {
+        BB_SECTION(BDrawEmit);
         EmitIndexBuffer();
     }
     BeginDraw(pipeline, state, is_indexed, jitter_eligible, draw_prepared, index_offset, true);
 
-    const auto& fetch_shader = pipeline->GetFetchShader();
-    const auto [vertex_offset, instance_offset] = GetDrawOffsets(regs, vs_info, fetch_shader);
-
-    const vk::Pipeline handle = pipeline->Handle();
     const u32 num_indices = regs.num_indices;
-    // BB_TRACE_PIPELINE=vs hash (diagnostics, the flicker): its pipeline handle and push data,
-    // printed when they differ from its previous draw.
-    if (static const u64 traced_pipeline = [] {
-            const char* env = std::getenv("BB_TRACE_PIPELINE");
-            return env ? std::strtoull(env, nullptr, 16) : 0ull;
-        }();
-        traced_pipeline && vs_info.pgm_hash == traced_pipeline) {
-        static VkPipeline last_handle{};
-        static std::array<float, 4> last_push{};
-        const std::array<float, 4> push{push_data.xscale, push_data.xoffset, push_data.yscale,
-                                        push_data.yoffset};
-        static u32 prints = 0;
-        if ((VkPipeline(handle) != last_handle || push != last_push) && prints++ < 2000) {
-            std::printf("Pipeline trace: gpu frame %llu vs %016llx handle %p push %g %g %g %g "
-                        "clipoff %d vte %#x\n",
-                        (unsigned long long)BbStats::gpu_frames.load(std::memory_order_relaxed),
-                        (unsigned long long)vs_info.pgm_hash, (void*)VkPipeline(handle), push[0],
-                        push[1], push[2], push[3], int(regs.IsClipDisabled()),
-                        std::bit_cast<u32>(regs.viewport_control));
-            last_handle = handle;
-            last_push = push;
-        }
-    }
     const u32 num_instances = regs.num_instances.NumInstances();
-    const u32 first_vertex = vertex_offset;
-    const u32 first_instance = instance_offset;
-    if (!Breadcrumbs::Enabled() && !DynCheck::Enabled()) [[likely]] {
-        const u64 cur_epoch = scheduler.DescriptorStateEpoch();
-        vk::Pipeline& tracked_pipe =
-            (gbuf_reorder_bucket < Scheduler::kNumReorderBuckets)
-                ? bound_bucket_pipeline[gbuf_reorder_bucket]
-                : bound_graphics_pipeline;
-        u64& tracked_epoch =
-            (gbuf_reorder_bucket < Scheduler::kNumReorderBuckets)
-                ? bound_bucket_epoch[gbuf_reorder_bucket]
-                : bound_graphics_epoch;
-        const bool need_bind_pipeline =
-            (tracked_epoch != cur_epoch) || (tracked_pipe != handle);
-        tracked_pipe = handle;
-        tracked_epoch = cur_epoch;
-        const s32 hw_occ_query_slot =
-            (is_indexed && occ_probe_entry_idx >= 0 && scene_occlusion_culler)
-                ? scene_occlusion_culler->AllocateQuery(static_cast<u16>(occ_probe_entry_idx))
-                : -1;
-        if (is_indexed) {
-            if (hw_occ_query_slot >= 0) {
-                const vk::QueryPool occ_pool = *scene_occlusion_culler->pool;
-                const u32 q_slot = static_cast<u32>(hw_occ_query_slot);
-                scheduler.Record([handle, need_bind_pipeline, occ_pool, q_slot, num_indices,
-                                  num_instances, first_vertex,
-                                  first_instance](vk::CommandBuffer cmdbuf) {
-                    if (need_bind_pipeline) {
+    {
+        BB_SECTION(BDrawEmit);
+        const auto& fetch_shader = pipeline->GetFetchShader();
+        const auto [vertex_offset, instance_offset] = GetDrawOffsets(regs, vs_info, fetch_shader);
+
+        const vk::Pipeline handle = pipeline->Handle();
+        // BB_TRACE_PIPELINE=vs hash (diagnostics, the flicker): its pipeline handle and push data,
+        // printed when they differ from its previous draw.
+        if (static const u64 traced_pipeline = [] {
+                const char* env = std::getenv("BB_TRACE_PIPELINE");
+                return env ? std::strtoull(env, nullptr, 16) : 0ull;
+            }();
+            traced_pipeline && vs_info.pgm_hash == traced_pipeline) {
+            static VkPipeline last_handle{};
+            static std::array<float, 4> last_push{};
+            const std::array<float, 4> push{push_data.xscale, push_data.xoffset, push_data.yscale,
+                                            push_data.yoffset};
+            static u32 prints = 0;
+            if ((VkPipeline(handle) != last_handle || push != last_push) && prints++ < 2000) {
+                std::printf("Pipeline trace: gpu frame %llu vs %016llx handle %p push %g %g %g %g "
+                            "clipoff %d vte %#x\n",
+                            (unsigned long long)BbStats::gpu_frames.load(std::memory_order_relaxed),
+                            (unsigned long long)vs_info.pgm_hash, (void*)VkPipeline(handle),
+                            push[0], push[1], push[2], push[3], int(regs.IsClipDisabled()),
+                            std::bit_cast<u32>(regs.viewport_control));
+                last_handle = handle;
+                last_push = push;
+            }
+        }
+        const u32 first_vertex = vertex_offset;
+        const u32 first_instance = instance_offset;
+        if (!Breadcrumbs::Enabled() && !DynCheck::Enabled()) [[likely]] {
+            const u64 cur_epoch = scheduler.DescriptorStateEpoch();
+            vk::Pipeline& tracked_pipe =
+                (gbuf_reorder_bucket < Scheduler::kNumReorderBuckets)
+                    ? bound_bucket_pipeline[gbuf_reorder_bucket]
+                    : bound_graphics_pipeline;
+            u64& tracked_epoch =
+                (gbuf_reorder_bucket < Scheduler::kNumReorderBuckets)
+                    ? bound_bucket_epoch[gbuf_reorder_bucket]
+                    : bound_graphics_epoch;
+            const bool need_bind_pipeline =
+                (tracked_epoch != cur_epoch) || (tracked_pipe != handle);
+            tracked_pipe = handle;
+            tracked_epoch = cur_epoch;
+            const s32 hw_occ_query_slot =
+                (is_indexed && occ_probe_entry_idx >= 0 && scene_occlusion_culler)
+                    ? scene_occlusion_culler->AllocateQuery(static_cast<u16>(occ_probe_entry_idx))
+                    : -1;
+            if (is_indexed) {
+                if (hw_occ_query_slot >= 0) {
+                    const vk::QueryPool occ_pool = *scene_occlusion_culler->pool;
+                    const u32 q_slot = static_cast<u32>(hw_occ_query_slot);
+                    scheduler.Record([handle, need_bind_pipeline, occ_pool, q_slot, num_indices,
+                                      num_instances, first_vertex,
+                                      first_instance](vk::CommandBuffer cmdbuf) {
+                        if (need_bind_pipeline) {
+                            cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
+                        }
+                        cmdbuf.beginQuery(occ_pool, q_slot, {});
+                        cmdbuf.drawIndexed(num_indices, num_instances, 0, s32(first_vertex),
+                                           first_instance);
+                        cmdbuf.endQuery(occ_pool, q_slot);
+                    });
+                } else if (need_bind_pipeline) {
+                    scheduler.Record([handle, num_indices, num_instances, first_vertex,
+                                      first_instance](vk::CommandBuffer cmdbuf) {
                         cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
-                    }
-                    cmdbuf.beginQuery(occ_pool, q_slot, {});
-                    cmdbuf.drawIndexed(num_indices, num_instances, 0, s32(first_vertex),
-                                       first_instance);
-                    cmdbuf.endQuery(occ_pool, q_slot);
-                });
-            } else if (need_bind_pipeline) {
-                scheduler.Record([handle, num_indices, num_instances, first_vertex,
-                                  first_instance](vk::CommandBuffer cmdbuf) {
-                    cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
-                    cmdbuf.drawIndexed(num_indices, num_instances, 0, s32(first_vertex),
-                                       first_instance);
-                });
+                        cmdbuf.drawIndexed(num_indices, num_instances, 0, s32(first_vertex),
+                                           first_instance);
+                    });
+                } else {
+                    scheduler.Record([num_indices, num_instances, first_vertex,
+                                      first_instance](vk::CommandBuffer cmdbuf) {
+                        cmdbuf.drawIndexed(num_indices, num_instances, 0, s32(first_vertex),
+                                           first_instance);
+                    });
+                }
             } else {
-                scheduler.Record([num_indices, num_instances, first_vertex,
-                                  first_instance](vk::CommandBuffer cmdbuf) {
-                    cmdbuf.drawIndexed(num_indices, num_instances, 0, s32(first_vertex),
-                                       first_instance);
-                });
+                if (hw_occ_query_slot >= 0) {
+                    const vk::QueryPool occ_pool = *scene_occlusion_culler->pool;
+                    const u32 q_slot = static_cast<u32>(hw_occ_query_slot);
+                    scheduler.Record([handle, need_bind_pipeline, occ_pool, q_slot, num_indices,
+                                      num_instances, first_vertex,
+                                      first_instance](vk::CommandBuffer cmdbuf) {
+                        if (need_bind_pipeline) {
+                            cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
+                        }
+                        cmdbuf.beginQuery(occ_pool, q_slot, {});
+                        cmdbuf.draw(num_indices, num_instances, first_vertex, first_instance);
+                        cmdbuf.endQuery(occ_pool, q_slot);
+                    });
+                } else if (need_bind_pipeline) {
+                    scheduler.Record([handle, num_indices, num_instances, first_vertex,
+                                      first_instance](vk::CommandBuffer cmdbuf) {
+                        cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
+                        cmdbuf.draw(num_indices, num_instances, first_vertex, first_instance);
+                    });
+                } else {
+                    scheduler.Record([num_indices, num_instances, first_vertex,
+                                      first_instance](vk::CommandBuffer cmdbuf) {
+                        cmdbuf.draw(num_indices, num_instances, first_vertex, first_instance);
+                    });
+                }
             }
         } else {
-            if (hw_occ_query_slot >= 0) {
-                const vk::QueryPool occ_pool = *scene_occlusion_culler->pool;
-                const u32 q_slot = static_cast<u32>(hw_occ_query_slot);
-                scheduler.Record([handle, need_bind_pipeline, occ_pool, q_slot, num_indices,
-                                  num_instances, first_vertex,
-                                  first_instance](vk::CommandBuffer cmdbuf) {
-                    if (need_bind_pipeline) {
-                        cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
-                    }
-                    cmdbuf.beginQuery(occ_pool, q_slot, {});
-                    cmdbuf.draw(num_indices, num_instances, first_vertex, first_instance);
-                    cmdbuf.endQuery(occ_pool, q_slot);
-                });
-            } else if (need_bind_pipeline) {
-                scheduler.Record([handle, num_indices, num_instances, first_vertex,
-                                  first_instance](vk::CommandBuffer cmdbuf) {
-                    cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
-                    cmdbuf.draw(num_indices, num_instances, first_vertex, first_instance);
-                });
-            } else {
-                scheduler.Record([num_indices, num_instances, first_vertex,
-                                  first_instance](vk::CommandBuffer cmdbuf) {
-                    cmdbuf.draw(num_indices, num_instances, first_vertex, first_instance);
-                });
-            }
-        }
-    } else {
         bound_graphics_pipeline = handle;
         bound_graphics_epoch = scheduler.DescriptorStateEpoch();
         const auto* ps_info = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
@@ -3636,6 +3741,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     }
     if (gbuf_reorder_bucket < Scheduler::kNumReorderBuckets) {
         scheduler.LeaveReorderBucket();
+    }
     }
     // BB_TRACE_SHADER with BB_GPU_PROFILE: a mark right after the traced vertex shader's draws,
     // so the profile splits their pass into the draw and what follows it unlabeled.

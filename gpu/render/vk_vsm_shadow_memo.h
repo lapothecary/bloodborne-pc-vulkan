@@ -203,6 +203,8 @@ private:
     bool replaying = false;
     u64 last_periodic_refresh_frame = ~0ULL;
     u64 last_seen_retire_seq = 0;
+    VAddr last_non_vsm_cb0_addr = 0;
+    u32 last_non_vsm_cb0_info = 0;
 
     // Diagnostics & telemetry:
     bool first_active_logged = false;

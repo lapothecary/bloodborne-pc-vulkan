@@ -107,6 +107,75 @@ void NormalizeStageBChunksForRun(VfxUiBatcher::StageBChunks& c) noexcept {
     ZeroStageBWordRange(c, static_cast<u32>(offsetof(Gcn::Regs, primitive_restart_index) / 4u), 1u);
 }
 
+struct StageBRunMaskTable {
+    VfxUiBatcher::StageBChunks mask{};
+    std::array<u8, Gcn::RegDirty::StageBNumChunks> chunk_mode{}; // 0=skip, 1=full_eq, 2=masked
+    u64 check_mask[2]{};
+    StageBRunMaskTable() noexcept {
+        mask.fill(~0u);
+        NormalizeStageBChunksForRun(mask);
+        for (u32 bit = 0; bit < Gcn::RegDirty::StageBNumChunks; ++bit) {
+            const u32* m = &mask[bit * Gcn::RegDirty::StageBChunkWords];
+            bool all_zero = true;
+            bool all_ones = true;
+            for (u32 k = 0; k < Gcn::RegDirty::StageBChunkWords; ++k) {
+                if (m[k] != 0u) all_zero = false;
+                if (m[k] != ~0u) all_ones = false;
+            }
+            chunk_mode[bit] = all_zero ? 0u : (all_ones ? 1u : 2u);
+            if (!all_zero) {
+                if (bit < 64u) {
+                    check_mask[0] |= (1ULL << bit);
+                } else {
+                    check_mask[1] |= (1ULL << (bit - 64u));
+                }
+            }
+        }
+    }
+};
+
+bool StageBMatchesRun(const Gcn::Regs& regs, Gcn::RegDirty& dirty,
+                      const VfxUiBatcher::StageBChunks& run_norm) noexcept {
+    static const StageBRunMaskTable tbl{};
+    u64 d0 = dirty.batch_stage_b_mask[0] & tbl.check_mask[0];
+    u64 d1 = dirty.batch_stage_b_mask[1] & tbl.check_mask[1];
+    if ((d0 | d1) == 0ULL) [[likely]] {
+        dirty.ClearBatchStageBDirty();
+        return true;
+    }
+    auto check_bit = [&](u32 bit) noexcept -> bool {
+        const u8 mode = tbl.chunk_mode[bit];
+        const u32* src = regs.reg_array.data() + Gcn::RegDirty::StageBChunkWordOffset(bit);
+        const u32* ref = &run_norm[bit * Gcn::RegDirty::StageBChunkWords];
+        if (mode == 1u) {
+            return std::memcmp(src, ref, Gcn::RegDirty::StageBChunkWords * sizeof(u32)) == 0;
+        }
+        const u32* m = &tbl.mask[bit * Gcn::RegDirty::StageBChunkWords];
+        for (u32 k = 0; k < Gcn::RegDirty::StageBChunkWords; ++k) {
+            if ((src[k] & m[k]) != ref[k]) {
+                return false;
+            }
+        }
+        return true;
+    };
+    while (d0) {
+        const u32 bit = static_cast<u32>(std::countr_zero(d0));
+        d0 &= (d0 - 1ULL);
+        if (!check_bit(bit)) {
+            return false;
+        }
+    }
+    while (d1) {
+        const u32 bit = 64u + static_cast<u32>(std::countr_zero(d1));
+        d1 &= (d1 - 1ULL);
+        if (!check_bit(bit)) {
+            return false;
+        }
+    }
+    dirty.ClearBatchStageBDirty();
+    return true;
+}
+
 void MarkStageBDiffDirty(const VfxUiBatcher::StageBChunks& prev,
                          const VfxUiBatcher::StageBChunks& next, Gcn::RegDirty& dirty) noexcept {
     for (u32 bit = 0; bit < Gcn::RegDirty::StageBNumChunks; ++bit) {
@@ -829,6 +898,12 @@ const u8* VfxUiBatcher::ResolveCpuReadableRange(Rasterizer& rasterizer, VAddr ad
 bool VfxUiBatcher::TryBatchDraw(Rasterizer& rasterizer, const GraphicsPipeline* pipeline,
                                 const PreparedDraw* /*used_prepared*/, bool is_indexed,
                                 u32 index_offset) {
+    auto& lp = *rasterizer.liverpool;
+    const auto& regs = lp.regs;
+    const u32 num_indices = regs.num_indices;
+    if (!HasPendingDraws() && (num_indices == 0u || num_indices > kMaxSmallDrawIndices)) [[likely]] {
+        return false;
+    }
     if (!Enabled() || flushing || !pipeline || pipeline->IsCompute() ||
         !rasterizer.constant_ring || BbToggle::Disabled(BbToggle::ConstantRing) ||
         !rasterizer.instance.IsVertexInputDynamicState()) {
@@ -838,9 +913,6 @@ bool VfxUiBatcher::TryBatchDraw(Rasterizer& rasterizer, const GraphicsPipeline* 
         return false;
     }
 
-    auto& lp = *rasterizer.liverpool;
-    const auto& regs = lp.regs;
-    const u32 num_indices = regs.num_indices;
     if (num_indices == 0u || num_indices > kMaxSmallDrawIndices ||
         regs.num_instances.NumInstances() != 1u || regs.depth_render_control.depth_clear_enable ||
         regs.depth_render_control.stencil_clear_enable ||
@@ -1014,21 +1086,14 @@ bool VfxUiBatcher::TryBatchDraw(Rasterizer& rasterizer, const GraphicsPipeline* 
         WakeStagingShadow(BbStats::frame_number.load(std::memory_order_relaxed));
     }
 
-    StageBChunks raw_chunks{};
-    CaptureStageBChunks(regs, raw_chunks);
-    StageBChunks norm_chunks = raw_chunks;
-    NormalizeStageBChunksForRun(norm_chunks);
-
     // Check if an open batch must flush before inspecting CBs/VBs due to pipeline / state change:
     if (open.active) {
-        StageBChunks open_norm = open.base_chunks;
-        NormalizeStageBChunksForRun(open_norm);
         const bool same_pipe_state =
             open.pipeline == pipeline && open.mode == cand_mode && open.prim_type == prim &&
             std::memcmp(&open.cb_extent, &lp.last_cb_extent, sizeof(open.cb_extent)) == 0 &&
             open.db_extent.raw == lp.last_db_extent.raw &&
             open.cb_uid == lp.last_cb_uid && open.db_uid == lp.last_db_uid &&
-            std::memcmp(open_norm.data(), norm_chunks.data(), sizeof(StageBChunks)) == 0;
+            StageBMatchesRun(regs, lp.pipe_dirty, open.norm_chunks);
         if (!same_pipe_state) {
             ++fb_regs;
             Flush(rasterizer);
@@ -1039,22 +1104,22 @@ bool VfxUiBatcher::TryBatchDraw(Rasterizer& rasterizer, const GraphicsPipeline* 
         }
     }
 
-    // Read stage descriptors & constant buffers on Stage A (zero locks!):
+    // Read stage descriptors & constant buffers on Stage A (zero locks, zero 9 KiB stack zeroing!):
     struct LocalBuf {
-        u32 sharp_idx = 0;
-        const u8* ptr = nullptr;
-        u32 size = 0;
+        u32 sharp_idx;
+        const u8* ptr;
+        u32 size;
     };
     struct LocalStage {
-        const Shader::Info* info = nullptr;
-        u32 num_bufs = 0;
-        std::array<LocalBuf, kMaxNonSpecialBufs> bufs{};
-        std::array<Gcn::Image, 24> images{};
-        u32 num_images = 0;
-        std::array<Gcn::Sampler, 16> samplers{};
-        u32 num_samplers = 0;
+        const Shader::Info* info;
+        u32 num_bufs;
+        u32 num_images;
+        u32 num_samplers;
+        std::array<LocalBuf, kMaxNonSpecialBufs> bufs;
+        std::array<Gcn::Image, 24> images;
+        std::array<Gcn::Sampler, 16> samplers;
     };
-    std::array<LocalStage, Shader::MaxStageTypes> local_stages{};
+    std::array<LocalStage, Shader::MaxStageTypes> local_stages;
     u32 num_active_stages = 0u;
     // Note: `Pipeline::GetStages()` is ordered `[Fragment(0), TessControl(1), TessEval(2),
     // Vertex(3), Geometry(4)]`, so `VS/LS` is NOT `slot 0` whenever `PS` is active!
@@ -1089,6 +1154,9 @@ bool VfxUiBatcher::TryBatchDraw(Rasterizer& rasterizer, const GraphicsPipeline* 
         }
         auto& ls = local_stages[slot];
         ls.info = st;
+        ls.num_bufs = 0u;
+        ls.num_images = 0u;
+        ls.num_samplers = 0u;
         for (u32 idx = 0; idx < st->buffers.size(); ++idx) {
             const auto& desc = st->buffers[idx];
             if (desc.IsSpecial()) {
@@ -1587,7 +1655,10 @@ bool VfxUiBatcher::TryBatchDraw(Rasterizer& rasterizer, const GraphicsPipeline* 
         open.num_stages = num_active_stages;
         open.vs_slot = vs_slot;
         open.ffx_ps_slot = ps_slot;
-        open.base_chunks = raw_chunks;
+        CaptureStageBChunks(regs, open.base_chunks);
+        open.norm_chunks = open.base_chunks;
+        NormalizeStageBChunksForRun(open.norm_chunks);
+        lp.pipe_dirty.ClearBatchStageBDirty();
         open.cb_extent = lp.last_cb_extent;
         open.db_extent = lp.last_db_extent;
         open.cb_uid = lp.last_cb_uid;
@@ -1878,6 +1949,7 @@ void VfxUiBatcher::Flush(Rasterizer& rasterizer) {
         lp.pipe_dirty.stage_b_mask[0] |= saved_dirty.stage_b_mask[0];
         lp.pipe_dirty.stage_b_mask[1] |= saved_dirty.stage_b_mask[1];
         MarkStageBDiffDirty(cur_chunks, saved_chunks, lp.pipe_dirty);
+        lp.pipe_dirty.MarkAllBatchStageBDirty();
 
         const u64 total_saved =
             stat_ffx_draws_saved + stat_ui_draws_saved + stat_eq_draws_saved;

@@ -1454,58 +1454,10 @@ void GXDevice_ResetContextStateAndBindDefaultDisplayTargets(
  *        and waits for worker pool completion.
  * VMA: 0x2198940 (710 bytes)
  */
+extern "C" void GXWorkerTaskPool_WakeWorkers(void* self, void* queue, uint32_t max_workers);
+
 static inline void GXWorkerPool_WakePendingWorkers(uint8_t* pDevice) {
-    *reinterpret_cast<uint64_t*>(pDevice + 0x288) = *reinterpret_cast<uint64_t*>(pDevice + 0x2e8);
-    uint32_t threadCount = *reinterpret_cast<uint32_t*>(pDevice + 0x280);
-    uint32_t wakeCount   = threadCount - 1u;
-    volatile uint32_t* pAtomicPending = reinterpret_cast<volatile uint32_t*>(pDevice + 0x290);
-
-    uint32_t releasedCount = 0u;
-    if (pDevice[0x2e0] != 0) {
-        uint32_t pending = *pAtomicPending;
-        if (pending < wakeCount) {
-            wakeCount = pending;
-        }
-        if (pDevice[0x2e0] != 0) {
-            if (wakeCount != 0u) {
-                for (uint32_t i = 0u; i < wakeCount; ++i) {
-                    __sync_fetch_and_sub(pAtomicPending, 1u);
-                }
-                void* pSemaphore = *reinterpret_cast<void**>(pDevice + 0x298);
-                if (pSemaphore != nullptr) {
-                    reinterpret_cast<void (*)(void*, uint32_t)>(GX_VMA(0x263b0d0ULL))(pSemaphore, wakeCount);
-                }
-                releasedCount = wakeCount;
-            }
-        } else {
-            __atomic_thread_fence(__ATOMIC_SEQ_CST);
-            __atomic_exchange_n(pAtomicPending, 0u, __ATOMIC_SEQ_CST);
-            if (wakeCount != 0u) {
-                void* pSemaphore = *reinterpret_cast<void**>(pDevice + 0x298);
-                if (pSemaphore != nullptr) {
-                    reinterpret_cast<void (*)(void*, uint32_t)>(GX_VMA(0x263b0d0ULL))(pSemaphore, wakeCount);
-                }
-                releasedCount = wakeCount;
-            }
-        }
-    } else {
-        __atomic_thread_fence(__ATOMIC_SEQ_CST);
-        __atomic_exchange_n(pAtomicPending, 0u, __ATOMIC_SEQ_CST);
-        if (wakeCount != 0u) {
-            void* pSemaphore = *reinterpret_cast<void**>(pDevice + 0x298);
-            if (pSemaphore != nullptr) {
-                reinterpret_cast<void (*)(void*, uint32_t)>(GX_VMA(0x263b0d0ULL))(pSemaphore, wakeCount);
-            }
-            releasedCount = wakeCount;
-        }
-    }
-
-    if (pDevice[0x2e0] != 0) {
-        releasedCount += *reinterpret_cast<uint32_t*>(pDevice + 0x2ac);
-    }
-    *reinterpret_cast<uint32_t*>(pDevice + 0x2ac) = releasedCount;
-    pDevice[0x2a9] = 0u;
-    pDevice[0x2e0] = 1u;
+    GXWorkerTaskPool_WakeWorkers(pDevice + 0x278, nullptr, 0u);
 }
 
 void GXDevice_DispatchWorkerThreadJobsAndWait(uint8_t* pDevice) {
@@ -2857,8 +2809,8 @@ bool GXDevice_CreateAndInitializeSingleton(uint8_t* pInitParams) {
 
     // 9. Create double-buffered context pools (+0x350/+0x358), linear heaps (+0x370/+0x378), cmd queues (+0x360/+0x368), and main deferred ctx (+0x70/+0x78)
     uint32_t queueCap = *reinterpret_cast<uint32_t*>(pDevice + 0x164);
-    if (queueCap == 0u) {
-        queueCap = 0x6Cu;
+    if (queueCap < 512u) {
+        queueCap = 512u;
     }
 
     const size_t kCtxPoolSlots[2] = { 0x350u, 0x358u };
@@ -2913,7 +2865,7 @@ bool GXDevice_CreateAndInitializeSingleton(uint8_t* pInitParams) {
             pDevice + 0x1f0);
     }
     *reinterpret_cast<uint32_t*>(pDevice + 0x2f0) = 6u;
-    reinterpret_cast<void (*)(uint32_t, uint32_t)>(GX_VMA(0x21b7050ULL))(6u, 0x64u);
+    reinterpret_cast<void (*)(uint32_t, uint32_t)>(GX_VMA(0x21b7050ULL))(6u, 0x200u);
 
     {
         uint8_t*  pWorkerCoreBools = reinterpret_cast<uint8_t*>(GX_VMA(0x56a6bd8ULL));

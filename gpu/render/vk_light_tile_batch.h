@@ -79,7 +79,8 @@ public:
 
     /// Looks up a CPU-source constant buffer shadow (`<= 2048 B`) recorded on Stage A.
     [[nodiscard]] const u8* LookupCpuShadow(VAddr addr, u32 size,
-                                            u32* out_entry_remaining = nullptr) noexcept;
+                                            u32* out_entry_remaining = nullptr,
+                                            u32* out_write_ver = nullptr) noexcept;
 
     /// Returns true if `task` is a small (`<= 2048` B) CPU-source `DirectVkCopyBatchTask` or a
     /// staging-pool release label batch (`DirectVkRelease*LabelsBatchTask`) that does not require
@@ -108,8 +109,10 @@ private:
         u32 last_use = 0;
         u32 coarse_e0 = 0;
         u32 coarse_e1 = 0;
+        u32 write_ver = 0;
+        u32 pad = 0;
     };
-    static_assert(sizeof(ShadowMeta) == 24);
+    static_assert(sizeof(ShadowMeta) == 32);
 
     struct StageSnapshot {
         VAddr pgm_base = 0;
@@ -123,7 +126,10 @@ private:
     struct BatchGroup {
         const GraphicsPipeline* pipeline = nullptr;
         u64 resource_hash = 0;
+        VAddr ssbo1_addr = 0;
         u32 ssbo1_bytes = 0;
+        u32 ssbo1_write_ver = 0;
+        u32 ps_stage_slot = ~0u;
         std::array<u8, kMaxShadowBytes> ssbo1{};
         std::vector<Gcn::Image> ps_images;
         std::vector<Gcn::Sampler> ps_samplers;
@@ -144,7 +150,10 @@ private:
         void Reset() noexcept {
             pipeline = nullptr;
             resource_hash = 0;
+            ssbo1_addr = 0;
             ssbo1_bytes = 0;
+            ssbo1_write_ver = 0;
+            ps_stage_slot = ~0u;
             ps_images.clear();
             ps_samplers.clear();
             norm_ps_flat.clear();
@@ -168,6 +177,7 @@ private:
     VAddr shadow_min_va = ~VAddr{0};
     VAddr shadow_max_va = 0;
     u32 shadow_clock = 0;
+    u32 shadow_write_clock = 0;
     u32 coarse_clock = 0;
     u32 coarse_wipe_bias = 0;
     bool shadow_awake = true;
@@ -180,12 +190,25 @@ private:
     bool summary_logged = false;
     u32 pending_tiles = 0;
     u32 active_groups = 0;
+    u32 last_group_idx = 0;
     StageBChunks pass_norm_chunks{};
     std::array<Gcn::CbDbExtent, Gcn::NUM_COLOR_BUFFERS> pass_cb_extent{};
     Gcn::CbDbExtent pass_db_extent{};
     std::array<u16, Gcn::NUM_COLOR_BUFFERS> pass_cb_uid{};
     u16 pass_db_uid = 0;
     std::array<BatchGroup, kMaxGroupsPerPass> groups{};
+
+    struct CachedQuad {
+        bool valid = false;
+        VAddr pos_addr = 0;
+        VAddr uv_addr = 0;
+        u32 pos_stride = 0;
+        u32 uv_stride = 0;
+        float qx_min = 0.0f, qx_max = 0.0f, qy_min = 0.0f, qy_max = 0.0f;
+        float u_at_xlo = 0.0f, u_at_xhi = 0.0f, v_at_ylo = 0.0f, v_at_yhi = 0.0f;
+        bool vtx_x_hi[4]{};
+        bool vtx_y_hi[4]{};
+    } cached_quad{};
 
     // Diagnostic counters (1-line summary after 2,000 tiles + optional `BB_LIGHT_TILE_BATCH_LOG=1`)
     u64 stat_seen = 0;

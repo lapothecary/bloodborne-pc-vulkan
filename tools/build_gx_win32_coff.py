@@ -399,9 +399,9 @@ def main() -> int:
     )
     for s in final_ext:
         print(f"  U {s}")
-    bad_libc = [s for s in final_ext if s.startswith("__isoc23_")]
+    bad_libc = [s for s in final_ext if s.startswith(("__isoc23_", "_ZNSt", "_ZNKSt"))]
     if bad_libc:
-        print(f"ERROR: unrewritten glibc C23 symbols in Windows archive: {bad_libc}", file=sys.stderr)
+        print(f"ERROR: unrewritten glibc/libstdc++ symbols in Windows archive: {bad_libc}", file=sys.stderr)
         return 1
     return 0
 

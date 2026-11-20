@@ -17,6 +17,7 @@
 extern "C" {
 uint8_t* sub_2ba2b10();
 void sub_20b55b0(const char* file, uint32_t line, const char* fmt, ...);
+void (*g_bb_sub_2293060_record)(uint64_t fn_va, uint64_t cycles, uint32_t kind, uint32_t count) noexcept = nullptr;
 }
 
 namespace {
@@ -1904,18 +1905,29 @@ void sub_2293060(void* pSelf, void* pRenderCtx) {
         } tempDesc = { nullptr, nullptr, nullptr, (count + 1) / 2, nullptr };
         tempDesc.descPtr = &tempDesc;
 
+        auto* const rec = g_bb_sub_2293060_record;
+        const uint64_t t_sort0 = rec ? __rdtsc() : 0ULL;
         sub_2293710(pFirst, pLast, count, &tempDesc);
         if (tempDesc.base != nullptr) {
             sub_2bbe588(tempDesc.base);
+        }
+        if (rec) {
+            rec(0x2293710ULL, __rdtsc() - t_sort0, 3u, static_cast<uint32_t>(count));
         }
 
         for (GXLightSortItem16* p = pFirst; p != pLast; ++p) {
             void* pObj = reinterpret_cast<void*>(p->payload);
             void* vtbl = *reinterpret_cast<void**>(pObj);
-            void* pSub = (*reinterpret_cast<void* (**)(void*)>(static_cast<uint8_t*>(vtbl) + 0x20))(pObj);
+            auto fn20 = *reinterpret_cast<void* (**)(void*)>(static_cast<uint8_t*>(vtbl) + 0x20);
+            const uint64_t t0 = rec ? __rdtsc() : 0ULL;
+            void* pSub = fn20(pObj);
             if (pSub != nullptr) {
                 void* subVtbl = *reinterpret_cast<void**>(pSub);
                 (*reinterpret_cast<void (**)(void*)>(static_cast<uint8_t*>(subVtbl) + 0x10))(pSub);
+            }
+            if (rec) {
+                rec(reinterpret_cast<uint64_t>(fn20), __rdtsc() - t0, 1u,
+                    static_cast<uint32_t>(count));
             }
         }
 
@@ -1923,8 +1935,13 @@ void sub_2293060(void* pSelf, void* pRenderCtx) {
         for (GXLightSortItem16* p = pFirst; p != pLast; ++p, ++idx) {
             void* pObj = reinterpret_cast<void*>(p->payload);
             void* vtbl = *reinterpret_cast<void**>(pObj);
-            (*reinterpret_cast<void (**)(void*, void*, uint32_t)>(static_cast<uint8_t*>(vtbl) + 0x38))(
-                pObj, pRenderCtx, idx);
+            auto fn38 = *reinterpret_cast<void (**)(void*, void*, uint32_t)>(static_cast<uint8_t*>(vtbl) + 0x38);
+            const uint64_t t0 = rec ? __rdtsc() : 0ULL;
+            fn38(pObj, pRenderCtx, idx);
+            if (rec) {
+                rec(reinterpret_cast<uint64_t>(fn38), __rdtsc() - t0, 2u,
+                    static_cast<uint32_t>(count));
+            }
         }
         encodedCount = (static_cast<uint32_t>(count) << 28) & 0xf0000000u;
     }
@@ -1933,7 +1950,12 @@ void sub_2293060(void* pSelf, void* pRenderCtx) {
     void* pSubTarget = (pGlobal6c8[0x84] != 0)
         ? *reinterpret_cast<void**>(pGlobal6c8 + 0x78)
         : *reinterpret_cast<void**>(pGlobal6c8 + 0x10);
+    auto* const rec_sub = g_bb_sub_2293060_record;
+    const uint64_t t_sub0 = rec_sub ? __rdtsc() : 0ULL;
     sub_2194340(pGlobal6c8, pSubTarget, encodedCount);
+    if (rec_sub) {
+        rec_sub(0x2194340ULL, __rdtsc() - t_sub0, 4u, 0u);
+    }
 
     if (sortVec.begin != nullptr && !usingInlineSortBuf) {
         void* vtbl = *reinterpret_cast<void**>(sortVec.alloc);

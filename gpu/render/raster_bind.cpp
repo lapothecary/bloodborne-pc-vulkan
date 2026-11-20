@@ -457,9 +457,25 @@ struct StageBVtxIdxDedup {
     vk::DeviceSize ib_resolved_offset = 0;
 };
 
+struct StageBIndexMemoEntry {
+    static constexpr size_t NumSets = 256;
+    static constexpr size_t NumWays = 2;
+    static constexpr size_t TableSize = NumSets * NumWays;
+    VAddr address = 0;
+    u64 erase_gen = 0;
+    u64 max_size = 0;
+    const VideoCore::Buffer* direct_buf = nullptr;
+    vk::Buffer vk_handle = VK_NULL_HANDLE;
+    vk::DeviceSize vk_offset = 0;
+    u32 last_use = 0;
+};
+
 struct StageBVtxIdxDedupBank {
     StageBVtxIdxDedup main;
     std::array<StageBVtxIdxDedup, Scheduler::kNumReorderBuckets> buckets;
+    u32 ib_memo_clock = 0;
+    std::array<VAddr, StageBIndexMemoEntry::TableSize> ib_memo_addrs{};
+    std::array<StageBIndexMemoEntry, StageBIndexMemoEntry::TableSize> ib_memo{};
 };
 
 thread_local std::unique_ptr<StageBVtxIdxDedupBank> tls_vtx_idx_dedup;
@@ -649,6 +665,9 @@ void Rasterizer::ResolveVertexBuffers(const GraphicsPipeline* pipeline,
         if (!stage_b_vertex_memo) [[unlikely]] {
             stage_b_vertex_memo = std::make_unique<
                 std::array<StageBVertexMemoEntry, StageBVertexMemoEntry::TableSize>>();
+            stage_b_vertex_memo_keys =
+                std::make_unique<std::array<u64, StageBVertexMemoEntry::TableSize>>();
+            stage_b_vertex_memo_keys->fill(0ULL);
         }
         const u32 cnt = static_cast<u32>(memo_vsharps.size());
         const u32 step0 = regs.vgt_instance_step_rate_0;
@@ -659,17 +678,31 @@ void Rasterizer::ResolveVertexBuffers(const GraphicsPipeline* pipeline,
         const u64 seed = reinterpret_cast<uintptr_t>(pipeline) ^
                          (u64(step0) * 0x9E3779B97F4A7C15ULL) ^
                          (u64(step1) * 0xBF58476D1CE4E5B9ULL);
-        const u64 vsharp_hash =
-            (ready && ready->buffers_hash != 0)
-                ? ready->buffers_hash
-                : XXH3_64bits(memo_vsharps.data(), cnt * sizeof(Gcn::Buffer));
+        u64 vsharp_hash = 0;
+        if (ready && ready->buffers_hash != 0) {
+            vsharp_hash = ready->buffers_hash;
+        } else if (!ready && packet_vsharps_hash != 0 &&
+                   memo_vsharps.data() == packet_vsharps.data() &&
+                   cnt == packet_vsharps.size()) {
+            vsharp_hash = packet_vsharps_hash;
+        } else {
+            vsharp_hash = XXH3_64bits(memo_vsharps.data(), cnt * sizeof(Gcn::Buffer));
+            if (!ready && memo_vsharps.data() == packet_vsharps.data() &&
+                cnt == packet_vsharps.size()) {
+                packet_vsharps_hash = vsharp_hash;
+            }
+        }
         const u64 memo_key = (vsharp_hash ^ seed) | 1ULL;
         const size_t set_base =
             ((memo_key >> 1) & (StageBVertexMemoEntry::NumSets - 1)) *
             StageBVertexMemoEntry::NumWays;
+        const u64* const kptr = &(*stage_b_vertex_memo_keys)[set_base];
         for (size_t w = 0; w < StageBVertexMemoEntry::NumWays; ++w) {
+            if (kptr[w] != memo_key) {
+                continue;
+            }
             auto& cand = (*stage_b_vertex_memo)[set_base + w];
-            if (cand.key == memo_key && cand.erase_gen == cur_erase_gen &&
+            if (cand.erase_gen == cur_erase_gen &&
                 cand.exact_gen == cur_exact_gen &&
                 (!cand.has_transient_cue || cand.frame_number == cur_frame) &&
                 cand.pipeline == pipeline && cand.step_rate_0 == step0 &&
@@ -722,7 +755,10 @@ void Rasterizer::ResolveVertexBuffers(const GraphicsPipeline* pipeline,
             if (attributes.size() == cnt && bindings.size() == cnt && guest_buffers.size() == cnt) {
                 auto& w0 = (*stage_b_vertex_memo)[set_base];
                 auto& w1 = (*stage_b_vertex_memo)[set_base + 1];
-                auto& slot = (w0.key == 0 || w0.last_use <= w1.last_use) ? w0 : w1;
+                const size_t victim_idx =
+                    (w0.key == 0 || w0.last_use <= w1.last_use) ? set_base : (set_base + 1);
+                auto& slot = (*stage_b_vertex_memo)[victim_idx];
+                (*stage_b_vertex_memo_keys)[victim_idx] = memo_key;
                 VAddr cue_base = 0;
                 VAddr cue_end = 0;
                 VideoCore::DirectBuffers::GetTransientCueHeapBounds(cue_base, cue_end);
@@ -1257,17 +1293,32 @@ void Rasterizer::ResolveIndexBuffer(u32 index_offset) {
     if (HasPendingHleCopies() && PendingHleCopiesConflict(address, size, false)) {
         FlushPendingHleCopies(*this);
     }
-    if (StageBFastBind() && !VideoCore::BufferCache::LayerPagedActive() &&
-        !InPlaceReads::Enabled()) {
-        auto& d = GetVtxIdxDedup();
-        const u64 cur_epoch = scheduler.DescriptorStateEpoch();
-        if (d.sched == &scheduler && d.ib_resolve_epoch == cur_epoch &&
-            d.ib_guest_addr == address && d.ib_guest_size == size &&
-            d.ib_guest_index16 == index16 && d.ib_resolved_handle) {
-            BbStats::native_buf_hits.fetch_add(1, std::memory_order_relaxed);
-            index_bind = {d.ib_resolved_handle, d.ib_resolved_offset,
-                          index16 ? vk::IndexType::eUint16 : vk::IndexType::eUint32};
-            return;
+    const bool can_ib_memo = StageBFastBind() && !VideoCore::BufferCache::LayerPagedActive() &&
+                             !InPlaceReads::Enabled();
+    const u64 cur_erase_gen = can_ib_memo ? direct_buffers.EraseGeneration() : 0ULL;
+    size_t ib_set_base = 0;
+    if (can_ib_memo) {
+        if (!tls_vtx_idx_dedup) [[unlikely]] {
+            tls_vtx_idx_dedup = std::make_unique<StageBVtxIdxDedupBank>();
+        }
+        auto& bank = *tls_vtx_idx_dedup;
+        ib_set_base = ((((address >> 4) * 0x9E3779B97F4A7C15ULL) >> (64u - 8u)) &
+                       (StageBIndexMemoEntry::NumSets - 1u)) *
+                      StageBIndexMemoEntry::NumWays;
+        const VAddr* const aptr = &bank.ib_memo_addrs[ib_set_base];
+        for (size_t w = 0; w < StageBIndexMemoEntry::NumWays; ++w) {
+            if (aptr[w] != address) {
+                continue;
+            }
+            auto& e = bank.ib_memo[ib_set_base + w];
+            if (e.erase_gen == cur_erase_gen && size <= e.max_size && e.direct_buf &&
+                !e.direct_buf->uav_written && e.vk_handle) [[likely]] {
+                e.last_use = ++bank.ib_memo_clock;
+                BbStats::native_buf_hits.fetch_add(1, std::memory_order_relaxed);
+                index_bind = {e.vk_handle, e.vk_offset,
+                              index16 ? vk::IndexType::eUint16 : vk::IndexType::eUint32};
+                return;
+            }
         }
     }
     bool is_direct_buf = false;
@@ -1292,20 +1343,37 @@ void Rasterizer::ResolveIndexBuffer(u32 index_offset) {
     }
     // Tracked as a graphics read after the draw (ResetBindings): an upload into a mirrored index
     // range must not overtake the draw's fixed-function index fetches.
-    if (!StageBFastBind() || VideoCore::BufferCache::LayerPagedActive() ||
-        (!is_direct_buf && buffer != &buffer_cache.GetStreamBuffer()) ||
+    if (!can_ib_memo || (!is_direct_buf && buffer != &buffer_cache.GetStreamBuffer()) ||
         (is_direct_buf && buffer->uav_written)) {
         needs_barrier |= runtime.IsBufferAccessed(buffer, offset, size);
         bound_buffers.emplace_back(buffer, offset, size, false);
-    } else if (is_direct_buf && is_static_immutable) {
-        auto& d = GetVtxIdxDedup();
-        d.sched = &scheduler;
-        d.ib_resolve_epoch = scheduler.DescriptorStateEpoch();
-        d.ib_guest_addr = address;
-        d.ib_guest_size = size;
-        d.ib_guest_index16 = index16;
-        d.ib_resolved_handle = buffer->Handle();
-        d.ib_resolved_offset = offset;
+    } else if (is_direct_buf && is_static_immutable && address != 0) {
+        auto& bank = *tls_vtx_idx_dedup;
+        auto& w0 = bank.ib_memo[ib_set_base];
+        auto& w1 = bank.ib_memo[ib_set_base + 1];
+        size_t victim = ib_set_base;
+        if (w0.address == address) {
+            victim = ib_set_base;
+        } else if (w1.address == address) {
+            victim = ib_set_base + 1;
+        } else if (w0.address == 0 || w0.erase_gen != cur_erase_gen) {
+            victim = ib_set_base;
+        } else if (w1.address == 0 || w1.erase_gen != cur_erase_gen) {
+            victim = ib_set_base + 1;
+        } else {
+            victim = (w0.last_use <= w1.last_use) ? ib_set_base : (ib_set_base + 1);
+        }
+        auto& slot = bank.ib_memo[victim];
+        const u64 prev_max =
+            (slot.address == address && slot.erase_gen == cur_erase_gen) ? slot.max_size : 0ULL;
+        slot.address = address;
+        slot.erase_gen = cur_erase_gen;
+        slot.max_size = std::max<u64>(prev_max, u64(size));
+        slot.direct_buf = buffer;
+        slot.vk_handle = buffer->Handle();
+        slot.vk_offset = offset;
+        slot.last_use = ++bank.ib_memo_clock;
+        bank.ib_memo_addrs[victim] = address;
     }
     index_bind = {buffer->Handle(), offset, index16 ? vk::IndexType::eUint16 : vk::IndexType::eUint32};
 }

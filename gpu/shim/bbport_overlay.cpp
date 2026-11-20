@@ -1188,6 +1188,11 @@ struct HudSampleSlot {
     double idle_a_ms = 0.0;
     double gnm_wait_ms = 0.0;
     double game_cpu_work_ms = 0.0;
+    double c1_adhoc_ms = 0.0;
+    double c1_movemap_ms = 0.0;
+    double c1_gfx_loc_ms = 0.0;
+    double c1_havok_ms = 0.0;
+    double c1_misc_ms = 0.0;
     double fps_cap_sleep_ms = 0.0;
     double main_sync_wait_ms = 0.0;
     double a_pm4_pipe_ms = 0.0;
@@ -1259,6 +1264,11 @@ struct HudSlidingWindow {
             sum.idle_a_ms += s.idle_a_ms;
             sum.gnm_wait_ms += s.gnm_wait_ms;
             sum.game_cpu_work_ms += s.game_cpu_work_ms;
+            sum.c1_adhoc_ms += s.c1_adhoc_ms;
+            sum.c1_movemap_ms += s.c1_movemap_ms;
+            sum.c1_gfx_loc_ms += s.c1_gfx_loc_ms;
+            sum.c1_havok_ms += s.c1_havok_ms;
+            sum.c1_misc_ms += s.c1_misc_ms;
             sum.fps_cap_sleep_ms += s.fps_cap_sleep_ms;
             sum.main_sync_wait_ms += s.main_sync_wait_ms;
             sum.a_pm4_pipe_ms += s.a_pm4_pipe_ms;
@@ -1332,6 +1342,12 @@ struct HudBreakdown {
     float idle_a_ms = 0.0f, avg_idle_a_ms = 0.0f;
     float gnm_wait_ms = 0.0f, avg_gnm_wait_ms = 0.0f;
     float game_cpu_work_ms = 0.0f, avg_game_cpu_work_ms = 0.0f;
+    bool c1_xray_valid = false;
+    float c1_adhoc_ms = 0.0f, avg_c1_adhoc_ms = 0.0f;
+    float c1_movemap_ms = 0.0f, avg_c1_movemap_ms = 0.0f;
+    float c1_gfx_loc_ms = 0.0f, avg_c1_gfx_loc_ms = 0.0f;
+    float c1_havok_ms = 0.0f, avg_c1_havok_ms = 0.0f;
+    float c1_misc_ms = 0.0f, avg_c1_misc_ms = 0.0f;
     float fps_cap_sleep_ms = 0.0f, avg_fps_cap_sleep_ms = 0.0f;
     float main_sync_wait_ms = 0.0f, avg_main_sync_wait_ms = 0.0f;
     // Stage 2: Stage A (bb:GpuComm / DirectVk RHI)
@@ -1345,7 +1361,13 @@ struct HudBreakdown {
     float a_tex_desc_ms = 0.0f, avg_a_tex_desc_ms = 0.0f;
     float a_state_draw_ms = 0.0f, avg_a_state_draw_ms = 0.0f;
     float a_submit_sync_ms = 0.0f, avg_a_submit_sync_ms = 0.0f;
-    // Stage 3: Stage B (bb:DrawRec)
+    float a_prepared_ms = 0.0f, a_cull_batch_ms = 0.0f, a_sync_base_ms = 0.0f;
+    float a_cull_micro_ms = 0.0f, a_cull_vsm_ms = 0.0f, a_cull_light_ms = 0.0f,
+          a_cull_vel_ms = 0.0f, a_cull_vfx_ms = 0.0f;
+    float a_fpso_sig_ms = 0.0f, a_fpso_flat_ms = 0.0f, a_fpso_match_ms = 0.0f;
+    float fast_pso_hit_pct = 100.0f, fast_pso_full_pf = 0.0f;
+    bool a_pipelined_breakdown = false;
+    // Stage 3: Stage B (bb:DrawRec) + PipeXRay counters
     float b_total_ms = 0.0f, avg_b_total_ms = 0.0f;
     float b_buffers_ms = 0.0f, avg_b_buffers_ms = 0.0f;
     float b_obtain_ms = 0.0f;
@@ -1356,6 +1378,14 @@ struct HudBreakdown {
     float b_tasks_ms = 0.0f, avg_b_tasks_ms = 0.0f;
     float b_packet_misc_ms = 0.0f, avg_b_packet_misc_ms = 0.0f;
     float b_flush_ms = 0.0f;
+    float pipe_pkts_pf = 0.0f, pipe_tasks_pf = 0.0f;
+    float resolve_pkts_pf = 0.0f, resolve_busy_ms = 0.0f, resolve_wakes_pf = 0.0f,
+          stage_b_wait_res_ms = 0.0f;
+    float ring_bufs_pf = 0.0f, ring_copies_pf = 0.0f, ring_kib_pf = 0.0f;
+    float b_bind_buf_ms = 0.0f, b_vtx_idx_ms = 0.0f, b_bind_tex_ms = 0.0f, b_pipe_bind_ms = 0.0f;
+    float b_prep_state_ms = 0.0f, b_begin_rp_ms = 0.0f, b_emit_vtx_ms = 0.0f, b_dyn_state_ms = 0.0f,
+          b_kick_ms = 0.0f, b_unpack_ms = 0.0f, b_draw_misc_ms = 0.0f,
+          b_occ_sort_ms = 0.0f, b_draw_emit_ms = 0.0f;
     // Stage 4: GPU / Sync Wait + Hardware GPU Busy/Gap + 10 Render-Pass Categories + 21 Sub-Categories
     float gpu_present_ms = 0.0f;
     float sync_rec_ms = 0.0f;
@@ -1642,6 +1672,10 @@ void UpdateHudBreakdown(HudBreakdown& h) {
     static std::uint64_t last_pacer_sleep_ns = 0, last_pacer_frames = 0, last_main_sync_wait_ns = 0;
     static std::uint64_t last_present_ns = 0, last_sync_rec_ns = 0, last_host_copy_ns = 0;
     static std::uint64_t last_pipe_drains = 0, last_pipe_drain_cyc = 0, last_pipe_busy_cyc = 0;
+    static std::uint64_t last_pipe_pkts = 0, last_pipe_tasks = 0, last_res_pkts = 0,
+                         last_res_busy_cyc = 0, last_res_wakes = 0, last_b_wait_res_cyc = 0;
+    static std::uint64_t last_ring_bufs = 0, last_ring_copies = 0, last_ring_bytes = 0;
+    static std::uint64_t last_fpso_hits = 0, last_fpso_full = 0;
     static std::uint64_t last_faults = 0, last_eop = 0;
     static std::uint64_t last_native_hits = 0, last_native_misses = 0;
     static std::uint64_t last_native_tex_hits = 0, last_native_tex_misses = 0;
@@ -1679,6 +1713,17 @@ void UpdateHudBreakdown(HudBreakdown& h) {
         last_pipe_drains = BbSections::pipe_drains.load(std::memory_order_relaxed);
         last_pipe_drain_cyc = BbSections::pipe_drain_cycles.load(std::memory_order_relaxed);
         last_pipe_busy_cyc = BbSections::pipe_busy_cycles.load(std::memory_order_relaxed);
+        last_pipe_pkts = BbSections::pipe_packets.load(std::memory_order_relaxed);
+        last_pipe_tasks = BbSections::pipe_tasks.load(std::memory_order_relaxed);
+        last_res_pkts = BbSections::resolve_packets.load(std::memory_order_relaxed);
+        last_res_busy_cyc = BbSections::resolve_busy_cycles.load(std::memory_order_relaxed);
+        last_res_wakes = BbSections::resolve_wakes.load(std::memory_order_relaxed);
+        last_b_wait_res_cyc = BbSections::stage_b_wait_res_cycles.load(std::memory_order_relaxed);
+        last_ring_bufs = BbSections::ring_buffers.load(std::memory_order_relaxed);
+        last_ring_copies = BbSections::ring_copies.load(std::memory_order_relaxed);
+        last_ring_bytes = BbSections::ring_bytes.load(std::memory_order_relaxed);
+        last_fpso_hits = BbSections::fast_pso_hits.load(std::memory_order_relaxed);
+        last_fpso_full = BbSections::fast_pso_full.load(std::memory_order_relaxed);
         last_faults = BbStats::tracker_faults_total.load(std::memory_order_relaxed);
         last_eop = BbStats::legacy_eop_decoded.load(std::memory_order_relaxed);
         last_native_hits = BbStats::native_buf_hits.load(std::memory_order_relaxed);
@@ -1748,6 +1793,19 @@ void UpdateHudBreakdown(HudBreakdown& h) {
         BbSections::pipe_drain_cycles.load(std::memory_order_relaxed);
     const std::uint64_t cur_pipe_busy_cyc =
         BbSections::pipe_busy_cycles.load(std::memory_order_relaxed);
+    const std::uint64_t cur_pipe_pkts = BbSections::pipe_packets.load(std::memory_order_relaxed);
+    const std::uint64_t cur_pipe_tasks = BbSections::pipe_tasks.load(std::memory_order_relaxed);
+    const std::uint64_t cur_res_pkts = BbSections::resolve_packets.load(std::memory_order_relaxed);
+    const std::uint64_t cur_res_busy_cyc =
+        BbSections::resolve_busy_cycles.load(std::memory_order_relaxed);
+    const std::uint64_t cur_res_wakes = BbSections::resolve_wakes.load(std::memory_order_relaxed);
+    const std::uint64_t cur_b_wait_res_cyc =
+        BbSections::stage_b_wait_res_cycles.load(std::memory_order_relaxed);
+    const std::uint64_t cur_ring_bufs = BbSections::ring_buffers.load(std::memory_order_relaxed);
+    const std::uint64_t cur_ring_copies = BbSections::ring_copies.load(std::memory_order_relaxed);
+    const std::uint64_t cur_ring_bytes = BbSections::ring_bytes.load(std::memory_order_relaxed);
+    const std::uint64_t cur_fpso_hits = BbSections::fast_pso_hits.load(std::memory_order_relaxed);
+    const std::uint64_t cur_fpso_full = BbSections::fast_pso_full.load(std::memory_order_relaxed);
     const std::uint64_t cur_faults =
         BbStats::tracker_faults_total.load(std::memory_order_relaxed);
     const std::uint64_t cur_eop = BbStats::legacy_eop_decoded.load(std::memory_order_relaxed);
@@ -1881,38 +1939,29 @@ void UpdateHudBreakdown(HudBreakdown& h) {
     h.sync_rec_ms = std::max(0.0f, raw_sync_rec_ms - h.gpu_present_ms);
     h.host_copy_ms = ns_to_ms(safe_delta(cur_host_copy_ns, last_host_copy_ns));
 
-    // Stage A granular X-Ray breakdown (covers both Direct Inline mode and Pipelined mode):
-    const float a_buf_only_ms = cyc_to_ms(dca[BbSections::BindBuffers] +
-                                          dca[BbSections::ResolveVertexBuffers] +
-                                          dca[BbSections::ResolveIndexBuffer]);
-    h.a_buf_ring_ms = a_buf_only_ms + h.a_ring_ms;
-    h.a_tex_desc_ms = cyc_to_ms(dca[BbSections::BindTextures] + dca[BbSections::PipelineBind]);
-    const float a_draw_disp_total_ms =
-        cyc_to_ms(dca[BbSections::DrawRecord] + dca[BbSections::DispatchRecord]);
-    h.a_state_draw_ms = std::max(
-        0.0f, a_draw_disp_total_ms - (a_buf_only_ms + h.a_tex_desc_ms));
-    const float a_tasks_ms = std::max(0.0f, cyc_to_ms(dca[BbSections::Task]) - h.gpu_present_ms);
-    h.a_submit_sync_ms = h.a_flush_ms + a_tasks_ms + h.a_drain_ms;
-    h.a_decode_pso_ms = std::max(0.0f, h.a_total_ms - (h.a_buf_ring_ms + h.a_tex_desc_ms +
-                                                       h.a_state_draw_ms + h.a_submit_sync_ms));
-
     const float raw_b_total_ms = cyc_to_ms(safe_delta(cur_pipe_busy_cyc, last_pipe_busy_cyc));
     h.b_total_ms = std::max(0.0f, raw_b_total_ms - h.gpu_present_ms);
     const std::uint64_t b_vert_idx_cyc =
         dcb[BbSections::ResolveVertexBuffers] + dcb[BbSections::ResolveIndexBuffer];
     h.b_obtain_ms = cyc_to_ms(dcb[BbSections::ObtainBuffer]);
     h.b_vram_ms = cyc_to_ms(dcb[BbSections::ObtainVram]);
+    h.b_bind_buf_ms = cyc_to_ms(dcb[BbSections::BindBuffers]);
+    h.b_vtx_idx_ms = cyc_to_ms(b_vert_idx_cyc);
+    h.b_bind_tex_ms = cyc_to_ms(dcb[BbSections::BindTextures]);
+    h.b_pipe_bind_ms = cyc_to_ms(dcb[BbSections::PipelineBind]);
+    h.b_prep_state_ms = cyc_to_ms(dcb[BbSections::PrepareRenderState]);
+    h.b_begin_rp_ms = cyc_to_ms(dcb[BbSections::BeginRendering]);
+    h.b_emit_vtx_ms = cyc_to_ms(dcb[BbSections::EmitVertexBuffers]);
+    h.b_dyn_state_ms = cyc_to_ms(dcb[BbSections::UpdateDynamicState]);
+    h.b_kick_ms = cyc_to_ms(dcb[BbSections::Kick]);
     // Fold ObtainVram into Buffers and DispatchRecord into RenderPass+Draw/Disp so all 5 sub-rows
     // stay permanently visible without flickering legacy rows.
-    h.b_buffers_ms = cyc_to_ms(dcb[BbSections::BindBuffers] + b_vert_idx_cyc) + h.b_vram_ms;
-    h.b_tex_desc_ms = cyc_to_ms(dcb[BbSections::BindTextures] + dcb[BbSections::PipelineBind]);
+    h.b_buffers_ms = h.b_bind_buf_ms + h.b_vtx_idx_ms + h.b_vram_ms;
+    h.b_tex_desc_ms = h.b_bind_tex_ms + h.b_pipe_bind_ms;
     h.b_motion_hle_ms = cyc_to_ms(dcb[BbSections::Motion] +
                                   dcb[BbSections::Preupload] + dcb[BbSections::DispatchRecord]);
-    h.b_state_pass_ms = cyc_to_ms(dcb[BbSections::PrepareRenderState] +
-                                  dcb[BbSections::BeginRendering] +
-                                  dcb[BbSections::EmitVertexBuffers] +
-                                  dcb[BbSections::UpdateDynamicState] + dcb[BbSections::Kick]) +
-                        h.b_motion_hle_ms;
+    h.b_state_pass_ms = h.b_prep_state_ms + h.b_begin_rp_ms + h.b_emit_vtx_ms +
+                        h.b_dyn_state_ms + h.b_kick_ms + h.b_motion_hle_ms;
     h.b_tasks_ms = std::max(0.0f, cyc_to_ms(dcb[BbSections::Task]) - h.gpu_present_ms);
     h.b_packet_misc_ms =
         std::max(0.0f, h.b_total_ms - (h.b_buffers_ms + h.b_tex_desc_ms + h.b_state_pass_ms +
@@ -1920,6 +1969,123 @@ void UpdateHudBreakdown(HudBreakdown& h) {
     h.b_flush_ms = cyc_to_ms(dcb[BbSections::Flush]);
     h.b_busy_pct =
         h.frame_ms > 0.01f ? std::clamp(100.0f * h.b_total_ms / h.frame_ms, 0.0f, 100.0f) : 0.0f;
+
+    h.pipe_pkts_pf = float(double(safe_delta(cur_pipe_pkts, last_pipe_pkts)) * inv_f);
+    h.pipe_tasks_pf = float(double(safe_delta(cur_pipe_tasks, last_pipe_tasks)) * inv_f);
+    h.resolve_pkts_pf = float(double(safe_delta(cur_res_pkts, last_res_pkts)) * inv_f);
+    h.resolve_busy_ms = cyc_to_ms(safe_delta(cur_res_busy_cyc, last_res_busy_cyc));
+    h.resolve_wakes_pf = float(double(safe_delta(cur_res_wakes, last_res_wakes)) * inv_f);
+    h.stage_b_wait_res_ms = cyc_to_ms(safe_delta(cur_b_wait_res_cyc, last_b_wait_res_cyc));
+    h.ring_bufs_pf = float(double(safe_delta(cur_ring_bufs, last_ring_bufs)) * inv_f);
+    h.ring_copies_pf = float(double(safe_delta(cur_ring_copies, last_ring_copies)) * inv_f);
+    h.ring_kib_pf = float((double(safe_delta(cur_ring_bytes, last_ring_bytes)) / 1024.0) * inv_f);
+    const float b_draw_rec_ms = cyc_to_ms(dcb[BbSections::DrawRecord]);
+    const float b_disp_rec_ms = cyc_to_ms(dcb[BbSections::DispatchRecord]);
+    const float b_packet_ms = std::max(0.0f, cyc_to_ms(dcb[BbSections::Packet]) - h.gpu_present_ms);
+    h.b_unpack_ms = std::max(0.0f, b_packet_ms - b_draw_rec_ms - h.b_tasks_ms - b_disp_rec_ms);
+    h.b_draw_misc_ms = std::max(0.0f, b_draw_rec_ms - (h.b_buffers_ms + h.b_tex_desc_ms +
+                                                       h.b_state_pass_ms));
+    h.b_occ_sort_ms = cyc_to_ms(dcb[BbSections::BOccSort]);
+    h.b_draw_emit_ms = cyc_to_ms(dcb[BbSections::BDrawEmit]);
+
+    // Stage A granular X-Ray breakdown:
+    // - Pipelined mode (Stage B active): real 5-way breakdown from BbSections::cycles_a:
+    //   2a. PM4 Decode & Regs | 2b. FastPSO Select | 2c. PostDraw & Pack | 2d. Ring Consts | 2e. Misc & Sync
+    // - Direct Inline mode (Stage B inactive): legacy 5-way inline Vulkan breakdown.
+    const float a_tasks_ms = std::max(0.0f, cyc_to_ms(dca[BbSections::Task]) - h.gpu_present_ms);
+    const float a_sync_base_ms = h.a_flush_ms + a_tasks_ms + h.a_drain_ms;
+    const float a_draw_ms = cyc_to_ms(dca[BbSections::ADraw]);
+    const float a_pipeline_ms = cyc_to_ms(dca[BbSections::APipeline]);
+    const float a_postdraw_ms = cyc_to_ms(dca[BbSections::APostDraw]);
+    h.a_prepared_ms = cyc_to_ms(dca[BbSections::APrepared]);
+    h.a_cull_batch_ms = cyc_to_ms(dca[BbSections::ACullBatch]);
+    h.a_cull_micro_ms = cyc_to_ms(dca[BbSections::ACullMicro]);
+    h.a_cull_vsm_ms = cyc_to_ms(dca[BbSections::ACullVsm]);
+    h.a_cull_light_ms = cyc_to_ms(dca[BbSections::ACullLight]);
+    h.a_cull_vel_ms = cyc_to_ms(dca[BbSections::ACullVel]);
+    h.a_cull_vfx_ms = cyc_to_ms(dca[BbSections::ACullVfx]);
+    h.a_fpso_sig_ms = cyc_to_ms(dca[BbSections::AFpsoSig]);
+    h.a_fpso_flat_ms = cyc_to_ms(dca[BbSections::AFpsoFlat]);
+    h.a_fpso_match_ms = cyc_to_ms(dca[BbSections::AFpsoMatch]);
+    const std::uint64_t dfh = safe_delta(cur_fpso_hits, last_fpso_hits);
+    const std::uint64_t dff = safe_delta(cur_fpso_full, last_fpso_full);
+    h.fast_pso_hit_pct = (dfh + dff) > 0 ? float(100.0 * double(dfh) / double(dfh + dff)) : 100.0f;
+    h.fast_pso_full_pf = float(double(dff) * inv_f);
+    h.a_sync_base_ms = a_sync_base_ms;
+    h.a_pipelined_breakdown = (h.b_total_ms >= 0.02f || a_draw_ms >= 0.02f);
+    if (h.a_pipelined_breakdown) {
+        const float a_post_only_ms = std::max(0.0f, a_postdraw_ms - h.a_ring_ms);
+        const float a_draw_misc_ms = std::max(0.0f, a_draw_ms - a_pipeline_ms - a_postdraw_ms);
+        h.a_buf_ring_ms = a_pipeline_ms;      // 2b. FastPSO Select
+        h.a_tex_desc_ms = a_post_only_ms;     // 2c. PostDraw & Pack
+        h.a_state_draw_ms = h.a_ring_ms;      // 2d. Ring Consts
+        h.a_submit_sync_ms = a_draw_misc_ms + a_sync_base_ms; // 2e. Draw Misc & Sync
+        h.a_decode_pso_ms = std::max(
+            0.0f, h.a_total_ms - (h.a_buf_ring_ms + h.a_tex_desc_ms + h.a_state_draw_ms +
+                                  h.a_submit_sync_ms));       // 2a. PM4 Decode & Regs
+    } else {
+        const float a_buf_only_ms = cyc_to_ms(dca[BbSections::BindBuffers] +
+                                              dca[BbSections::ResolveVertexBuffers] +
+                                              dca[BbSections::ResolveIndexBuffer]);
+        h.a_buf_ring_ms = a_buf_only_ms + h.a_ring_ms;
+        h.a_tex_desc_ms = cyc_to_ms(dca[BbSections::BindTextures] + dca[BbSections::PipelineBind]);
+        const float a_draw_disp_total_ms =
+            cyc_to_ms(dca[BbSections::DrawRecord] + dca[BbSections::DispatchRecord]);
+        h.a_state_draw_ms = std::max(
+            0.0f, a_draw_disp_total_ms - (a_buf_only_ms + h.a_tex_desc_ms));
+        h.a_submit_sync_ms = a_sync_base_ms;
+        h.a_decode_pso_ms = std::max(0.0f, h.a_total_ms - (h.a_buf_ring_ms + h.a_tex_desc_ms +
+                                                           h.a_state_draw_ms + h.a_submit_sync_ms));
+    }
+
+    // CPU 1 (Main Thread) 5-bucket X-Ray breakdown for live F9 overlay (zero overhead: ~50 tasks/f).
+    if (BbSections::main_xray.installed.load(std::memory_order_relaxed)) {
+        static std::array<std::uint64_t, BbSections::MainXRay::MaxGroups> last_hud_t0{};
+        static std::array<std::int8_t, BbSections::MainXRay::MaxGroups> bucket_cache{};
+        static bool hud_mx_seeded = false;
+        const std::size_t gcnt = std::min<std::size_t>(
+            BbSections::main_xray.group_count.load(std::memory_order_acquire),
+            BbSections::MainXRay::MaxGroups);
+        std::array<std::uint64_t, 5> b_cyc{};
+        for (std::size_t g = 0; g < gcnt; ++g) {
+            const std::uint64_t cur_c =
+                BbSections::main_xray.cycles_t0[g].load(std::memory_order_relaxed);
+            const std::uint64_t dc =
+                (hud_mx_seeded && cur_c >= last_hud_t0[g]) ? (cur_c - last_hud_t0[g]) : 0ULL;
+            last_hud_t0[g] = cur_c;
+            if (dc == 0) {
+                continue;
+            }
+            std::int8_t b = bucket_cache[g];
+            if (b == 0 && BbSections::main_xray.name_ready[g].load(std::memory_order_acquire)) {
+                const char* nm = BbSections::main_xray.names[g];
+                if (std::strcmp(nm, "AdhocDraw") == 0) {
+                    b = 1;
+                } else if (std::strcmp(nm, "MoveMapStep") == 0) {
+                    b = 2;
+                } else if (std::strcmp(nm, "GraphicsStep") == 0 ||
+                           std::strcmp(nm, "LocationStep") == 0) {
+                    b = 3;
+                } else if (std::strncmp(nm, "Havok", 5) == 0) {
+                    b = 4;
+                } else {
+                    b = 5;
+                }
+                bucket_cache[g] = b;
+            }
+            const std::size_t bi = (b >= 1 && b <= 5) ? static_cast<std::size_t>(b - 1) : 4u;
+            b_cyc[bi] += dc;
+        }
+        if (hud_mx_seeded && (b_cyc[0] + b_cyc[1] + b_cyc[2] + b_cyc[3] + b_cyc[4]) > 0) {
+            h.c1_xray_valid = true;
+            h.c1_adhoc_ms = cyc_to_ms(b_cyc[0]);
+            h.c1_movemap_ms = cyc_to_ms(b_cyc[1]);
+            h.c1_gfx_loc_ms = cyc_to_ms(b_cyc[2]);
+            h.c1_havok_ms = cyc_to_ms(b_cyc[3]);
+            h.c1_misc_ms = cyc_to_ms(b_cyc[4]);
+        }
+        hud_mx_seeded = true;
+    }
 
     const auto effective_fps_cap = []() noexcept -> int {
         if (const int live = BbFrameRate::Limit(); live > 0) {
@@ -2009,6 +2175,11 @@ void UpdateHudBreakdown(HudBreakdown& h) {
         s.idle_a_ms = double(h.idle_a_ms) * f_weight;
         s.gnm_wait_ms = double(h.gnm_wait_ms) * f_weight;
         s.game_cpu_work_ms = double(h.game_cpu_work_ms) * f_weight;
+        s.c1_adhoc_ms = double(h.c1_adhoc_ms) * f_weight;
+        s.c1_movemap_ms = double(h.c1_movemap_ms) * f_weight;
+        s.c1_gfx_loc_ms = double(h.c1_gfx_loc_ms) * f_weight;
+        s.c1_havok_ms = double(h.c1_havok_ms) * f_weight;
+        s.c1_misc_ms = double(h.c1_misc_ms) * f_weight;
         s.fps_cap_sleep_ms = double(h.fps_cap_sleep_ms) * f_weight;
         s.main_sync_wait_ms = double(h.main_sync_wait_ms) * f_weight;
         s.a_pm4_pipe_ms = double(h.a_pm4_pipe_ms) * f_weight;
@@ -2081,6 +2252,11 @@ void UpdateHudBreakdown(HudBreakdown& h) {
         h.avg_idle_a_ms = float(win.sum.idle_a_ms * inv_af);
         h.avg_gnm_wait_ms = float(win.sum.gnm_wait_ms * inv_af);
         h.avg_game_cpu_work_ms = float(win.sum.game_cpu_work_ms * inv_af);
+        h.avg_c1_adhoc_ms = float(win.sum.c1_adhoc_ms * inv_af);
+        h.avg_c1_movemap_ms = float(win.sum.c1_movemap_ms * inv_af);
+        h.avg_c1_gfx_loc_ms = float(win.sum.c1_gfx_loc_ms * inv_af);
+        h.avg_c1_havok_ms = float(win.sum.c1_havok_ms * inv_af);
+        h.avg_c1_misc_ms = float(win.sum.c1_misc_ms * inv_af);
         h.avg_fps_cap_sleep_ms = float(win.sum.fps_cap_sleep_ms * inv_af);
         h.avg_main_sync_wait_ms = float(win.sum.main_sync_wait_ms * inv_af);
         h.avg_a_pm4_pipe_ms = float(win.sum.a_pm4_pipe_ms * inv_af);
@@ -2294,6 +2470,17 @@ void UpdateHudBreakdown(HudBreakdown& h) {
     last_pipe_drains = cur_pipe_drains;
     last_pipe_drain_cyc = cur_pipe_drain_cyc;
     last_pipe_busy_cyc = cur_pipe_busy_cyc;
+    last_pipe_pkts = cur_pipe_pkts;
+    last_pipe_tasks = cur_pipe_tasks;
+    last_res_pkts = cur_res_pkts;
+    last_res_busy_cyc = cur_res_busy_cyc;
+    last_res_wakes = cur_res_wakes;
+    last_b_wait_res_cyc = cur_b_wait_res_cyc;
+    last_ring_bufs = cur_ring_bufs;
+    last_ring_copies = cur_ring_copies;
+    last_ring_bytes = cur_ring_bytes;
+    last_fpso_hits = cur_fpso_hits;
+    last_fpso_full = cur_fpso_full;
     last_faults = cur_faults;
     last_eop = cur_eop;
     last_native_hits = cur_native_hits;
@@ -2324,8 +2511,9 @@ void UpdateHudBreakdown(HudBreakdown& h) {
             "Counts/f: Draws %.0f (Avg %.0f) | Disp %.0f (Avg %.0f) | Subm %.1f (Avg %.1f) | PipeDrains %.1f | Faults/s %.1f | NativeVkBuf %.1f%% | NativeVkTex %.1f%% | DescSaved %.1f%% | DontCare %llu/%llu\n"
             "DirectShaders: reg %llu | manifest %llu/%u | stageA_hits %llu | worker_hits %llu\n"
             "CPU 1. Game Engine: Work %.2f ms (Avg %.2f) | ThreadSync %.2f ms (Avg %.2f) | FpsCapSleep %.2f ms (Avg %.2f) | GnmWait %.2f ms (Avg %.2f)\n"
-            "CPU 2. Stage A (DirectVk RHI): Total %.2f ms (Avg %.2f) -> [2a.PM4+FastPSO %.2f | 2b.Buf+Vtx+Ring %.2f | 2c.Tex+PushDesc %.2f | 2d.Pass+State+Draw %.2f | 2e.Submit+Sync %.2f]\n"
+            "CPU 2. Stage A (DirectVk RHI): Total %.2f ms (Avg %.2f) -> [%s %.2f | %s %.2f | %s %.2f | %s %.2f | %s %.2f]\n"
             "CPU 3. Stage B (Vulkan Record): Total %.2f ms (Avg %.2f) -> [3a.Buffers %.2f | 3b.Tex+Desc %.2f | 3c.Pass+Draw+Disp %.2f | 3d.Tasks %.2f | 3e.Packet+Regs %.2f]\n"
+            "PipeXRay/f: Pkts %.0f (Tasks %.0f, Resolve %.0f / %.2f ms, ResWakes %.0f, B_WaitRes %.2f ms) | FastPSO %.1f%% (full %.0f/f, Sig %.2f Flat %.2f Match %.2f) | A_Cull[Tot %.2f Micro %.2f Vsm %.2f Light %.2f Vel %.2f Vfx %.2f] | B_Sub[Unpack %.2f DrawMisc %.2f (OccSort %.2f DrawEmit %.2f) BindBuf %.2f VtxIdx %.2f BindTex %.2f PipeBind %.2f PrepSt %.2f BeginRP %.2f EmitVtx %.2f DynSt %.2f Kick %.2f Mot %.2f]\n"
             "GPU Render Passes: TotalBusy %.2f ms (Avg %.2f) | MidBubble %.2f ms (Avg %.2f) | InterWait %.2f ms (Avg %.2f) | PresentSync %.2f ms (Avg %.2f)\n"
             "  1.Shadow %.2f ms (1a.CSM/Spot %.2f | 1b.VSM/PCF %.2f) | 2.GBuf %.2f ms (2a.World/Chr %.2f | 2b.Foliage %.2f)\n"
             "  3.SSAO %.2f ms (3a.RawGen %.2f | 3b.Blur/Up %.3f) | 4.DefPBR %.2f ms (4a.Sun/IBL/Local %.2f | 4b.Sky/Fog/Shafts %.2f)\n"
@@ -2354,10 +2542,25 @@ void UpdateHudBreakdown(HudBreakdown& h) {
             static_cast<unsigned long long>(shd.worker_direct_hits),
             h.game_cpu_work_ms, h.avg_game_cpu_work_ms, h.main_sync_wait_ms, h.avg_main_sync_wait_ms,
             h.fps_cap_sleep_ms, h.avg_fps_cap_sleep_ms, h.gnm_wait_ms, h.avg_gnm_wait_ms,
-            h.a_total_ms, h.avg_a_total_ms, h.a_decode_pso_ms, h.a_buf_ring_ms, h.a_tex_desc_ms, h.a_state_draw_ms, h.a_submit_sync_ms,
+            h.a_total_ms, h.avg_a_total_ms,
+            h.a_pipelined_breakdown ? "2a.PM4+Regs" : "2a.PM4+FastPSO", h.a_decode_pso_ms,
+            h.a_pipelined_breakdown ? "2b.FastPSO" : "2b.Buf+Vtx+Ring", h.a_buf_ring_ms,
+            h.a_pipelined_breakdown ? "2c.PostDraw" : "2c.Tex+PushDesc", h.a_tex_desc_ms,
+            h.a_pipelined_breakdown ? "2d.Ring" : "2d.Pass+State+Draw", h.a_state_draw_ms,
+            h.a_pipelined_breakdown ? "2e.Misc+Sync" : "2e.Submit+Sync", h.a_submit_sync_ms,
             h.b_total_ms, h.avg_b_total_ms, h.b_buffers_ms,
             h.b_tex_desc_ms, h.b_state_pass_ms,
             h.b_tasks_ms, h.b_packet_misc_ms,
+            h.pipe_pkts_pf, h.pipe_tasks_pf, h.resolve_pkts_pf, h.resolve_busy_ms,
+            h.resolve_wakes_pf, h.stage_b_wait_res_ms,
+            h.fast_pso_hit_pct, h.fast_pso_full_pf,
+            h.a_fpso_sig_ms, h.a_fpso_flat_ms, h.a_fpso_match_ms,
+            h.a_cull_batch_ms, h.a_cull_micro_ms, h.a_cull_vsm_ms, h.a_cull_light_ms,
+            h.a_cull_vel_ms, h.a_cull_vfx_ms,
+            h.b_unpack_ms, h.b_draw_misc_ms, h.b_occ_sort_ms, h.b_draw_emit_ms,
+            h.b_bind_buf_ms, h.b_vtx_idx_ms, h.b_bind_tex_ms, h.b_pipe_bind_ms,
+            h.b_prep_state_ms, h.b_begin_rp_ms, h.b_emit_vtx_ms, h.b_dyn_state_ms, h.b_kick_ms,
+            h.b_motion_hle_ms,
             h.hw_gpu_busy_ms, h.avg_hw_gpu_busy_ms, h.hw_gpu_gap_ms, h.avg_hw_gpu_gap_ms,
             h.hw_gpu_inter_gap_ms, h.avg_hw_gpu_inter_gap_ms,
             gpu_wait_now_ms, h.avg_gpu_wait_ms,
@@ -2580,6 +2783,268 @@ void UpdateHudBreakdown(HudBreakdown& h) {
             last_log_print = now;
             last_log_frames = cur_frames;
             std::printf("\n[HUD Telemetry]\n%s", hud_buf);
+            if (BbSections::main_xray.installed.load(std::memory_order_relaxed)) {
+                static std::array<std::uint64_t, BbSections::MainXRay::MaxGroups> prev_t0{};
+                static std::array<std::uint64_t, BbSections::MainXRay::MaxGroups> prev_wk{};
+                static bool mx_seeded = false;
+                struct MxRow {
+                    std::size_t idx;
+                    double ms;
+                };
+                auto print_band = [&](const char* label,
+                                      const std::array<std::atomic<std::uint64_t>,
+                                                       BbSections::MainXRay::MaxGroups>& src,
+                                      std::array<std::uint64_t, BbSections::MainXRay::MaxGroups>& prev,
+                                      std::size_t max_show) {
+                    std::array<MxRow, BbSections::MainXRay::MaxGroups> rows{};
+                    std::size_t n = 0;
+                    double tot_ms = 0.0;
+                    const std::size_t cnt = std::min<std::size_t>(
+                        BbSections::main_xray.group_count.load(std::memory_order_acquire),
+                        BbSections::MainXRay::MaxGroups);
+                    for (std::size_t g = 0; g < cnt; ++g) {
+                        const std::uint64_t cur_c = src[g].load(std::memory_order_relaxed);
+                        const std::uint64_t d_c =
+                            (mx_seeded && cur_c >= prev[g]) ? (cur_c - prev[g]) : 0ULL;
+                        prev[g] = cur_c;
+                        if (d_c > 0 && cyc_per_ms > 0.0) {
+                            const double ms = (double(d_c) / cyc_per_ms) / double(log_df);
+                            tot_ms += ms;
+                            if (ms >= 0.015) {
+                                rows[n++] = {g, ms};
+                            }
+                        }
+                    }
+                    if (mx_seeded && n > 0) {
+                        std::sort(rows.begin(), rows.begin() + n,
+                                  [](const MxRow& a, const MxRow& b) { return a.ms > b.ms; });
+                        std::printf("%s (%.2f ms tracked):", label, tot_ms);
+                        const std::size_t show = std::min<std::size_t>(n, max_show);
+                        for (std::size_t k = 0; k < show; ++k) {
+                            const auto idx = rows[k].idx;
+                            const char* nm =
+                                BbSections::main_xray.name_ready[idx].load(std::memory_order_acquire)
+                                    ? BbSections::main_xray.names[idx]
+                                    : "?";
+                            std::printf("%s %s %.2f", k ? " |" : "", nm, rows[k].ms);
+                        }
+                        std::printf("\n");
+                    }
+                };
+                print_band("MainXRay/f [T0]", BbSections::main_xray.cycles_t0, prev_t0, 10);
+                if (BbSections::main_xray.deep_enabled.load(std::memory_order_relaxed)) {
+                    print_band("WorkXRay/f [T1+]", BbSections::main_xray.cycles_wk, prev_wk, 8);
+                    {
+                    static std::array<std::uint64_t, BbSections::MainXRay::MaxTasks> prev_tc{};
+                    static std::array<std::uint64_t, BbSections::MainXRay::MaxTasks> prev_tn{};
+                    struct TfRow {
+                        std::size_t idx;
+                        double ms;
+                        double calls;
+                    };
+                    std::array<TfRow, BbSections::MainXRay::MaxTasks> trows{};
+                    std::size_t tn = 0;
+                    const std::size_t tcnt = std::min<std::size_t>(
+                        BbSections::main_xray.task_count.load(std::memory_order_acquire),
+                        BbSections::MainXRay::MaxTasks);
+                    for (std::size_t t = 0; t < tcnt; ++t) {
+                        const std::uint64_t cc =
+                            BbSections::main_xray.task_cycles[t].load(std::memory_order_relaxed);
+                        const std::uint64_t cn =
+                            BbSections::main_xray.task_calls[t].load(std::memory_order_relaxed);
+                        const std::uint64_t dc =
+                            (mx_seeded && cc >= prev_tc[t]) ? (cc - prev_tc[t]) : 0ULL;
+                        const std::uint64_t dn =
+                            (mx_seeded && cn >= prev_tn[t]) ? (cn - prev_tn[t]) : 0ULL;
+                        prev_tc[t] = cc;
+                        prev_tn[t] = cn;
+                        if (dc > 0 && cyc_per_ms > 0.0) {
+                            const double ms = (double(dc) / cyc_per_ms) / double(log_df);
+                            if (ms >= 0.02) {
+                                trows[tn++] = {t, ms, double(dn) / double(log_df)};
+                            }
+                        }
+                    }
+                    if (mx_seeded && tn > 0) {
+                        std::sort(trows.begin(), trows.begin() + tn,
+                                  [](const TfRow& a, const TfRow& b) { return a.ms > b.ms; });
+                        std::printf("TaskFnXRay/f:");
+                        const std::size_t show = std::min<std::size_t>(tn, 10);
+                        for (std::size_t k = 0; k < show; ++k) {
+                            const auto ti = trows[k].idx;
+                            const auto gs = BbSections::main_xray.task_group_slot[ti];
+                            const char* gnm =
+                                (gs >= 0 &&
+                                 static_cast<std::size_t>(gs) < BbSections::MainXRay::MaxGroups &&
+                                 BbSections::main_xray.name_ready[static_cast<std::size_t>(gs)].load(
+                                     std::memory_order_acquire))
+                                    ? BbSections::main_xray.names[static_cast<std::size_t>(gs)]
+                                    : "?";
+                            std::printf("%s %s@0x%llx %.2f (%.0f/f)", k ? " |" : "", gnm,
+                                        static_cast<unsigned long long>(
+                                            BbSections::main_xray.task_fn_off[ti]),
+                                        trows[k].ms, trows[k].calls);
+                        }
+                        std::printf("\n");
+                    }
+                }
+                if (BbSections::main_xray.adhoc_sub_installed.load(std::memory_order_relaxed)) {
+                    static std::array<std::uint64_t, BbSections::MainXRay::AdhocSubCount> prev_adhoc{};
+                    std::array<double, BbSections::MainXRay::AdhocSubCount> ms{};
+                    double tot = 0.0;
+                    for (std::size_t i = 0; i < BbSections::MainXRay::AdhocSubCount; ++i) {
+                        const std::uint64_t c =
+                            BbSections::main_xray.adhoc_sub_cycles[i].load(std::memory_order_relaxed);
+                        const std::uint64_t dc =
+                            (mx_seeded && c >= prev_adhoc[i]) ? (c - prev_adhoc[i]) : 0ULL;
+                        prev_adhoc[i] = c;
+                        ms[i] = (cyc_per_ms > 0.0) ? ((double(dc) / cyc_per_ms) / double(log_df)) : 0.0;
+                        tot += ms[i];
+                    }
+                    if (mx_seeded && tot > 0.005) {
+                        std::printf(
+                            "SceneSubXRay/f (%.2f ms): GX_LightCull %.2f | Scene_1f5c1b0 %.2f | "
+                            "Draw_1db6d70 %.2f | Queue_f5d780 %.2f | Init_Misc %.2f | MoveMapState #%d\n",
+                            tot, ms[0], ms[1], ms[2], ms[3], ms[4],
+                            BbSections::main_xray.movemap_last_state.load(std::memory_order_relaxed));
+                    }
+                }
+                {
+                    static std::array<std::uint64_t, BbSections::MainXRay::MaxPassCallbacks> prev_pc{};
+                    static std::array<std::uint64_t, BbSections::MainXRay::MaxPassCallbacks> prev_pn{};
+                    struct PRow {
+                        std::size_t idx;
+                        double ms;
+                        double calls;
+                    };
+                    std::array<PRow, BbSections::MainXRay::MaxPassCallbacks> prows{};
+                    std::size_t pn = 0;
+                    double ptot = 0.0;
+                    const std::size_t pcnt = std::min<std::size_t>(
+                        BbSections::main_xray.pass_count.load(std::memory_order_acquire),
+                        BbSections::MainXRay::MaxPassCallbacks);
+                    for (std::size_t i = 0; i < pcnt; ++i) {
+                        const std::uint64_t cc =
+                            BbSections::main_xray.pass_cycles[i].load(std::memory_order_relaxed);
+                        const std::uint64_t cn =
+                            BbSections::main_xray.pass_calls[i].load(std::memory_order_relaxed);
+                        const std::uint64_t dc =
+                            (mx_seeded && cc >= prev_pc[i]) ? (cc - prev_pc[i]) : 0ULL;
+                        const std::uint64_t dn =
+                            (mx_seeded && cn >= prev_pn[i]) ? (cn - prev_pn[i]) : 0ULL;
+                        prev_pc[i] = cc;
+                        prev_pn[i] = cn;
+                        if (dc > 0 && cyc_per_ms > 0.0) {
+                            const double ms = (double(dc) / cyc_per_ms) / double(log_df);
+                            ptot += ms;
+                            if (ms >= 0.01) {
+                                prows[pn++] = {i, ms, double(dn) / double(log_df)};
+                            }
+                        }
+                    }
+                    if (mx_seeded && pn > 0) {
+                        std::sort(prows.begin(), prows.begin() + pn,
+                                  [](const PRow& a, const PRow& b) { return a.ms > b.ms; });
+                        static constexpr const char* kKindTag[5] = {"?", "prep", "exec", "sort", "subm"};
+                        std::printf("Pass2293060XRay/f (items=%u, %.2f ms):",
+                                    BbSections::main_xray.pass_last_items.load(std::memory_order_relaxed),
+                                    ptot);
+                        const std::size_t show = std::min<std::size_t>(pn, 10);
+                        for (std::size_t k = 0; k < show; ++k) {
+                            const auto pi = prows[k].idx;
+                            const auto kd = BbSections::main_xray.pass_kind[pi];
+                            std::printf("%s %s@0x%llx %.2f (%.0f/f)", k ? " |" : "",
+                                        kKindTag[kd < 5u ? kd : 0u],
+                                        static_cast<unsigned long long>(
+                                            BbSections::main_xray.pass_fn_off[pi]),
+                                        prows[k].ms, prows[k].calls);
+                        }
+                        std::printf("\n");
+                    }
+                }
+                {
+                    static std::array<std::uint64_t, 6> prev_gp{};
+                    std::array<std::uint64_t, 6> dgp{};
+                    for (std::size_t i = 0; i < 6; ++i) {
+                        const std::uint64_t cur =
+                            BbSections::main_xray.gxpool_stats[i].load(std::memory_order_relaxed);
+                        dgp[i] = (mx_seeded && cur >= prev_gp[i]) ? (cur - prev_gp[i]) : 0ULL;
+                        prev_gp[i] = cur;
+                    }
+                    if (mx_seeded && dgp[4] > 0 && cyc_per_ms > 0.0) {
+                        const auto to_ms = [&](std::uint64_t c) {
+                            return (double(c) / cyc_per_ms) / double(log_df);
+                        };
+                        std::printf(
+                            "GxPoolXRay/f (workers=%u, flushes=%.1f/f, wakes=%.1f/f): "
+                            "MainWork %.2f | MainSpin %.2f | WakeSem %.2f | WaitIdle %.2f\n",
+                            BbSections::main_xray.gxpool_workers.load(std::memory_order_relaxed),
+                            double(dgp[4]) / double(log_df), double(dgp[5]) / double(log_df),
+                            to_ms(dgp[0]), to_ms(dgp[1]), to_ms(dgp[2]), to_ms(dgp[3]));
+                    }
+                    static std::array<std::uint64_t, BbSections::MainXRay::MaxParTasks> prev_ptot{};
+                    static std::array<std::uint64_t, BbSections::MainXRay::MaxParTasks> prev_pt0{};
+                    static std::array<std::uint64_t, BbSections::MainXRay::MaxParTasks> prev_pcnt{};
+                    static std::array<std::uint64_t, BbSections::MainXRay::MaxParTasks> prev_pitm{};
+                    struct ParRow {
+                        std::size_t idx;
+                        double tot_ms;
+                        double t0_ms;
+                        double calls;
+                        double items;
+                        double max_ms;
+                    };
+                    std::array<ParRow, BbSections::MainXRay::MaxParTasks> parrows{};
+                    std::size_t pn2 = 0;
+                    const std::size_t pcnt2 = std::min<std::size_t>(
+                        BbSections::main_xray.par_count.load(std::memory_order_acquire),
+                        BbSections::MainXRay::MaxParTasks);
+                    for (std::size_t i = 0; i < pcnt2; ++i) {
+                        const std::uint64_t ct =
+                            BbSections::main_xray.par_tot_cycles[i].load(std::memory_order_relaxed);
+                        const std::uint64_t c0 =
+                            BbSections::main_xray.par_t0_cycles[i].load(std::memory_order_relaxed);
+                        const std::uint64_t cc =
+                            BbSections::main_xray.par_calls[i].load(std::memory_order_relaxed);
+                        const std::uint64_t ci =
+                            BbSections::main_xray.par_items[i].load(std::memory_order_relaxed);
+                        const std::uint64_t cm =
+                            BbSections::main_xray.par_max_cycles[i].exchange(0ULL, std::memory_order_relaxed);
+                        const std::uint64_t dt_ = (mx_seeded && ct >= prev_ptot[i]) ? (ct - prev_ptot[i]) : 0ULL;
+                        const std::uint64_t d0_ = (mx_seeded && c0 >= prev_pt0[i]) ? (c0 - prev_pt0[i]) : 0ULL;
+                        const std::uint64_t dc_ = (mx_seeded && cc >= prev_pcnt[i]) ? (cc - prev_pcnt[i]) : 0ULL;
+                        const std::uint64_t di_ = (mx_seeded && ci >= prev_pitm[i]) ? (ci - prev_pitm[i]) : 0ULL;
+                        prev_ptot[i] = ct;
+                        prev_pt0[i] = c0;
+                        prev_pcnt[i] = cc;
+                        prev_pitm[i] = ci;
+                        if (dt_ > 0 && cyc_per_ms > 0.0) {
+                            const double tms = (double(dt_) / cyc_per_ms) / double(log_df);
+                            if (tms >= 0.02) {
+                                parrows[pn2++] = {i, tms, (double(d0_) / cyc_per_ms) / double(log_df),
+                                                  double(dc_) / double(log_df), double(di_) / double(log_df),
+                                                  double(cm) / cyc_per_ms};
+                            }
+                        }
+                    }
+                    if (mx_seeded && pn2 > 0) {
+                        std::sort(parrows.begin(), parrows.begin() + pn2,
+                                  [](const ParRow& a, const ParRow& b) { return a.tot_ms > b.tot_ms; });
+                        std::printf("GxParTaskXRay/f:");
+                        const std::size_t show = std::min<std::size_t>(pn2, 8);
+                        for (std::size_t k = 0; k < show; ++k) {
+                            const auto& r = parrows[k];
+                            std::printf("%s 0x%llx tot=%.2f(t0=%.2f,max=%.2f,%.0fc/%.0fi)",
+                                        k ? " |" : "",
+                                        static_cast<unsigned long long>(BbSections::main_xray.par_fn_off[r.idx]),
+                                        r.tot_ms, r.t0_ms, r.max_ms, r.calls, r.items);
+                        }
+                        std::printf("\n");
+                    }
+                }
+                } // if (deep_enabled)
+                mx_seeded = true;
+            }
             {
                 const std::uint32_t cnt = log_frame_ms_cnt;
                 log_frame_ms_cnt = 0;
@@ -2945,6 +3410,13 @@ void FpsCounter() {
         // CPU section (active work cleanly separated from FPS cap sleep / Gnm sync + X-Ray sub-rows)
         row_cpu("CPU 1. Game Engine (Work)",
                 h.game_cpu_work_ms, h.avg_game_cpu_work_ms, h.bottleneck_kind == 1);
+        if (xray && h.c1_xray_valid) {
+            row_cpu_sub("  1a. Scene Prep (AdhocDraw)", h.c1_adhoc_ms, h.avg_c1_adhoc_ms);
+            row_cpu_sub("  1b. World & AI (MoveMapStep)", h.c1_movemap_ms, h.avg_c1_movemap_ms);
+            row_cpu_sub("  1c. Graphics & Loc (Gfx+Loc)", h.c1_gfx_loc_ms, h.avg_c1_gfx_loc_ms);
+            row_cpu_sub("  1d. Physics & Cloth (Havok)", h.c1_havok_ms, h.avg_c1_havok_ms);
+            row_cpu_sub("  1e. UI, Draw & Misc Tasks", h.c1_misc_ms, h.avg_c1_misc_ms);
+        }
         const bool cap_sleeping =
             h.fps_cap_active > 0 && (h.fps_cap_sleep_ms >= 0.05f || h.avg_fps_cap_sleep_ms >= 0.05f);
         const bool thread_syncing =
@@ -2964,15 +3436,23 @@ void FpsCounter() {
                 h.a_total_ms, h.avg_a_total_ms, h.bottleneck_kind == 2);
         const bool stage_b_active = (h.b_total_ms >= 0.02f || h.avg_b_total_ms >= 0.02f);
         if (xray) {
-            row_cpu_sub("  2a. Cmd Stream, Cull & FastPSO", h.a_decode_pso_ms, h.avg_a_decode_pso_ms);
-            row_cpu_sub("  2b. Buffers, Vtx/Idx & Ring", h.a_buf_ring_ms, h.avg_a_buf_ring_ms);
-            if (!stage_b_active || h.a_tex_desc_ms >= 0.015f || h.avg_a_tex_desc_ms >= 0.015f) {
-                row_cpu_sub("  2c. Textures & PushDesc", h.a_tex_desc_ms, h.avg_a_tex_desc_ms);
+            if (h.a_pipelined_breakdown) {
+                row_cpu_sub("  2a. PM4 Decode & Regs", h.a_decode_pso_ms, h.avg_a_decode_pso_ms);
+                row_cpu_sub("  2b. FastPSO Select", h.a_buf_ring_ms, h.avg_a_buf_ring_ms);
+                row_cpu_sub("  2c. PostDraw & Pack", h.a_tex_desc_ms, h.avg_a_tex_desc_ms);
+                row_cpu_sub("  2d. Ring Consts", h.a_state_draw_ms, h.avg_a_state_draw_ms);
+                row_cpu_sub("  2e. Draw Misc & Sync", h.a_submit_sync_ms, h.avg_a_submit_sync_ms);
+            } else {
+                row_cpu_sub("  2a. Cmd Stream, Cull & FastPSO", h.a_decode_pso_ms, h.avg_a_decode_pso_ms);
+                row_cpu_sub("  2b. Buffers, Vtx/Idx & Ring", h.a_buf_ring_ms, h.avg_a_buf_ring_ms);
+                if (!stage_b_active || h.a_tex_desc_ms >= 0.015f || h.avg_a_tex_desc_ms >= 0.015f) {
+                    row_cpu_sub("  2c. Textures & PushDesc", h.a_tex_desc_ms, h.avg_a_tex_desc_ms);
+                }
+                if (!stage_b_active || h.a_state_draw_ms >= 0.015f || h.avg_a_state_draw_ms >= 0.015f) {
+                    row_cpu_sub("  2d. RenderPass, State & Draws", h.a_state_draw_ms, h.avg_a_state_draw_ms);
+                }
+                row_cpu_sub("  2e. Queue Submit & Sync", h.a_submit_sync_ms, h.avg_a_submit_sync_ms);
             }
-            if (!stage_b_active || h.a_state_draw_ms >= 0.015f || h.avg_a_state_draw_ms >= 0.015f) {
-                row_cpu_sub("  2d. RenderPass, State & Draws", h.a_state_draw_ms, h.avg_a_state_draw_ms);
-            }
-            row_cpu_sub("  2e. Queue Submit & Sync", h.a_submit_sync_ms, h.avg_a_submit_sync_ms);
         }
         row_cpu("CPU 3. Stage B (Vulkan Record)",
                 h.b_total_ms, h.avg_b_total_ms, h.bottleneck_kind == 3);

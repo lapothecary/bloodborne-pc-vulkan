@@ -1701,6 +1701,8 @@ void Rasterizer::RunDrawPacket(void* context, const u8* data, u32 size) {
     } tick_note{self, guest_in_place ? self.draw_pipe->RunningPacket() : 0};
     if (*reinterpret_cast<const PacketKind*>(data) == PacketKind::Task) {
         BB_SECTION(Task);
+        BbSections::pipe_tasks.store(
+            BbSections::pipe_tasks.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
         self.buffer_cache.NewPacket();
         const auto& task = *reinterpret_cast<const TaskPacket*>(data);
         if (!self.pending_buf_copies.empty() &&

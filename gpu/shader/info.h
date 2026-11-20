@@ -275,11 +275,13 @@ struct Info : InfoPersistent {
 
     /// The flat user data for the current draw: the registers, then what the SRT walker copies.
     void RefreshFlatBuf() {
-        if (flat_buf_replay) {
+        if (flat_buf_replay) [[unlikely]] {
             flattened_ud_buf = *flat_buf_replay;
             return;
         }
-        flattened_ud_buf.resize(srt_info.flattened_bufsize_dw);
+        if (flattened_ud_buf.size() != srt_info.flattened_bufsize_dw) [[unlikely]] {
+            flattened_ud_buf.resize(srt_info.flattened_bufsize_dw);
+        }
         ASSERT(user_data.size() <= NUM_USER_DATA_REGS);
         std::memcpy(flattened_ud_buf.data(), user_data.data(), user_data.size_bytes());
         if (srt_info.walker_func) {

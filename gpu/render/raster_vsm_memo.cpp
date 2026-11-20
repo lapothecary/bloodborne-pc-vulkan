@@ -473,6 +473,7 @@ void VsmShadowMemo::EnrichFaceKey(FaceEntry& f, const VsmTargetKey& key) noexcep
 }
 
 u32 VsmShadowMemo::GetOrAllocateFaceIndex(const VsmTargetKey& key, u64 cur_frame) noexcept {
+    last_non_vsm_cb0_addr = 0;
     if (const s32 existing = FindFaceIndex(key); existing >= 0) {
         EnrichFaceKey(faces[static_cast<size_t>(existing)], key);
         faces[static_cast<size_t>(existing)].last_seen_frame = cur_frame;
@@ -515,6 +516,7 @@ u32 VsmShadowMemo::GetOrAllocateFaceIndex(const VsmTargetKey& key, u64 cur_frame
 
 void VsmShadowMemo::SetScratchLink(const VsmTargetKey& scratch_key, u32 face_idx, bool skip,
                                    bool from_blur, u64 cur_frame) noexcept {
+    last_non_vsm_cb0_addr = 0;
     size_t slot_idx = 0u;
     bool matched = false;
     for (size_t i = 0; i < kMaxScratchLinks; ++i) {
@@ -883,6 +885,32 @@ bool VsmShadowMemo::TryHandleDraw(Rasterizer& rasterizer, const GraphicsPipeline
         return false;
     }
 
+    // Fast-reject non-VSM draws (G-Buffer, LightAcc, SSR, Yebis2, UI: ~85%+ of frame draws)
+    // before DrainRetiredRanges(), stage loops, GetColorSliceSize(), or linear face scans.
+    auto& lp = *rasterizer.liverpool;
+    const auto& regs = lp.regs;
+    if (!pending_face.active && !has_pending_depth_clear && num_deferred_clears == 0u &&
+        !passthrough_target.valid) {
+        const auto& col0 = regs.color_buffers[0];
+        const bool maybe_vsm = col0 && col0.GetDataFmt() == Gcn::DataFormat::Format16_16 &&
+                               col0.GetNumberFmt() == Gcn::NumberFormat::Float;
+        if (!maybe_vsm) [[likely]] {
+            if (!col0) {
+                return false;
+            }
+            const VAddr cb_addr = col0.Address();
+            const u32 cb_info = col0.info.raw;
+            if (cb_addr != last_non_vsm_cb0_addr || cb_info != last_non_vsm_cb0_info) {
+                if (tracked_va_min < tracked_va_max) {
+                    InvalidateOverlappingMemory(cb_addr, col0.GetColorSliceSize());
+                }
+                last_non_vsm_cb0_addr = cb_addr;
+                last_non_vsm_cb0_info = cb_info;
+            }
+            return false;
+        }
+    }
+
     DrainRetiredRanges();
 
     const auto stages = pipeline->GetStages();
@@ -897,8 +925,6 @@ bool VsmShadowMemo::TryHandleDraw(Rasterizer& rasterizer, const GraphicsPipeline
         }
     }
 
-    auto& lp = *rasterizer.liverpool;
-    const auto& regs = lp.regs;
     const auto& gkey = pipeline->GetGraphicsKey();
 
     // -------------------------------------------------------------------------

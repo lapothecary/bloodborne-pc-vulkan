@@ -98,6 +98,75 @@ void NormalizeStageBChunksForPass(LightTileBatcher::StageBChunks& c) noexcept {
     ZeroStageBWordRange(c, static_cast<u32>(offsetof(Gcn::Regs, depth_shader_control) / 4u), 1u);
 }
 
+struct StageBPassMaskTable {
+    LightTileBatcher::StageBChunks mask{};
+    std::array<u8, Gcn::RegDirty::StageBNumChunks> chunk_mode{}; // 0=skip, 1=full_eq, 2=masked
+    u64 check_mask[2]{};
+    StageBPassMaskTable() noexcept {
+        mask.fill(~0u);
+        NormalizeStageBChunksForPass(mask);
+        for (u32 bit = 0; bit < Gcn::RegDirty::StageBNumChunks; ++bit) {
+            const u32* m = &mask[bit * Gcn::RegDirty::StageBChunkWords];
+            bool all_zero = true;
+            bool all_ones = true;
+            for (u32 k = 0; k < Gcn::RegDirty::StageBChunkWords; ++k) {
+                if (m[k] != 0u) all_zero = false;
+                if (m[k] != ~0u) all_ones = false;
+            }
+            chunk_mode[bit] = all_zero ? 0u : (all_ones ? 1u : 2u);
+            if (!all_zero) {
+                if (bit < 64u) {
+                    check_mask[0] |= (1ULL << bit);
+                } else {
+                    check_mask[1] |= (1ULL << (bit - 64u));
+                }
+            }
+        }
+    }
+};
+
+bool StageBMatchesPass(const Gcn::Regs& regs, Gcn::RegDirty& dirty,
+                       const LightTileBatcher::StageBChunks& pass_norm) noexcept {
+    static const StageBPassMaskTable tbl{};
+    u64 d0 = dirty.batch_stage_b_mask[0] & tbl.check_mask[0];
+    u64 d1 = dirty.batch_stage_b_mask[1] & tbl.check_mask[1];
+    if ((d0 | d1) == 0ULL) [[likely]] {
+        dirty.ClearBatchStageBDirty();
+        return true;
+    }
+    auto check_bit = [&](u32 bit) noexcept -> bool {
+        const u8 mode = tbl.chunk_mode[bit];
+        const u32* src = regs.reg_array.data() + Gcn::RegDirty::StageBChunkWordOffset(bit);
+        const u32* ref = &pass_norm[bit * Gcn::RegDirty::StageBChunkWords];
+        if (mode == 1u) {
+            return std::memcmp(src, ref, Gcn::RegDirty::StageBChunkWords * sizeof(u32)) == 0;
+        }
+        const u32* m = &tbl.mask[bit * Gcn::RegDirty::StageBChunkWords];
+        for (u32 k = 0; k < Gcn::RegDirty::StageBChunkWords; ++k) {
+            if ((src[k] & m[k]) != ref[k]) {
+                return false;
+            }
+        }
+        return true;
+    };
+    while (d0) {
+        const u32 bit = static_cast<u32>(std::countr_zero(d0));
+        d0 &= (d0 - 1ULL);
+        if (!check_bit(bit)) {
+            return false;
+        }
+    }
+    while (d1) {
+        const u32 bit = 64u + static_cast<u32>(std::countr_zero(d1));
+        d1 &= (d1 - 1ULL);
+        if (!check_bit(bit)) {
+            return false;
+        }
+    }
+    dirty.ClearBatchStageBDirty();
+    return true;
+}
+
 void MarkStageBDiffDirty(const LightTileBatcher::StageBChunks& prev,
                          const LightTileBatcher::StageBChunks& next,
                          Gcn::RegDirty& dirty) noexcept {
@@ -229,6 +298,7 @@ void LightTileBatcher::WipeCpuShadow() noexcept {
     ++coarse_wipe_bias;
     shadow_min_va = ~VAddr{0};
     shadow_max_va = 0;
+    cached_quad.valid = false;
 }
 
 bool LightTileBatcher::IsBatchedLightAccPsHash(u64 pgm_hash) noexcept {
@@ -348,6 +418,10 @@ void LightTileBatcher::NoteStageACpuCopyBatch(const u32* raw_regions, u32 count)
             if (slot.byte_size == reg.byte_size && slot.dst_va == reg.dst_va &&
                 slot.coarse_e0 == ce0 && slot.coarse_e1 == ce1) {
                 slot.last_use = ++shadow_clock;
+                if (++shadow_write_clock == 0u) {
+                    ++shadow_write_clock;
+                }
+                slot.write_ver = shadow_write_clock;
                 std::memcpy(&shadow_bytes[(set_base + w) * kMaxShadowBytes],
                             reinterpret_cast<const void*>(reg.src_va), reg.byte_size);
                 updated_in_place = true;
@@ -375,6 +449,10 @@ void LightTileBatcher::NoteStageACpuCopyBatch(const u32* raw_regions, u32 count)
         dst_slot.dst_va = reg.dst_va;
         dst_slot.byte_size = reg.byte_size;
         dst_slot.last_use = ++shadow_clock;
+        if (++shadow_write_clock == 0u) {
+            ++shadow_write_clock;
+        }
+        dst_slot.write_ver = shadow_write_clock;
         dst_slot.coarse_e0 = ce0;
         dst_slot.coarse_e1 = ce1;
         shadow_min_va = std::min(shadow_min_va, reg.dst_va);
@@ -433,9 +511,10 @@ void LightTileBatcher::InvalidateCpuShadow(VAddr addr, u64 size) noexcept {
 }
 
 const u8* LightTileBatcher::LookupCpuShadow(VAddr addr, u32 size,
-                                            u32* out_entry_remaining) noexcept {
+                                            u32* out_entry_remaining,
+                                            u32* out_write_ver) noexcept {
     if (!shadow_awake || !addr || size == 0u || size > kMaxShadowBytes || shadow_max_va == 0u ||
-        addr >= shadow_max_va || (addr + size) <= shadow_min_va) [[likely]] {
+        addr >= shadow_max_va || (addr + size) <= shadow_min_va) {
         return nullptr;
     }
     const u64 page = addr >> 11;
@@ -454,6 +533,9 @@ const u8* LightTileBatcher::LookupCpuShadow(VAddr addr, u32 size,
                 slot.last_use = ++shadow_clock;
                 if (out_entry_remaining) {
                     *out_entry_remaining = slot.byte_size;
+                }
+                if (out_write_ver) {
+                    *out_write_ver = slot.write_ver;
                 }
                 return &shadow_bytes[(set_base + w) * kMaxShadowBytes];
             }
@@ -480,6 +562,9 @@ const u8* LightTileBatcher::LookupCpuShadow(VAddr addr, u32 size,
                     slot.last_use = ++shadow_clock;
                     if (out_entry_remaining) {
                         *out_entry_remaining = static_cast<u32>(slot.byte_size - sub_off);
+                    }
+                    if (out_write_ver) {
+                        *out_write_ver = slot.write_ver;
                     }
                     return &shadow_bytes[(set_base + w) * kMaxShadowBytes + sub_off];
                 }
@@ -638,36 +723,61 @@ bool LightTileBatcher::TryBatchDraw(Rasterizer& rasterizer, const GraphicsPipeli
         return fail(fb_layout);
     }
 
-    auto resolve_cb_bytes = [&](const Gcn::Buffer& sharp, u32 min_bytes,
-                                u32& out_size) -> const u8* {
+    auto resolve_cb_bytes = [&](const Gcn::Buffer& sharp, u32 min_bytes, u32& out_size,
+                                u32* out_write_ver = nullptr) -> const u8* {
+        if (out_write_ver) {
+            *out_write_ver = 0u;
+        }
         const VAddr addr = sharp.base_address;
         u64 raw_sz = sharp.GetSize();
-        if (VideoCore::DirectBuffers::IsNativeOwnedAddress(addr)) {
-            raw_sz = VideoCore::DirectBuffers::ClampNativeGpuReadSize(addr, raw_sz);
-        } else if (VideoCore::DirectBuffers::IsTransientCueHeap(addr, 16u)) {
+        // Fast-path 1: Transient CUE heap / Aux CPU ring (2 integer compares, zero 4 MiB table probe).
+        if (VideoCore::DirectBuffers::IsTransientCueHeap(addr, 16u)) {
             raw_sz = VideoCore::DirectBuffers::ClampTransientCueReadSize(addr, raw_sz);
+            if (raw_sz >= min_bytes && raw_sz <= kMaxShadowBytes &&
+                VideoCore::DirectBuffers::IsTransientCueHeap(addr, raw_sz)) {
+                out_size = static_cast<u32>(raw_sz);
+                return reinterpret_cast<const u8*>(addr);
+            }
+            return nullptr;
         }
+        if (raw_sz >= min_bytes && raw_sz <= kMaxShadowBytes &&
+            VideoCore::DirectBuffers::IsTransientAuxCpuRing(addr, raw_sz)) {
+            out_size = static_cast<u32>(raw_sz);
+            return reinterpret_cast<const u8*>(addr);
+        }
+        // Fast-path 2: Stage-A CPU shadow (hits on almost all GXLightAcc `DEFAULT` CBs; when
+        // `raw_sz <= shadow_rem`, `CopyBufferBatch` itself proved `>= raw_sz` valid bytes at `addr`,
+        // skipping the 4 MiB `ExactBufferTable` L3 miss inside `ClampNativeGpuReadSize`).
         u32 shadow_rem = 0u;
-        if (const u8* sh = LookupCpuShadow(addr, min_bytes, &shadow_rem)) {
+        u32 shadow_ver = 0u;
+        if (const u8* sh = LookupCpuShadow(addr, min_bytes, &shadow_rem, &shadow_ver)) {
+            if (raw_sz >= min_bytes && raw_sz <= shadow_rem && raw_sz <= kMaxShadowBytes) [[likely]] {
+                out_size = static_cast<u32>(raw_sz);
+                if (out_write_ver) {
+                    *out_write_ver = shadow_ver;
+                }
+                return sh;
+            }
+            if (VideoCore::DirectBuffers::IsNativeOwnedAddress(addr)) {
+                raw_sz = VideoCore::DirectBuffers::ClampNativeGpuReadSize(addr, raw_sz);
+            }
             const u64 bounded = (raw_sz >= min_bytes && raw_sz <= kMaxShadowBytes)
                                     ? std::min<u64>(raw_sz, shadow_rem)
                                     : u64(shadow_rem);
             if (bounded >= min_bytes && bounded <= kMaxShadowBytes) {
                 out_size = static_cast<u32>(bounded);
+                if (out_write_ver) {
+                    *out_write_ver = shadow_ver;
+                }
                 return sh;
             }
-        }
-        if (raw_sz < min_bytes || raw_sz > kMaxShadowBytes) {
-            return nullptr;
-        }
-        if (VideoCore::DirectBuffers::IsTransientCueHeap(addr, raw_sz) ||
-            VideoCore::DirectBuffers::IsTransientAuxCpuRing(addr, raw_sz)) {
-            out_size = static_cast<u32>(raw_sz);
-            return reinterpret_cast<const u8*>(addr);
         }
         // Native-owned `DEFAULT` ConstantBuffers have stale guest RAM unless updated via
         // `CopyBufferBatch` (which `LookupCpuShadow` catches above).
         if (VideoCore::DirectBuffers::IsNativeOwnedAddress(addr)) {
+            return nullptr;
+        }
+        if (raw_sz < min_bytes || raw_sz > kMaxShadowBytes) {
             return nullptr;
         }
         uintptr_t mapped_end = 0;
@@ -682,12 +792,13 @@ bool LightTileBatcher::TryBatchDraw(Rasterizer& rasterizer, const GraphicsPipeli
 
     u32 vs_cb0_bytes = 0u;
     u32 ssbo1_bytes = 0u;
+    u32 ssbo1_write_ver = 0u;
     u32 ssbo2_bytes = 0u;
     const u8* vs_cb0_ptr = resolve_cb_bytes(vs_cb0_sharp, 4u, vs_cb0_bytes);
     if (!vs_cb0_ptr) {
         return fail(fb_cb0);
     }
-    const u8* ssbo1_ptr = resolve_cb_bytes(ps_b0_sharp, 64u, ssbo1_bytes);
+    const u8* ssbo1_ptr = resolve_cb_bytes(ps_b0_sharp, 64u, ssbo1_bytes, &ssbo1_write_ver);
     if (!ssbo1_ptr) {
         return fail(fb_ssbo1);
     }
@@ -730,92 +841,137 @@ bool LightTileBatcher::TryBatchDraw(Rasterizer& rasterizer, const GraphicsPipeli
     }
     const u32 pos_span = 3u * pos_stride + 16u;
     const u32 uv_span = 3u * uv_stride + 8u;
-    auto resolve_vb_bytes = [&](VAddr addr, u32 span) -> const u8* {
-        if (!addr || span > kMaxShadowBytes) {
-            return nullptr;
-        }
-        if (const u8* sh = LookupCpuShadow(addr, span)) {
-            return sh;
-        }
-        if (VideoCore::DirectBuffers::IsTransientCueHeap(addr, span) ||
-            VideoCore::DirectBuffers::IsTransientAuxCpuRing(addr, span)) {
-            return reinterpret_cast<const u8*>(addr);
-        }
-        uintptr_t mapped_end = 0;
-        if (!BbLookupMappedEnd(addr, mapped_end) || span > (mapped_end - addr)) {
-            return nullptr;
-        }
-        // Immutable native-owned quad VBs (`pShaderRepo + 0x9a0`, `usageType == 1`) store their
-        // initial CPU data directly in guest RAM at `addr`, while neighbor `DEFAULT` CBs on the
-        // same 4 KiB page mark `PendingWriteOverlaps` / `IsRegionGpuModified` at 4 KiB granularity.
-        if (VideoCore::DirectBuffers::IsNativeOwnedAddress(addr) &&
-            VideoCore::DirectBuffers::ClampNativeGpuReadSize(addr, span) >= span) {
-            return reinterpret_cast<const u8*>(addr);
-        }
-        if (rasterizer.PendingWriteOverlaps(addr, span) ||
-            rasterizer.buffer_cache.IsRegionGpuModified(addr, span)) {
-            return nullptr;
-        }
-        return reinterpret_cast<const u8*>(addr);
-    };
-    const u8* pos_bytes = resolve_vb_bytes(pos_vb.base_address, pos_span);
-    const u8* uv_bytes = resolve_vb_bytes(uv_vb.base_address, uv_span);
-    if (!pos_bytes || !uv_bytes) {
-        return fail(fb_vb);
-    }
-
-    float q_pos[4][4]{};
-    float q_uv[4][2]{};
     float qx_min = 1e30f, qx_max = -1e30f;
     float qy_min = 1e30f, qy_max = -1e30f;
-    for (u32 k = 0; k < 4u; ++k) {
-        std::memcpy(q_pos[k], pos_bytes + k * pos_stride, 16u);
-        std::memcpy(q_uv[k], uv_bytes + k * uv_stride, 8u);
-        if (!std::isfinite(q_pos[k][0]) || !std::isfinite(q_pos[k][1]) ||
-            !std::isfinite(q_pos[k][2]) || !std::isfinite(q_pos[k][3]) ||
-            !std::isfinite(q_uv[k][0]) || !std::isfinite(q_uv[k][1]) ||
-            std::abs(q_pos[k][3] - 1.0f) > 1e-4f) {
-            return fail(fb_quad);
-        }
-        qx_min = std::min(qx_min, q_pos[k][0]);
-        qx_max = std::max(qx_max, q_pos[k][0]);
-        qy_min = std::min(qy_min, q_pos[k][1]);
-        qy_max = std::max(qy_max, q_pos[k][1]);
-    }
-    if ((qx_max - qx_min) <= 1e-3f || (qy_max - qy_min) <= 1e-3f) {
-        return fail(fb_quad);
-    }
-
-    u32 corner_mask = 0u;
-    u32 corner_vtx[4]{0, 0, 0, 0};
+    float u_at_xlo = 0.0f, u_at_xhi = 0.0f, v_at_ylo = 0.0f, v_at_yhi = 0.0f;
     bool vtx_x_hi[4]{};
     bool vtx_y_hi[4]{};
-    for (u32 k = 0; k < 4u; ++k) {
-        const bool x_lo = std::abs(q_pos[k][0] - qx_min) <= 1e-4f;
-        const bool x_hi = std::abs(q_pos[k][0] - qx_max) <= 1e-4f;
-        const bool y_lo = std::abs(q_pos[k][1] - qy_min) <= 1e-4f;
-        const bool y_hi = std::abs(q_pos[k][1] - qy_max) <= 1e-4f;
-        if ((!x_lo && !x_hi) || (!y_lo && !y_hi)) {
+
+    const bool quad_hit =
+        cached_quad.valid && cached_quad.pos_addr == pos_vb.base_address &&
+        cached_quad.uv_addr == uv_vb.base_address && cached_quad.pos_stride == pos_stride &&
+        cached_quad.uv_stride == uv_stride &&
+        !(pos_vb.base_address + pos_span > shadow_min_va && pos_vb.base_address < shadow_max_va) &&
+        !(uv_vb.base_address + uv_span > shadow_min_va && uv_vb.base_address < shadow_max_va);
+    if (quad_hit) [[likely]] {
+        qx_min = cached_quad.qx_min;
+        qx_max = cached_quad.qx_max;
+        qy_min = cached_quad.qy_min;
+        qy_max = cached_quad.qy_max;
+        u_at_xlo = cached_quad.u_at_xlo;
+        u_at_xhi = cached_quad.u_at_xhi;
+        v_at_ylo = cached_quad.v_at_ylo;
+        v_at_yhi = cached_quad.v_at_yhi;
+        for (u32 k = 0; k < 4u; ++k) {
+            vtx_x_hi[k] = cached_quad.vtx_x_hi[k];
+            vtx_y_hi[k] = cached_quad.vtx_y_hi[k];
+        }
+    } else {
+        auto resolve_vb_bytes = [&](VAddr addr, u32 span, bool& is_immutable_native) -> const u8* {
+            is_immutable_native = false;
+            if (!addr || span > kMaxShadowBytes) {
+                return nullptr;
+            }
+            if (const u8* sh = LookupCpuShadow(addr, span)) {
+                return sh;
+            }
+            if (VideoCore::DirectBuffers::IsTransientCueHeap(addr, span) ||
+                VideoCore::DirectBuffers::IsTransientAuxCpuRing(addr, span)) {
+                return reinterpret_cast<const u8*>(addr);
+            }
+            uintptr_t mapped_end = 0;
+            if (!BbLookupMappedEnd(addr, mapped_end) || span > (mapped_end - addr)) {
+                return nullptr;
+            }
+            // Immutable native-owned quad VBs (`pShaderRepo + 0x9a0`, `usageType == 1`) store their
+            // initial CPU data directly in guest RAM at `addr`, while neighbor `DEFAULT` CBs on the
+            // same 4 KiB page mark `PendingWriteOverlaps` / `IsRegionGpuModified` at 4 KiB granularity.
+            if (VideoCore::DirectBuffers::IsNativeOwnedAddress(addr) &&
+                VideoCore::DirectBuffers::ClampNativeGpuReadSize(addr, span) >= span) {
+                is_immutable_native = true;
+                return reinterpret_cast<const u8*>(addr);
+            }
+            if (rasterizer.PendingWriteOverlaps(addr, span) ||
+                rasterizer.buffer_cache.IsRegionGpuModified(addr, span)) {
+                return nullptr;
+            }
+            return reinterpret_cast<const u8*>(addr);
+        };
+        bool pos_imm = false, uv_imm = false;
+        const u8* pos_bytes = resolve_vb_bytes(pos_vb.base_address, pos_span, pos_imm);
+        const u8* uv_bytes = resolve_vb_bytes(uv_vb.base_address, uv_span, uv_imm);
+        if (!pos_bytes || !uv_bytes) {
+            return fail(fb_vb);
+        }
+
+        float q_pos[4][4]{};
+        float q_uv[4][2]{};
+        for (u32 k = 0; k < 4u; ++k) {
+            std::memcpy(q_pos[k], pos_bytes + k * pos_stride, 16u);
+            std::memcpy(q_uv[k], uv_bytes + k * uv_stride, 8u);
+            if (!std::isfinite(q_pos[k][0]) || !std::isfinite(q_pos[k][1]) ||
+                !std::isfinite(q_pos[k][2]) || !std::isfinite(q_pos[k][3]) ||
+                !std::isfinite(q_uv[k][0]) || !std::isfinite(q_uv[k][1]) ||
+                std::abs(q_pos[k][3] - 1.0f) > 1e-4f) {
+                return fail(fb_quad);
+            }
+            qx_min = std::min(qx_min, q_pos[k][0]);
+            qx_max = std::max(qx_max, q_pos[k][0]);
+            qy_min = std::min(qy_min, q_pos[k][1]);
+            qy_max = std::max(qy_max, q_pos[k][1]);
+        }
+        if ((qx_max - qx_min) <= 1e-3f || (qy_max - qy_min) <= 1e-3f) {
             return fail(fb_quad);
         }
-        vtx_x_hi[k] = x_hi;
-        vtx_y_hi[k] = y_hi;
-        const u32 c = (x_hi ? 1u : 0u) | (y_hi ? 2u : 0u);
-        corner_mask |= (1u << c);
-        corner_vtx[c] = k;
-    }
-    if (corner_mask != 0xFu) {
-        return fail(fb_quad);
-    }
-    const float u_at_xlo = q_uv[corner_vtx[0]][0];
-    const float u_at_xhi = q_uv[corner_vtx[1]][0];
-    const float v_at_ylo = q_uv[corner_vtx[0]][1];
-    const float v_at_yhi = q_uv[corner_vtx[2]][1];
-    if (std::abs(q_uv[corner_vtx[2]][0] - u_at_xlo) > 1e-4f ||
-        std::abs(q_uv[corner_vtx[3]][0] - u_at_xhi) > 1e-4f ||
-        std::abs(q_uv[corner_vtx[1]][1] - v_at_ylo) > 1e-4f ||
-        std::abs(q_uv[corner_vtx[3]][1] - v_at_yhi) > 1e-4f) {
-        return fail(fb_quad);
+
+        u32 corner_mask = 0u;
+        u32 corner_vtx[4]{0, 0, 0, 0};
+        for (u32 k = 0; k < 4u; ++k) {
+            const bool x_lo = std::abs(q_pos[k][0] - qx_min) <= 1e-4f;
+            const bool x_hi = std::abs(q_pos[k][0] - qx_max) <= 1e-4f;
+            const bool y_lo = std::abs(q_pos[k][1] - qy_min) <= 1e-4f;
+            const bool y_hi = std::abs(q_pos[k][1] - qy_max) <= 1e-4f;
+            if ((!x_lo && !x_hi) || (!y_lo && !y_hi)) {
+                return fail(fb_quad);
+            }
+            vtx_x_hi[k] = x_hi;
+            vtx_y_hi[k] = y_hi;
+            const u32 c = (x_hi ? 1u : 0u) | (y_hi ? 2u : 0u);
+            corner_mask |= (1u << c);
+            corner_vtx[c] = k;
+        }
+        if (corner_mask != 0xFu) {
+            return fail(fb_quad);
+        }
+        u_at_xlo = q_uv[corner_vtx[0]][0];
+        u_at_xhi = q_uv[corner_vtx[1]][0];
+        v_at_ylo = q_uv[corner_vtx[0]][1];
+        v_at_yhi = q_uv[corner_vtx[2]][1];
+        if (std::abs(q_uv[corner_vtx[2]][0] - u_at_xlo) > 1e-4f ||
+            std::abs(q_uv[corner_vtx[3]][0] - u_at_xhi) > 1e-4f ||
+            std::abs(q_uv[corner_vtx[1]][1] - v_at_ylo) > 1e-4f ||
+            std::abs(q_uv[corner_vtx[3]][1] - v_at_yhi) > 1e-4f) {
+            return fail(fb_quad);
+        }
+        if (pos_imm && uv_imm) {
+            cached_quad.valid = true;
+            cached_quad.pos_addr = pos_vb.base_address;
+            cached_quad.uv_addr = uv_vb.base_address;
+            cached_quad.pos_stride = pos_stride;
+            cached_quad.uv_stride = uv_stride;
+            cached_quad.qx_min = qx_min;
+            cached_quad.qx_max = qx_max;
+            cached_quad.qy_min = qy_min;
+            cached_quad.qy_max = qy_max;
+            cached_quad.u_at_xlo = u_at_xlo;
+            cached_quad.u_at_xhi = u_at_xhi;
+            cached_quad.v_at_ylo = v_at_ylo;
+            cached_quad.v_at_yhi = v_at_yhi;
+            for (u32 k = 0; k < 4u; ++k) {
+                cached_quad.vtx_x_hi[k] = vtx_x_hi[k];
+                cached_quad.vtx_y_hi[k] = vtx_y_hi[k];
+            }
+        }
     }
 
     const auto& vp = regs.viewports[0];
@@ -830,11 +986,7 @@ bool LightTileBatcher::TryBatchDraw(Rasterizer& rasterizer, const GraphicsPipeli
         return false;
     }
 
-    // Check pass-level state compatibility against any open light-tile batch pass:
-    StageBChunks cur_base_chunks{};
-    CaptureStageBChunks(regs, cur_base_chunks);
-    StageBChunks cur_norm_chunks = cur_base_chunks;
-    NormalizeStageBChunksForPass(cur_norm_chunks);
+    // Check pass-level state compatibility against any open light-tile batch pass (zero-copy!).
     const bool cur_commutative = IsCommutativeLightBlend(pipeline);
 
     if (pass_active) {
@@ -846,8 +998,7 @@ bool LightTileBatcher::TryBatchDraw(Rasterizer& rasterizer, const GraphicsPipeli
                         sizeof(pass_cb_uid)) == 0 &&
             std::memcmp(rasterizer.liverpool->last_cb_extent.data(), pass_cb_extent.data(),
                         sizeof(pass_cb_extent)) == 0 &&
-            std::memcmp(cur_norm_chunks.data(), pass_norm_chunks.data(),
-                        sizeof(StageBChunks)) == 0;
+            StageBMatchesPass(regs, rasterizer.liverpool->pipe_dirty, pass_norm_chunks);
         if (!same_pass) {
             Flush(rasterizer);
         }
@@ -912,108 +1063,170 @@ bool LightTileBatcher::TryBatchDraw(Rasterizer& rasterizer, const GraphicsPipeli
         return true;
     }
 
-    // Extract PS `T#` and `S#` descriptors and hash `(pipeline, ssbo_1, T#[], S#[])`.
-    std::array<Gcn::Image, 32> cand_images{};
-    std::array<Gcn::Sampler, 16> cand_samplers{};
-    if (ps->images.size() > cand_images.size() || ps->samplers.size() > cand_samplers.size()) {
-        ++stat_fallbacks;
-        return false;
-    }
-    const u32 num_ps_img = static_cast<u32>(ps->images.size());
-    const u32 num_ps_smp = static_cast<u32>(ps->samplers.size());
-    for (u32 i = 0; i < num_ps_img; ++i) {
-        if (ps->images[i].is_written) {
-            ++stat_fallbacks;
-            return false;
-        }
-        cand_images[i] = ps->images[i].GetSharp(*ps);
-    }
-    for (u32 i = 0; i < num_ps_smp; ++i) {
-        cand_samplers[i] = ps->samplers[i].GetSharp(*ps);
-    }
-
-    u64 res_hash = reinterpret_cast<uintptr_t>(pipeline) ^ (u64(ssbo1_bytes) * 0x9E3779B97F4A7C15ULL);
-    res_hash = XXH3_64bits_withSeed(ssbo1_ptr, ssbo1_bytes, res_hash);
-    if (num_ps_img != 0u) {
-        res_hash = XXH3_64bits_withSeed(cand_images.data(), num_ps_img * sizeof(Gcn::Image),
-                                        res_hash);
-    }
-    if (num_ps_smp != 0u) {
-        res_hash = XXH3_64bits_withSeed(cand_samplers.data(), num_ps_smp * sizeof(Gcn::Sampler),
-                                        res_hash);
-    }
-    std::array<u32, 128> cand_norm_flat{};
-    u32 num_norm_flat = 0u;
-    if (ps_flatbuf_idx != ~0u && !ps->flattened_ud_buf.empty()) {
-        if (ps->flattened_ud_buf.size() > cand_norm_flat.size()) {
-            return fail(fb_layout);
-        }
-        num_norm_flat = static_cast<u32>(ps->flattened_ud_buf.size());
-        std::memcpy(cand_norm_flat.data(), ps->flattened_ud_buf.data(),
-                    num_norm_flat * sizeof(u32));
-        const auto& sf1 = ps->buffers[ps_buf_idx[1]].sharp_fetch;
-        for (u32 d = 0; d < 4u; ++d) {
-            if (((sf1.load_mask >> d) & 1u) != 0u && sf1.offsets[d] < num_norm_flat) {
-                cand_norm_flat[sf1.offsets[d]] = 0u;
-            }
-        }
-        res_hash =
-            XXH3_64bits_withSeed(cand_norm_flat.data(), num_norm_flat * sizeof(u32), res_hash);
-    }
-
     const u32 aligned_ssbo2_bytes = Common::AlignUp(ssbo2_bytes, 16u);
     const u32 add_ssbo2_dwords = 4u + (aligned_ssbo2_bytes >> 2u);
 
-    auto group_matches = [&](const BatchGroup& g) noexcept {
-        if (g.pipeline != pipeline || g.resource_hash != res_hash ||
-            g.ssbo1_bytes != ssbo1_bytes || g.ps_images.size() != num_ps_img ||
-            g.ps_samplers.size() != num_ps_smp || g.norm_ps_flat.size() != num_norm_flat ||
-            g.has_vport_scissor != use_vp_sc) {
-            return false;
-        }
-        if (use_vp_sc &&
-            g.union_vport_scissor0.window_offset_disable !=
-                regs.viewport_scissors[0].window_offset_disable) {
-            return false;
-        }
-        if (g.ssbo2_dwords.size() + add_ssbo2_dwords > kMaxGroupSsbo2Dwords) {
-            return false;
-        }
-        if (std::memcmp(g.ssbo1.data(), ssbo1_ptr, ssbo1_bytes) != 0) {
-            return false;
-        }
-        if (num_ps_img != 0u &&
-            std::memcmp(g.ps_images.data(), cand_images.data(),
-                        num_ps_img * sizeof(Gcn::Image)) != 0) {
-            return false;
-        }
-        if (num_ps_smp != 0u &&
-            std::memcmp(g.ps_samplers.data(), cand_samplers.data(),
-                        num_ps_smp * sizeof(Gcn::Sampler)) != 0) {
-            return false;
-        }
-        if (num_norm_flat != 0u &&
-            std::memcmp(g.norm_ps_flat.data(), cand_norm_flat.data(),
-                        num_norm_flat * sizeof(u32)) != 0) {
-            return false;
-        }
-        return true;
-    };
-
+    // Fast-path: consecutive tiles in `GXLightAcc` almost always share the exact same group as
+    // `last_group_idx`, with `ps->flattened_ud_buf` differing ONLY at `ssbo2`'s 4 V# dwords.
+    // Checking `ps->flattened_ud_buf` directly proves all PS `T#`s, `S#`s, and `norm_ps_flat` are
+    // bit-identical without extracting 16 images or running 4x `XXH3_64bits_withSeed`!
     BatchGroup* target_group = nullptr;
     if (pass_active && active_groups != 0u) {
-        if (cur_commutative) {
-            for (u32 i = 0; i < active_groups; ++i) {
-                if (group_matches(groups[i])) {
-                    target_group = &groups[i];
-                    break;
+        const u32 fast_idx = (cur_commutative && last_group_idx < active_groups)
+                                 ? last_group_idx
+                                 : (active_groups - 1u);
+        auto& g = groups[fast_idx];
+        if (g.pipeline == pipeline && g.ssbo1_bytes == ssbo1_bytes &&
+            g.has_vport_scissor == use_vp_sc && g.ps_stage_slot < g.num_stages &&
+            (!use_vp_sc ||
+             g.union_vport_scissor0.window_offset_disable ==
+                 regs.viewport_scissors[0].window_offset_disable) &&
+            g.ssbo2_dwords.size() + add_ssbo2_dwords <= kMaxGroupSsbo2Dwords) {
+            const auto& ref_flat = g.stages[g.ps_stage_slot].flattened_ud_buf;
+            const auto& cur_flat = ps->flattened_ud_buf;
+            if (cur_flat.size() == ref_flat.size()) {
+                const auto& sf1 = ps->buffers[ps_buf_idx[1]].sharp_fetch;
+                const u32 n = static_cast<u32>(cur_flat.size());
+                const u32* a = cur_flat.data();
+                const u32* b = ref_flat.data();
+                bool flat_ok = true;
+                for (u32 k = 0; k < n; ++k) {
+                    if (a[k] != b[k]) {
+                        bool is_s2 = false;
+                        for (u32 d = 0; d < 4u; ++d) {
+                            if (((sf1.load_mask >> d) & 1u) != 0u && sf1.offsets[d] == k) {
+                                is_s2 = true;
+                                break;
+                            }
+                        }
+                        if (!is_s2) {
+                            flat_ok = false;
+                            break;
+                        }
+                    }
+                }
+                if (flat_ok) {
+                    const bool ssbo1_same =
+                        (ssbo1_write_ver != 0u && ssbo1_write_ver == g.ssbo1_write_ver &&
+                         ps_b0_sharp.base_address == g.ssbo1_addr) ||
+                        std::memcmp(g.ssbo1.data(), ssbo1_ptr, ssbo1_bytes) == 0;
+                    if (ssbo1_same) {
+                        target_group = &g;
+                        last_group_idx = fast_idx;
+                    }
                 }
             }
-        } else {
-            if (group_matches(groups[active_groups - 1u])) {
-                target_group = &groups[active_groups - 1u];
+        }
+    }
+
+    // General path (only when switching groups or opening a new group):
+    std::array<Gcn::Image, 32> cand_images;
+    std::array<Gcn::Sampler, 16> cand_samplers;
+    std::array<u32, 128> cand_norm_flat;
+    u32 num_ps_img = 0u;
+    u32 num_ps_smp = 0u;
+    u32 num_norm_flat = 0u;
+    u64 res_hash = 0u;
+    if (!target_group) {
+        if (ps->images.size() > cand_images.size() || ps->samplers.size() > cand_samplers.size()) {
+            ++stat_fallbacks;
+            return false;
+        }
+        num_ps_img = static_cast<u32>(ps->images.size());
+        num_ps_smp = static_cast<u32>(ps->samplers.size());
+        for (u32 i = 0; i < num_ps_img; ++i) {
+            if (ps->images[i].is_written) {
+                ++stat_fallbacks;
+                return false;
+            }
+            cand_images[i] = ps->images[i].GetSharp(*ps);
+        }
+        for (u32 i = 0; i < num_ps_smp; ++i) {
+            cand_samplers[i] = ps->samplers[i].GetSharp(*ps);
+        }
+
+        res_hash =
+            reinterpret_cast<uintptr_t>(pipeline) ^ (u64(ssbo1_bytes) * 0x9E3779B97F4A7C15ULL);
+        res_hash = XXH3_64bits_withSeed(ssbo1_ptr, ssbo1_bytes, res_hash);
+        if (num_ps_img != 0u) {
+            res_hash = XXH3_64bits_withSeed(cand_images.data(), num_ps_img * sizeof(Gcn::Image),
+                                            res_hash);
+        }
+        if (num_ps_smp != 0u) {
+            res_hash = XXH3_64bits_withSeed(cand_samplers.data(),
+                                            num_ps_smp * sizeof(Gcn::Sampler), res_hash);
+        }
+        if (ps_flatbuf_idx != ~0u && !ps->flattened_ud_buf.empty()) {
+            if (ps->flattened_ud_buf.size() > cand_norm_flat.size()) {
+                return fail(fb_layout);
+            }
+            num_norm_flat = static_cast<u32>(ps->flattened_ud_buf.size());
+            std::memcpy(cand_norm_flat.data(), ps->flattened_ud_buf.data(),
+                        num_norm_flat * sizeof(u32));
+            const auto& sf1 = ps->buffers[ps_buf_idx[1]].sharp_fetch;
+            for (u32 d = 0; d < 4u; ++d) {
+                if (((sf1.load_mask >> d) & 1u) != 0u && sf1.offsets[d] < num_norm_flat) {
+                    cand_norm_flat[sf1.offsets[d]] = 0u;
+                }
+            }
+            res_hash = XXH3_64bits_withSeed(cand_norm_flat.data(), num_norm_flat * sizeof(u32),
+                                            res_hash);
+        }
+
+        auto group_matches = [&](const BatchGroup& g) noexcept {
+            if (g.pipeline != pipeline || g.resource_hash != res_hash ||
+                g.ssbo1_bytes != ssbo1_bytes || g.ps_images.size() != num_ps_img ||
+                g.ps_samplers.size() != num_ps_smp || g.norm_ps_flat.size() != num_norm_flat ||
+                g.has_vport_scissor != use_vp_sc) {
+                return false;
+            }
+            if (use_vp_sc &&
+                g.union_vport_scissor0.window_offset_disable !=
+                    regs.viewport_scissors[0].window_offset_disable) {
+                return false;
+            }
+            if (g.ssbo2_dwords.size() + add_ssbo2_dwords > kMaxGroupSsbo2Dwords) {
+                return false;
+            }
+            if (!((ssbo1_write_ver != 0u && ssbo1_write_ver == g.ssbo1_write_ver &&
+                   ps_b0_sharp.base_address == g.ssbo1_addr) ||
+                  std::memcmp(g.ssbo1.data(), ssbo1_ptr, ssbo1_bytes) == 0)) {
+                return false;
+            }
+            if (num_ps_img != 0u &&
+                std::memcmp(g.ps_images.data(), cand_images.data(),
+                            num_ps_img * sizeof(Gcn::Image)) != 0) {
+                return false;
+            }
+            if (num_ps_smp != 0u &&
+                std::memcmp(g.ps_samplers.data(), cand_samplers.data(),
+                            num_ps_smp * sizeof(Gcn::Sampler)) != 0) {
+                return false;
+            }
+            if (num_norm_flat != 0u &&
+                std::memcmp(g.norm_ps_flat.data(), cand_norm_flat.data(),
+                            num_norm_flat * sizeof(u32)) != 0) {
+                return false;
+            }
+            return true;
+        };
+
+        if (pass_active && active_groups != 0u) {
+            if (cur_commutative) {
+                for (u32 i = 0; i < active_groups; ++i) {
+                    if (group_matches(groups[i])) {
+                        target_group = &groups[i];
+                        last_group_idx = i;
+                        break;
+                    }
+                }
             } else {
-                Flush(rasterizer);
+                if (group_matches(groups[active_groups - 1u])) {
+                    target_group = &groups[active_groups - 1u];
+                    last_group_idx = active_groups - 1u;
+                } else {
+                    Flush(rasterizer);
+                }
             }
         }
     }
@@ -1025,7 +1238,9 @@ bool LightTileBatcher::TryBatchDraw(Rasterizer& rasterizer, const GraphicsPipeli
     if (!pass_active) {
         pass_active = true;
         pass_commutative_blend = cur_commutative;
-        pass_norm_chunks = cur_norm_chunks;
+        CaptureStageBChunks(regs, pass_norm_chunks);
+        NormalizeStageBChunksForPass(pass_norm_chunks);
+        rasterizer.liverpool->pipe_dirty.ClearBatchStageBDirty();
         pass_cb_extent = rasterizer.liverpool->last_cb_extent;
         pass_db_extent = rasterizer.liverpool->last_db_extent;
         pass_cb_uid = rasterizer.liverpool->last_cb_uid;
@@ -1033,11 +1248,14 @@ bool LightTileBatcher::TryBatchDraw(Rasterizer& rasterizer, const GraphicsPipeli
     }
 
     if (!target_group) {
+        last_group_idx = active_groups;
         target_group = &groups[active_groups++];
         target_group->Reset();
         target_group->pipeline = pipeline;
         target_group->resource_hash = res_hash;
+        target_group->ssbo1_addr = ps_b0_sharp.base_address;
         target_group->ssbo1_bytes = ssbo1_bytes;
+        target_group->ssbo1_write_ver = ssbo1_write_ver;
         std::memcpy(target_group->ssbo1.data(), ssbo1_ptr, ssbo1_bytes);
         target_group->ps_images.assign(cand_images.begin(), cand_images.begin() + num_ps_img);
         target_group->ps_samplers.assign(cand_samplers.begin(), cand_samplers.begin() + num_ps_smp);
@@ -1045,7 +1263,7 @@ bool LightTileBatcher::TryBatchDraw(Rasterizer& rasterizer, const GraphicsPipeli
                                           cand_norm_flat.begin() + num_norm_flat);
         target_group->orig_vsharps = {orig_vsharps[0], orig_vsharps[1]};
         target_group->attr_semantics = {sem0, sem1};
-        target_group->base_chunks = cur_base_chunks;
+        CaptureStageBChunks(regs, target_group->base_chunks);
         target_group->has_vport_scissor = use_vp_sc;
         target_group->union_screen_scissor = regs.screen_scissor;
         if (use_vp_sc) {
@@ -1057,7 +1275,8 @@ bool LightTileBatcher::TryBatchDraw(Rasterizer& rasterizer, const GraphicsPipeli
             if (!st) {
                 continue;
             }
-            auto& snap = target_group->stages[slot++];
+            const u32 cur_slot = slot++;
+            auto& snap = target_group->stages[cur_slot];
             snap.pgm_base = st->pgm_base;
             snap.user_data.assign(st->user_data.begin(), st->user_data.end());
             snap.flattened_ud_buf.assign(st->flattened_ud_buf.begin(), st->flattened_ud_buf.end());
@@ -1066,6 +1285,7 @@ bool LightTileBatcher::TryBatchDraw(Rasterizer& rasterizer, const GraphicsPipeli
                 snap.num_non_special_bufs = 1u;
                 snap.flatbuf_idx = vs_flatbuf_idx;
             } else {
+                target_group->ps_stage_slot = cur_slot;
                 snap.non_special_buf_indices[0] = ps_buf_idx[0];
                 snap.non_special_buf_indices[1] = ps_buf_idx[1];
                 snap.num_non_special_bufs = 2u;
@@ -1349,6 +1569,8 @@ void LightTileBatcher::Flush(Rasterizer& rasterizer) {
     } else {
         lp.pipe_dirty = saved_dirty;
     }
+    lp.pipe_dirty.MarkAllBatchStageBDirty();
+    last_group_idx = 0u;
 
     if (!first_active_logged && pending_tiles >= 16u && any_emitted) {
         first_active_logged = true;

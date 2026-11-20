@@ -879,6 +879,7 @@ inline void ApplyProcessThreadTopology() {
             boost_prio = true;
         } else if (starts_with(comm, "GXWorker")) {
             target_mask = &topo.gx_workers;
+            boost_prio = true;
         } else if (starts_with(comm, "HavokWorker") ||
                    starts_with(comm, "CSChrThread") ||
                    starts_with(comm, "CSClothThread") ||

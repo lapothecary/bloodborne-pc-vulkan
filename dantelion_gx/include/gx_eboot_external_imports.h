@@ -24014,6 +24014,8 @@ __attribute__((weak, visibility("hidden"))) void BbGoldenEngine_NotifyGpuSurface
 __attribute__((weak, visibility("hidden"))) void BbGoldenEngine_OnDrawCall(uint32_t, uint32_t, bool, bool) {}
 __attribute__((weak, visibility("hidden"))) void BbGoldenEngine_OnDispatchCall(uint32_t, uint32_t, uint32_t, bool) {}
 __attribute__((weak, visibility("hidden"))) void BbGoldenEngine_UpgradeResourceCache(void**, uint32_t*) {}
+__attribute__((weak, visibility("hidden"))) void __gx_sysv_wait_u32(const void*, uint32_t) noexcept {}
+__attribute__((weak, visibility("hidden"))) void __gx_sysv_notify_one_u32(void*) noexcept {}
 #endif
 } // extern "C"
 #endif // GX_DISABLE_WEAK_EXTERNAL_IMPORTS

@@ -82,6 +82,7 @@ BB_ENV(BB_RENDER_RES, SETTING, "=WxH: render resolution through the startup patc
 BB_ENV(BB_SAVE_LOG, SETTING, "=1: the log and frame statistics also kept in logs/")
 BB_ENV(BB_LOG_TIMESTAMPS, INTERNAL, "=1: wrapper already adds millisecond timestamps to every log line")
 BB_ENV(BB_FORCE_PREPARE, DEBUG, "=1: bypass incremental boot-linked.bin cache and re-run prepare/link")
+BB_ENV(BB_MAIN_XRAY, DEBUG, "=1: enable deep main-thread & GXWorkerTaskPool diagnostic probes; =0: disable F9 CPU 1 X-Ray")
 BB_ENV(BB_BOOT_SPLASH, SETTING, "=0: disable official sce_sys/pic1.png PS4 boot splash screen")
 BB_ENV(BB_SHADER_PROGRESS, SETTING, "=0: no shader compilation progress on screen")
 BB_ENV(BB_SHADNET_NPID, SETTING, "the shadNet account name (the launcher's)")

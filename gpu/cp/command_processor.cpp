@@ -501,6 +501,7 @@ constexpr u32 ComputeWords = sizeof(ComputeProgram) / 4;
     if (dirty) {
         dirty->Clear();
         dirty->reset = true;
+        dirty->MarkAllBatchStageBDirty();
     }
     BumpPsoAndDyn(pso_sig_epoch, dyn_reg_epoch);
     if (gen == 4u) {
@@ -717,6 +718,7 @@ bool CommandProcessor::ApplyGraphicsRegisterPacket(Regs& regs, const u32* packet
         if (dirty) {
             dirty->Clear();
             dirty->reset = true;
+            dirty->MarkAllBatchStageBDirty();
         }
         BumpPsoAndDyn(pso_sig_epoch, dyn_reg_epoch);
         break;

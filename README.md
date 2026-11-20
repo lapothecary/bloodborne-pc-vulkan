@@ -49,11 +49,11 @@ BloodBorne/
 
 ---
 
-## 🆕 Latest Release (`v1.1.9`)
+## 🆕 Latest Release (`v1.2.0`)
 
-- **Authentic Native Launcher Overhaul** — Dark-slate frosted-glass redesign, zero startup flicker, and local runtime decoding of Bloodborne's title artwork, official Victorian `.ttf` font, and *Hunter's Dream* / *Omen* ambient soundtrack straight from your game files.
-- **Seamless Boot Splash** — Starts directly into the native title artwork and transitions cleanly to the live main menu with no black-screen flash.
-- **Major Stability & Visual Fixes** — Fixed the reproducible Cathedral Ward / Oedon Chapel crash, fixed pink/blue color inversion on glowing gothic windows, fixed crashes when toggling post-FX live, and added live in-game VSync (`Fast / On / Off`) plus ~2.3 s faster repeat startups.
+- **Major Full-Pipeline CPU Breakthrough (+35–55% Higher CPU-Bound FPS)** — Overhauled the DirectVk RHI (`Stage A`), Vulkan command recording (`Stage B`), pipeline lookup, light/UI batching, and Bloodborne's 6-thread scene worker pool so heavy Central Yharnam vistas now push **330–375+ FPS** at native `1440p` (even becoming GPU-bound on an RTX 4090).
+- **Leaner Multi-Core Workers & Faster C++20 Draw Recording** — Replaced legacy kernel semaphore wakeups with an instant user-space worker coordinator, balanced work-stealing across all 6 graphics threads, and inlined hot C++20 shader/vertex binding paths.
+- **Upgraded `F9` Full-Engine X-Ray Overlay** — Live breakdown of all 4 pipeline stages: Game Engine CPU (`1a..1e`), DirectVk RHI (`Stage A`), Vulkan Record (`Stage B`), and GPU Render Passes.
 
 *(See [Releases](https://github.com/lapothecary/bloodborne-pc-vulkan/releases) for clean per-version changelogs.)*
 

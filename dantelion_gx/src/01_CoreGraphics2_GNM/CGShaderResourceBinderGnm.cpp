@@ -108,6 +108,111 @@ static_assert(sizeof(CGShaderResourceBinderGnm) == 0xb370, "Exact 0xb370 CGShade
 // ============================================================================
 
 namespace {
+
+// Exact 1:1 inline fast-path for `CGResourceStagingHashMapGnm_FindStagingBuffer` (`0x26ae840`).
+// Avoids ~8,000 cross-TU trampoline calls/frame on VS/PS/CS constant buffers.
+inline void* FastFindStagingBuffer(void* map_raw, const void* resource_key_raw) noexcept {
+    const auto* map = static_cast<const uint8_t*>(map_raw);
+    const auto* resource_key = static_cast<void* const*>(resource_key_raw);
+    const uint32_t entry_count = *reinterpret_cast<const uint32_t*>(map + 0x10);
+    auto* const* chunk_table = *reinterpret_cast<void*** const*>(map + 0x08);
+    if (entry_count == 0u || chunk_table == nullptr) {
+        return resource_key[1];
+    }
+    const uint16_t slot = *reinterpret_cast<const uint16_t*>(map + 0x18);
+    if (slot <= 0xFu) {
+        const auto* slot_array = static_cast<const uint16_t*>(resource_key[7]);
+        const uint32_t entry_idx = static_cast<uint32_t>(slot_array[slot]) - 1u;
+        if (entry_count > entry_idx) {
+            void** chunk = chunk_table[entry_idx >> 7];
+            void** entry = reinterpret_cast<void**>(
+                reinterpret_cast<uint8_t*>(chunk) + ((entry_idx & 0x7Fu) << 4));
+            if (entry != nullptr && entry[0] == const_cast<void*>(resource_key_raw)) {
+                return entry[1];
+            }
+        }
+        return resource_key[1];
+    }
+    return reinterpret_cast<void*(*)(void*, const void*)>(GX_VMA(0x26ae840ULL))(map_raw, resource_key_raw);
+}
+
+// Exact 1:1 inline fast-path for `StagingPool_Suballocate64K` (`0x26addc0`).
+// Hits 99%+ of calls inline without cross-TU trampoline overhead; falls back to `0x26addc0`
+// only when a fresh 64 KiB chunk needs allocation/reclaim.
+inline void* FastSuballocate64K(void* pool_raw, void* fence_ctx, uint64_t size) noexcept {
+    if (size == 0ULL || size > 0x10000ULL) [[unlikely]] {
+        return nullptr;
+    }
+    auto* pool = static_cast<uint8_t*>(pool_raw);
+    const uint32_t req = static_cast<uint32_t>(size);
+    const uint32_t req_minus_1 = req - 1u;
+    const uint32_t lz = (req_minus_1 == 0u) ? 32u : static_cast<uint32_t>(__builtin_clz(req_minus_1));
+    const uint32_t shift = (32u - lz) & 31u;
+    uint32_t& non_empty_mask = *reinterpret_cast<uint32_t*>(pool + 0x90);
+    const uint32_t eligible_mask = (0xFFFFFFFFu << shift) & non_empty_mask;
+    if (eligible_mask != 0u) [[likely]] {
+        const uint32_t bucket = static_cast<uint32_t>(__builtin_ctz(eligible_mask));
+        if (bucket < 16u) [[likely]] {
+            auto** buckets = reinterpret_cast<uint8_t**>(pool + 0x08);
+            uint8_t* node = buckets[bucket];
+            const uint32_t used_before = static_cast<uint32_t>(*reinterpret_cast<uint64_t*>(node + 0x00));
+            const uint64_t start_va = *reinterpret_cast<uint64_t*>(node + 0x08);
+            uint8_t* ptr = reinterpret_cast<uint8_t*>(start_va + used_before);
+            const uint32_t used_after = used_before + req;
+            *reinterpret_cast<uint64_t*>(node + 0x00) = used_after;
+            if (used_after == 0x10000u) [[unlikely]] {
+                uint8_t* next = *reinterpret_cast<uint8_t**>(node + 0x28);
+                buckets[bucket] = next;
+                if (next == nullptr) {
+                    non_empty_mask &= ~(1u << bucket);
+                }
+                auto** full_chunks = reinterpret_cast<uint8_t**>(pool + 0x88);
+                *reinterpret_cast<uint8_t**>(node + 0x28) = *full_chunks;
+                *full_chunks = node;
+            } else {
+                const uint32_t rem = 0x10000u - used_after;
+                const uint32_t new_bucket = 31u - static_cast<uint32_t>(__builtin_clz(rem));
+                if (new_bucket != bucket) {
+                    uint8_t* next = *reinterpret_cast<uint8_t**>(node + 0x28);
+                    buckets[bucket] = next;
+                    *reinterpret_cast<uint8_t**>(node + 0x28) = buckets[new_bucket];
+                    buckets[new_bucket] = node;
+                    uint32_t mask = non_empty_mask;
+                    if (next == nullptr) {
+                        mask &= ~(1u << bucket);
+                    }
+                    non_empty_mask = mask | (1u << new_bucket);
+                }
+            }
+            return ptr;
+        }
+    }
+    return reinterpret_cast<void*(*)(void*, void*, uint64_t)>(GX_VMA(0x26addc0ULL))(pool_raw, fence_ctx, size);
+}
+
+// Exact 1:1 inline fast-path for `CGSurfaceSyncTrackerGnm_FlushToGfxContext` (`0x26b9850`)
+// when `DirectRingEnabled()` is active.
+inline void FastFlushSurfaceSync(uint8_t* sync_raw, void* gnmx_ctx) noexcept {
+    if (sync_raw[0x24] != 0u) {
+        return;
+    }
+    if (gx_direct_vk::DirectRingEnabled()) [[likely]] {
+        if (*reinterpret_cast<uint32_t*>(sync_raw + 0x20) != 0u) {
+            *reinterpret_cast<uint32_t*>(sync_raw + 0x0c) = 0xFFFFFFFFu;
+            *reinterpret_cast<uint32_t*>(sync_raw + 0x10) = 0u;
+            *reinterpret_cast<uint32_t*>(sync_raw + 0x14) = 0xFFFFFFFFu;
+            *reinterpret_cast<uint32_t*>(sync_raw + 0x18) = 0u;
+            *reinterpret_cast<uint32_t*>(sync_raw + 0x1c) = 0u;
+            *reinterpret_cast<uint32_t*>(sync_raw + 0x20) = 0u;
+        }
+        *reinterpret_cast<uint32_t*>(sync_raw + 0x00) = 0u;
+        *reinterpret_cast<uint32_t*>(sync_raw + 0x04) = 0u;
+        *reinterpret_cast<uint32_t*>(sync_raw + 0x08) = 1u;
+        return;
+    }
+    reinterpret_cast<void(*)(void*, void*)>(GX_VMA(0x26b9850ULL))(sync_raw, gnmx_ctx);
+}
+
 inline bool BindShaderHeaderToStageImpl(
     CGShaderResourceBinderGnm* self,
     uint32_t stage_idx,
@@ -185,7 +290,9 @@ inline void ExecuteStageBindingBytecode(
     auto fn_setSsharp = reinterpret_cast<void(*)(void*, uint32_t, uint32_t, const void*)>(GX_VMA(0x10762f0ULL));
     auto fn_setPtr    = reinterpret_cast<void(*)(void*, uint32_t, uint32_t, void*)>(GX_VMA(0x1076390ULL));
     auto fn_setUserD  = reinterpret_cast<void(*)(void*, uint32_t, uint32_t, uint32_t)>(GX_VMA(0x1076420ULL));
-    auto fn_suballoc  = reinterpret_cast<void*(*)(void*, void*, uint64_t)>(GX_VMA(0x26addc0ULL));
+    auto fn_suballoc  = [&](void* pool, void* fctx, uint64_t sz) noexcept -> void* {
+        return FastSuballocate64K(pool, fctx, sz);
+    };
 
     auto emit_vsharp = [&](uint32_t dst_reg, const void* sharp) noexcept {
         if (direct_ud) {
@@ -494,30 +601,45 @@ void CGShaderResourceBinderGnm_BindVertexBuffersAndFetchShader(
     uint32_t binder_stage_idx,
     uint32_t gnm_shader_stage)
 {
-    uint8_t* gnmx_ctx = gnmx_ctx_wrapper + 0x10;
     const uint32_t dirty_vb     = self->dirty_vb_mask;
     const uint32_t table_dirty  = dirty_vb & self->eud_table_vb_mask;
     const uint32_t direct_dirty = dirty_vb & self->direct_sgpr_vb_mask;
+    if ((table_dirty | direct_dirty) == 0u) {
+        return;
+    }
 
+    uint8_t* gnmx_ctx = gnmx_ctx_wrapper + 0x10;
     const bool native_vsharp  = gx_direct_vk::EnabledV2Sub(gx_direct_vk::kV2Sub_NativeVsharp);
     const bool direct_ud      = gx_direct_vk::EnabledV2Sub(gx_direct_vk::kV2Sub_StageUserData);
     const bool n1_native_bufs = gx_direct_vk::EnabledNativeVk(gx_direct_vk::kN1_NativeBuffers);
     gx_direct_vk::StageUserDataBatch ud_batch{};
 
     auto fn_resolveDyn = reinterpret_cast<uint64_t(*)(void*, const void*)>(GX_VMA(0x26d0ff0ULL));
-    auto fn_getBase    = native_vsharp ? static_cast<uint64_t(*)(const void*)>(&gx_direct_vk::Vsharp_GetBaseAddress)
-                                       : reinterpret_cast<uint64_t(*)(const void*)>(GX_VMA(0x1071180ULL));
-    auto fn_setBase    = native_vsharp ? static_cast<void(*)(void*, uint64_t)>(&gx_direct_vk::Vsharp_SetBaseAddress)
-                                       : reinterpret_cast<void(*)(void*, uint64_t)>(GX_VMA(0x1070710ULL));
-    auto fn_setStride  = native_vsharp ? static_cast<void(*)(void*, uint32_t)>(&gx_direct_vk::Vsharp_SetStride)
-                                       : reinterpret_cast<void(*)(void*, uint32_t)>(GX_VMA(0x1070730ULL));
-    auto fn_setNumRec  = native_vsharp ? static_cast<void(*)(void*, uint32_t)>(&gx_direct_vk::Vsharp_SetNumElements)
-                                       : reinterpret_cast<void(*)(void*, uint32_t)>(GX_VMA(0x10707b0ULL));
-    auto fn_setMtype   = native_vsharp ? static_cast<void(*)(void*, uint32_t, uint32_t, uint32_t)>(&gx_direct_vk::Vsharp_SetResourceMemoryType)
-                                       : reinterpret_cast<void(*)(void*, uint32_t, uint32_t, uint32_t)>(GX_VMA(0x10710c0ULL));
     auto fn_setVsharp  = reinterpret_cast<void(*)(void*, uint32_t, uint32_t, const void*)>(GX_VMA(0x10761a0ULL));
     auto fn_setPtr     = reinterpret_cast<void(*)(void*, uint32_t, uint32_t, void*)>(GX_VMA(0x1076390ULL));
-    auto fn_suballoc   = reinterpret_cast<void*(*)(void*, void*, uint64_t)>(GX_VMA(0x26addc0ULL));
+
+    auto build_vb_vsharp = [&](uint8_t* dst_vsharp, const uint8_t* tmpl_vsharp,
+                               uint64_t gpu_base, uint64_t vb_offset, uint32_t stride,
+                               uint32_t num_records, uint32_t mtype_raw) noexcept {
+        if (native_vsharp) [[likely]] {
+            const uint64_t tmpl_base = gx_direct_vk::Vsharp_GetBaseAddress(tmpl_vsharp);
+            std::memcpy(dst_vsharp, tmpl_vsharp, 16);
+            gx_direct_vk::Vsharp_SetBaseAddress(dst_vsharp, gpu_base + tmpl_base + vb_offset);
+            gx_direct_vk::Vsharp_SetStride(dst_vsharp, stride);
+            gx_direct_vk::Vsharp_SetNumElements(dst_vsharp, num_records);
+            gx_direct_vk::Vsharp_SetResourceMemoryType(dst_vsharp, mtype_raw >> 16, 0u, mtype_raw & 1u);
+        } else {
+            const uint64_t tmpl_base =
+                reinterpret_cast<uint64_t(*)(const void*)>(GX_VMA(0x1071180ULL))(tmpl_vsharp);
+            std::memcpy(dst_vsharp, tmpl_vsharp, 16);
+            reinterpret_cast<void(*)(void*, uint64_t)>(GX_VMA(0x1070710ULL))(
+                dst_vsharp, gpu_base + tmpl_base + vb_offset);
+            reinterpret_cast<void(*)(void*, uint32_t)>(GX_VMA(0x1070730ULL))(dst_vsharp, stride);
+            reinterpret_cast<void(*)(void*, uint32_t)>(GX_VMA(0x10707b0ULL))(dst_vsharp, num_records);
+            reinterpret_cast<void(*)(void*, uint32_t, uint32_t, uint32_t)>(GX_VMA(0x10710c0ULL))(
+                dst_vsharp, mtype_raw >> 16, 0u, mtype_raw & 1u);
+        }
+    };
 
     if (direct_dirty != 0u) {
         uint32_t rem = direct_dirty;
@@ -526,10 +648,16 @@ void CGShaderResourceBinderGnm_BindVertexBuffersAndFetchShader(
 
         while (rem != 0u) {
             const uint32_t slot = static_cast<uint32_t>(__builtin_ctz(rem));
-            rem -= (1u << slot);
+            rem &= (rem - 1u);
 
             const uint8_t* vb_res = *reinterpret_cast<const uint8_t* const*>(pipeline_state + 0x20 + slot * 8);
             if (vb_res == nullptr) {
+                continue;
+            }
+            const uint32_t elem_range  = self->vb_slot_element_range[slot];
+            const uint32_t elem_start  = elem_range & 0xFFu;
+            const uint32_t elem_count  = (elem_range >> 8) & 0xFFu;
+            if (elem_count == 0u) {
                 continue;
             }
             const uint32_t stride      = *reinterpret_cast<const uint32_t*>(pipeline_state + 0x120 + slot * 4);
@@ -538,12 +666,16 @@ void CGShaderResourceBinderGnm_BindVertexBuffersAndFetchShader(
             const uint32_t eff_bytes   = !n1_native_bufs ? vb_bytes
                                          : (vb_offset < vb_bytes ? (vb_bytes - static_cast<uint32_t>(vb_offset)) : 0u);
             const uint32_t num_records = (stride != 0u) ? (eff_bytes / stride) : 0u;
-            const uint32_t elem_range  = self->vb_slot_element_range[slot];
-            const uint32_t elem_start  = elem_range & 0xFFu;
-            const uint32_t elem_count  = (elem_range >> 8) & 0xFFu;
-            if (elem_count == 0u) {
-                continue;
+
+            uint64_t gpu_base  = 0ULL;
+            uint32_t mtype_raw = 0x100000u;
+            if (vb_res[0x40] == 0u) {
+                gpu_base = *reinterpret_cast<const uint64_t*>(vb_res + 0x20);
+            } else {
+                gpu_base  = fn_resolveDyn(gnmx_ctx_wrapper + 0xb6f8, vb_res + 0x18);
+                mtype_raw = 0x6e0001u;
             }
+
             for (uint32_t i = 0; i < elem_count; ++i) {
                 const uint32_t elem_idx    = elem_start + i;
                 const uint32_t sgpr_packed = self->input_elem_to_sgpr[elem_idx];
@@ -552,21 +684,7 @@ void CGShaderResourceBinderGnm_BindVertexBuffersAndFetchShader(
                 uint8_t* dst_vsharp        = self->staged_vb_vsharps[staged_idx];
                 const uint8_t* tmpl_vsharp = self->input_elem_vsharp_Templates[elem_idx];
 
-                uint64_t gpu_base  = 0ULL;
-                uint32_t mtype_raw = 0x100000u;
-                if (vb_res[0x40] == 0u) {
-                    gpu_base = *reinterpret_cast<const uint64_t*>(vb_res + 0x20);
-                } else {
-                    gpu_base  = fn_resolveDyn(gnmx_ctx_wrapper + 0xb6f8, vb_res + 0x18);
-                    mtype_raw = 0x6e0001u;
-                }
-
-                const uint64_t tmpl_base = fn_getBase(tmpl_vsharp);
-                std::memcpy(dst_vsharp, tmpl_vsharp, 16);
-                fn_setBase(dst_vsharp, gpu_base + tmpl_base + vb_offset);
-                fn_setStride(dst_vsharp, stride);
-                fn_setNumRec(dst_vsharp, num_records);
-                fn_setMtype(dst_vsharp, mtype_raw >> 16, 0u, mtype_raw & 1u);
+                build_vb_vsharp(dst_vsharp, tmpl_vsharp, gpu_base, vb_offset, stride, num_records, mtype_raw);
 
                 if ((sgpr_target & 0xF0u) <= 0x0Fu) {
                     if (direct_ud) {
@@ -588,10 +706,16 @@ void CGShaderResourceBinderGnm_BindVertexBuffersAndFetchShader(
         uint32_t rem = table_dirty;
         while (rem != 0u) {
             const uint32_t slot = static_cast<uint32_t>(__builtin_ctz(rem));
-            rem -= (1u << slot);
+            rem &= (rem - 1u);
 
             const uint8_t* vb_res = *reinterpret_cast<const uint8_t* const*>(pipeline_state + 0x20 + slot * 8);
             if (vb_res == nullptr) {
+                continue;
+            }
+            const uint32_t elem_range  = self->vb_slot_element_range[slot];
+            const uint32_t elem_start  = elem_range & 0xFFu;
+            const uint32_t elem_count  = (elem_range >> 8) & 0xFFu;
+            if (elem_count == 0u) {
                 continue;
             }
             const uint32_t stride      = *reinterpret_cast<const uint32_t*>(pipeline_state + 0x120 + slot * 4);
@@ -600,40 +724,30 @@ void CGShaderResourceBinderGnm_BindVertexBuffersAndFetchShader(
             const uint32_t eff_bytes   = !n1_native_bufs ? vb_bytes
                                          : (vb_offset < vb_bytes ? (vb_bytes - static_cast<uint32_t>(vb_offset)) : 0u);
             const uint32_t num_records = (stride != 0u) ? (eff_bytes / stride) : 0u;
-            const uint32_t elem_range  = self->vb_slot_element_range[slot];
-            const uint32_t elem_start  = elem_range & 0xFFu;
-            const uint32_t elem_count  = (elem_range >> 8) & 0xFFu;
-            if (elem_count == 0u) {
-                continue;
+
+            uint64_t gpu_base  = 0ULL;
+            uint32_t mtype_raw = 0x100000u;
+            if (vb_res[0x40] == 0u) {
+                gpu_base = *reinterpret_cast<const uint64_t*>(vb_res + 0x20);
+            } else {
+                gpu_base  = fn_resolveDyn(gnmx_ctx_wrapper + 0xb6f8, vb_res + 0x18);
+                mtype_raw = 0x6e0001u;
             }
+
             for (uint32_t i = 0; i < elem_count; ++i) {
                 const uint32_t elem_idx    = elem_start + i;
                 const uint32_t staged_idx  = self->input_elem_to_sgpr[elem_idx] & 0xFFu;
                 uint8_t* dst_vsharp        = self->staged_vb_vsharps[staged_idx];
                 const uint8_t* tmpl_vsharp = self->input_elem_vsharp_Templates[elem_idx];
 
-                uint64_t gpu_base  = 0ULL;
-                uint32_t mtype_raw = 0x100000u;
-                if (vb_res[0x40] == 0u) {
-                    gpu_base = *reinterpret_cast<const uint64_t*>(vb_res + 0x20);
-                } else {
-                    gpu_base  = fn_resolveDyn(gnmx_ctx_wrapper + 0xb6f8, vb_res + 0x18);
-                    mtype_raw = 0x6e0001u;
-                }
-
-                const uint64_t tmpl_base = fn_getBase(tmpl_vsharp);
-                std::memcpy(dst_vsharp, tmpl_vsharp, 16);
-                fn_setBase(dst_vsharp, gpu_base + tmpl_base + vb_offset);
-                fn_setStride(dst_vsharp, stride);
-                fn_setNumRec(dst_vsharp, num_records);
-                fn_setMtype(dst_vsharp, mtype_raw >> 16, 0u, mtype_raw & 1u);
+                build_vb_vsharp(dst_vsharp, tmpl_vsharp, gpu_base, vb_offset, stride, num_records, mtype_raw);
             }
         }
 
         const uint64_t start_off  = static_cast<uint64_t>(self->fetch_table_start_slot) << 4;
         const uint64_t copy_bytes = static_cast<uint64_t>(self->fetch_table_slot_count) << 4;
         void* ctx_ptr = gnmx_ctx;
-        uint8_t* gpu_tbl = static_cast<uint8_t*>(fn_suballoc(gnmx_ctx_wrapper + 0xb3e0, &ctx_ptr, start_off + copy_bytes));
+        uint8_t* gpu_tbl = static_cast<uint8_t*>(FastSuballocate64K(gnmx_ctx_wrapper + 0xb3e0, &ctx_ptr, start_off + copy_bytes));
         if (gpu_tbl != nullptr) {
             std::memcpy(
                 gpu_tbl + start_off,
@@ -1438,23 +1552,21 @@ inline void StageAndExecuteGraphicsShaderStage(
     uint64_t cb_dirty = (other_dirty & 0x3FFF0000ULL) >> 16;
     if (cb_dirty != 0ULL) {
         const bool native_vsharp = gx_direct_vk::EnabledV2Sub(gx_direct_vk::kV2Sub_NativeVsharp);
-        auto fn_resolveCb = reinterpret_cast<void*(*)(void*, const void*)>(GX_VMA(0x26ae840ULL));
-        auto fn_initCb    = reinterpret_cast<void(*)(void*, void*, uint32_t)>(GX_VMA(0x1070960ULL));
-        auto fn_setMtype  = reinterpret_cast<void(*)(void*, uint32_t, uint32_t, uint32_t)>(GX_VMA(0x10710c0ULL));
+        void* const staging_map = gnmx_ctx_wrapper + 0xb3c0;
         while (cb_dirty != 0ULL) {
             const uint32_t slot = static_cast<uint32_t>(__builtin_ctzll(cb_dirty));
-            cb_dirty -= (1ULL << slot);
+            cb_dirty &= (cb_dirty - 1ULL);
             const uint8_t* cb_res = *reinterpret_cast<const uint8_t* const*>(stage_state + 0x480 + slot * 8);
             if (cb_res != nullptr) {
                 uint8_t* dst_vsharp = self->staged_cb_vsharps[binder_stage_idx][slot];
-                void* gpu_addr      = fn_resolveCb(gnmx_ctx_wrapper + 0xb3c0, cb_res + 0x18);
+                void* gpu_addr      = FastFindStagingBuffer(staging_map, cb_res + 0x18);
                 const uint32_t dwords = *reinterpret_cast<const uint32_t*>(cb_res + 0x2c);
-                if (native_vsharp) {
+                if (native_vsharp) [[likely]] {
                     gx_direct_vk::Vsharp_InitAsConstantBuffer(dst_vsharp, gpu_addr, dwords);
                     gx_direct_vk::Vsharp_SetResourceMemoryType(dst_vsharp, 0x6eu, 0u, 0u);
                 } else {
-                    fn_initCb(dst_vsharp, gpu_addr, dwords);
-                    fn_setMtype(dst_vsharp, 0x6eu, 0u, 0u);
+                    reinterpret_cast<void(*)(void*, void*, uint32_t)>(GX_VMA(0x1070960ULL))(dst_vsharp, gpu_addr, dwords);
+                    reinterpret_cast<void(*)(void*, uint32_t, uint32_t, uint32_t)>(GX_VMA(0x10710c0ULL))(dst_vsharp, 0x6eu, 0u, 0u);
                 }
                 dirty_cmds_accum |= st.other_dep_masks[16u + slot];
             }
@@ -1900,15 +2012,19 @@ void CGShaderResourceBinderGnm_BindAndFlushGraphicsPipeline(
 
     const uint32_t prev_mode = self->active_shader_stages_mask;
     const bool skip_prefetch = gx_direct_vk::EnabledV2Sub(gx_direct_vk::kV2Sub_SkipShaderPrefetch);
-    auto fn_setActiveStages = gx_direct_vk::EnabledV2Sub(gx_direct_vk::kV2Sub_NativeVsharp)
-        ? static_cast<void(*)(void*, uint32_t)>(&gx_direct_vk::EmitSetActiveShaderStages)
-        : reinterpret_cast<void(*)(void*, uint32_t)>(GX_VMA(0x1076030ULL));
+    auto set_active_stages = [](void* ctx, uint32_t stages) noexcept {
+        if (gx_direct_vk::EnabledV2Sub(gx_direct_vk::kV2Sub_NativeVsharp)) [[likely]] {
+            gx_direct_vk::EmitSetActiveShaderStages(ctx, stages);
+        } else {
+            reinterpret_cast<void(*)(void*, uint32_t)>(GX_VMA(0x1076030ULL))(ctx, stages);
+        }
+    };
 
     if (hs_hdr == nullptr && gs_hdr == nullptr) {
         // ====================================================================
         // Case 2: VS + PS (active_shader_stages_mask = 0x00)
         // ====================================================================
-        if (prev_mode != 0x00u) {
+        if (prev_mode != 0x00u) [[unlikely]] {
             self->streamout_buffer_mask  = 0xFFu;
             self->bound_streamout_shader = nullptr;
             if (prev_mode == 0xADu || prev_mode == 0xB0u) {
@@ -1921,7 +2037,7 @@ void CGShaderResourceBinderGnm_BindAndFlushGraphicsPipeline(
             self->stages[0].bound_shader_hdr  = reinterpret_cast<const CGShaderBindingHeaderGnm*>(~0ULL);
             self->dirty_vb_mask               = 0xFFFFFFFFu;
             self->bound_input_layout          = reinterpret_cast<void*>(~0ULL);
-            fn_setActiveStages(gnmx_ctx, 0x00u);
+            set_active_stages(gnmx_ctx, 0x00u);
             self->active_shader_stages_mask   = 0x00u;
         }
 
@@ -1949,7 +2065,7 @@ void CGShaderResourceBinderGnm_BindAndFlushGraphicsPipeline(
             self->stages[0].bound_shader_hdr  = reinterpret_cast<const CGShaderBindingHeaderGnm*>(~0ULL);
             self->dirty_vb_mask               = 0xFFFFFFFFu;
             self->bound_input_layout          = reinterpret_cast<void*>(~0ULL);
-            fn_setActiveStages(gnmx_ctx, 0xB0u);
+            set_active_stages(gnmx_ctx, 0xB0u);
             self->active_shader_stages_mask   = 0xB0u;
         }
 
@@ -2016,7 +2132,7 @@ void CGShaderResourceBinderGnm_BindAndFlushGraphicsPipeline(
             self->stages[2].dirty_other_mask  = ~0ULL;
             self->stages[2].dirty_cmd_mask    = ~0ULL;
             self->stages[2].bound_shader_hdr  = reinterpret_cast<const CGShaderBindingHeaderGnm*>(~0ULL);
-            fn_setActiveStages(gnmx_ctx, 0xADu);
+            set_active_stages(gnmx_ctx, 0xADu);
             self->active_shader_stages_mask   = 0xADu;
         }
 
@@ -2130,7 +2246,7 @@ void CGShaderResourceBinderGnm_BindAndFlushGraphicsPipeline(
                 self->stages[2].dirty_other_mask  = ~0ULL;
                 self->stages[2].dirty_cmd_mask    = ~0ULL;
                 self->stages[2].bound_shader_hdr  = reinterpret_cast<const CGShaderBindingHeaderGnm*>(~0ULL);
-                fn_setActiveStages(gnmx_ctx, 0x45u);
+                set_active_stages(gnmx_ctx, 0x45u);
                 self->active_shader_stages_mask   = 0x45u;
             }
 
@@ -2235,7 +2351,7 @@ void CGShaderResourceBinderGnm_SyncAndBindGraphicsPipeline(
     uint8_t* gnmx_ctx_wrapper,
     const uint8_t* pipeline_state)
 {
-    reinterpret_cast<void(*)(void*, void*)>(GX_VMA(0x26b9850ULL))(gnmx_ctx_wrapper + 0xb478, gnmx_ctx_wrapper + 0x10);
+    FastFlushSurfaceSync(gnmx_ctx_wrapper + 0xb478, gnmx_ctx_wrapper + 0x10);
     CGShaderResourceBinderGnm_BindAndFlushGraphicsPipeline(self, gnmx_ctx_wrapper, pipeline_state);
 }
 

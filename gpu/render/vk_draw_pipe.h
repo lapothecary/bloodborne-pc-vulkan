@@ -100,6 +100,7 @@ public:
                 const u64 q_idx = resolve_enqueued++;
                 resolve_queue[q_idx & SlotMask] = pkt_num;
                 resolve_published.store(resolve_enqueued, std::memory_order_release);
+                BbSections::resolve_packets.store(resolve_enqueued, std::memory_order_relaxed);
             }
         }
         head += pending_size;
@@ -111,6 +112,7 @@ public:
         std::atomic_thread_fence(std::memory_order_seq_cst);
         if (has_resolvers && resolve && resolvers_sleeping.load(std::memory_order_relaxed)) [[unlikely]] {
             resolve_wake.fetch_add(1, std::memory_order_release);
+            BbSections::resolve_wakes.fetch_add(1, std::memory_order_relaxed);
             if (num_resolvers == 1) {
                 resolve_wake.notify_one();
             } else {
@@ -126,6 +128,7 @@ public:
     void WakeResolversIfSleeping() noexcept {
         if (num_resolvers != 0 && resolvers_sleeping.load(std::memory_order_acquire)) [[unlikely]] {
             resolve_wake.fetch_add(1, std::memory_order_release);
+            BbSections::resolve_wakes.fetch_add(1, std::memory_order_relaxed);
             resolve_wake.notify_all();
         }
     }
@@ -364,6 +367,7 @@ private:
                 const auto& slot = slots[(consumed_packets.load(std::memory_order_relaxed) + 1) &
                                          SlotMask];
                 if (slot.state.load(std::memory_order_acquire) != SlotDone) {
+                    const u64 w0 = BbSections::Enabled() ? __rdtsc() : 0;
                     WakeResolversIfSleeping();
                     for (u32 spins = 0; slot.state.load(std::memory_order_acquire) != SlotDone;
                          ++spins) {
@@ -375,6 +379,12 @@ private:
                         } else {
                             std::this_thread::yield();
                         }
+                    }
+                    if (w0) {
+                        const u64 wprev =
+                            BbSections::stage_b_wait_res_cycles.load(std::memory_order_relaxed);
+                        BbSections::stage_b_wait_res_cycles.store(wprev + (__rdtsc() - w0),
+                                                                  std::memory_order_relaxed);
                     }
                 }
             }
@@ -418,8 +428,11 @@ private:
                         return;
                     }
                     __builtin_ia32_pause();
+                    // Adaptive pause spin (~7-10 us on Zen4/Intel) avoids 1,400+ futex wait/wake
+                    // syscalls per frame between consecutive draws (1.5-3 us apart) while still
+                    // sleeping cleanly during inter-frame pauses without steady_clock overhead.
                     const bool should_sleep =
-                        spin_us == 0 ? ((spins & 7u) == 0)
+                        spin_us == 0 ? ((spins & 511u) == 0)
                                      : (!(spins & 63u) &&
                                         std::chrono::steady_clock::now() >= spin_until);
                     if (should_sleep) {
@@ -447,8 +460,19 @@ private:
             auto& slot = slots[number & SlotMask];
             if (slot.state.load(std::memory_order_acquire) == SlotPending) {
                 auto* header = reinterpret_cast<Header*>(ring.get() + slot.at % Capacity);
+                const u64 t0 = BbSections::Enabled() ? __rdtsc() : 0;
                 resolver(context, reinterpret_cast<u8*>(header + 1), header->payload, number,
                          worker);
+                if (t0) {
+                    const u64 dt = __rdtsc() - t0;
+                    if (single_worker) {
+                        const u64 prev =
+                            BbSections::resolve_busy_cycles.load(std::memory_order_relaxed);
+                        BbSections::resolve_busy_cycles.store(prev + dt, std::memory_order_relaxed);
+                    } else {
+                        BbSections::resolve_busy_cycles.fetch_add(dt, std::memory_order_relaxed);
+                    }
+                }
                 slot.state.store(SlotDone, std::memory_order_release);
             }
         }

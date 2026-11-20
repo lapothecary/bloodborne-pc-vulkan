@@ -252,8 +252,18 @@ struct RegDirty {
     std::bitset<NumBlocks> blocks;
     std::bitset<Regs::NumRegs>* exact_words = nullptr;
     u64 stage_b_mask[2]{};
+    u64 batch_stage_b_mask[2]{~0ULL, ~0ULL}; ///< Stage-A batcher dirty bits (only cleared by batchers)
     bool track_all_blocks = true;
     bool reset = false; ///< CLEAR_STATE: the defaults, then only the blocks marked after it
+
+    [[gnu::always_inline]] void ClearBatchStageBDirty() noexcept {
+        batch_stage_b_mask[0] = 0ULL;
+        batch_stage_b_mask[1] = 0ULL;
+    }
+    [[gnu::always_inline]] void MarkAllBatchStageBDirty() noexcept {
+        batch_stage_b_mask[0] = ~0ULL;
+        batch_stage_b_mask[1] = ~0ULL;
+    }
 
     static constexpr u32 StageBChunkWordOffset(u32 bit) noexcept {
         if (bit < 114u) {
@@ -288,14 +298,17 @@ struct RegDirty {
             const u32 lo = (std::max(word, 0xA000u) - 0xA000u) >> 3;
             const u32 hi = (std::min(end, 0xA390u) - 1u - 0xA000u) >> 3;
             SetStageBBitRange(stage_b_mask, lo, hi);
+            SetStageBBitRange(batch_stage_b_mask, lo, hi);
         } else if (end > 0xC038u && word < 0xC258u) {
             if (end > 0xC038u && word < 0xC040u) {
                 stage_b_mask[1] |= (1ULL << (114u - 64u));
+                batch_stage_b_mask[1] |= (1ULL << (114u - 64u));
             }
             if (end > 0xC240u && word < 0xC258u) {
                 const u32 lo = 115u + ((std::max(word, 0xC240u) - 0xC240u) >> 3);
                 const u32 hi = 115u + ((std::min(end, 0xC258u) - 1u - 0xC240u) >> 3);
                 SetStageBBitRange(stage_b_mask, lo, hi);
+                SetStageBBitRange(batch_stage_b_mask, lo, hi);
             }
         }
         if (track_all_blocks) {

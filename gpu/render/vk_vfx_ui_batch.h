@@ -154,6 +154,7 @@ private:
         u32 vs_slot = 0u;
         u32 ffx_ps_slot = 0u;
         StageBChunks base_chunks{};
+        StageBChunks norm_chunks{};
         std::array<Gcn::CbDbExtent, Gcn::NUM_COLOR_BUFFERS> cb_extent{};
         Gcn::CbDbExtent db_extent{};
         std::array<u16, Gcn::NUM_COLOR_BUFFERS> cb_uid{};

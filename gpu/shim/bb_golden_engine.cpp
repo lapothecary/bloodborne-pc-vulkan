@@ -87,6 +87,17 @@ float GX_SYSV_ABI __gx_sysv_tanf(float x) noexcept { return std::tan(x); }
 float GX_SYSV_ABI __gx_sysv_exp2f(float x) noexcept { return std::exp2(x); }
 float GX_SYSV_ABI __gx_sysv_log2f(float x) noexcept { return std::log2(x); }
 float GX_SYSV_ABI __gx_sysv_powf(float x, float y) noexcept { return std::pow(x, y); }
+void GX_SYSV_ABI __gx_sysv_wait_u32(const void* addr, std::uint32_t expected) noexcept {
+    static_assert(sizeof(std::atomic<std::uint32_t>) == sizeof(std::uint32_t) &&
+                  alignof(std::atomic<std::uint32_t>) == alignof(std::uint32_t));
+    if (!addr) return;
+    reinterpret_cast<const std::atomic<std::uint32_t>*>(addr)->wait(
+        expected, std::memory_order_acquire);
+}
+void GX_SYSV_ABI __gx_sysv_notify_one_u32(void* addr) noexcept {
+    if (!addr) return;
+    reinterpret_cast<std::atomic<std::uint32_t>*>(addr)->notify_one();
+}
 
 void runtime_memory_note_write(std::uint64_t address, std::uint64_t size);
 int runtime_extra_direct_map(std::uint64_t size, std::uint64_t alignment, void** out);

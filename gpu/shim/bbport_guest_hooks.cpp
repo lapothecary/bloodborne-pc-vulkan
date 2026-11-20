@@ -2,6 +2,7 @@
 #include "common/types.h"
 #include "bbport_guest_hooks.h"
 #include "bbport_settings.h"
+#include "bbport_sections.h"
 #include "bbport_guest_code.h"
 #include "bbport_heap_sites.h"
 #include "bbport_toggles.h"
@@ -33,6 +34,7 @@
 #include <utility>
 
 extern "C" void runtime_memory_note_write(uintptr_t address, uint64_t size);
+extern "C" bool BbLookupMappedEnd(uint64_t address, uintptr_t& out_end);
 extern "C" void runtime_re_watch(uint64_t address);
 
 namespace BbGuestHooks {
@@ -2059,6 +2061,445 @@ bool InstallFxInitClear() {
 }
 } // namespace
 
+// Main-thread SprjTaskGroup X-Ray profiler (`0x1042a10` in `EZTaskGroupRunner::Execute`):
+// Measures every one of Bloodborne's named `FD4TaskGroup` engine phases (`InGameStep`,
+// `HavokWorldUpdate_*`, `HavokClothUpdate_*`, `SfxMan`, `ScaleformStep`, `GameSceneDraw`, etc.)
+// directly inside `FD4TaskExecutor::RunTask` (`0x103d3b0`) via its empty built-in profiler calls
+// `0x103d3e5: call 0x103bd10` and `0x103d43d: call 0x103bd20`. Zero static TLS.
+struct alignas(64) MxThreadSlot {
+    s32 slot = -1;
+    s32 task_slot = -1;
+    u64 t0 = 0;
+};
+std::array<MxThreadSlot, 32> g_mx_threads{};
+
+constexpr std::size_t MxHashMask = 255;
+std::array<std::atomic<u32>, 256> g_mx_hash_id{};
+std::array<std::atomic<s32>, 256> g_mx_hash_slot{};
+std::atomic_flag g_mx_reg_lock = ATOMIC_FLAG_INIT;
+
+constexpr std::size_t MxTaskHashMask = 511;
+std::array<std::atomic<u64>, 512> g_mx_task_key{};
+std::array<std::atomic<s32>, 512> g_mx_task_slot{};
+std::atomic_flag g_mx_task_lock = ATOMIC_FLAG_INIT;
+
+void CaptureMainTaskGroupNameById(std::size_t slot, u32 group_id) noexcept {
+    auto& mx = BbSections::main_xray;
+    char* dst = mx.names[slot];
+    std::snprintf(dst, BbSections::MainXRay::NameCap, "Grp#%u", group_id);
+
+    auto valid_ptr = [](u64 addr) noexcept -> bool {
+        return addr >= 0x100000ULL && addr < 0x0000800000000000ULL;
+    };
+    // FD4TaskManager* at ImageBase + 0x54b2e30 -> +0x40 TaskRunner* -> [+0x18..+0x20) 0x88-byte entries
+    // (+0x00 u32 id, +0x04 char16_t name[66]). Matches 0xf89b60 verbatim.
+    const u64 tm_ptr_va = ImageBase + 0x54b2e30ULL;
+    if (valid_ptr(tm_ptr_va)) {
+        const u64 tm = *reinterpret_cast<const u64*>(tm_ptr_va);
+        if (valid_ptr(tm)) {
+            const u64 tr = *reinterpret_cast<const u64*>(tm + 0x40ULL);
+            if (valid_ptr(tr)) {
+                const u64 beg = *reinterpret_cast<const u64*>(tr + 0x18ULL);
+                const u64 end = *reinterpret_cast<const u64*>(tr + 0x20ULL);
+                if (valid_ptr(beg) && end > beg && (end - beg) <= 0x88ULL * 512ULL) {
+                    for (u64 p = beg; p + 0x88ULL <= end; p += 0x88ULL) {
+                        if (*reinterpret_cast<const u32*>(p) == group_id) {
+                            const auto* w = reinterpret_cast<const u16*>(p + 4ULL);
+                            char full[96]{};
+                            std::size_t n = 0;
+                            for (; n < 64 && w[n] != 0; ++n) {
+                                const u16 ch = w[n];
+                                full[n] = (ch >= 32 && ch < 127) ? static_cast<char>(ch) : '?';
+                            }
+                            full[n] = '\0';
+                            if (n > 0) {
+                                const char* trimmed = full;
+                                if (std::strncmp(trimmed, "TaskLineIdx_InGame_", 19) == 0) {
+                                    trimmed += 19;
+                                } else if (std::strncmp(trimmed, "TaskLineIdx_", 12) == 0) {
+                                    trimmed += 12;
+                                }
+                                std::snprintf(dst, BbSections::MainXRay::NameCap, "%s", trimmed);
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    mx.name_ready[slot].store(1, std::memory_order_release);
+}
+
+s32 FindOrAllocMainGroupSlot(u32 group_id) noexcept {
+    if (group_id == 0) {
+        return -1;
+    }
+    std::size_t h = (group_id * 2654435761u) & MxHashMask;
+    for (std::size_t probe = 0; probe < 16; ++probe) {
+        const std::size_t pos = (h + probe) & MxHashMask;
+        const u32 k = g_mx_hash_id[pos].load(std::memory_order_acquire);
+        if (k == group_id) {
+            return g_mx_hash_slot[pos].load(std::memory_order_relaxed);
+        }
+        if (k == 0) {
+            break;
+        }
+    }
+    // Slow path (first encounter of this group_id, ~76 times total per run).
+    while (g_mx_reg_lock.test_and_set(std::memory_order_acquire)) {
+    }
+    s32 result = -1;
+    for (std::size_t probe = 0; probe < 256; ++probe) {
+        const std::size_t pos = (h + probe) & MxHashMask;
+        const u32 k = g_mx_hash_id[pos].load(std::memory_order_relaxed);
+        if (k == group_id) {
+            result = g_mx_hash_slot[pos].load(std::memory_order_relaxed);
+            break;
+        }
+        if (k == 0) {
+            const u32 idx = BbSections::main_xray.group_count.load(std::memory_order_relaxed);
+            if (idx < BbSections::MainXRay::MaxGroups) {
+                CaptureMainTaskGroupNameById(idx, group_id);
+                BbSections::main_xray.group_count.store(idx + 1, std::memory_order_release);
+                g_mx_hash_slot[pos].store(static_cast<s32>(idx), std::memory_order_relaxed);
+                g_mx_hash_id[pos].store(group_id, std::memory_order_release);
+                result = static_cast<s32>(idx);
+            }
+            break;
+        }
+    }
+    g_mx_reg_lock.clear(std::memory_order_release);
+    return result;
+}
+
+s32 FindOrAllocMainTaskSlot(u64 fn_off, s32 group_slot) noexcept {
+    if (fn_off == 0) {
+        return -1;
+    }
+    const u64 key = (fn_off << 8) ^ static_cast<u64>(group_slot & 0xFF);
+    const u64 nz_key = key ? key : 1ULL;
+    const std::size_t h =
+        static_cast<std::size_t>((nz_key * 11400714819323198485ULL) >> 55) & MxTaskHashMask;
+    for (std::size_t probe = 0; probe < 16; ++probe) {
+        const std::size_t pos = (h + probe) & MxTaskHashMask;
+        const u64 k = g_mx_task_key[pos].load(std::memory_order_acquire);
+        if (k == nz_key) {
+            return g_mx_task_slot[pos].load(std::memory_order_relaxed);
+        }
+        if (k == 0) {
+            break;
+        }
+    }
+    while (g_mx_task_lock.test_and_set(std::memory_order_acquire)) {
+    }
+    s32 result = -1;
+    for (std::size_t probe = 0; probe < 512; ++probe) {
+        const std::size_t pos = (h + probe) & MxTaskHashMask;
+        const u64 k = g_mx_task_key[pos].load(std::memory_order_relaxed);
+        if (k == nz_key) {
+            result = g_mx_task_slot[pos].load(std::memory_order_relaxed);
+            break;
+        }
+        if (k == 0) {
+            const u32 idx = BbSections::main_xray.task_count.load(std::memory_order_relaxed);
+            if (idx < BbSections::MainXRay::MaxTasks) {
+                BbSections::main_xray.task_fn_off[idx] = fn_off;
+                BbSections::main_xray.task_group_slot[idx] = static_cast<std::int16_t>(group_slot);
+                BbSections::main_xray.task_count.store(idx + 1, std::memory_order_release);
+                g_mx_task_slot[pos].store(static_cast<s32>(idx), std::memory_order_relaxed);
+                g_mx_task_key[pos].store(nz_key, std::memory_order_release);
+                result = static_cast<s32>(idx);
+            }
+            break;
+        }
+    }
+    g_mx_task_lock.clear(std::memory_order_release);
+    return result;
+}
+
+void PS4_SYSV_ABI MainTaskGroupBeginHook(u32 group_id, u32 thread_idx, u64 task_entry_ptr) noexcept {
+    auto& ts = g_mx_threads[thread_idx & 31u];
+    const s32 slot = FindOrAllocMainGroupSlot(group_id);
+    s32 tslot = -1;
+    auto valid_ptr = [](u64 p) noexcept -> bool {
+        return p >= 0x100000ULL && p < 0x0000800000000000ULL;
+    };
+    if (BbSections::main_xray.deep_enabled.load(std::memory_order_relaxed) &&
+        slot >= 0 && valid_ptr(task_entry_ptr)) {
+        u64 fn_va = 0;
+        u64 obj = 0;
+        const u64 p8 = *reinterpret_cast<const u64*>(task_entry_ptr + 8ULL);
+        if (valid_ptr(p8)) {
+            obj = p8;
+            const u64 vt = *reinterpret_cast<const u64*>(p8);
+            if (valid_ptr(vt)) {
+                fn_va = *reinterpret_cast<const u64*>(vt + 0x10ULL);
+            }
+        } else {
+            const u64 p0 = *reinterpret_cast<const u64*>(task_entry_ptr);
+            if (valid_ptr(p0)) {
+                obj = p0;
+                const u64 vt = *reinterpret_cast<const u64*>(p0);
+                if (valid_ptr(vt)) {
+                    fn_va = *reinterpret_cast<const u64*>(vt + 0x18ULL);
+                }
+            }
+        }
+        if (fn_va != 0) {
+            u64 fn_off =
+                (fn_va >= ImageBase && fn_va < ImageBase + 0x6000000ULL) ? (fn_va - ImageBase) : fn_va;
+            // Unwrap SprjTask wrapper chain:
+            // 1) `0x20507c0`: `obj = *(obj+0x10); fn = *(*(obj)+0x18)`
+            // 2) `0x142de10`: `fn = *(*(obj)+0x20)`
+            // 3) `0x142de20` (Itanium PMF delegate):
+            //    `obj2 = *(obj+0x18) + *(obj+0x28); pmf = *(obj+0x20);`
+            //    `fn = (pmf & 1) ? *(*(obj2) + pmf - 1) : pmf`
+            auto to_off = [&](u64 va) noexcept -> u64 {
+                return (va >= ImageBase && va < ImageBase + 0x6000000ULL) ? (va - ImageBase) : va;
+            };
+            if (fn_off == 0x20507c0ULL && valid_ptr(obj)) {
+                const u64 obj2 = *reinterpret_cast<const u64*>(obj + 0x10ULL);
+                if (valid_ptr(obj2)) {
+                    obj = obj2;
+                    const u64 vt2 = *reinterpret_cast<const u64*>(obj);
+                    if (valid_ptr(vt2)) {
+                        fn_off = to_off(*reinterpret_cast<const u64*>(vt2 + 0x18ULL));
+                    }
+                }
+            }
+            if (fn_off == 0x142de10ULL && valid_ptr(obj)) {
+                const u64 vt2 = *reinterpret_cast<const u64*>(obj);
+                if (valid_ptr(vt2)) {
+                    fn_off = to_off(*reinterpret_cast<const u64*>(vt2 + 0x20ULL));
+                }
+            }
+            if (fn_off < 0x6000000ULL && valid_ptr(obj)) {
+                static constexpr u8 pmf_sig[7] = {0x48, 0x89, 0xf8, 0x48, 0x8b, 0x78, 0x18};
+                const auto* code_ptr = reinterpret_cast<const u8*>(ImageBase + fn_off);
+                if (std::memcmp(code_ptr, pmf_sig, sizeof(pmf_sig)) == 0) {
+                    const u64 raw_obj = *reinterpret_cast<const u64*>(obj + 0x18ULL);
+                    const u64 pmf = *reinterpret_cast<const u64*>(obj + 0x20ULL);
+                    const u64 adj = *reinterpret_cast<const u64*>(obj + 0x28ULL);
+                    const u64 target_obj = raw_obj + adj;
+                    if (valid_ptr(target_obj)) {
+                        obj = target_obj;
+                        if ((pmf & 1ULL) != 0ULL) {
+                            const u64 vt3 = *reinterpret_cast<const u64*>(obj);
+                            if (valid_ptr(vt3) && pmf < 0x10000ULL) {
+                                fn_off = to_off(*reinterpret_cast<const u64*>(vt3 + (pmf - 1ULL)));
+                            }
+                        } else if (pmf != 0ULL) {
+                            fn_off = to_off(pmf);
+                        }
+                    }
+                }
+            }
+            // If MoveMapStep::Execute (0x19386e0), record active state index [obj+0xc].
+            if (fn_off == 0x19386e0ULL && valid_ptr(obj)) {
+                const s32 st = *reinterpret_cast<const s32*>(obj + 0x0cULL);
+                BbSections::main_xray.movemap_last_state.store(st, std::memory_order_relaxed);
+            }
+            tslot = FindOrAllocMainTaskSlot(fn_off, slot);
+        }
+    }
+    ts.slot = slot;
+    ts.task_slot = tslot;
+    ts.t0 = (slot >= 0) ? __rdtsc() : 0ULL;
+}
+
+void PS4_SYSV_ABI MainTaskGroupEndHook(u32 /*group_id*/, u32 thread_idx) noexcept {
+    auto& ts = g_mx_threads[thread_idx & 31u];
+    const s32 slot = ts.slot;
+    const s32 tslot = ts.task_slot;
+    if (slot >= 0) {
+        const u64 dt = __rdtsc() - ts.t0;
+        ts.slot = -1;
+        ts.task_slot = -1;
+        auto& arr = (thread_idx == 0) ? BbSections::main_xray.cycles_t0
+                                      : BbSections::main_xray.cycles_wk;
+        arr[static_cast<std::size_t>(slot)].fetch_add(dt, std::memory_order_relaxed);
+        if (tslot >= 0) {
+            const auto ti = static_cast<std::size_t>(tslot);
+            BbSections::main_xray.task_cycles[ti].fetch_add(dt, std::memory_order_relaxed);
+            BbSections::main_xray.task_calls[ti].fetch_add(1ULL, std::memory_order_relaxed);
+        }
+    }
+}
+
+u64 g_adhoc_sub_t0[BbSections::MainXRay::AdhocSubCount]{};
+
+void PS4_SYSV_ABI AdhocSubBeginHook(u32 idx) noexcept {
+    if (idx < BbSections::MainXRay::AdhocSubCount) {
+        g_adhoc_sub_t0[idx] = __rdtsc();
+    }
+}
+
+void PS4_SYSV_ABI AdhocSubEndHook(u32 idx) noexcept {
+    if (idx < BbSections::MainXRay::AdhocSubCount) {
+        const u64 dt = __rdtsc() - g_adhoc_sub_t0[idx];
+        BbSections::main_xray.adhoc_sub_cycles[idx].fetch_add(dt, std::memory_order_relaxed);
+    }
+}
+
+extern "C" {
+extern void (PS4_SYSV_ABI *g_bb_sub_2293060_record)(std::uint64_t, std::uint64_t, std::uint32_t, std::uint32_t) noexcept;
+extern void (PS4_SYSV_ABI *g_bb_gxpool_event)(std::uint32_t, std::uint64_t, std::uint32_t) noexcept;
+extern void (PS4_SYSV_ABI *g_bb_gxpool_partask)(std::uint64_t, std::uint64_t, std::uint32_t, std::uint32_t) noexcept;
+void PS4_SYSV_ABI BbSub2293060Record(std::uint64_t fn_va, std::uint64_t cycles, std::uint32_t kind,
+                                     std::uint32_t count) noexcept;
+void PS4_SYSV_ABI BbGxPoolEvent(std::uint32_t kind, std::uint64_t val, std::uint32_t extra) noexcept;
+void PS4_SYSV_ABI BbGxPoolParTask(std::uint64_t fn_va, std::uint64_t cycles, std::uint32_t worker_id,
+                                  std::uint32_t items) noexcept;
+}
+
+bool InstallMainTaskProfiler() {
+    const char* env = std::getenv("BB_MAIN_XRAY");
+    if (env && env[0] == '0') {
+        return false;
+    }
+    const bool deep_xray = (env && env[0] == '1');
+    // `FD4TaskExecutor::RunTask` (`0x103d3b0`):
+    // - `0x103d3e5`: `e8 26 e9 ff ff` (`call 0x103bd10`, empty `ret`; `r12d`=group_id, `ebx`=thread_idx, `r15`=task_entry)
+    // - `0x103d43d`: `e8 de e8 ff ff` (`call 0x103bd20`, empty `ret`; `r12d`=group_id, `ebx`=thread_idx)
+    constexpr u64 beg_off = 0x103d3e5;
+    constexpr u64 end_off = 0x103d43d;
+    static constexpr std::array<u8, 5> beg_orig = {0xe8, 0x26, 0xe9, 0xff, 0xff};
+    static constexpr std::array<u8, 5> end_orig = {0xe8, 0xde, 0xe8, 0xff, 0xff};
+
+    const u64 beg_addr = ImageBase + beg_off;
+    const u64 end_addr = ImageBase + end_off;
+    if (std::memcmp(reinterpret_cast<const void*>(beg_addr), beg_orig.data(), beg_orig.size()) != 0 ||
+        std::memcmp(reinterpret_cast<const void*>(end_addr), end_orig.data(), end_orig.size()) != 0) {
+        return false;
+    }
+
+    auto make_call_stub = [&](const void* fn, bool pass_r15) -> u64 {
+        Emitter e;
+        e.SaveVolatile();
+        // SaveVolatile pushed the game's original r12 (group_id) at [r12]; ebx (thread_idx) & r15 (task_entry) are untouched.
+        e.Bytes({0x41, 0x8b, 0x3c, 0x24}); // mov edi, DWORD PTR [r12]
+        e.Bytes({0x89, 0xde});             // mov esi, ebx
+        if (pass_r15) {
+            e.Bytes({0x4c, 0x89, 0xfa});   // mov rdx, r15
+        }
+        e.CallAbs(fn);
+        e.RestoreVolatile();
+        e.Bytes({0xc3});                   // ret
+        return PlaceStub(e);
+    };
+
+    const u64 s_beg = make_call_stub(reinterpret_cast<const void*>(&MainTaskGroupBeginHook), true);
+    const u64 s_end = make_call_stub(reinterpret_cast<const void*>(&MainTaskGroupEndHook), false);
+    std::uint32_t r_beg = 0, r_end = 0;
+    if (!s_beg || !s_end ||
+        !Rel32To(beg_addr + 5, s_beg, r_beg) || !Rel32To(end_addr + 5, s_end, r_end)) {
+        return false;
+    }
+
+    WriteJumpOverTrap(beg_addr, 0xe8, r_beg);
+    WriteJumpOverTrap(end_addr, 0xe8, r_end);
+
+    if (deep_xray) {
+        // Deep diagnostic probes (BB_MAIN_XRAY=1): 21 call sites inside `SceneSub` (`0x1ed82d0`),
+        // `sub_2293060` callback breakdown, and `GXWorkerTaskPool` / parallel-for X-Ray.
+        struct SceneSubSite {
+            u64 call_off;
+            u64 target_off;
+            u32 bucket;
+        };
+        static constexpr std::array<SceneSubSite, 21> scene_sites = {{
+            {0x1ed8326, 0x1ede680, 4u}, {0x1ed8357, 0x20b55b0, 4u}, {0x1ed83af, 0x0e47290, 4u},
+            {0x1ed83b7, 0x0e47840, 4u}, {0x1ed83d6, 0x2194340, 0u}, {0x1ed83f0, 0x2293060, 0u},
+            {0x1ed841a, 0x20b55b0, 4u}, {0x1ed8423, 0x1d97bc0, 4u}, {0x1ed85d7, 0x2192d20, 0u},
+            {0x1ed85e7, 0x0f5d780, 3u}, {0x1ed8789, 0x0f5d780, 3u}, {0x1ed87a2, 0x1db6d70, 2u},
+            {0x1ed87bf, 0x1f5c1b0, 1u}, {0x1ed897d, 0x0f5d780, 3u}, {0x1ed8999, 0x1db6d70, 2u},
+            {0x1ed8b3b, 0x0f5d780, 3u}, {0x1ed8cdd, 0x0f5d780, 3u}, {0x1ed8e7f, 0x0f5d780, 3u},
+            {0x1ed9021, 0x0f5d780, 3u}, {0x1ed91c3, 0x0f5d780, 3u}, {0x1ed91df, 0x1db6d70, 2u},
+        }};
+        bool all_scene_ok = true;
+        for (const auto& s : scene_sites) {
+            const auto* p = reinterpret_cast<const u8*>(ImageBase + s.call_off);
+            if (p[0] != 0xe8) {
+                all_scene_ok = false;
+                break;
+            }
+            s32 rel = 0;
+            std::memcpy(&rel, p + 1, sizeof(rel));
+            if (s.call_off + 5ULL + static_cast<u64>(static_cast<s64>(rel)) != s.target_off) {
+                all_scene_ok = false;
+                break;
+            }
+        }
+        if (all_scene_ok) {
+            struct StubCacheEntry {
+                u64 target_off = 0;
+                u32 bucket = 0;
+                u64 stub_addr = 0;
+            };
+            std::array<StubCacheEntry, 16> cache{};
+            std::size_t cache_n = 0;
+            std::array<std::uint32_t, scene_sites.size()> rels{};
+            bool stubs_ok = true;
+            for (std::size_t i = 0; i < scene_sites.size(); ++i) {
+                const auto& s = scene_sites[i];
+                u64 stub = 0;
+                for (std::size_t c = 0; c < cache_n; ++c) {
+                    if (cache[c].target_off == s.target_off && cache[c].bucket == s.bucket) {
+                        stub = cache[c].stub_addr;
+                        break;
+                    }
+                }
+                if (!stub) {
+                    Emitter e;
+                    e.SaveVolatile();
+                    e.Bytes({0xbf});
+                    e.U32(s.bucket); // mov edi, bucket
+                    e.CallAbs(reinterpret_cast<const void*>(&AdhocSubBeginHook));
+                    e.RestoreVolatile();
+                    e.Bytes({0x48, 0x83, 0xec, 0x08}); // sub rsp, 8 (16B align before call)
+                    // Use r11 (pure scratch in SysV ABI) so rax/al is preserved for varargs (`0x20b55b0`).
+                    e.Bytes({0x49, 0xbb}); // movabs r11, target
+                    e.U64(ImageBase + s.target_off);
+                    e.Bytes({0x41, 0xff, 0xd3});       // call r11
+                    e.Bytes({0x48, 0x83, 0xc4, 0x08}); // add rsp, 8
+                    e.SaveVolatile();
+                    e.Bytes({0xbf});
+                    e.U32(s.bucket); // mov edi, bucket
+                    e.CallAbs(reinterpret_cast<const void*>(&AdhocSubEndHook));
+                    e.RestoreVolatile();
+                    e.Bytes({0xc3}); // ret
+                    stub = PlaceStub(e);
+                    if (!stub) {
+                        stubs_ok = false;
+                        break;
+                    }
+                    if (cache_n < cache.size()) {
+                        cache[cache_n++] = {s.target_off, s.bucket, stub};
+                    }
+                }
+                if (!Rel32To(ImageBase + s.call_off + 5ULL, stub, rels[i])) {
+                    stubs_ok = false;
+                    break;
+                }
+            }
+            if (stubs_ok) {
+                for (std::size_t i = 0; i < scene_sites.size(); ++i) {
+                    WriteJumpOverTrap(ImageBase + scene_sites[i].call_off, 0xe8, rels[i]);
+                }
+                BbSections::main_xray.adhoc_sub_installed.store(true, std::memory_order_release);
+            }
+        }
+
+        g_bb_sub_2293060_record = &BbSub2293060Record;
+        g_bb_gxpool_event = &BbGxPoolEvent;
+        g_bb_gxpool_partask = &BbGxPoolParTask;
+        BbSections::main_xray.deep_enabled.store(true, std::memory_order_release);
+    }
+    BbSections::main_xray.installed.store(true, std::memory_order_release);
+    return true;
+}
+
 void Install(RangeCallback on_gpu_range_allocated) {
     static std::atomic<bool> installed{false};
     if (installed.exchange(true)) {
@@ -2122,6 +2563,8 @@ void Install(RangeCallback on_gpu_range_allocated) {
             }
         }
         const int aspect_sites = InstallCameraAspectHooks();
+        std::printf("Guest hooks: main-thread SprjTaskGroup X-Ray profiler %s\n",
+                    InstallMainTaskProfiler() ? "on" : "off");
         std::printf("Guest hooks: render job slot leak fix %s\n",
                     InstallJobSlotFix() ? "on" : "not installed");
         std::printf("Guest hooks: job allocation failure probe %s\n",
@@ -2433,3 +2876,97 @@ bool CameraLookAdd(float pitch, float yaw) {
     }
 }
 } // namespace BbGuestHooks
+
+extern "C" void PS4_SYSV_ABI BbSub2293060Record(std::uint64_t fn_va, std::uint64_t cycles, std::uint32_t kind,
+                                                std::uint32_t count) noexcept {
+    auto& mx = BbSections::main_xray;
+    if (count > 0) {
+        mx.pass_last_items.store(count, std::memory_order_relaxed);
+    }
+    const std::uint64_t off =
+        (fn_va >= 0x800000000ULL && fn_va < 0x806000000ULL) ? (fn_va - 0x800000000ULL) : fn_va;
+    std::uint32_t cnt = mx.pass_count.load(std::memory_order_acquire);
+    for (std::uint32_t i = 0; i < cnt && i < BbSections::MainXRay::MaxPassCallbacks; ++i) {
+        if (mx.pass_fn_off[i] == off && mx.pass_kind[i] == kind) {
+            mx.pass_cycles[i].fetch_add(cycles, std::memory_order_relaxed);
+            mx.pass_calls[i].fetch_add(1ULL, std::memory_order_relaxed);
+            return;
+        }
+    }
+    static std::mutex s_pass_mu;
+    std::lock_guard<std::mutex> lk(s_pass_mu);
+    cnt = mx.pass_count.load(std::memory_order_relaxed);
+    for (std::uint32_t i = 0; i < cnt && i < BbSections::MainXRay::MaxPassCallbacks; ++i) {
+        if (mx.pass_fn_off[i] == off && mx.pass_kind[i] == kind) {
+            mx.pass_cycles[i].fetch_add(cycles, std::memory_order_relaxed);
+            mx.pass_calls[i].fetch_add(1ULL, std::memory_order_relaxed);
+            return;
+        }
+    }
+    if (cnt < BbSections::MainXRay::MaxPassCallbacks) {
+        mx.pass_fn_off[cnt] = off;
+        mx.pass_kind[cnt] = kind;
+        mx.pass_cycles[cnt].store(cycles, std::memory_order_relaxed);
+        mx.pass_calls[cnt].store(1ULL, std::memory_order_relaxed);
+        mx.pass_count.store(cnt + 1u, std::memory_order_release);
+    }
+}
+
+extern "C" void PS4_SYSV_ABI BbGxPoolEvent(std::uint32_t kind, std::uint64_t val, std::uint32_t extra) noexcept {
+    auto& mx = BbSections::main_xray;
+    if (extra > 0) {
+        mx.gxpool_workers.store(extra, std::memory_order_relaxed);
+    }
+    if (kind < mx.gxpool_stats.size()) {
+        mx.gxpool_stats[kind].fetch_add(val, std::memory_order_relaxed);
+    }
+}
+
+extern "C" void PS4_SYSV_ABI BbGxPoolParTask(std::uint64_t fn_va, std::uint64_t cycles, std::uint32_t worker_id,
+                                             std::uint32_t items) noexcept {
+    auto& mx = BbSections::main_xray;
+    const std::uint64_t off =
+        (fn_va >= 0x800000000ULL && fn_va < 0x806000000ULL) ? (fn_va - 0x800000000ULL) : fn_va;
+    auto update_max = [](std::atomic<std::uint64_t>& dst, std::uint64_t v) noexcept {
+        std::uint64_t cur = dst.load(std::memory_order_relaxed);
+        while (v > cur && !dst.compare_exchange_weak(cur, v, std::memory_order_relaxed)) {
+        }
+    };
+    std::uint32_t cnt = mx.par_count.load(std::memory_order_acquire);
+    for (std::uint32_t i = 0; i < cnt && i < BbSections::MainXRay::MaxParTasks; ++i) {
+        if (mx.par_fn_off[i] == off) {
+            mx.par_tot_cycles[i].fetch_add(cycles, std::memory_order_relaxed);
+            if (worker_id == 0) {
+                mx.par_t0_cycles[i].fetch_add(cycles, std::memory_order_relaxed);
+            }
+            mx.par_calls[i].fetch_add(1ULL, std::memory_order_relaxed);
+            mx.par_items[i].fetch_add(items, std::memory_order_relaxed);
+            update_max(mx.par_max_cycles[i], cycles);
+            return;
+        }
+    }
+    static std::mutex s_par_mu;
+    std::lock_guard<std::mutex> lk(s_par_mu);
+    cnt = mx.par_count.load(std::memory_order_relaxed);
+    for (std::uint32_t i = 0; i < cnt && i < BbSections::MainXRay::MaxParTasks; ++i) {
+        if (mx.par_fn_off[i] == off) {
+            mx.par_tot_cycles[i].fetch_add(cycles, std::memory_order_relaxed);
+            if (worker_id == 0) {
+                mx.par_t0_cycles[i].fetch_add(cycles, std::memory_order_relaxed);
+            }
+            mx.par_calls[i].fetch_add(1ULL, std::memory_order_relaxed);
+            mx.par_items[i].fetch_add(items, std::memory_order_relaxed);
+            update_max(mx.par_max_cycles[i], cycles);
+            return;
+        }
+    }
+    if (cnt < BbSections::MainXRay::MaxParTasks) {
+        mx.par_fn_off[cnt] = off;
+        mx.par_tot_cycles[cnt].store(cycles, std::memory_order_relaxed);
+        mx.par_t0_cycles[cnt].store(worker_id == 0 ? cycles : 0ULL, std::memory_order_relaxed);
+        mx.par_calls[cnt].store(1ULL, std::memory_order_relaxed);
+        mx.par_items[cnt].store(items, std::memory_order_relaxed);
+        mx.par_max_cycles[cnt].store(cycles, std::memory_order_relaxed);
+        mx.par_count.store(cnt + 1u, std::memory_order_release);
+    }
+}

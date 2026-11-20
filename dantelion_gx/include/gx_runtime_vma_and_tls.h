@@ -32,6 +32,8 @@ __attribute__((visibility("hidden"))) extern uint32_t  g_win32_guest_tls_teb_off
 __attribute__((visibility("hidden"))) extern volatile uint32_t g_gx_resource_tracker_spinlock;
 __attribute__((visibility("hidden"))) extern uint8_t   g_gx_offline_scratch[0x10000];
 __attribute__((visibility("hidden"))) extern uint8_t   g_gx_offline_tls_area[0x4000];
+GX_HOST_IMPORT void __gx_sysv_wait_u32(const void* addr, uint32_t expected) noexcept;
+GX_HOST_IMPORT void __gx_sysv_notify_one_u32(void* addr) noexcept;
 #if !defined(GX_HOST_PROVIDES_CYG_PROFILE)
 __attribute__((weak, no_instrument_function)) void __cyg_profile_func_enter(void*, void*) noexcept {}
 __attribute__((weak, no_instrument_function)) void __cyg_profile_func_exit(void*, void*) noexcept {}

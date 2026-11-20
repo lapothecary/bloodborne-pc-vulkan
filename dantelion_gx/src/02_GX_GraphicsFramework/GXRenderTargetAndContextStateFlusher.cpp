@@ -1035,6 +1035,11 @@ void GXDeviceContext_CopyShadowStateAndDirtyMasks(
 
 // Helper for resetting dirty bitmasks after a Draw/Dispatch call
 static inline void GXDeviceContext_ResetDirtyMasksAfterDraw(uint8_t* pCtx) {
+    if (*reinterpret_cast<const uint64_t*>(pCtx + 0x1670) == 0ULL &&
+        *reinterpret_cast<const uint64_t*>(pCtx + 0x1680) == 0x20ULL &&
+        *reinterpret_cast<const uint64_t*>(pCtx + 0x1688) == 0x08ULL) {
+        return;
+    }
     std::memset(pCtx + 0x1670, 0, 0xB8);
     *reinterpret_cast<uint64_t*>(pCtx + 0x1680) = 0x20;
     *reinterpret_cast<uint64_t*>(pCtx + 0x1688) = 0x08;
@@ -1499,6 +1504,14 @@ bool GXDeviceContext_FinalizeCommandListIfRecording(uint8_t* pCtx, void* a2, uin
 // ----------------------------------------------------------------------------
 // Per-stage dirty-run helpers for `GXDeviceContext_FlushDirtyStateToGnmContext`
 // ----------------------------------------------------------------------------
+static inline uint64_t GXDeviceContext_BuildActiveSlotMask(
+    uint32_t minSlot, uint32_t maxSlot, uint64_t slotMask) noexcept
+{
+    const uint64_t hiMask = (maxSlot >= 64u) ? ~0ULL : ((1ULL << maxSlot) - 1ULL);
+    const uint64_t loMask = ~((1ULL << minSlot) - 1ULL);
+    return (slotMask & hiMask & loMask) | (1ULL << minSlot);
+}
+
 static inline void GXDeviceContext_FlushStageSamplers(
     uint8_t* pCtx,
     uint8_t* pGnmCtx,
@@ -1508,27 +1521,19 @@ static inline void GXDeviceContext_FlushStageSamplers(
     size_t gnmSamplersOff,
     size_t gnmDirtyOff)
 {
-    uint32_t minSlot = *reinterpret_cast<uint32_t*>(pCtx + minMaxOff);
-    uint32_t maxSlot = *reinterpret_cast<uint32_t*>(pCtx + minMaxOff + 4);
+    const uint32_t minSlot = *reinterpret_cast<const uint32_t*>(pCtx + minMaxOff);
+    const uint32_t maxSlot = *reinterpret_cast<const uint32_t*>(pCtx + minMaxOff + 4);
     if (minSlot < maxSlot) {
-        uint64_t slotMask = *reinterpret_cast<uint64_t*>(pCtx + maskOff);
-        uint32_t cur = minSlot;
-        while (cur < maxSlot) {
-            uint32_t end = cur + 1;
-            while (end < maxSlot && ((slotMask >> end) & 1ULL)) {
-                ++end;
-            }
-            uint64_t runBits = (((1ULL << (end - cur)) - 1ULL) << cur);
-            *reinterpret_cast<uint64_t*>(pGnmCtx + gnmDirtyOff) |= runBits;
-            for (uint32_t s = cur; s < end; ++s) {
-                *reinterpret_cast<void**>(pGnmCtx + gnmSamplersOff + static_cast<size_t>(s) * 8) =
-                    *reinterpret_cast<void**>(pCtx + ctxSamplersOff + static_cast<size_t>(s) * 8);
-            }
-            uint32_t next = end + 1;
-            while (next < maxSlot && !((slotMask >> next) & 1ULL)) {
-                ++next;
-            }
-            cur = next;
+        const uint64_t active = GXDeviceContext_BuildActiveSlotMask(
+            minSlot, maxSlot, *reinterpret_cast<const uint64_t*>(pCtx + maskOff));
+        *reinterpret_cast<uint64_t*>(pGnmCtx + gnmDirtyOff) |= active;
+        auto** dst = reinterpret_cast<void**>(pGnmCtx + gnmSamplersOff);
+        auto* const* src = reinterpret_cast<void* const*>(pCtx + ctxSamplersOff);
+        uint64_t rem = active;
+        while (rem != 0ULL) {
+            const uint32_t s = static_cast<uint32_t>(__builtin_ctzll(rem));
+            rem &= (rem - 1ULL);
+            dst[s] = src[s];
         }
     }
     *reinterpret_cast<uint64_t*>(pCtx + minMaxOff) = 0x10ULL;
@@ -1544,37 +1549,28 @@ static inline void GXDeviceContext_FlushStageConstantBuffers(
     size_t gnmDirtyOff,
     uint64_t stageUsageBit)
 {
-    uint32_t minSlot = *reinterpret_cast<uint32_t*>(pCtx + minMaxOff);
-    uint32_t maxSlot = *reinterpret_cast<uint32_t*>(pCtx + minMaxOff + 4);
+    const uint32_t minSlot = *reinterpret_cast<const uint32_t*>(pCtx + minMaxOff);
+    const uint32_t maxSlot = *reinterpret_cast<const uint32_t*>(pCtx + minMaxOff + 4);
     if (minSlot < maxSlot) {
-        uint64_t slotMask = *reinterpret_cast<uint64_t*>(pCtx + maskOff);
-        uint32_t cur = minSlot;
-        while (cur < maxSlot) {
-            uint32_t end = cur + 1;
-            while (end < maxSlot && ((slotMask >> end) & 1ULL)) {
-                ++end;
-            }
-            uint64_t runBits = (((1ULL << (end - cur)) - 1ULL) << (cur + 16));
-            *reinterpret_cast<uint64_t*>(pGnmCtx + gnmDirtyOff) |= runBits;
-            for (uint32_t s = cur; s < end; ++s) {
-                uint8_t* pBuf = *reinterpret_cast<uint8_t**>(pCtx + ctxCbsOff + static_cast<size_t>(s) * 8);
-                if (pBuf) {
-                    uint32_t req = (1u << s) | static_cast<uint32_t>(stageUsageBit);
-                    uint32_t curUsage = *reinterpret_cast<uint32_t*>(pBuf + 0x44);
-                    if ((curUsage & req) != req) {
-                        __sync_fetch_and_or(reinterpret_cast<uint32_t*>(pBuf + 0x44), req);
-                    }
+        const uint64_t active = GXDeviceContext_BuildActiveSlotMask(
+            minSlot, maxSlot, *reinterpret_cast<const uint64_t*>(pCtx + maskOff));
+        *reinterpret_cast<uint64_t*>(pGnmCtx + gnmDirtyOff) |= (active << 16);
+        auto** dst = reinterpret_cast<uint8_t**>(pGnmCtx + gnmCbsOff);
+        auto* const* src = reinterpret_cast<uint8_t* const*>(pCtx + ctxCbsOff);
+        const uint32_t stageBit32 = static_cast<uint32_t>(stageUsageBit);
+        uint64_t rem = active;
+        while (rem != 0ULL) {
+            const uint32_t s = static_cast<uint32_t>(__builtin_ctzll(rem));
+            rem &= (rem - 1ULL);
+            uint8_t* pBuf = src[s];
+            dst[s] = pBuf;
+            if (pBuf) {
+                const uint32_t req = (1u << s) | stageBit32;
+                uint32_t* pUsage = reinterpret_cast<uint32_t*>(pBuf + 0x44);
+                if ((*pUsage & req) != req) {
+                    __sync_fetch_and_or(pUsage, req);
                 }
             }
-            for (uint32_t s = cur; s < end; ++s) {
-                *reinterpret_cast<void**>(pGnmCtx + gnmCbsOff + static_cast<size_t>(s) * 8) =
-                    *reinterpret_cast<void**>(pCtx + ctxCbsOff + static_cast<size_t>(s) * 8);
-            }
-            uint32_t next = end + 1;
-            while (next < maxSlot && !((slotMask >> next) & 1ULL)) {
-                ++next;
-            }
-            cur = next;
         }
     }
     *reinterpret_cast<uint64_t*>(pCtx + minMaxOff) = 0x0EULL;
@@ -1590,30 +1586,44 @@ static inline void GXDeviceContext_FlushStageSrvs(
     size_t gnmSrvLoOff,
     size_t gnmSrvHiOff)
 {
-    uint32_t minSlot = *reinterpret_cast<uint32_t*>(pCtx + minMaxOff);
-    uint32_t maxSlot = *reinterpret_cast<uint32_t*>(pCtx + minMaxOff + 4);
+    const uint32_t minSlot = *reinterpret_cast<const uint32_t*>(pCtx + minMaxOff);
+    const uint32_t maxSlot = *reinterpret_cast<const uint32_t*>(pCtx + minMaxOff + 4);
     if (minSlot < maxSlot) {
-        uint64_t slotMask = *reinterpret_cast<uint64_t*>(pCtx + maskOff);
-        uint32_t cur = minSlot;
-        while (cur < maxSlot) {
-            uint32_t end = cur + 1;
-            while (end < maxSlot && ((slotMask >> end) & 1ULL)) {
-                ++end;
+        if (maxSlot <= 64u) {
+            const uint64_t active = GXDeviceContext_BuildActiveSlotMask(
+                minSlot, maxSlot, *reinterpret_cast<const uint64_t*>(pCtx + maskOff));
+            *reinterpret_cast<uint64_t*>(pGnmCtx + gnmSrvLoOff) |= active;
+            auto** dst = reinterpret_cast<void**>(pGnmCtx + gnmSrvsOff);
+            auto* const* src = reinterpret_cast<void* const*>(pCtx + ctxSrvsOff);
+            uint64_t rem = active;
+            while (rem != 0ULL) {
+                const uint32_t s = static_cast<uint32_t>(__builtin_ctzll(rem));
+                rem &= (rem - 1ULL);
+                dst[s] = src[s];
             }
-            for (uint32_t s = cur; s < end; ++s) {
-                if (s < 64) {
-                    *reinterpret_cast<uint64_t*>(pGnmCtx + gnmSrvLoOff) |= (1ULL << s);
-                } else {
-                    *reinterpret_cast<uint64_t*>(pGnmCtx + gnmSrvHiOff) |= (1ULL << (s - 64));
+        } else {
+            uint64_t slotMask = *reinterpret_cast<const uint64_t*>(pCtx + maskOff);
+            uint32_t cur = minSlot;
+            while (cur < maxSlot) {
+                uint32_t end = cur + 1;
+                while (end < maxSlot && ((slotMask >> end) & 1ULL)) {
+                    ++end;
                 }
-                *reinterpret_cast<void**>(pGnmCtx + gnmSrvsOff + static_cast<size_t>(s) * 8) =
-                    *reinterpret_cast<void**>(pCtx + ctxSrvsOff + static_cast<size_t>(s) * 8);
+                for (uint32_t s = cur; s < end; ++s) {
+                    if (s < 64) {
+                        *reinterpret_cast<uint64_t*>(pGnmCtx + gnmSrvLoOff) |= (1ULL << s);
+                    } else {
+                        *reinterpret_cast<uint64_t*>(pGnmCtx + gnmSrvHiOff) |= (1ULL << (s - 64));
+                    }
+                    *reinterpret_cast<void**>(pGnmCtx + gnmSrvsOff + static_cast<size_t>(s) * 8) =
+                        *reinterpret_cast<void**>(pCtx + ctxSrvsOff + static_cast<size_t>(s) * 8);
+                }
+                uint32_t next = end + 1;
+                while (next < maxSlot && !((slotMask >> next) & 1ULL)) {
+                    ++next;
+                }
+                cur = next;
             }
-            uint32_t next = end + 1;
-            while (next < maxSlot && !((slotMask >> next) & 1ULL)) {
-                ++next;
-            }
-            cur = next;
         }
     }
     *reinterpret_cast<uint64_t*>(pCtx + minMaxOff) = 0x3BULL;
@@ -1626,261 +1636,257 @@ static inline void GXDeviceContext_FlushStageSrvs(
 // dirty state bitmasks (`+0x1670..+0x1727`).
 // ----------------------------------------------------------------------------
 void GXDeviceContext_FlushDirtyStateToGnmContext(uint8_t* pCtx) {
-    uint8_t* pGnmCtx = *reinterpret_cast<uint8_t**>(pCtx + 0x08);
     uint64_t dirtyFlags = *reinterpret_cast<uint64_t*>(pCtx + 0x1670);
-
-    // 1. Render Targets, Depth-Stencil View & OM UAVs (bits 0x01 / 0x02)
-    if (dirtyFlags & 0x02ULL) {
-        uint32_t numRtvs = *reinterpret_cast<uint32_t*>(pCtx + 0x10);
-        void* pDsv       = *reinterpret_cast<void**>(pCtx + 0x58);
-        uint32_t uavStart = *reinterpret_cast<uint32_t*>(pCtx + 0x60);
-        uint32_t uavCount = *reinterpret_cast<uint32_t*>(pCtx + 0x64);
-
-        pGnmCtx[0xB656] = static_cast<uint8_t>(numRtvs);
-        if (numRtvs > 0) {
-            std::memcpy(pGnmCtx + 0xBC10, pCtx + 0x18, static_cast<size_t>(numRtvs) * sizeof(void*));
-        }
-        *reinterpret_cast<void**>(pGnmCtx + 0xBC50) = pDsv;
-        for (uint32_t i = 0; i < uavCount; ++i) {
-            uint32_t slot = uavStart + i;
-            *reinterpret_cast<void**>(pGnmCtx + 0xBC58 + static_cast<size_t>(slot) * 8) =
-                *reinterpret_cast<void**>(pCtx + 0x68 + static_cast<size_t>(slot) * 8);
-        }
-    } else if (dirtyFlags & 0x01ULL) {
-        uint32_t numRtvs = *reinterpret_cast<uint32_t*>(pCtx + 0x10);
-        void* pDsv       = *reinterpret_cast<void**>(pCtx + 0x58);
-        pGnmCtx[0xB656] = static_cast<uint8_t>(numRtvs);
-        if (numRtvs > 0) {
-            std::memcpy(pGnmCtx + 0xBC10, pCtx + 0x18, static_cast<size_t>(numRtvs) * sizeof(void*));
-        }
-        *reinterpret_cast<void**>(pGnmCtx + 0xBC50) = pDsv;
-        pGnmCtx[0xBCB5] = static_cast<uint8_t>(numRtvs);
+    if (dirtyFlags == 0ULL) {
+        return;
     }
+    uint8_t* pGnmCtx = *reinterpret_cast<uint8_t**>(pCtx + 0x08);
 
-    // 2. Viewports (bit 0x04)
-    if (pCtx[0x1670] & 0x04u) {
-        uint32_t vpCount = *reinterpret_cast<uint32_t*>(pCtx + 0xC8);
-        if (vpCount == 0) {
-            GXDeviceContext_UpdateViewportFromBoundRtvOrDsv(pCtx);
-            vpCount = *reinterpret_cast<uint32_t*>(pCtx + 0xC8);
-        }
-        CGGfxContext_SetViewportCount(pGnmCtx + 0xB528, vpCount);
-        *reinterpret_cast<uint32_t*>(pGnmCtx + 0xBBF8) = vpCount;
-        if (vpCount > 0) {
-            std::memcpy(pGnmCtx + 0xB978, pCtx + 0xCC, static_cast<size_t>(vpCount) * 24);
-        }
-    }
+    // 1..5. OM / Viewport / Scissor / Stream-Out / DepthStencil / Blend / Rasterizer
+    if (dirtyFlags & 0x000000010000007FULL) {
+        // 1. Render Targets, Depth-Stencil View & OM UAVs (bits 0x01 / 0x02)
+        if (dirtyFlags & 0x02ULL) {
+            uint32_t numRtvs = *reinterpret_cast<uint32_t*>(pCtx + 0x10);
+            void* pDsv       = *reinterpret_cast<void**>(pCtx + 0x58);
+            uint32_t uavStart = *reinterpret_cast<uint32_t*>(pCtx + 0x60);
+            uint32_t uavCount = *reinterpret_cast<uint32_t*>(pCtx + 0x64);
 
-    // 3. Scissor Rectangles (bit 0x08)
-    if (pCtx[0x1670] & 0x08u) {
-        uint32_t scCount = *reinterpret_cast<uint32_t*>(pCtx + 0x18C);
-        if (scCount == 0) {
-            uint8_t* pRtv0 = *reinterpret_cast<uint8_t**>(pCtx + 0x18);
-            if (pRtv0) {
-                CGTextureGnmHeader* pTex = *reinterpret_cast<CGTextureGnmHeader**>(pRtv0 + 0x08);
-                uint32_t scissor[4] = { 0, 0, 0, 0 };
-                if (pTex && pTex->m_resourceType == 3) {
-                    scissor[2] = pTex->m_width;
-                    scissor[3] = pTex->m_height;
-                }
-                *reinterpret_cast<uint32_t*>(pCtx + 0x18C) = 1;
-                std::memcpy(pCtx + 0x190, scissor, 16);
-                uint8_t* pGnmCtx0 = *reinterpret_cast<uint8_t**>(pCtx + 0x08);
-                CGGfxContext_SetScissorCount(pGnmCtx0 + 0xB528, 1);
-                *reinterpret_cast<uint32_t*>(pGnmCtx0 + 0xBBFC) = 1;
-                std::memcpy(pGnmCtx0 + 0xBAF8, scissor, 16);
-                scCount = *reinterpret_cast<uint32_t*>(pCtx + 0x18C);
+            pGnmCtx[0xB656] = static_cast<uint8_t>(numRtvs);
+            if (numRtvs > 0) {
+                std::memcpy(pGnmCtx + 0xBC10, pCtx + 0x18, static_cast<size_t>(numRtvs) * sizeof(void*));
+            }
+            *reinterpret_cast<void**>(pGnmCtx + 0xBC50) = pDsv;
+            for (uint32_t i = 0; i < uavCount; ++i) {
+                uint32_t slot = uavStart + i;
+                *reinterpret_cast<void**>(pGnmCtx + 0xBC58 + static_cast<size_t>(slot) * 8) =
+                    *reinterpret_cast<void**>(pCtx + 0x68 + static_cast<size_t>(slot) * 8);
+            }
+        } else if (dirtyFlags & 0x01ULL) {
+            uint32_t numRtvs = *reinterpret_cast<uint32_t*>(pCtx + 0x10);
+            void* pDsv       = *reinterpret_cast<void**>(pCtx + 0x58);
+            pGnmCtx[0xB656] = static_cast<uint8_t>(numRtvs);
+            if (numRtvs > 0) {
+                std::memcpy(pGnmCtx + 0xBC10, pCtx + 0x18, static_cast<size_t>(numRtvs) * sizeof(void*));
+            }
+            *reinterpret_cast<void**>(pGnmCtx + 0xBC50) = pDsv;
+            pGnmCtx[0xBCB5] = static_cast<uint8_t>(numRtvs);
+        }
+
+        // 2. Viewports (bit 0x04)
+        if (dirtyFlags & 0x04ULL) {
+            uint32_t vpCount = *reinterpret_cast<uint32_t*>(pCtx + 0xC8);
+            if (vpCount == 0) {
+                GXDeviceContext_UpdateViewportFromBoundRtvOrDsv(pCtx);
+                vpCount = *reinterpret_cast<uint32_t*>(pCtx + 0xC8);
+            }
+            CGGfxContext_SetViewportCount(pGnmCtx + 0xB528, vpCount);
+            *reinterpret_cast<uint32_t*>(pGnmCtx + 0xBBF8) = vpCount;
+            if (vpCount > 0) {
+                std::memcpy(pGnmCtx + 0xB978, pCtx + 0xCC, static_cast<size_t>(vpCount) * 24);
             }
         }
-        CGGfxContext_SetScissorCount(pGnmCtx + 0xB528, scCount);
-        *reinterpret_cast<uint32_t*>(pGnmCtx + 0xBBFC) = scCount;
-        if (scCount > 0) {
-            std::memcpy(pGnmCtx + 0xBAF8, pCtx + 0x190, static_cast<size_t>(scCount) * 16);
-        }
-    }
 
-    // 4. Stream-Out Targets (bit 1ULL << 32, i.e., `pCtx[0x1674] & 0x01`)
-    if (pCtx[0x1674] & 0x01u) {
-        uint32_t soCount = *reinterpret_cast<uint32_t*>(pCtx + 0x250);
-        if (soCount > 0) {
-            std::memcpy(pGnmCtx + 0x2920, pCtx + 0x240, static_cast<size_t>(soCount) * sizeof(uint32_t));
-            *reinterpret_cast<uint64_t*>(pGnmCtx + 0x1338) |= (((1ULL << soCount) - 1ULL) << 52);
-            std::memcpy(pGnmCtx + 0xB950, pCtx + 0x220, static_cast<size_t>(soCount) * sizeof(void*));
-        }
-    }
-
-    // 5. DepthStencilState (bit 0x10), BlendState (bit 0x40), RasterizerState (bit 0x20)
-    uint64_t flags = *reinterpret_cast<uint64_t*>(pCtx + 0x1670);
-    if (flags & 0x10ULL) {
-        *reinterpret_cast<void**>(pGnmCtx + 0xBC08) = *reinterpret_cast<void**>(pCtx + 0x210);
-        pGnmCtx[0xBCB4] = pCtx[0x218];
-        flags = (*reinterpret_cast<uint64_t*>(pCtx + 0x1670) &= ~0x10ULL);
-    }
-    if (flags & 0x40ULL) {
-        *reinterpret_cast<void**>(pGnmCtx + 0xBC00) = *reinterpret_cast<void**>(pCtx + 0x480);
-        std::memcpy(pGnmCtx + 0xBC98, pCtx + 0x488, 16);
-        *reinterpret_cast<uint32_t*>(pGnmCtx + 0xBCB0) = *reinterpret_cast<uint32_t*>(pCtx + 0x498);
-        flags = (*reinterpret_cast<uint64_t*>(pCtx + 0x1670) &= ~0x40ULL);
-    }
-    if (flags & 0x20ULL) {
-        *reinterpret_cast<void**>(pGnmCtx + 0xB970) = *reinterpret_cast<void**>(pCtx + 0x258);
-        flags = (*reinterpret_cast<uint64_t*>(pCtx + 0x1670) &= ~0x20ULL);
-    }
-
-    // 6. Shader Stage Bindings: VS, PS, GS, HS, DS, CS
-    // VS
-    if (flags & 0x200ULL) {
-        GXDeviceContext_FlushStageSamplers(pCtx, pGnmCtx, 0x0778, 0x16A0, 0x06F8, 0xBCC8, 0x0078);
-    }
-    if (flags & 0x100ULL) {
-        GXDeviceContext_FlushStageConstantBuffers(pCtx, pGnmCtx, 0x06F0, 0x1698, 0x0680, 0xC148, 0x0078, 0x10000ULL);
-    }
-    if (flags & 0x80ULL) {
-        GXDeviceContext_FlushStageSrvs(pCtx, pGnmCtx, 0x0678, 0x1690, 0x04A0, 0xBD48, 0x0068, 0x0070);
-    }
-    if (flags & 0x400ULL) {
-        *reinterpret_cast<void**>(pGnmCtx + 0xC1B8) = *reinterpret_cast<void**>(pCtx + 0x0780);
-    }
-
-    // PS
-    if (flags & 0x2000ULL) {
-        GXDeviceContext_FlushStageSamplers(pCtx, pGnmCtx, 0x0A60, 0x16B8, 0x09E0, 0xD0A8, 0x1978);
-    }
-    if (flags & 0x1000ULL) {
-        GXDeviceContext_FlushStageConstantBuffers(pCtx, pGnmCtx, 0x09D8, 0x16B0, 0x0968, 0xD528, 0x1978, 0x100000ULL);
-    }
-    if (flags & 0x800ULL) {
-        GXDeviceContext_FlushStageSrvs(pCtx, pGnmCtx, 0x0960, 0x16A8, 0x0788, 0xD128, 0x1968, 0x1970);
-    }
-    if (flags & 0x4000ULL) {
-        *reinterpret_cast<void**>(pGnmCtx + 0xD598) = *reinterpret_cast<void**>(pCtx + 0x0A68);
-    }
-
-    // GS
-    if (flags & 0x20000ULL) {
-        GXDeviceContext_FlushStageSamplers(pCtx, pGnmCtx, 0x0D48, 0x16D0, 0x0CC8, 0xCBB0, 0x1338);
-    }
-    if (flags & 0x10000ULL) {
-        GXDeviceContext_FlushStageConstantBuffers(pCtx, pGnmCtx, 0x0CC0, 0x16C8, 0x0C50, 0xD030, 0x1338, 0x80000ULL);
-    }
-    if (flags & 0x8000ULL) {
-        GXDeviceContext_FlushStageSrvs(pCtx, pGnmCtx, 0x0C48, 0x16C0, 0x0A70, 0xCC30, 0x1328, 0x1330);
-    }
-    if (flags & 0x40000ULL) {
-        *reinterpret_cast<void**>(pGnmCtx + 0xD0A0) = *reinterpret_cast<void**>(pCtx + 0x0D50);
-    }
-
-    // HS
-    if (flags & 0x200000ULL) {
-        GXDeviceContext_FlushStageSamplers(pCtx, pGnmCtx, 0x1030, 0x16E8, 0x0FB0, 0xC6B8, 0x0CF8);
-    }
-    if (flags & 0x100000ULL) {
-        GXDeviceContext_FlushStageConstantBuffers(pCtx, pGnmCtx, 0x0FA8, 0x16E0, 0x0F38, 0xCB38, 0x0CF8, 0x40000ULL);
-    }
-    if (flags & 0x80000ULL) {
-        GXDeviceContext_FlushStageSrvs(pCtx, pGnmCtx, 0x0F30, 0x16D8, 0x0D58, 0xC738, 0x0CE8, 0x0CF0);
-    }
-    if (flags & 0x400000ULL) {
-        *reinterpret_cast<void**>(pGnmCtx + 0xCBA8) = *reinterpret_cast<void**>(pCtx + 0x1038);
-    }
-
-    // DS
-    if (flags & 0x2000000ULL) {
-        GXDeviceContext_FlushStageSamplers(pCtx, pGnmCtx, 0x1318, 0x1700, 0x1298, 0xC1C0, 0x06B8);
-    }
-    if (flags & 0x1000000ULL) {
-        GXDeviceContext_FlushStageConstantBuffers(pCtx, pGnmCtx, 0x1290, 0x16F8, 0x1220, 0xC640, 0x06B8, 0x20000ULL);
-    }
-    if (flags & 0x800000ULL) {
-        GXDeviceContext_FlushStageSrvs(pCtx, pGnmCtx, 0x1218, 0x16F0, 0x1040, 0xC240, 0x06A8, 0x06B0);
-    }
-    if (flags & 0x4000000ULL) {
-        *reinterpret_cast<void**>(pGnmCtx + 0xC6B0) = *reinterpret_cast<void**>(pCtx + 0x1320);
-    }
-
-    // CS
-    if (flags & 0x20000000ULL) {
-        GXDeviceContext_FlushStageSamplers(pCtx, pGnmCtx, 0x1600, 0x1718, 0x1580, 0xD5A0, 0x1FB8);
-    }
-    if (flags & 0x10000000ULL) {
-        GXDeviceContext_FlushStageConstantBuffers(pCtx, pGnmCtx, 0x1578, 0x1710, 0x1508, 0xDA20, 0x1FB8, 0x200000ULL);
-    }
-    if (flags & 0x8000000ULL) {
-        GXDeviceContext_FlushStageSrvs(pCtx, pGnmCtx, 0x1500, 0x1708, 0x1328, 0xD620, 0x1FA8, 0x1FB0);
-    }
-    if (flags & 0x40000000ULL) {
-        *reinterpret_cast<void**>(pGnmCtx + 0xDA90) = *reinterpret_cast<void**>(pCtx + 0x1608);
-    }
-
-    // 7. CS UAVs (bit 0x80000000ULL)
-    if (flags & 0x80000000ULL) {
-        uint32_t minSlot = *reinterpret_cast<uint32_t*>(pCtx + 0x1688);
-        uint32_t maxSlot = *reinterpret_cast<uint32_t*>(pCtx + 0x168C);
-        if (minSlot < maxSlot) {
-            uint64_t slotMask = *reinterpret_cast<uint64_t*>(pCtx + 0x1720);
-            uint32_t cur = minSlot;
-            while (cur < maxSlot) {
-                uint32_t end = cur + 1;
-                while (end < maxSlot && ((slotMask >> end) & 1ULL)) {
-                    ++end;
+        // 3. Scissor Rectangles (bit 0x08)
+        if (dirtyFlags & 0x08ULL) {
+            uint32_t scCount = *reinterpret_cast<uint32_t*>(pCtx + 0x18C);
+            if (scCount == 0) {
+                uint8_t* pRtv0 = *reinterpret_cast<uint8_t**>(pCtx + 0x18);
+                if (pRtv0) {
+                    CGTextureGnmHeader* pTex = *reinterpret_cast<CGTextureGnmHeader**>(pRtv0 + 0x08);
+                    uint32_t scissor[4] = { 0, 0, 0, 0 };
+                    if (pTex && pTex->m_resourceType == 3) {
+                        scissor[2] = pTex->m_width;
+                        scissor[3] = pTex->m_height;
+                    }
+                    *reinterpret_cast<uint32_t*>(pCtx + 0x18C) = 1;
+                    std::memcpy(pCtx + 0x190, scissor, 16);
+                    CGGfxContext_SetScissorCount(pGnmCtx + 0xB528, 1);
+                    *reinterpret_cast<uint32_t*>(pGnmCtx + 0xBBFC) = 1;
+                    std::memcpy(pGnmCtx + 0xBAF8, scissor, 16);
+                    scCount = *reinterpret_cast<uint32_t*>(pCtx + 0x18C);
                 }
-                uint64_t runBits = (((1ULL << (end - cur)) - 1ULL) << (cur + 0x24));
-                *reinterpret_cast<uint64_t*>(pGnmCtx + 0x1FB8) |= runBits;
-                for (uint32_t s = cur; s < end; ++s) {
-                    *reinterpret_cast<uint32_t*>(pGnmCtx + 0x1FD0 + static_cast<size_t>(s) * 4) =
-                        *reinterpret_cast<uint32_t*>(pCtx + 0x1650 + static_cast<size_t>(s) * 4);
-                }
-                for (uint32_t s = cur; s < end; ++s) {
-                    *reinterpret_cast<void**>(pGnmCtx + 0xDA98 + static_cast<size_t>(s) * 8) =
-                        *reinterpret_cast<void**>(pCtx + 0x1610 + static_cast<size_t>(s) * 8);
-                }
-                uint32_t next = end + 1;
-                while (next < maxSlot && !((slotMask >> next) & 1ULL)) {
-                    ++next;
-                }
-                cur = next;
+            }
+            CGGfxContext_SetScissorCount(pGnmCtx + 0xB528, scCount);
+            *reinterpret_cast<uint32_t*>(pGnmCtx + 0xBBFC) = scCount;
+            if (scCount > 0) {
+                std::memcpy(pGnmCtx + 0xBAF8, pCtx + 0x190, static_cast<size_t>(scCount) * 16);
             }
         }
-        *reinterpret_cast<uint64_t*>(pCtx + 0x1688) = 0x08ULL;
+
+        // 4. Stream-Out Targets (bit 1ULL << 32)
+        if (dirtyFlags & (1ULL << 32)) {
+            uint32_t soCount = *reinterpret_cast<uint32_t*>(pCtx + 0x250);
+            if (soCount > 0) {
+                std::memcpy(pGnmCtx + 0x2920, pCtx + 0x240, static_cast<size_t>(soCount) * sizeof(uint32_t));
+                *reinterpret_cast<uint64_t*>(pGnmCtx + 0x1338) |= (((1ULL << soCount) - 1ULL) << 52);
+                std::memcpy(pGnmCtx + 0xB950, pCtx + 0x220, static_cast<size_t>(soCount) * sizeof(void*));
+            }
+        }
+
+        // 5. DepthStencilState (bit 0x10), BlendState (bit 0x40), RasterizerState (bit 0x20)
+        if (dirtyFlags & 0x10ULL) {
+            *reinterpret_cast<void**>(pGnmCtx + 0xBC08) = *reinterpret_cast<void**>(pCtx + 0x210);
+            pGnmCtx[0xBCB4] = pCtx[0x218];
+        }
+        if (dirtyFlags & 0x40ULL) {
+            *reinterpret_cast<void**>(pGnmCtx + 0xBC00) = *reinterpret_cast<void**>(pCtx + 0x480);
+            std::memcpy(pGnmCtx + 0xBC98, pCtx + 0x488, 16);
+            *reinterpret_cast<uint32_t*>(pGnmCtx + 0xBCB0) = *reinterpret_cast<uint32_t*>(pCtx + 0x498);
+        }
+        if (dirtyFlags & 0x20ULL) {
+            *reinterpret_cast<void**>(pGnmCtx + 0xB970) = *reinterpret_cast<void**>(pCtx + 0x258);
+        }
+    }
+
+    // Re-read in case UpdateViewportFromBoundRtvOrDsv touched bit 0x04; preserves exact flags.
+    const uint64_t flags = *reinterpret_cast<const uint64_t*>(pCtx + 0x1670);
+
+    // 6. Shader Stage Bindings: VS, PS (hot path), GS/HS/DS/CS/CS_UAV (cold path)
+    if (flags & 0x00000780ULL) {
+        if (flags & 0x200ULL) {
+            GXDeviceContext_FlushStageSamplers(pCtx, pGnmCtx, 0x0778, 0x16A0, 0x06F8, 0xBCC8, 0x0078);
+        }
+        if (flags & 0x100ULL) {
+            GXDeviceContext_FlushStageConstantBuffers(pCtx, pGnmCtx, 0x06F0, 0x1698, 0x0680, 0xC148, 0x0078, 0x10000ULL);
+        }
+        if (flags & 0x80ULL) {
+            GXDeviceContext_FlushStageSrvs(pCtx, pGnmCtx, 0x0678, 0x1690, 0x04A0, 0xBD48, 0x0068, 0x0070);
+        }
+        if (flags & 0x400ULL) {
+            *reinterpret_cast<void**>(pGnmCtx + 0xC1B8) = *reinterpret_cast<void**>(pCtx + 0x0780);
+        }
+    }
+
+    if (flags & 0x00007800ULL) {
+        if (flags & 0x2000ULL) {
+            GXDeviceContext_FlushStageSamplers(pCtx, pGnmCtx, 0x0A60, 0x16B8, 0x09E0, 0xD0A8, 0x1978);
+        }
+        if (flags & 0x1000ULL) {
+            GXDeviceContext_FlushStageConstantBuffers(pCtx, pGnmCtx, 0x09D8, 0x16B0, 0x0968, 0xD528, 0x1978, 0x100000ULL);
+        }
+        if (flags & 0x800ULL) {
+            GXDeviceContext_FlushStageSrvs(pCtx, pGnmCtx, 0x0960, 0x16A8, 0x0788, 0xD128, 0x1968, 0x1970);
+        }
+        if (flags & 0x4000ULL) {
+            *reinterpret_cast<void**>(pGnmCtx + 0xD598) = *reinterpret_cast<void**>(pCtx + 0x0A68);
+        }
+    }
+
+    // Rare stages: GS, HS, DS, CS, CS UAVs (0 on ~99% of G-Buffer/Shadow draws)
+    if (flags & 0xFFFF8000ULL) [[unlikely]] {
+        if (flags & 0x00078000ULL) {
+            if (flags & 0x20000ULL) {
+                GXDeviceContext_FlushStageSamplers(pCtx, pGnmCtx, 0x0D48, 0x16D0, 0x0CC8, 0xCBB0, 0x1338);
+            }
+            if (flags & 0x10000ULL) {
+                GXDeviceContext_FlushStageConstantBuffers(pCtx, pGnmCtx, 0x0CC0, 0x16C8, 0x0C50, 0xD030, 0x1338, 0x80000ULL);
+            }
+            if (flags & 0x8000ULL) {
+                GXDeviceContext_FlushStageSrvs(pCtx, pGnmCtx, 0x0C48, 0x16C0, 0x0A70, 0xCC30, 0x1328, 0x1330);
+            }
+            if (flags & 0x40000ULL) {
+                *reinterpret_cast<void**>(pGnmCtx + 0xD0A0) = *reinterpret_cast<void**>(pCtx + 0x0D50);
+            }
+        }
+        if (flags & 0x00780000ULL) {
+            if (flags & 0x200000ULL) {
+                GXDeviceContext_FlushStageSamplers(pCtx, pGnmCtx, 0x1030, 0x16E8, 0x0FB0, 0xC6B8, 0x0CF8);
+            }
+            if (flags & 0x100000ULL) {
+                GXDeviceContext_FlushStageConstantBuffers(pCtx, pGnmCtx, 0x0FA8, 0x16E0, 0x0F38, 0xCB38, 0x0CF8, 0x40000ULL);
+            }
+            if (flags & 0x80000ULL) {
+                GXDeviceContext_FlushStageSrvs(pCtx, pGnmCtx, 0x0F30, 0x16D8, 0x0D58, 0xC738, 0x0CE8, 0x0CF0);
+            }
+            if (flags & 0x400000ULL) {
+                *reinterpret_cast<void**>(pGnmCtx + 0xCBA8) = *reinterpret_cast<void**>(pCtx + 0x1038);
+            }
+        }
+        if (flags & 0x07800000ULL) {
+            if (flags & 0x2000000ULL) {
+                GXDeviceContext_FlushStageSamplers(pCtx, pGnmCtx, 0x1318, 0x1700, 0x1298, 0xC1C0, 0x06B8);
+            }
+            if (flags & 0x1000000ULL) {
+                GXDeviceContext_FlushStageConstantBuffers(pCtx, pGnmCtx, 0x1290, 0x16F8, 0x1220, 0xC640, 0x06B8, 0x20000ULL);
+            }
+            if (flags & 0x800000ULL) {
+                GXDeviceContext_FlushStageSrvs(pCtx, pGnmCtx, 0x1218, 0x16F0, 0x1040, 0xC240, 0x06A8, 0x06B0);
+            }
+            if (flags & 0x4000000ULL) {
+                *reinterpret_cast<void**>(pGnmCtx + 0xC6B0) = *reinterpret_cast<void**>(pCtx + 0x1320);
+            }
+        }
+        if (flags & 0x78000000ULL) {
+            if (flags & 0x20000000ULL) {
+                GXDeviceContext_FlushStageSamplers(pCtx, pGnmCtx, 0x1600, 0x1718, 0x1580, 0xD5A0, 0x1FB8);
+            }
+            if (flags & 0x10000000ULL) {
+                GXDeviceContext_FlushStageConstantBuffers(pCtx, pGnmCtx, 0x1578, 0x1710, 0x1508, 0xDA20, 0x1FB8, 0x200000ULL);
+            }
+            if (flags & 0x8000000ULL) {
+                GXDeviceContext_FlushStageSrvs(pCtx, pGnmCtx, 0x1500, 0x1708, 0x1328, 0xD620, 0x1FA8, 0x1FB0);
+            }
+            if (flags & 0x40000000ULL) {
+                *reinterpret_cast<void**>(pGnmCtx + 0xDA90) = *reinterpret_cast<void**>(pCtx + 0x1608);
+            }
+        }
+        // 7. CS UAVs (bit 0x80000000ULL)
+        if (flags & 0x80000000ULL) {
+            const uint32_t minSlot = *reinterpret_cast<const uint32_t*>(pCtx + 0x1688);
+            const uint32_t maxSlot = *reinterpret_cast<const uint32_t*>(pCtx + 0x168C);
+            if (minSlot < maxSlot) {
+                const uint64_t active = GXDeviceContext_BuildActiveSlotMask(
+                    minSlot, maxSlot, *reinterpret_cast<const uint64_t*>(pCtx + 0x1720));
+                *reinterpret_cast<uint64_t*>(pGnmCtx + 0x1FB8) |= (active << 0x24);
+                auto* dstCnt = reinterpret_cast<uint32_t*>(pGnmCtx + 0x1FD0);
+                const auto* srcCnt = reinterpret_cast<const uint32_t*>(pCtx + 0x1650);
+                auto** dstUav = reinterpret_cast<void**>(pGnmCtx + 0xDA98);
+                auto* const* srcUav = reinterpret_cast<void* const*>(pCtx + 0x1610);
+                uint64_t rem = active;
+                while (rem != 0ULL) {
+                    const uint32_t s = static_cast<uint32_t>(__builtin_ctzll(rem));
+                    rem &= (rem - 1ULL);
+                    dstCnt[s] = srcCnt[s];
+                    dstUav[s] = srcUav[s];
+                }
+            }
+            *reinterpret_cast<uint64_t*>(pCtx + 0x1688) = 0x08ULL;
+        }
     }
 
     // 8. Input Assembler (IA): InputLayout (bit 36), Topology (bit 35), IndexBuffer (bit 33), VertexBuffers (bit 34)
-    if (flags & (1ULL << 36)) {
-        *reinterpret_cast<void**>(pGnmCtx + 0xB730) = *reinterpret_cast<void**>(pCtx + 0x0260);
-    }
-    if (flags & (1ULL << 35)) {
-        *reinterpret_cast<uint32_t*>(pGnmCtx + 0xB738) = *reinterpret_cast<uint32_t*>(pCtx + 0x0268);
-    }
-    if (flags & (1ULL << 33)) {
-        *reinterpret_cast<void**>(pGnmCtx + 0xB740)     = *reinterpret_cast<void**>(pCtx + 0x0270);
-        *reinterpret_cast<uint64_t*>(pGnmCtx + 0xB748) = *reinterpret_cast<uint64_t*>(pCtx + 0x0278);
-    }
-    if (flags & (1ULL << 34)) {
-        uint32_t minSlot = *reinterpret_cast<uint32_t*>(pCtx + 0x1680);
-        uint32_t maxSlot = *reinterpret_cast<uint32_t*>(pCtx + 0x1684);
-        if (minSlot < maxSlot) {
-            uint64_t slotMask = *reinterpret_cast<uint64_t*>(pCtx + 0x1678);
-            uint32_t cur = minSlot;
-            while (cur < maxSlot) {
-                uint32_t end = cur + 1;
-                while (end < maxSlot && ((slotMask >> end) & 1ULL)) {
-                    ++end;
+    if (flags & 0x0000001E00000000ULL) {
+        if (flags & (1ULL << 36)) {
+            *reinterpret_cast<void**>(pGnmCtx + 0xB730) = *reinterpret_cast<void**>(pCtx + 0x0260);
+        }
+        if (flags & (1ULL << 35)) {
+            *reinterpret_cast<uint32_t*>(pGnmCtx + 0xB738) = *reinterpret_cast<uint32_t*>(pCtx + 0x0268);
+        }
+        if (flags & (1ULL << 33)) {
+            *reinterpret_cast<void**>(pGnmCtx + 0xB740)     = *reinterpret_cast<void**>(pCtx + 0x0270);
+            *reinterpret_cast<uint64_t*>(pGnmCtx + 0xB748) = *reinterpret_cast<uint64_t*>(pCtx + 0x0278);
+        }
+        if (flags & (1ULL << 34)) {
+            const uint32_t minSlot = *reinterpret_cast<const uint32_t*>(pCtx + 0x1680);
+            const uint32_t maxSlot = *reinterpret_cast<const uint32_t*>(pCtx + 0x1684);
+            if (minSlot < maxSlot) {
+                const uint64_t active = GXDeviceContext_BuildActiveSlotMask(
+                    minSlot, maxSlot, *reinterpret_cast<const uint64_t*>(pCtx + 0x1678));
+                *reinterpret_cast<uint32_t*>(pGnmCtx + 0x25F0) |= static_cast<uint32_t>(active);
+                auto** dstVb = reinterpret_cast<void**>(pGnmCtx + 0xB750);
+                auto* const* srcVb = reinterpret_cast<void* const*>(pCtx + 0x0280);
+                auto* dstSt = reinterpret_cast<uint32_t*>(pGnmCtx + 0xB850);
+                const auto* srcSt = reinterpret_cast<const uint32_t*>(pCtx + 0x0380);
+                auto* dstOff = reinterpret_cast<uint32_t*>(pGnmCtx + 0xB8D0);
+                const auto* srcOff = reinterpret_cast<const uint32_t*>(pCtx + 0x0400);
+                uint64_t rem = active;
+                while (rem != 0ULL) {
+                    const uint32_t s = static_cast<uint32_t>(__builtin_ctzll(rem));
+                    rem &= (rem - 1ULL);
+                    dstVb[s] = srcVb[s];
+                    dstSt[s] = srcSt[s];
+                    dstOff[s] = srcOff[s];
                 }
-                uint32_t runBits = static_cast<uint32_t>(((1ULL << (end - cur)) - 1ULL) << cur);
-                *reinterpret_cast<uint32_t*>(pGnmCtx + 0x25F0) |= runBits;
-                for (uint32_t s = cur; s < end; ++s) {
-                    *reinterpret_cast<void**>(pGnmCtx + 0xB750 + static_cast<size_t>(s) * 8) =
-                        *reinterpret_cast<void**>(pCtx + 0x0280 + static_cast<size_t>(s) * 8);
-                    *reinterpret_cast<uint32_t*>(pGnmCtx + 0xB850 + static_cast<size_t>(s) * 4) =
-                        *reinterpret_cast<uint32_t*>(pCtx + 0x0380 + static_cast<size_t>(s) * 4);
-                    *reinterpret_cast<uint32_t*>(pGnmCtx + 0xB8D0 + static_cast<size_t>(s) * 4) =
-                        *reinterpret_cast<uint32_t*>(pCtx + 0x0400 + static_cast<size_t>(s) * 4);
-                }
-                uint32_t next = end + 1;
-                while (next < maxSlot && !((slotMask >> next) & 1ULL)) {
-                    ++next;
-                }
-                cur = next;
             }
         }
     }

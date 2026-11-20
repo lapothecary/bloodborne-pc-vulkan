@@ -846,8 +846,10 @@ private:
         std::array<vk::DeviceSize, 16> host_offsets{};
     };
     u64 stage_b_vertex_memo_clock = 0;
+    std::unique_ptr<std::array<u64, StageBVertexMemoEntry::TableSize>> stage_b_vertex_memo_keys;
     std::unique_ptr<std::array<StageBVertexMemoEntry, StageBVertexMemoEntry::TableSize>>
         stage_b_vertex_memo;
+    u64 packet_vsharps_hash = 0; ///< Cached XXH3 of `packet_vsharps` shared across DrawRecord & ResolveVertexBuffers
     boost::container::small_vector<DirectCopyTextureRegionArgs, 16> pending_tex_copies;
     std::vector<DirectCopyRegion> pending_buf_copies;
     VAddr stage_a_shadow_cb_addr = 0;

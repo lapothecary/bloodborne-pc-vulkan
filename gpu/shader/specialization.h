@@ -397,10 +397,12 @@ struct StageSpecialization {
             }
         }
 
+        const bool start_ok = (start == cur_start);
+        const bool paged_enabled = profile.paged_buffers;
         const bool buffers_match_size = (buffers.size() == cur_info.buffers.size());
         const bool images_match_size = (images.size() == cur_info.images.size());
         const bool samplers_match_size = (samplers.size() == cur_info.samplers.size());
-        if (!bitset.none() && (!(start == cur_start) || !buffers_match_size || !images_match_size ||
+        if (!bitset.none() && (!start_ok || !buffers_match_size || !images_match_size ||
                                !samplers_match_size)) {
             return false;
         }
@@ -412,12 +414,12 @@ struct StageSpecialization {
                 continue;
             }
             cur_any_bit = true;
-            if (!buffers_match_size || !(start == cur_start)) {
+            if (!buffers_match_size || !start_ok) [[unlikely]] {
                 return false;
             }
             const u32 stride = sharp.GetStride();
             const bool is_paged =
-                profile.paged_buffers &&
+                paged_enabled &&
                 IsPagedBuffer(true, sharp, cur_info.pgm_hash, profile.buffer_copy_shader_hash);
             if (!desc.is_formatted && !sharp.swizzle_enable) [[likely]] {
                 const auto& ref = buffers[i];
@@ -454,7 +456,7 @@ struct StageSpecialization {
                 continue;
             }
             cur_any_bit = true;
-            if (!images_match_size || !(start == cur_start)) {
+            if (!images_match_size || !start_ok) [[unlikely]] {
                 return false;
             }
             ImageSpecialization ispec{};
@@ -477,8 +479,7 @@ struct StageSpecialization {
         if (bitset.none() && !cur_any_bit) {
             return true;
         }
-        if (!(start == cur_start) || !buffers_match_size || !images_match_size ||
-            !samplers_match_size) {
+        if (!start_ok || !buffers_match_size || !images_match_size || !samplers_match_size) {
             return false;
         }
         for (size_t i = 0; i < cur_info.samplers.size(); ++i) {
