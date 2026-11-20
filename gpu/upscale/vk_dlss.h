@@ -38,6 +38,9 @@ public:
     void Shutdown();
 
     [[nodiscard]] bool Available() const;
+    /// Non-blocking boot check: true when NVIDIA RTX + NGX bridge/extensions are present
+    /// (background `bb:DlssInit` may still be finalizing NGX initialization).
+    [[nodiscard]] bool EligibleForBoot() const noexcept;
     /// Why DLSS cannot run on this system (empty when it can, or before device creation).
     [[nodiscard]] std::string Problem() const;
 

@@ -9,6 +9,7 @@
 #include "bbport_crash_blackbox.h"
 #include "bbport_frame_rate.h"
 #include "bbport_guest_code_hooks.h"
+#include "bbport_settings.h"
 #include "common/types.h"
 
 #include <algorithm>
@@ -21,6 +22,7 @@
 #include <unistd.h>
 
 extern "C" {
+int runtime_memory_is_mapped(std::uintptr_t address, std::uint64_t size);
 void runtime_memory_prepare_cpu_write(std::uintptr_t address, std::uint64_t size);
 void runtime_memory_note_cpu_write(std::uintptr_t address, std::uint64_t size);
 }
@@ -31,8 +33,12 @@ namespace {
 constexpr std::uint64_t kHostZlibBridgeMagic = 0x42425A4C42524447ull; // "BBZLBRDG"
 constexpr std::uint64_t kBurstActiveWindowNs = 250'000'000ull;        // 250 ms post-inflate hold
 constexpr std::uint64_t kMaxLoadingScreenDraws = 160ull;              // 3D gameplay is 450..1500+
+constexpr std::uint64_t kMaxNowLoadingDraws = 320ull;                 // sanity guard while MenuMan NowLoading is active
 
 // Zero thread_local variables (strictly preserves PT_TLS <= 73.00 KiB ceiling).
+std::atomic<unsigned char*> g_image_base{nullptr};
+std::atomic<std::uint64_t> g_image_size{0};
+std::atomic<bool> g_tips_timer_site_verified{false};
 std::atomic<std::uint64_t> g_last_inflate_ns{0};
 std::atomic<std::uint64_t> g_inflated_bytes{0};
 std::atomic<std::uint64_t> g_inflate_calls{0};
@@ -253,6 +259,8 @@ bool Enabled() noexcept {
 }
 
 void PatchImage(unsigned char* image, std::uint64_t size) {
+    g_image_size.store(size, std::memory_order_relaxed);
+    g_image_base.store(image, std::memory_order_release);
     if (!Enabled()) {
         std::printf("[bb_vulkan] Fast Load: disabled (BB_FAST_LOAD=0)\n");
         return;
@@ -365,20 +373,116 @@ void PatchImage(unsigned char* image, std::uint64_t size) {
                                        kPatchedMov64k.size(), page);
     }
 
+    // Verify StageFlow's 12.0s artificial item-tips reading timer site (0x01938b62):
+    //   74 0a                   je  +10 (skip 12.0f -> 0.0f on Load Game)
+    //   c5 fa 10 05 5c f5 fe 02 vmovss xmm0, [rip+0x2fef55c]  # 0x049280c8 = 12.0f
+    static constexpr std::array<std::uint8_t, 10> kExpectedTipsTimerJe = {
+        0x74, 0x0a, 0xc5, 0xfa, 0x10, 0x05, 0x5c, 0xf5, 0xfe, 0x02,
+    };
+    if (Vma::StageFlow_TipsTimerJe + kExpectedTipsTimerJe.size() <= size &&
+        std::memcmp(image + Vma::StageFlow_TipsTimerJe, kExpectedTipsTimerJe.data(),
+                    kExpectedTipsTimerJe.size()) == 0) {
+        g_tips_timer_site_verified.store(true, std::memory_order_release);
+        SyncLoadingTipsTimer(BbSettings::Get().loading_tips_timer.load(std::memory_order_relaxed));
+    }
+
     std::printf("[bb_vulkan] Fast Load: host SIMD zlib %s (%zu/11 hooks, libz %s), DcxDflt 64 KiB "
-                "chunk %s, 500 Hz loading pacer ON\n",
+                "chunk %s, 500 Hz loading pacer ON, 12s tips timer %s\n",
                 installed == 11 ? "ON" : "PARTIAL", installed, ::zlibVersion(),
-                chunk_64k ? "ON" : "OFF");
+                chunk_64k ? "ON" : "OFF",
+                g_tips_timer_site_verified.load(std::memory_order_relaxed)
+                    ? (BbSettings::Get().loading_tips_timer.load(std::memory_order_relaxed)
+                           ? "KEPT (menu=On)"
+                           : "BYPASSED (menu=Off)")
+                    : "UNAVAILABLE");
+}
+
+void SyncLoadingTipsTimer(bool keep_tips_timer) noexcept {
+    if (!g_tips_timer_site_verified.load(std::memory_order_acquire)) {
+        return;
+    }
+    unsigned char* base = g_image_base.load(std::memory_order_acquire);
+    if (!base) {
+        return;
+    }
+    const std::size_t page = static_cast<std::size_t>(::sysconf(_SC_PAGESIZE));
+    const std::uint8_t opcode = keep_tips_timer ? 0x74u : 0xebu; // je (12s) vs jmp (0s)
+    WriteVerifiedBytes(base + Vma::StageFlow_TipsTimerJe, &opcode, 1, page);
 }
 
 bool UpdateFrameAndCheckBurst(std::uint64_t now_ns, std::uint64_t frame_draws) noexcept {
     if (!Enabled()) {
         return false;
     }
+
+    // 1. Exact engine ground-truth: read Bloodborne's MenuMan NowLoading state (+0x804) and
+    //    NowLoadingOpenFlag (ImageBase + 0x0556286b).
+    //    IMPORTANT: MenuManPtr lives in eboot.bin's ELF .bss (ALWAYS mapped in [base, base+size)),
+    //    NOT in runtime_memory's direct/flexible vmas[] table — so check offset < g_image_size
+    //    instead of runtime_memory_is_mapped() on the .bss pointer itself!
+    bool engine_now_loading = false;
+    std::uint32_t observed_state = 0;
+    float observed_timer_before = 0.0f;
+    float observed_timer_after = 0.0f;
+    const unsigned char* base = g_image_base.load(std::memory_order_acquire);
+    const std::uint64_t img_size = g_image_size.load(std::memory_order_relaxed);
+    if (base && Vma::MenuManPtr + sizeof(std::uint64_t) <= img_size) {
+        const std::uint8_t open_flag = *(base + Vma::NowLoadingOpenFlag);
+        const std::uint64_t menu_man =
+            *reinterpret_cast<const std::uint64_t*>(base + Vma::MenuManPtr);
+        if (menu_man >= 0x10000ull &&
+            runtime_memory_is_mapped(
+                static_cast<std::uintptr_t>(menu_man + Vma::MenuMan_LoadingStateOff),
+                sizeof(std::uint32_t))) {
+            observed_state = *reinterpret_cast<const std::uint32_t*>(
+                menu_man + Vma::MenuMan_LoadingStateOff);
+            if (observed_state == 1u || observed_state == 2u ||
+                (open_flag != 0u && observed_state != 3u)) {
+                engine_now_loading = true;
+                const auto timer_addr =
+                    static_cast<std::uintptr_t>(menu_man + Vma::MenuMan_MinTimerOff);
+                if (runtime_memory_is_mapped(timer_addr, sizeof(float))) {
+                    auto* min_timer = reinterpret_cast<float*>(timer_addr);
+                    observed_timer_before = *min_timer;
+                    if (!BbSettings::Get().loading_tips_timer.load(std::memory_order_relaxed) &&
+                        *min_timer > 0.0f) {
+                        *min_timer = 0.0f;
+                    }
+                    observed_timer_after = *min_timer;
+                }
+            }
+        }
+    }
+
+    // Track exact loading-screen transitions in the log for verification.
+    static bool prev_engine_loading = false;
+    static std::uint64_t loading_enter_ns = 0;
+    static std::uint64_t loading_frames = 0;
+    if (engine_now_loading) {
+        if (!prev_engine_loading) {
+            loading_enter_ns = now_ns;
+            loading_frames = 0;
+            std::printf("[bb_vulkan] Fast Load: NowLoading ENTER (state=%u, tips_timer=%.2fs -> %.2fs, draws=%llu)\n",
+                        observed_state, double(observed_timer_before), double(observed_timer_after),
+                        static_cast<unsigned long long>(frame_draws));
+        }
+        ++loading_frames;
+    } else if (prev_engine_loading) {
+        const double dur_s =
+            (now_ns >= loading_enter_ns) ? double(now_ns - loading_enter_ns) * 1e-9 : 0.0;
+        std::printf("[bb_vulkan] Fast Load: NowLoading EXIT (%.2f s, %llu frames, state=%u, draws=%llu)\n",
+                    dur_s, static_cast<unsigned long long>(loading_frames), observed_state,
+                    static_cast<unsigned long long>(frame_draws));
+    }
+    prev_engine_loading = engine_now_loading;
+
+    // 2. Fallback heuristic for early boot / pre-MenuMan loads: recent .dcx inflate + non-3D draws.
     const std::uint64_t last_ns = g_last_inflate_ns.load(std::memory_order_relaxed);
     const bool recent_inflate =
         (last_ns != 0) && (now_ns >= last_ns ? (now_ns - last_ns <= kBurstActiveWindowNs) : true);
-    const bool active = recent_inflate && (frame_draws < kMaxLoadingScreenDraws);
+    const bool active =
+        (engine_now_loading && frame_draws < kMaxNowLoadingDraws) ||
+        (recent_inflate && frame_draws < kMaxLoadingScreenDraws);
     g_loading_burst_active.store(active, std::memory_order_relaxed);
     return active;
 }

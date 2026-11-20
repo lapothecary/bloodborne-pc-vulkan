@@ -1212,6 +1212,7 @@ inline void EmitSetShRegDirect(
 struct StageUserDataBatch {
     uint32_t vals[16];
     uint32_t mask = 0u;
+    StageUserDataBatch() noexcept : mask(0u) {}
 
     inline void SetDwords(void* dcb_raw, uint32_t gnm_stage, uint32_t dst_reg, const void* src, uint32_t count) noexcept {
         if (dst_reg + count <= 16u) {
@@ -1673,6 +1674,8 @@ struct ContextRegBatch {
     uint32_t num_spans = 0u;
     uint32_t last_span_hdr_idx = 0u;
     uint32_t last_end_reg = 0xFFFFFFFFu;
+    ContextRegBatch() noexcept
+        : num_words(0u), num_spans(0u), last_span_hdr_idx(0u), last_end_reg(0xFFFFFFFFu) {}
 
     inline void Flush(void* dcb_raw) noexcept {
         if (num_spans == 0u || !dcb_raw) {

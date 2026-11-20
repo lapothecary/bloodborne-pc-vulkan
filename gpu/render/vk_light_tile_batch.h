@@ -210,6 +210,19 @@ private:
         bool vtx_y_hi[4]{};
     } cached_quad{};
 
+    struct PipeLayoutEntry {
+        const GraphicsPipeline* pipeline = nullptr;
+        bool valid = false;
+        u32 vs_buf_idx = ~0u;
+        u32 vs_flatbuf_idx = ~0u;
+        u32 ps_buf_idx0 = ~0u;
+        u32 ps_buf_idx1 = ~0u;
+        u32 ps_flatbuf_idx = ~0u;
+    };
+    static constexpr u32 kPipeLayoutCacheSize = 16u;
+    std::array<PipeLayoutEntry, kPipeLayoutCacheSize> pipe_layout_cache{};
+    u32 pipe_layout_next = 0u;
+
     // Diagnostic counters (1-line summary after 2,000 tiles + optional `BB_LIGHT_TILE_BATCH_LOG=1`)
     u64 stat_seen = 0;
     u64 stat_tiles_batched = 0;

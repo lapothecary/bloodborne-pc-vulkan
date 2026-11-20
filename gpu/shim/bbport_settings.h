@@ -172,7 +172,7 @@ struct Values {
     std::atomic<float> reactive_threshold{0.2f};
     std::atomic<float> reactive_max{0.9f};
     std::atomic<int> debug_view{DebugNone};
-    std::atomic<bool> show_fps{true};
+    std::atomic<bool> show_fps{false};
     std::atomic<bool> show_additional_debug{false};
     /// The settings menu's position (fraction of the screen), -1 until it is moved.
     std::atomic<float> menu_x{-1.0f}, menu_y{-1.0f};
@@ -211,6 +211,8 @@ struct Values {
     std::atomic<float> mouse_sensitivity{1.0f};
     /// Camera follow physics mode: 0 = Original (PS4), 1 = Balanced (default), 2 = Locked (Rigid 1:1).
     std::atomic<int> camera_follow_mode{CameraFollowBalanced};
+    /// Keep original 5-second minimum reading timer for item tips on loading screens (false = instant close).
+    std::atomic<bool> loading_tips_timer{false};
     /// DLSS model preset: 11 = DLSS 4 Transformer (Preset K), 0 = DLSS 3 CNN Default.
     std::atomic<int> dlss_preset{11};
     /// Forced anisotropic filtering on scene textures: 16, 8, 4, or 1/0 (game default).
@@ -223,7 +225,8 @@ struct Values {
     /// Incremented whenever vsync_mode changes so Presenter recreates the swapchain live.
     std::atomic<std::uint32_t> swapchain_generation{0};
     /// AI / SDF UI & Icon Super-Resolution (2x/4x + disk cache) for 1-mip 2D UI textures.
-    std::atomic<bool> ui_upscale{false};
+    /// GPU Super-Resolution (xBRZ + SDF 2x-4x) for HUD, icons, runes, and logos (0 ms runtime cost).
+    std::atomic<bool> ui_upscale{true};
     /// Enhanced Multi-Scale GTAO / Low-Noise SSAO in ps_cbbca5dc.frag.
     std::atomic<bool> ssao_quality{true};
     /// Screen-Space Contact Micro-Shadows + 12-Tap Vogel Disk Soft PCF in ps_f55643de.frag.

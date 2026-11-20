@@ -87,13 +87,14 @@ private:
         on_helper = true;
         u64 seen = 0;
         while (!stop.stop_requested()) {
-            // Draws arrive every few microseconds while a frame is recorded: spin, and sleep
-            // only after a pause longer than that (between frames).
-            const auto spin_until = std::chrono::steady_clock::now() + std::chrono::microseconds(100);
+            // Draws arrive every ~1-2 us while a frame is recorded: spin ~13 us with RDTSC
+            // (zero vDSO calls), then sleep immediately between frames to save power.
+            constexpr u64 kSpinBudgetCycles = 60'000ULL;
+            const u64 spin_start = __rdtsc();
             u64 now = posted.load(std::memory_order_acquire);
             for (u32 spins = 1; now == seen; ++spins) {
                 __builtin_ia32_pause();
-                if (!(spins & 255) && std::chrono::steady_clock::now() >= spin_until) {
+                if (!(spins & 255) && (__rdtsc() - spin_start) >= kSpinBudgetCycles) {
                     sleeping.store(true, std::memory_order_seq_cst);
                     posted.wait(seen, std::memory_order_seq_cst);
                     sleeping.store(false, std::memory_order_relaxed);

@@ -1942,8 +1942,10 @@ void GXDeviceContext_BeginRecordingAndResetShadow(uint8_t* pCtx) {
     GXDeviceContext_ResetShadowStateAndBounds(pCtx);
     *reinterpret_cast<void**>(pCtx + 0x1EC8) = nullptr;
     *reinterpret_cast<void**>(pCtx + 0x1EC0) = nullptr;
-    reinterpret_cast<void(*)(void*, const void*, uint32_t)>(GX_VMA(0x262a720ULL))(
-        pCtx + 0x20A8, reinterpret_cast<const void*>(GX_VMA(0x49d85f0ULL)), 0);
+    if (*reinterpret_cast<const uint64_t*>(pCtx + 0x20C0) != 0ULL) [[unlikely]] {
+        reinterpret_cast<void(*)(void*, const void*, uint32_t)>(GX_VMA(0x262a720ULL))(
+            pCtx + 0x20A8, reinterpret_cast<const void*>(GX_VMA(0x49d85f0ULL)), 0);
+    }
     *reinterpret_cast<uint32_t*>(pCtx + 0x20E0) = 0;
     pCtx[0x209C] = 1;
 }

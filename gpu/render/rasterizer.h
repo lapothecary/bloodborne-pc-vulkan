@@ -724,7 +724,8 @@ private:
 
     /// Everything of a direct draw after the pipeline selection (GPU thread or stage B).
     void DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw* used_prepared,
-                    bool is_indexed, u32 index_offset, u16 occ_handoff = kOccStageBFallback);
+                    bool is_indexed, u32 index_offset, u16 occ_handoff = kOccStageBFallback,
+                    u8 gbuf_bucket = 0xFFu);
     /// Arguments of an indirect draw: `args` holds `max_count` commands `stride` apart.
     struct IndirectDraw {
         VAddr args;
@@ -742,7 +743,7 @@ private:
                   u32 index_offset, const Gcn::ComputeProgram* cs = nullptr,
                   const IndirectDraw* indirect = nullptr,
                   const BatchedLightDrawOverride* batch_override = nullptr,
-                  u16 occ_handoff = kOccNoProbe);
+                  u16 occ_handoff = kOccNoProbe, u8 gbuf_bucket = 0xFFu);
     /// Everything of a direct dispatch after the pipeline selection (GPU thread or stage B).
     void DispatchRecord(const ComputePipeline* pipeline);
     /// The compute registers of the dispatch being recorded.
@@ -861,7 +862,7 @@ private:
     [[nodiscard]] bool TryCullSceneOcclusionStageA(const GraphicsPipeline* pipeline,
                                                    const PreparedDraw* used_prepared,
                                                    bool is_indexed, u32 index_offset,
-                                                   u16& out_handoff);
+                                                   u16& out_handoff, u8& out_gbuf_bucket);
     vk::Pipeline bound_graphics_pipeline{};
     u64 bound_graphics_epoch = 0;
     std::array<vk::Pipeline, Scheduler::kNumReorderBuckets> bound_bucket_pipeline{};
@@ -871,6 +872,11 @@ private:
     /// Whether the helper may bind textures for this pipeline at all (fixed descriptor layout,
     /// no storage writes that invalidate cached images).
     bool HelperEligible(const Pipeline* pipeline) const;
+    /// Pure read-only fast-path on `bb:TexBind` using `native_srv_fast_cache` +
+    /// `native_sampler_cache` (zero `thread_local` / `texture_cache` mutations).
+    bool TryBindTexturesFastOnHelper(const Shader::Info& stage, const PreparedStage* prepared,
+                                     const u32* stage_flat, Gcn::BorderColorBuffer bc_base,
+                                     Shader::Backend::Bindings binding, u32 write_index);
     /// Whether every texture of `stage` takes the memoized path without refreshing, creating or
     /// redirecting anything that records commands or touches the buffer cache.
     bool TexturesBindableOnHelper(const Shader::Info& stage, const PreparedStage* prepared);
@@ -1155,14 +1161,18 @@ private:
         struct Stage {
             const Shader::Info* info;
             const PreparedStage* prepared;
+            const u32* flat_ud;
             Shader::Backend::Bindings binding;
             u32 write_index;
         };
         std::array<Stage, Shader::MaxStageTypes> stages;
+        Gcn::BorderColorBuffer bc_base{};
         u32 count = 0;
         u32 completed = 0; ///< stages the helper bound; the rest are bound after the join
         bool barrier = false;
     } texture_task;
+    u8 frame_fx_mask = 0;
+    bool frame_fx_mask_valid = false;
     /// Draws whose textures the helper bound completely, partly or not at all (BB_FRAME_STATS).
     u64 helper_full = 0, helper_partial = 0, helper_serial = 0;
     /// The memoized cache entry of each image binding (FindImage memo taken), else null.

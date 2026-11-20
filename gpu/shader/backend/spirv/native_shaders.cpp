@@ -141,6 +141,18 @@
 #include "bbgpu/shaders/ps_01ae5388_frag.h"
 #include "bbgpu/shaders/ps_9eb30215_frag.h"
 #include "bbgpu/shaders/ps_4baeaa00_frag.h"
+#include "bbgpu/shaders/ps_7cde8e5f_pack_frag.h"
+#include "bbgpu/shaders/ps_7cde8e5f_noclip_frag.h"
+#include "bbgpu/shaders/ps_7cde8e5f_cldist_frag.h"
+#include "bbgpu/shaders/ps_b25e4fae_loc2_frag.h"
+#include "bbgpu/shaders/ps_b25e4fae_loc3_frag.h"
+#include "bbgpu/shaders/ps_2eacb983_sss_x_frag.h"
+#include "bbgpu/shaders/ps_2eacb983_sss_x_loc1_frag.h"
+#include "bbgpu/shaders/ps_8c13b984_sss_y_frag.h"
+#include "bbgpu/shaders/ps_8c13b984_sss_y_loc1_frag.h"
+#include "bbgpu/shaders/ps_0f54e5f9_2d_frag.h"
+#include "bbgpu/shaders/ps_0f54e5f9_arr_frag.h"
+#include "bbgpu/shaders/ps_d3c8bb21_frag.h"
 
 namespace Shader::Backend::SPIRV {
 
@@ -158,6 +170,7 @@ constexpr u32 kOpTypeVector = 23u;
 constexpr u32 kOpTypeImage = 25u;
 constexpr u32 kOpTypeSampler = 26u;
 constexpr u32 kOpTypeSampledImage = 27u;
+constexpr u32 kOpImageQuerySizeLod = 103u;
 constexpr u32 kOpTypeStruct = 30u;
 constexpr u32 kOpTypePointer = 32u;
 constexpr u32 kOpConstant = 43u;
@@ -211,7 +224,7 @@ struct NativeShaderCandidate {
     const char* label;
 };
 
-constexpr std::array<NativeShaderCandidate, 129> kNativeRegistry{{
+constexpr std::array<NativeShaderCandidate, 141> kNativeRegistry{{
     {0x000000000f61fd27ull, PS_0F61FD27_VSM_BLUR_FRAG, "ps_0f61fd27_vsm_blur"},
     {0x000000001ae03d75ull, PS_1AE03D75_VSM_MOMENT_CLDIST_FRAG, "ps_1ae03d75_vsm_moment_cldist"},
     {0x000000001ae03d75ull, PS_1AE03D75_VSM_MOMENT_NOCLIP_FRAG, "ps_1ae03d75_vsm_moment_noclip"},
@@ -341,6 +354,18 @@ constexpr std::array<NativeShaderCandidate, 129> kNativeRegistry{{
     {0x0000000001ae5388ull, PS_01AE5388_FRAG, "ps_01ae5388_ssr_hiz_min4"},
     {0x000000009eb30215ull, PS_9EB30215_FRAG, "ps_9eb30215_const_fill"},
     {0x000000004baeaa00ull, PS_4BAEAA00_FRAG, "ps_4baeaa00_scaleform_cxform_bgra"},
+    {0x000000007cde8e5full, PS_7CDE8E5F_PACK_FRAG, "ps_7cde8e5f_shadow_pack"},
+    {0x000000007cde8e5full, PS_7CDE8E5F_NOCLIP_FRAG, "ps_7cde8e5f_shadow_noclip"},
+    {0x000000007cde8e5full, PS_7CDE8E5F_CLDIST_FRAG, "ps_7cde8e5f_shadow_cldist"},
+    {0x00000000b25e4faeull, PS_B25E4FAE_LOC2_FRAG, "ps_b25e4fae_motblur_alpha_loc2"},
+    {0x00000000b25e4faeull, PS_B25E4FAE_LOC3_FRAG, "ps_b25e4fae_motblur_alpha_loc3"},
+    {0x000000002eacb983ull, PS_2EACB983_SSS_X_FRAG, "ps_2eacb983_sss_blur_x"},
+    {0x000000002eacb983ull, PS_2EACB983_SSS_X_LOC1_FRAG, "ps_2eacb983_sss_blur_x_loc1"},
+    {0x000000008c13b984ull, PS_8C13B984_SSS_Y_FRAG, "ps_8c13b984_sss_blur_y"},
+    {0x000000008c13b984ull, PS_8C13B984_SSS_Y_LOC1_FRAG, "ps_8c13b984_sss_blur_y_loc1"},
+    {0x000000000f54e5f9ull, PS_0F54E5F9_2D_FRAG, "ps_0f54e5f9_gbuf6_alpha_2d"},
+    {0x000000000f54e5f9ull, PS_0F54E5F9_ARR_FRAG, "ps_0f54e5f9_gbuf6_alpha_arr"},
+    {0x00000000d3c8bb21ull, PS_D3C8BB21_FRAG, "ps_d3c8bb21_motblur_vel_combine"},
 }};
 
 struct DescSlot {
@@ -354,6 +379,7 @@ struct SpvInterfaceSig {
     bool has_per_vertex_input = false;
     bool has_frag0_swizzle = false;
     bool bgra_export = false;
+    bool has_image_query_size = false;
     u64 in_loc_mask = 0;
     u64 out_loc_mask = 0;
     std::array<u8, 64> in_interp{};
@@ -471,6 +497,9 @@ bool ExtractInterfaceSig(std::span<const u32> spv, SpvInterfaceSig& sig) {
                         var_used[w[i]] = 1u;
                     }
                 }
+                break;
+            case kOpImageQuerySizeLod:
+                sig.has_image_query_size = true;
                 break;
             default:
                 break;
@@ -1121,6 +1150,10 @@ bool TryReplaceWithNativeShader(u64 pgm_hash, const std::vector<u32>& ref_spv,
         }
         if (pgm_hash == 0x000000009a9cf8a9ull &&
             !SpecializeConstantId0(out_spv, static_cast<u32>(cs_9a9_swz_mode))) {
+            return false;
+        }
+        if ((pgm_hash == 0x000000002eacb983ull || pgm_hash == 0x000000008c13b984ull) &&
+            !SpecializeConstantId0(out_spv, ref_sig.has_image_query_size ? 1u : 0u)) {
             return false;
         }
         return true;

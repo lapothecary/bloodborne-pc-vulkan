@@ -1090,7 +1090,8 @@ void CommandProcessor::StallWatch(std::stop_token stop) {
     BbThreads::PinToHelperDomain();
     BbThreads::ApplyProcessThreadTopology();
     using Clock = std::chrono::steady_clock;
-    constexpr auto Limit = std::chrono::seconds(5);
+    constexpr auto QueueStallLimit = std::chrono::seconds(5);
+    constexpr auto GuestIdleLimit = std::chrono::seconds(15);
     u64 last_submitted = ~0ull, last_decoded = ~0ull;
     auto submitted_at = Clock::now(), decoded_at = Clock::now();
     bool reported = false;
@@ -1117,12 +1118,12 @@ void CommandProcessor::StallWatch(std::stop_token stop) {
         if (reported || submitted == 0) {
             continue;
         }
-        if (now - decoded_at >= Limit) {
+        if (now - decoded_at >= QueueStallLimit) {
             reported = true;
             ReportStall("the queues have made no progress for 5 s");
-        } else if (now - submitted_at >= Limit) {
+        } else if (now - submitted_at >= GuestIdleLimit) {
             reported = true;
-            ReportStall("the guest has submitted nothing for 5 s");
+            ReportStall("the guest has submitted nothing for 15 s");
         }
     }
 }

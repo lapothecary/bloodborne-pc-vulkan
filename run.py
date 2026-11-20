@@ -622,7 +622,7 @@ def run(extra_args=(), env=None, on_line=None, prepare_only=False):
         setdefault(env, 'BB_HW_OCCLUSION_CULL', '1')
         setdefault(env, 'BB_MICRO_SHADOW_CULL', '1')
         setdefault(env, 'BB_NATIVE_SHADERS', '1')
-        setdefault(env, 'BB_READBACKS', '0')
+        setdefault(env, 'BB_READBACKS', '1')
         setdefault(env, 'BB_BREADCRUMBS', '0')
         setdefault(env, 'BB_INDIRECT_GUARD', '0')
         setdefault(env, 'BB_OBJECT_MOTION', '0')

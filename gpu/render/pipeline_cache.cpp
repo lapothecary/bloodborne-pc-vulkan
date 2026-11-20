@@ -26,6 +26,7 @@
 #include "common/hash.h"
 #include "common/io_file.h"
 #include "common/path_util.h"
+#include "common/thread.h"
 #include "core/emulator_settings.h"
 #include "cp/command_processor.h"
 #include "game_profile.h"
@@ -375,6 +376,10 @@ struct PipelineCache::FastSelect {
         u16 fast_check_min_flat = 0;
         u32 fast_check_offset = 0;
         Shader::Backend::Bindings fast_check_start{};
+        const Shader::Gcn::FetchShaderData* fast_vs_fetch = nullptr;
+        u16 fast_vs_valid_mask = 0;
+        u8 fast_vs_attr_count = 0;
+        std::array<u32, 16> fast_vs_dw3_exp{};
         u64 last_flat_hash = 0;
         u32 last_flat_words = 0;
         std::array<u32, 4> last_ud_head{};
@@ -403,6 +408,8 @@ struct PipelineCache::FastSelect {
     /// Compact L1D-resident key mirror (`16 KiB`): probing all 4 ways reads 1 cache line instead
     /// of 4 scattered `Entry`-strided cache lines!
     std::array<u64, TableSize> hot_keys{};
+    /// Compact L1D-resident MRU way hint (`512 B`): tries the last-winning way first.
+    std::array<u8, NumSets> mru_way{};
     std::vector<SpecWordCheck> fast_checks_pool;
     std::array<Entry, TableSize> entries{};
     std::unordered_map<const u32*, CachedFetch> fetch_map;
@@ -482,6 +489,7 @@ struct PipelineCache::MtFastPsoTable {
 void PipelineCache::InvalidateFastSelect() {
     if (fast) {
         fast->hot_keys.fill(0ULL);
+    fast->mru_way.fill(0u);
         fast->fast_checks_pool.clear();
         for (auto& e : fast->entries) {
             e.key = 0;
@@ -538,7 +546,9 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     fast = std::make_unique<FastSelect>();
     mt_fast = std::make_unique<MtFastPsoTable>();
     sel.regs = liverpool ? &liverpool->regs : nullptr;
-    WarmUp();
+
+    // Keep the 6 ms manifest index synchronous so `bb_golden_engine.cpp` never races with it.
+    DirectShaders::InitializeManifestLibrary();
 
     const char* async_env = std::getenv("BB_ASYNC_PIPELINES");
     if (!(async_env && async_env[0] == '0') && instance.IsVertexInputDynamicState()) {
@@ -551,12 +561,51 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         std::printf("[bb_vulkan] V4.2 Async PipelineCompiler prewarmed with %u worker threads\n",
                     threads);
     }
-    if (liverpool != nullptr && EmulatorSettings.IsPipelineCacheEnabled()) {
-        StartBackgroundAutoBake();
+
+    const bool auto_bake = (liverpool != nullptr && EmulatorSettings.IsPipelineCacheEnabled());
+    const char* sync_prewarm_env = std::getenv("BB_PREWARM_SYNC");
+    const char* export_env = std::getenv("BB_EXPORT_RECIPES");
+    const bool sync_prewarm =
+        (sync_prewarm_env && sync_prewarm_env[0] == '1') ||
+        (export_env && export_env[0] == '1');
+    if (sync_prewarm) {
+        WarmUp();
+        prewarm_done.store(true, std::memory_order_release);
+        if (auto_bake) {
+            StartBackgroundAutoBake();
+        }
+    } else {
+        // Overlap V4.2 disk/driver PSO prewarm (~0.82 s) with `eboot.bin` CPU/IO boot (~1.31 s):
+        // finishes ~0.50 s before the first Vulkan draw call while cutting boot-to-menu time!
+        prewarm_thread = std::thread([this, auto_bake]() {
+            Common::SetCurrentThreadName("bb:PsoPrewarm");
+            WarmUp();
+            if (auto_bake && !prewarm_cancel.load(std::memory_order_acquire)) {
+                StartBackgroundAutoBake();
+            }
+            prewarm_done.store(true, std::memory_order_release);
+        });
+    }
+}
+
+void PipelineCache::EnsurePrewarmDone() {
+    if (prewarm_done.load(std::memory_order_acquire)) [[likely]] {
+        return;
+    }
+    std::scoped_lock lk{prewarm_join_mutex};
+    if (prewarm_thread.joinable()) {
+        prewarm_thread.join();
     }
 }
 
 PipelineCache::~PipelineCache() {
+    prewarm_cancel.store(true, std::memory_order_release);
+    {
+        std::scoped_lock lk{prewarm_join_mutex};
+        if (prewarm_thread.joinable()) {
+            prewarm_thread.join();
+        }
+    }
     StopBackgroundAutoBake();
     compiler.reset();
     {
@@ -746,6 +795,9 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(PipelineSelection& se
 }
 
 bool PipelineCache::PrepareGraphicsPipeline(PipelineSelection& worker_sel) {
+    if (!prewarm_done.load(std::memory_order_acquire)) [[unlikely]] {
+        return false;
+    }
     // Tessellation stages read constant buffers from memory at selection time: not prepared.
     if (worker_sel.regs->stage_enable.hs_en) {
         return false;
@@ -909,6 +961,7 @@ bool PipelineCache::ProgramDecodes(const Shader::ShaderParams& params, HwStage s
 }
 
 const GraphicsPipeline* PipelineCache::TryPreparedPipeline(const PreparedDraw& prepared) {
+    EnsurePrewarmDone();
     BB_SECTION(APrepared);
     if (prepared.state.load(std::memory_order_acquire) != PreparedDraw::Ready ||
         prepared.reg_checksum != liverpool->gfx_reg_checksum) {
@@ -1504,7 +1557,10 @@ const GraphicsPipeline* PipelineCache::TryFastSelect(const DrawIndirectParams& p
 
     BB_SECTION(AFpsoMatch);
     bool saw_motion_mismatch = false;
-    for (u32 w = 0; w < FastSelect::NumWays; ++w) {
+    const u32 set_idx = static_cast<u32>(set_base / FastSelect::NumWays);
+    const u32 mru_w = f.mru_way[set_idx] & (FastSelect::NumWays - 1u);
+    for (u32 wi = 0; wi < FastSelect::NumWays; ++wi) {
+        const u32 w = (mru_w + wi) & (FastSelect::NumWays - 1u);
         if (((matching_ways_mask >> w) & 1u) == 0) {
             continue;
         }
@@ -1589,7 +1645,49 @@ const GraphicsPipeline* PipelineCache::TryFastSelect(const DrawIndirectParams& p
                 if (want_vsharps) {
                     const auto& spec = modules[st.perm_idx].spec;
                     const auto& attrs = way_fetch[i]->attributes;
-                    if (spec.vs_attribs.size() != attrs.size()) {
+                    if (way_fetch[i] == st.fast_vs_fetch && st.fast_vs_attr_count == attrs.size() &&
+                        st.fast_vs_attr_count != 0u) [[likely]] {
+                        f.last_vsharps.clear();
+                        const u16 vmask = st.fast_vs_valid_mask;
+                        for (size_t a = 0; a < attrs.size(); ++a) {
+                            const auto& desc = attrs[a];
+                            const auto sharp = desc.GetSharpDirect(ud_span);
+                            if (f.last_vsharps.size() < f.last_vsharps.capacity()) {
+                                f.last_vsharps.push_back(sharp);
+                            }
+                            const bool is_valid = static_cast<bool>(sharp);
+                            const bool exp_valid = ((vmask >> a) & 1u) != 0u;
+                            u32 dw3 = 0u;
+                            std::memcpy(&dw3, reinterpret_cast<const u8*>(&sharp) + 12u,
+                                        sizeof(u32));
+                            if (is_valid == exp_valid &&
+                                (!is_valid || (dw3 & 0x007FFFFFu) == st.fast_vs_dw3_exp[a]))
+                                [[likely]] {
+                                continue;
+                            }
+                            // Exact fallback for equivalent `NumberClass` / `RemapSwizzle`:
+                            Shader::VsAttribSpecialization aspec{};
+                            if (is_valid) {
+                                using InstanceIdType = Shader::Gcn::VertexAttribute::InstanceIdType;
+                                if (const auto step_rate = desc.GetStepRate();
+                                    step_rate != InstanceIdType::None) {
+                                    aspec.divisor =
+                                        step_rate == InstanceIdType::OverStepRate0
+                                            ? st.runtime_info.sw.vs.step_rate_0
+                                            : (step_rate == InstanceIdType::OverStepRate1
+                                                   ? st.runtime_info.sw.vs.step_rate_1
+                                                   : 1u);
+                                }
+                                aspec.num_class = ::Gcn::GetNumberClass(sharp.GetNumberFmt());
+                                aspec.dst_select = sharp.DstSelect();
+                            }
+                            if (spec.vs_attribs[a] != aspec) {
+                                f.last_vsharps.clear();
+                                fast_ok = false;
+                                break;
+                            }
+                        }
+                    } else if (spec.vs_attribs.size() != attrs.size()) {
                         fast_ok = false;
                     } else {
                         f.last_vsharps.clear();
@@ -1734,10 +1832,6 @@ const GraphicsPipeline* PipelineCache::TryFastSelect(const DrawIndirectParams& p
                     };
                     for (size_t b = 0; ok_compile && b < info.buffers.size(); ++b) {
                         const auto& desc = info.buffers[b];
-                        if (desc.post_op == Shader::SharpFetchPostOp::OffsetByProgramBase) {
-                            ok_compile = false;
-                            break;
-                        }
                         const auto& sf = desc.sharp_fetch;
                         const auto sharp = desc.GetSharpDirect(flat_ptr, info.pgm_base);
                         if (sharp) {
@@ -1754,8 +1848,10 @@ const GraphicsPipeline* PipelineCache::TryFastSelect(const DrawIndirectParams& p
                                 push_masked(sf.offsets[3], m3);
                             }
                         } else {
-                            if ((sf.load_mask & 4u) && sf.offsets[2] < flat_words &&
-                                flat_ptr[sf.offsets[2]] == 0u) {
+                            if ((sf.load_mask & 12u) == 0u) {
+                                // Compile-time constant null sharp (neither dw2 nor dw3 varies).
+                            } else if ((sf.load_mask & 4u) && sf.offsets[2] < flat_words &&
+                                       flat_ptr[sf.offsets[2]] == 0u) {
                                 push_chk(sf.offsets[2], 0u, ~0u, 0u);
                             } else if ((sf.load_mask & 8u) && sf.offsets[3] < flat_words &&
                                        (flat_ptr[sf.offsets[3]] & 0xC0000000u) != 0u) {
@@ -1822,6 +1918,27 @@ const GraphicsPipeline* PipelineCache::TryFastSelect(const DrawIndirectParams& p
                         st.fast_check_start = start_binding;
                         f.fast_checks_pool.insert(f.fast_checks_pool.end(), local_chk.begin(),
                                                   local_chk.begin() + local_cnt);
+                        if (want_vsharps && way_fetch[i] &&
+                            way_fetch[i]->attributes.size() == spec.vs_attribs.size() &&
+                            way_fetch[i]->attributes.size() <= st.fast_vs_dw3_exp.size() &&
+                            f.last_vsharps.size() == way_fetch[i]->attributes.size()) {
+                            u16 vmask = 0u;
+                            for (size_t a = 0; a < f.last_vsharps.size(); ++a) {
+                                const auto& sh = f.last_vsharps[a];
+                                if (sh) {
+                                    vmask |= static_cast<u16>(1u << a);
+                                    u32 dw3 = 0u;
+                                    std::memcpy(&dw3, reinterpret_cast<const u8*>(&sh) + 12u,
+                                                sizeof(u32));
+                                    st.fast_vs_dw3_exp[a] = dw3 & 0x007FFFFFu;
+                                } else {
+                                    st.fast_vs_dw3_exp[a] = 0u;
+                                }
+                            }
+                            st.fast_vs_valid_mask = vmask;
+                            st.fast_vs_attr_count = static_cast<u8>(f.last_vsharps.size());
+                            st.fast_vs_fetch = way_fetch[i];
+                        }
                     }
                 }
             }
@@ -1856,6 +1973,7 @@ const GraphicsPipeline* PipelineCache::TryFastSelect(const DrawIndirectParams& p
             info.AddBindings(binding);
         }
         if (spec_ok) {
+            f.mru_way[set_idx] = static_cast<u8>(w);
             for (u32 i = 0; i < way.num_stages; ++i) {
                 way.stages[i].program->last_used = way.stages[i].perm_idx;
             }
@@ -1937,6 +2055,7 @@ void PipelineCache::NoteDrawTarget(const Gcn::Regs& regs) {
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectParams params,
                                                            const PreparedDraw* prepared,
                                                            bool indirect) {
+    EnsurePrewarmDone();
     BB_SECTION(APipeline);
     used_prepared = nullptr;
     NoteDrawTarget(liverpool->regs);
@@ -2143,6 +2262,7 @@ const GraphicsPipeline* PipelineCache::SelectGraphicsPipelineMt(const Gcn::Regs&
                                                                 bool indirect,
                                                                 bool allow_compile_fallback,
                                                                 MtPsoFailKind* out_fail_kind) {
+    EnsurePrewarmDone();
     if (out_fail_kind) {
         *out_fail_kind = MtPsoFailKind::None;
     }
@@ -2622,6 +2742,7 @@ bool PipelineCache::AsyncSkippable(const PipelineSelection& selection, bool indi
 }
 
 const ComputePipeline* PipelineCache::GetComputePipeline() {
+    EnsurePrewarmDone();
     if (!RefreshComputeKey()) {
         return nullptr;
     }
@@ -3190,6 +3311,7 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
                                                 const Shader::ShaderParams& params,
                                                 Shader::Backend::Bindings& binding,
                                                 Program* direct_program) {
+    EnsurePrewarmDone();
     if (sel.async_ctx) {
         return GetProgramAsyncWorker(sel, hw_stage, sw_stage, params, binding);
     }

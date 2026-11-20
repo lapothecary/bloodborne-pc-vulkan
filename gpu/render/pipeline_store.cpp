@@ -155,6 +155,30 @@ bool IsOpt36BgraFixShaderHash(u64 pgm_hash) noexcept {
     }
 }
 
+bool IsOpt38StageC2ShaderHash(u64 pgm_hash) noexcept {
+    switch (pgm_hash) {
+    // Stage C2: GXSssBlurX/Y loc1 fix + 6-MRT G-Buffer cutout 0f54e5f9 + MotBlur combine d3c8bb21
+    case 0x000000002eacb983ULL:
+    case 0x000000008c13b984ULL:
+    case 0x000000000f54e5f9ULL:
+    case 0x00000000d3c8bb21ULL:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool IsOpt37StageC1ShaderHash(u64 pgm_hash) noexcept {
+    switch (pgm_hash) {
+    // Stage C1: 4K shadow depth, motion blur alpha velocity
+    case 0x000000007cde8e5fULL:
+    case 0x00000000b25e4faeULL:
+        return true;
+    default:
+        return false;
+    }
+}
+
 std::string OptBinaryName(u64 pgm_hash, size_t perm_idx) {
     const bool hw_interp = Shader::Backend::SPIRV::HwInterpEnabled();
     const bool fast_fp = Shader::Backend::SPIRV::FastFpEnabled();
@@ -164,16 +188,23 @@ std::string OptBinaryName(u64 pgm_hash, size_t perm_idx) {
     if (hw_interp) {
         if (fast_fp) {
             prefix = native_sh
-                         ? (IsOpt36BgraFixShaderHash(pgm_hash)
-                                ? "opt36"
-                                : (IsOpt35Phase5ShaderHash(pgm_hash)
-                                       ? "opt35"
-                                       : (IsOpt33Phase2ShaderHash(pgm_hash)
-                                              ? "opt33"
-                                              : ((pgm_hash == 0x0000000024042a9bULL ||
-                                                  pgm_hash == 0x00000000f55643deULL || ltb_patched)
-                                                     ? "opt32"
-                                                     : "opt31"))))
+                         ? (IsOpt38StageC2ShaderHash(pgm_hash)
+                                ? "opt38"
+                                : (IsOpt37StageC1ShaderHash(pgm_hash)
+                                       ? "opt37"
+                                       : (IsOpt36BgraFixShaderHash(pgm_hash)
+                                              ? "opt36"
+                                              : (IsOpt35Phase5ShaderHash(pgm_hash)
+                                                     ? "opt35"
+                                                     : (IsOpt33Phase2ShaderHash(pgm_hash)
+                                                            ? "opt33"
+                                                            : ((pgm_hash ==
+                                                                    0x0000000024042a9bULL ||
+                                                                pgm_hash ==
+                                                                    0x00000000f55643deULL ||
+                                                                ltb_patched)
+                                                                   ? "opt32"
+                                                                   : "opt31"))))))
                          : (ltb_patched ? "opt6_ltb2" : "opt6_nonat");
         } else {
             prefix = ltb_patched ? "opt3_ltb2" : "opt3_strict";
@@ -1071,6 +1102,13 @@ void PipelineCache::WarmUp() {
 }
 
 void PipelineCache::Sync() {
+    prewarm_cancel.store(true, std::memory_order_release);
+    {
+        std::scoped_lock lk{prewarm_join_mutex};
+        if (prewarm_thread.joinable()) {
+            prewarm_thread.join();
+        }
+    }
     StopBackgroundAutoBake();
     if (driver_cache_save_thread.joinable()) {
         driver_cache_save_thread.join();

@@ -266,7 +266,7 @@ export BB_COPY_GPU_BUFFERS=${BB_COPY_GPU_BUFFERS:-1}
 # up to BB_GPU_WRITE_TWINS_MAX bytes per page) does not wait for the GPU (BufferCache twins).
 export BB_GPU_WRITE_TWINS=${BB_GPU_WRITE_TWINS:-1} BB_GPU_WRITE_TWINS_MAX=${BB_GPU_WRITE_TWINS_MAX:-65536}
 export BB_BREADCRUMBS=${BB_BREADCRUMBS:-0}
-export BB_READBACKS=${BB_READBACKS:-0}
+export BB_READBACKS=${BB_READBACKS:-1}
 export BB_FPS_LIMIT=${BB_FPS_LIMIT:-0}
 if [[ -z ${BB_VBLANK_HZ:-} ]]; then
     case $fps in uncap) export BB_VBLANK_HZ=1000 ;; 90) export BB_VBLANK_HZ=90 ;; *) export BB_VBLANK_HZ=60 ;; esac

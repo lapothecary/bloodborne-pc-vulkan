@@ -283,50 +283,50 @@ inline void ExecuteStageBindingBytecode(
     uint32_t* srt_dwords = self->srt_user_data_dwords[gnm_stage];
 
     const bool direct_ud = gx_direct_vk::EnabledV2Sub(gx_direct_vk::kV2Sub_StageUserData);
-    gx_direct_vk::StageUserDataBatch ud_batch{};
+    gx_direct_vk::StageUserDataBatch ud_batch;
 
-    auto fn_setVsharp = reinterpret_cast<void(*)(void*, uint32_t, uint32_t, const void*)>(GX_VMA(0x10761a0ULL));
-    auto fn_setTsharp = reinterpret_cast<void(*)(void*, uint32_t, uint32_t, const void*)>(GX_VMA(0x1076240ULL));
-    auto fn_setSsharp = reinterpret_cast<void(*)(void*, uint32_t, uint32_t, const void*)>(GX_VMA(0x10762f0ULL));
-    auto fn_setPtr    = reinterpret_cast<void(*)(void*, uint32_t, uint32_t, void*)>(GX_VMA(0x1076390ULL));
-    auto fn_setUserD  = reinterpret_cast<void(*)(void*, uint32_t, uint32_t, uint32_t)>(GX_VMA(0x1076420ULL));
     auto fn_suballoc  = [&](void* pool, void* fctx, uint64_t sz) noexcept -> void* {
         return FastSuballocate64K(pool, fctx, sz);
     };
 
     auto emit_vsharp = [&](uint32_t dst_reg, const void* sharp) noexcept {
-        if (direct_ud) {
+        if (direct_ud) [[likely]] {
             ud_batch.SetDwords(gnmx_ctx, gnm_stage, dst_reg, sharp, 4u);
         } else {
-            fn_setVsharp(gnmx_ctx, gnm_stage, dst_reg, sharp);
+            reinterpret_cast<void(*)(void*, uint32_t, uint32_t, const void*)>(GX_VMA(0x10761a0ULL))(
+                gnmx_ctx, gnm_stage, dst_reg, sharp);
         }
     };
     auto emit_tsharp = [&](uint32_t dst_reg, const void* sharp) noexcept {
-        if (direct_ud) {
+        if (direct_ud) [[likely]] {
             ud_batch.SetDwords(gnmx_ctx, gnm_stage, dst_reg, sharp, 8u);
         } else {
-            fn_setTsharp(gnmx_ctx, gnm_stage, dst_reg, sharp);
+            reinterpret_cast<void(*)(void*, uint32_t, uint32_t, const void*)>(GX_VMA(0x1076240ULL))(
+                gnmx_ctx, gnm_stage, dst_reg, sharp);
         }
     };
     auto emit_ssharp = [&](uint32_t dst_reg, const void* sharp) noexcept {
-        if (direct_ud) {
+        if (direct_ud) [[likely]] {
             ud_batch.SetDwords(gnmx_ctx, gnm_stage, dst_reg, sharp, 4u);
         } else {
-            fn_setSsharp(gnmx_ctx, gnm_stage, dst_reg, sharp);
+            reinterpret_cast<void(*)(void*, uint32_t, uint32_t, const void*)>(GX_VMA(0x10762f0ULL))(
+                gnmx_ctx, gnm_stage, dst_reg, sharp);
         }
     };
     auto emit_ptr = [&](uint32_t dst_reg, void* ptr) noexcept {
-        if (direct_ud) {
+        if (direct_ud) [[likely]] {
             ud_batch.SetPtr(gnmx_ctx, gnm_stage, dst_reg, ptr);
         } else {
-            fn_setPtr(gnmx_ctx, gnm_stage, dst_reg, ptr);
+            reinterpret_cast<void(*)(void*, uint32_t, uint32_t, void*)>(GX_VMA(0x1076390ULL))(
+                gnmx_ctx, gnm_stage, dst_reg, ptr);
         }
     };
     auto emit_user_d = [&](uint32_t dst_reg, uint32_t val) noexcept {
-        if (direct_ud) {
+        if (direct_ud) [[likely]] {
             ud_batch.SetDword(gnmx_ctx, gnm_stage, dst_reg, val);
         } else {
-            fn_setUserD(gnmx_ctx, gnm_stage, dst_reg, val);
+            reinterpret_cast<void(*)(void*, uint32_t, uint32_t, uint32_t)>(GX_VMA(0x1076420ULL))(
+                gnmx_ctx, gnm_stage, dst_reg, val);
         }
     };
 
@@ -612,11 +612,21 @@ void CGShaderResourceBinderGnm_BindVertexBuffersAndFetchShader(
     const bool native_vsharp  = gx_direct_vk::EnabledV2Sub(gx_direct_vk::kV2Sub_NativeVsharp);
     const bool direct_ud      = gx_direct_vk::EnabledV2Sub(gx_direct_vk::kV2Sub_StageUserData);
     const bool n1_native_bufs = gx_direct_vk::EnabledNativeVk(gx_direct_vk::kN1_NativeBuffers);
-    gx_direct_vk::StageUserDataBatch ud_batch{};
+    gx_direct_vk::StageUserDataBatch ud_batch;
 
-    auto fn_resolveDyn = reinterpret_cast<uint64_t(*)(void*, const void*)>(GX_VMA(0x26d0ff0ULL));
-    auto fn_setVsharp  = reinterpret_cast<void(*)(void*, uint32_t, uint32_t, const void*)>(GX_VMA(0x10761a0ULL));
-    auto fn_setPtr     = reinterpret_cast<void(*)(void*, uint32_t, uint32_t, void*)>(GX_VMA(0x1076390ULL));
+    auto resolve_dyn_vb = [&](const uint8_t* vb_res) noexcept -> uint64_t {
+        uint8_t* ring = gnmx_ctx_wrapper + 0xb6f8;
+        if (*reinterpret_cast<void* const*>(ring + 0x08) == nullptr) [[likely]] {
+            return *reinterpret_cast<const uint64_t*>(vb_res + 0x20);
+        }
+        return reinterpret_cast<uint64_t(*)(void*, const void*)>(GX_VMA(0x26d0ff0ULL))(ring, vb_res + 0x18);
+    };
+    auto fn_setVsharp = [&](void* c, uint32_t stg, uint32_t reg, const void* sh) noexcept {
+        reinterpret_cast<void(*)(void*, uint32_t, uint32_t, const void*)>(GX_VMA(0x10761a0ULL))(c, stg, reg, sh);
+    };
+    auto fn_setPtr = [&](void* c, uint32_t stg, uint32_t reg, void* p) noexcept {
+        reinterpret_cast<void(*)(void*, uint32_t, uint32_t, void*)>(GX_VMA(0x1076390ULL))(c, stg, reg, p);
+    };
 
     auto build_vb_vsharp = [&](uint8_t* dst_vsharp, const uint8_t* tmpl_vsharp,
                                uint64_t gpu_base, uint64_t vb_offset, uint32_t stride,
@@ -672,7 +682,7 @@ void CGShaderResourceBinderGnm_BindVertexBuffersAndFetchShader(
             if (vb_res[0x40] == 0u) {
                 gpu_base = *reinterpret_cast<const uint64_t*>(vb_res + 0x20);
             } else {
-                gpu_base  = fn_resolveDyn(gnmx_ctx_wrapper + 0xb6f8, vb_res + 0x18);
+                gpu_base  = resolve_dyn_vb(vb_res);
                 mtype_raw = 0x6e0001u;
             }
 
@@ -730,7 +740,7 @@ void CGShaderResourceBinderGnm_BindVertexBuffersAndFetchShader(
             if (vb_res[0x40] == 0u) {
                 gpu_base = *reinterpret_cast<const uint64_t*>(vb_res + 0x20);
             } else {
-                gpu_base  = fn_resolveDyn(gnmx_ctx_wrapper + 0xb6f8, vb_res + 0x18);
+                gpu_base  = resolve_dyn_vb(vb_res);
                 mtype_raw = 0x6e0001u;
             }
 
@@ -848,7 +858,7 @@ void CGShaderResourceBinderGnm_FlushVsAndPsBindingsToPM4(
             reinterpret_cast<void(*)(void*, uint32_t)>(GX_VMA(0x1076030ULL))(gnmx_ctx, 0u);
         }
     }
-    reinterpret_cast<void(*)(void*, void*)>(GX_VMA(0x26b9850ULL))(gnmx_ctx + 0xb468, gnmx_ctx);
+    FastFlushSurfaceSync(gnmx_ctx + 0xb468, gnmx_ctx);
 
     ExecuteStageBindingBytecode(self, gnmx_ctx, gnmx_ctx + 0xb3d0, vs_hdr, 0u, 2u, 0x20u);
     if (ps_hdr != nullptr) {
@@ -1040,7 +1050,7 @@ void CGShaderResourceBinderGnm_FlushCsBindingsToPM4(
     uint8_t* gnmx_ctx,
     const CGShaderBindingHeaderGnm* cs_hdr)
 {
-    reinterpret_cast<void(*)(void*, void*)>(GX_VMA(0x26b9850ULL))(gnmx_ctx + 0xb468, gnmx_ctx);
+    FastFlushSurfaceSync(gnmx_ctx + 0xb468, gnmx_ctx);
     ExecuteStageBindingBytecode(self, gnmx_ctx, gnmx_ctx + 0xb3d0, cs_hdr, 5u, 0u, 0x200020u);
 }
 
@@ -1415,7 +1425,7 @@ void CGShaderResourceBinderGnm_SyncAndBindComputeStage(
     uint8_t* gnmx_ctx_wrapper,
     const uint8_t* pipeline_state)
 {
-    reinterpret_cast<void(*)(void*, void*)>(GX_VMA(0x26b9850ULL))(gnmx_ctx_wrapper + 0xb478, gnmx_ctx_wrapper + 0x10);
+    FastFlushSurfaceSync(gnmx_ctx_wrapper + 0xb478, gnmx_ctx_wrapper + 0x10);
     CGShaderResourceBinderGnm_BindAndFlushComputeStage(self, gnmx_ctx_wrapper, pipeline_state);
 }
 
@@ -1539,13 +1549,15 @@ inline void StageAndExecuteGraphicsShaderStage(
     // 3. Dirty Samplers 0..15
     const uint64_t other_dirty = st.dirty_other_mask & st.active_other_mask;
     uint64_t samp_dirty = other_dirty & 0xFFFFULL;
-    const void* default_sampler = reinterpret_cast<const void*>(GX_VMA(0x546c8b0ULL));
-    while (samp_dirty != 0ULL) {
-        const uint32_t slot = static_cast<uint32_t>(__builtin_ctzll(samp_dirty));
-        samp_dirty -= (1ULL << slot);
-        const void* samp_view = *reinterpret_cast<const void* const*>(stage_state + 0x000 + slot * 8);
-        std::memcpy(self->staged_sampler_ssharps[binder_stage_idx][slot], samp_view ? samp_view : default_sampler, 16);
-        dirty_cmds_accum |= st.other_dep_masks[slot];
+    if (samp_dirty != 0ULL) {
+        const void* default_sampler = reinterpret_cast<const void*>(GX_VMA(0x546c8b0ULL));
+        while (samp_dirty != 0ULL) {
+            const uint32_t slot = static_cast<uint32_t>(__builtin_ctzll(samp_dirty));
+            samp_dirty &= (samp_dirty - 1ULL);
+            const void* samp_view = *reinterpret_cast<const void* const*>(stage_state + 0x000 + slot * 8);
+            std::memcpy(self->staged_sampler_ssharps[binder_stage_idx][slot], samp_view ? samp_view : default_sampler, 16);
+            dirty_cmds_accum |= st.other_dep_masks[slot];
+        }
     }
 
     // 4. Dirty Constant Buffers 0..13 (bits 16..29)
@@ -1680,7 +1692,7 @@ inline bool UnpackAndBindPsHeader(
     uint8_t* gnmx_ctx,
     const CGShaderBindingHeaderGnm* ps_hdr)
 {
-    if (!CGShaderResourceBinderGnm_BindShaderHeader_StageD(self, 4u, ps_hdr)) {
+    if (!BindShaderHeaderToStageImpl(self, 4u, ps_hdr)) {
         return false;
     }
     if (ps_hdr != nullptr) {

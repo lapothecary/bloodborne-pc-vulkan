@@ -833,10 +833,10 @@ bool SplashScreen::EvaluateProbe() {
         return false;
     }
 
-    // 3) Darker custom/modded non-uniform screen that finished fading in (plateau for 8 probes).
+    // 3) Darker custom/modded non-uniform screen that finished fading in (plateau for 3 probes).
     if (contrast >= 48u && max_luma >= 80u && non_black >= 80u) {
         if (max_luma <= prev_max_luma + 2u) {
-            if (++stable_probes >= 8u) {
+            if (++stable_probes >= 3u) {
                 std::printf("[bb_vulkan] Boot splash handoff (settled): probes=%u min=%u max=%u "
                             "contrast=%u bright=%u non_black=%u\n",
                             probe_count, min_luma, max_luma, contrast, bright, non_black);

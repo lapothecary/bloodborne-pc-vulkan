@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -9,7 +10,10 @@
 #include <mutex>
 #include <optional>
 #include <string_view>
+#include <thread>
 
+#include "bbport_settings.h"
+#include "common/thread.h"
 #include "upscale/vk_dlss.h"
 
 #ifdef _WIN32
@@ -160,6 +164,19 @@ struct Dlss::Impl {
     std::optional<FeatureDesc> feature;
     std::string problem;
     bool eligible{true}, instance_ready{}, device_ready{}, initialized{}, available{};
+    mutable std::mutex init_mutex;
+    std::atomic<bool> init_done{false};
+    std::jthread init_thread;
+
+    void WaitInit() const {
+        if (init_done.load(std::memory_order_acquire)) [[likely]] {
+            return;
+        }
+        std::scoped_lock lk{init_mutex};
+        if (init_thread.joinable()) {
+            const_cast<std::jthread&>(init_thread).join();
+        }
+    }
 
     void Disable(std::string_view reason) {
         eligible = available = false;
@@ -258,28 +275,49 @@ void Dlss::AppendDeviceExtensions(vk::Instance instance, vk::PhysicalDevice phys
 }
 
 void Dlss::Disable(std::string_view reason) {
+    impl->WaitInit();
     impl->Disable(reason);
 }
 
 void Dlss::Initialize(vk::Instance instance, vk::PhysicalDevice physical, vk::Device device) {
     if (!impl->eligible || !impl->device_ready || impl->initialized) {
+        impl->init_done.store(true, std::memory_order_release);
         return;
     }
     impl->initialized = true;
-    if (!impl->api->Initialize(instance, physical, device,
-                               VULKAN_HPP_DEFAULT_DISPATCHER.vkGetInstanceProcAddr,
-                               VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr)) {
-        return impl->Disable("NVIDIA NGX initialization failed (update the GPU driver)");
+    const auto run_init = [p = impl.get(), instance, physical, device]() {
+        Common::SetCurrentThreadName("bb:DlssInit");
+        if (!p->api->Initialize(instance, physical, device,
+                                VULKAN_HPP_DEFAULT_DISPATCHER.vkGetInstanceProcAddr,
+                                VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr)) {
+            p->Disable("NVIDIA NGX initialization failed (update the GPU driver)");
+            BbSettings::ConfigureDlssSupport(false, p->problem.c_str());
+        } else {
+            p->available = true;
+            std::printf("DLSS: ready\n");
+            BbSettings::ConfigureDlssSupport(true, "");
+        }
+        p->init_done.store(true, std::memory_order_release);
+    };
+    const char* sync_env = std::getenv("BB_DLSS_SYNC");
+    if (sync_env && sync_env[0] == '1') {
+        run_init();
+        return;
     }
-    impl->available = true;
-    std::printf("DLSS: ready\n");
+    impl->init_thread = std::jthread(run_init);
+}
+
+bool Dlss::EligibleForBoot() const noexcept {
+    return impl->eligible && impl->device_ready;
 }
 
 bool Dlss::Available() const {
+    impl->WaitInit();
     return impl->available;
 }
 
 std::string Dlss::Problem() const {
+    impl->WaitInit();
     return impl->problem;
 }
 
@@ -288,6 +326,7 @@ bool Dlss::HasFeature(const FeatureDesc& desc) const {
 }
 
 bool Dlss::CreateFeature(vk::CommandBuffer command, const FeatureDesc& desc) {
+    impl->WaitInit();
     if (!impl->available) {
         return false;
     }
@@ -345,6 +384,12 @@ void Dlss::ReleaseFeature() {
 }
 
 void Dlss::Shutdown() {
+    {
+        std::scoped_lock lk{impl->init_mutex};
+        if (impl->init_thread.joinable()) {
+            impl->init_thread.join();
+        }
+    }
     impl->available = false;
     impl->feature.reset();
     if (impl->api && impl->initialized) {
@@ -366,6 +411,9 @@ void Dlss::AppendDeviceExtensions(vk::Instance, vk::PhysicalDevice, std::vector<
 void Dlss::Initialize(vk::Instance, vk::PhysicalDevice, vk::Device) {}
 void Dlss::Disable(std::string_view) {}
 void Dlss::Shutdown() {}
+bool Dlss::EligibleForBoot() const noexcept {
+    return false;
+}
 bool Dlss::Available() const {
     return false;
 }

@@ -157,9 +157,9 @@ struct GxPoolFastWake {
         }
         auto& s = slots[worker_id];
         const uint32_t my_gen = s.local_gen;
-        // Fast path: spin ~35 us (1536 pauses) to bridge consecutive same-frame flushes
-        // with ~15 ns wakeup latency while cutting wasted idle CPU burn by 4x.
-        for (int sp = 0; sp < 1536; ++sp) {
+        // Fast path: spin ~60 us (3072 pauses) to bridge intra-frame parallel dispatches
+        // (skinning / frustum cull / draw prep) with ~15 ns wakeup latency and zero futex syscalls.
+        for (int sp = 0; sp < 3072; ++sp) {
             const uint32_t cur_gen = s.wake_gen.load(std::memory_order_acquire);
             if (cur_gen != my_gen) {
                 s.local_gen = cur_gen;
@@ -346,27 +346,43 @@ void GXWorkerThreadContext_ExecuteOneTaskOrSteal(void* self) {
     void* task = nullptr;
     uint8_t* own_deque = base + 0x18;
 
-    bool popped = reinterpret_cast<FnBoolPtrPtr>(GX_VMA(0xe47b60ULL))(own_deque, &task);
+    bool popped = false;
+    if (__atomic_load_n(reinterpret_cast<const uint64_t*>(base + 0x38), __ATOMIC_ACQUIRE) != 0) {
+        popped = reinterpret_cast<FnBoolPtrPtr>(GX_VMA(0xe47b60ULL))(own_deque, &task);
+    }
     if (!popped) {
-        uint64_t tsc = reinterpret_cast<FnU64Void>(GX_VMA(0x2bc0de8ULL))();
-        uint64_t seed = tsc + *reinterpret_cast<uint32_t*>(base + 0xa0);
+        const uint64_t tsc = __rdtsc();
+        const uint32_t self_id = *reinterpret_cast<uint32_t*>(base + 0xa0);
+        const uint64_t seed = tsc + self_id;
         auto* pool = *reinterpret_cast<uint8_t**>(base + 0x08);
         uint32_t worker_count = *reinterpret_cast<uint32_t*>(pool + 0x08);
         if (worker_count != 0) {
+            auto* workers_base = *reinterpret_cast<uint8_t**>(pool + 0x00);
             uint32_t start_offset = static_cast<uint32_t>(seed % worker_count);
             for (uint32_t i = 0; i < worker_count; ++i) {
-                uint32_t target_idx = (start_offset + i) % worker_count;
-                auto* workers_base = *reinterpret_cast<uint8_t**>(pool + 0x00);
+                uint32_t target_idx = start_offset + i;
+                if (target_idx >= worker_count) {
+                    target_idx -= worker_count;
+                }
                 uint8_t* target_worker = workers_base + static_cast<size_t>(target_idx) * 0x530ULL;
                 if (target_worker == base) {
                     continue;
                 }
+                // Lock-free empty check on `target_deque->count` (`+0x20` inside deque = `+0x38`
+                // inside worker): avoids 2x PS4 mutex lock/unlock inside `0xe47d20` on empty deques!
+                if (__atomic_load_n(reinterpret_cast<const uint64_t*>(target_worker + 0x38),
+                                    __ATOMIC_ACQUIRE) == 0) {
+                    continue;
+                }
                 bool stolen = reinterpret_cast<FnBoolPtrPtr>(GX_VMA(0xe47d20ULL))(target_worker + 0x18, own_deque);
-                if (stolen || *reinterpret_cast<uint64_t*>(base + 0x38) != 0) {
+                if (stolen ||
+                    __atomic_load_n(reinterpret_cast<const uint64_t*>(base + 0x38),
+                                    __ATOMIC_ACQUIRE) != 0) {
                     reinterpret_cast<FnBoolPtrPtr>(GX_VMA(0xe47b60ULL))(own_deque, &task);
                     break;
                 }
                 pool = *reinterpret_cast<uint8_t**>(base + 0x08);
+                workers_base = *reinterpret_cast<uint8_t**>(pool + 0x00);
                 worker_count = *reinterpret_cast<uint32_t*>(pool + 0x08);
             }
         }
@@ -421,32 +437,44 @@ void GXWorkerThreadContext_ThreadMainLoop(void* self) {
         void* task = nullptr;
 
         for (;;) {
-            while (reinterpret_cast<FnBoolPtrPtr>(GX_VMA(0xe47b60ULL))(own_deque, &task)) {
+            while (__atomic_load_n(reinterpret_cast<const uint64_t*>(base + 0x38),
+                                   __ATOMIC_ACQUIRE) != 0 &&
+                   reinterpret_cast<FnBoolPtrPtr>(GX_VMA(0xe47b60ULL))(own_deque, &task)) {
                 auto* t_vtbl = *reinterpret_cast<FnVoidPtrU32**>(task);
-                t_vtbl[0](task, *reinterpret_cast<uint32_t*>(base + 0xa0));
+                t_vtbl[0](task, worker_id);
             }
 
-            uint64_t tsc = reinterpret_cast<FnU64Void>(GX_VMA(0x2bc0de8ULL))();
-            uint64_t seed = tsc + *reinterpret_cast<uint32_t*>(base + 0xa0);
+            const uint64_t tsc = __rdtsc();
+            const uint64_t seed = tsc + worker_id;
             pool = *reinterpret_cast<uint8_t**>(base + 0x08);
             uint32_t worker_count = *reinterpret_cast<uint32_t*>(pool + 0x08);
             bool stole_work = false;
 
             if (worker_count != 0) {
+                auto* workers_base = *reinterpret_cast<uint8_t**>(pool + 0x00);
                 uint32_t start_offset = static_cast<uint32_t>(seed % worker_count);
                 for (uint32_t i = 0; i < worker_count; ++i) {
-                    uint32_t target_idx = (start_offset + i) % worker_count;
-                    auto* workers_base = *reinterpret_cast<uint8_t**>(pool + 0x00);
+                    uint32_t target_idx = start_offset + i;
+                    if (target_idx >= worker_count) {
+                        target_idx -= worker_count;
+                    }
                     uint8_t* target_worker = workers_base + static_cast<size_t>(target_idx) * 0x530ULL;
                     if (target_worker != base) {
+                        if (__atomic_load_n(reinterpret_cast<const uint64_t*>(target_worker + 0x38),
+                                            __ATOMIC_ACQUIRE) == 0) {
+                            continue;
+                        }
                         bool stolen = reinterpret_cast<FnBoolPtrPtr>(GX_VMA(0xe47d20ULL))(target_worker + 0x18, own_deque);
-                        if (stolen || *reinterpret_cast<uint64_t*>(base + 0x38) != 0) {
+                        if (stolen ||
+                            __atomic_load_n(reinterpret_cast<const uint64_t*>(base + 0x38),
+                                            __ATOMIC_ACQUIRE) != 0) {
                             stole_work = true;
                             break;
                         }
                         pool = *reinterpret_cast<uint8_t**>(base + 0x08);
+                        workers_base = *reinterpret_cast<uint8_t**>(pool + 0x00);
+                        worker_count = *reinterpret_cast<uint32_t*>(pool + 0x08);
                     }
-                    worker_count = *reinterpret_cast<uint32_t*>(pool + 0x08);
                 }
             }
 

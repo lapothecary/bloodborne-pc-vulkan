@@ -389,11 +389,11 @@ int LauncherBridge::CountCachedShaders(const fs::path& user_dir) const {
 std::string LauncherBridge::ReadVersionTag() const {
     const fs::path vf = ctx_.package_dir / ".bbport-version.json";
     std::ifstream f(vf);
-    if (!f) return "v1.1.9";
+    if (!f) return "v1.2.0";
     std::stringstream ss;
     ss << f.rdbuf();
     std::string tag = ExtractJsonField(ss.str(), "tag");
-    return tag.empty() ? "v1.1.9" : tag;
+    return tag.empty() ? "v1.2.0" : tag;
 }
 
 std::string LauncherBridge::BuildModsJson() const {

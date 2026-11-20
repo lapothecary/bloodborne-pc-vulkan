@@ -27,6 +27,10 @@
       updates_up_to_date: "Up to date",
       updates_avail: "Update available:",
       updates_done: "Update installed — restart the launcher to apply.",
+      upd_tip_checking: "Checking for updates...",
+      upd_tip_uptodate: "Up to date",
+      upd_tip_click: "Click to update",
+      upd_tip_failed: "Update check failed · Retry",
       btn_check_update: "Check Updates",
       btn_update_now: "Update",
       safe_reset_title: "Safe-Mode Graphics Reset",
@@ -82,6 +86,10 @@
       updates_up_to_date: "Установлена актуальная версия",
       updates_avail: "Доступно обновление:",
       updates_done: "Обновление установлено — перезапустите лаунчер.",
+      upd_tip_checking: "Проверка обновлений...",
+      upd_tip_uptodate: "Актуальная версия",
+      upd_tip_click: "Нажмите для обновления",
+      upd_tip_failed: "Ошибка проверки · Повторить",
       btn_check_update: "Проверить",
       btn_update_now: "Обновить",
       safe_reset_title: "Безопасный сброс графики",
@@ -132,6 +140,10 @@
   let wizardSkipped = false;
   let bakePollTimer = null;
   let updPollTimer = null;
+  let updSettleTimer = null;
+  let updCheckStartedAt = 0;
+  let lastUpdateInfo = null;
+  let railUpdateMode = "checking"; // "checking" | "up-to-date" | "available" | "applying" | "error"
 
   // Ambient Launcher BGM Player (Hunter's Dream / Omen decoded locally from sprj_smain.fsb)
   const bgmAudio = new Audio();
@@ -491,6 +503,11 @@
       el.title = tr(el.dataset.i18nTitle);
     });
     document.getElementById("btn-lang").textContent = state.lang.toUpperCase();
+    if (lastUpdateInfo) {
+      renderUpdate(lastUpdateInfo);
+    } else {
+      setRailUpdateState(railUpdateMode, tr("upd_tip_checking"));
+    }
   }
 
   function renderState() {
@@ -603,11 +620,23 @@
     }
   }
 
+  function setRailUpdateState(mode, tipText) {
+    railUpdateMode = mode;
+    const btn = document.getElementById("btn-rail-update");
+    const tip = document.getElementById("rail-update-tip");
+    if (btn) {
+      btn.classList.remove("checking", "up-to-date", "available", "applying", "error");
+      btn.classList.add(mode);
+      btn.setAttribute("aria-label", tipText);
+    }
+    if (tip) {
+      tip.textContent = tipText;
+    }
+  }
+
   function renderUpdate(u) {
-    const homeBanner = document.getElementById("home-update-banner");
-    const homeText = document.getElementById("home-update-text");
-    const homeBarWrap = document.getElementById("home-update-bar-wrap");
-    const homeBar = document.getElementById("home-update-bar");
+    if (!u) return;
+    lastUpdateInfo = u;
     const sysSub = document.getElementById("sys-update-sub");
     const sysApplyBtn = document.getElementById("btn-sys-apply-update");
     const sysProgWrap = document.getElementById("sys-update-progress-wrap");
@@ -615,27 +644,27 @@
     const sysLbl = document.getElementById("sys-update-progress-label");
 
     if (u.checking) {
+      if (updSettleTimer) { clearTimeout(updSettleTimer); updSettleTimer = null; }
+      if (!updCheckStartedAt) updCheckStartedAt = performance.now();
+      setRailUpdateState("checking", tr("upd_tip_checking"));
       sysSub.textContent = tr("updates_checking");
       return;
     }
     if (u.applying) {
-      homeBanner.classList.remove("hidden");
-      homeBarWrap.classList.remove("hidden");
-      homeBar.style.width = `${Math.max(4, u.pct)}%`;
-      homeText.textContent = `${u.pct}% — ${u.detail || u.stage}`;
+      if (updSettleTimer) { clearTimeout(updSettleTimer); updSettleTimer = null; }
+      const pctText = `${u.pct}% — ${u.detail || u.stage}`;
+      setRailUpdateState("applying", pctText);
       sysProgWrap.classList.remove("hidden");
       sysBar.style.width = `${Math.max(4, u.pct)}%`;
-      sysLbl.textContent = `${u.pct}% — ${u.detail || u.stage}`;
+      sysLbl.textContent = pctText;
       return;
     }
 
     if (updPollTimer) { clearInterval(updPollTimer); updPollTimer = null; }
-    homeBarWrap.classList.add("hidden");
     sysProgWrap.classList.add("hidden");
 
     if (u.restartNeeded) {
-      homeBanner.classList.remove("hidden");
-      homeText.textContent = tr("updates_done");
+      setRailUpdateState("up-to-date", tr("updates_done"));
       sysSub.textContent = tr("updates_done");
       sysApplyBtn.classList.add("hidden");
       showToast(tr("updates_done"));
@@ -645,25 +674,36 @@
     }
 
     if (u.error) {
-      homeBanner.classList.remove("hidden");
-      homeText.textContent = u.error;
+      setRailUpdateState("error", tr("upd_tip_failed"));
       sysSub.textContent = u.error;
-      showToast(u.error);
       return;
     }
 
     if (u.checked) {
-      if (!u.ok) {
-        sysSub.textContent = u.error || "Check failed";
-      } else if (u.upToDate) {
-        homeBanner.classList.add("hidden");
-        sysApplyBtn.classList.add("hidden");
-        sysSub.textContent = `${tr("updates_up_to_date")} (${u.localTag || state.version})`;
+      // Keep the checking spin visible for at least 550 ms so the morph to checkmark/glow always feels intentional
+      const elapsed = updCheckStartedAt ? (performance.now() - updCheckStartedAt) : 600;
+      const waitMs = Math.max(0, 550 - elapsed);
+      const applyCheckedUi = () => {
+        updCheckStartedAt = 0;
+        if (!u.ok) {
+          setRailUpdateState("error", tr("upd_tip_failed"));
+          sysSub.textContent = u.error || "Check failed";
+        } else if (u.upToDate) {
+          const ver = u.localTag || state.version;
+          setRailUpdateState("up-to-date", `${tr("upd_tip_uptodate")} · ${ver}`);
+          sysApplyBtn.classList.add("hidden");
+          sysSub.textContent = `${tr("updates_up_to_date")} (${ver})`;
+        } else {
+          setRailUpdateState("available", `${tr("updates_avail")} ${u.remoteTag} · ${tr("upd_tip_click")}`);
+          sysSub.textContent = `${tr("updates_avail")} ${u.remoteTag} (current: ${u.localTag || state.version})`;
+          sysApplyBtn.classList.remove("hidden");
+        }
+      };
+      if (waitMs > 20) {
+        if (updSettleTimer) clearTimeout(updSettleTimer);
+        updSettleTimer = setTimeout(() => { updSettleTimer = null; applyCheckedUi(); }, waitMs);
       } else {
-        homeBanner.classList.remove("hidden");
-        homeText.textContent = `${tr("updates_avail")} ${u.remoteTag}`;
-        sysSub.textContent = `${tr("updates_avail")} ${u.remoteTag} (current: ${u.localTag || state.version})`;
-        sysApplyBtn.classList.remove("hidden");
+        applyCheckedUi();
       }
     }
   }
@@ -986,8 +1026,10 @@
     });
 
     // 1-Click SHA-256 Updater
-    const triggerCheck = async () => {
-      playSfx("click");
+    const triggerCheck = async (silent = false) => {
+      if (!silent) playSfx("click");
+      updCheckStartedAt = performance.now();
+      setRailUpdateState("checking", tr("upd_tip_checking"));
       const u = await window.bbInvoke("checkUpdate", {});
       renderUpdate(u);
       startUpdatePoll();
@@ -998,9 +1040,15 @@
       renderUpdate(u);
       startUpdatePoll();
     };
-    document.getElementById("btn-check-update").addEventListener("click", triggerCheck);
-    document.getElementById("btn-home-update").addEventListener("click", triggerApply);
+    document.getElementById("btn-check-update").addEventListener("click", () => triggerCheck(false));
     document.getElementById("btn-sys-apply-update").addEventListener("click", triggerApply);
+    document.getElementById("btn-rail-update").addEventListener("click", () => {
+      if (railUpdateMode === "available") {
+        triggerApply();
+      } else if (railUpdateMode !== "checking" && railUpdateMode !== "applying") {
+        triggerCheck(false);
+      }
+    });
 
     document.getElementById("btn-open-mods").addEventListener("click", () => { playSfx("click"); window.bbInvoke("openFolder", { which: "mods" }); });
     document.getElementById("btn-open-saves").addEventListener("click", () => { playSfx("click"); window.bbInvoke("openFolder", { which: "saves" }); });
@@ -1025,12 +1073,9 @@
     loadSfx();
     loadAndSyncBgm(false);
 
-    // Quiet background update check 1.2s after launch
-    setTimeout(async () => {
-      const u = await window.bbInvoke("checkUpdate", {});
-      renderUpdate(u);
-      startUpdatePoll();
-    }, 1200);
+    // Immediate visible background update check right after first paint
+    setRailUpdateState("checking", tr("upd_tip_checking"));
+    setTimeout(() => { triggerCheck(true); }, 120);
   }
 
   window.addEventListener("DOMContentLoaded", init);

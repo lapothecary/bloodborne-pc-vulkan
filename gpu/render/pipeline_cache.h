@@ -272,6 +272,7 @@ private:
 
     // The pipeline cache on disk (pipeline_store.cpp).
     void WarmUp();
+    void EnsurePrewarmDone();
     bool InitDriverPipelineCache(bool load_from_store, size_t* loaded_bytes = nullptr);
     void SaveDriverPipelineCache();
     void NoteDriverPipelineCacheDirty();
@@ -374,6 +375,10 @@ private:
     std::mutex driver_cache_save_mutex;
     std::thread driver_cache_save_thread;
     u32 last_driver_cache_save_sec = 0;
+    std::atomic<bool> prewarm_done{false};
+    std::atomic<bool> prewarm_cancel{false};
+    std::mutex prewarm_join_mutex;
+    std::thread prewarm_thread;
     std::unique_ptr<PipelineCompiler> compiler; ///< last: its threads are joined first
 };
 

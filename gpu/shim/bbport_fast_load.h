@@ -100,6 +100,19 @@ inline constexpr std::uint64_t Z123_InflateEnd    = 0x20697c0ull;
 
 // DcxDfltDecompressor::ctor (0x2626010): `mov eax, 0x4000` -> `0x10000` (64 KiB read chunk)
 inline constexpr std::uint64_t DcxDflt_ChunkImm   = 0x262603dull;
+
+// Exact Bloodborne NowLoading state machine (verified statically in eboot.bin:
+//   NowLoadingOpen  0x0176d380, NowLoadingClose 0x0176d3c0,
+//   MenuMan::Update 0x01769318, StageFlow open  0x01940d30 / close 0x019290a9).
+inline constexpr std::uint64_t MenuManPtr              = 0x05562878ull; // MenuMan* singleton
+inline constexpr std::uint64_t NowLoadingOpenFlag      = 0x0556286bull; // uint8_t (1 open, 0 closed)
+inline constexpr std::uint64_t MenuMan_LoadingStateOff = 0x804ull;      // uint32_t: 0=off, 1=opening, 2=shown, 3=closing
+inline constexpr std::uint64_t MenuMan_MinTimerOff     = 0x17c0ull;     // float: 5.0s artificial item-lore floor on death/warp
+// StageFlow (0x01938b59): `cmp byte [r12+0xe4], 0; je +10; vmovss xmm0, [0x49280c8 (12.0f)]`
+// stores 12.0f into StageFlow+0x278 (blocks NowLoadingClose in sub_193a3e0 @ 0x0193a581 for 12s).
+// Patching 0x01938b62 between 0x74 (je = 12.0s on death/warp) and 0xeb (jmp = 0.0s like Load Game)
+// toggles the artificial 12s item-tips timer live without restarting.
+inline constexpr std::uint64_t StageFlow_TipsTimerJe   = 0x01938b62ull;
 } // namespace Vma
 
 /// Whether BB_FAST_LOAD is enabled (default 1; BB_FAST_LOAD=0 disables all fast-load paths).
@@ -107,6 +120,10 @@ bool Enabled() noexcept;
 
 /// Installs host SIMD zlib detours and DcxDflt 64 KiB read-chunk upgrade into the guest image.
 void PatchImage(unsigned char* image, std::uint64_t size);
+
+/// Live-toggles Bloodborne's artificial 12s/5s loading-screen item-tips reading timer
+/// (false = instant close when loaded; true = original PS4 item-tips reading timer).
+void SyncLoadingTipsTimer(bool keep_tips_timer) noexcept;
 
 /// Called once per guest frame on MOMainThread (inside PacerWait) with current monotonic time and
 /// last frame's draw count. Returns true when an active non-3D loading screen burst is underway.

@@ -292,6 +292,8 @@ void Set(Values& v, const std::string& key, const std::string& value) {
         } else if (value == "locked" || value == "rigid" || value == "2") {
             v.camera_follow_mode = CameraFollowLocked;
         }
+    } else if (key == "loading_tips_timer") {
+        v.loading_tips_timer = i != 0;
     } else if (key == "dlss_preset") {
         v.dlss_preset = (i == 0 || i == 5 || i == 6 || (i >= 10 && i <= 13)) ? i : 11;
     } else if (key == "anisotropic") {
@@ -812,6 +814,8 @@ void ConfigureUpscalerSupport(bool fsr4, bool fsr411) {
 }
 
 void ConfigureDlssSupport(bool available, const char* problem) {
+    static std::mutex dlss_cfg_mutex;
+    std::scoped_lock lk{dlss_cfg_mutex};
     auto& v = Get();
     v.dlss_supported = available;
     static std::string kept;
@@ -909,6 +913,7 @@ void Save() {
     put("mouse_invert_y", flag(v.mouse_invert_y));
     put("mouse_sensitivity", fixed(v.mouse_sensitivity, 2));
     put("camera_follow_mode", CameraFollowModeName(v.camera_follow_mode.load()));
+    put("loading_tips_timer", flag(v.loading_tips_timer));
     put("dlss_preset", std::to_string(v.dlss_preset.load()));
     put("anisotropic", std::to_string(v.anisotropic.load()));
     put("fps_limit", std::to_string(v.fps_limit.load()));

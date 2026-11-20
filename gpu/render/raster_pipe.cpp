@@ -51,7 +51,8 @@ struct DrawPacket {
     static constexpr u8 kCompactStageBDesc = 0x80u;
     PacketKind kind;
     u16 occ_handoff; ///< Step 5.2: Stage-A occlusion probe entry idx, kOccNoProbe, or kOccStageBFallback
-    u16 pad0;
+    u8 gbuf_bucket;  ///< Stage-A precomputed 4-bucket Hi-Z reorder index (0..3, or 0xFF fallback)
+    u8 pad0;
     const Pipeline* pipeline;
     const PreparedDraw* prepared;
     u32 index_offset;
@@ -1072,7 +1073,8 @@ void Rasterizer::CollectRingBindings(const Shader::Info& stage, const PreparedDr
 void Rasterizer::PostDraw(const Pipeline* pipeline, const PreparedDraw* used_prepared,
                           bool is_indexed, u32 index_offset, const Gcn::ComputeProgram* cs,
                           const IndirectDraw* indirect,
-                          const BatchedLightDrawOverride* batch_override, u16 occ_handoff) {
+                          const BatchedLightDrawOverride* batch_override, u16 occ_handoff,
+                          u8 gbuf_bucket) {
     if (!batch_override) {
         if (HasPendingVsmShadowWork()) {
             FlushVsmShadowMemo();
@@ -1469,6 +1471,7 @@ void Rasterizer::PostDraw(const Pipeline* pipeline, const PreparedDraw* used_pre
                   : pipeline ? PacketKind::Draw
                              : PacketKind::Special;
     packet.occ_handoff = occ_handoff;
+    packet.gbuf_bucket = gbuf_bucket;
     packet.pad0 = 0u;
     packet.pipeline = pipeline;
     packet.prepared = used_prepared;
@@ -1925,7 +1928,8 @@ void Rasterizer::RunDrawPacket(void* context, const u8* data, u32 size) {
                                 packet.is_indexed, *indirect);
     } else {
         self.DrawRecord(static_cast<const GraphicsPipeline*>(packet.pipeline), packet.prepared,
-                        packet.is_indexed, packet.index_offset, packet.occ_handoff);
+                        packet.is_indexed, packet.index_offset, packet.occ_handoff,
+                        packet.gbuf_bucket);
     }
     Shader::Info::num_ud_snapshots = 0;
     self.num_ring_stages = 0;

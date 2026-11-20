@@ -52,29 +52,34 @@ const PreparedStage* Rasterizer::FindPreparedStage(const Shader::Info& stage) co
 }
 
 bool Rasterizer::BindHelperWanted() {
-    // A spinning helper pays off only with cores to spare (the recording thread spins too).
+    // Measured neutral on 16-core/32-thread Zen 4 (`DrawMisc` +0.07 ms Fork/Join vs `BindTex`
+    // -0.05 ms, plus +2.3 ms core spin): keep opt-in via `BB_TEXTURE_HELPER=1`.
     const char* env = std::getenv("BB_TEXTURE_HELPER");
     if (env && env[0]) {
         return env[0] == '1';
     }
-    // Measured neutral on 16 threads (docs/parallel_gpu.md): opt-in.
     return false;
 }
 
 bool Rasterizer::HelperEligible(const Pipeline* pipeline) const {
     if (pipeline->IsCompute() || !bind_helper.Available() || FrameCapture::Active() ||
+        ui_pass_started || !native_srv_fast_cache || !native_sampler_cache ||
         BbToggle::Disabled(BbToggle::TextureBindHelper) ||
         BbToggle::Disabled(BbToggle::TextureBindingMemo) ||
+        BbToggle::Disabled(BbToggle::TextureSetMemo) ||
         BbToggle::Disabled(BbToggle::UpdateImageFastPath)) {
         return false;
     }
+    u32 total_tex_smp = 0;
+    u32 total_bufs = 0;
     for (const auto* stage : pipeline->GetStages()) {
         if (!stage) {
             continue;
         }
-        // Mip arrays make the descriptor layout depend on the T#s.
+        // Mip arrays or storage image writes make descriptor layout/barriers depend on T#s.
         for (const auto& image : stage->images) {
-            if (image.mip_fallback_mode != Shader::MipStorageFallbackMode::None) {
+            if (image.is_written ||
+                image.mip_fallback_mode != Shader::MipStorageFallbackMode::None) {
                 return false;
             }
         }
@@ -84,8 +89,11 @@ bool Rasterizer::HelperEligible(const Pipeline* pipeline) const {
                 return false;
             }
         }
+        total_tex_smp += static_cast<u32>(stage->images.size() + stage->samplers.size());
+        total_bufs += static_cast<u32>(stage->buffers.size());
     }
-    return true;
+    // Only fork when there are textures/samplers to bind AND buffer/vertex work to overlap.
+    return total_tex_smp != 0u && (total_bufs != 0u || draw_inputs.pending);
 }
 
 bool Rasterizer::TexturesBindableOnHelper(const Shader::Info& stage,
@@ -141,12 +149,13 @@ void Rasterizer::RunTextureTask(void* context) {
     auto& task = self.texture_task;
     for (u32 i = 0; i < task.count; ++i) {
         auto& stage = task.stages[i];
-        if (!self.TexturesBindableOnHelper(*stage.info, stage.prepared)) {
+        // Pure read-only fast-path using Stage B's captured `flat_ud` & `bc_base` (never touches
+        // `thread_local` `ud_snapshots`/`stage_regs` or mutates `texture_cache`/`texture_sets`).
+        // Any miss stops immediately so Stage B resolves the remaining stages safely after Join().
+        if (!self.TryBindTexturesFastOnHelper(*stage.info, stage.prepared, stage.flat_ud,
+                                              task.bc_base, stage.binding, stage.write_index)) {
             return;
         }
-        auto binding = stage.binding;
-        u32 write_index = stage.write_index;
-        self.BindTextures(*stage.info, stage.prepared, binding, write_index, task.barrier, true);
         task.completed = i + 1;
     }
 }
@@ -378,6 +387,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
         };
         std::array<BufferStage, Shader::MaxStageTypes> buffer_stages;
         auto& task = texture_task;
+        task.bc_base = Regs().ta_bc_base;
         task.count = 0;
         task.completed = 0;
         task.barrier = false;
@@ -395,8 +405,8 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
             auto texture_binding = binding;
             texture_binding.buffer += num_buffers;
             texture_binding.unified += num_buffers;
-            task.stages[task.count] = {stage, prepared, texture_binding,
-                                       set_write_index + num_buffers};
+            task.stages[task.count] = {stage, prepared, stage->FlatUserData().data(),
+                                       texture_binding, set_write_index + num_buffers};
             ++task.count;
             binding.buffer += num_buffers;
             binding.unified += num_descriptors;

@@ -218,10 +218,16 @@ TemporalUpscaler::TemporalUpscaler(const Instance& instance_, Scheduler& schedul
     frame_generation = std::make_unique<FrameGeneration>(instance, scheduler);
     {
         const Dlss* dlss = Dlss::Get();
-        static std::string problem;
-        problem = !dlss ? "the DLSS bridge and NVIDIA's DLSS library are not installed"
-                        : dlss->Problem();
-        BbSettings::ConfigureDlssSupport(dlss && dlss->Available(), problem.c_str());
+        if (dlss && dlss->EligibleForBoot()) {
+            // Non-blocking boot: `bb:DlssInit` finishes NGX init asynchronously in ~590 ms
+            // (well before the first 3D frame) and updates `ConfigureDlssSupport` if NGX fails.
+            BbSettings::ConfigureDlssSupport(true, "");
+        } else {
+            static std::string problem;
+            problem = !dlss ? "the DLSS bridge and NVIDIA's DLSS library are not installed"
+                            : dlss->Problem();
+            BbSettings::ConfigureDlssSupport(false, problem.c_str());
+        }
     }
     // Available unless BB_UPSCALER=none; on/off and the parameters are the menu's settings.
     const char* env = std::getenv("BB_UPSCALER");

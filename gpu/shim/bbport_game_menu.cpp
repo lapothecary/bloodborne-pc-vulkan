@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "common/types.h"
 #include "bbport_game_menu.h"
+#include "bbport_fast_load.h"
 
 #include <new>
 #include <sys/mman.h>
@@ -231,6 +232,7 @@ const char* TranslateForCurrentGameLang(const char* en) {
         {"Additional Debug", "Debug détaillé", "Depuración detallada", "Erweitertes Debug", "Debug dettagliato", "Debug detalhado", "Szczegółowy debug", "詳細デバッグ", "상세 디버그", "详细调试信息"},
         {"Camera Follow Hotkey", "Raccourci suivi caméra", "Atajo seguimiento cámara", "Kamera-Folgemodus-Taste", "Tasto modalità telecamera", "Atalho modo de câmera", "Skrót trybu kamery", "カメラ追従切替キー", "카메라 추적 전환 키", "视角跟随切换热键"},
         {"Camera Follow Mode", "Suivi de la caméra", "Seguimiento de cámara", "Kamera-Folgemodus", "Inseguimento telecamera", "Seguimento da câmera", "Śledzenie kamery", "カメラ追従モード", "카메라 추적 모드", "视角跟随模式"},
+        {"Loading Screen Tips Timer", "Minuteur d'astuces", "Temporizador de consejos", "Ladebildschirm-Tipps-Timer", "Timer consigli caricamento", "Timer de dicas na carga", "Timer wskazówek ładowania", "ロード画面ヒント表示時間", "로딩 화면 팁 타이머", "加载界面提示计时器"},
         {"Original (PS4)", "Original (PS4)", "Original (PS4)", "Original (PS4)", "Originale (PS4)", "Original (PS4)", "Oryginalny (PS4)", "オリジナル (PS4)", "오리지널 (PS4)", "原版惯性 (PS4)"},
         {"Balanced", "Équilibré", "Equilibrado", "Ausgewogen", "Bilanciato", "Equilibrado", "Zbalansowany", "バランス", "밸런스", "均衡"},
         {"Locked (Rigid 1:1)", "Verrouillé (Rigide 1:1)", "Fijo (Rígido 1:1)", "Fixiert (Starr 1:1)", "Bloccato (Rigido 1:1)", "Fixo (Rígido 1:1)", "Sztywny (1:1)", "固定 (リジッド 1:1)", "고정 (1:1 직결)", "完全锁定 (1:1 刚性)"},
@@ -300,7 +302,8 @@ constexpr int ItemCameraX = FirstControlSettingItem + 4;
 constexpr int ItemCameraY = FirstControlSettingItem + 5;
 constexpr int ItemAutoTarget = FirstControlSettingItem + 6;
 constexpr int ItemCameraAdjust = FirstControlSettingItem + 7;
-constexpr int TotalControlsItems = BbSettings::KeyActionCount + 8; ///< 27 keybinds + Mouse Speed + Camera Follow + 6 native settings
+constexpr int ItemLoadingTipsTimer = FirstControlSettingItem + 8;
+constexpr int TotalControlsItems = BbSettings::KeyActionCount + 9; ///< 27 keybinds + Mouse Speed + Camera Follow + Loading Tips Timer + 6 native settings
 constexpr int MaxControlsScroll = TotalControlsItems - ControlsSlotCount;
 constexpr int DisplaySlotCount = 11; ///< all 11 Display settings fit on a single screen (0 scroll)
 constexpr int TotalDisplayItems = 12;
@@ -1008,6 +1011,13 @@ void RefreshSlotTexts(int slot) {
                    "Автоматический обход стен при движении камеры");
         const bool on = !active_game_settings || active_game_settings[0xc] != 0;
         SetDynamic(val_id, on ? "On" : "Off", on ? "Вкл" : "Выкл");
+    } else if (item_idx == ItemLoadingTipsTimer) {
+        SetDynamic(name_id, "Loading Screen Tips Timer", "Таймер подсказок загрузки");
+        SetDynamic(help_id,
+                   "Keep original 12-second minimum timer to read item tips on loading screens (Off = instant close)",
+                   "Оставить оригинальный 12-сек таймер для чтения описаний на экране загрузки (Выкл = мгновенно)");
+        const bool on = BbSettings::Get().loading_tips_timer.load(std::memory_order_relaxed);
+        SetDynamic(val_id, on ? "On" : "Off", on ? "Вкл" : "Выкл");
     }
 }
 
@@ -1184,6 +1194,11 @@ void BuildControlsSlotChoices(int slot, std::vector<u32>& out_choices, int& out_
         add_choice("Off", "Выкл");
         add_choice("On", "Вкл");
         out_selected_idx = (!active_game_settings || active_game_settings[0xc] != 0) ? 1 : 0;
+    } else if (item_idx == ItemLoadingTipsTimer) {
+        add_choice("Off", "Выкл");
+        add_choice("On", "Вкл");
+        out_selected_idx =
+            BbSettings::Get().loading_tips_timer.load(std::memory_order_relaxed) ? 1 : 0;
     }
 }
 
@@ -1592,6 +1607,13 @@ void StepSlotSetting(u8* row, int slot, int delta, bool wrap) {
         changed = true;
     } else if (item_idx == ItemCameraAdjust && active_game_settings) {
         active_game_settings[0xc] = active_game_settings[0xc] ? 0 : 1;
+        changed = true;
+    } else if (item_idx == ItemLoadingTipsTimer) {
+        auto& s = BbSettings::Get();
+        const bool next = !s.loading_tips_timer.load(std::memory_order_relaxed);
+        s.loading_tips_timer.store(next, std::memory_order_relaxed);
+        BbFastLoad::SyncLoadingTipsTimer(next);
+        BbSettings::Save();
         changed = true;
     }
     if (changed) {
@@ -3044,7 +3066,7 @@ u64 PS4_SYSV_ABI RowInputHook(u8* row, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, d
             SetSharpnessStep(0);
             s.anisotropic = 1;
             s.model_lod = 0;
-            s.ui_upscale = false;
+            s.ui_upscale = true;
             if (s.vsync_mode.load() != BbSettings::VsyncFast) {
                 s.vsync_mode = BbSettings::VsyncFast;
                 s.vsync_mode_chosen = true;
@@ -3108,6 +3130,8 @@ u64 PS4_SYSV_ABI RowInputHook(u8* row, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, d
             }
             BbSettings::Get().camera_follow_mode.store(BbSettings::CameraFollowBalanced,
                                                        std::memory_order_relaxed);
+            BbSettings::Get().loading_tips_timer.store(false, std::memory_order_relaxed);
+            BbFastLoad::SyncLoadingTipsTimer(false);
             SetMouseSpeedStep(5); // also saves bbport.ini
             if (active_game_settings) {
                 active_game_settings[0x0] = 5;  // Camera Sensitivity

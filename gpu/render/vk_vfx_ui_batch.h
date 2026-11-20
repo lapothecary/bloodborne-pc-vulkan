@@ -226,6 +226,18 @@ private:
     OpenBatch open{};
     bool flushing = false;
 
+    struct PipeMetaEntry {
+        const GraphicsPipeline* pipeline = nullptr;
+        Gcn::PrimitiveType prim = Gcn::PrimitiveType::TriangleList;
+        bool valid = false;
+        bool native_sf2404 = false;
+        Mode mode = Mode::None;
+        u32 patch_cp = 1u;
+    };
+    static constexpr u32 kPipeMetaCacheSize = 16u;
+    std::array<PipeMetaEntry, kPipeMetaCacheSize> pipe_meta_cache{};
+    u32 pipe_meta_next = 0u;
+
     u64 stat_candidates_seen = 0;
     u64 stat_ffx_draws_in = 0;
     u64 stat_ffx_draws_saved = 0;

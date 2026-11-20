@@ -1162,6 +1162,24 @@ void GXGnmCommandContext_DrawInstancedIndirect(
     CGGfxContextGnm_FlushPendingStagingUploads(gfxCtx);
 }
 
+static inline void FastFlushPendingStagingUploads(void* gfxCtx) noexcept {
+    auto* p = static_cast<std::uint8_t*>(gfxCtx);
+    *reinterpret_cast<std::uint64_t*>(p + 0xB4B8) =
+        *reinterpret_cast<const std::uint64_t*>(p + 0x10);
+    if (*reinterpret_cast<const std::uint64_t*>(p + 0xB4D8) != 0ULL) [[unlikely]] {
+        CGGfxContextGnm_FlushPendingStagingUploads(gfxCtx);
+    }
+}
+
+static inline void FastPostDrawSyncAndResetStreamout(void* srBinder, void* ctxBase) noexcept {
+    const auto* b = static_cast<const std::uint8_t*>(srBinder);
+    if (*reinterpret_cast<const std::uint32_t*>(b + 0xB368) != 0u ||
+        *reinterpret_cast<const std::uint32_t*>(b + 0x0008) != 0xFFu ||
+        *reinterpret_cast<const void* const*>(b + 0x0010) != nullptr) [[unlikely]] {
+        CGShaderResourceBinderGnm_PostDrawSyncAndResetStreamout(srBinder, ctxBase);
+    }
+}
+
 // [VMA: 0x2169900 | Size: 194 B]
 void GXGnmCommandContext_DrawIndexedInstanced(
     void* context,
@@ -1176,17 +1194,17 @@ void GXGnmCommandContext_DrawIndexedInstanced(
     void* srBinder = ctxBase + 0x50;
 
     if (gx_direct_vk::DrawBundleEnabled()) [[unlikely]] {
-        CGGfxContextGnm_FlushPendingStagingUploads(gfxCtx);
+        FastFlushPendingStagingUploads(gfxCtx);
     }
     const auto bundle_mark = gx_direct_vk::CaptureDrawBundleBookmark(gfxCtx);
 
     CGOutputMergerCacheGnm_FlushBlendAndDepthStencilState(ctxBase + 0xB558, ctxBase, stateContext);
     CGIndexBufferCacheGnm_BindToGfxContext(ctxBase + 0xB518, ctxBase, stateContext, 1);
     CGRasterizerCacheGnm_FlushToGfxContext(ctxBase + 0xB528, ctxBase, stateContext);
-    CGGfxContextGnm_FlushPendingStagingUploads(gfxCtx);
+    FastFlushPendingStagingUploads(gfxCtx);
     CGShaderResourceBinderGnm_SyncAndBindGraphicsPipeline(srBinder, ctxBase, stateContext);
 
-    if (gx_direct_vk::EnabledV2Sub(gx_direct_vk::kV2Sub_DrawDirect)) {
+    if (gx_direct_vk::EnabledV2Sub(gx_direct_vk::kV2Sub_DrawDirect)) [[likely]] {
         gx_direct_vk::EmitDrawIndexedBundled(gfxCtx, bundle_mark, indexCountPerInstance,
                                              instanceCount, startIndexLocation, baseVertexLocation);
     } else {
@@ -1194,10 +1212,9 @@ void GXGnmCommandContext_DrawIndexedInstanced(
         sub_1075370(gfxCtx, instanceCount);
         sub_1074420(gfxCtx, startIndexLocation, indexCountPerInstance);
     }
-    BbGoldenEngine_OnDrawCall(indexCountPerInstance, instanceCount, true, false);
 
-    CGShaderResourceBinderGnm_PostDrawSyncAndResetStreamout(srBinder, ctxBase);
-    CGGfxContextGnm_FlushPendingStagingUploads(gfxCtx);
+    FastPostDrawSyncAndResetStreamout(srBinder, ctxBase);
+    FastFlushPendingStagingUploads(gfxCtx);
 }
 
 // [VMA: 0x2169840 | Size: 181 B]
@@ -1213,17 +1230,17 @@ void GXGnmCommandContext_DrawInstanced(
     void* srBinder = ctxBase + 0x50;
 
     if (gx_direct_vk::DrawBundleEnabled()) [[unlikely]] {
-        CGGfxContextGnm_FlushPendingStagingUploads(gfxCtx);
+        FastFlushPendingStagingUploads(gfxCtx);
     }
     const auto bundle_mark = gx_direct_vk::CaptureDrawBundleBookmark(gfxCtx);
 
     CGOutputMergerCacheGnm_FlushBlendAndDepthStencilState(ctxBase + 0xB558, ctxBase, stateContext);
     CGIndexBufferCacheGnm_BindToGfxContext(ctxBase + 0xB518, ctxBase, stateContext, 0);
     CGRasterizerCacheGnm_FlushToGfxContext(ctxBase + 0xB528, ctxBase, stateContext);
-    CGGfxContextGnm_FlushPendingStagingUploads(gfxCtx);
+    FastFlushPendingStagingUploads(gfxCtx);
     CGShaderResourceBinderGnm_SyncAndBindGraphicsPipeline(srBinder, ctxBase, stateContext);
 
-    if (gx_direct_vk::EnabledV2Sub(gx_direct_vk::kV2Sub_DrawDirect)) {
+    if (gx_direct_vk::EnabledV2Sub(gx_direct_vk::kV2Sub_DrawDirect)) [[likely]] {
         gx_direct_vk::EmitDrawAutoBundled(gfxCtx, bundle_mark, vertexCountPerInstance,
                                           instanceCount,
                                           static_cast<std::int32_t>(startVertexLocation));
@@ -1232,10 +1249,9 @@ void GXGnmCommandContext_DrawInstanced(
         sub_1075370(gfxCtx, instanceCount);
         sub_10741b0(gfxCtx, vertexCountPerInstance);
     }
-    BbGoldenEngine_OnDrawCall(vertexCountPerInstance, instanceCount, false, false);
 
-    CGShaderResourceBinderGnm_PostDrawSyncAndResetStreamout(srBinder, ctxBase);
-    CGGfxContextGnm_FlushPendingStagingUploads(gfxCtx);
+    FastPostDrawSyncAndResetStreamout(srBinder, ctxBase);
+    FastFlushPendingStagingUploads(gfxCtx);
 }
 
 // [VMA: 0x2169780 | Size: 189 B]
@@ -1251,17 +1267,17 @@ void GXGnmCommandContext_DrawIndexed(
     void* srBinder = ctxBase + 0x50;
 
     if (gx_direct_vk::DrawBundleEnabled()) [[unlikely]] {
-        CGGfxContextGnm_FlushPendingStagingUploads(gfxCtx);
+        FastFlushPendingStagingUploads(gfxCtx);
     }
     const auto bundle_mark = gx_direct_vk::CaptureDrawBundleBookmark(gfxCtx);
 
     CGOutputMergerCacheGnm_FlushBlendAndDepthStencilState(ctxBase + 0xB558, ctxBase, stateContext);
     CGIndexBufferCacheGnm_BindToGfxContext(ctxBase + 0xB518, ctxBase, stateContext, 1);
     CGRasterizerCacheGnm_FlushToGfxContext(ctxBase + 0xB528, ctxBase, stateContext);
-    CGGfxContextGnm_FlushPendingStagingUploads(gfxCtx);
+    FastFlushPendingStagingUploads(gfxCtx);
     CGShaderResourceBinderGnm_SyncAndBindGraphicsPipeline(srBinder, ctxBase, stateContext);
 
-    if (gx_direct_vk::EnabledV2Sub(gx_direct_vk::kV2Sub_DrawDirect)) {
+    if (gx_direct_vk::EnabledV2Sub(gx_direct_vk::kV2Sub_DrawDirect)) [[likely]] {
         gx_direct_vk::EmitDrawIndexedBundled(gfxCtx, bundle_mark, indexCount, 1u,
                                              startIndexLocation, baseVertexLocation);
     } else {
@@ -1269,10 +1285,9 @@ void GXGnmCommandContext_DrawIndexed(
         sub_1075370(gfxCtx, 1);
         sub_1074420(gfxCtx, startIndexLocation, indexCount);
     }
-    BbGoldenEngine_OnDrawCall(indexCount, 1, true, false);
 
-    CGShaderResourceBinderGnm_PostDrawSyncAndResetStreamout(srBinder, ctxBase);
-    CGGfxContextGnm_FlushPendingStagingUploads(gfxCtx);
+    FastPostDrawSyncAndResetStreamout(srBinder, ctxBase);
+    FastFlushPendingStagingUploads(gfxCtx);
 }
 
 // [VMA: 0x21696c0 | Size: 180 B]
@@ -1287,17 +1302,17 @@ void GXGnmCommandContext_Draw(
     void* srBinder = ctxBase + 0x50;
 
     if (gx_direct_vk::DrawBundleEnabled()) [[unlikely]] {
-        CGGfxContextGnm_FlushPendingStagingUploads(gfxCtx);
+        FastFlushPendingStagingUploads(gfxCtx);
     }
     const auto bundle_mark = gx_direct_vk::CaptureDrawBundleBookmark(gfxCtx);
 
     CGOutputMergerCacheGnm_FlushBlendAndDepthStencilState(ctxBase + 0xB558, ctxBase, stateContext);
     CGIndexBufferCacheGnm_BindToGfxContext(ctxBase + 0xB518, ctxBase, stateContext, 0);
     CGRasterizerCacheGnm_FlushToGfxContext(ctxBase + 0xB528, ctxBase, stateContext);
-    CGGfxContextGnm_FlushPendingStagingUploads(gfxCtx);
+    FastFlushPendingStagingUploads(gfxCtx);
     CGShaderResourceBinderGnm_SyncAndBindGraphicsPipeline(srBinder, ctxBase, stateContext);
 
-    if (gx_direct_vk::EnabledV2Sub(gx_direct_vk::kV2Sub_DrawDirect)) {
+    if (gx_direct_vk::EnabledV2Sub(gx_direct_vk::kV2Sub_DrawDirect)) [[likely]] {
         gx_direct_vk::EmitDrawAutoBundled(gfxCtx, bundle_mark, vertexCount, 1u,
                                           static_cast<std::int32_t>(startVertexLocation));
     } else {
@@ -1305,10 +1320,9 @@ void GXGnmCommandContext_Draw(
         sub_1075370(gfxCtx, 1);
         sub_10741b0(gfxCtx, vertexCount);
     }
-    BbGoldenEngine_OnDrawCall(vertexCount, 1, false, false);
 
-    CGShaderResourceBinderGnm_PostDrawSyncAndResetStreamout(srBinder, ctxBase);
-    CGGfxContextGnm_FlushPendingStagingUploads(gfxCtx);
+    FastPostDrawSyncAndResetStreamout(srBinder, ctxBase);
+    FastFlushPendingStagingUploads(gfxCtx);
 }
 
 // [VMA: 0x2169640 | Size: 115 B]

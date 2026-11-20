@@ -130,11 +130,15 @@ void CGRasterizerCacheGnm_FlushToGfxContext(
     uint8_t* gnmx_ctx_wrapper,
     const uint8_t* pipeline_state)
 {
+    const auto* rs = *reinterpret_cast<const CGRasterizerStateObject* const*>(pipeline_state + 0x240);
+    if (rs == self->bound_rs && (self->dirty_viewport_mask | self->dirty_scissor_mask) == 0u) [[likely]] {
+        return;
+    }
+
     void* gfxc = gnmx_ctx_wrapper + 0x10;
     const bool direct_rs = gx_direct_vk::EnabledV2Sub(gx_direct_vk::kV2Sub_RasterState);
-    gx_direct_vk::ContextRegBatch batch{};
+    gx_direct_vk::ContextRegBatch batch;
 
-    const auto* rs = *reinterpret_cast<const CGRasterizerStateObject* const*>(pipeline_state + 0x240);
     if (rs != self->bound_rs) {
         const auto* eff_rs = rs ? rs : reinterpret_cast<const CGRasterizerStateObject*>(g_eboot_live_slide + 0x546ca58ULL);
         if (eff_rs->primitive_setup != self->primitive_setup) {
@@ -865,20 +869,22 @@ void CGOutputMergerCacheGnm_FlushBlendAndDepthStencilState(
     const uint8_t* pipeline_state)
 {
     uint8_t count = self->active_rtv_count;
-    for (uint32_t slot = 0; slot < count; ++slot) {
-        uint32_t rtv_bank = self->state_dirty_bits & 1u;
-        const uint8_t* rtv = reinterpret_cast<const uint8_t*>(self->rtv_bank[rtv_bank][slot]);
-        const uint8_t* new_rtv = *reinterpret_cast<const uint8_t* const*>(pipeline_state + 0x4e0 + slot * 8);
-        if (rtv != new_rtv && reinterpret_cast<uintptr_t>(rtv) + 1ULL >= 2ULL) {
-            const uint8_t* tex_view = *reinterpret_cast<const uint8_t* const*>(rtv + 0x08);
-            if (tex_view != nullptr && (tex_view[0x3b] & 0x8Bu) != 0) {
-                uint32_t view_type = *reinterpret_cast<const uint32_t*>(rtv + 0x40);
-                if (view_type - 1u <= 7u) {
-                    uint32_t slice_start = (view_type == 1u) ? 0u : *reinterpret_cast<const uint32_t*>(rtv + 0x48);
-                    uint32_t slice_count = (view_type == 1u) ? 0u : *reinterpret_cast<const uint32_t*>(rtv + 0x4c);
-                    CGOutputMergerCacheGnm_FlushCmaskClearColors(self, gnmx_ctx_wrapper);
-                    sub_26b5a70_decompressRt(gnmx_ctx_wrapper, rtv + 0x10, tex_view + 0x18, slice_start, slice_count, 0u);
-                    count = self->active_rtv_count;
+    if (count != 0) {
+        const uint32_t rtv_bank = self->state_dirty_bits & 1u;
+        for (uint32_t slot = 0; slot < count; ++slot) {
+            const uint8_t* rtv = reinterpret_cast<const uint8_t*>(self->rtv_bank[rtv_bank][slot]);
+            const uint8_t* new_rtv = *reinterpret_cast<const uint8_t* const*>(pipeline_state + 0x4e0 + slot * 8);
+            if (rtv != new_rtv && reinterpret_cast<uintptr_t>(rtv) + 1ULL >= 2ULL) [[unlikely]] {
+                const uint8_t* tex_view = *reinterpret_cast<const uint8_t* const*>(rtv + 0x08);
+                if (tex_view != nullptr && (tex_view[0x3b] & 0x8Bu) != 0) {
+                    uint32_t view_type = *reinterpret_cast<const uint32_t*>(rtv + 0x40);
+                    if (view_type - 1u <= 7u) {
+                        uint32_t slice_start = (view_type == 1u) ? 0u : *reinterpret_cast<const uint32_t*>(rtv + 0x48);
+                        uint32_t slice_count = (view_type == 1u) ? 0u : *reinterpret_cast<const uint32_t*>(rtv + 0x4c);
+                        CGOutputMergerCacheGnm_FlushCmaskClearColors(self, gnmx_ctx_wrapper);
+                        sub_26b5a70_decompressRt(gnmx_ctx_wrapper, rtv + 0x10, tex_view + 0x18, slice_start, slice_count, 0u);
+                        count = self->active_rtv_count;
+                    }
                 }
             }
         }
@@ -1295,9 +1301,12 @@ void* CGDynamicBufferRingGnm_ResolveGpuAddress(
     uint8_t* buffer_res)
 {
     uint8_t* chunk = self->head_chunk;
+    if (chunk == nullptr) [[likely]] {
+        return *reinterpret_cast<void**>(buffer_res + 0x08);
+    }
     uint32_t cap   = self->nodes_per_chunk;
     uint64_t key   = sub_216e1b0_getBufferBaseAddr(buffer_res);
-    if (chunk != nullptr) {
+    {
         size_t next_off = static_cast<size_t>(cap) * 24ULL;
         while (chunk != nullptr) {
             uint8_t* next_chunk = *reinterpret_cast<uint8_t**>(chunk + next_off);

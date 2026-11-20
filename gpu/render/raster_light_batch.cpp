@@ -676,44 +676,74 @@ bool LightTileBatcher::TryBatchDraw(Rasterizer& rasterizer, const GraphicsPipeli
         }
     }
 
-    // Locate buffer descriptors: exactly 1 non-special in VS (`cbLightAccVtxParam`, ignoring
-    // unused `BufferType::ClipPlanes` when `user_clip_plane_enable == 0`) and 2 non-special in PS
-    // (`ssbo_1`, `ssbo_2`), plus at most 1 `BufferType::Flatbuf` (`srt_flatbuf`) per stage for
-    // SPIR-V patched non-native `GXLightAcc_*.ppo` shaders.
+    // Locate buffer descriptors (cached per `pipeline` in 16-slot MRU):
     u32 vs_buf_idx = ~0u;
     u32 vs_flatbuf_idx = ~0u;
-    u32 vs_non_special = 0u;
-    for (u32 i = 0; i < vs.buffers.size(); ++i) {
-        if (vs.buffers[i].buffer_type == Shader::BufferType::ClipPlanes) {
-            continue;
-        }
-        if (vs.buffers[i].buffer_type == Shader::BufferType::Flatbuf && !vs.buffers[i].is_written &&
-            vs_flatbuf_idx == ~0u) {
-            vs_flatbuf_idx = i;
-            continue;
-        }
-        if (vs.buffers[i].IsSpecial() || vs.buffers[i].is_written || vs_non_special >= 1u) {
-            return fail(fb_layout);
-        }
-        vs_buf_idx = i;
-        ++vs_non_special;
-    }
     u32 ps_buf_idx[2]{~0u, ~0u};
     u32 ps_flatbuf_idx = ~0u;
-    u32 ps_non_special = 0u;
-    for (u32 i = 0; i < ps->buffers.size(); ++i) {
-        if (ps->buffers[i].buffer_type == Shader::BufferType::Flatbuf &&
-            !ps->buffers[i].is_written && ps_flatbuf_idx == ~0u) {
-            ps_flatbuf_idx = i;
-            continue;
+    bool layout_cached = false;
+    for (const auto& e : pipe_layout_cache) {
+        if (e.pipeline == pipeline) {
+            if (!e.valid) {
+                return fail(fb_layout);
+            }
+            vs_buf_idx = e.vs_buf_idx;
+            vs_flatbuf_idx = e.vs_flatbuf_idx;
+            ps_buf_idx[0] = e.ps_buf_idx0;
+            ps_buf_idx[1] = e.ps_buf_idx1;
+            ps_flatbuf_idx = e.ps_flatbuf_idx;
+            layout_cached = true;
+            break;
         }
-        if (ps->buffers[i].IsSpecial() || ps->buffers[i].is_written || ps_non_special >= 2u) {
+    }
+    if (!layout_cached) [[unlikely]] {
+        bool ok = true;
+        u32 vs_non_special = 0u;
+        for (u32 i = 0; i < vs.buffers.size(); ++i) {
+            if (vs.buffers[i].buffer_type == Shader::BufferType::ClipPlanes) {
+                continue;
+            }
+            if (vs.buffers[i].buffer_type == Shader::BufferType::Flatbuf &&
+                !vs.buffers[i].is_written && vs_flatbuf_idx == ~0u) {
+                vs_flatbuf_idx = i;
+                continue;
+            }
+            if (vs.buffers[i].IsSpecial() || vs.buffers[i].is_written || vs_non_special >= 1u) {
+                ok = false;
+                break;
+            }
+            vs_buf_idx = i;
+            ++vs_non_special;
+        }
+        u32 ps_non_special = 0u;
+        for (u32 i = 0; ok && i < ps->buffers.size(); ++i) {
+            if (ps->buffers[i].buffer_type == Shader::BufferType::Flatbuf &&
+                !ps->buffers[i].is_written && ps_flatbuf_idx == ~0u) {
+                ps_flatbuf_idx = i;
+                continue;
+            }
+            if (ps->buffers[i].IsSpecial() || ps->buffers[i].is_written || ps_non_special >= 2u) {
+                ok = false;
+                break;
+            }
+            ps_buf_idx[ps_non_special++] = i;
+        }
+        if (vs_non_special != 1u || ps_non_special != 2u) {
+            ok = false;
+        }
+        auto& slot = pipe_layout_cache[pipe_layout_next++ & (kPipeLayoutCacheSize - 1u)];
+        slot = PipeLayoutEntry{
+            .pipeline = pipeline,
+            .valid = ok,
+            .vs_buf_idx = vs_buf_idx,
+            .vs_flatbuf_idx = vs_flatbuf_idx,
+            .ps_buf_idx0 = ps_buf_idx[0],
+            .ps_buf_idx1 = ps_buf_idx[1],
+            .ps_flatbuf_idx = ps_flatbuf_idx,
+        };
+        if (!ok) {
             return fail(fb_layout);
         }
-        ps_buf_idx[ps_non_special++] = i;
-    }
-    if (vs_non_special != 1u || ps_non_special != 2u) {
-        return fail(fb_layout);
     }
 
     const auto vs_cb0_sharp = vs.buffers[vs_buf_idx].GetSharp(vs);
@@ -1066,54 +1096,57 @@ bool LightTileBatcher::TryBatchDraw(Rasterizer& rasterizer, const GraphicsPipeli
     const u32 aligned_ssbo2_bytes = Common::AlignUp(ssbo2_bytes, 16u);
     const u32 add_ssbo2_dwords = 4u + (aligned_ssbo2_bytes >> 2u);
 
-    // Fast-path: consecutive tiles in `GXLightAcc` almost always share the exact same group as
-    // `last_group_idx`, with `ps->flattened_ud_buf` differing ONLY at `ssbo2`'s 4 V# dwords.
-    // Checking `ps->flattened_ud_buf` directly proves all PS `T#`s, `S#`s, and `norm_ps_flat` are
-    // bit-identical without extracting 16 images or running 4x `XXH3_64bits_withSeed`!
+    // Fast-path: check matching open groups by comparing `ps->flattened_ud_buf` directly (ignoring
+    // `ssbo2`'s 4 V# dwords) + `ssbo1_write_ver`. Scanning all `active_groups` when `cur_commutative`
+    // handles interleaved 1..12-light tiles in ~10 ns without extracting 16 T#s or 4x XXH3!
     BatchGroup* target_group = nullptr;
     if (pass_active && active_groups != 0u) {
+        const auto& sf1 = ps->buffers[ps_buf_idx[1]].sharp_fetch;
+        const u32 o0 = (sf1.load_mask & 1u) ? sf1.offsets[0] : ~0u;
+        const u32 o1 = (sf1.load_mask & 2u) ? sf1.offsets[1] : ~0u;
+        const u32 o2 = (sf1.load_mask & 4u) ? sf1.offsets[2] : ~0u;
+        const u32 o3 = (sf1.load_mask & 8u) ? sf1.offsets[3] : ~0u;
+        const auto& cur_flat = ps->flattened_ud_buf;
+        const u32 cur_flat_n = static_cast<u32>(cur_flat.size());
+        const u32* const cur_flat_ptr = cur_flat.data();
+
+        auto try_fast_group = [&](u32 idx) noexcept -> bool {
+            auto& g = groups[idx];
+            if (g.pipeline != pipeline || g.ssbo1_bytes != ssbo1_bytes ||
+                g.has_vport_scissor != use_vp_sc || g.ps_stage_slot >= g.num_stages ||
+                (use_vp_sc && g.union_vport_scissor0.window_offset_disable !=
+                                  regs.viewport_scissors[0].window_offset_disable) ||
+                g.ssbo2_dwords.size() + add_ssbo2_dwords > kMaxGroupSsbo2Dwords) {
+                return false;
+            }
+            const auto& ref_flat = g.stages[g.ps_stage_slot].flattened_ud_buf;
+            if (ref_flat.size() != cur_flat_n) {
+                return false;
+            }
+            const bool ssbo1_fast_same =
+                (ssbo1_write_ver != 0u && ssbo1_write_ver == g.ssbo1_write_ver &&
+                 ps_b0_sharp.base_address == g.ssbo1_addr);
+            const u32* const ref_ptr = ref_flat.data();
+            for (u32 k = 0; k < cur_flat_n; ++k) {
+                if (cur_flat_ptr[k] != ref_ptr[k] && k != o0 && k != o1 && k != o2 && k != o3) {
+                    return false;
+                }
+            }
+            if (!ssbo1_fast_same && std::memcmp(g.ssbo1.data(), ssbo1_ptr, ssbo1_bytes) != 0) {
+                return false;
+            }
+            target_group = &g;
+            last_group_idx = idx;
+            return true;
+        };
+
         const u32 fast_idx = (cur_commutative && last_group_idx < active_groups)
                                  ? last_group_idx
                                  : (active_groups - 1u);
-        auto& g = groups[fast_idx];
-        if (g.pipeline == pipeline && g.ssbo1_bytes == ssbo1_bytes &&
-            g.has_vport_scissor == use_vp_sc && g.ps_stage_slot < g.num_stages &&
-            (!use_vp_sc ||
-             g.union_vport_scissor0.window_offset_disable ==
-                 regs.viewport_scissors[0].window_offset_disable) &&
-            g.ssbo2_dwords.size() + add_ssbo2_dwords <= kMaxGroupSsbo2Dwords) {
-            const auto& ref_flat = g.stages[g.ps_stage_slot].flattened_ud_buf;
-            const auto& cur_flat = ps->flattened_ud_buf;
-            if (cur_flat.size() == ref_flat.size()) {
-                const auto& sf1 = ps->buffers[ps_buf_idx[1]].sharp_fetch;
-                const u32 n = static_cast<u32>(cur_flat.size());
-                const u32* a = cur_flat.data();
-                const u32* b = ref_flat.data();
-                bool flat_ok = true;
-                for (u32 k = 0; k < n; ++k) {
-                    if (a[k] != b[k]) {
-                        bool is_s2 = false;
-                        for (u32 d = 0; d < 4u; ++d) {
-                            if (((sf1.load_mask >> d) & 1u) != 0u && sf1.offsets[d] == k) {
-                                is_s2 = true;
-                                break;
-                            }
-                        }
-                        if (!is_s2) {
-                            flat_ok = false;
-                            break;
-                        }
-                    }
-                }
-                if (flat_ok) {
-                    const bool ssbo1_same =
-                        (ssbo1_write_ver != 0u && ssbo1_write_ver == g.ssbo1_write_ver &&
-                         ps_b0_sharp.base_address == g.ssbo1_addr) ||
-                        std::memcmp(g.ssbo1.data(), ssbo1_ptr, ssbo1_bytes) == 0;
-                    if (ssbo1_same) {
-                        target_group = &g;
-                        last_group_idx = fast_idx;
-                    }
+        if (!try_fast_group(fast_idx) && cur_commutative) {
+            for (u32 gi = 0; gi < active_groups; ++gi) {
+                if (gi != fast_idx && try_fast_group(gi)) {
+                    break;
                 }
             }
         }

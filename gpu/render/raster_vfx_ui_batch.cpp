@@ -952,14 +952,6 @@ bool VfxUiBatcher::TryBatchDraw(Rasterizer& rasterizer, const GraphicsPipeline* 
         }
         return false;
     }
-    for (const auto& attr : fetch->attributes) {
-        if (attr.GetStepRate() != Shader::Gcn::VertexAttribute::InstanceIdType::None) {
-            if (HasPendingDraws()) {
-                Flush(rasterizer);
-            }
-            return false;
-        }
-    }
     if (fetch->instance_offset_sgpr != -1 &&
         static_cast<size_t>(fetch->instance_offset_sgpr) < vs_stage->UserData().size() &&
         vs_stage->UserData()[fetch->instance_offset_sgpr] != 0u) {
@@ -969,81 +961,142 @@ bool VfxUiBatcher::TryBatchDraw(Rasterizer& rasterizer, const GraphicsPipeline* 
         return false;
     }
 
-    for (const auto* st : stages_span) {
-        if (!st) {
-            continue;
-        }
-        if (st->uses_dma || st->has_storage_images) {
-            if (HasPendingDraws()) {
-                Flush(rasterizer);
-            }
-            return false;
-        }
-        u32 ns_count = 0u;
-        for (const auto& desc : st->buffers) {
-            if (desc.IsSpecial()) {
-                continue;
-            }
-            if (desc.is_written || desc.is_formatted) {
+    const Gcn::PrimitiveType prim = regs.primitive_type;
+    const bool native_sf2404 = Shader::Backend::SPIRV::NativeShadersEnabled() &&
+                               !Shader::Backend::SPIRV::NativeShadersCustomRange();
+    const u64 ps_hash = ps_stage ? ps_stage->pgm_hash : 0ULL;
+
+    Mode cand_mode = Mode::None;
+    u32 patch_cp = 1u;
+    bool pipe_cached = false;
+    for (const auto& pm : pipe_meta_cache) {
+        if (pm.pipeline == pipeline && pm.prim == prim && pm.native_sf2404 == native_sf2404) {
+            if (!pm.valid) {
                 if (HasPendingDraws()) {
                     Flush(rasterizer);
                 }
                 return false;
             }
-            if (++ns_count > kMaxNonSpecialBufs) {
-                if (HasPendingDraws()) {
-                    Flush(rasterizer);
-                }
-                return false;
-            }
+            cand_mode = pm.mode;
+            patch_cp = pm.patch_cp;
+            pipe_cached = true;
+            break;
         }
     }
 
-    const auto& key = pipeline->GetGraphicsKey();
-    const Gcn::PrimitiveType prim = regs.primitive_type;
-    if (prim != key.prim_type) {
-        if (HasPendingDraws()) {
-            Flush(rasterizer);
+    if (!pipe_cached) [[unlikely]] {
+        bool ok = true;
+        for (const auto& attr : fetch->attributes) {
+            if (attr.GetStepRate() != Shader::Gcn::VertexAttribute::InstanceIdType::None) {
+                ok = false;
+                break;
+            }
         }
-        return false;
+        for (const auto* st : stages_span) {
+            if (!ok || !st) {
+                continue;
+            }
+            if (st->uses_dma || st->has_storage_images) {
+                ok = false;
+                break;
+            }
+            u32 ns_count = 0u;
+            for (const auto& desc : st->buffers) {
+                if (desc.IsSpecial()) {
+                    continue;
+                }
+                if (desc.is_written || desc.is_formatted || ++ns_count > kMaxNonSpecialBufs) {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        const auto& key = pipeline->GetGraphicsKey();
+        if (ok && prim != key.prim_type) {
+            ok = false;
+        }
+        if (ok) {
+            switch (prim) {
+            case Gcn::PrimitiveType::TriangleList:
+            case Gcn::PrimitiveType::RectList:
+            case Gcn::PrimitiveType::QuadList:
+            case Gcn::PrimitiveType::TriangleStrip:
+                break;
+            case Gcn::PrimitiveType::PatchPrimitive:
+                patch_cp = std::max<u32>(key.patch_control_points, 1u);
+                if (!hs_stage || !ds_stage) {
+                    ok = false;
+                }
+                break;
+            default:
+                ok = false;
+                break;
+            }
+        }
+        if (ok) {
+            if (!hs_stage && !ds_stage && vs_hash == kScaleform2404VsHash &&
+                fetch->attributes.size() == 2u && fetch->attributes[0].semantic == 0u &&
+                fetch->attributes[1].semantic == 1u && native_sf2404) {
+                cand_mode = Mode::Scaleform2404;
+            } else if (!hs_stage && !ds_stage && vs_hash == kScaleformE94BVsHash &&
+                       fetch->attributes.size() == 3u && fetch->attributes[0].semantic == 0u &&
+                       fetch->attributes[1].semantic == 1u && fetch->attributes[2].semantic == 2u) {
+                cand_mode = Mode::ScaleformE94B;
+            } else if (!hs_stage && !ds_stage && vs_hash == kScaleformA400VsHash &&
+                       fetch->attributes.size() == 2u && fetch->attributes[0].semantic == 0u &&
+                       fetch->attributes[1].semantic == 1u) {
+                cand_mode = Mode::ScaleformA400;
+            } else if (ps_stage && IsFfxSoftPsHash(ps_hash) &&
+                       ((vs_hash == kFfxTessLsHash && hs_stage && ds_stage &&
+                         IsFfxHsHash(hs_stage->pgm_hash) && IsFfxDsHash(ds_stage->pgm_hash)) ||
+                        (vs_hash == kFfxQuadVsHash && !hs_stage && !ds_stage)) &&
+                       fetch->attributes.size() >= 2u && fetch->attributes[1].semantic == 1u) {
+                cand_mode = Mode::FfxTintBaked;
+            } else {
+                ok = false;
+            }
+        }
+        auto& slot = pipe_meta_cache[pipe_meta_next++ & (kPipeMetaCacheSize - 1u)];
+        slot = PipeMetaEntry{
+            .pipeline = pipeline,
+            .prim = prim,
+            .valid = ok,
+            .native_sf2404 = native_sf2404,
+            .mode = cand_mode,
+            .patch_cp = patch_cp,
+        };
+        if (!ok) {
+            if (cand_mode == Mode::None) {
+                ++fb_layout;
+            }
+            if (HasPendingDraws()) {
+                Flush(rasterizer);
+            }
+            return false;
+        }
     }
-    u32 patch_cp = 1u;
+
+    // Per-draw vertex count divisibility check:
+    bool count_ok = true;
     switch (prim) {
     case Gcn::PrimitiveType::TriangleList:
     case Gcn::PrimitiveType::RectList:
-        if ((num_indices % 3u) != 0u) {
-            if (HasPendingDraws()) {
-                Flush(rasterizer);
-            }
-            return false;
-        }
+        count_ok = (num_indices % 3u) == 0u;
         break;
     case Gcn::PrimitiveType::QuadList:
-        if ((num_indices % 4u) != 0u) {
-            if (HasPendingDraws()) {
-                Flush(rasterizer);
-            }
-            return false;
-        }
+        count_ok = (num_indices % 4u) == 0u;
         break;
     case Gcn::PrimitiveType::TriangleStrip:
-        if (num_indices < 3u) {
-            if (HasPendingDraws()) {
-                Flush(rasterizer);
-            }
-            return false;
-        }
+        count_ok = num_indices >= 3u;
         break;
     case Gcn::PrimitiveType::PatchPrimitive:
-        patch_cp = std::max<u32>(key.patch_control_points, 1u);
-        if (!hs_stage || !ds_stage || (num_indices % patch_cp) != 0u) {
-            if (HasPendingDraws()) {
-                Flush(rasterizer);
-            }
-            return false;
-        }
+        count_ok = (num_indices % patch_cp) == 0u;
         break;
     default:
+        count_ok = false;
+        break;
+    }
+    if (!count_ok) {
         if (HasPendingDraws()) {
             Flush(rasterizer);
         }
@@ -1051,37 +1104,6 @@ bool VfxUiBatcher::TryBatchDraw(Rasterizer& rasterizer, const GraphicsPipeline* 
     }
 
     ++stat_candidates_seen;
-
-    // Classify candidate mode (only exact Scaleform GFx & GXFfx soft-particle targets):
-    Mode cand_mode = Mode::None;
-    const u64 ps_hash = ps_stage ? ps_stage->pgm_hash : 0ULL;
-    if (!hs_stage && !ds_stage && vs_hash == kScaleform2404VsHash &&
-        fetch->attributes.size() == 2u && fetch->attributes[0].semantic == 0u &&
-        fetch->attributes[1].semantic == 1u && Shader::Backend::SPIRV::NativeShadersEnabled() &&
-        !Shader::Backend::SPIRV::NativeShadersCustomRange()) {
-        cand_mode = Mode::Scaleform2404;
-    } else if (!hs_stage && !ds_stage && vs_hash == kScaleformE94BVsHash &&
-               fetch->attributes.size() == 3u && fetch->attributes[0].semantic == 0u &&
-               fetch->attributes[1].semantic == 1u && fetch->attributes[2].semantic == 2u) {
-        cand_mode = Mode::ScaleformE94B;
-    } else if (!hs_stage && !ds_stage && vs_hash == kScaleformA400VsHash &&
-               fetch->attributes.size() == 2u && fetch->attributes[0].semantic == 0u &&
-               fetch->attributes[1].semantic == 1u) {
-        cand_mode = Mode::ScaleformA400;
-    } else if (ps_stage && IsFfxSoftPsHash(ps_hash) &&
-               ((vs_hash == kFfxTessLsHash && hs_stage && ds_stage &&
-                 IsFfxHsHash(hs_stage->pgm_hash) && IsFfxDsHash(ds_stage->pgm_hash)) ||
-                (vs_hash == kFfxQuadVsHash && !hs_stage && !ds_stage)) &&
-               fetch->attributes.size() >= 2u && fetch->attributes[1].semantic == 1u) {
-        cand_mode = Mode::FfxTintBaked;
-    }
-    if (cand_mode == Mode::None) {
-        ++fb_layout;
-        if (HasPendingDraws()) {
-            Flush(rasterizer);
-        }
-        return false;
-    }
     if (cand_mode == Mode::FfxTintBaked) {
         WakeStagingShadow(BbStats::frame_number.load(std::memory_order_relaxed));
     }
@@ -1171,17 +1193,39 @@ bool VfxUiBatcher::TryBatchDraw(Rasterizer& rasterizer, const GraphicsPipeline* 
                 }
                 return false;
             }
-            const u64 clamped_sz = VideoCore::DirectBuffers::ClampNativeGpuReadSize(
-                sharp.base_address, sharp.GetSize());
-            if (clamped_sz == 0u || clamped_sz > 16384u) {
-                ++fb_cb;
-                if (open.active) {
-                    Flush(rasterizer);
+            const VAddr b_addr = sharp.base_address;
+            u64 clamped_sz = sharp.GetSize();
+            const u8* ptr = nullptr;
+            // Fast-path 1: Transient CUE heap / Aux CPU ring (zero 4 MiB ExactBufferTable probe).
+            if (VideoCore::DirectBuffers::IsTransientCueHeap(b_addr, 16u)) {
+                clamped_sz = VideoCore::DirectBuffers::ClampTransientCueReadSize(b_addr, clamped_sz);
+                if (clamped_sz > 0u && clamped_sz <= 16384u &&
+                    VideoCore::DirectBuffers::IsTransientCueHeap(b_addr, clamped_sz)) {
+                    ptr = reinterpret_cast<const u8*>(b_addr);
                 }
-                return false;
+            } else if (clamped_sz > 0u && clamped_sz <= 16384u &&
+                       VideoCore::DirectBuffers::IsTransientAuxCpuRing(b_addr, clamped_sz)) {
+                ptr = reinterpret_cast<const u8*>(b_addr);
+            } else {
+                // Fast-path 2: Stage-A CPU shadow (skips 4 MiB ExactBufferTable when covered).
+                u32 shadow_rem = 0u;
+                if (clamped_sz > 0u && clamped_sz <= LightTileBatcher::kMaxShadowBytes &&
+                    rasterizer.light_tile_batcher) {
+                    if (const u8* sh = rasterizer.light_tile_batcher->LookupCpuShadow(
+                            b_addr, 1u, &shadow_rem)) {
+                        if (clamped_sz <= shadow_rem && clamped_sz <= 16384u) [[likely]] {
+                            ptr = sh;
+                        }
+                    }
+                }
+                if (!ptr) {
+                    clamped_sz = VideoCore::DirectBuffers::ClampNativeGpuReadSize(b_addr, clamped_sz);
+                    if (clamped_sz > 0u && clamped_sz <= 16384u) {
+                        ptr = ResolveCpuReadableRange(rasterizer, b_addr, clamped_sz);
+                    }
+                }
             }
-            const u8* ptr = ResolveCpuReadableRange(rasterizer, sharp.base_address, clamped_sz);
-            if (!ptr) {
+            if (!ptr || clamped_sz == 0u || clamped_sz > 16384u) {
                 ++fb_cb;
                 if (open.active) {
                     Flush(rasterizer);

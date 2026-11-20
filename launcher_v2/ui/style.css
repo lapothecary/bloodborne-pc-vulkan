@@ -171,7 +171,7 @@ html, body {
 /* Left Slim Navigation Rail */
 .rail {
   position: relative;
-  z-index: 5;
+  z-index: 15;
   width: 62px;
   flex-shrink: 0;
   display: flex;
@@ -272,6 +272,119 @@ html, body {
 .rail-mini.muted { opacity: 0.36; }
 .rail-ver { font-size: 9.5px; color: var(--text-faint); letter-spacing: 0.04em; margin-top: 2px; }
 
+/* Rail Update Status Icon + Smooth Morph + Gentle Breathing Glow + Hover Tooltip */
+.rail-update-wrap {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.rail-update {
+  position: relative;
+  overflow: visible;
+  transition: border-color 0.45s ease, background 0.45s ease, color 0.45s ease, box-shadow 0.45s ease;
+}
+.rail-update .upd-ico {
+  position: absolute;
+  width: 14px;
+  height: 14px;
+  pointer-events: none;
+  transition: opacity 0.48s cubic-bezier(0.22, 1, 0.36, 1), transform 0.48s cubic-bezier(0.22, 1, 0.36, 1);
+}
+.rail-update .upd-ico-sync {
+  opacity: 0.92;
+  transform: scale(1) rotate(0deg);
+}
+.rail-update .upd-ico-check {
+  opacity: 0;
+  transform: scale(0.52) rotate(-18deg);
+}
+
+/* Checking / Applying: calm continuous rotation */
+.rail-update.checking .upd-ico-sync,
+.rail-update.applying .upd-ico-sync {
+  opacity: 0.96;
+  animation: railSpin 1.15s linear infinite;
+}
+.rail-update.checking {
+  color: var(--silver-bright);
+  border-color: rgba(202, 210, 224, 0.32);
+}
+
+/* Up to date: smoothly morphs into same-palette checkmark */
+.rail-update.up-to-date .upd-ico-sync {
+  opacity: 0;
+  transform: scale(0.55) rotate(90deg);
+}
+.rail-update.up-to-date .upd-ico-check {
+  opacity: 0.90;
+  transform: scale(1) rotate(0deg);
+}
+
+/* Update available: ultra-smooth breathing silver-moonlight glow */
+.rail-update.available {
+  color: #f0f4fa;
+  background: rgba(34, 38, 48, 0.84);
+  animation: railUpdateBreath 3.4s ease-in-out infinite;
+}
+.rail-update.available:hover {
+  color: #ffffff;
+  border-color: rgba(238, 244, 255, 0.92);
+  background: rgba(48, 54, 68, 0.92);
+}
+.rail-update.applying {
+  color: #f0f4fa;
+  border-color: rgba(226, 234, 248, 0.68);
+  box-shadow: 0 0 12px rgba(214, 226, 244, 0.30);
+}
+
+@keyframes railSpin {
+  from { transform: scale(1) rotate(0deg); }
+  to   { transform: scale(1) rotate(360deg); }
+}
+
+@keyframes railUpdateBreath {
+  0%, 100% {
+    border-color: rgba(202, 212, 228, 0.34);
+    box-shadow: 0 0 4px rgba(208, 220, 240, 0.10), inset 0 0 4px rgba(208, 220, 240, 0.05);
+    color: rgba(224, 230, 242, 0.82);
+  }
+  50% {
+    border-color: rgba(236, 242, 252, 0.90);
+    box-shadow: 0 0 14px rgba(220, 232, 250, 0.48), inset 0 0 8px rgba(220, 232, 250, 0.20);
+    color: #ffffff;
+  }
+}
+
+/* Compact Gothic Tooltip anchored to the right of the rail update icon */
+.rail-tooltip {
+  position: absolute;
+  left: calc(100% + 10px);
+  top: 50%;
+  transform: translateY(-50%) translateX(-5px);
+  z-index: 40;
+  padding: 5px 10px;
+  border-radius: 3px;
+  border: 1px solid var(--slate-line);
+  background: linear-gradient(135deg, rgba(22, 25, 31, 0.92) 0%, rgba(11, 13, 17, 0.94) 100%);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  box-shadow: inset 0 1px 0 rgba(235, 240, 250, 0.10), 0 8px 22px rgba(0, 0, 0, 0.68);
+  color: var(--silver-bright);
+  font-family: var(--serif);
+  font-size: 12px;
+  letter-spacing: 0.03em;
+  white-space: nowrap;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.26s ease, transform 0.26s cubic-bezier(0.22, 1, 0.36, 1);
+}
+.rail-update-wrap:hover .rail-tooltip,
+.rail-update:focus-visible + .rail-tooltip {
+  opacity: 1;
+  transform: translateY(-50%) translateX(0);
+}
+
 /* Main Workspace */
 .workspace {
   position: relative;
@@ -320,29 +433,6 @@ html, body {
 }
 .ornament-rule span { flex: 1; height: 1px; background: linear-gradient(90deg, transparent, var(--slate-line), transparent); }
 .ornament-rule i { width: 5px; height: 5px; transform: rotate(45deg); border: 1px solid var(--slate-line); background: rgba(196, 206, 222, 0.22); }
-
-/* Floating Update Plaque — pinned top-right, smoked frosted glass */
-.update-plaque {
-  position: absolute;
-  top: 18px;
-  right: 22px;
-  z-index: 25;
-  min-width: 240px;
-  padding: 8px 12px;
-  background: linear-gradient(135deg, rgba(24, 27, 33, 0.72) 0%, rgba(13, 15, 19, 0.76) 100%);
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
-  border: 1px solid var(--slate-line);
-  border-radius: 3px;
-  box-shadow: inset 0 1px 0 rgba(235, 240, 250, 0.12), 0 10px 26px rgba(0, 0, 0, 0.62);
-  display: flex;
-  flex-direction: column;
-  gap: 7px;
-  animation: fadeIn 0.22s ease;
-}
-.update-plaque-top { display: flex; align-items: center; gap: 9px; }
-.plaque-diamond { font-size: 7.5px; color: var(--silver-bright); opacity: 0.85; }
-.update-text { flex: 1; font-family: var(--serif); font-size: 12.5px; color: var(--silver-bright); letter-spacing: 0.03em; white-space: nowrap; }
 
 .bb-btn-mini {
   padding: 4px 12px;

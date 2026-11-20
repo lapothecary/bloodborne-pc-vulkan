@@ -122,6 +122,113 @@ bool Rasterizer::TransitSampled(VideoCore::Image& image,
                            read_access, desc.view_info.range);
 }
 
+bool Rasterizer::TryBindTexturesFastOnHelper(const Shader::Info& stage,
+                                             const PreparedStage* prepared,
+                                             const u32* stage_flat, Gcn::BorderColorBuffer bc_base,
+                                             Shader::Backend::Bindings binding, u32 write_index) {
+    const u32 stage_img_cnt = static_cast<u32>(stage.images.size());
+    const u32 stage_smp_cnt = static_cast<u32>(stage.samplers.size());
+    if (stage_img_cnt == 0u && stage_smp_cnt == 0u) {
+        return true;
+    }
+    if (ui_pass_started || !native_srv_fast_cache || !native_sampler_cache) {
+        return false;
+    }
+    if (image_infos.size() + stage_img_cnt + stage_smp_cnt > image_infos.capacity()) [[unlikely]] {
+        return false;
+    }
+    const size_t saved_img_sz = image_infos.size();
+    const u16 cur_imm_epoch16 = VideoCore::DirectTextures::ImmutableRoEpoch16();
+
+    for (u32 i = 0; i < stage_img_cnt; ++i) {
+        const auto& res = stage.images[i];
+        if (res.is_written || res.mip_fallback_mode != Shader::MipStorageFallbackMode::None) {
+            image_infos.resize(saved_img_sz);
+            return false;
+        }
+        const Gcn::Image tsharp =
+            prepared ? prepared->image_sharps[i] : res.GetSharpDirect(stage_flat);
+        const u32 dw7 = reinterpret_cast<const u32*>(&tsharp)[7];
+        if ((dw7 >> 24) != VideoCore::DirectTextures::kSrvTagMagic) {
+            image_infos.resize(saved_img_sz);
+            return false;
+        }
+        const u16 uid = static_cast<u16>(dw7 & 0xFFFFu);
+        if (uid == 0u) [[unlikely]] {
+            image_infos.resize(saved_img_sz);
+            return false;
+        }
+        u64 qw0 = 0;
+        std::memcpy(&qw0, &tsharp, sizeof(u64));
+        const auto& fe = native_srv_fast_cache[uid];
+        const u8 rflags = (u8(res.is_depth) << 1) | (u8(res.is_array) << 2);
+        if (!fe.valid || fe.dw7_tag != dw7 || fe.qw0 != qw0 || fe.res_flags != rflags ||
+            fe.imm_epoch16 != cur_imm_epoch16) {
+            image_infos.resize(saved_img_sz);
+            return false;
+        }
+        texture_cache.NoteMtImageAccess(fe.id);
+        image_infos.emplace_back(VK_NULL_HANDLE, fe.view,
+                                 vk::ImageLayout::eShaderReadOnlyOptimal);
+    }
+
+    if (stage_smp_cnt != 0u) {
+        const u32 color_bias_bits = std::bit_cast<u32>(sampler_lod_bias);
+        const bool aniso_off = BbToggle::Disabled(BbToggle::ForcedAniso);
+        const u8 forced_aniso =
+            aniso_off
+                ? u8(0)
+                : u8(std::clamp(BbSettings::Get().anisotropic.load(std::memory_order_relaxed), 0,
+                                16));
+        const u64 cur_evict_gen = texture_cache.SamplerEvictGeneration();
+        for (u32 s = 0; s < stage_smp_cnt; ++s) {
+            const auto& sampler = stage.samplers[s];
+            const Gcn::Sampler ssharp =
+                prepared ? prepared->sampler_sharps[s] : sampler.GetSharpDirect(stage_flat);
+            const u32 variant = sampler.is_depth ? 2u : (pipeline_is_compute ? 1u : 0u);
+            const u32 dw3 = reinterpret_cast<const u32*>(&ssharp)[3];
+            if (((dw3 >> 24) & 0x3Fu) != VideoCore::DirectTextures::kSamplerTagMagic) {
+                image_infos.resize(saved_img_sz);
+                return false;
+            }
+            const u32 cand_uid = (dw3 >> 12) & 0xFFFu;
+            if (cand_uid == 0u || cand_uid >= VideoCore::DirectTextures::kMaxNativeSamplers) {
+                image_infos.resize(saved_img_sz);
+                return false;
+            }
+            const auto& sc = native_sampler_cache[cand_uid];
+            if (!sc.handles[variant] || sc.tagged_sharp != ssharp ||
+                sc.touched_ticks[variant] != cur_evict_gen || sc.forced_aniso != forced_aniso ||
+                sc.forced_aniso_off != aniso_off ||
+                (variant != 2u && sc.bias_bits != color_bias_bits) ||
+                sc.bc_base.base_addr != bc_base.base_addr) {
+                image_infos.resize(saved_img_sz);
+                return false;
+            }
+            image_infos.push_back(sc.desc_infos[variant]);
+        }
+    }
+
+    for (u32 i = 0; i < stage_img_cnt; ++i) {
+        set_writes[write_index++] = vk::WriteDescriptorSet{
+            .dstBinding = binding.unified++,
+            .descriptorCount = 1,
+            .descriptorType = vk::DescriptorType::eSampledImage,
+            .pImageInfo = &image_infos[saved_img_sz + i],
+        };
+    }
+    for (u32 s = 0; s < stage_smp_cnt; ++s) {
+        set_writes[write_index++] = vk::WriteDescriptorSet{
+            .dstBinding = binding.unified++,
+            .descriptorCount = 1,
+            .descriptorType = vk::DescriptorType::eSampler,
+            .pImageInfo = &image_infos[saved_img_sz + stage_img_cnt + s],
+        };
+    }
+    BbStats::native_tex_hits.fetch_add(stage_img_cnt + stage_smp_cnt, std::memory_order_relaxed);
+    return true;
+}
+
 void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* prepared,
                               Shader::Backend::Bindings& binding, u32& write_index,
                               bool& barrier, bool on_helper) {
@@ -169,6 +276,26 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
     if (!on_helper &&
         BindTexturesFromSet(stage, eff_image_hashes, eff_precomputed_key, first_image_idx, barrier,
                             set_slot, set_key)) {
+        // Keep `native_srv_fast_cache[uid].imm_epoch16` fresh when an immutable TextureSet hits
+        // after an `ImmutableRoEpoch16()` bump so `bb:TexBind` (`TryBindTexturesFastOnHelper`)
+        // immediately resumes hitting on the very next frame.
+        if (set_slot && set_slot->all_direct_immutable && native_srv_fast_cache &&
+            eff_image_sharps) [[likely]] {
+            const u16 cur_imm_epoch16 = VideoCore::DirectTextures::ImmutableRoEpoch16();
+            for (u32 i = 0; i < stage_img_cnt; ++i) {
+                const u32 dw7 = reinterpret_cast<const u32*>(&eff_image_sharps[i])[7];
+                if ((dw7 >> 24) == VideoCore::DirectTextures::kSrvTagMagic) [[likely]] {
+                    const u16 uid = static_cast<u16>(dw7 & 0xFFFFu);
+                    if (uid != 0u) {
+                        auto& fe = native_srv_fast_cache[uid];
+                        if (fe.valid && fe.dw7_tag == dw7 && fe.imm_epoch16 != cur_imm_epoch16)
+                            [[unlikely]] {
+                            fe.imm_epoch16 = cur_imm_epoch16;
+                        }
+                    }
+                }
+            }
+        }
         // Descriptor writes: one per image (no mip arrays in a memoized set).
         for (u32 i = 0; i < stage_img_cnt; ++i) {
             set_writes[write_index++] = vk::WriteDescriptorSet{
@@ -1092,6 +1219,7 @@ bool Rasterizer::BindTexturesFromSet(const Shader::Info& stage, const u64* image
             }
             if (all_live) {
                 set.generation = generation;
+                set.imm_epoch16 = cur_imm_epoch16;
                 gen_ok = true;
             }
         }

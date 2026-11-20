@@ -133,10 +133,17 @@ void CGIndexBufferCacheGnm_BindToGfxContext(
     bool bind_index_buffer)
 {
     void* gnmx_ctx = gnmx_ctx_wrapper + 0x10;
-    const uint32_t prim_type = sub_26b7b60_TranslatePrimitiveTopology(
-        *reinterpret_cast<const uint32_t*>(pipeline_state + 0x08));
+    static constexpr uint32_t kPrimTable[42] = {
+        0, 1, 2, 3, 4, 6, 10, 11, 12, 13,
+        9, 9, 9, 9, 9, 9, 9, 9, 9, 9,
+        9, 9, 9, 9, 9, 9, 9, 9, 9, 9,
+        9, 9, 9, 9, 9, 9, 9, 9, 9, 9,
+        9, 9
+    };
+    const uint32_t raw_topo = *reinterpret_cast<const uint32_t*>(pipeline_state + 0x08);
+    const uint32_t prim_type = (raw_topo <= 0x29u) ? kPrimTable[raw_topo] : 0u;
 
-    if (gx_direct_vk::EnabledV2Sub(gx_direct_vk::kV2Sub_IndexAndPrim)) {
+    if (gx_direct_vk::EnabledV2Sub(gx_direct_vk::kV2Sub_IndexAndPrim)) [[likely]] {
         gx_direct_vk::SetIndexStateArgs args{};
         if (self->bound_primitive_type != prim_type) {
             args.prim_type = prim_type;
@@ -160,7 +167,8 @@ void CGIndexBufferCacheGnm_BindToGfxContext(
 
         const uint8_t* gpu_addr = nullptr;
         const uint32_t byte_offset = *reinterpret_cast<const uint32_t*>(pipeline_state + 0x1c);
-        if (ib_obj[0x40] != 0) {
+        if (ib_obj[0x40] != 0 &&
+            *reinterpret_cast<void* const*>(gnmx_ctx_wrapper + 0xb6f8 + 0x08) != nullptr) [[unlikely]] {
             gpu_addr = CGDynamicBufferRingGnm_ResolveGpuAddress(
                            gnmx_ctx_wrapper + 0xb6f8,
                            ib_obj + 0x18) + byte_offset;

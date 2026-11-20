@@ -53,10 +53,22 @@
         </nav>
 
         <div class="rail-footer">
+          <div class="rail-update-wrap">
+            <button id="btn-rail-update" class="rail-mini rail-update checking" aria-label="Check Updates">
+              <svg viewBox="0 0 24 24" class="upd-ico upd-ico-sync" aria-hidden="true">
+                <path d="M20 12a8 8 0 0 1-13.66 5.66M4 12a8 8 0 0 1 13.66-5.66" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+                <path d="M17.5 3.6v3.4h-3.4M6.5 20.4V17h3.4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+              <svg viewBox="0 0 24 24" class="upd-ico upd-ico-check" aria-hidden="true">
+                <path d="M5.5 12.6l4.2 4.2L18.5 7.8" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+            </button>
+            <div id="rail-update-tip" class="rail-tooltip" role="tooltip">Checking for updates...</div>
+          </div>
           <button id="btn-bgm" class="rail-mini" data-i18n-title="bgm_title" title="Ambient Music">♫</button>
           <button id="btn-sfx" class="rail-mini" data-i18n-title="sfx_title" title="Menu SFX">♪</button>
           <button id="btn-lang" class="rail-mini" title="Language">EN</button>
-          <span id="ver-badge" class="rail-ver">v1.1.6</span>
+          <span id="ver-badge" class="rail-ver">v1.2.0</span>
         </div>
       </aside>
 
@@ -313,18 +325,6 @@
             <button id="btn-wiz-pick" class="bb-btn-primary wiz-btn" data-i18n="wiz_choose">Choose Game Folder</button>
             <button id="btn-wiz-skip" class="bb-btn-secondary" data-i18n="wiz_skip">Skip for now</button>
           </div>
-        </div>
-      </div>
-
-      <!-- Floating Update Plaque (top-right corner — zero layout shift on Play/buttons) -->
-      <div id="home-update-banner" class="update-plaque hidden">
-        <div class="update-plaque-top">
-          <span class="plaque-diamond">◆</span>
-          <span id="home-update-text" class="update-text">Update available</span>
-          <button id="btn-home-update" class="bb-btn-mini" data-i18n="btn_update_now">Update</button>
-        </div>
-        <div id="home-update-bar-wrap" class="progress-track hidden">
-          <div id="home-update-bar" class="progress-fill"></div>
         </div>
       </div>
 
