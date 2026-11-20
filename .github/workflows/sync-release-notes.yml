@@ -1,0 +1,66 @@
+name: Sync GitHub Release Notes
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/release_notes.json'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync-notes:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Update release titles & notes from docs/release_notes.json
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          python3 - <<'PY'
+          import json, os, urllib.request, urllib.error
+
+          token = os.environ["GH_TOKEN"]
+          repo = os.environ["REPO"]
+          notes = json.load(open("docs/release_notes.json", encoding="utf-8"))
+
+          def gh_api(method, path, payload=None):
+              url = f"https://api.github.com/repos/{repo}{path}"
+              data = json.dumps(payload).encode("utf-8") if payload is not None else None
+              req = urllib.request.Request(url, data=data, method=method)
+              req.add_header("Authorization", f"Bearer {token}")
+              req.add_header("Accept", "application/vnd.github+json")
+              req.add_header("X-GitHub-Api-Version", "2022-11-28")
+              if data is not None:
+                  req.add_header("Content-Type", "application/json")
+              with urllib.request.urlopen(req, timeout=30) as resp:
+                  return json.loads(resp.read().decode("utf-8"))
+
+          releases = gh_api("GET", "/releases?per_page=50")
+          by_tag = {r["tag_name"]: r for r in releases}
+
+          updated = 0
+          for tag, info in notes.items():
+              rel = by_tag.get(tag)
+              if not rel:
+                  print(f"[skip] {tag}: release does not exist yet")
+                  continue
+              want_name = info.get("name", f"Bloodborne PC Vulkan {tag}")
+              want_body = info.get("body", "")
+              if rel.get("name") == want_name and (rel.get("body") or "") == want_body:
+                  print(f"[ok]   {tag}: already up to date")
+                  continue
+              gh_api("PATCH", f"/releases/{rel['id']}", {
+                  "name": want_name,
+                  "body": want_body,
+              })
+              print(f"[upd]  {tag}: updated (body {len(want_body)} chars)")
+              updated += 1
+
+          print(f"Done: {updated} release(s) updated.")
+          PY

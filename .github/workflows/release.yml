@@ -22,8 +22,10 @@ jobs:
 
       - name: Build portable Linux C++20 WebView Launcher (out/bb-launcher)
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq libwebkit2gtk-4.1-dev pkg-config cmake ninja-build
+          sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+            -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" \
+            libwebkit2gtk-4.1-dev pkg-config cmake ninja-build
           cmake -S launcher_v2 -B launcher_v2/build_ci -G Ninja -DCMAKE_BUILD_TYPE=Release
           ninja -C launcher_v2/build_ci
           cp -f launcher_v2/build_ci/bb-launcher out/bb-launcher
@@ -46,75 +48,26 @@ jobs:
             linux-manifest.json \
             .bbport-version.json
 
+      - name: Prepare Release Notes from docs/release_notes.json
+        run: |
+          TAG="${GITHUB_REF_NAME:-v1.1.9}"
+          python3 -c '
+          import json, os
+          tag = os.environ.get("TAG", "v1.1.9")
+          notes = json.load(open("docs/release_notes.json", encoding="utf-8"))
+          entry = notes.get(tag) or {"body": f"## Bloodborne PC Vulkan {tag} (Windows & Linux)\n"}
+          with open("release_body.md", "w", encoding="utf-8") as f:
+              f.write(entry["body"])
+          '
+        env:
+          TAG: ${{ github.ref_name || 'v1.1.9' }}
+
       - name: Create or Update GitHub Release (Linux x86_64)
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name || 'v1.1.9' }}
           name: "Bloodborne PC Vulkan ${{ github.ref_name || 'v1.1.9' }}"
-          body: |
-            ## Bloodborne PC Vulkan ${{ github.ref_name || 'v1.1.9' }} (Windows & Linux `x86_64`)
-
-            ### Quick Start
-            - **Windows 10/11**: Extract `bloodborne-pc-vulkan-windows-x86_64-prebuilt.zip` next to your `CUSA03173` (`v1.09`) folder and run **`Bloodborne.exe`** (direct native launch) or **`Launcher.exe`** (settings, mods, online & updates).
-            - **Linux**: Extract `bloodborne-pc-vulkan-linux-x86_64-prebuilt.tar.gz` next to your `CUSA03173` (`v1.09`) folder and run **`./play.sh`** (direct launch) or **`./launcher.sh`** (launcher).
-
-            ### What's New in `${{ github.ref_name || 'v1.1.9' }}` — Authentic Launcher V2 Remaster, Boot Splash, Bloom/Window Color Fix, Live-Toggle Crash Fix & Cathedral Ward Fix:
-            - **Launcher V2 Remaster (`Launcher.exe` on Windows, `bb-launcher` on Linux — `0` bytes of copyrighted assets in repo):**
-              - **Authentic Runtime-Decoded Bloodborne Title Art:** Automatically extracts and reconstructs `dvdroot_ps4/menu/title.tpf.dcx` (`MENU_Title_00001`, cropped `1644×1080` with zero pillarboxes or edge artifacts) directly from the user's local game dump into `user/cache/ui_assets/title_hero_v2.bmp` (pure C++20 Inflate + PS4 BC1 Morton untiler), falling back cleanly to built-in artwork when the game folder is not set yet.
-              - **Official Victorian Game Font (`BloodborneUI`):** Parses `dvdroot_ps4/menu/<lang>/font.gfx` (`SWF DefineFont3`, `TT-黎ミンY10 B`) at runtime into a standards-compliant TrueType font (`user/cache/ui_assets/bloodborne_font_v2.ttf`) with full English & Cyrillic (`Ёё`) coverage and injects it via `@font-face`.
-              - **Ambient Launcher Music (*Hunter's Dream* & *Omen*):** Decodes `m210000001_SafeArea1` (*Hunter's Dream*) and `019_StoryIntro_Quad96k_Mix5` (*Omen*) from `dvdroot_ps4/sound/sprj_smain.fsb` via `LibAtrac9` (Quad → Stereo, peak-normalized to `-3.1 dBFS`, exact FSB5 seamless loop points) with rail mute button (`♫`), System track selector, live `%` volume sliders persisted to `bbport.ini`, and smooth fade-out on `PLAY`.
-              - **Zero-Flicker Instant Reveal & Smoked-Slate Frosted Glass UI:** Pre-boot `window.__BB_BOOT` injection keeps the window invisible until authentic art and font finish decoding (`readyToShow`), paired with a compact ash-grey frosted-glass redesign, fixed dropdown layering over blurred cards, unified rail buttons, and fast incremental boot cache (`scripts/check_boot_cache.py`, skips redundant `~2.3 s` `eboot.bin` relinking on steady-state launches).
-            - **Authentic Game Boot Splash & Zero-Flash Handoff (`gpu/render/splash_screen.{h,cpp}`):**
-              - Displays the native `1920×1080` `MENU_Title_00001` artwork on startup with an async `32×18` GPU readiness probe so the swapchain transitions seamlessly to the live Title Screen without black flashes.
-            - **Fixed Pink/Blue Window Glow & Mixed RGBA/BGRA Native Shaders (`opt36`):**
-              - Fixed red/blue channel inversion on glowing gothic windows (`ps_57f3b8c2_bloom_copy` `#123`) and 3 other mixed RGBA/BGRA native shaders (`ps_f7229091_bgra_blit`, `ps_8c08444c_blur13`, `ps_ed4c7668_lut3d`) via `kBgraExport` specialization constants and a universal `BGRA↔RGBA` guard in `native_shaders.cpp` (`opt36` cache key).
-              - Fixed `IMAGE_GET_LOD` (`ImageQueryLod`) sampler forwarding in the GCN→SPIR-V translator and added safe `BB_GX_SKIP_MODS` module bisection.
-            - **Fixed Live Post-FX Toggle Crash (`ApplyHotEffects` UAF):**
-              - Eliminated Use-After-Free crashes on `GXWorker` threads when toggling effects (Bloom/DoF/SSAO/SSR/etc.) live in-game via 4-layer hardening in `bbport_guest_hooks.cpp` (destructor hook `0x22c2e10`, dual-vtable validation, strict boolean range checks, and mutex protection).
-            - **Fixed 100% Reproducible Crash in Cathedral Ward / Oedon Chapel (`GXFeedBackBlurRenderPass::sub_22ae030`):**
-              - Fixed a double-dereference bug in decompiled `GXSceneRenderPass_ResolveMsaaColorTargetIfRequired` (`dantelion_gx/src/06_DeferredLightingAndAO/GXFeedBackBlurRenderPass.cpp:1412`), matching PS4 `eboot.bin` (`0x22ae071..0x22ae093`) 1:1, plus `CGDeferredContextGnm_Init` and `ReserveDcbDwords` hardening.
-            - **Live In-Game VSync (`Fast / On / Off`), Crash Black-Box V2, & 1-Click Updater Fix:**
-              - Added live VSync switching (`System -> Display`, `Insert` overlay, and swapchain), multi-thread Crash Black-Box V2 parking (`logs/crash-*.log`), timestamped engine logs, and fixed `--apply-json` 1-click auto-updater progress callbacks.
-
-            ---
-
-            ### Previous Highlights (`v1.1.8` / `v1.1.7`):
-            - **Zero Python in RAM During Gameplay (`Bloodborne.exe` on Windows, `bb-vulkan` on Linux):**
-              - Replaced the internal `bb-probe` executable name everywhere with **`Bloodborne.exe`** (Windows, with embedded Hunter's Mark icon) and **`bb-vulkan`** (Linux).
-              - Replaced the PyInstaller Python wrapper in the Windows root with a tiny **`~130 KiB` pure C++20 native `Bloodborne.exe` starter** (`launcher_v2/bloodborne_starter.cpp`). On steady-state launches, it validates `out/launch_env.txt` in `< 5 ms`, spawns native `bin/Bloodborne.exe` directly with OS log redirection, and exits immediately — leaving **only ONE `Bloodborne.exe` process** in Task Manager with **`0%` Python in RAM**!
-              - Moved the optional preparation/updater helper (`bb-helper.exe` + `_internal/`) cleanly into `bin/`, keeping the package root completely spotless (`Bloodborne.exe`, `Launcher.exe`, `play.bat`, `LICENSE`, `README-Windows.txt`). It runs only on first launch, mod/patch changes, or 1-click updates, then exits before gameplay begins.
-            - **Native Wayland & Windows Taskbar Icons:**
-              - Both the Linux `bb-launcher` (`g_set_prgname`) and the SDL3 Vulkan game window (`SDL_HINT_APP_ID = "bloodborne-vulkan"`) now automatically register `~/.local/share/applications/bloodborne-vulkan*.desktop` entries so KDE Plasma / GNOME Wayland taskbars display the authentic **Hunter's Mark** icon instead of the generic Wayland "W" placeholder.
-              - Embedded the Hunter's Mark icon directly into `bin/Bloodborne.exe` (`gpu/platform/win32/bb-probe.rc`), root `Bloodborne.exe`, and `Launcher.exe` on Windows.
-            - **Includes all `v1.1.7` Launcher & Audio Enhancements:**
-              - Lightweight native C++20 WebView launcher (`BLOODBORNE VULKAN REMASTER`, `WebView2` / `WebKitGTK 4.1`), Smoked Iron & Antique Brass gothic theme, armed Victorian hunter backdrop, floating non-shifting top-right Update plaque, and legally extracted runtime Bloodborne menu audio (`30%` default volume) with stone-chamber stereo reverb.
-
-            ---
-
-            ### Previous Highlights (`v1.1.6` / `v1.1.5`):
-            - **Full-Game + Embedded `eboot.bin` Vulkan Shader & PSO Pre-Baker (`0% → 100%`, `5,761 / 5,761` Shaders):**
-              - **Complete Shader Coverage (`5,761` Unique Programs + `423` Base PSOs):** Added a standalone native Vulkan shader pre-compiler (`bb-probe --bake-shaders` + dedicated **Vulkan Shader Cache & Pre-Compilation** `0% → 100%` progress card and safe **Clear Cache** button in all Windows & Linux Launchers). Scans all 7 `dvdroot_ps4/shader/*.shaderbnd.dcx` archives (supporting both merged `CUSA03173` and split `CUSA03173-patch` layouts) **plus** all embedded `Shdr\x07` containers inside `eboot.bin` (`354` Scaleform GFx UI / internal GNM / Compute shaders + the active `EXP_32_ABGR` Yebis 2 Post-FX bank: `CS=68 + PS=4,058 + VS=1,635 = 5,761` unique programs), synthesized with exact 1:1 hardware `RuntimeInfo` (`VS num_input_vgprs = 3`, `step_rate_0/1 = 0`, `Format10_11_11` on 6-MRT `cb=4` & 2-MRT passes, `default_cb` `stride = 16`, and dual `_0 + _1` HDR/LDR specializations).
-              - **12-Thread Parallel Startup `WarmUp()` (`~292 ms`):** Parallelized `PipelineStore::WarmUp` (`Phase 3B`) across up to 12 worker threads so all `5,761` pre-baked `VkShaderModule` binaries (`opt31_*.spv`) and `423` base PSOs load in under `0.3 s` at boot.
-              - **Polite Invisible Background Auto-Baker (`bb:AutoBake`):** On game startup, automatically checks if all `5,761` game shaders are already warm in `user/cache/`. If already baked, exits immediately at `0%` CPU; on a fresh install (even if the user clicks `PLAY` without running `Pre-Compile Shaders` first), silently pre-compiles missing shaders in the background on `1–3` OS idle-priority threads (`SCHED_IDLE` / `nice 19` on Linux, `THREAD_PRIORITY_LOWEST` on Windows, `~10–15%` CPU) without blocking the Title Screen or impacting frame times.
-            - **Zero-Stutter / Zero-Pop-In Multi-Threaded `Async SPV + PSO` Runtime (`PipelineCache`):**
-              - **`~2.5 ms` Live Worker `SPIR-V` Specialization (`runtime_fast_opt`, `5,000 ms → ~2.5 ms`):** Eliminated multi-second $O(N^2)$ `spirv-tools` full `-O` stalls on large `60+ KB` character/cloth/combat shaders during live gameplay by switching `GetProgramAsyncWorker` and runtime `Stage A` specialization misses to fast dead-branch DCE (`runtime_fast_opt = true` for `>= 512` words, upgrading to full `-O` `opt31_*.spv` across 12 threads on next startup) — preventing 2–5 second invisible character/armor/face pop-in on first combat hits or rare specialization permutations.
-              - **Unbound Descriptor Default Normalization (`NormalizeUnboundDefaults`) & Stage-Hash Sync (`UpdateStageHash`):** Normalized unbound (`!sharp`) texture and buffer slots in `StageSpecialization` (`Image::Null` / `Buffer::Null`, `num_bindings = 1`) so pre-baked `.meta` specializations match live runtime draws 1:1 without redundant `_1` recompilations, snapshotted per-frame `flat_buf` + `PtrVertexBufferTable` (`0x1028...` GFX Command Heap) synchronously on `Stage A` before async dispatch, added `GraphicsPipeline::UpdateStageHash` (`kMaxDrainPerCall = 16`), and lowered the `AsyncSkippable` occlusion-culled draw threshold (`last_frame_draws >= 64`) so rare runtime PSO permutations link off-thread with `0.00 ms` render stall.
-            - **Hunter Clothes & Face Blood-Splatter Rendering Fix (`GXFlver_*_Bloody_*` `cldist_attr0.zw`):**
-              - Fixed missing dynamic blood splatter on the Hunter's attire, cape, and face after combat kills on strict desktop GPUs (e.g. NVIDIA RTX 40-series). `GXFlver_*_Bloody_*_Pnt*.vpo` (`0x4899010a`) only exported `ClipDist0..1` while leaving `.zw` of `cldist_attr0` (`vec4`) uninitialized, causing fragment clip-plane discard (`cldist_attr0[0..3] < 0.0`) to reject blood-paint pixels on undefined GPU attribute lanes. `LowerUserClipPlanes` now initializes all unwritten `ClipDistance` components to `1.0f` (`>= 0.0f`), paired with an automatic startup SPIR-V healer (`EnsureClipDistanceInitializedInSpv`, `< 3 ms`) and an `8`-draw steady-pass gate on blended offscreen `Blood Paint RTT` targets.
-            - **Persistent Frame-Spike Profiler (`logs/bb_hitch.log`):** Added `[BB-HITCH]` diagnostics that pinpoint the exact subsystem (`Stage A` wait, `PSO-SYNC` hash, `Present` acquire, or driver fence) whenever a frame exceeds `25 ms` (`>= 120` draws).
-
-            ---
-
-            ### Highlights from `v1.1.5`:
-            - **Dual-Stage Frame Pacing (`PacerWait` + Output `Present Pacing`) & Swapchain Starvation Fix (`Jit: 2.50 ms -> 0.01–0.15 ms`):**
-              - **Monotonic Phase-Locked Guest Pacer (`HookPacerWait`, `0x2034964..0x2034c55`):** Replaced `SprjFlipper`'s relative `sceKernelUsleep` path with an absolute deadline pacer (`CLOCK_MONOTONIC` + `TIMER_ABSTIME` + `PR_SET_TIMERSLACK=1ns` on Linux; `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION` on Windows) with bounded 1-period phase catch-up, eliminating persistent FPS cap sag (`170 -> 145–155 FPS`).
-              - **Phase-Locked Output `Present Pacing`, `5`-Image `Mailbox`/`Immediate` Swapchain & `sim_dt` Stabilizer:** Bypassed the intermediate `bb:Vblank` thread hop when unlocked (`Stage B -> bb:Present` directly) and added post-`WaitRendered` output presentation pacing on `bb:Present` (`p50 = 5.87 ms`, `p95 = 5.88 ms`, `0` `>1.5x` spikes at `170 FPS`).
-            - **Event-Driven `1000+ Hz` Mouse Input & Lock-Free Overlay Fast-Path:** Replaced `SDL_Delay(2)` window polling with `SDL_WaitEventTimeout` and added lock-free fast-exits on `imgui_mutex` when the overlay is closed.
-            - **3 Camera Follow Physics Modes (`F4` Live Hotkey + `Balanced` Mode Inspired by *Lies of P*):**
-              - Live-switchable **`Original (PS4)`**, **`Balanced`** (default), and **`Locked (1:1)`** camera follow modes (`F4` with OSD toast, `System -> Controls`, `Insert` overlay, and GUI Launchers). **`Balanced`** adapts a ***Lies of P*-inspired** physical world-space spring-arm camera feel to *Bloodborne*'s `ChrExFollowCam` (`0x143ac60`) — direct world-space `XZ` pivot inertia from `t = 0.000 s` (no camera jerk on `A/D` or diagonal movement), quadratic (`y ~ t^2`) sprint/jog pull-back with native Havok wall collision, crisp `~0.55 s` stop return, stair vertical smoothing, and `0.00%` mouse rotation interference.
-            - **`4–5×` Faster Location, Warp & Respawn Loading (`BB_FAST_LOAD=1`) & Streaming `GFX` Heap Stability Fixes:** Host SIMD `zlib` (`11/11` detours + `64 KiB` `.dcx` chunk), `500 Hz` non-3D loading-screen pacer (`~11–12 s -> ~2.0–2.5 s` respawn reload), background save `fsync`, and full thread-safety + teardown fixes across `dantelion_gx` eliminating sector-streaming `GFX` heap crashes.
-            - **One-Click SHA-256 Launcher Auto-Updater, Unified 17-Setting `CSOptionsData` Persistence, Expanded Scaleform Menus (`ScrollBarV` + `0-ms` Wheel), Crash "Black Box" (`logs/crash-*.log`), & Title Screen `"Exit Game"`.**
-            - **Previously in `v1.1.4`:** DirectVk `Stage A`/`Stage B` command stream overhaul (`decommission_pm4`), `SceneOcclusionCuller` 2.0 (`27–41%` G-Buffer culling at `0.00 ms` `Stage A` cost), and `123` native vectorized GLSL 460 shaders (`opt35`).
+          body_path: release_body.md
           files: |
             bloodborne-pc-vulkan-linux-x86_64-prebuilt.tar.gz
             bloodborne-pc-vulkan-linux-x86_64-prebuilt.tar.gz.sha256
