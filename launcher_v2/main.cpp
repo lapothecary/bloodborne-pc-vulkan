@@ -625,11 +625,21 @@ void EnsureLinuxWaylandDesktopIcon(const std::string& app_id,
 }
 
 int RunLinuxWebView(bb_launcher::LauncherContext ctx, int argc, char** argv) {
+    // Use an authoritative PipeWire/PulseAudio application.name override so users upgrading
+    // from v1.1.9 (whose WirePlumber state saved a mid-fade pulsesink volume under
+    // "bloodborne-vulkan-launcher", e.g. 52% / -17 dB) immediately get a clean 100% (0 dB) stream.
+    // Note: libpulse treats PULSE_PROP_* as a low-priority fallback that GStreamer pulsesink's
+    // explicit PA_PROP_APPLICATION_NAME (= g_get_application_name()) overrides; PULSE_PROP_OVERRIDE_*
+    // and g_set_application_name() take precedence while keeping g_set_prgname() intact for Wayland icons.
+    setenv("PULSE_PROP_OVERRIDE_application.name", "Bloodborne Vulkan Launcher", 1);
+    setenv("PULSE_PROP_application.name", "Bloodborne Vulkan Launcher", 1);
+
     // Set explicit Wayland app_id + auto-register .desktop icon so KDE/GNOME Wayland taskbar
     // shows our Hunter's Mark instead of the generic yellow 'W' Wayland placeholder.
     EnsureLinuxWaylandDesktopIcon("bloodborne-vulkan-launcher", "Bloodborne Vulkan Remaster", ctx.icon_png_path);
     EnsureLinuxWaylandDesktopIcon("bloodborne-vulkan", "Bloodborne Vulkan Remaster", ctx.icon_png_path);
     g_set_prgname("bloodborne-vulkan-launcher");
+    g_set_application_name("Bloodborne Vulkan Launcher");
 
     gtk_init(&argc, &argv);
     gdk_set_program_class("bloodborne-vulkan-launcher");

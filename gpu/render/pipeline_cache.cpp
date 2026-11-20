@@ -2594,16 +2594,17 @@ bool PipelineCache::AsyncSkippable(const PipelineSelection& selection, bool indi
         return false;
     }
     // A full-screen pass (one triangle or quad without depth testing: lighting, fog, post-processing)
-    // waits for its pipeline: going without one for a frame left whole frames grey. So does an
-    // indirect draw (its size unknown here). 3D depth-tested geometry (including first-frame world
-    // spawn, 6-index blood decals and hit sparks) may compile asynchronously without stalling the frame.
+    // waits for its pipeline: going without one for a frame left whole frames grey. So does a
+    // non-depth indirect draw (its size unknown here). 3D depth-tested geometry (including
+    // first-frame world spawn, depth-only shadow/prepass DrawIndirect, 6-index blood decals and hit
+    // sparks) may compile asynchronously without stalling the frame.
     constexpr u32 FullScreenIndices = 12;
     const bool has_depth =
         bool(selection.regs->depth_control.depth_enable) &&
         (selection.regs->depth_buffer.DepthValid() || selection.regs->depth_buffer.StencilValid());
-    if (indirect || (!has_depth && !selection.regs->depth_control.depth_enable &&
-                     selection.regs->num_indices <= FullScreenIndices &&
-                     !selection.regs->blend_control[0].enable)) {
+    if (!has_depth && (indirect || (!selection.regs->depth_control.depth_enable &&
+                                    selection.regs->num_indices <= FullScreenIndices &&
+                                    !selection.regs->blend_control[0].enable))) {
         return false;
     }
     if (has_depth) {

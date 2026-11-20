@@ -137,11 +137,22 @@
   const bgmAudio = new Audio();
   bgmAudio.preload = "auto";
   bgmAudio.loop = true;
+  bgmAudio.volume = 1.0;
+  // On Linux WebKitGTK, mutating HTMLAudioElement.volume calls GStreamer pulsesink's
+  // pa_context_set_sink_input_volume(), which poisons WirePlumber's per-app saved volume
+  // and drags down the Web Audio API SFX stream (-25 dB!). Routing BGM through a Web Audio
+  // GainNode keeps HTMLAudioElement.volume pinned at 1.0 forever and runs sample-accurate
+  // fades on the audio thread even after the launcher window is hidden.
+  const isWebKitGtk = !!(window.webkit && window.webkit.messageHandlers);
+  let bgmSourceNode = null;
+  let bgmGainNode = null;
+  let bgmMediaSourceFailed = false;
   let bgmLoadedTrack = "";
   let bgmLoadedUrl = "";
   let bgmLoopStart = 0;
   let bgmLoopEnd = 0;
-  let bgmFadeRaf = null;
+  let bgmFadeInterval = null;
+  let bgmFadeTimer = null;
   let bgmPendingGesture = false;
 
   bgmAudio.addEventListener("timeupdate", () => {
@@ -155,6 +166,42 @@
   function getTargetBgmVolume() {
     const v = Number(state.bgmVolume);
     return Math.max(0, Math.min(1, Number.isFinite(v) ? v : 0.28));
+  }
+
+  function ensureBgmGainNode() {
+    if (!isWebKitGtk || bgmMediaSourceFailed) return null;
+    if (bgmGainNode) return bgmGainNode;
+    const ctx = ensureAudioCtx();
+    if (!ctx) return null;
+    try {
+      bgmAudio.volume = 1.0;
+      bgmSourceNode = ctx.createMediaElementSource(bgmAudio);
+      bgmGainNode = ctx.createGain();
+      bgmGainNode.gain.value = 0;
+      bgmSourceNode.connect(bgmGainNode);
+      bgmGainNode.connect(ctx.destination);
+      return bgmGainNode;
+    } catch (_) {
+      bgmMediaSourceFailed = true;
+      return null;
+    }
+  }
+
+  function cancelBgmFade() {
+    if (bgmFadeInterval) { clearInterval(bgmFadeInterval); bgmFadeInterval = null; }
+    if (bgmFadeTimer) { clearTimeout(bgmFadeTimer); bgmFadeTimer = null; }
+  }
+
+  function setBgmVolumeImmediate(vol) {
+    const clamped = Math.max(0, Math.min(1, vol));
+    const gn = ensureBgmGainNode();
+    if (gn && audioCtx) {
+      const now = audioCtx.currentTime;
+      gn.gain.cancelScheduledValues(now);
+      gn.gain.setValueAtTime(clamped, now);
+    } else {
+      bgmAudio.volume = clamped;
+    }
   }
 
   function updateBgmRailVisual() {
@@ -182,37 +229,68 @@
   }
 
   function fadeBgmVolume(targetVol, durationMs, onDone = null) {
-    if (bgmFadeRaf) { cancelAnimationFrame(bgmFadeRaf); bgmFadeRaf = null; }
-    const startVol = bgmAudio.volume;
+    cancelBgmFade();
     const clampedTarget = Math.max(0, Math.min(1, targetVol));
+    const gn = ensureBgmGainNode();
+    if (gn && audioCtx) {
+      if (audioCtx.state === "suspended") audioCtx.resume().catch(() => {});
+      const now = audioCtx.currentTime;
+      const cur = Number.isFinite(gn.gain.value) ? gn.gain.value : 0;
+      if (typeof gn.gain.cancelAndHoldAtTime === "function") {
+        try { gn.gain.cancelAndHoldAtTime(now); } catch (_) {
+          gn.gain.cancelScheduledValues(now);
+          gn.gain.setValueAtTime(cur, now);
+        }
+      } else {
+        gn.gain.cancelScheduledValues(now);
+        gn.gain.setValueAtTime(cur, now);
+      }
+      if (durationMs <= 16 || Math.abs(clampedTarget - cur) < 0.002) {
+        gn.gain.setValueAtTime(clampedTarget, now);
+        if (onDone) onDone();
+        return;
+      }
+      gn.gain.linearRampToValueAtTime(clampedTarget, now + durationMs / 1000.0);
+      if (onDone) {
+        bgmFadeTimer = setTimeout(() => {
+          bgmFadeTimer = null;
+          onDone();
+        }, durationMs + 20);
+      }
+      return;
+    }
+
+    // Fallback (Windows WebView2): use setInterval instead of requestAnimationFrame
+    // so hiding the launcher window on Play never freezes the fade-out.
+    const startVol = bgmAudio.volume;
     if (durationMs <= 16 || Math.abs(clampedTarget - startVol) < 0.002) {
       bgmAudio.volume = clampedTarget;
       if (onDone) onDone();
       return;
     }
     const t0 = performance.now();
-    const step = (now) => {
-      const k = Math.min(1, (now - t0) / durationMs);
+    bgmFadeInterval = setInterval(() => {
+      const k = Math.min(1, (performance.now() - t0) / durationMs);
       bgmAudio.volume = Math.max(0, Math.min(1, startVol + (clampedTarget - startVol) * k));
-      if (k < 1) {
-        bgmFadeRaf = requestAnimationFrame(step);
-      } else {
-        bgmFadeRaf = null;
+      if (k >= 1) {
+        clearInterval(bgmFadeInterval);
+        bgmFadeInterval = null;
         if (onDone) onDone();
       }
-    };
-    bgmFadeRaf = requestAnimationFrame(step);
+    }, 16);
   }
 
   function tryStartBgmPlayback(fadeMs = 1500) {
     if (!state.bgmEnabled || !bgmLoadedUrl) return;
     const targetVol = getTargetBgmVolume();
     if (targetVol <= 0.001) {
-      bgmAudio.volume = 0;
+      cancelBgmFade();
+      setBgmVolumeImmediate(0);
       if (!bgmAudio.paused) bgmAudio.pause();
       return;
     }
-    if (bgmAudio.paused) bgmAudio.volume = 0;
+    ensureBgmGainNode();
+    if (bgmAudio.paused) setBgmVolumeImmediate(0);
     const p = bgmAudio.play();
     if (p && typeof p.then === "function") {
       p.then(() => {
@@ -239,15 +317,19 @@
     }
   }
 
-  function stopBgmPlayback(fadeMs = 260) {
+  function stopBgmPlayback(fadeMs = 260, onDone = null) {
     bgmPendingGesture = false;
     if (bgmAudio.paused) {
+      cancelBgmFade();
+      setBgmVolumeImmediate(0);
       updateBgmRailVisual();
+      if (onDone) onDone();
       return;
     }
     fadeBgmVolume(0, fadeMs, () => {
       bgmAudio.pause();
       updateBgmRailVisual();
+      if (onDone) onDone();
     });
   }
 
@@ -769,12 +851,28 @@
         return;
       }
       launching = true;
-      stopBgmPlayback(220);
+      const bgmWasPlaying = !bgmAudio.paused && state.bgmEnabled && getTargetBgmVolume() > 0.001;
+      let bgmFadeDone = !bgmWasPlaying;
+      let sfxDone = false;
+      const maybeQuit = () => {
+        if (bgmFadeDone && sfxDone) {
+          setTimeout(() => window.bbInvoke("quit", {}), 80);
+        }
+      };
+      if (bgmWasPlaying) {
+        stopBgmPlayback(1000, () => {
+          bgmFadeDone = true;
+          maybeQuit();
+        });
+      } else {
+        stopBgmPlayback(0);
+      }
       showToast(tr("toast_launching"));
       window.bbInvoke("launchGame", {});
       setTimeout(() => window.bbInvoke("hideWindow", {}), 160);
       playSfx("gamestart", () => {
-        setTimeout(() => window.bbInvoke("quit", {}), 120);
+        sfxDone = true;
+        maybeQuit();
       });
     });
 

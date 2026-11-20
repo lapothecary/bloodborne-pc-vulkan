@@ -428,11 +428,11 @@ private:
                         return;
                     }
                     __builtin_ia32_pause();
-                    // Adaptive pause spin (~7-10 us on Zen4/Intel) avoids 1,400+ futex wait/wake
-                    // syscalls per frame between consecutive draws (1.5-3 us apart) while still
-                    // sleeping cleanly during inter-frame pauses without steady_clock overhead.
+                    // Adaptive pause spin (~14-20 us on Zen4/Intel) avoids futex wait/wake
+                    // syscalls between consecutive draws (even on 4.5 GHz / non-boost clocks)
+                    // while still sleeping cleanly during inter-frame pauses.
                     const bool should_sleep =
-                        spin_us == 0 ? ((spins & 511u) == 0)
+                        spin_us == 0 ? ((spins & 1023u) == 0)
                                      : (!(spins & 63u) &&
                                         std::chrono::steady_clock::now() >= spin_until);
                     if (should_sleep) {
