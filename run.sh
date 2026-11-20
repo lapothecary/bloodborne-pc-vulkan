@@ -78,8 +78,30 @@ if [[ ${BB_SAVE_LOG:-} == 1 ]]; then
     # this script replaced the launcher, and closing that pipe unmounted the store under it
     # ("python3: Software caused connection abort").
     exec {log_fd}>"$logs/$stamp.log"
-    # Bash builtins only (the AppImage's PATH has no tee).
-    exec > >(while IFS= read -r line || [[ -n $line ]]; do printf '%s\n' "$line"; printf '%s\n' "$line" >&$log_fd; done) 2>&1
+    export BB_LOG_TIMESTAMPS=1
+    _bb_t0_ms=0
+    if [[ -n ${EPOCHREALTIME:-} ]]; then
+        _bb_er=$EPOCHREALTIME
+        _bb_t0_ms=$(( 10#${_bb_er%.*} * 1000 + 10#${_bb_er#*.} / 1000 ))
+    fi
+    # Bash builtins only (the AppImage's PATH has no tee/date/awk): millisecond wall + elapsed timer.
+    exec > >(
+        while IFS= read -r line || [[ -n $line ]]; do
+            if [[ -n ${EPOCHREALTIME:-} ]]; then
+                _er=$EPOCHREALTIME
+                _sec=${_er%.*}
+                _ms=$(( 10#${_er#*.} / 1000 ))
+                _now_ms=$(( 10#$_sec * 1000 + _ms ))
+                _el=$(( _now_ms - _bb_t0_ms ))
+                (( _el < 0 )) && _el=0
+                printf -v _ts '%(%H:%M:%S)T.%03d +%d.%03ds' "$_sec" "$_ms" "$(( _el / 1000 ))" "$(( _el % 1000 ))"
+            else
+                printf -v _ts '%(%H:%M:%S)T' -1
+            fi
+            printf '[%s] %s\n' "$_ts" "$line"
+            printf '[%s] %s\n' "$_ts" "$line" >&$log_fd
+        done
+    ) 2>&1
 fi
 if [[ -z ${PYTHON:-} ]]; then
     PYTHON=$(command -v python3 || true)
@@ -107,9 +129,14 @@ if [[ $game != "$(realpath "$original_game")" && $(basename -- "$game") == mod-g
     mod_game=$game
     trap '"$PYTHON" -c '\''import shutil,sys; shutil.rmtree(sys.argv[1])'\'' "$mod_game"' EXIT
 fi
-"$PYTHON" scripts/prepare.py "$game" --out "$out"
-"$PYTHON" scripts/link_libc.py "$game" --out "$out"
-"$PYTHON" scripts/link_modules.py "$game" --out "$out"
+if "$PYTHON" scripts/check_boot_cache.py "$game" --out "$out"; then
+    echo "[bb_vulkan] Boot image cache hit: $out/boot-linked.bin (skipped prepare/link)"
+else
+    "$PYTHON" scripts/prepare.py "$game" --out "$out"
+    "$PYTHON" scripts/link_libc.py "$game" --out "$out"
+    "$PYTHON" scripts/link_modules.py "$game" --out "$out"
+    "$PYTHON" scripts/check_boot_cache.py "$game" --out "$out" --write
+fi
 "$PYTHON" scripts/content_profile.py "$game" --out "$out" --sku "${BB_CONTENT_SKU:-full}"
 # Sizes chosen below for the previous launch are recomputed after an in-game restart.
 if [[ ${BB_AUTO_RENDER_RES:-} == 1 ]]; then

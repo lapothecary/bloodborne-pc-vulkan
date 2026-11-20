@@ -126,6 +126,30 @@ std::string ExtractRawPayload(const std::string& msg) {
     return payload;
 }
 
+std::string BuildPrebootJs(bb_launcher::LauncherBridge& bridge) {
+    // Pre-populate state, cached hero art, and cached game font at DOCUMENT_START
+    // so the WebView renders the authentic artwork & Victorian font on its very
+    // first frame with zero IPC round-trips and zero visible flash.
+    const std::string state_json = bridge.HandleCommand("getState", "{}");
+    const std::string art_json = bridge.HandleCommand("getHeroArt", "{}");
+    const std::string font_json = bridge.HandleCommand("getGameFont", "{}");
+    std::string js = "window.__BB_BOOT = { state: " + state_json +
+                     ", heroArt: " + art_json +
+                     ", gameFont: " + font_json + " };\n";
+    js += R"JS(
+        (function() {
+            const f = window.__BB_BOOT && window.__BB_BOOT.gameFont;
+            if (f && f.authentic && f.url) {
+                const st = document.createElement("style");
+                st.id = "bb-game-font-style";
+                st.textContent = '@font-face { font-family: "BloodborneUI"; src: url("' + f.url + '") format("truetype"); font-weight: 100 900; font-style: normal; font-display: block; }';
+                (document.head || document.documentElement).appendChild(st);
+            }
+        })();
+    )JS";
+    return js;
+}
+
 #ifdef _WIN32
 
 std::wstring Utf8ToWide(const std::string& s) {
@@ -238,12 +262,30 @@ struct WinAppState {
     ICoreWebView2Controller* controller = nullptr;
     ICoreWebView2* webview = nullptr;
     std::unique_ptr<bb_launcher::LauncherBridge> bridge;
+    bool shown = false;
 };
 
 static WinAppState* g_win_app = nullptr;
 
+static constexpr UINT_PTR kWinRevealTimerId = 777;
+
+void RevealWinWindow(HWND hwnd) {
+    KillTimer(hwnd, kWinRevealTimerId);
+    if (g_win_app && g_win_app->shown) return;
+    if (g_win_app) g_win_app->shown = true;
+    ShowWindow(hwnd, SW_SHOW);
+    UpdateWindow(hwnd);
+    SetForegroundWindow(hwnd);
+}
+
 LRESULT CALLBACK WinWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
+        case WM_TIMER:
+            if (wp == kWinRevealTimerId) {
+                RevealWinWindow(hwnd);
+                return 0;
+            }
+            break;
         case WM_SIZE:
             if (g_win_app && g_win_app->controller) {
                 RECT rc{};
@@ -317,8 +359,9 @@ int RunWindowsWebView(bb_launcher::LauncherContext ctx) {
     });
     g_win_app = &app;
 
-    ShowWindow(hwnd, SW_SHOW);
-    UpdateWindow(hwnd);
+    // Keep window hidden until the WebView finishes decoding authentic art & font
+    // and signals "readyToShow" (failsafe timer guarantees reveal within 1.5s).
+    SetTimer(hwnd, kWinRevealTimerId, 1500, nullptr);
 
     // Keep WebView2 profile portable inside user/cache/webview2
     const fs::path wv2_data = ctx.package_dir / "user" / "cache" / "webview2";
@@ -378,7 +421,7 @@ int RunWindowsWebView(bb_launcher::LauncherContext ctx) {
                             st->Release();
                         }
 
-                        const wchar_t* init_js = LR"JS(
+                        const std::string init_utf8 = std::string(R"JS(
                             window.__bbSeq = 1;
                             window.__bbPending = new Map();
                             window.__bbResolve = function(id, data) {
@@ -394,8 +437,9 @@ int RunWindowsWebView(bb_launcher::LauncherContext ctx) {
                                     );
                                 });
                             };
-                        )JS";
-                        wv->AddScriptToExecuteOnDocumentCreated(init_js, nullptr);
+                        )JS") + "\n" + BuildPrebootJs(*app.bridge);
+                        const std::wstring init_w = Utf8ToWide(init_utf8);
+                        wv->AddScriptToExecuteOnDocumentCreated(init_w.c_str(), nullptr);
 
                         auto* msg_handler = new WebMessageHandler(
                             [&app, hwnd](ICoreWebView2* sender,
@@ -411,6 +455,10 @@ int RunWindowsWebView(bb_launcher::LauncherContext ctx) {
                                 const std::string action = ExtractJsonStrField(msg, "action");
                                 const std::string payload = ExtractRawPayload(msg);
 
+                                if (action == "readyToShow") {
+                                    RevealWinWindow(hwnd);
+                                    return S_OK;
+                                }
                                 if (action == "quit" || action == "closeWindow") {
                                     PostQuitMessage(0);
                                     return S_OK;
@@ -501,6 +549,10 @@ void OnScriptMessage(WebKitUserContentManager*,
     const std::string action = ExtractJsonStrField(msg, "action");
     const std::string payload = ExtractRawPayload(msg);
 
+    if (action == "readyToShow") {
+        gtk_widget_set_opacity(app->window, 1.0);
+        return;
+    }
     if (action == "quit" || action == "closeWindow") {
         gtk_main_quit();
         return;
@@ -629,7 +681,7 @@ int RunLinuxWebView(bb_launcher::LauncherContext ctx, int argc, char** argv) {
     webkit_user_content_manager_register_script_message_handler(ucm, "bbHost");
     g_signal_connect(ucm, "script-message-received::bbHost", G_CALLBACK(OnScriptMessage), &app);
 
-    const char* init_js = R"JS(
+    const std::string init_js = std::string(R"JS(
         window.__bbSeq = 1;
         window.__bbPending = new Map();
         window.__bbResolve = function(id, data) {
@@ -645,9 +697,9 @@ int RunLinuxWebView(bb_launcher::LauncherContext ctx, int argc, char** argv) {
                 );
             });
         };
-    )JS";
+    )JS") + "\n" + BuildPrebootJs(*app.bridge);
     WebKitUserScript* user_script = webkit_user_script_new(
-        init_js, WEBKIT_USER_CONTENT_INJECT_TOP_FRAME,
+        init_js.c_str(), WEBKIT_USER_CONTENT_INJECT_TOP_FRAME,
         WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START, nullptr, nullptr);
     webkit_user_content_manager_add_script(ucm, user_script);
 
@@ -683,6 +735,13 @@ int RunLinuxWebView(bb_launcher::LauncherContext ctx, int argc, char** argv) {
     const std::string uri = "file://" + html_path.string();
     webkit_web_view_load_uri(app.webview, uri.c_str());
 
+    // Map transparently until WebKitGTK has decoded authentic hero art & game font
+    // and signals "readyToShow" (failsafe timer guarantees reveal within 1.5s).
+    gtk_widget_set_opacity(window, 0.0);
+    g_timeout_add(1500, +[](gpointer w) -> gboolean {
+        if (GTK_IS_WIDGET(w)) gtk_widget_set_opacity(GTK_WIDGET(w), 1.0);
+        return G_SOURCE_REMOVE;
+    }, window);
     gtk_widget_show_all(window);
     gtk_main();
     return 0;
@@ -704,6 +763,12 @@ int main(int argc, char** argv) {
             std::cout << "SFX_JSON_LEN: " << sfx.size()
                       << " authentic=" << (sfx.find("\"authentic\":true") != std::string::npos ? "true" : "false")
                       << "\n";
+            const std::string art = bridge.HandleCommand("getHeroArt", "{}");
+            std::cout << "HERO_ART: " << art << "\n";
+            const std::string font = bridge.HandleCommand("getGameFont", "{}");
+            std::cout << "GAME_FONT: " << font << "\n";
+            const std::string bgm = bridge.HandleCommand("getBgm", "{\"track\":\"hunters_dream\"}");
+            std::cout << "BGM_DREAM: " << bgm << "\n";
             return 0;
         }
     }

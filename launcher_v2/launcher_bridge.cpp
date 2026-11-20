@@ -1,6 +1,8 @@
 #include "launcher_bridge.h"
 
 #include "fsb_ui_sfx.h"
+#include "gfx_font_extract.h"
+#include "tpf_hero_art.h"
 
 #include <algorithm>
 #include <cctype>
@@ -440,7 +442,8 @@ bool LauncherBridge::ClearShaderCache() const {
     std::error_code ec;
     if (!fs::is_directory(cache_root, ec)) return true;
     for (const auto& entry : fs::directory_iterator(cache_root, ec)) {
-        if (entry.path().filename() == "ui_sfx") continue;
+        const auto fn = entry.path().filename();
+        if (fn == "ui_sfx" || fn == "ui_assets" || fn == "webview2") continue;
         fs::remove_all(entry.path(), ec);
     }
     return true;
@@ -746,6 +749,10 @@ std::string LauncherBridge::BuildStateJson() const {
     if (lang != "ru" && lang != "en") lang = "en";
     const bool sfx_on = ReadIniValue("launcher_sfx", "1") != "0";
     std::string sfx_vol = ReadIniValue("launcher_sfx_vol", "0.30");
+    const bool bgm_on = ReadIniValue("launcher_bgm", "1") != "0";
+    std::string bgm_vol = ReadIniValue("launcher_bgm_vol", "0.28");
+    std::string bgm_track = ReadIniValue("launcher_bgm_track", "hunters_dream");
+    if (bgm_track != "hunters_dream" && bgm_track != "omen") bgm_track = "hunters_dream";
 
     std::string online_pool = ReadIniValue("online_pool", "offline");
     bool online_upnp = ReadIniValue("online_upnp", "1") != "0";
@@ -758,6 +765,9 @@ std::string LauncherBridge::BuildStateJson() const {
        << "\"lang\":\"" << JsonEscape(lang) << "\","
        << "\"sfxEnabled\":" << (sfx_on ? "true" : "false") << ","
        << "\"sfxVolume\":" << (sfx_vol.empty() ? "0.30" : sfx_vol) << ","
+       << "\"bgmEnabled\":" << (bgm_on ? "true" : "false") << ","
+       << "\"bgmVolume\":" << (bgm_vol.empty() ? "0.28" : bgm_vol) << ","
+       << "\"bgmTrack\":\"" << JsonEscape(bgm_track) << "\","
        << "\"shaderCount\":" << shaders << ","
        << "\"shaderTotal\":5761,"
        << "\"onlinePool\":\"" << JsonEscape(online_pool) << "\","
@@ -782,9 +792,50 @@ std::string LauncherBridge::BuildSfxJson() const {
     return out;
 }
 
+std::string LauncherBridge::BuildHeroArtJson() const {
+    const fs::path game_dir = ResolveGameDir();
+    const fs::path cache_dir = ResolveUserDir() / "cache";
+    const std::string url = LoadOrExtractHeroArtUrl(game_dir, cache_dir);
+    if (url.empty()) {
+        return "{\"authentic\":false,\"url\":\"\"}";
+    }
+    return "{\"authentic\":true,\"url\":\"" + JsonEscape(url) + "\"}";
+}
+
+std::string LauncherBridge::BuildGameFontJson() const {
+    const fs::path game_dir = ResolveGameDir();
+    const fs::path cache_dir = ResolveUserDir() / "cache";
+    const std::string url = LoadOrExtractGameFontUrl(game_dir, cache_dir);
+    if (url.empty()) {
+        return "{\"authentic\":false,\"url\":\"\"}";
+    }
+    return "{\"authentic\":true,\"url\":\"" + JsonEscape(url) + "\"}";
+}
+
+std::string LauncherBridge::BuildBgmJson(const std::string& payload) const {
+    const fs::path game_dir = ResolveGameDir();
+    const fs::path cache_dir = ResolveUserDir() / "cache";
+    std::string track = ExtractJsonField(payload, "track");
+    if (track.empty()) track = ReadIniValue("launcher_bgm_track", "hunters_dream");
+    const BgmTrackInfo info = LoadOrExtractBgmTrack(game_dir, cache_dir, track);
+    if (!info.authentic) {
+        return "{\"authentic\":false,\"url\":\"\",\"track\":\"" + JsonEscape(info.track_key) +
+               "\",\"loopStart\":0,\"loopEnd\":0}";
+    }
+    std::ostringstream os;
+    os << "{\"authentic\":true,\"track\":\"" << JsonEscape(info.track_key)
+       << "\",\"url\":\"" << JsonEscape(info.url)
+       << "\",\"loopStart\":" << info.loop_start_sec
+       << ",\"loopEnd\":" << info.loop_end_sec << "}";
+    return os.str();
+}
+
 std::string LauncherBridge::HandleCommand(const std::string& action, const std::string& payload) {
     if (action == "getState") return BuildStateJson();
     if (action == "getUiSfx") return BuildSfxJson();
+    if (action == "getHeroArt") return BuildHeroArtJson();
+    if (action == "getGameFont") return BuildGameFontJson();
+    if (action == "getBgm") return BuildBgmJson(payload);
     if (action == "setUiPref") {
         const std::string lang = ExtractJsonField(payload, "lang");
         if (lang == "ru" || lang == "en") WriteIniValue("launcher_lang", lang);
@@ -792,6 +843,14 @@ std::string LauncherBridge::HandleCommand(const std::string& action, const std::
         if (sfx == "true" || sfx == "false") WriteIniValue("launcher_sfx", sfx == "true" ? "1" : "0");
         const std::string vol = ExtractJsonField(payload, "sfxVolume");
         if (!vol.empty()) WriteIniValue("launcher_sfx_vol", vol);
+        const std::string bgm = ExtractJsonField(payload, "bgmEnabled");
+        if (bgm == "true" || bgm == "false") WriteIniValue("launcher_bgm", bgm == "true" ? "1" : "0");
+        const std::string bgm_vol = ExtractJsonField(payload, "bgmVolume");
+        if (!bgm_vol.empty()) WriteIniValue("launcher_bgm_vol", bgm_vol);
+        const std::string bgm_track = ExtractJsonField(payload, "bgmTrack");
+        if (bgm_track == "hunters_dream" || bgm_track == "omen") {
+            WriteIniValue("launcher_bgm_track", bgm_track);
+        }
         return BuildStateJson();
     }
     if (action == "setOnline") {

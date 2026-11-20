@@ -43,6 +43,8 @@ set(LAUNCHER_SOURCES
     main.cpp
     launcher_bridge.cpp
     fsb_ui_sfx.cpp
+    tpf_hero_art.cpp
+    gfx_font_extract.cpp
 )
 
 if(WIN32)

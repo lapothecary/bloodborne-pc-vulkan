@@ -322,4 +322,271 @@ std::unordered_map<std::string, std::string> LoadOrExtractUiSfx(
     return result;
 }
 
+namespace {
+
+std::string BgmPathToFileUrl(const std::filesystem::path& p) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const fs::path abs = fs::weakly_canonical(p, ec);
+    auto u8s = (ec ? p : abs).u8string();
+    std::string raw(reinterpret_cast<const char*>(u8s.data()), u8s.size());
+    for (char& c : raw) {
+        if (c == '\\') c = '/';
+    }
+    std::string encoded = (!raw.empty() && raw[0] == '/') ? "file://" : "file:///";
+    encoded.reserve(raw.size() + 16);
+    static constexpr char kHex[] = "0123456789ABCDEF";
+    for (unsigned char c : raw) {
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+            c == '/' || c == ':' || c == '-' || c == '_' || c == '.' || c == '~') {
+            encoded.push_back(static_cast<char>(c));
+        } else {
+            encoded.push_back('%');
+            encoded.push_back(kHex[(c >> 4) & 0xFu]);
+            encoded.push_back(kHex[c & 0xFu]);
+        }
+    }
+    return encoded;
+}
+
+bool DecodeAt9ToStereoWavAtomic(const uint8_t* at9_data,
+                                size_t at9_size,
+                                uint32_t target_samples,
+                                const uint8_t config_data[4],
+                                const std::filesystem::path& out_wav,
+                                int& out_sample_rate) {
+    namespace fs = std::filesystem;
+    void* handle = Atrac9GetHandle();
+    if (!handle) return false;
+
+    unsigned char cfg[4] = {config_data[0], config_data[1], config_data[2], config_data[3]};
+    if (Atrac9InitDecoder(handle, cfg) != 0) {
+        Atrac9ReleaseHandle(handle);
+        return false;
+    }
+
+    Atrac9CodecInfo info{};
+    if (Atrac9GetCodecInfo(handle, &info) != 0 || info.superframeSize <= 0 ||
+        info.frameSamples <= 0 || info.channels <= 0 || info.samplingRate <= 0) {
+        Atrac9ReleaseHandle(handle);
+        return false;
+    }
+    out_sample_rate = info.samplingRate;
+
+    const size_t ch = static_cast<size_t>(info.channels);
+    const size_t fsamp = static_cast<size_t>(info.frameSamples);
+    std::vector<int16_t> stereo;
+    stereo.reserve(static_cast<size_t>(target_samples + info.frameSamples) * 2u);
+    std::vector<int16_t> frame_buf(fsamp * ch);
+
+    size_t sf_off = 0;
+    size_t decoded_samples = 0;
+    while (sf_off + static_cast<size_t>(info.superframeSize) <= at9_size) {
+        size_t pos = sf_off;
+        for (int f = 0; f < info.framesInSuperframe; ++f) {
+            int used = 0;
+            const int rc = Atrac9Decode(handle, at9_data + pos, frame_buf.data(), &used);
+            if (rc != 0 || used <= 0) break;
+            pos += static_cast<size_t>(used);
+
+            const size_t take = (target_samples > 0 && decoded_samples + fsamp > target_samples)
+                                    ? (target_samples - decoded_samples)
+                                    : fsamp;
+            if (ch == 4) {
+                for (size_t s = 0; s < take; ++s) {
+                    const int32_t fl = frame_buf[s * 4 + 0];
+                    const int32_t fr = frame_buf[s * 4 + 1];
+                    const int32_t rl = frame_buf[s * 4 + 2];
+                    const int32_t rr = frame_buf[s * 4 + 3];
+                    const int32_t l = std::clamp<int32_t>((fl * 65 + rl * 48) / 100, -32768, 32767);
+                    const int32_t r = std::clamp<int32_t>((fr * 65 + rr * 48) / 100, -32768, 32767);
+                    stereo.push_back(static_cast<int16_t>(l));
+                    stereo.push_back(static_cast<int16_t>(r));
+                }
+            } else if (ch == 2) {
+                stereo.insert(stereo.end(), frame_buf.begin(), frame_buf.begin() + take * 2u);
+            } else if (ch == 1) {
+                for (size_t s = 0; s < take; ++s) {
+                    const int16_t v = frame_buf[s];
+                    stereo.push_back(v);
+                    stereo.push_back(v);
+                }
+            } else {
+                for (size_t s = 0; s < take; ++s) {
+                    stereo.push_back(frame_buf[s * ch + 0]);
+                    stereo.push_back(frame_buf[s * ch + 1]);
+                }
+            }
+            decoded_samples += take;
+            if (target_samples > 0 && decoded_samples >= target_samples) break;
+        }
+        sf_off += static_cast<size_t>(info.superframeSize);
+        if (target_samples > 0 && decoded_samples >= target_samples) break;
+    }
+
+    Atrac9ReleaseHandle(handle);
+    if (stereo.empty()) return false;
+
+    // Bloodborne's BGM banks are mastered around -15 dBFS for in-game 3D FMOD headroom.
+    // Gently peak-normalize to -3 dBFS (capped at +12 dB) so the launcher volume slider
+    // feels natural and consistent across Hunter's Dream and Omen with zero clipping.
+    int32_t peak = 0;
+    for (int16_t s : stereo) {
+        const int32_t a = std::abs(static_cast<int32_t>(s));
+        if (a > peak) peak = a;
+    }
+    if (peak > 256 && peak < 23000) {
+        const double gain = std::min(4.0, 23000.0 / static_cast<double>(peak));
+        for (int16_t& s : stereo) {
+            const int32_t v = static_cast<int32_t>(s * gain);
+            s = static_cast<int16_t>(std::clamp<int32_t>(v, -32768, 32767));
+        }
+    }
+
+    std::error_code ec;
+    fs::create_directories(out_wav.parent_path(), ec);
+    const fs::path tmp = out_wav.string() + ".tmp";
+    if (!WriteWavFile(tmp, stereo, info.samplingRate, 2)) {
+        fs::remove(tmp, ec);
+        return false;
+    }
+    fs::rename(tmp, out_wav, ec);
+    if (ec) {
+        fs::remove(out_wav, ec);
+        ec.clear();
+        fs::rename(tmp, out_wav, ec);
+        if (ec) {
+            fs::remove(tmp, ec);
+            return false;
+        }
+    }
+    return true;
+}
+
+}  // namespace
+
+BgmTrackInfo LoadOrExtractBgmTrack(const std::filesystem::path& game_dir,
+                                   const std::filesystem::path& cache_dir,
+                                   const std::string& track_key) {
+    namespace fs = std::filesystem;
+    BgmTrackInfo out{};
+    if (game_dir.empty()) return out;
+
+    const std::string key = (track_key == "omen") ? "omen" : "hunters_dream";
+    const char* target_name = (key == "omen") ? "019_StoryIntro_Quad96k_Mix5"
+                                              : "m210000001_SafeArea1";
+    out.track_key = key;
+
+    std::error_code ec;
+    const fs::path fsb_path = game_dir / "dvdroot_ps4" / "sound" / "sprj_smain.fsb";
+    if (!fs::is_regular_file(fsb_path, ec)) return out;
+
+    const fs::path assets_dir = cache_dir / "ui_assets";
+    const fs::path wav_path = assets_dir / ("bgm_" + key + "_v2.wav");
+    const fs::path loop_path = assets_dir / ("bgm_" + key + "_v2.loop");
+
+    if (fs::is_regular_file(wav_path, ec) && fs::file_size(wav_path, ec) > 65536) {
+        out.authentic = true;
+        out.url = BgmPathToFileUrl(wav_path);
+        std::ifstream lf(loop_path);
+        if (lf) lf >> out.loop_start_sec >> out.loop_end_sec;
+        return out;
+    }
+
+    std::ifstream f(fsb_path, std::ios::binary);
+    if (!f) return out;
+    uint8_t header[60]{};
+    if (!f.read(reinterpret_cast<char*>(header), sizeof(header))) return out;
+    if (std::memcmp(header, "FSB5", 4) != 0) return out;
+
+    const uint32_t num_samples = ReadU32(header + 8);
+    const uint32_t shdr_size = ReadU32(header + 12);
+    const uint32_t name_size = ReadU32(header + 16);
+    const uint32_t data_size = ReadU32(header + 20);
+    const uint32_t mode = ReadU32(header + 24);
+    if (mode != 13 || num_samples == 0 || name_size == 0) return out;
+
+    std::vector<uint8_t> meta(static_cast<size_t>(shdr_size) + static_cast<size_t>(name_size));
+    if (!f.read(reinterpret_cast<char*>(meta.data()), static_cast<std::streamsize>(meta.size()))) {
+        return out;
+    }
+
+    struct BgmSampleMeta {
+        uint64_t data_off = 0;
+        uint32_t num_pcm_samples = 0;
+        uint32_t loop_start = 0;
+        uint32_t loop_end = 0;
+        bool has_loop = false;
+        uint8_t at9_cfg[4] = {};
+        bool has_at9_cfg = false;
+        std::string name;
+    };
+
+    std::vector<BgmSampleMeta> samples(num_samples);
+    size_t pos = 0;
+    for (uint32_t i = 0; i < num_samples && pos + 8 <= shdr_size; ++i) {
+        const uint64_t sh = ReadU64(meta.data() + pos);
+        pos += 8;
+        bool has_chunks = (sh & 1ull) != 0;
+        samples[i].data_off = ((sh >> 6) & 0x0FFFFFFFull) * 16ull;
+        samples[i].num_pcm_samples = static_cast<uint32_t>((sh >> 34) & 0x3FFFFFFFull);
+
+        while (has_chunks && pos + 4 <= shdr_size) {
+            const uint32_t ch = ReadU32(meta.data() + pos);
+            pos += 4;
+            has_chunks = (ch & 1u) != 0;
+            const uint32_t ch_size = (ch >> 1) & 0xFFFFFFu;
+            const uint32_t ch_type = (ch >> 25) & 0x7Fu;
+            if (pos + ch_size > shdr_size) break;
+            if (ch_type == 3 && ch_size >= 8) {  // LOOP chunk
+                samples[i].loop_start = ReadU32(meta.data() + pos);
+                samples[i].loop_end = ReadU32(meta.data() + pos + 4);
+                samples[i].has_loop = true;
+            } else if (ch_type == 9 && ch_size >= 8) {  // AT9DATA chunk
+                std::memcpy(samples[i].at9_cfg, meta.data() + pos + 4, 4);
+                samples[i].has_at9_cfg = true;
+            }
+            pos += ch_size;
+        }
+    }
+
+    const uint8_t* nt = meta.data() + shdr_size;
+    for (uint32_t i = 0; i < num_samples && (i + 1) * 4 <= name_size; ++i) {
+        const uint32_t rel = ReadU32(nt + i * 4);
+        if (rel < name_size) {
+            const char* s = reinterpret_cast<const char*>(nt + rel);
+            samples[i].name.assign(s, strnlen(s, name_size - rel));
+        }
+    }
+
+    const uint64_t data_base = 60ull + shdr_size + name_size;
+    for (uint32_t i = 0; i < num_samples; ++i) {
+        if (samples[i].name != target_name || !samples[i].has_at9_cfg) continue;
+        const uint64_t next_off =
+            (i + 1 < num_samples) ? samples[i + 1].data_off : static_cast<uint64_t>(data_size);
+        if (next_off <= samples[i].data_off) break;
+        const size_t raw_len = static_cast<size_t>(next_off - samples[i].data_off);
+        std::vector<uint8_t> raw(raw_len);
+        f.seekg(static_cast<std::streamoff>(data_base + samples[i].data_off));
+        if (!f.read(reinterpret_cast<char*>(raw.data()), static_cast<std::streamsize>(raw_len))) {
+            break;
+        }
+        int sr = 48000;
+        if (DecodeAt9ToStereoWavAtomic(raw.data(), raw.size(), samples[i].num_pcm_samples,
+                                       samples[i].at9_cfg, wav_path, sr)) {
+            out.authentic = true;
+            out.url = BgmPathToFileUrl(wav_path);
+            if (samples[i].has_loop && sr > 0 && samples[i].loop_end > samples[i].loop_start) {
+                out.loop_start_sec = static_cast<double>(samples[i].loop_start) / sr;
+                out.loop_end_sec = static_cast<double>(samples[i].loop_end) / sr;
+            }
+            std::ofstream lf(loop_path, std::ios::trunc);
+            if (lf) lf << out.loop_start_sec << " " << out.loop_end_sec << "\n";
+        }
+        break;
+    }
+
+    return out;
+}
+
 }  // namespace bb_launcher

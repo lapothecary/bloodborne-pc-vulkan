@@ -53,7 +53,8 @@
         </nav>
 
         <div class="rail-footer">
-          <button id="btn-sfx" class="rail-mini" title="Menu SFX">♪</button>
+          <button id="btn-bgm" class="rail-mini" data-i18n-title="bgm_title" title="Ambient Music">♫</button>
+          <button id="btn-sfx" class="rail-mini" data-i18n-title="sfx_title" title="Menu SFX">♪</button>
           <button id="btn-lang" class="rail-mini" title="Language">EN</button>
           <span id="ver-badge" class="rail-ver">v1.1.6</span>
         </div>
@@ -237,6 +238,32 @@
               <button id="btn-safe-reset" class="bb-btn-secondary" data-i18n="btn_safe_reset">Reset</button>
             </div>
 
+            <!-- Launcher Ambient Music (Hunter's Dream / Omen) -->
+            <div class="bb-setting-row">
+              <div>
+                <div class="row-title" data-i18n="bgm_title">Launcher Ambient Music</div>
+                <div class="row-sub" data-i18n="bgm_sub">Decoded locally from your sprj_smain.fsb (Hunter's Dream / Omen)</div>
+              </div>
+              <div class="btn-group">
+                <div id="dd-bgm-track" class="bb-dropdown compact">
+                  <button type="button" class="bb-dd-trigger" id="dd-bgm-trigger">
+                    <span id="dd-bgm-label">Hunter's Dream</span>
+                    <span class="bb-dd-caret">▾</span>
+                  </button>
+                  <div class="bb-dd-menu" id="dd-bgm-menu">
+                    <button type="button" class="bb-dd-item" data-val="hunters_dream" data-i18n="bgm_track_dream">Hunter's Dream</button>
+                    <button type="button" class="bb-dd-item" data-val="omen" data-i18n="bgm_track_omen">Omen (Main Theme)</button>
+                  </div>
+                </div>
+                <input id="rng-bgm-vol" type="range" min="0" max="100" value="28" class="bb-range" />
+                <span id="val-bgm-vol" class="range-val">28%</span>
+                <label class="bb-switch">
+                  <input id="chk-bgm-on" type="checkbox" checked />
+                  <span class="slider"></span>
+                </label>
+              </div>
+            </div>
+
             <!-- Bloodborne Menu SFX -->
             <div class="bb-setting-row">
               <div>
@@ -245,6 +272,7 @@
               </div>
               <div class="btn-group">
                 <input id="rng-sfx-vol" type="range" min="0" max="100" value="30" class="bb-range" />
+                <span id="val-sfx-vol" class="range-val">30%</span>
                 <label class="bb-switch">
                   <input id="chk-sfx-on" type="checkbox" checked />
                   <span class="slider"></span>

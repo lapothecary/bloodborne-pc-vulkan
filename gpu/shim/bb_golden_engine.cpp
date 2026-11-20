@@ -812,9 +812,12 @@ bool RedirectSkippedHostFnToGuest(void* host_fn_ptr, const u8* guest_fn, std::si
 }
 
 bool ShouldInstallEntry(const GXDecompiledFunctionEntry& e, u64 size,
-                        u64 skip_min, u64 skip_max, const char* env_mods) {
+                        u64 skip_min, u64 skip_max, const char* env_skip_mods,
+                        const char* env_mods) {
     if (skip_max != 0ULL && e.vma >= skip_min && e.vma <= skip_max) {
-        return false;
+        if (!env_skip_mods || !env_skip_mods[0] || ModuleEnabled(env_skip_mods, e.module_name)) {
+            return false;
+        }
     }
     if (e.size < 5 || e.vma + e.size > size) {
         return false;
@@ -970,8 +973,9 @@ void PatchImage(unsigned char* image, u64 size) {
         return;
     }
 
-    const char* const env_skip_min = std::getenv("BB_GX_SKIP_MIN");
-    const char* const env_skip_max = std::getenv("BB_GX_SKIP_MAX");
+    const char* const env_skip_min  = std::getenv("BB_GX_SKIP_MIN");
+    const char* const env_skip_max  = std::getenv("BB_GX_SKIP_MAX");
+    const char* const env_skip_mods = std::getenv("BB_GX_SKIP_MODS");
     const u64 skip_min = (env_skip_min && env_skip_min[0]) ? std::strtoull(env_skip_min, nullptr, 0) : 0ULL;
     const u64 skip_max = (env_skip_max && env_skip_max[0]) ? std::strtoull(env_skip_max, nullptr, 0) : 0ULL;
 
@@ -979,7 +983,7 @@ void PatchImage(unsigned char* image, u64 size) {
     std::size_t redirected = 0;
     for (std::size_t i = 0; i < kGXDecompiledFunctionCount; ++i) {
         const GXDecompiledFunctionEntry& e = kGXDecompiledFunctions[i];
-        if (!ShouldInstallEntry(e, size, skip_min, skip_max, env_mods)) {
+        if (!ShouldInstallEntry(e, size, skip_min, skip_max, env_skip_mods, env_mods)) {
             if (e.size >= 5 && e.vma < size && RedirectSkippedHostFnToGuest(e.func_ptr, image + e.vma, page)) {
                 ++redirected;
             }
@@ -1079,11 +1083,13 @@ void PatchImage(unsigned char* image, u64 size) {
     g_near_stubs_base.store(reinterpret_cast<std::uintptr_t>(stubs), std::memory_order_release);
     g_near_stubs_end.store(reinterpret_cast<std::uintptr_t>(stubs) + installed * kSlotSize,
                            std::memory_order_release);
-    std::printf("[bb_vulkan] Golden Engine C++20: installed %zu / %zu native C++ functions, redirected %zu skipped host symbols to guest, %u manifest shaders active (slide=0x%llx, filter=%s)\n",
+    std::printf("[bb_vulkan] Golden Engine C++20: installed %zu / %zu native C++ functions, redirected %zu skipped host symbols to guest, %u manifest shaders active (slide=0x%llx, filter=%s%s%s)\n",
                 installed, kGXDecompiledFunctionCount, redirected,
                 GXShaderLibrary_GetTotalShaderCount(),
                 static_cast<unsigned long long>(g_eboot_live_slide),
-                (env_mods && env_mods[0]) ? env_mods : "all");
+                (env_mods && env_mods[0]) ? env_mods : "all",
+                (env_skip_mods && env_skip_mods[0]) ? ", skip_mods=" : "",
+                (env_skip_mods && env_skip_mods[0]) ? env_skip_mods : "");
     Vulkan::DirectShaders::InitializeManifestLibrary();
     std::printf("[bb_vulkan] Direct Vulkan RHI: mask=0x%08x (V1_BufferCopyFill=%s, V2_DrawDispatch=%s, "
                 "V3_ResourceViews=%s, V4_NativeShadersAndPrewarmedPSO=%s, V5_NativePcControls=%s "

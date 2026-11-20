@@ -15,6 +15,7 @@
 
 #include "platform/videoout/videoout.h"
 #include "render/present_passes.h"
+#include "render/splash_screen.h"
 #include "vulkan/instance.h"
 #include "render/runtime.h"
 #include "render/scheduler.h"
@@ -108,6 +109,7 @@ private:
     Scheduler present_scheduler;
     Swapchain swapchain;
     u32 last_swapchain_generation = 0;
+    SplashScreen splash;
     Runtime runtime;
     std::unique_ptr<Rasterizer> rasterizer;
     VideoCore::TextureCache& texture_cache;

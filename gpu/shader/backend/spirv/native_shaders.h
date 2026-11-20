@@ -13,6 +13,7 @@ namespace Shader::Backend::SPIRV {
 /// 0 = always use GCN-translated SPIR-V).
 [[nodiscard]] bool NativeShadersEnabled() noexcept;
 [[nodiscard]] bool NativeShadersCustomRange() noexcept;
+[[nodiscard]] bool HasNativeShader(u64 pgm_hash) noexcept;
 [[nodiscard]] u32 NativeShadersMinIdx() noexcept;
 [[nodiscard]] u32 NativeShadersMaxIdx() noexcept;
 

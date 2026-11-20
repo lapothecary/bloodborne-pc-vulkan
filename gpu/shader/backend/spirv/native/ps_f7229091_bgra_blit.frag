@@ -6,9 +6,12 @@
 layout(location = 0) in vec2 fs_in_uv;
 layout(location = 0) out vec4 frag_color0;
 
+layout(constant_id = 0) const uint kBgraExport = 1u;
+
 layout(set = 0, binding = 0) uniform texture2D fs_img0;
 layout(set = 0, binding = 1) uniform sampler fs_samp0;
 
 void main() {
-    frag_color0 = textureLod(sampler2D(fs_img0, fs_samp0), fs_in_uv, 0.0).bgra;
+    const vec4 col = textureLod(sampler2D(fs_img0, fs_samp0), fs_in_uv, 0.0);
+    frag_color0 = (kBgraExport != 0u) ? col.bgra : col;
 }

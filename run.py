@@ -61,13 +61,24 @@ def script(name, *args):
 
 
 _log_file = None
+_log_start_mono = time.perf_counter()
+
+
+def _format_log_line(line):
+    now = time.time()
+    sec = int(now)
+    ms = int((now - sec) * 1000.0)
+    el = max(0.0, time.perf_counter() - _log_start_mono)
+    ts = f'{time.strftime("%H:%M:%S", time.localtime(sec))}.{ms:03d} +{el:.3f}s'
+    return f'[{ts}] {line}'
 
 
 def log(line):
+    stamped = _format_log_line(line)
     if sys.stdout:  # a windowed Bloodborne.exe has none
-        print(line, flush=True)
+        print(stamped, flush=True)
     if _log_file:
-        _log_file.write(line + '\n')
+        _log_file.write(stamped + '\n')
         _log_file.flush()
 
 
@@ -501,9 +512,14 @@ def run(extra_args=(), env=None, on_line=None, prepare_only=False):
                            '--saves', user / 'savedata', '--state', data / 'mods.last').strip().splitlines()[-1])
         if game != original_game and game.name.startswith('mod-game-'):
             _mod_games.append(game)  # the game with the mods' files linked in: removed at the end
-        script('prepare.py', game, '--out', out)
-        script('link_libc.py', game, '--out', out)
-        script('link_modules.py', game, '--out', out)
+        import check_boot_cache
+        if check_boot_cache.is_cache_valid(game, out):
+            log(f'[bb_vulkan] Boot image cache hit: {out / "boot-linked.bin"} (skipped prepare/link)')
+        else:
+            script('prepare.py', game, '--out', out)
+            script('link_libc.py', game, '--out', out)
+            script('link_modules.py', game, '--out', out)
+            check_boot_cache.write_stamp(game, out)
         script('content_profile.py', game, '--out', out, '--sku', env.get('BB_CONTENT_SKU', 'full'))
         if env.get('BB_AUTO_RENDER_RES') == '1':
             for name in ('BB_RENDER_RES', 'BB_OUTPUT_RES', 'BB_AUTO_RENDER_RES'):
@@ -636,7 +652,9 @@ def run(extra_args=(), env=None, on_line=None, prepare_only=False):
                 '--patches', str(out / 'patches.bin'), '--app0', str(game), '--user', str(user),
                 '--timeout', env.get('BB_TIMEOUT', '0'), *extra_args]
         log('Starting ' + ' '.join(args))
-        with subprocess.Popen(args, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        run_env = dict(env)
+        run_env['BB_LOG_TIMESTAMPS'] = '1'
+        with subprocess.Popen(args, env=run_env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                               cwd=str(data), creationflags=NO_WINDOW) as game_process:
             for raw in game_process.stdout:
                 line = raw.decode('utf-8', 'replace').rstrip('\r\n')

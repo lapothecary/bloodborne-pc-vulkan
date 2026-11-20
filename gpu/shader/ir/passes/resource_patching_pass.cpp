@@ -320,7 +320,7 @@ void BindImage(const ResourceDiscovery& resource, const Info& info, Descriptors&
 
     const u32 image_binding = descriptors.Add(desc);
     IR::IREmitter ir{*inst.GetParent(), IR::Block::InstructionList::s_iterator_to(inst)};
-    if (inst.GetOpcode() != Opcode::ImageSampleRaw) {
+    if (inst.GetOpcode() != Opcode::ImageSampleRaw && inst.GetOpcode() != Opcode::ImageQueryLod) {
         inst.SetArg(0, ir.Imm32(image_binding));
         return;
     }
@@ -334,6 +334,9 @@ void BindImage(const ResourceDiscovery& resource, const Info& info, Descriptors&
         .is_depth = bool(flags.is_depth), // the compare opcodes
     });
     inst.SetArg(0, ir.Imm32(image_binding | sampler_binding << 16));
+    if (inst.GetOpcode() == Opcode::ImageQueryLod) {
+        inst.SetArg(2, IR::Value{});
+    }
 }
 
 /// The operand of `value` = v_mbcnt_(lo|hi)(exec half, operand), where the exec half comes from

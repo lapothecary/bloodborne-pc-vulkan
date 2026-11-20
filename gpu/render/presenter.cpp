@@ -97,7 +97,8 @@ Presenter::Presenter(Frontend::WindowSDL& window_, BbCp::CommandProcessor* cp_)
       instance{window, EmulatorSettings.GetGpuId(), EmulatorSettings.IsVkValidationEnabled(),
                EmulatorSettings.IsVkCrashDiagnosticEnabled()},
       cp{cp_}, draw_scheduler{instance, true}, present_scheduler{instance},
-      swapchain{instance, window}, runtime{instance, draw_scheduler},
+      swapchain{instance, window}, splash{instance, present_scheduler, swapchain},
+      runtime{instance, draw_scheduler},
       rasterizer{std::make_unique<Rasterizer>(instance, draw_scheduler, runtime, cp)},
       texture_cache{rasterizer->GetTextureCache()},
       encode_pass{instance.GetDevice(), swapchain.GetSurfaceFormat().format} {
@@ -117,6 +118,7 @@ Presenter::Presenter(Frontend::WindowSDL& window_, BbCp::CommandProcessor* cp_)
 Presenter::~Presenter() {
     draw_scheduler.Finish();
     present_scheduler.Finish();
+    splash.DestroyImmediate();
     const vk::Device device = instance.GetDevice();
     for (auto& frame : frames) {
         device.destroyImageView(frame.image_view);
@@ -526,9 +528,10 @@ void Presenter::EncodeInterpolated(Frame* frame, vk::Image image, vk::Format for
 
 void Presenter::RecordPresent(vk::CommandBuffer cmdbuf, const Frame* frame, vk::Image target,
                               vk::Extent2D extent, vk::Image source) {
-    const vk::Rect2D rect =
-        frame ? Letterbox({frame->width, frame->height}, extent) : vk::Rect2D{{0, 0}, {0, 0}};
-    const bool bars = rect.extent != extent;
+    const vk::Image game_img = frame ? (source ? source : frame->image) : vk::Image{};
+    const vk::Extent2D game_ext =
+        frame ? vk::Extent2D{frame->width, frame->height} : vk::Extent2D{0, 0};
+    const bool use_splash = splash.UpdateAndShouldCover(cmdbuf, game_img, game_ext);
     const vk::ImageMemoryBarrier2 to_transfer{
         .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
         .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
@@ -539,32 +542,39 @@ void Presenter::RecordPresent(vk::CommandBuffer cmdbuf, const Frame* frame, vk::
         .subresourceRange = ColorRange,
     };
     cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_transfer});
-    if (bars) {
-        const vk::ClearColorValue black{std::array{0.0f, 0.0f, 0.0f, 1.0f}};
-        cmdbuf.clearColorImage(target, vk::ImageLayout::eTransferDstOptimal, black, ColorRange);
-    }
-    if (frame) {
+    if (use_splash) {
+        splash.RecordBlit(cmdbuf, target, extent);
+    } else {
+        const vk::Rect2D rect =
+            frame ? Letterbox({frame->width, frame->height}, extent) : vk::Rect2D{{0, 0}, {0, 0}};
+        const bool bars = rect.extent != extent;
         if (bars) {
-            const vk::MemoryBarrier2 cleared{
-                .srcStageMask = vk::PipelineStageFlagBits2::eClear,
-                .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
-                .dstStageMask = vk::PipelineStageFlagBits2::eBlit,
-                .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
-            };
-            cmdbuf.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &cleared});
+            const vk::ClearColorValue black{std::array{0.0f, 0.0f, 0.0f, 1.0f}};
+            cmdbuf.clearColorImage(target, vk::ImageLayout::eTransferDstOptimal, black, ColorRange);
         }
-        const vk::ImageSubresourceLayers layers{vk::ImageAspectFlagBits::eColor, 0, 0, 1};
-        const vk::ImageBlit region{
-            .srcSubresource = layers,
-            .srcOffsets = std::array{vk::Offset3D{0, 0, 0},
-                                     vk::Offset3D{s32(frame->width), s32(frame->height), 1}},
-            .dstSubresource = layers,
-            .dstOffsets = std::array{vk::Offset3D{rect.offset.x, rect.offset.y, 0},
-                                     vk::Offset3D{rect.offset.x + s32(rect.extent.width),
-                                                  rect.offset.y + s32(rect.extent.height), 1}},
-        };
-        cmdbuf.blitImage(source ? source : frame->image, vk::ImageLayout::eGeneral, target,
-                         vk::ImageLayout::eTransferDstOptimal, region, vk::Filter::eLinear);
+        if (frame) {
+            if (bars) {
+                const vk::MemoryBarrier2 cleared{
+                    .srcStageMask = vk::PipelineStageFlagBits2::eClear,
+                    .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                    .dstStageMask = vk::PipelineStageFlagBits2::eBlit,
+                    .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                };
+                cmdbuf.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &cleared});
+            }
+            const vk::ImageSubresourceLayers layers{vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+            const vk::ImageBlit region{
+                .srcSubresource = layers,
+                .srcOffsets = std::array{vk::Offset3D{0, 0, 0},
+                                         vk::Offset3D{s32(frame->width), s32(frame->height), 1}},
+                .dstSubresource = layers,
+                .dstOffsets = std::array{vk::Offset3D{rect.offset.x, rect.offset.y, 0},
+                                         vk::Offset3D{rect.offset.x + s32(rect.extent.width),
+                                                      rect.offset.y + s32(rect.extent.height), 1}},
+            };
+            cmdbuf.blitImage(source ? source : frame->image, vk::ImageLayout::eGeneral, target,
+                             vk::ImageLayout::eTransferDstOptimal, region, vk::Filter::eLinear);
+        }
     }
 
     // The port's menu and FPS counter over the frame, at display resolution.

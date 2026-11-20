@@ -19,6 +19,8 @@ layout(push_constant) uniform AuxData {
     uint scene_size;
 } push_data;
 
+layout(constant_id = 0) const uint kBgraExport = 1u;
+
 layout(location = 0) in vec2 fs_in_uv;
 layout(location = 0) out vec4 frag_color0;
 
@@ -30,7 +32,7 @@ layout(set = 0, binding = 3) uniform sampler fs_samp1;
 void main() {
     const vec4 src = textureLod(sampler2D(fs_img0, fs_samp0), fs_in_uv, 0.0);
     const vec3 lut_uv = fma(src.rgb, vec3(0.9375), vec3(0.03125));
-    vec3 c = max(textureLod(sampler3D(fs_img1, fs_samp1), lut_uv, 0.0).bgr, vec3(0.0));
+    vec3 c = max(textureLod(sampler3D(fs_img1, fs_samp1), lut_uv, 0.0).rgb, vec3(0.0));
     if (((push_data.buf_offsets2.y >> 24u) & 0x08u) != 0u) {
         // True Black / OLED Shadow De-Haze + Filmic S-Contrast + Skin/Blood-Safe Vibrance:
         // Removes FromSoftware's 2015 LCD black-floor lift (~0.012) in dark shadows while
@@ -47,5 +49,5 @@ void main() {
         const float sat = max_c - min_c;
         c = clamp(mix(vec3(luma2), c, 1.0 + 0.14 * (1.0 - sat)), 0.0, 1.0);
     }
-    frag_color0 = vec4(c, src.a);
+    frag_color0 = vec4((kBgraExport != 0u) ? c.bgr : c, max(src.a, 0.0));
 }

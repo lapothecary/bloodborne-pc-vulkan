@@ -25,6 +25,7 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <mutex>
 #include <sys/mman.h>
 #include <sys/uio.h>
 #include <ucontext.h>
@@ -249,6 +250,9 @@ bool InstallCallDetour(u64 offset) {
 /// BB_HOT_EFFECTS=0: the patches at start as before (patches.py).
 /// The options objects built so far (the game builds about ten at a load, one per render context).
 constexpr std::size_t MaxEffectObjects = 64;
+constexpr u64 SceneTargetsVtable0 = 0x53b8450ull; // Primary vtable written at sub_22c1050+0x14 / dtor 0x22c2e10+0x11
+constexpr u64 SceneTargetsVtable1 = 0x53b8480ull; // Secondary vtable written at sub_22c1050+0x1e / dtor 0x22c2e10+0x1b
+std::mutex effects_objects_mutex{};
 std::array<std::atomic<u64>, MaxEffectObjects> effects_objects{};
 std::atomic<std::size_t> effects_object_count{0};
 std::atomic<int> effects_applied[BbSettings::EffectCount];
@@ -327,7 +331,7 @@ void WriteHotCode(u64 address, const u8* bytes, std::size_t size, bool data) {
 // (counted below)
 extern "C" int runtime_memory_is_mapped(uintptr_t address, uint64_t size);
 
-void ApplyHotEffects(bool force, u64 fresh = 0) {
+void ApplyHotEffectsLocked(bool force, u64 fresh = 0) {
     auto& settings = BbSettings::Get();
     // Live Model Detail (LOD) bias: VMA 0x1d6fc09 (0x216fc09 - 0x400000) reads int32_t at
     // ImageBase + 0x5587d20 (0x1d6fc0f + 0x3818111, range -2..2).
@@ -357,35 +361,39 @@ void ApplyHotEffects(bool force, u64 fresh = 0) {
     std::size_t live_objects = 0;
     for (std::size_t i = 0; i < count; ++i) {
         const u64 object = effects_objects[i].load(std::memory_order_relaxed);
-        const bool is_fresh = object == fresh; // just built: certainly an options object
-        // An object the game has freed since may hold anything: it is written only while its
-        // switches still look like switches (every byte 0 or 1, +0x2968..+0x2970).
-        // Still the options object: its switches look like switches, and the block of constants the
-        // constructor copies from the game's data (32 bytes at +0x2980) is still whole. The game frees
-        // these objects; the memory is reused, and a block of zeros has passed for switches: a write
-        // there damaged the game's heap (Havok's job queue stopped, a black screen).
-        u8 block[0x40]{};
-        // process_vm_readv fails on the game's memory (its pages are protected for the kernel's copy);
-        // the runtime's own map says whether the range is still mapped.
-        if (!runtime_memory_is_mapped(object + 0x2960, sizeof(block))) {
-            continue; // not mapped any more
-        }
-        std::memcpy(block, reinterpret_cast<const void*>(object + 0x2960), sizeof(block));
-        bool has_targets = false;
-        if (runtime_memory_is_mapped(object + 0x48, 8) &&
-            runtime_memory_is_mapped(object + 0x10d0, 8) &&
-            runtime_memory_is_mapped(object + 0x24f8, 8)) {
-            const u32 ctx_flags = *reinterpret_cast<const u32*>(object + 0x48);
-            const u64 ssao_target = *reinterpret_cast<const u64*>(object + 0x10d0);
-            const u64 ssr_target = *reinterpret_cast<const u64*>(object + 0x24f8);
-            has_targets = ((ctx_flags & 0x10008u) != 0) && (ssao_target != 0 || ssr_target != 0);
-        }
-        bool plausible = std::memcmp(block + 0x20, reinterpret_cast<const void*>(ImageBase + 0x5128a40), 32) == 0 || has_targets;
-        for (int b = 8; b <= 0x10; ++b) {
-            plausible &= block[b] <= 1;
-        }
-        if (!plausible && !is_fresh) {
+        if (object == 0) {
             continue;
+        }
+        const bool is_fresh = object == fresh; // just built: certainly an options object
+        // Strict live-object identity check (defense-in-depth alongside the destructor hook at
+        // 0x22c2e10): every live SceneTargets object has exact dual vtables at +0x00 and +0x08
+        // (ImageBase + 0x53b8450 / 0x53b8480) and boolean (0/1) switches across +0x2968..+0x2979.
+        // If the game ever freed & reused the chunk (e.g. for particle nodes in GFX heap), the
+        // vtables no longer match and we immediately prune the slot without writing a single byte.
+        if (!runtime_memory_is_mapped(object, 0x29a0)) {
+            if (!is_fresh) {
+                effects_objects[i].store(0, std::memory_order_release);
+            }
+            continue;
+        }
+        const u64 vt0 = *reinterpret_cast<const u64*>(object + 0x00);
+        const u64 vt1 = *reinterpret_cast<const u64*>(object + 0x08);
+        if (vt0 != ImageBase + SceneTargetsVtable0 || vt1 != ImageBase + SceneTargetsVtable1) {
+            if (!is_fresh) {
+                effects_objects[i].store(0, std::memory_order_release);
+            }
+            continue;
+        }
+        u8 block[0x20]{};
+        std::memcpy(block, reinterpret_cast<const void*>(object + 0x2960), sizeof(block));
+        if (!is_fresh) {
+            bool switches_bool = true;
+            for (int b = 0x08; b <= 0x19; ++b) {
+                switches_bool &= (block[b] <= 1);
+            }
+            if (!switches_bool) {
+                continue;
+            }
         }
         ++live_objects;
         for (const auto& flag : hot_flags) {
@@ -393,7 +401,7 @@ void ApplyHotEffects(bool force, u64 fresh = 0) {
             if (flag.effect == 3 && !is_fresh) {
                 // Menus and auxiliary contexts can deliberately have no SSAO target.
                 // Preserve that restriction instead of overriding the game's safety flag.
-                // Note: when is_fresh is true (at 0x22c254c inside sub_22c1f70), sub_22c39f0 has
+                // Note: when is_fresh is true (at 0x22c254c inside sub_22c1050), sub_22c39f0 has
                 // not run yet to allocate +0x10d0; keep want as the setting so sub_22c39f0 preserves
                 // it on main scene views and zeroes +0x2968 on non-SSAO views.
                 want = BbEffectFlags::SsaoEnabled(
@@ -409,11 +417,11 @@ void ApplyHotEffects(bool force, u64 fresh = 0) {
         // at construction time by the startup patches in InstallHotEffects(). Per-frame SSR
         // execution is gated on +0x296f and +0x2974 (vs non-SSR fallback +0x2977) on main
         // scene contexts where (+0x48 & 0x10000) != 0 and *(u64*)(object + 0x24f8) != 0.
-        if (runtime_memory_is_mapped(object + 0x48, 8) &&
-            runtime_memory_is_mapped(object + 0x24f8, 8)) {
+        if (!is_fresh) {
             const u32 ctx_flags = *reinterpret_cast<const u32*>(object + 0x48);
             const u64 ssr_target = *reinterpret_cast<const u64*>(object + 0x24f8);
-            if ((ctx_flags & 0x10000u) != 0 && ssr_target != 0) {
+            if ((ctx_flags & 0x10000u) != 0 && ssr_target != 0 &&
+                runtime_memory_is_mapped(ssr_target, 8)) {
                 const u8 want_ssr = settings.effects[6].load(std::memory_order_relaxed) ? 1 : 0;
                 const u8 want_fallback = u8(want_ssr ^ 1);
                 auto* b_296f = reinterpret_cast<volatile u8*>(object + 0x296f);
@@ -465,21 +473,34 @@ void ApplyHotEffects(bool force, u64 fresh = 0) {
     }
 }
 
+void ApplyHotEffects(bool force, u64 fresh = 0) {
+    std::scoped_lock lock{effects_objects_mutex};
+    ApplyHotEffectsLocked(force, fresh);
+}
+
 /// The renderer options object is built (rbx at the constructor's tail): its switches follow the
 /// settings from the start.
 void PS4_SYSV_ABI EffectsConstructed(u64 object) {
-    // Built again at the same place: not counted twice.
+    std::scoped_lock lock{effects_objects_mutex};
     const std::size_t known = std::min(effects_object_count.load(std::memory_order_acquire), MaxEffectObjects);
+    std::size_t free_slot = MaxEffectObjects;
     bool seen = false;
     for (std::size_t i = 0; i < known; ++i) {
-        seen |= effects_objects[i].load(std::memory_order_relaxed) == object;
+        const u64 cur = effects_objects[i].load(std::memory_order_relaxed);
+        if (cur == object) {
+            seen = true;
+            break;
+        }
+        if (cur == 0 && free_slot == MaxEffectObjects) {
+            free_slot = i;
+        }
     }
     if (!seen) {
-        const std::size_t at = effects_object_count.fetch_add(1);
-        if (at < MaxEffectObjects) {
-            effects_objects[at].store(object, std::memory_order_release);
-        } else {
-            effects_object_count.store(MaxEffectObjects);
+        if (free_slot < MaxEffectObjects) {
+            effects_objects[free_slot].store(object, std::memory_order_release);
+        } else if (known < MaxEffectObjects) {
+            effects_objects[known].store(object, std::memory_order_release);
+            effects_object_count.store(known + 1, std::memory_order_release);
         }
         static const bool verbose_hooks = [] {
             const char* e = std::getenv("BB_VERBOSE_STATS");
@@ -491,7 +512,22 @@ void PS4_SYSV_ABI EffectsConstructed(u64 object) {
                         "follow the settings in each)\n", static_cast<unsigned long long>(object));
         }
     }
-    ApplyHotEffects(true, object);
+    ApplyHotEffectsLocked(true, object);
+}
+
+/// Non-deleting destructor of SceneTargets (`0x22c2e10`): unregisters `object` immediately before
+/// its heap memory can be freed and reused by other GFX subsystems (such as particle nodes).
+void PS4_SYSV_ABI EffectsDestroyed(u64 object) {
+    if (!object) {
+        return;
+    }
+    std::scoped_lock lock{effects_objects_mutex};
+    const std::size_t known = std::min(effects_object_count.load(std::memory_order_acquire), MaxEffectObjects);
+    for (std::size_t i = 0; i < known; ++i) {
+        if (effects_objects[i].load(std::memory_order_relaxed) == object) {
+            effects_objects[i].store(0, std::memory_order_release);
+        }
+    }
 }
 
 bool InstallHotEffects() {
@@ -530,6 +566,31 @@ bool InstallHotEffects() {
         return false;
     }
     WriteJumpOverTrap(address, 0xe9, rel);
+    // Hook SceneTargets destructor (0x22c2e10: push rbp; mov rbp, rsp; push r14) so destroyed
+    // objects are unregistered immediately before their GFX heap chunk is freed & reused.
+    {
+        constexpr u64 dtor_offset = 0x22c2e10;
+        static constexpr std::array<u8, 6> dtor_head = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x56};
+        const u64 dtor_addr = ImageBase + dtor_offset;
+        if (std::memcmp(reinterpret_cast<const void*>(dtor_addr), dtor_head.data(),
+                        dtor_head.size()) == 0) {
+            Emitter de;
+            de.SaveVolatile();
+            // rdi already holds `this` (SceneTargets*)
+            de.CallAbs(reinterpret_cast<const void*>(&EffectsDestroyed));
+            de.RestoreVolatile();
+            for (const u8 b : dtor_head) {
+                de.Bytes({b});
+            }
+            de.Bytes({0xff, 0x25, 0x00, 0x00, 0x00, 0x00}); // jmp [rip]
+            de.U64(dtor_addr + dtor_head.size());
+            const u64 dtor_stub = PlaceStub(de);
+            std::uint32_t dtor_rel = 0;
+            if (dtor_stub && Rel32To(dtor_addr + 5, dtor_stub, dtor_rel)) {
+                WriteJumpOverTrap(dtor_addr, 0xe9, dtor_rel);
+            }
+        }
+    }
     // Pre-allocate full-size SSR targets (+0x24f8, +0x1078) and raymarcher constants at
     // renderer construction time so SSR (effect 6) can be toggled live via +0x296f/+0x2974/+0x2977.
     {

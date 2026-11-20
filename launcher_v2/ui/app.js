@@ -34,6 +34,10 @@
       btn_safe_reset: "Reset",
       sfx_title: "Bloodborne Menu SFX",
       sfx_sub: "Decoded locally from your sprj_main_*.fsb with gothic chamber reverb",
+      bgm_title: "Launcher Ambient Music",
+      bgm_sub: "Decoded locally from your sprj_smain.fsb (Hunter's Dream / Omen)",
+      bgm_track_dream: "Hunter's Dream",
+      bgm_track_omen: "Omen (Main Theme)",
       folders_title: "Quick Folders",
       folders_sub: "Open save data, crash logs, or change your game folder",
       btn_saves: "Saves",
@@ -85,6 +89,10 @@
       btn_safe_reset: "Сбросить",
       sfx_title: "Звуки меню Bloodborne",
       sfx_sub: "Декодируются локально из sprj_main_*.fsb с реверберацией каменного зала",
+      bgm_title: "Эмбиент-музыка лаунчера",
+      bgm_sub: "Декодируется локально из sprj_smain.fsb (Сон Охотника / Omen)",
+      bgm_track_dream: "Сон Охотника",
+      bgm_track_omen: "Omen (Главная тема)",
       folders_title: "Служебные папки",
       folders_sub: "Быстрый доступ к сохранениям, логам крашей и папке игры",
       btn_saves: "Сейвы",
@@ -110,12 +118,138 @@
     dream: "The Hunter's Dream",
   };
 
-  let state = { lang: "en", sfxEnabled: true, sfxVolume: 0.30, gameValid: false };
+  let state = {
+    lang: "en",
+    sfxEnabled: true,
+    sfxVolume: 0.30,
+    bgmEnabled: true,
+    bgmVolume: 0.28,
+    bgmTrack: "hunters_dream",
+    gameValid: false,
+  };
   const sfxBuffers = {};
   let lastHoverAt = 0;
   let wizardSkipped = false;
   let bakePollTimer = null;
   let updPollTimer = null;
+
+  // Ambient Launcher BGM Player (Hunter's Dream / Omen decoded locally from sprj_smain.fsb)
+  const bgmAudio = new Audio();
+  bgmAudio.preload = "auto";
+  bgmAudio.loop = true;
+  let bgmLoadedTrack = "";
+  let bgmLoadedUrl = "";
+  let bgmLoopStart = 0;
+  let bgmLoopEnd = 0;
+  let bgmFadeRaf = null;
+  let bgmPendingGesture = false;
+
+  bgmAudio.addEventListener("timeupdate", () => {
+    if (bgmLoopEnd > bgmLoopStart + 2.0 && bgmAudio.currentTime >= bgmLoopEnd - 0.12) {
+      bgmAudio.currentTime = bgmLoopStart;
+    }
+  });
+  bgmAudio.addEventListener("play", () => updateBgmRailVisual());
+  bgmAudio.addEventListener("pause", () => updateBgmRailVisual());
+
+  function getTargetBgmVolume() {
+    const v = Number(state.bgmVolume);
+    return Math.max(0, Math.min(1, Number.isFinite(v) ? v : 0.28));
+  }
+
+  function updateBgmRailVisual() {
+    const btn = document.getElementById("btn-bgm");
+    if (!btn) return;
+    btn.classList.toggle("muted", !state.bgmEnabled);
+  }
+
+  function closeAllDropdowns() {
+    document.querySelectorAll(".bb-dropdown.open").forEach((el) => {
+      el.classList.remove("open");
+      const row = el.closest(".bb-setting-row");
+      if (row) row.classList.remove("dd-row-open");
+    });
+  }
+
+  function toggleDropdown(ddEl) {
+    const wasOpen = ddEl.classList.contains("open");
+    closeAllDropdowns();
+    if (!wasOpen) {
+      ddEl.classList.add("open");
+      const row = ddEl.closest(".bb-setting-row");
+      if (row) row.classList.add("dd-row-open");
+    }
+  }
+
+  function fadeBgmVolume(targetVol, durationMs, onDone = null) {
+    if (bgmFadeRaf) { cancelAnimationFrame(bgmFadeRaf); bgmFadeRaf = null; }
+    const startVol = bgmAudio.volume;
+    const clampedTarget = Math.max(0, Math.min(1, targetVol));
+    if (durationMs <= 16 || Math.abs(clampedTarget - startVol) < 0.002) {
+      bgmAudio.volume = clampedTarget;
+      if (onDone) onDone();
+      return;
+    }
+    const t0 = performance.now();
+    const step = (now) => {
+      const k = Math.min(1, (now - t0) / durationMs);
+      bgmAudio.volume = Math.max(0, Math.min(1, startVol + (clampedTarget - startVol) * k));
+      if (k < 1) {
+        bgmFadeRaf = requestAnimationFrame(step);
+      } else {
+        bgmFadeRaf = null;
+        if (onDone) onDone();
+      }
+    };
+    bgmFadeRaf = requestAnimationFrame(step);
+  }
+
+  function tryStartBgmPlayback(fadeMs = 1500) {
+    if (!state.bgmEnabled || !bgmLoadedUrl) return;
+    const targetVol = getTargetBgmVolume();
+    if (targetVol <= 0.001) {
+      bgmAudio.volume = 0;
+      if (!bgmAudio.paused) bgmAudio.pause();
+      return;
+    }
+    if (bgmAudio.paused) bgmAudio.volume = 0;
+    const p = bgmAudio.play();
+    if (p && typeof p.then === "function") {
+      p.then(() => {
+        bgmPendingGesture = false;
+        fadeBgmVolume(targetVol, fadeMs);
+        updateBgmRailVisual();
+      }).catch(() => {
+        // Autoplay policy fallback: start smoothly on the very first user gesture
+        if (!bgmPendingGesture) {
+          bgmPendingGesture = true;
+          const unlock = () => {
+            window.removeEventListener("pointerdown", unlock, true);
+            window.removeEventListener("keydown", unlock, true);
+            bgmPendingGesture = false;
+            tryStartBgmPlayback(1200);
+          };
+          window.addEventListener("pointerdown", unlock, true);
+          window.addEventListener("keydown", unlock, true);
+        }
+      });
+    } else {
+      fadeBgmVolume(targetVol, fadeMs);
+      updateBgmRailVisual();
+    }
+  }
+
+  function stopBgmPlayback(fadeMs = 260) {
+    bgmPendingGesture = false;
+    if (bgmAudio.paused) {
+      updateBgmRailVisual();
+      return;
+    }
+    fadeBgmVolume(0, fadeMs, () => {
+      bgmAudio.pause();
+      updateBgmRailVisual();
+    });
+  }
 
   // Web Audio API + Gothic Stone-Chamber Stereo Reverb (emulating Bloodborne's FMOD SFX Reverb)
   let audioCtx = null;
@@ -263,7 +397,7 @@
     document.querySelectorAll(".page").forEach((p) => p.classList.toggle("active", p.id === "tab-" + tabId));
     document.querySelectorAll(".rail-btn").forEach((b) => b.classList.toggle("active", b.dataset.tab === tabId));
     document.getElementById("hero-backdrop").classList.toggle("dimmed", tabId !== "home");
-    document.getElementById("dd-online-pool").classList.remove("open");
+    closeAllDropdowns();
     if (!silent) playSfx("tab");
   }
 
@@ -305,10 +439,24 @@
       `${state.shaderCount} / ${state.shaderTotal} (${pct}%)`;
     document.getElementById("home-path-val").textContent = state.gameDir || "—";
 
+    const sfxPct = Math.round((state.sfxVolume ?? 0.30) * 100);
     document.getElementById("chk-online-upnp").checked = !!state.onlineUpnp;
     document.getElementById("chk-sfx-on").checked = !!state.sfxEnabled;
-    document.getElementById("rng-sfx-vol").value = Math.round((state.sfxVolume ?? 0.30) * 100);
+    document.getElementById("rng-sfx-vol").value = sfxPct;
+    document.getElementById("val-sfx-vol").textContent = `${sfxPct}%`;
     document.getElementById("btn-sfx").classList.toggle("muted", !state.sfxEnabled);
+
+    const bgmTrack = state.bgmTrack === "omen" ? "omen" : "hunters_dream";
+    const bgmPct = Math.round((state.bgmVolume ?? 0.28) * 100);
+    document.getElementById("chk-bgm-on").checked = !!state.bgmEnabled;
+    document.getElementById("rng-bgm-vol").value = bgmPct;
+    document.getElementById("val-bgm-vol").textContent = `${bgmPct}%`;
+    document.getElementById("dd-bgm-label").textContent =
+      bgmTrack === "omen" ? tr("bgm_track_omen") : tr("bgm_track_dream");
+    document.querySelectorAll("#dd-bgm-menu .bb-dd-item").forEach((item) => {
+      item.classList.toggle("selected", item.dataset.val === bgmTrack);
+    });
+    updateBgmRailVisual();
 
     const modsList = document.getElementById("mods-list");
     modsList.innerHTML = "";
@@ -458,6 +606,111 @@
     }
   }
 
+  function preloadImageUrl(url, timeoutMs = 700) {
+    return new Promise((resolve) => {
+      if (!url) { resolve(); return; }
+      let settled = false;
+      const done = () => { if (!settled) { settled = true; resolve(); } };
+      const timer = setTimeout(done, timeoutMs);
+      const img = new Image();
+      img.onload = () => {
+        if (typeof img.decode === "function") {
+          img.decode().catch(() => {}).finally(() => { clearTimeout(timer); done(); });
+        } else {
+          clearTimeout(timer);
+          done();
+        }
+      };
+      img.onerror = () => { clearTimeout(timer); done(); };
+      img.src = url;
+    });
+  }
+
+  async function loadHeroArt(preloadedRes = null) {
+    const backdrop = document.getElementById("hero-backdrop");
+    const artEl = backdrop ? backdrop.querySelector(".hero-art") : null;
+    if (!backdrop || !artEl) return;
+    try {
+      const res = preloadedRes || await window.bbInvoke("getHeroArt", {});
+      if (res && res.authentic && res.url) {
+        await preloadImageUrl(res.url);
+        artEl.style.backgroundImage = `url("${res.url}")`;
+        backdrop.classList.add("authentic");
+        artEl.classList.remove("fallback");
+        artEl.classList.add("authentic");
+      } else {
+        await preloadImageUrl("assets/hero_home.jpg");
+        artEl.style.backgroundImage = "";
+        backdrop.classList.remove("authentic");
+        artEl.classList.remove("authentic");
+        artEl.classList.add("fallback");
+      }
+    } catch (_) {
+      artEl.style.backgroundImage = "";
+      backdrop.classList.remove("authentic");
+      artEl.classList.remove("authentic");
+      artEl.classList.add("fallback");
+    }
+  }
+
+  async function loadGameFont(preloadedRes = null) {
+    let styleEl = document.getElementById("bb-game-font-style");
+    try {
+      const res = preloadedRes || await window.bbInvoke("getGameFont", {});
+      if (res && res.authentic && res.url) {
+        if (!styleEl) {
+          styleEl = document.createElement("style");
+          styleEl.id = "bb-game-font-style";
+          document.head.appendChild(styleEl);
+        }
+        const css = `@font-face { font-family: "BloodborneUI"; src: url("${res.url}") format("truetype"); font-weight: 100 900; font-style: normal; font-display: block; }`;
+        if (styleEl.textContent !== css) styleEl.textContent = css;
+        if (document.fonts && typeof document.fonts.load === "function") {
+          await Promise.race([
+            document.fonts.load('16px "BloodborneUI"'),
+            new Promise((r) => setTimeout(r, 450)),
+          ]);
+        }
+      } else if (styleEl) {
+        styleEl.textContent = "";
+      }
+    } catch (_) {}
+  }
+
+  async function loadAndSyncBgm(forceReload = false) {
+    if (!state.bgmEnabled) {
+      stopBgmPlayback(240);
+      return;
+    }
+    const wantTrack = state.bgmTrack === "omen" ? "omen" : "hunters_dream";
+    if (!forceReload && bgmLoadedUrl && bgmLoadedTrack === wantTrack) {
+      tryStartBgmPlayback(900);
+      return;
+    }
+    try {
+      const res = await window.bbInvoke("getBgm", { track: wantTrack });
+      if (!res || !res.authentic || !res.url) {
+        bgmLoadedUrl = "";
+        bgmLoadedTrack = "";
+        stopBgmPlayback(150);
+        return;
+      }
+      const urlChanged = bgmLoadedUrl !== res.url;
+      bgmLoadedTrack = res.track || wantTrack;
+      bgmLoadedUrl = res.url;
+      bgmLoopStart = Number(res.loopStart) || 0;
+      bgmLoopEnd = Number(res.loopEnd) || 0;
+      if (urlChanged) {
+        bgmAudio.pause();
+        bgmAudio.src = res.url;
+        bgmAudio.currentTime = 0;
+      }
+      if (state.bgmEnabled) {
+        tryStartBgmPlayback(1600);
+      }
+    } catch (_) {}
+  }
+
   async function init() {
     document.getElementById("titlebar-drag").addEventListener("mousedown", (e) => {
       if (e.button === 0) window.bbInvoke("startDrag", {});
@@ -475,20 +728,37 @@
     document.querySelectorAll("[data-goto]").forEach((btn) => btn.addEventListener("click", () => switchTab(btn.dataset.goto)));
 
     const dd = document.getElementById("dd-online-pool");
+    const ddBgm = document.getElementById("dd-bgm-track");
     document.getElementById("dd-online-trigger").addEventListener("click", (e) => {
       e.stopPropagation();
       playSfx("click");
-      dd.classList.toggle("open");
+      toggleDropdown(dd);
     });
     document.querySelectorAll("#dd-online-menu .bb-dd-item").forEach((item) => {
       item.addEventListener("click", async () => {
-        dd.classList.remove("open");
+        closeAllDropdowns();
         playSfx("select");
         state = await window.bbInvoke("setOnline", { onlinePool: item.dataset.val });
         renderState();
       });
     });
-    document.addEventListener("click", () => dd.classList.remove("open"));
+
+    document.getElementById("dd-bgm-trigger").addEventListener("click", (e) => {
+      e.stopPropagation();
+      playSfx("click");
+      toggleDropdown(ddBgm);
+    });
+    document.querySelectorAll("#dd-bgm-menu .bb-dd-item").forEach((item) => {
+      item.addEventListener("click", async () => {
+        closeAllDropdowns();
+        playSfx("select");
+        state = await window.bbInvoke("setUiPref", { bgmTrack: item.dataset.val });
+        renderState();
+        await loadAndSyncBgm(true);
+      });
+    });
+
+    document.addEventListener("click", () => closeAllDropdowns());
 
     let launching = false;
     document.getElementById("btn-play").addEventListener("click", () => {
@@ -499,6 +769,7 @@
         return;
       }
       launching = true;
+      stopBgmPlayback(220);
       showToast(tr("toast_launching"));
       window.bbInvoke("launchGame", {});
       setTimeout(() => window.bbInvoke("hideWindow", {}), 160);
@@ -511,7 +782,8 @@
       playSfx("click");
       state = await window.bbInvoke("pickGameFolder", {});
       renderState();
-      await loadSfx();
+      await Promise.all([loadHeroArt(), loadGameFont(), loadSfx()]);
+      loadAndSyncBgm(true);
     };
     document.getElementById("btn-pick-game-home").addEventListener("click", pickGame);
     document.getElementById("btn-pick-game-sys").addEventListener("click", pickGame);
@@ -529,6 +801,35 @@
       renderState();
     });
 
+    const toggleBgm = async (enabled) => {
+      state = await window.bbInvoke("setUiPref", { bgmEnabled: enabled });
+      renderState();
+      if (enabled) {
+        playSfx("select");
+        await loadAndSyncBgm(false);
+      } else {
+        playSfx("cancel");
+        stopBgmPlayback(240);
+      }
+    };
+    document.getElementById("btn-bgm").addEventListener("click", () => toggleBgm(!state.bgmEnabled));
+    document.getElementById("chk-bgm-on").addEventListener("change", (e) => toggleBgm(e.target.checked));
+    document.getElementById("rng-bgm-vol").addEventListener("input", (e) => {
+      const pct = Math.round(Number(e.target.value));
+      state.bgmVolume = pct / 100;
+      document.getElementById("val-bgm-vol").textContent = `${pct}%`;
+      if (state.bgmEnabled && !bgmAudio.paused) {
+        fadeBgmVolume(getTargetBgmVolume(), 40);
+      } else if (state.bgmEnabled && bgmLoadedUrl && state.bgmVolume > 0.01) {
+        tryStartBgmPlayback(250);
+      }
+    });
+    document.getElementById("rng-bgm-vol").addEventListener("change", async (e) => {
+      const v = (Number(e.target.value) / 100).toFixed(2);
+      state = await window.bbInvoke("setUiPref", { bgmVolume: v });
+      renderState();
+    });
+
     const toggleSfx = async (enabled) => {
       state = await window.bbInvoke("setUiPref", { sfxEnabled: enabled });
       renderState();
@@ -537,7 +838,9 @@
     document.getElementById("btn-sfx").addEventListener("click", () => toggleSfx(!state.sfxEnabled));
     document.getElementById("chk-sfx-on").addEventListener("change", (e) => toggleSfx(e.target.checked));
     document.getElementById("rng-sfx-vol").addEventListener("input", (e) => {
-      state.sfxVolume = Number(e.target.value) / 100;
+      const pct = Math.round(Number(e.target.value));
+      state.sfxVolume = pct / 100;
+      document.getElementById("val-sfx-vol").textContent = `${pct}%`;
     });
     document.getElementById("rng-sfx-vol").addEventListener("change", async (e) => {
       const v = (Number(e.target.value) / 100).toFixed(2);
@@ -605,9 +908,24 @@
     document.getElementById("btn-open-saves").addEventListener("click", () => { playSfx("click"); window.bbInvoke("openFolder", { which: "saves" }); });
     document.getElementById("btn-open-logs").addEventListener("click", () => { playSfx("click"); window.bbInvoke("openFolder", { which: "logs" }); });
 
-    state = await window.bbInvoke("getState", {});
+    const boot = window.__BB_BOOT || null;
+    state = (boot && boot.state) ? boot.state : await window.bbInvoke("getState", {});
     renderState();
-    await loadSfx();
+
+    // Decode & bind the authentic hero art and Bloodborne TTF font BEFORE revealing
+    // the window so the user sees the finished UI on the very first visible frame.
+    await Promise.all([
+      loadHeroArt(boot ? boot.heroArt : null),
+      loadGameFont(boot ? boot.gameFont : null),
+    ]);
+    await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+    const frameEl = document.querySelector(".window-frame");
+    if (frameEl) frameEl.classList.add("ready");
+    window.bbInvoke("readyToShow", {});
+
+    // Load SFX & Hunter's Dream ambient asynchronously right after the window is visible
+    loadSfx();
+    loadAndSyncBgm(false);
 
     // Quiet background update check 1.2s after launch
     setTimeout(async () => {

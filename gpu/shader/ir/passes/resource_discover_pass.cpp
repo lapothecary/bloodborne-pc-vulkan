@@ -205,11 +205,12 @@ void DiscoverImage(IR::Inst& inst, ResourceDiscoveryList& resources) {
     }
     MarkSharpReads(tsharp);
 
-    if (inst.GetOpcode() != Opcode::ImageSampleRaw) {
+    if (inst.GetOpcode() != Opcode::ImageSampleRaw && inst.GetOpcode() != Opcode::ImageQueryLod) {
         return;
     }
     SharpReference& ssharp = resource.sharps[1];
-    const IR::Inst* const sampler = inst.Arg(1).Inst();
+    const IR::Inst* const sampler =
+        (inst.GetOpcode() == Opcode::ImageQueryLod ? inst.Arg(2) : inst.Arg(1)).Inst();
     for (size_t i = 0; i < sampler->NumArgs(); ++i) {
         ssharp.dwords[ssharp.num_dwords++] = sampler->Arg(i);
     }

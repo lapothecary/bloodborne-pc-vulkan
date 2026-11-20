@@ -23,9 +23,12 @@ layout(push_constant) uniform AuxData {
     uint scene_size;
 } push_data;
 
+layout(constant_id = 0) const uint kBgraExport = 0u;
+
 layout(set = 0, binding = 0) uniform texture2D fs_img0;
 layout(set = 0, binding = 1) uniform sampler fs_samp0;
 
 void main() {
-    frag_color0 = textureLod(sampler2D(fs_img0, fs_samp0), fs_in_attr0_p.xy, 0.0);
+    const vec4 col = textureLod(sampler2D(fs_img0, fs_samp0), fs_in_attr0_p.xy, 0.0);
+    frag_color0 = (kBgraExport != 0u) ? col.bgra : col;
 }

@@ -605,12 +605,15 @@ void Translator::IMAGE_GATHER(const GcnInst& inst) {
 void Translator::IMAGE_GET_LOD(const GcnInst& inst) {
     const auto& mimg = inst.control.mimg;
     IR::VectorReg dst{inst.dst[0].code};
+    const IR::ScalarReg sampler_reg{inst.src[3].code * 4};
     IR::TextureInstInfo info{};
     info.is_array.Assign(mimg.da);
     info.is_r128.Assign(mimg.r128);
     const TSharp tsharp = LoadTSharp(ir, inst);
+    const IR::Value sampler_handle = Sgpr4(ir, sampler_reg);
     const IR::Value body = Vgpr4<IR::F32>(ir, IR::VectorReg(inst.src[0].code));
-    const IR::Value lod = ir.ImageQueryLod(ir.ImageHandle(tsharp.low, tsharp.high), body, info);
+    const IR::Value lod =
+        ir.ImageQueryLod(ir.ImageHandle(tsharp.low, tsharp.high), body, sampler_handle, info);
     if (mimg.dmask & 1) {
         ir.SetVectorReg(dst++, IR::F32{ir.CompositeExtract(lod, 0)});
     }

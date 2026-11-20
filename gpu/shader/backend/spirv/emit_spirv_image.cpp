@@ -218,8 +218,12 @@ Id EmitImageQueryDimensions(EmitContext& ctx, IR::Inst* inst, u32 handle, Id lod
 
 Id EmitImageQueryLod(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords) {
     const auto& texture = ctx.images[handle & 0xFFFF];
+    const u32 sampler_idx = handle >> 16;
+    if (!Sirit::ValidId(ctx.sampler_type) || sampler_idx >= ctx.samplers.size()) {
+        return ctx.OpCompositeConstruct(ctx.F32[2], ctx.f32_zero_value, ctx.f32_zero_value);
+    }
     const Id image = ctx.OpLoad(texture.image_type, texture.id);
-    const Id sampler = ctx.OpLoad(ctx.sampler_type, ctx.samplers[handle >> 16]);
+    const Id sampler = ctx.OpLoad(ctx.sampler_type, ctx.samplers[sampler_idx]);
     const Id sampled_image = ctx.OpSampledImage(texture.sampled_type, image, sampler);
     return ctx.OpImageQueryLod(ctx.F32[2], sampled_image, coords);
 }

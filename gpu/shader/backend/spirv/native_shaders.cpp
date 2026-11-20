@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <span>
+#include <unordered_set>
 #include <vector>
 
 #include "bbgpu/shaders/cs_a954e79d_indirect_prep_comp.h"
@@ -171,8 +172,10 @@ constexpr u32 kOpInBoundsAccessChain = 66u;
 constexpr u32 kOpImageTexelPointer = 67u;
 constexpr u32 kOpDecorate = 71u;
 constexpr u32 kOpVectorShuffle = 79u;
+constexpr u32 kOpCompositeExtract = 81u;
 constexpr u32 kOpCopyObject = 83u;
 constexpr u32 kOpImageWrite = 99u;
+constexpr u32 kExecModelFragment = 4u;
 
 // Storage classes
 constexpr u32 kStorageClassUniformConstant = 0u;
@@ -349,6 +352,7 @@ struct DescSlot {
 struct SpvInterfaceSig {
     u32 exec_model = 0xFFFFFFFFu;
     bool has_per_vertex_input = false;
+    bool has_frag0_swizzle = false;
     bool bgra_export = false;
     u64 in_loc_mask = 0;
     u64 out_loc_mask = 0;
@@ -368,6 +372,9 @@ bool ExtractInterfaceSig(std::span<const u32> spv, SpvInterfaceSig& sig) {
     }
 
     std::vector<u8> type_comps(bound, 0u);
+    std::vector<u8> is_int32_type(bound, 0u);
+    std::vector<u8> is_const_id(bound, 0u);
+    std::vector<u32> const_u32_val(bound, 0xFFFFFFFFu);
     std::vector<u32> type_desc_tag(bound, 0u);
     std::vector<u8> struct_deco(bound, 0u); // 1 = Block, 2 = BufferBlock
     std::vector<u32> ptr_sc(bound, 0xFFFFFFFFu);
@@ -383,13 +390,18 @@ bool ExtractInterfaceSig(std::span<const u32> spv, SpvInterfaceSig& sig) {
     std::vector<u32> var_set(bound, 0u);
     std::vector<u8> var_used(bound, 0u);
 
+    std::vector<u8> frag0_ac_comp(bound, 0xFFu);
+    std::vector<u32> extract_src(bound, 0u);
+    std::vector<u32> extract_idx(bound, 0xFFFFFFFFu);
+    std::array<u32, 4> frag0_store_val{};
+    u32 frag0_var_id = 0xFFFFFFFFu;
+
     struct VarRec {
         u32 id;
         u32 ptr_type;
         u32 sc;
     };
     std::vector<VarRec> global_vars;
-    std::vector<u32> store_vals;
     bool in_func = false;
 
     for (size_t pos = 5; pos < spv.size();) {
@@ -400,26 +412,51 @@ bool ExtractInterfaceSig(std::span<const u32> spv, SpvInterfaceSig& sig) {
         }
         const u32* w = &spv[pos];
         if (op == kOpFunction) {
+            if (!in_func) {
+                for (const auto& v : global_vars) {
+                    if (v.sc == kStorageClassOutput && !var_has_builtin[v.id] &&
+                        var_has_loc[v.id] && var_loc[v.id] == 0u) {
+                        frag0_var_id = v.id;
+                        break;
+                    }
+                }
+            }
             in_func = true;
         }
         if (in_func) {
             // Track which global descriptor variables are actually referenced inside functions
-            // (so unreferenced pre-spirv-opt declarations like %clip_planes are ignored).
+            // (so unreferenced pre-spirv-opt declarations like %clip_planes are ignored),
+            // and inspect exact `frag_color0` component export order (RGBA vs BGRA).
             switch (op) {
             case kOpLoad:
-            case kOpAccessChain:
-            case kOpInBoundsAccessChain:
             case kOpImageTexelPointer:
             case kOpCopyObject:
                 if (wc >= 4 && w[3] < bound) {
                     var_used[w[3]] = 1u;
                 }
                 break;
+            case kOpAccessChain:
+            case kOpInBoundsAccessChain:
+                if (wc >= 4 && w[3] < bound) {
+                    var_used[w[3]] = 1u;
+                    if (wc == 5 && w[2] < bound && w[3] == frag0_var_id && w[4] < bound &&
+                        const_u32_val[w[4]] < 4u) {
+                        frag0_ac_comp[w[2]] = static_cast<u8>(const_u32_val[w[4]]);
+                    }
+                }
+                break;
+            case kOpCompositeExtract:
+                if (wc == 5 && w[2] < bound) {
+                    extract_src[w[2]] = w[3];
+                    extract_idx[w[2]] = w[4];
+                }
+                break;
             case kOpStore:
                 if (wc >= 3 && w[1] < bound) {
                     var_used[w[1]] = 1u;
-                    if (store_vals.size() < 4u) {
-                        store_vals.push_back(w[2]);
+                    const u8 comp = frag0_ac_comp[w[1]];
+                    if (comp < 4u) {
+                        frag0_store_val[comp] = w[2];
                     }
                 }
                 break;
@@ -480,9 +517,24 @@ bool ExtractInterfaceSig(std::span<const u32> spv, SpvInterfaceSig& sig) {
             }
             break;
         case kOpTypeInt:
+            if (wc >= 4 && w[1] < bound) {
+                type_comps[w[1]] = 1u;
+                if (w[2] == 32u) {
+                    is_int32_type[w[1]] = 1u;
+                }
+            }
+            break;
         case kOpTypeFloat:
             if (wc >= 3 && w[1] < bound) {
                 type_comps[w[1]] = 1u;
+            }
+            break;
+        case kOpConstant:
+            if (wc >= 4 && w[1] < bound && w[2] < bound) {
+                is_const_id[w[2]] = 1u;
+                if (wc == 4 && is_int32_type[w[1]]) {
+                    const_u32_val[w[2]] = w[3];
+                }
             }
             break;
         case kOpTypeVector:
@@ -597,8 +649,28 @@ bool ExtractInterfaceSig(std::span<const u32> spv, SpvInterfaceSig& sig) {
     std::ranges::sort(sig.descs, [](const DescSlot& a, const DescSlot& b) {
         return (a.set != b.set) ? (a.set < b.set) : (a.binding < b.binding);
     });
-    if (store_vals.size() >= 3u && store_vals[0] > store_vals[2]) {
-        sig.bgra_export = true;
+    const u32 v0 = frag0_store_val[0];
+    const u32 v1 = frag0_store_val[1];
+    const u32 v2 = frag0_store_val[2];
+    if (v0 != 0u && v2 != 0u && v0 < bound && v2 < bound) {
+        if (extract_src[v0] != 0u && extract_src[v0] == extract_src[v2]) {
+            if (extract_idx[v0] == 2u && extract_idx[v2] == 0u) {
+                sig.has_frag0_swizzle = true;
+                sig.bgra_export = true;
+            } else if (extract_idx[v0] == 0u && extract_idx[v2] == 2u) {
+                sig.has_frag0_swizzle = true;
+                sig.bgra_export = false;
+            }
+        } else if (v1 != 0u && v1 < bound && !is_const_id[v0] && !is_const_id[v1] &&
+                   !is_const_id[v2]) {
+            if (v0 > v1 && v1 > v2) {
+                sig.has_frag0_swizzle = true;
+                sig.bgra_export = true;
+            } else if (v0 < v1 && v1 < v2) {
+                sig.has_frag0_swizzle = true;
+                sig.bgra_export = false;
+            }
+        }
     }
     return true;
 }
@@ -640,6 +712,31 @@ u32 NativeShadersMaxIdx() noexcept {
 }
 
 namespace {
+
+enum class BgraMode : u8 {
+    RgbaOnly,
+    BgraOnly,
+    SpecConstBgra,
+};
+
+constexpr BgraMode ExpectedBgraMode(u64 pgm_hash) noexcept {
+    switch (pgm_hash) {
+    case 0x0000000057f3b8c2ull: // ps_57f3b8c2_bloom_copy
+    case 0x00000000f7229091ull: // ps_f7229091_bgra_blit
+    case 0x000000008c08444cull: // ps_8c08444c_blur13
+    case 0x00000000ed4c7668ull: // ps_ed4c7668_lut3d
+        return BgraMode::SpecConstBgra;
+    case 0x000000005c02eaf8ull: // ps_5c02eaf8_tonemap
+    case 0x000000005e67d866ull: // ps_5e67d866_tonemap_hd
+    case 0x0000000038d65b32ull: // ps_38d65b32_gamma_lut1d
+    case 0x000000005e4596f4ull: // ps_5e4596f4_1mrt
+    case 0x00000000babda34dull: // ps_babda34d_1mrt
+    case 0x000000004baeaa00ull: // ps_4baeaa00_scaleform_cxform_bgra
+        return BgraMode::BgraOnly;
+    default:
+        return BgraMode::RgbaOnly;
+    }
+}
 
 constexpr size_t ExpectedVsConsecutiveBufs(u64 pgm_hash) noexcept {
     switch (pgm_hash) {
@@ -815,6 +912,18 @@ bool NativeShadersCustomRange() noexcept {
            NativeShadersSkipMaxIdx() != 0xFFFFFFFFu;
 }
 
+bool HasNativeShader(u64 pgm_hash) noexcept {
+    static const std::unordered_set<u64> hashes = [] {
+        std::unordered_set<u64> s;
+        s.reserve(kNativeRegistry.size() * 2u);
+        for (const auto& entry : kNativeRegistry) {
+            s.insert(entry.pgm_hash);
+        }
+        return s;
+    }();
+    return hashes.contains(pgm_hash);
+}
+
 bool TryReplaceWithNativeShader(u64 pgm_hash, const std::vector<u32>& ref_spv,
                                 std::vector<u32>& out_spv) {
     if (!NativeShadersEnabled()) {
@@ -853,8 +962,15 @@ bool TryReplaceWithNativeShader(u64 pgm_hash, const std::vector<u32>& ref_spv,
     if (!ExtractInterfaceSig(ref_spv, ref_sig) || ref_sig.has_per_vertex_input) {
         return false;
     }
-    if (pgm_hash == 0x000000004b766f62ull && ref_sig.bgra_export) {
-        return false;
+    const BgraMode bgra_mode = ExpectedBgraMode(pgm_hash);
+    if (ref_sig.exec_model == kExecModelFragment && ref_sig.out_loc_mask == 1ull &&
+        ref_sig.has_frag0_swizzle) {
+        if (bgra_mode == BgraMode::RgbaOnly && ref_sig.bgra_export) {
+            return false;
+        }
+        if (bgra_mode == BgraMode::BgraOnly && !ref_sig.bgra_export) {
+            return false;
+        }
     }
     s32 vs_first_buf_slot = -1;
     const size_t expected_vs_bufs = ExpectedVsConsecutiveBufs(pgm_hash);
@@ -997,6 +1113,10 @@ bool TryReplaceWithNativeShader(u64 pgm_hash, const std::vector<u32>& ref_spv,
         }
         if (expected_vs_bufs != 0u &&
             !SpecializeConstantId0(out_spv, static_cast<u32>(vs_first_buf_slot))) {
+            return false;
+        }
+        if (bgra_mode == BgraMode::SpecConstBgra &&
+            !SpecializeConstantId0(out_spv, ref_sig.bgra_export ? 1u : 0u)) {
             return false;
         }
         if (pgm_hash == 0x000000009a9cf8a9ull &&

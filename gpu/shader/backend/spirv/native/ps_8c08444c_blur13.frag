@@ -4,6 +4,8 @@
 // Streams taps sequentially instead of preloading 13 RGB samples + 39 SSBO scalars (~80 VGPRs -> ~12 VGPRs).
 #version 450
 
+layout(constant_id = 0) const uint kBgraExport = 1u;
+
 layout(location = 0) in vec2 fs_in_uv;
 layout(location = 0) out vec4 frag_color0;
 
@@ -63,5 +65,5 @@ void main() {
 
     const float post_scale = uintBitsToFloat(ssbo_3.data[d2]);
     const vec3 res = post_scale * acc;
-    frag_color0 = vec4(res.bgr, 1.0);
+    frag_color0 = vec4((kBgraExport != 0u) ? res.bgr : res, 1.0);
 }

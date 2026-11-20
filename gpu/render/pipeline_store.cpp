@@ -142,6 +142,19 @@ bool IsOpt35Phase5ShaderHash(u64 pgm_hash) noexcept {
     }
 }
 
+bool IsOpt36BgraFixShaderHash(u64 pgm_hash) noexcept {
+    switch (pgm_hash) {
+    // Mixed RGBA/BGRA specialization fix (kBgraExport constant_id = 0)
+    case 0x0000000057f3b8c2ULL: // ps_57f3b8c2_bloom_copy
+    case 0x00000000f7229091ULL: // ps_f7229091_bgra_blit
+    case 0x000000008c08444cULL: // ps_8c08444c_blur13
+    case 0x00000000ed4c7668ULL: // ps_ed4c7668_lut3d
+        return true;
+    default:
+        return false;
+    }
+}
+
 std::string OptBinaryName(u64 pgm_hash, size_t perm_idx) {
     const bool hw_interp = Shader::Backend::SPIRV::HwInterpEnabled();
     const bool fast_fp = Shader::Backend::SPIRV::FastFpEnabled();
@@ -151,14 +164,16 @@ std::string OptBinaryName(u64 pgm_hash, size_t perm_idx) {
     if (hw_interp) {
         if (fast_fp) {
             prefix = native_sh
-                         ? (IsOpt35Phase5ShaderHash(pgm_hash)
-                                ? "opt35"
-                                : (IsOpt33Phase2ShaderHash(pgm_hash)
-                                       ? "opt33"
-                                       : ((pgm_hash == 0x0000000024042a9bULL ||
-                                           pgm_hash == 0x00000000f55643deULL || ltb_patched)
-                                              ? "opt32"
-                                              : "opt31")))
+                         ? (IsOpt36BgraFixShaderHash(pgm_hash)
+                                ? "opt36"
+                                : (IsOpt35Phase5ShaderHash(pgm_hash)
+                                       ? "opt35"
+                                       : (IsOpt33Phase2ShaderHash(pgm_hash)
+                                              ? "opt33"
+                                              : ((pgm_hash == 0x0000000024042a9bULL ||
+                                                  pgm_hash == 0x00000000f55643deULL || ltb_patched)
+                                                     ? "opt32"
+                                                     : "opt31"))))
                          : (ltb_patched ? "opt6_ltb2" : "opt6_nonat");
         } else {
             prefix = ltb_patched ? "opt3_ltb2" : "opt3_strict";
@@ -274,7 +289,9 @@ void SaveShaderBinary(std::vector<u32>&& spv, u64 pgm_hash, size_t perm_idx) {
 }
 
 void SaveOptShaderBinary(std::vector<u32>&& spv, u64 pgm_hash, size_t perm_idx) {
-    if (!Store().IsOpened() || Shader::Backend::SPIRV::NativeShadersCustomRange()) {
+    if (!Store().IsOpened() ||
+        (Shader::Backend::SPIRV::NativeShadersCustomRange() &&
+         Shader::Backend::SPIRV::HasNativeShader(pgm_hash))) {
         return;
     }
     Store().Save(BbCache::BlobType::ShaderBinary, OptBinaryName(pgm_hash, perm_idx),
@@ -450,9 +467,11 @@ bool PipelineCache::PreloadStage(Serialization::Archive& ar, const Shader::Info*
     const auto load_and_compile = [&](vk::ShaderModule& out_mod) -> bool {
         std::vector<u32> spv{};
         bool upgraded_from_raw = false;
-        const bool custom_native_range = Shader::Backend::SPIRV::NativeShadersCustomRange();
+        const bool bypass_opt_cache =
+            Shader::Backend::SPIRV::NativeShadersCustomRange() &&
+            Shader::Backend::SPIRV::HasNativeShader(pgm_hash);
         if (Shader::Backend::SPIRV::SpirvOptEnabled()) {
-            if (!custom_native_range) {
+            if (!bypass_opt_cache) {
                 Store().Load(BbCache::BlobType::ShaderBinary, OptBinaryName(pgm_hash, perm_idx),
                              spv);
                 if (!spv.empty() && (spv.size() < 5 || spv[0] != 0x07230203u)) {
@@ -468,7 +487,7 @@ bool PipelineCache::PreloadStage(Serialization::Archive& ar, const Shader::Info*
                     return false;
                 }
                 Shader::Backend::SPIRV::OptimizeSPIRV(spv, pgm_hash);
-                upgraded_from_raw = !custom_native_range;
+                upgraded_from_raw = !bypass_opt_cache;
             }
         } else {
             Store().Load(BbCache::BlobType::ShaderBinary, BinaryName(pgm_hash, perm_idx), spv);
@@ -480,7 +499,7 @@ bool PipelineCache::PreloadStage(Serialization::Archive& ar, const Shader::Info*
             }
         }
         if (Shader::Backend::SPIRV::EnsureClipDistanceInitializedInSpv(spv)) {
-            upgraded_from_raw = !custom_native_range;
+            upgraded_from_raw = !bypass_opt_cache;
         }
         // A module the driver rejects is a damaged entry (the cache is rebuilt), not a fatal error.
         auto [result, created] = instance.GetDevice().createShaderModule(
@@ -866,10 +885,12 @@ void PipelineCache::WarmUp() {
                         continue;
                     }
                     const u64 pgm_hash = item.program->info.pgm_hash;
+                    const bool bypass_opt_cache =
+                        custom_native_range && Shader::Backend::SPIRV::HasNativeShader(pgm_hash);
                     std::vector<u32> spv;
                     bool upgraded = false;
                     if (spirv_opt_on) {
-                        if (!custom_native_range) {
+                        if (!bypass_opt_cache) {
                             Store().Load(BbCache::BlobType::ShaderBinary,
                                          OptBinaryName(pgm_hash, item.perm_idx), spv);
                             if (!spv.empty() && (spv.size() < 5 || spv[0] != 0x07230203u)) {
@@ -883,7 +904,7 @@ void PipelineCache::WarmUp() {
                                 continue;
                             }
                             Shader::Backend::SPIRV::OptimizeSPIRV(spv, pgm_hash);
-                            upgraded = !custom_native_range;
+                            upgraded = !bypass_opt_cache;
                         }
                     } else {
                         Store().Load(BbCache::BlobType::ShaderBinary,
@@ -893,7 +914,7 @@ void PipelineCache::WarmUp() {
                         }
                     }
                     if (Shader::Backend::SPIRV::EnsureClipDistanceInitializedInSpv(spv)) {
-                        upgraded = !custom_native_range;
+                        upgraded = !bypass_opt_cache;
                     }
                     auto [res, created] = instance.GetDevice().createShaderModule(
                         {.codeSize = spv.size() * sizeof(u32), .pCode = spv.data()});

@@ -34,6 +34,7 @@
 #include "render/pipeline_store.h"
 #include "render/recipe_catalog.h"
 #include "render/scheduler.h"
+#include "shader/backend/spirv/native_shaders.h"
 #include "shader/backend/spirv/spirv_opt.h"
 #include "shader/frontend/fetch_shader.h"
 #include "shim/bbport_toggles.h"
@@ -449,14 +450,16 @@ struct SyntheticStageEnv {
     alignas(64) std::array<u32, Gcn::NUM_USER_DATA> user_data{};
     alignas(64) std::array<u32, 512> eud{};
     alignas(64) std::array<u32, 256> vb_table{};
-    alignas(64) std::array<u32, 256> res_table{};
-    alignas(64) std::array<u32, 128> cb_table{};
-    alignas(64) std::array<u32, 128> smp_table{};
+    alignas(64) std::array<u32, 512> res_table{};
+    alignas(64) std::array<u32, 512> cb_table{};
+    alignas(64) std::array<u32, 256> smp_table{};
     alignas(64) std::array<u32, 256> rw_table{};
     alignas(64) std::array<u32, 256> fetch_code{};
     alignas(64) std::array<u32, 256> dummy_mem{};
 
     void Build(const ParsedOrbShader& sh) {
+        user_data.fill(0);
+        smp_table.fill(0);
         dummy_mem.fill(0);
         const uintptr_t dummy_ptr = reinterpret_cast<uintptr_t>(dummy_mem.data());
         const Gcn::Buffer default_cb = MakeSyntheticBuffer(dummy_ptr, 16);
@@ -502,21 +505,36 @@ struct SyntheticStageEnv {
         bool has_vb_ptr = false;
         for (const auto& sl : sh.slots) {
             switch (sl.usage_type) {
+            case 0x07: { // ImmGdsCounterRange (1 dword)
+                const u32 zero = 0;
+                write_words(sl.start_reg, &zero, 1);
+                break;
+            }
             case 0x12: // SubPtrFetchShader
                 write_ptr(sl.start_reg, fetch_code.data());
+                break;
+            case 0x13: // PtrResourceTable (PS4 Gnm kShaderInputUsagePtrResourceTable)
+            case 0x14: // PtrInternalResourceTable
+                write_ptr(sl.start_reg, res_table.data());
+                break;
+            case 0x15: // PtrSamplerTable
+                write_ptr(sl.start_reg, smp_table.data());
+                break;
+            case 0x16: // PtrConstBufferTable (PS4 Gnm kShaderInputUsagePtrConstBufferTable)
+                write_ptr(sl.start_reg, cb_table.data());
                 break;
             case 0x17: // PtrVertexBufferTable
                 vb_sgpr = sl.start_reg;
                 has_vb_ptr = true;
                 write_ptr(sl.start_reg, vb_table.data());
                 break;
-            case 0x18: // PtrResourceTable
+            case 0x18: // PtrResourceTable / PtrSoBufferTable
                 write_ptr(sl.start_reg, res_table.data());
                 break;
-            case 0x19: // PtrConstBufferTable
-                write_ptr(sl.start_reg, cb_table.data());
+            case 0x19: // PtrRwResourceTable / PtrConstBufferTable
+                write_ptr(sl.start_reg, rw_table.data());
                 break;
-            case 0x1A: // PtrRwResourceTable
+            case 0x1A: // PtrInternalGlobalTable / PtrRwResourceTable
                 write_ptr(sl.start_reg, rw_table.data());
                 break;
             case 0x1B: // PtrExtendedUserData
@@ -1839,6 +1857,16 @@ void SetPoliteAutoBakeThreadPriority() {
 
 void PipelineCache::StartBackgroundAutoBake() {
     if (const char* env = std::getenv("BB_AUTO_BAKE"); env && env[0] == '0') {
+        return;
+    }
+    const bool bisect_run =
+        Shader::Backend::SPIRV::NativeShadersCustomRange() ||
+        !Shader::Backend::SPIRV::NativeShadersEnabled() ||
+        (std::getenv("BB_GX_SKIP_MIN") != nullptr && std::getenv("BB_GX_SKIP_MIN")[0] != '\0') ||
+        (std::getenv("BB_GX_SKIP_MAX") != nullptr && std::getenv("BB_GX_SKIP_MAX")[0] != '\0');
+    if (bisect_run) {
+        std::printf("[bb_vulkan] Background Auto-Baker paused during diagnostic/bisect run\n");
+        std::fflush(stdout);
         return;
     }
     constexpr size_t kFullGameShaderThreshold = 5500;

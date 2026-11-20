@@ -67,6 +67,9 @@ private:
     std::string ReadVersionTag() const;
     std::string BuildStateJson() const;
     std::string BuildSfxJson() const;
+    std::string BuildHeroArtJson() const;
+    std::string BuildGameFontJson() const;
+    std::string BuildBgmJson(const std::string& payload) const;
     std::string BuildModsJson() const;
     std::string BuildBakeJson() const;
     std::string BuildUpdateJson() const;
