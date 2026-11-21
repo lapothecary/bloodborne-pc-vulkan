@@ -228,6 +228,7 @@ const char* TranslateForCurrentGameLang(const char* en) {
         {"Contact Micro-Shadows", "Micro-ombres de contact", "Micro-sombras de contacto", "Kontakt-Mikroschatten", "Micro-ombre di contatto", "Micro-sombras de contato", "Kontaktowe mikro-cienie", "コンタクトマイクロシャドウ", "접촉 마이크로 그림자", "屏幕空间接触微阴影"},
         {"High-Precision Ultra SSR", "Ultra SSR haute précision", "Ultra SSR de alta precisión", "Hochpräzises Ultra-SSR", "Ultra SSR ad alta precisione", "Ultra SSR de alta precisão", "Wysokoprecyzyjne Ultra SSR", "高精度ウルトラ SSR", "고정밀 울트라 SSR", "高精度 Ultra SSR (2x 步进)"},
         {"True Black & Vibrance", "Noir profond (OLED) & Vibrance", "Negro puro (OLED) y viveza", "Tiefschwarz (OLED) & Brillanz", "Nero puro (OLED) e vividezza", "Preto puro (OLED) e vivacidade", "Głęboka czerń (OLED) i nasycenie", "トゥルーブラック (OLED) & 彩度", "트루 블랙 (OLED) 및 채도", "纯黑去雾 (OLED) 与色彩鲜艳度"},
+        {"Native HDR10 (PQ)", "HDR10 natif (PQ)", "HDR10 nativo (PQ)", "Natives HDR10 (PQ)", "HDR10 nativo (PQ)", "HDR10 nativo (PQ)", "Natywny HDR10 (PQ)", "ネイティブ HDR10 (PQ)", "네이티브 HDR10 (PQ)", "原生 HDR10 输出 (PQ)"},
         {"Debug", "Debug", "Depuración", "Debug", "Debug", "Debug", "Debug", "デバッグ", "디버그", "调试信息"},
         {"Additional Debug", "Debug détaillé", "Depuración detallada", "Erweitertes Debug", "Debug dettagliato", "Debug detalhado", "Szczegółowy debug", "詳細デバッグ", "상세 디버그", "详细调试信息"},
         {"Camera Follow Hotkey", "Raccourci suivi caméra", "Atajo seguimiento cámara", "Kamera-Folgemodus-Taste", "Tasto modalità telecamera", "Atalho modo de câmera", "Skrót trybu kamery", "カメラ追従切替キー", "카메라 추적 전환 키", "视角跟随切换热键"},
@@ -309,7 +310,7 @@ constexpr int DisplaySlotCount = 11; ///< all 11 Display settings fit on a singl
 constexpr int TotalDisplayItems = 12;
 constexpr int MaxDisplayScroll = TotalDisplayItems - DisplaySlotCount;
 constexpr int EffectsSlotCount = 11; ///< all 11 Effects settings fit on a single screen (0 scroll)
-constexpr int TotalEffectsItems = 11;
+constexpr int TotalEffectsItems = 12;
 constexpr int MaxEffectsScroll = TotalEffectsItems - EffectsSlotCount;
 constexpr int MaxChoicesPerSlot = 16;
 constexpr int DefaultResetSentinel = -999;
@@ -2448,6 +2449,9 @@ constexpr EffectsItemMeta EffectsItems[TotalEffectsItems] = {
     {"True Black & Vibrance", "Глубокий чёрный и сочность",
      "Vulkan 1.3 Remaster: removes 2015 PS4 LCD grey black-floor haze after 3D LUT + subtle vibrance",
      "Ремастер Vulkan 1.3: убирает серую пелену старых LCD 2015 года после 3D LUT и добавляет сочность", true},
+    {"Native HDR10 (PQ)", "Настоящий HDR10 (PQ)",
+     "Vulkan 1.3 Remaster: 10-bit Rec.2020 ST.2084 PQ HDR output with highlight expansion (enable HDR in OS)",
+     "Ремастер Vulkan 1.3: 10-битный вывод HDR10 (Rec.2020 PQ) с расширением яркости огня и луны (включи HDR в ОС)", false},
 };
 
 constexpr int EffectsItemToEffectIdx(int item_idx) {
@@ -2472,6 +2476,7 @@ bool GetEffectsItemActive(int item_idx) {
     case 8: return s.contact_shadows.load();
     case 9: return s.ssr_quality.load();
     case 10: return s.true_black_hdr.load();
+    case 11: return s.hdr_output.load();
     default: return false;
     }
 }
@@ -2490,6 +2495,10 @@ void SetEffectsItemActive(int item_idx, bool active) {
         case 8: s.contact_shadows = active; break;
         case 9: s.ssr_quality = active; break;
         case 10: s.true_black_hdr = active; break;
+        case 11:
+            s.hdr_output = active;
+            s.swapchain_generation.fetch_add(1, std::memory_order_relaxed);
+            break;
         default: break;
         }
     }

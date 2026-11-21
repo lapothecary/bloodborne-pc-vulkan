@@ -116,6 +116,7 @@ private:
     EncodePass encode_pass;
     std::atomic<float> gamma{1.0f};
     std::atomic<bool> hdr{false};
+    std::atomic<bool> guest_hdr{false};
 
     std::vector<Frame> frames;
     Frame blank_frame;

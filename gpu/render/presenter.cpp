@@ -112,7 +112,8 @@ Presenter::Presenter(Frontend::WindowSDL& window_, BbCp::CommandProcessor* cp_)
             device.createFence({.flags = vk::FenceCreateFlagBits::eSignaled}));
         free_frames.push_back(&frames[i]);
     }
-    BbOverlay::Init(instance, swapchain.GetSurfaceFormat().format, frame_count);
+    hdr.store(swapchain.GetHDR(), std::memory_order_relaxed);
+    BbOverlay::Init(instance, swapchain.GetActiveFormat(), frame_count);
 }
 
 Presenter::~Presenter() {
@@ -130,15 +131,21 @@ Presenter::~Presenter() {
 }
 
 void Presenter::SetHDR(bool enable) {
-    if (!IsHDRSupported()) {
-        return;
-    }
-    if (swapchain.GetHDR() != enable) {
+    guest_hdr.store(enable, std::memory_order_relaxed);
+    const bool effective =
+        IsHDRSupported() &&
+        (enable || BbSettings::Get().hdr_output.load(std::memory_order_relaxed));
+    if (swapchain.GetHDR() != effective) {
         // Changing HDR recreates the swapchain and waits for the device: exclude queue submits.
         std::scoped_lock lock{Scheduler::submit_mutex};
-        swapchain.SetHDR(enable);
+        swapchain.SetHDR(effective);
+        BbOverlay::SetSwapchainFormat(swapchain.GetActiveFormat());
+        last_swapchain_generation =
+            BbSettings::Get().swapchain_generation.load(std::memory_order_relaxed);
+        std::printf("Presenter: switched output live to %s\n",
+                    effective ? "HDR10 (A2B10G10R10 ST.2084 PQ)" : "SDR (sRGB)");
     }
-    hdr.store(enable, std::memory_order_relaxed);
+    hdr.store(effective, std::memory_order_release);
 }
 
 VideoCore::Image& Presenter::RegisterVideoOutSurface(
@@ -156,7 +163,9 @@ void Presenter::RecreateFrame(Frame& frame, u32 width, u32 height) {
     if (frame.image) {
         vmaDestroyImage(instance.GetAllocator(), frame.image, frame.allocation);
     }
-    const vk::Format format = swapchain.GetSurfaceFormat().format;
+    const bool is_hdr = hdr.load(std::memory_order_acquire);
+    const vk::Format format =
+        is_hdr ? vk::Format::eA2B10G10R10UnormPack32 : swapchain.GetSurfaceFormat().format;
     const VkImageCreateInfo image_info = vk::ImageCreateInfo{
         .imageType = vk::ImageType::e2D,
         .format = format,
@@ -192,7 +201,7 @@ void Presenter::RecreateFrame(Frame& frame, u32 width, u32 height) {
     frame.has_interp = false;
     frame.width = width;
     frame.height = height;
-    frame.is_hdr = swapchain.GetHDR();
+    frame.is_hdr = is_hdr;
 }
 
 Frame* Presenter::GetRenderFrame() {
@@ -212,7 +221,7 @@ Frame* Presenter::GetRenderFrame() {
     const u32 width = expected_width.load(std::memory_order_relaxed);
     const u32 height = expected_height.load(std::memory_order_relaxed);
     if (frame->width != width || frame->height != height ||
-        frame->is_hdr != swapchain.GetHDR()) {
+        frame->is_hdr != hdr.load(std::memory_order_acquire)) {
         RecreateFrame(*frame, width, height);
     }
     return frame;
@@ -305,9 +314,24 @@ Frame* Presenter::PrepareFrame(const BbVideoOut::BufferAttributeGroup& attribute
     shown_aspect.store(float(source_size.width) / float(source_size.height),
                        std::memory_order_relaxed);
 
+    static const float hdr_peak_nits = [] {
+        const char* env = std::getenv("BB_HDR_PEAK_NITS");
+        const float v = env && *env ? std::strtof(env, nullptr) : 800.0f;
+        return std::clamp(v, 300.0f, 4000.0f);
+    }();
+    static const float hdr_paper_white = [] {
+        const char* env = std::getenv("BB_HDR_PAPER_WHITE");
+        const float v = env && *env ? std::strtof(env, nullptr) : 240.0f;
+        return std::clamp(v, 80.0f, 600.0f);
+    }();
+    const u32 hdr_mode =
+        !frame->is_hdr
+            ? 0u
+            : (attribute.attrib.pixel_format == BbVideoOut::PixelFormat::A2R10G10B10Bt2020Pq ? 1u
+                                                                                             : 2u);
     const EncodePass::Settings encode{
         .gamma = gamma.load(std::memory_order_relaxed),
-        .hdr = hdr.load(std::memory_order_relaxed),
+        .hdr = hdr_mode,
         .srgb_input = attribute.attrib.pixel_format == BbVideoOut::PixelFormat::A2R10G10B10Srgb,
         // Sharpening without an upscaler, or with DLSS/DLAA (NGX DLSS 2.5.1+ removed internal sharpening).
         .sharpen = (BbSettings::EffectiveUpscaler() == BbSettings::UpscalerOff ||
@@ -315,6 +339,8 @@ Frame* Presenter::PrepareFrame(const BbVideoOut::BufferAttributeGroup& attribute
                            BbSettings::Get().sharpen
                        ? std::clamp(BbSettings::Get().sharpness.load(), 0.0f, 2.0f)
                        : 0.0f,
+        .hdr_peak_nits = hdr_peak_nits,
+        .hdr_paper_white = hdr_paper_white,
     };
     // Numbered here, in command order; marked where the commands are recorded.
     const u32 stream = draw_scheduler.CrumbStream();
@@ -434,9 +460,11 @@ void Presenter::EncodeInterpolated(Frame* frame, vk::Image image, vk::Format for
                                    const EncodePass::Settings& encode) {
     const vk::Device device = instance.GetDevice();
     if (!frame->interp_image) {
+        const vk::Format interp_fmt =
+            frame->is_hdr ? vk::Format::eA2B10G10R10UnormPack32 : swapchain.GetSurfaceFormat().format;
         const VkImageCreateInfo image_info = vk::ImageCreateInfo{
             .imageType = vk::ImageType::e2D,
-            .format = swapchain.GetSurfaceFormat().format,
+            .format = interp_fmt,
             .extent = {frame->width, frame->height, 1},
             .mipLevels = 1,
             .arrayLayers = 1,
@@ -456,7 +484,7 @@ void Presenter::EncodeInterpolated(Frame* frame, vk::Image image, vk::Format for
         frame->interp_view = Check<"create a frame view">(device.createImageView({
             .image = frame->interp_image,
             .viewType = vk::ImageViewType::e2D,
-            .format = swapchain.GetSurfaceFormat().format,
+            .format = interp_fmt,
             .subresourceRange = ColorRange,
         }));
     }
@@ -666,6 +694,17 @@ bool Presenter::PresentImage(Frame* frame, vk::Image source, bool last) {
         std::scoped_lock lock{Scheduler::submit_mutex};
         swapchain.Recreate(width, height);
     };
+    // Live SDR <-> HDR10 swapchain switch from System -> Effects / Overlay.
+    const bool want_hdr =
+        swapchain.HasHDR() &&
+        (guest_hdr.load(std::memory_order_relaxed) ||
+         BbSettings::Get().hdr_output.load(std::memory_order_relaxed));
+    if (want_hdr != swapchain.GetHDR()) {
+        SetHDR(guest_hdr.load(std::memory_order_relaxed));
+        if (!swapchain.IsPresentable()) {
+            return false;
+        }
+    }
     // A resized window, a live VSync change, or a previously minimised surface needs a new swapchain.
     const u32 sc_gen = BbSettings::Get().swapchain_generation.load(std::memory_order_relaxed);
     if (width != swapchain.GetWidth() || height != swapchain.GetHeight() ||
@@ -677,6 +716,10 @@ bool Presenter::PresentImage(Frame* frame, vk::Image source, bool last) {
         }
     }
     const bool blank = frame == &blank_frame;
+    if (!blank && frame->is_hdr != swapchain.GetHDR()) {
+        // Skip the single in-flight frame rendered in the old color space to avoid a 1-frame flash.
+        return false;
+    }
     if (!blank && last && !source) {
         const u64 period_ns =
             (BbFrameRate::PresentPacingEnabled() && !BbFastLoad::IsLoadingBurstActive())

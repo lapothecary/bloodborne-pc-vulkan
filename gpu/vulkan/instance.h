@@ -220,6 +220,9 @@ public:
     bool IsBufferMarkerSupported() const {
         return ext.buffer_marker;
     }
+    bool IsHdrMetadataSupported() const {
+        return ext.hdr_metadata;
+    }
     bool IsAttachmentFeedbackLoopLayoutSupported() const {
         return ext.feedback_loop;
     }
@@ -377,7 +380,7 @@ private:
             trinary_minmax, nv_mixed_samples, amd_mixed_samples, atomic_float, atomic_float2,
             workgroup_layout, view_2d_of_3d, image_view_min_lod, memory_budget, memory_fd,
             dma_buf, memory_host, compute_derivatives, mixed_float_dot, cooperative_matrix,
-            float8, shader_clock, guest_uncached;
+            float8, shader_clock, guest_uncached, hdr_metadata;
     };
 
     vk::UniqueInstance instance;

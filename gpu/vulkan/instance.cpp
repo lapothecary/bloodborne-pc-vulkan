@@ -224,6 +224,7 @@ void Instance::CreateDevice() {
 
     ext.maintenance_5 = enable(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
     ext.maintenance_8 = enable(VK_KHR_MAINTENANCE_8_EXTENSION_NAME);
+    ext.hdr_metadata = enable(VK_EXT_HDR_METADATA_EXTENSION_NAME);
     ext.buffer_marker = enable(VK_AMD_BUFFER_MARKER_EXTENSION_NAME); // GPU breadcrumbs
     // The feedback loop layout only with its dynamic state.
     ext.feedback_loop = has(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME) &&

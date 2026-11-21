@@ -20,6 +20,8 @@ namespace BbOverlay {
 
 /// Present thread, once: the ImGui context and its Vulkan backend.
 void Init(const Vulkan::Instance& instance, vk::Format format, u32 image_count);
+/// Present thread: recreates ImGui's dynamic-rendering pipeline after SDR <-> HDR10 switch.
+void SetSwapchainFormat(vk::Format format);
 
 /// Window thread, for every SDL event: true when the menu consumed it.
 bool HandleEvent(const SDL_Event& event);

@@ -235,6 +235,8 @@ struct Values {
     std::atomic<bool> ssr_quality{true};
     /// True Black / OLED Contrast De-Haze & Vibrance in Yebis2 3D LUT pass (ps_ed4c7668_lut3d.frag).
     std::atomic<bool> true_black_hdr{true};
+    /// Native 10-bit HDR10 (Rec.2020 ST.2084 PQ) Vulkan swapchain output with highlight expansion.
+    std::atomic<bool> hdr_output{false};
 
     // --- Native Bloodborne System Options (CSOptionsData <-> bbport.ini <-> Launcher) -----------
     enum NativeMaskBit : std::uint32_t {

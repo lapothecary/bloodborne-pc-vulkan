@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <limits>
 
 #include "bbport_settings.h"
@@ -52,6 +53,7 @@ vk::PresentModeKHR RequestedPresentMode() {
 Swapchain::Swapchain(const Instance& instance_, const Frontend::WindowSDL& window)
     : instance{instance_}, surface{CreateSurface(instance.GetInstance(), window)} {
     ChooseFormat();
+    use_hdr = supports_hdr && BbSettings::Get().hdr_output.load(std::memory_order_relaxed);
     ChoosePresentMode();
     Create(u32(window.GetWidth()), u32(window.GetHeight()));
 }
@@ -67,7 +69,9 @@ Swapchain::~Swapchain() {
 void Swapchain::ChooseFormat() {
     const auto formats =
         Check<"query surface formats">(instance.GetPhysicalDevice().getSurfaceFormatsKHR(surface));
-    supports_hdr = EmulatorSettings.IsHdrAllowed() && std::ranges::contains(formats, HdrFormat);
+    supports_hdr = std::ranges::contains(formats, HdrFormat);
+    std::printf("Swapchain: HDR10 (A2B10G10R10 + ST.2084 PQ) %s by surface\n",
+                supports_hdr ? "supported" : "not advertised");
     // A single undefined format: the surface takes any.
     if (formats.size() == 1 && formats[0].format == vk::Format::eUndefined) {
         sdr_format = {vk::Format::eR8G8B8A8Unorm, vk::ColorSpaceKHR::eSrgbNonlinear};
@@ -164,6 +168,29 @@ void Swapchain::Create(u32 width_, u32 height_) {
     }));
     if (old) {
         device.destroySwapchainKHR(old);
+    }
+    if (use_hdr && instance.IsHdrMetadataSupported()) {
+        static const float peak_nits = [] {
+            const char* env = std::getenv("BB_HDR_PEAK_NITS");
+            const float v = env && *env ? std::strtof(env, nullptr) : 800.0f;
+            return std::clamp(v, 300.0f, 4000.0f);
+        }();
+        static const float paper_white = [] {
+            const char* env = std::getenv("BB_HDR_PAPER_WHITE");
+            const float v = env && *env ? std::strtof(env, nullptr) : 240.0f;
+            return std::clamp(v, 80.0f, 600.0f);
+        }();
+        const vk::HdrMetadataEXT meta{
+            .displayPrimaryRed = {0.708f, 0.292f},
+            .displayPrimaryGreen = {0.170f, 0.797f},
+            .displayPrimaryBlue = {0.131f, 0.046f},
+            .whitePoint = {0.3127f, 0.3290f},
+            .maxLuminance = peak_nits,
+            .minLuminance = 0.005f,
+            .maxContentLightLevel = peak_nits,
+            .maxFrameAverageLightLevel = paper_white,
+        };
+        device.setHdrMetadataEXT(swapchain, meta);
     }
 
     images = Check<"get swapchain images">(device.getSwapchainImagesKHR(swapchain));

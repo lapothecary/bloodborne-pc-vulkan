@@ -96,9 +96,7 @@ std::vector<const char*> Extensions(Frontend::WindowSystemType window_type,
 #endif
     // The headless renderer's device enables swapchains too, which need this.
     extensions.push_back(VK_KHR_SURFACE_EXTENSION_NAME);
-    if (EmulatorSettings.IsHdrAllowed()) {
-        extensions.push_back(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME);
-    }
+    extensions.push_back(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME);
     extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
     std::erase_if(extensions, [&](const char* name) {
         const bool present = Has(available, name, &vk::ExtensionProperties::extensionName);

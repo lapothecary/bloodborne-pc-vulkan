@@ -31,7 +31,7 @@ vk::UniqueSampler LinearClampSampler(vk::Device device) {
 
 } // namespace
 
-EncodePass::EncodePass(vk::Device device, vk::Format output_format)
+EncodePass::EncodePass(vk::Device device, vk::Format sdr_output_format)
     : sampler{LinearClampSampler(device)} {
     const vk::DescriptorSetLayoutBinding binding{
         .binding = 0,
@@ -71,10 +71,6 @@ EncodePass::EncodePass(vk::Device device, vk::Format output_format)
             .pName = "main",
         },
     };
-    const vk::PipelineRenderingCreateInfo rendering{
-        .colorAttachmentCount = 1,
-        .pColorAttachmentFormats = &output_format,
-    };
     const vk::PipelineVertexInputStateCreateInfo vertex_input{};
     const vk::PipelineInputAssemblyStateCreateInfo assembly{
         .topology = vk::PrimitiveTopology::eTriangleList,
@@ -97,23 +93,32 @@ EncodePass::EncodePass(vk::Device device, vk::Format output_format)
         .dynamicStateCount = u32(dynamic_states.size()),
         .pDynamicStates = dynamic_states.data(),
     };
-    pipeline = Check<"create encode pipeline">(device.createGraphicsPipelineUnique(
-        {}, vk::GraphicsPipelineCreateInfo{
-                .pNext = &rendering,
-                .stageCount = u32(stages.size()),
-                .pStages = stages.data(),
-                .pVertexInputState = &vertex_input,
-                .pInputAssemblyState = &assembly,
-                .pViewportState = &viewport,
-                .pRasterizationState = &raster,
-                .pMultisampleState = &multisample,
-                .pColorBlendState = &blend,
-                .pDynamicState = &dynamic,
-                .layout = *layout,
-            }));
+    auto build_pipeline = [&](vk::Format fmt, const char* name) {
+        const vk::PipelineRenderingCreateInfo rendering{
+            .colorAttachmentCount = 1,
+            .pColorAttachmentFormats = &fmt,
+        };
+        auto pipe = Check<"create encode pipeline">(device.createGraphicsPipelineUnique(
+            {}, vk::GraphicsPipelineCreateInfo{
+                    .pNext = &rendering,
+                    .stageCount = u32(stages.size()),
+                    .pStages = stages.data(),
+                    .pVertexInputState = &vertex_input,
+                    .pInputAssemblyState = &assembly,
+                    .pViewportState = &viewport,
+                    .pRasterizationState = &raster,
+                    .pMultisampleState = &multisample,
+                    .pColorBlendState = &blend,
+                    .pDynamicState = &dynamic,
+                    .layout = *layout,
+                }));
+        SetObjectName(device, *pipe, name);
+        return pipe;
+    };
+    pipeline_sdr = build_pipeline(sdr_output_format, "present encode sdr");
+    pipeline_hdr = build_pipeline(vk::Format::eA2B10G10R10UnormPack32, "present encode hdr10");
     device.destroyShaderModule(vertex);
     device.destroyShaderModule(fragment);
-    SetObjectName(device, *pipeline, "present encode");
 }
 
 EncodePass::~EncodePass() = default;
@@ -137,7 +142,8 @@ void EncodePass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input, vk::Image
         .descriptorType = vk::DescriptorType::eCombinedImageSampler,
         .pImageInfo = &source,
     };
-    cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline);
+    cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics,
+                        settings.hdr != 0u ? *pipeline_hdr : *pipeline_sdr);
     cmdbuf.setViewport(0, vk::Viewport{0.0f, 0.0f, float(output_size.width),
                                        float(output_size.height), 0.0f, 1.0f});
     cmdbuf.setScissor(0, vk::Rect2D{{0, 0}, output_size});

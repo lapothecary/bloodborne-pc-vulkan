@@ -864,6 +864,14 @@ void Menu() {
         "grading with a smooth toe curve and subtle blood/gold vibrance boost.",
         "Убирает серую пелену (~1.1% подъём чёрного под LCD 2015 года) после цветокоррекции "
         "3D LUT с мягкой S-кривой контраста и подчёркиванием оттенков крови и огня."));
+    Checkbox(BbSettings::MenuText("Native HDR10 Output (Rec.2020 ST.2084 PQ)",
+                                  "Настоящий HDR10 вывод (Rec.2020 ST.2084 PQ)"),
+             s.hdr_output);
+    Hint(BbSettings::MenuText(
+        "Switches the Vulkan swapchain live to 10-bit HDR10 (ST.2084 PQ) with linear highlight "
+        "expansion for torches, bonfires, and moonlight. Requires HDR enabled in OS display settings.",
+        "Переключает Vulkan swapchain на лету в 10-битный HDR10 (ST.2084 PQ) с расширением яркости "
+        "факелов, костров и луны. Для полного эффекта включи HDR в настройках экрана ОС."));
     BbGuestHooks::ApplyGameEffects();
     Hint(BbSettings::MenuText(
         "All visual effects (including SSR reflections, Bloom, DoF, Motion Blur, SSAO, and Model LOD) "
@@ -3705,6 +3713,22 @@ void Init(const Vulkan::Instance& instance, vk::Format format, u32 image_count) 
     }
     initialized = true;
     std::printf("Overlay: menu ready (Insert or L3+R3)\n");
+}
+
+void SetSwapchainFormat(vk::Format format) {
+    std::scoped_lock lock{imgui_mutex};
+    if (!initialized) {
+        return;
+    }
+    const VkFormat color_format = static_cast<VkFormat>(format);
+    ImGui_ImplVulkan_PipelineInfo pipe{};
+    pipe.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
+    pipe.PipelineRenderingCreateInfo = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO_KHR,
+        .colorAttachmentCount = 1,
+        .pColorAttachmentFormats = &color_format,
+    };
+    ImGui_ImplVulkan_CreateMainPipeline(&pipe);
 }
 
 void UpdateTextInput(SDL_Window* window) {

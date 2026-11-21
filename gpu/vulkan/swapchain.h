@@ -49,9 +49,13 @@ public:
     vk::ImageView ImageView() const {
         return views[image_index];
     }
-    /// The SDR surface format (frames and passes are made in it; HDR images take A2B10G10R10).
+    /// The SDR surface format (passes use this for SDR; HDR images take A2B10G10R10).
     vk::SurfaceFormatKHR GetSurfaceFormat() const {
         return sdr_format;
+    }
+    /// The active swapchain image format (A2B10G10R10UnormPack32 in HDR10, sdr_format otherwise).
+    vk::Format GetActiveFormat() const {
+        return use_hdr ? vk::Format::eA2B10G10R10UnormPack32 : sdr_format.format;
     }
     vk::Extent2D GetExtent() const {
         return extent;
