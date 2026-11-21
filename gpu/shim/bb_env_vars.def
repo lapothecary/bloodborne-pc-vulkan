@@ -115,6 +115,8 @@ BB_ENV(BB_BIND_MEMO, TUNING, "=0: every resource binding takes the full path (no
 BB_ENV(BB_BREADCRUMBS, TUNING, "=0: no GPU breadcrumbs (what the GPU was drawing at a hang)")
 BB_ENV(BB_CHUNK_TEXTURES, TUNING, "=0: texture data copied instead of read in place from guest memory chunks")
 BB_ENV(BB_CHUNK_UPLOADS, TUNING, "=0: uploads through CPU staging instead of binding guest memory in place")
+BB_ENV(BB_CLOTH_EXP, TUNING, "=value: override Havok Cloth high-FPS stiffness exponent (default: 1.725 matching Havok's native substep exponent; 1.0 = legacy linear)")
+BB_ENV(BB_CLOTH_FRICTION, TUNING, "=0: disable dt-adapted Havok Cloth collision friction hooks (default 1)")
 BB_ENV(BB_COMMIT_IMPORT_LOCKED, TUNING, "=1: guest memory commits import under the lock")
 BB_ENV(BB_COMPUTE_RELEASE_FLUSH, TUNING, "=0: work before a compute release waits for the rest of the frame")
 BB_ENV(BB_CONSTANTS_IN_PLACE, TUNING, "=1: shader constants bound in place from guest memory instead of copied")

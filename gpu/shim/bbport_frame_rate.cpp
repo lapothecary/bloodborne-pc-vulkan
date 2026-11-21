@@ -82,11 +82,17 @@ struct alignas(64) Live {
     float slope_accel = 1.0f;         ///< 1.0 per 30 FPS frame (slope-slide acceleration, 0x1a46c52)
     float decay60 = 0.6f;             ///< 0.6 per 30 FPS frame (foot-IK pelvis Y-offset decay, 0x1515195)
     float cloth = 1.0f;               ///< cloth constraints' stiffness
+    float cloth_stiffness_scale = 1.0f; ///< frames^(-cloth_exponent) = frames^1.725 (Havok substep-equivalent)
     float model_turn = 0.0f;          ///< the model preview's turn per 30 FPS frame (radians per stick unit)
     float dt_half = Frame30 * 0.5f;   ///< 1/60 s at 30 FPS (0.5 * dt), used by foliage wave timers (0x2313870)
+    alignas(16) float cloth_friction_scale[4] = {1.0f, 1.0f, 1.0f, 1.0f}; ///< dt-adapted cloth collision friction scale
 };
+static_assert(offsetof(Live, cloth_friction_scale) % 16 == 0,
+              "cloth_friction_scale must be 16-byte aligned for vmulps");
 Live* live = nullptr;
 float model_turn_base = 0.0f;         ///< the game's own model_turn (its constant, read at start)
+/// The game's exponent of Havok's stiffness adaptation (0x48d7bbc: -1.725), read at start.
+float cloth_exponent = -1.725f;
 int base_rate = 0;               /// the launched mode's rate (0 = truly uncapped)
 std::atomic<int> live_limit{0};
 std::atomic<u64> pacer_epoch{1};
@@ -469,27 +475,42 @@ void PS4_SYSV_ABI FrameStep(u64 pacer) {
     live->dt_half = dt * 0.5f;
     // The cloth setups' range checks of Stiffness, Rigid Factor and Allowed Compression (0x80d800
     // only warns) and a few uses of 1.0 next to them: the game's 1.0. The cloth follows the frame
-    // rate by its constraints' stiffness factor instead (ClothStiffnessFactor).
+    // rate by its constraints' stiffness factor (ClothStiffnessFactor) and collision friction hooks.
     // BB_CLOTH_STIFFNESS=value (diagnostics): another value there.
     static const float cloth_override = [] {
         const char* env = std::getenv("BB_CLOTH_STIFFNESS");
         return env && *env ? std::strtof(env, nullptr) : -1.0f;
     }();
     live->cloth = cloth_override > 0.0f ? cloth_override : 1.0f;
+    // Havok's native stiffness adaptation scales by (substeps_per_30Hz)^(-1.725). Running at
+    // 1/frames times the 30 FPS rate multiplies substeps/s by 1/frames, so the matching per-substep
+    // stiffness multiplier is frames^(-cloth_exponent) = frames^(+1.725) (1.0 at 30 FPS).
+    // BB_CLOTH_EXP=value (diagnostics, e.g. 1.0 for legacy linear scaling): override exponent.
+    static const float cloth_exp_override = [] {
+        const char* env = std::getenv("BB_CLOTH_EXP");
+        const float v = env && *env ? std::strtof(env, nullptr) : -1.0f;
+        return (v > 0.0f && v <= 3.0f) ? v : -1.0f;
+    }();
+    const double cloth_exp =
+        cloth_exp_override > 0.0f ? double(cloth_exp_override) : double(-cloth_exponent);
+    live->cloth_stiffness_scale = static_cast<float>(std::pow(frames_d, cloth_exp));
+    // Cloth collision friction is applied per substep as v_t *= (1 - f). Scaling f by
+    // (1 - (1 - f_ref)^frames) / f_ref (f_ref = 0.35) preserves 30 FPS tangential damping across
+    // 60..500 FPS so capes/mantles slide smoothly off shoulders instead of sticking like velcro.
+    constexpr double kClothFrictionRef = 0.35;
+    const float friction_scale = static_cast<float>(
+        (-std::expm1(frames_d * std::log(1.0 - kClothFrictionRef))) / kClothFrictionRef);
+    for (float& s : live->cloth_friction_scale) s = friction_scale;
 }
 
 // ---- Cloth: the constraints' stiffness factor per substep ----
-/// The game's exponent of Havok's stiffness adaptation (0x48d7bbc: -1.725), read at start.
-float cloth_exponent = -1.725f;
-
 /// Havok's stiffness factor of a constraint set for one substep (0x1167a80, replaced): `mode` 2
 /// adapts the constraints' stiffness to how often they are solved, (substeps x a x b)^-1.725
 /// (a, b the instance's scales at +0x1d0/+0x1d4), for a set of type 8 the iteration's share
-/// instead and for types 5 and 10 only the last substep. The substeps are per frame: at 191 FPS
-/// the cloth is solved 6.4 times as often as at 30 FPS by the same factor, and stiffer by as much
-/// (it flutters). The factor here is the game's x frames (the frame's length in 30 FPS frames):
-/// the cloth is pulled as far per second as at 30 FPS, whether or not it adapts to its own
-/// substeps. At 30 FPS it is the game's.
+/// instead and for types 5 and 10 only the last substep. The substeps are per frame: at high FPS
+/// the cloth is solved (1 / frames) times as often per second as at 30 FPS. Scaling by
+/// live->cloth_stiffness_scale = frames^1.725 matches Havok's own substep-count exponent so gravity
+/// sag, drape, and bend stiffness match 30 FPS at any frame rate (1.0 at 30 FPS).
 float PS4_SYSV_ABI ClothStiffnessFactor(const u8* set, int mode, int iteration, int substeps, float a,
                                         float b) {
     const std::uint32_t type = *reinterpret_cast<const std::uint32_t*>(set + 0x18);
@@ -510,8 +531,7 @@ float PS4_SYSV_ABI ClothStiffnessFactor(const u8* set, int mode, int iteration, 
     if (type == 5 || type == 8 || type == 10) {
         return game;
     }
-    const float frames = live->dt * 30.0f;
-    return game * frames;
+    return game * live->cloth_stiffness_scale;
 }
 
 // ---- Redirected constants: instruction (its RIP-relative operand), the constant, the value ----
@@ -764,6 +784,69 @@ bool HookClothStiffness() {
     return Detour(site, code, sizeof(code), e);
 }
 
+/// Havok Cloth collision friction is applied per substep as `v_t *= (1 - particle.friction)`
+/// with no dt scaling, causing capes/mantles to stick to shoulder/back colliders like velcro at
+/// 90..300+ FPS. Multiply each particle's loaded friction in registers by `live->cloth_friction_scale`
+/// (thread-safe, zero shared asset mutation, zero register clobber) across the landscape/pinch
+/// solver (0x7745e2) and all 8 collidable shape solvers (16 sites in 0x257c14d..0x2580bee).
+int HookClothFriction() {
+    const char* env = std::getenv("BB_CLOTH_FRICTION");
+    if (env && env[0] == '0' && env[1] == '\0') {
+        return 0;
+    }
+    const u64 scale_addr = reinterpret_cast<u64>(&live->cloth_friction_scale[0]);
+    int hooked = 0;
+
+    // 1. Landscape / pinch collision solver (0x7745e2: vbroadcastss xmm1, [rcx + rdi + 0xc], 7 B)
+    {
+        constexpr u64 site = 0x7745e2;
+        constexpr u8 code[7] = {0xc4, 0xe2, 0x79, 0x18, 0x4c, 0x39, 0x0c};
+        const u64 stub_addr = reinterpret_cast<u64>(stub_page + stub_used);
+        const std::int64_t disp = std::int64_t(scale_addr) - std::int64_t(stub_addr + sizeof(code) + 8);
+        if (disp == std::int32_t(disp)) {
+            Emitter e;
+            for (const u8 b : code) e.Bytes({b});
+            e.Bytes({0xc5, 0xf0, 0x59, 0x0d}); // vmulps xmm1, xmm1, [rip + disp32]
+            e.U32(static_cast<std::uint32_t>(std::int32_t(disp)));
+            e.JmpAbs(image_base + site + sizeof(code));
+            if (Detour(site, code, sizeof(code), e)) {
+                ++hooked;
+            }
+        }
+    }
+
+    // 2. All 8 Havok Cloth collidable shape solvers (2 paths each, 6 B vmovss xmm0, [reg1+reg2+0xc])
+    struct FrictionSite {
+        u64 site;
+        u8 sib; // 0x37 = [rdi + rsi + 0xc], 0x16 = [rsi + rdx + 0xc]
+    };
+    constexpr FrictionSite sites[] = {
+        {0x257c14d, 0x37}, {0x257c43e, 0x16},
+        {0x257cc6e, 0x37}, {0x257cf8e, 0x37},
+        {0x257d78f, 0x37}, {0x257da8e, 0x16},
+        {0x257e16d, 0x37}, {0x257e45e, 0x16},
+        {0x257eb4d, 0x37}, {0x257ee3e, 0x16},
+        {0x257f52d, 0x37}, {0x257f81e, 0x16},
+        {0x257ff0d, 0x37}, {0x258020e, 0x16},
+        {0x25808fd, 0x37}, {0x2580bee, 0x16},
+    };
+    for (const FrictionSite& s : sites) {
+        const u8 code[6] = {0xc5, 0xfa, 0x10, 0x44, s.sib, 0x0c};
+        const u64 stub_addr = reinterpret_cast<u64>(stub_page + stub_used);
+        const std::int64_t disp = std::int64_t(scale_addr) - std::int64_t(stub_addr + sizeof(code) + 8);
+        if (disp != std::int32_t(disp)) continue;
+        Emitter e;
+        for (const u8 b : code) e.Bytes({b});
+        e.Bytes({0xc5, 0xfa, 0x59, 0x05}); // vmulss xmm0, xmm0, [rip + disp32]
+        e.U32(static_cast<std::uint32_t>(std::int32_t(disp)));
+        e.JmpAbs(image_base + s.site + sizeof(code));
+        if (Detour(s.site, code, sizeof(code), e)) {
+            ++hooked;
+        }
+    }
+    return hooked;
+}
+
 /// Foliage wind/interaction sway in 0x2313870:
 /// - At 0x23149ea (`vmovdqa xmm14, [rbp - 0x170]`), `xmm14` multiplies the already-integrated
 ///   wind phase `[rbp - 0x190]` (`[rdi + 0x1b4]`, advanced by `live->dt` in 0x29552d0) and sway
@@ -859,6 +942,7 @@ void PatchImage(unsigned char* image, std::uint64_t image_size) {
     const bool foliage = HookFoliageSway();
     const int run = HookRunSpeed();
     const bool cloth = HookClothStiffness();
+    const int cloth_friction = HookClothFriction();
     int redirected = 0;
     for (const Redirect& r : Redirects) {
         if (RedirectOperand(r)) {
@@ -887,14 +971,15 @@ void PatchImage(unsigned char* image, std::uint64_t image_size) {
     std::printf("Frame rate: free (hooks, no patches): the game steps by each frame's time "
                 "(pacer=%s%s, sim=1/%d..1/30 s); %d fixed steps, %d of %zu per-frame values follow the frame's "
                 "time, foliage sway=%s, pacer usleep spin=%d/3, the run's wall check %s, "
-                "the cloth's stiffness %s\n",
+                "the cloth's stiffness %s (exp=%.3f, friction=%d/17)\n",
                 live->shortest > 0.0f ? "capped" : "truly uncapped (0.0 ms)",
                 pacer_wait_hooked ? " + monotonic-abstime" : "", MaxRate,
                 steps, redirected, std::size(Redirects),
                 foliage ? "fixed-amplitude + dt-phase" : "unchanged", spin_redirected,
                 run == 1 ? "by speed" : run == 2 ? "by speed (a Sprint Fix patch did it already)"
                                                  : "unchanged (not found)",
-                cloth ? "by solves per second" : "per frame (not found)");
+                cloth ? "by solves per second" : "per frame (not found)",
+                -cloth_exponent, cloth_friction);
 }
 
 bool CleanPacerEnabled() noexcept {
