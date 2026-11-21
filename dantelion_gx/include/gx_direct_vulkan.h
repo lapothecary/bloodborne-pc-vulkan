@@ -73,6 +73,9 @@ GX_HOST_IMPORT void bb_direct_vk_retire_shader_range(const void* gpu_addr,
 
 // V5.1: Native C++20 PC PostFX, Resolution, Heap & Hardware Fix Controls
 GX_HOST_IMPORT int bb_direct_vk_is_effect_enabled(uint32_t effect_index) noexcept;
+GX_HOST_IMPORT void bb_direct_vk_motion_blur_scales(float* out_time_scale,
+                                                    float* out_max_len_scale,
+                                                    float* out_cam_thresh_scale) noexcept;
 GX_HOST_IMPORT uint32_t bb_direct_vk_gx_command_heap_bytes() noexcept;
 GX_HOST_IMPORT int bb_direct_vk_intel_tonemap_fix() noexcept;
 GX_HOST_IMPORT int bb_direct_vk_light_grid_override(uint32_t* out_w, uint32_t* out_h) noexcept;
@@ -456,6 +459,18 @@ inline bool IsEffectEnabled(uint32_t effect_index) noexcept {
         return true;
     }
     return bb_direct_vk_is_effect_enabled(effect_index) != 0;
+}
+
+inline void GetMotionBlurScales(float& out_time_scale,
+                                float& out_max_len_scale,
+                                float& out_cam_thresh_scale) noexcept {
+    out_time_scale = 1.0f;
+    out_max_len_scale = 1.0f;
+    out_cam_thresh_scale = 1.0f;
+    if (!EnabledV5Sub(kV5Sub_NativePostFx) || !bb_direct_vk_motion_blur_scales) {
+        return;
+    }
+    bb_direct_vk_motion_blur_scales(&out_time_scale, &out_max_len_scale, &out_cam_thresh_scale);
 }
 
 inline uint32_t GxCommandHeapBytes() noexcept {

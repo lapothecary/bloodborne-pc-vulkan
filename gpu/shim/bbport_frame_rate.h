@@ -35,4 +35,6 @@ std::uint64_t PacerEpoch() noexcept;
 /// when capped in Mailbox/Immediate so variable render durations (2.4..4.8 ms) do not cause
 /// early burst presents (172-175 FPS) or 2.5 ms phase jitter.
 bool PresentPacingEnabled() noexcept;
+/// Latest simulation frame delta in 30 FPS units (`dt * 30.0f`: 1.0 at 30 FPS, ~0.176 at 170 FPS).
+float CurrentFramesPer30() noexcept;
 } // namespace BbFrameRate

@@ -90,6 +90,7 @@ struct alignas(64) Live {
 static_assert(offsetof(Live, cloth_friction_scale) % 16 == 0,
               "cloth_friction_scale must be 16-byte aligned for vmulps");
 Live* live = nullptr;
+std::atomic<float> current_frames_per_30{1.0f};
 float model_turn_base = 0.0f;         ///< the game's own model_turn (its constant, read at start)
 /// The game's exponent of Havok's stiffness adaptation (0x48d7bbc: -1.725), read at start.
 float cloth_exponent = -1.725f;
@@ -470,6 +471,7 @@ void PS4_SYSV_ABI FrameStep(u64 pacer) {
     live->grow12 = static_cast<float>(std::pow(1.2, frames_d));
     live->decay65 = static_cast<float>(std::pow(0.65, frames_d));
     live->slope_accel = frames;
+    current_frames_per_30.store(frames, std::memory_order_relaxed);
     live->decay60 = static_cast<float>(std::pow(0.6, frames_d));
     live->model_turn = model_turn_base * frames;
     live->dt_half = dt * 0.5f;
@@ -1050,5 +1052,10 @@ bool PresentPacingEnabled() noexcept {
         return !env || !*env || !(env[0] == '0' && env[1] == '\0');
     }();
     return enabled;
+}
+
+float CurrentFramesPer30() noexcept {
+    const float f = current_frames_per_30.load(std::memory_order_relaxed);
+    return (f > 0.0f && std::isfinite(f)) ? std::clamp(f, 0.05f, 1.5f) : 1.0f;
 }
 } // namespace BbFrameRate

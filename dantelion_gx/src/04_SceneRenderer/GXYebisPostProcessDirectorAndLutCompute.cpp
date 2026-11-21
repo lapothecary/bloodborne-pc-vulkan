@@ -2546,9 +2546,13 @@ void sub_21d5f80(void* self, void* renderCmdCtx, void* filterParam) {
         const int32_t mbType = ((resetFlags & 2u) != 0u)
                                    ? 1
                                    : *reinterpret_cast<const int32_t*>(param + 0x1e0);
+        float mbTimeScale = 1.0f;
+        float mbMaxLenScale = 1.0f;
+        float mbCamThreshScale = 1.0f;
+        gx_direct_vk::GetMotionBlurScales(mbTimeScale, mbMaxLenScale, mbCamThreshScale);
         const bool objMoved  = gx_direct_vk::ConsumeActiveObjectVelocity();
         const bool hasObjVel = (mbType == 2) && (velWrap != nullptr) && objMoved;
-        const bool camMoved  = (maxCamDelta > f0_0001) || hasObjVel;
+        const bool camMoved  = (maxCamDelta > (f0_0001 * mbCamThreshScale)) || hasObjVel;
         const bool mbAllowed = gx_direct_vk::IsEffectEnabled(gx_direct_vk::kEffectMotionBlur) &&
                                (*reinterpret_cast<const int32_t*>(param + 0x1dc) != 0) &&
                                camMoved;
@@ -2601,8 +2605,8 @@ void sub_21d5f80(void* self, void* renderCmdCtx, void* filterParam) {
         sub_bb38f0(ppfxCtx,
                    mbSamp0,
                    mbSamp1,
-                   *reinterpret_cast<const float*>(param + 0x1e4),
-                   *reinterpret_cast<const float*>(param + 0x1e8),
+                   *reinterpret_cast<const float*>(param + 0x1e4) * mbTimeScale,
+                   *reinterpret_cast<const float*>(param + 0x1e8) * mbMaxLenScale,
                    *reinterpret_cast<const float*>(param + 0x1f4));
         sub_bb3900(ppfxCtx,
                    (*reinterpret_cast<const int32_t*>(param + 0x200) != 0) ? 1u : 0u,

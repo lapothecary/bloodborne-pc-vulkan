@@ -325,6 +325,16 @@ void Set(Values& v, const std::string& key, const std::string& value) {
         v.hdr_output = (value != "0" && value != "false" && value != "off");
     } else if (key == "pcss_shadows") {
         v.pcss_shadows = (value != "0" && value != "false" && value != "off");
+    } else if (key == "ssgi_enabled") {
+        v.ssgi_enabled = (value != "0" && value != "false" && value != "off");
+    } else if (key == "motion_blur_strength") {
+        if (value == "low" || value == "0") {
+            v.motion_blur_strength = 0;
+        } else if (value == "high" || value == "2") {
+            v.motion_blur_strength = 2;
+        } else {
+            v.motion_blur_strength = 1;
+        }
     } else if (key == "bgm_volume") {
         v.bgm_volume = std::clamp(i, 0, 10);
         v.native_chosen_mask.fetch_or(Values::NativeBgmVolume, std::memory_order_relaxed);
@@ -726,6 +736,7 @@ void Load() {
         {"BB_SSAO_QUALITY", "ssao_quality"},        {"BB_CONTACT_SHADOWS", "contact_shadows"},
         {"BB_SSR_QUALITY", "ssr_quality"},          {"BB_TRUE_BLACK_HDR", "true_black_hdr"},
         {"BB_HDR_OUTPUT", "hdr_output"},            {"BB_PCSS_SHADOWS", "pcss_shadows"},
+        {"BB_SSGI", "ssgi_enabled"},                {"BB_MOTION_BLUR_STRENGTH", "motion_blur_strength"},
         {"BB_CAMERA_FOLLOW", "camera_follow_mode"},
     };
     // Frame generation is hidden in the menu until its artifacts are fixed: only BB_FRAME_GEN turns
@@ -930,6 +941,9 @@ void Save() {
     put("true_black_hdr", flag(v.true_black_hdr.load()));
     put("hdr_output", flag(v.hdr_output.load()));
     put("pcss_shadows", flag(v.pcss_shadows.load()));
+    put("ssgi_enabled", flag(v.ssgi_enabled.load()));
+    const int mbs = std::clamp(v.motion_blur_strength.load(), 0, 2);
+    put("motion_blur_strength", mbs == 0 ? "low" : (mbs == 2 ? "high" : "default"));
     const std::uint32_t nmask = v.native_chosen_mask.load(std::memory_order_relaxed);
     if (nmask & Values::NativeBgmVolume) put("bgm_volume", std::to_string(std::clamp(v.bgm_volume.load(), 0, 10)));
     if (nmask & Values::NativeSeVolume) put("se_volume", std::to_string(std::clamp(v.se_volume.load(), 0, 10)));

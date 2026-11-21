@@ -819,6 +819,27 @@ void Menu() {
         if (e == 4) continue; // effect_game_aa is controlled by the Anti-Aliasing combo above
         const auto& effect = BbSettings::Effects[e];
         Checkbox(BbSettings::MenuText(effect.label, effect.label_ru), s.effects[e]);
+        if (e == 2 && s.effects[2].load(std::memory_order_relaxed)) {
+            int mb_str = std::clamp(s.motion_blur_strength.load(std::memory_order_relaxed), 0, 2);
+            const char* mb_labels[3] = {
+                BbSettings::MenuText("Low (Subtle)", "Низкий (мягкий)"),
+                BbSettings::MenuText("Default (PS4 30-FPS Parity)", "Стандарт (как на PS4 при любом FPS)"),
+                BbSettings::MenuText("High (Cinematic)", "Высокий (кинематографичный)"),
+            };
+            ImGui::Indent(20.0f);
+            ImGui::SetNextItemWidth(-120.0f);
+            if (ImGui::BeginCombo(BbSettings::MenuText("Motion blur strength", "Сила размытия"),
+                                  mb_labels[mb_str])) {
+                for (int k = 0; k < 3; ++k) {
+                    if (ImGui::Selectable(mb_labels[k], mb_str == k)) {
+                        s.motion_blur_strength.store(k, std::memory_order_relaxed);
+                        BbSettings::Save();
+                    }
+                }
+                ImGui::EndCombo();
+            }
+            ImGui::Unindent(20.0f);
+        }
         if (std::string_view(effect.key) == "debug_camera") {
             Hint(BbSettings::MenuText("Hold Cross and press L3 (keyboard: F + Left Ctrl).",
                                       "Удерживайте Cross и нажмите L3 (клавиатура: F + Left Ctrl)."));
@@ -880,13 +901,15 @@ void Menu() {
         "softening for torches, lanterns, and bonfires: sharp at contact, smoothly soft at distance.",
         "Физическая полутень по дистанции до препятствия для 4K теней солнца/луны и мягкое "
         "размытие теней от факелов, фонарей и костров: чёткие у основания, плавно мягкие вдали."));
-    BbGuestHooks::ApplyGameEffects();
+    Checkbox(BbSettings::MenuText("Screen-Space Global Illumination (SSGI)",
+                                  "Отражённый свет (SSGI)"),
+             s.ssgi_enabled);
     Hint(BbSettings::MenuText(
-        "All visual effects (including SSR reflections, Bloom, DoF, Motion Blur, SSAO, and Model LOD) "
-        "switch live in-game. Skip intro videos, free camera, and debug menu apply on startup.",
-        "Все графические эффекты (включая отражения SSR, Bloom, DoF, Motion Blur, SSAO и детализацию "
-        "моделей) переключаются в игре на лету. Пропуск заставок, свободная камера и debug menu "
-        "применяются при запуске."));
+        "Horizon-based indirect bounce lighting (HBIL) in the linear deferred composite pass: "
+        "warm fire, lanterns, and crimson sky softly bounce onto cobblestones, arches, and cloaks.",
+        "Горизонтно-окклюзионный отражённый свет (SSGI) в линейном пайплайне освещения: "
+        "тёплый свет костров, факелов, фонарей и неба мягко отражается на камнях, стенах и плаще."));
+    BbGuestHooks::ApplyGameEffects();
 
     bool restart =
         s.object_motion != s.startup_object_motion || BbSettings::ResolutionNeedsRestart();

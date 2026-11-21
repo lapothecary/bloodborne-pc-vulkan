@@ -239,6 +239,10 @@ struct Values {
     std::atomic<bool> hdr_output{false};
     /// PCSS Contact-Hardening Soft Shadows (blocker-distance penumbra for 4K CSM + VSM point lights).
     std::atomic<bool> pcss_shadows{false};
+    /// Horizon-Based Screen-Space Global Illumination (HBIL indirect bounce lighting in GXLightComposite).
+    std::atomic<bool> ssgi_enabled{false};
+    /// Motion Blur strength (FPS-normalized shutter): 0 = Low, 1 = Default (PS4 30-FPS parity), 2 = High.
+    std::atomic<int> motion_blur_strength{1};
 
     // --- Native Bloodborne System Options (CSOptionsData <-> bbport.ini <-> Launcher) -----------
     enum NativeMaskBit : std::uint32_t {

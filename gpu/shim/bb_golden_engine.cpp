@@ -6,6 +6,7 @@
 // (dantelion_gx / libbb_gx_engine_native.a) into bb_vulkan.
 // ============================================================================
 #include "bb_golden_engine.h"
+#include "bbport_frame_rate.h"
 #include "bbport_guest_code_hooks.h"
 #include "bbport_heap_sites.h"
 #include "bbport_settings.h"
@@ -211,6 +212,23 @@ int GX_SYSV_ABI bb_direct_vk_is_effect_enabled(std::uint32_t effect_index) noexc
         return BbSettings::Get().effects[effect_index].load(std::memory_order_relaxed) ? 1 : 0;
     }
     return 1;
+}
+
+void GX_SYSV_ABI bb_direct_vk_motion_blur_scales(float* out_time_scale,
+                                                 float* out_max_len_scale,
+                                                 float* out_cam_thresh_scale) noexcept {
+    // Normalize Yebis2 1-frame velocity blur to 30 FPS shutter philosophy at any FPS
+    // (30 FPS -> 1.0x, 60 FPS -> 2.0x, 170 FPS -> 5.67x), modulated by user strength preset:
+    // 0 = Low (0.45x), 1 = Default (1.0x PS4 parity), 2 = High (1.75x).
+    const float frames = std::clamp(BbFrameRate::CurrentFramesPer30(), 0.05f, 1.5f);
+    const float fps_scale = std::clamp(1.0f / frames, 1.0f, 12.0f);
+    const int strength = std::clamp(
+        BbSettings::Get().motion_blur_strength.load(std::memory_order_relaxed), 0, 2);
+    const float time_mult = (strength == 0) ? 0.45f : ((strength == 2) ? 1.75f : 1.00f);
+    const float len_mult  = (strength == 0) ? 0.65f : ((strength == 2) ? 1.60f : 1.00f);
+    if (out_time_scale)       *out_time_scale       = fps_scale * time_mult;
+    if (out_max_len_scale)    *out_max_len_scale    = len_mult;
+    if (out_cam_thresh_scale) *out_cam_thresh_scale = frames;
 }
 
 extern "C" void GX_SYSV_ABI bb_direct_vk_note_vel_silhouette_mask() noexcept {

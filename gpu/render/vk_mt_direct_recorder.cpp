@@ -3276,6 +3276,7 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
         if (settings.ssr_quality.load(std::memory_order_relaxed))     m |= 0x04u;
         if (settings.true_black_hdr.load(std::memory_order_relaxed))  m |= 0x08u;
         if (settings.pcss_shadows.load(std::memory_order_relaxed))    m |= 0x10u;
+        if (settings.ssgi_enabled.load(std::memory_order_relaxed))    m |= 0x20u;
         return m;
     }();
     static const bool all_motion = [] {

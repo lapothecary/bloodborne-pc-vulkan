@@ -310,7 +310,7 @@ constexpr int DisplaySlotCount = 11; ///< all 11 Display settings fit on a singl
 constexpr int TotalDisplayItems = 12;
 constexpr int MaxDisplayScroll = TotalDisplayItems - DisplaySlotCount;
 constexpr int EffectsSlotCount = 11; ///< all 11 Effects settings fit on a single screen (0 scroll)
-constexpr int TotalEffectsItems = 13;
+constexpr int TotalEffectsItems = 14;
 constexpr int MaxEffectsScroll = TotalEffectsItems - EffectsSlotCount;
 constexpr int MaxChoicesPerSlot = 16;
 constexpr int DefaultResetSentinel = -999;
@@ -2423,8 +2423,8 @@ constexpr EffectsItemMeta EffectsItems[TotalEffectsItems] = {
      "Cinematic background blur for objects outside the camera focus plane",
      "Кинематографическое размытие дальнего фона и объектов вне фокуса камеры", true},
     {"Motion Blur", "Размытие в движении",
-     "Camera and per-object motion blur during fast turns and dodges",
-     "Размытие при резких поворотах камеры и перекатах персонажа", true},
+     "FPS-normalized camera & per-object motion blur (Off / Low / Default / High — identical feel at any FPS)",
+     "Размытие камеры и объектов с адаптацией под любой FPS (Выкл / Низкий / Стандарт / Высокий)", true},
     {"Ambient Occlusion (SSAO)", "Затенение SSAO",
      "Soft contact shading in corners, cobblestones, and cloth folds (adds depth)",
      "Мягкое контактное затенение в углах, щелях брусчатки и складках одежды", true},
@@ -2455,6 +2455,9 @@ constexpr EffectsItemMeta EffectsItems[TotalEffectsItems] = {
     {"PCSS Soft Shadows", "Мягкие тени PCSS",
      "Vulkan 1.3 Remaster: physical contact-hardening soft shadows for 4K sun/moon CSM and torch/lantern VSM",
      "Ремастер Vulkan 1.3: физически мягкие тени PCSS (чёткие у основания, мягкие вдали) для луны, факелов и костров", false},
+    {"Screen-Space GI (SSGI)", "Отражённый свет (SSGI)",
+     "Vulkan 1.3 Remaster: horizon-based indirect bounce lighting from fire, lanterns, torches, and sunset sky",
+     "Ремастер Vulkan 1.3: живой отражённый свет (SSGI) от костров, факелов, фонарей и закатного неба на камни и одежду", false},
 };
 
 constexpr int EffectsItemToEffectIdx(int item_idx) {
@@ -2481,6 +2484,7 @@ bool GetEffectsItemActive(int item_idx) {
     case 10: return s.true_black_hdr.load();
     case 11: return s.hdr_output.load();
     case 12: return s.pcss_shadows.load();
+    case 13: return s.ssgi_enabled.load();
     default: return false;
     }
 }
@@ -2490,6 +2494,9 @@ void SetEffectsItemActive(int item_idx, bool active) {
     const int e = EffectsItemToEffectIdx(item_idx);
     if (e >= 0) {
         s.effects[e] = active;
+        if (item_idx == 2 && active) {
+            s.motion_blur_strength = 1; // Default when Reset to Defaults runs
+        }
         values[FirstEffect + e] = active ? 1 : 0;
         applied[FirstEffect + e] = active ? 1 : 0;
         bytes[FirstEffect + e] = u8(active ? 1 : 0);
@@ -2504,6 +2511,7 @@ void SetEffectsItemActive(int item_idx, bool active) {
             s.swapchain_generation.fetch_add(1, std::memory_order_relaxed);
             break;
         case 12: s.pcss_shadows = active; break;
+        case 13: s.ssgi_enabled = active; break;
         default: break;
         }
     }
@@ -2511,10 +2519,28 @@ void SetEffectsItemActive(int item_idx, bool active) {
     BbSettings::Save();
 }
 
+int GetMotionBlurMenuChoiceIdx() {
+    const auto& s = BbSettings::Get();
+    if (!s.effects[2].load()) return 0;
+    return std::clamp(s.motion_blur_strength.load(), 0, 2) + 1; // 1=Low, 2=Default, 3=High
+}
+
 void BuildEffectsSlotChoices(int slot, std::vector<u32>& out_choices, int& out_selected_idx) {
     out_choices.clear();
     const int item_idx = std::clamp(effects_scroll + slot, 0, TotalEffectsItems - 1);
     const u32 base_id = EffectsSlotChoices + u32(slot * 4);
+    if (item_idx == 2) {
+        SetDynamic(base_id + 0, "Off", "Выкл");
+        SetDynamic(base_id + 1, "Low", "Низкий");
+        SetDynamic(base_id + 2, "Default", "Стандарт");
+        SetDynamic(base_id + 3, "High", "Высокий");
+        out_choices.push_back(base_id + 0);
+        out_choices.push_back(base_id + 1);
+        out_choices.push_back(base_id + 2);
+        out_choices.push_back(base_id + 3);
+        out_selected_idx = GetMotionBlurMenuChoiceIdx();
+        return;
+    }
     SetDynamic(base_id + 0, "Off", "Выкл");
     SetDynamic(base_id + 1, "On", "Вкл");
     out_choices.push_back(base_id + 0);
@@ -2527,6 +2553,13 @@ void RefreshEffectsSlotTexts(int slot) {
     const auto& meta = EffectsItems[item_idx];
     SetDynamic(EffectsSlotName + u32(slot), meta.name_en, meta.name_ru);
     SetDynamic(EffectsSlotHelp + u32(slot), meta.help_en, meta.help_ru);
+    if (item_idx == 2) {
+        const int idx = GetMotionBlurMenuChoiceIdx();
+        static constexpr const char* kEn[4] = {"Off", "Low", "Default", "High"};
+        static constexpr const char* kRu[4] = {"Выкл", "Низкий", "Стандарт", "Высокий"};
+        SetDynamic(EffectsSlotVal + u32(slot), kEn[idx], kRu[idx]);
+        return;
+    }
     const bool on = GetEffectsItemActive(item_idx);
     SetDynamic(EffectsSlotVal + u32(slot), on ? "On" : "Off", on ? "Вкл" : "Выкл");
 }
@@ -2594,6 +2627,24 @@ void InitEffectsPage(void* page) {
 
 void ApplyEffectsSlotChoiceIndex(u8* row, int slot, int choice_idx) {
     const int item_idx = std::clamp(effects_scroll + slot, 0, TotalEffectsItems - 1);
+    if (item_idx == 2) {
+        const int clamped = std::clamp(choice_idx, 0, 3);
+        auto& s = BbSettings::Get();
+        const bool new_active = (clamped != 0);
+        const int new_strength = (clamped > 0) ? (clamped - 1) : s.motion_blur_strength.load();
+        if (new_active != s.effects[2].load() || new_strength != s.motion_blur_strength.load()) {
+            s.motion_blur_strength = new_strength;
+            s.effects[2] = new_active;
+            values[FirstEffect + 2] = new_active ? 1 : 0;
+            applied[FirstEffect + 2] = new_active ? 1 : 0;
+            bytes[FirstEffect + 2] = u8(new_active ? 1 : 0);
+            BbGuestHooks::ApplyGameEffects();
+            BbSettings::Save();
+        }
+        RefreshEffectsSlotTexts(slot);
+        UpdateEffectsSlotRowDisplay(row, slot);
+        return;
+    }
     const bool new_active = (choice_idx != 0);
     if (new_active != GetEffectsItemActive(item_idx)) {
         SetEffectsItemActive(item_idx, new_active);
@@ -2605,6 +2656,13 @@ void ApplyEffectsSlotChoiceIndex(u8* row, int slot, int choice_idx) {
 void StepEffectsSlotSetting(u8* row, int slot, int delta) {
     if (delta == 0) return;
     const int item_idx = std::clamp(effects_scroll + slot, 0, TotalEffectsItems - 1);
+    if (item_idx == 2) {
+        const int cur = GetMotionBlurMenuChoiceIdx();
+        const int next = (cur + (delta > 0 ? 1 : 3)) % 4;
+        PlayMenuStepSound();
+        ApplyEffectsSlotChoiceIndex(row, slot, next);
+        return;
+    }
     const bool cur = GetEffectsItemActive(item_idx);
     PlayMenuStepSound();
     ApplyEffectsSlotChoiceIndex(row, slot, cur ? 0 : 1);

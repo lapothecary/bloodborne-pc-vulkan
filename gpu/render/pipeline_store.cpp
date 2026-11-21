@@ -168,6 +168,16 @@ bool IsOpt38StageC2ShaderHash(u64 pgm_hash) noexcept {
     }
 }
 
+bool IsOpt40RemasterSsgiShaderHash(u64 pgm_hash) noexcept {
+    switch (pgm_hash) {
+    // Remaster-v2 Stage 1.3: Horizon-Based SSGI in GXLightComposite (ps_32e47788_atmos_fog)
+    case 0x0000000032e47788ULL:
+        return true;
+    default:
+        return false;
+    }
+}
+
 bool IsOpt39RemasterPcssShaderHash(u64 pgm_hash) noexcept {
     switch (pgm_hash) {
     // Remaster-v2 Stage 1.2: PCSS contact-hardening soft shadows (4K CSM + 5 cubemap VSM point-light shaders)
@@ -208,25 +218,27 @@ std::string OptBinaryName(u64 pgm_hash, size_t perm_idx) {
     if (hw_interp) {
         if (fast_fp) {
             prefix = use_native_prefix
-                         ? (IsOpt39RemasterPcssShaderHash(pgm_hash)
-                                ? "opt39"
-                                : (IsOpt38StageC2ShaderHash(pgm_hash)
-                                       ? "opt38"
-                                       : (IsOpt37StageC1ShaderHash(pgm_hash)
-                                              ? "opt37"
-                                              : (IsOpt36BgraFixShaderHash(pgm_hash)
-                                                     ? "opt36"
-                                                     : (IsOpt35Phase5ShaderHash(pgm_hash)
-                                                            ? "opt35"
-                                                            : (IsOpt33Phase2ShaderHash(pgm_hash)
-                                                                   ? "opt33"
-                                                                   : ((pgm_hash ==
-                                                                           0x0000000024042a9bULL ||
-                                                                       pgm_hash ==
-                                                                           0x00000000f55643deULL ||
-                                                                       ltb_patched)
-                                                                          ? "opt32"
-                                                                          : "opt31")))))))
+                         ? (IsOpt40RemasterSsgiShaderHash(pgm_hash)
+                                ? "opt41"
+                                : (IsOpt39RemasterPcssShaderHash(pgm_hash)
+                                       ? "opt39"
+                                       : (IsOpt38StageC2ShaderHash(pgm_hash)
+                                              ? "opt38"
+                                              : (IsOpt37StageC1ShaderHash(pgm_hash)
+                                                     ? "opt37"
+                                                     : (IsOpt36BgraFixShaderHash(pgm_hash)
+                                                            ? "opt36"
+                                                            : (IsOpt35Phase5ShaderHash(pgm_hash)
+                                                                   ? "opt35"
+                                                                   : (IsOpt33Phase2ShaderHash(pgm_hash)
+                                                                          ? "opt33"
+                                                                          : ((pgm_hash ==
+                                                                                  0x0000000024042a9bULL ||
+                                                                              pgm_hash ==
+                                                                                  0x00000000f55643deULL ||
+                                                                              ltb_patched)
+                                                                                 ? "opt32"
+                                                                                 : "opt31"))))))))
                          : (ltb_patched ? "opt6_ltb2" : "opt6_nonat");
         } else {
             prefix = ltb_patched ? "opt3_ltb2" : "opt3_strict";
