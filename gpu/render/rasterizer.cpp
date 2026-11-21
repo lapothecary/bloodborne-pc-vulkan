@@ -13,6 +13,8 @@
 #include "render/vk_vsm_shadow_memo.h"
 #include "render/vk_obj_vel_cull.h"
 #include "render/vk_vfx_ui_batch.h"
+#include "render/vk_native_postfx.h"
+#include "shim/bbport_frame_rate.h"
 #include "shim/bbport_settings.h"
 #include "textures/direct_textures.h"
 #include "../../dantelion_gx/include/gx_direct_vulkan.h"
@@ -1206,6 +1208,8 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     upscaler = std::make_unique<TemporalUpscaler>(instance, scheduler, texture_cache, runtime,
                                                   *camera_motion, *scene_targets);
     prompts = std::make_unique<ButtonPrompts>(instance, scheduler, buffer_cache);
+    native_postfx = std::make_unique<NativePostFx>(instance, scheduler, texture_cache,
+                                                   buffer_cache, runtime);
     if (!EmulatorSettings.IsNullGPU()) {
         liverpool->BindRasterizer(this);
     }
@@ -3991,8 +3995,21 @@ void Rasterizer::ScaleToTarget(const GraphicsPipeline* pipeline) {
         if (settings.pcss_shadows.load(std::memory_order_relaxed))    fx_mask |= 0x10u;
         if (settings.ssgi_enabled.load(std::memory_order_relaxed))    fx_mask |= 0x20u;
         frame_fx_mask = fx_mask;
+        const u8 mb_cam = static_cast<u8>(
+            std::clamp(settings.motion_blur_camera.load(std::memory_order_relaxed), 0, 3));
+        const u8 mb_obj = static_cast<u8>(
+            std::clamp(settings.motion_blur_object.load(std::memory_order_relaxed), 0, 3));
+        const u8 mb_native_bit =
+            settings.native_postfx.load(std::memory_order_relaxed) ? 0x10u : 0x00u;
+        frame_mb_mask = static_cast<u8>((mb_cam & 0x3u) | ((mb_obj & 0x3u) << 2u) | mb_native_bit);
+        const float mb_frames = std::clamp(BbFrameRate::CurrentFramesPer30(), 0.05f, 1.5f);
+        const float mb_fps_scale = std::clamp(1.0f / mb_frames, 1.0f, 12.0f);
+        frame_mb_fps_q4 = static_cast<u8>(
+            std::clamp(static_cast<int>(std::lround(mb_fps_scale * 16.0f)), 16, 255));
         frame_fx_mask_valid = true;
     }
+    push_data.buf_offsets[37] = frame_mb_fps_q4;
+    push_data.buf_offsets[38] = frame_mb_mask;
     push_data.buf_offsets[39] = frame_fx_mask;
 }
 

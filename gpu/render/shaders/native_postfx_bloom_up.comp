@@ -1,0 +1,45 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Native Vulkan 1.3 Post-Process — Step 2: FP16 9-tap Tent Bloom Upsample & Progressive Combine.
+#version 460
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform texture2D lower_mip_tex;
+layout(set = 0, binding = 1) uniform sampler linear_samp;
+layout(set = 0, binding = 2, rgba16f) uniform image2D dst_img;
+
+layout(push_constant) uniform BloomUpPush {
+    uint dst_w;
+    uint dst_h;
+    float radius_x; // in UV units (resolution-independent aspect-corrected filter radius)
+    float radius_y;
+    float up_weight;
+    float cur_weight;
+} pc;
+
+void main() {
+    const uvec2 px = gl_GlobalInvocationID.xy;
+    if (px.x >= pc.dst_w || px.y >= pc.dst_h) {
+        return;
+    }
+
+    const vec2 uv = (vec2(px) + 0.5) / vec2(float(pc.dst_w), float(pc.dst_h));
+    const float rx = pc.radius_x;
+    const float ry = pc.radius_y;
+
+    // 9-tap tent filter (1-2-1 x 1-2-1 / 16): ultra-smooth isotropic circular halo, zero box artifacts.
+    vec3 up = textureLod(sampler2D(lower_mip_tex, linear_samp), uv + vec2(-rx, -ry), 0.0).rgb * 1.0
+            + textureLod(sampler2D(lower_mip_tex, linear_samp), uv + vec2(0.0, -ry), 0.0).rgb * 2.0
+            + textureLod(sampler2D(lower_mip_tex, linear_samp), uv + vec2( rx, -ry), 0.0).rgb * 1.0
+            + textureLod(sampler2D(lower_mip_tex, linear_samp), uv + vec2(-rx, 0.0), 0.0).rgb * 2.0
+            + textureLod(sampler2D(lower_mip_tex, linear_samp), uv,                  0.0).rgb * 4.0
+            + textureLod(sampler2D(lower_mip_tex, linear_samp), uv + vec2( rx, 0.0), 0.0).rgb * 2.0
+            + textureLod(sampler2D(lower_mip_tex, linear_samp), uv + vec2(-rx,  ry), 0.0).rgb * 1.0
+            + textureLod(sampler2D(lower_mip_tex, linear_samp), uv + vec2(0.0,  ry), 0.0).rgb * 2.0
+            + textureLod(sampler2D(lower_mip_tex, linear_samp), uv + vec2( rx,  ry), 0.0).rgb * 1.0;
+    up *= (1.0 / 16.0);
+
+    const vec3 cur = imageLoad(dst_img, ivec2(px)).rgb;
+    const vec3 combined = max(cur * pc.cur_weight + up * pc.up_weight, vec3(0.0));
+    imageStore(dst_img, ivec2(px), vec4(combined, 1.0));
+}

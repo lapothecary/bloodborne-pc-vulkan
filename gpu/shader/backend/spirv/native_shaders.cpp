@@ -153,6 +153,7 @@
 #include "bbgpu/shaders/ps_0f54e5f9_2d_frag.h"
 #include "bbgpu/shaders/ps_0f54e5f9_arr_frag.h"
 #include "bbgpu/shaders/ps_d3c8bb21_frag.h"
+#include "bbgpu/shaders/ps_34bc187c_frag.h"
 
 namespace Shader::Backend::SPIRV {
 
@@ -224,7 +225,7 @@ struct NativeShaderCandidate {
     const char* label;
 };
 
-constexpr std::array<NativeShaderCandidate, 141> kNativeRegistry{{
+constexpr std::array<NativeShaderCandidate, 142> kNativeRegistry{{
     {0x000000000f61fd27ull, PS_0F61FD27_VSM_BLUR_FRAG, "ps_0f61fd27_vsm_blur"},
     {0x000000001ae03d75ull, PS_1AE03D75_VSM_MOMENT_CLDIST_FRAG, "ps_1ae03d75_vsm_moment_cldist"},
     {0x000000001ae03d75ull, PS_1AE03D75_VSM_MOMENT_NOCLIP_FRAG, "ps_1ae03d75_vsm_moment_noclip"},
@@ -366,6 +367,7 @@ constexpr std::array<NativeShaderCandidate, 141> kNativeRegistry{{
     {0x000000000f54e5f9ull, PS_0F54E5F9_2D_FRAG, "ps_0f54e5f9_gbuf6_alpha_2d"},
     {0x000000000f54e5f9ull, PS_0F54E5F9_ARR_FRAG, "ps_0f54e5f9_gbuf6_alpha_arr"},
     {0x00000000d3c8bb21ull, PS_D3C8BB21_FRAG, "ps_d3c8bb21_motblur_vel_combine"},
+    {0x0000000034bc187cull, PS_34BC187C_FRAG, "ps_34bc187c_motblur_obj_vel_opaque"},
 }};
 
 struct DescSlot {
@@ -1152,7 +1154,8 @@ bool TryReplaceWithNativeShader(u64 pgm_hash, const std::vector<u32>& ref_spv,
             !SpecializeConstantId0(out_spv, static_cast<u32>(cs_9a9_swz_mode))) {
             return false;
         }
-        if ((pgm_hash == 0x000000002eacb983ull || pgm_hash == 0x000000008c13b984ull) &&
+        if ((pgm_hash == 0x000000002eacb983ull || pgm_hash == 0x000000008c13b984ull ||
+             pgm_hash == 0x00000000d3c8bb21ull) &&
             !SpecializeConstantId0(out_spv, ref_sig.has_image_query_size ? 1u : 0u)) {
             return false;
         }

@@ -738,12 +738,17 @@ bool Presenter::PresentImage(Frame* frame, vk::Image source, bool last) {
             static u64 pres_last_period_ns = 0;
             static u64 pres_seen_epoch = 0;
             if (pres_deadline_ns == 0 || epoch != pres_seen_epoch ||
-                period_ns != pres_last_period_ns || BbVideoOut::QueuedPresentCount() > 0) {
+                period_ns != pres_last_period_ns) {
                 pres_seen_epoch = epoch;
                 pres_last_period_ns = period_ns;
                 pres_deadline_ns = ready_ns;
             } else {
-                pres_deadline_ns += period_ns;
+                // When a second frame is already queued in BbVideoOut (transient catch-up),
+                // drain smoothly at ~0.78x period instead of resetting pres_deadline_ns=ready_ns,
+                // which would fire two frames 0.14..0.60 ms apart and trigger Mailbox frame drops.
+                const u64 step_ns =
+                    (BbVideoOut::QueuedPresentCount() > 0) ? ((period_ns * 3ull) / 4ull) : period_ns;
+                pres_deadline_ns += step_ns;
                 if (ready_ns >= pres_deadline_ns) {
                     pres_deadline_ns = ready_ns;
                 } else {

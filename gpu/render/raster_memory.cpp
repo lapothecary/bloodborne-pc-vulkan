@@ -8,6 +8,7 @@
 // the CPU does it in decode order.
 
 #include "render/raster_internal.h"
+#include "render/vk_native_postfx.h"
 #include "textures/direct_textures.h"
 #include "../../dantelion_gx/include/gx_direct_vulkan.h"
 
@@ -1723,6 +1724,24 @@ void Rasterizer::MapMemory(VAddr addr, u64 size) {
         mapped_ranges += decltype(mapped_ranges)::interval_type::right_open(addr, addr + size);
     }
     buffer_cache.NotePreuploadMapping(addr, size, true);
+}
+
+void Rasterizer::DirectNativePostProcess(const BbCp::DirectVk::NativePostProcessArgs& args) {
+    if (!native_postfx) {
+        return;
+    }
+    if (!pending_tex_copies.empty()) {
+        FlushPendingTextureRegionCopies();
+    }
+    if (HasPendingHleCopies()) {
+        FlushPendingHleCopies(*this);
+    }
+    if (native_postfx->Execute(args, upscaler.get())) {
+        bound_graphics_pipeline = nullptr;
+        bound_graphics_epoch = 0;
+        bound_bucket_pipeline.fill(nullptr);
+        bound_bucket_epoch.fill(0);
+    }
 }
 
 void Rasterizer::RegisterMemory(VAddr addr, u64 size) {

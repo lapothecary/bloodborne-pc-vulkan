@@ -483,6 +483,7 @@ enum class Op : u32 {
     SetVgtControl = 33u,
     DrawBundle = 34u,
     ExecuteSecondaryCmds = 35u,
+    NativePostProcess = 36u,
 };
 struct CopyRegion {
     u64 dst_va;
@@ -633,6 +634,92 @@ struct ExecuteSecondaryArgs {
     u64 cmd_seq;
 };
 static_assert(sizeof(ExecuteSecondaryArgs) == 16);
+constexpr u32 kNativePostFlagLut3d = 1u << 0;
+constexpr u32 kNativePostFlagAutoExposure = 1u << 1;
+constexpr u32 kNativePostFlagCa = 1u << 2;
+constexpr u32 kNativePostFlagTrueBlack = 1u << 3;
+constexpr u32 kNativePostFlagResetHistory = 1u << 4;
+constexpr u32 kNativePostFlagBloom = 1u << 5;
+constexpr u32 kNativePostFlagMotionBlur = 1u << 6;
+constexpr u32 kNativePostFlagHasDepth = 1u << 7;
+constexpr u32 kNativePostFlagHasVel = 1u << 8;
+constexpr u32 kNativePostFlagDof = 1u << 9;
+constexpr u32 kNativePostFlagDofCustom = 1u << 10;
+constexpr u32 kNativePostFlagDofNearCust = 1u << 11;
+constexpr u32 kNativePostFlagDofFarCust = 1u << 12;
+constexpr u32 kNativePostFlagDofAutoFocus = 1u << 13;
+struct NativePostProcessArgs {
+    u64 in_color_tsharp[4];
+    u64 lut3d_tsharp[4];
+    u64 in_depth_tsharp[4];
+    u64 vel_tsharp[4];
+    u32 out_cb_regs[11];
+    u32 flags;
+    std::int32_t tone_type;
+    float exposure;
+    float gamma;
+    float tone_factor;
+    float filmic_contrast;
+    float scene_lum_scale;
+    float middle_gray;
+    float min_exposure;
+    float max_exposure;
+    float meter_rect[4];
+    float adapt_sens;
+    float adapt_scale;
+    float adapt_speed_limit;
+    float dark_sens;
+    float dark_scale;
+    float dark_speed_limit;
+    float hue_rad;
+    float saturation;
+    float value_scale;
+    float contrast;
+    float vig_power;
+    float vig_fov_dep;
+    float fov_y_rad;
+    float aspect;
+    float ca_lat_disp[2];
+    float ca_uni_disp[2];
+    std::int32_t ca_wave_samples;
+    float delta_time_sec;
+    u32 frame_index;
+    u32 out_width;
+    u32 out_height;
+    // Step 2: Live GPARAM Bloom & Glare parameters
+    float bloom_luminance;
+    float bloom_threshold;
+    float bloom_remap;
+    float bloom_radius_scale;
+    float bloom_luma_gamma;
+    float bloom_dispersion;
+    std::int32_t glare_shape;
+    u32 bloom_reserved;
+    // Step 3: Native Motion Blur (row-vector inv(curVP) * prevVP + live GPARAM MB settings)
+    float clip_to_prev_clip[16];
+    float mb_time_ratio;
+    float mb_max_len;
+    float mb_vel_scale;
+    float mb_near_z;
+    // Step 4: Native Depth of Field (live GPARAM physical thin-lens + CustomDof + AutoFocus)
+    float dof_focus_dist;
+    float dof_fstop;
+    float dof_ccd_diag_mm;
+    float dof_scale;
+    float dof_near_start;
+    float dof_near_end;
+    float dof_near_coc_size;
+    float dof_near_coc_scale;
+    float dof_far_start;
+    float dof_far_end;
+    float dof_far_coc_size;
+    float dof_far_coc_scale;
+    float dof_far_cutoff;
+    float dof_view_near_z;
+    float dof_view_far_z;
+    float dof_af_sens;
+};
+static_assert(sizeof(NativePostProcessArgs) == 496);
 } // namespace DirectVk
 
 template <typename Write, typename Irq>

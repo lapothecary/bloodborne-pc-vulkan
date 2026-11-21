@@ -48,35 +48,47 @@ void main() {
         float min_w = s1f(d0 + 757u) + c0.w;
         float min_dot = v_len * (s1f(d0 + 756u) * v_len);
 
-        vec2 uv_m = uv - step_uv;
-        vec2 uv_p = uv + step_uv;
         vec2 b_scale = vec2(s1f(d0 + 760u), s1f(d0 + 761u));
         vec2 b_bias  = vec2(s1f(d0 + 762u), s1f(d0 + 763u));
-        vec2 bm = b_scale * uv_m + b_bias;
-        vec2 bp = b_scale * uv_p + b_bias;
+
+        // Smooth 7-tap IGN-jittered bilateral gather (center + 3 symmetric pairs along step_uv).
+        // Eliminates the discrete comb-banding ("||||||") of the original 3-tap PS4 kernel on
+        // fast camera whips while preserving Yebis2's exact depth + velocity silhouette protection.
+        float ign = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
+        float jitter = (ign - 0.5) * 0.28;
 
         vec4 acc = c0;
         float weight = 1.0;
 
-        if ((1.0 >= abs(bm.y)) && (1.0 >= abs(bm.x))) {
-            vec2 vm_raw = textureLod(sampler2D(fs_img1, fs_samp1), uv_m, 0.0).xy;
-            vec4 cm = textureLod(sampler2D(fs_img0, fs_samp0), uv_m, 0.0);
-            vec2 vel_m = v_scale * vm_raw + v_bias;
-            float d_m = vel_m.y * vel.y + vel.x * vel_m.x;
-            if ((cm.w >= min_w) || (d_m > min_dot)) {
-                acc += cm;
-                weight = 2.0;
-            }
-        }
+        const float kTapFrac[3] = float[3](0.33333334, 0.66666669, 1.0);
+        for (int i = 0; i < 3; ++i) {
+            float t = clamp(kTapFrac[i] + jitter, 0.08, 1.12);
+            vec2 off = step_uv * t;
 
-        if ((1.0 >= abs(bp.y)) && (1.0 >= abs(bp.x))) {
-            vec2 vp_raw = textureLod(sampler2D(fs_img1, fs_samp1), uv_p, 0.0).xy;
-            vec4 cp = textureLod(sampler2D(fs_img0, fs_samp0), uv_p, 0.0);
-            vec2 vel_p = v_scale * vp_raw + v_bias;
-            float d_p = vel_p.y * vel.y + vel.x * vel_p.x;
-            if ((cp.w >= min_w) || (d_p > min_dot)) {
-                acc += cp;
-                weight = 1.0 + weight;
+            vec2 uv_m = uv - off;
+            vec2 bm = b_scale * uv_m + b_bias;
+            if ((1.0 >= abs(bm.y)) && (1.0 >= abs(bm.x))) {
+                vec2 vm_raw = textureLod(sampler2D(fs_img1, fs_samp1), uv_m, 0.0).xy;
+                vec4 cm = textureLod(sampler2D(fs_img0, fs_samp0), uv_m, 0.0);
+                vec2 vel_m = v_scale * vm_raw + v_bias;
+                float d_m = vel_m.y * vel.y + vel.x * vel_m.x;
+                if ((cm.w >= min_w) || (d_m > min_dot)) {
+                    acc += cm;
+                    weight += 1.0;
+                }
+            }
+
+            vec2 uv_p = uv + off;
+            vec2 bp = b_scale * uv_p + b_bias;
+            if ((1.0 >= abs(bp.y)) && (1.0 >= abs(bp.x))) {
+                vec2 vp_raw = textureLod(sampler2D(fs_img1, fs_samp1), uv_p, 0.0).xy;
+                vec4 cp = textureLod(sampler2D(fs_img0, fs_samp0), uv_p, 0.0);
+                vec2 vel_p = v_scale * vp_raw + v_bias;
+                float d_p = vel_p.y * vel.y + vel.x * vel_p.x;
+                if ((cp.w >= min_w) || (d_p > min_dot)) {
+                    acc += cp;
+                    weight += 1.0;
+                }
             }
         }
 

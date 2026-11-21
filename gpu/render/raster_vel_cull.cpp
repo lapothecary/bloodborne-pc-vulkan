@@ -15,6 +15,7 @@
 #include "buffers/direct_buffers.h"
 #include "render/raster_internal.h"
 #include "render/vk_vsm_shadow_memo.h"
+#include "shim/bbport_frame_rate.h"
 #include "../../dantelion_gx/include/gx_direct_vulkan.h"
 
 extern "C" bool BbLookupMappedEnd(u64 address, uintptr_t& out_end);
@@ -139,20 +140,22 @@ bool ObjectVelocityCuller::IsObjectVelocityPs(u64 ps_hash) noexcept {
 }
 
 float ObjectVelocityCuller::EpsilonThreshold() noexcept {
-    static const float eps = [] {
+    static const float base_eps = [] {
         if (const char* env = std::getenv("BB_VEL_CULL_EPS"); env && env[0] != '\0') {
             const float v = std::strtof(env, nullptr);
             if (std::isfinite(v) && v >= 0.0f && v <= 0.1f) {
                 return v;
             }
         }
-        // `velWrap` is 8-bit `R8G8B8A8Unorm` (`0x7F` = zero velocity; 1 LSB corresponds to
-        // ~0.012f bone matrix delta, see `kObjectVelocityBoneDeltaThreshold`). `0.008f` (8 mm)
-        // absorbs subtle idle Morpheme breathing (~0.0005f..0.003f) while preserving 100% of
-        // visible limb, weapon, and character motion blur.
-        return 0.008f;
+        // `0.0015f` (1.5 mm) at 30 FPS culls bit-identical static props/corpses (`delta == 0`)
+        // while keeping the living Hunter, weapons, and enemies inside Pass 0x2e (`obj.a = 1.0`)
+        // so both Camera Blur (foreground mask) and Object Blur (weapon/body trails) stay accurate.
+        return 0.0015f;
     }();
-    return eps;
+    // Scale bone delta threshold by `frames = dt * 30` so high-FPS (90..300 FPS) weapon swings
+    // and dodges are never culled as stationary (per-frame bone displacement shrinks 1/FPS).
+    const float frames = std::clamp(BbFrameRate::CurrentFramesPer30(), 0.05f, 1.0f);
+    return base_eps * frames;
 }
 
 void ObjectVelocityCuller::NoteSilhouetteMaskActiveGlobal() noexcept {

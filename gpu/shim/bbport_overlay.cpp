@@ -6,12 +6,14 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 #include <dlfcn.h>
 #ifdef _WIN32
@@ -818,28 +820,43 @@ void Menu() {
     for (int e = 0; e < BbSettings::EffectCount; ++e) {
         if (e == 4) continue; // effect_game_aa is controlled by the Anti-Aliasing combo above
         const auto& effect = BbSettings::Effects[e];
-        Checkbox(BbSettings::MenuText(effect.label, effect.label_ru), s.effects[e]);
-        if (e == 2 && s.effects[2].load(std::memory_order_relaxed)) {
-            int mb_str = std::clamp(s.motion_blur_strength.load(std::memory_order_relaxed), 0, 2);
-            const char* mb_labels[3] = {
+        if (e == 2) {
+            const char* mb_labels[4] = {
+                BbSettings::MenuText("Off", "Выкл"),
                 BbSettings::MenuText("Low (Subtle)", "Низкий (мягкий)"),
-                BbSettings::MenuText("Default (PS4 30-FPS Parity)", "Стандарт (как на PS4 при любом FPS)"),
+                BbSettings::MenuText("Default (PS4 Parity)", "Стандарт (как на PS4)"),
                 BbSettings::MenuText("High (Cinematic)", "Высокий (кинематографичный)"),
             };
-            ImGui::Indent(20.0f);
-            ImGui::SetNextItemWidth(-120.0f);
-            if (ImGui::BeginCombo(BbSettings::MenuText("Motion blur strength", "Сила размытия"),
-                                  mb_labels[mb_str])) {
-                for (int k = 0; k < 3; ++k) {
-                    if (ImGui::Selectable(mb_labels[k], mb_str == k)) {
-                        s.motion_blur_strength.store(k, std::memory_order_relaxed);
-                        BbSettings::Save();
+            auto draw_mb_combo = [&](const char* label, std::atomic<int>& target) {
+                int cur = std::clamp(target.load(std::memory_order_relaxed), 0, 3);
+                if (ImGui::BeginCombo(label, mb_labels[cur])) {
+                    for (int k = 0; k < 4; ++k) {
+                        if (ImGui::Selectable(mb_labels[k], cur == k)) {
+                            target.store(k, std::memory_order_relaxed);
+                            const bool any_on =
+                                s.motion_blur_camera.load(std::memory_order_relaxed) > 0 ||
+                                s.motion_blur_object.load(std::memory_order_relaxed) > 0;
+                            s.effects[2].store(any_on, std::memory_order_relaxed);
+                            BbGuestHooks::ApplyGameEffects();
+                            BbSettings::Save();
+                        }
                     }
+                    ImGui::EndCombo();
                 }
-                ImGui::EndCombo();
-            }
-            ImGui::Unindent(20.0f);
+            };
+            draw_mb_combo(BbSettings::MenuText("Camera motion blur", "Размытие камеры"),
+                          s.motion_blur_camera);
+            Hint(BbSettings::MenuText(
+                "World blur when turning the camera, normalized to 30 FPS shutter at any FPS (0 extra CPU draws).",
+                "Размытие мира при повороте камеры с адаптацией под любой FPS (без лишней нагрузки на CPU)."));
+            draw_mb_combo(BbSettings::MenuText("Object motion blur", "Размытие объектов"),
+                          s.motion_blur_object);
+            Hint(BbSettings::MenuText(
+                "Per-object blur for characters, weapons, and cloth. Setting Off also skips CPU Pass 0x2e.",
+                "Пообъектное размытие персонажей, оружия и плащей. Выключение также отключает CPU-проход Pass 0x2e."));
+            continue;
         }
+        Checkbox(BbSettings::MenuText(effect.label, effect.label_ru), s.effects[e]);
         if (std::string_view(effect.key) == "debug_camera") {
             Hint(BbSettings::MenuText("Hold Cross and press L3 (keyboard: F + Left Ctrl).",
                                       "Удерживайте Cross и нажмите L3 (клавиатура: F + Left Ctrl)."));
@@ -909,6 +926,71 @@ void Menu() {
         "warm fire, lanterns, and crimson sky softly bounce onto cobblestones, arches, and cloaks.",
         "Горизонтно-окклюзионный отражённый свет (SSGI) в линейном пайплайне освещения: "
         "тёплый свет костров, факелов, фонарей и неба мягко отражается на камнях, стенах и плаще."));
+    Checkbox(BbSettings::MenuText("Native Vulkan PostFX (A/B vs Yebis2)",
+                                  "Нативный пост-процесс Vulkan (A/B вместо Yebis2)"),
+             s.native_postfx);
+    Hint(BbSettings::MenuText(
+        "Experimental Remaster v2 live A/B toggle: replaces the 2013 Yebis2 black-box with a "
+        "native Vulkan 1.3 pipeline (True-dt Auto-Exposure, FP16 Bloom, 16-tap IGN Motion Blur, "
+        "Tonemap, original 3D LUT, True Black, Vignette, CA). Toggle live to compare vs Yebis2.",
+        "Экспериментальный живой A/B-переключатель: заменяет чёрный ящик Yebis2 2013 года на "
+        "чистый Vulkan 1.3 (честный Auto-Exposure, FP16 Bloom, 16-tap IGN Motion Blur, Tonemap, "
+        "оригинальный 3D LUT, True Black, виньетка, ХА). Переключай на лету для сравнения."));
+    if (s.native_postfx.load(std::memory_order_relaxed)) {
+        ImGui::Indent(16.0f);
+        float bloom_int = s.native_bloom_intensity.load(std::memory_order_relaxed);
+        if (ImGui::SliderFloat(
+                BbSettings::MenuText("Bloom Intensity (GPARAM scale)",
+                                     "Сила Bloom (множитель GPARAM)"),
+                &bloom_int, 0.00f, 0.40f, "%.3f")) {
+            s.native_bloom_intensity.store(std::clamp(bloom_int, 0.0f, 0.40f),
+                                           std::memory_order_relaxed);
+        }
+        Hint(BbSettings::MenuText(
+            "Multiplies each area's live GPARAM GlareLuminance. Calibrated default: 0.250.",
+            "Множитель над живым GPARAM GlareLuminance каждой локации. Откалиброванный стандарт: 0.250."));
+
+        float bloom_thr = s.native_bloom_threshold.load(std::memory_order_relaxed);
+        if (ImGui::SliderFloat(
+                BbSettings::MenuText("Bloom Threshold (GPARAM mult)",
+                                     "Порог Bloom (множитель GPARAM)"),
+                &bloom_thr, 0.50f, 5.00f, "%.2f")) {
+            s.native_bloom_threshold.store(std::clamp(bloom_thr, 0.50f, 5.00f),
+                                           std::memory_order_relaxed);
+        }
+        Hint(BbSettings::MenuText(
+            "Higher = only lanterns/fire/moon bloom (clean face & sky). Calibrated default: 3.50.",
+            "Выше = светятся только фонари/огонь/луна (чистое лицо и небо). Откалиброванный стандарт: 3.50."));
+
+        float obj_boost = s.native_mb_obj_boost.load(std::memory_order_relaxed);
+        if (ImGui::SliderFloat(
+                BbSettings::MenuText("Object Motion Blur Boost",
+                                     "Усиление Object Motion Blur"),
+                &obj_boost, 0.25f, 4.00f, "%.2fx")) {
+            s.native_mb_obj_boost.store(std::clamp(obj_boost, 0.25f, 4.00f),
+                                        std::memory_order_relaxed);
+        }
+        Hint(BbSettings::MenuText(
+            "Live tuning multiplier for Pass 0x2e per-object velocity (Hunter/weapon/enemies).",
+            "Живой множитель скорости объектов Pass 0x2e (Охотник, оружие, враги)."));
+
+        float dof_str = s.native_dof_strength.load(std::memory_order_relaxed);
+        if (ImGui::SliderFloat(
+                BbSettings::MenuText("Depth of Field Strength",
+                                     "Сила глубины резкости (DoF)"),
+                &dof_str, 0.25f, 3.00f, "%.2fx")) {
+            s.native_dof_strength.store(std::clamp(dof_str, 0.25f, 3.00f),
+                                        std::memory_order_relaxed);
+        }
+        Hint(BbSettings::MenuText(
+            "Scales live GPARAM bokeh CoC radius (1.00x = exact FromSoftware GPARAM strength).",
+            "Масштабирует радиус боке из живого GPARAM локации (1.00x = точный стандарт игры)."));
+
+        Checkbox(BbSettings::MenuText("Debug: Show Velocity Map (Cam=R/G, ObjMask=B, ObjVel=Y)",
+                                      "Отладка: Карта скоростей (Мир=R/G, Маска=Синий, Герой=Жёлтый)"),
+                 s.native_mb_debug_vis);
+        ImGui::Unindent(16.0f);
+    }
     BbGuestHooks::ApplyGameEffects();
 
     bool restart =
@@ -1552,41 +1634,39 @@ void PollGpuHwSensors(HudBreakdown& h) noexcept {
             h.vram_used_gb = float(double(mem.used) * kInvGiB);
             h.vram_total_gb = float(double(mem.total) * kInvGiB);
         }
-        unsigned long long proc_bytes = 0;
-        auto query_self_vram = [&](FnGetProcs fn) {
-            if (!fn) {
-                return;
-            }
-            std::array<NvmlProcInfo, 128> procs{};
-            unsigned int count = static_cast<unsigned int>(procs.size());
-            if (fn(nvml_dev, &count, procs.data()) == 0) {
-                const unsigned int n = std::min<unsigned int>(count, procs.size());
-                for (unsigned int i = 0; i < n; ++i) {
-                    if (procs[i].pid == self_pid && procs[i].usedGpuMemory > 0 &&
-                        procs[i].usedGpuMemory < (1ULL << 48)) {
-                        proc_bytes = std::max(proc_bytes, procs[i].usedGpuMemory);
-                    }
-                }
-            }
-        };
-        query_self_vram(fn_gfx_procs);
-        query_self_vram(fn_cmp_procs);
-        h.vram_proc_gb = proc_bytes > 0 ? float(double(proc_bytes) * kInvGiB) : 0.0f;
-#ifdef _WIN32
-        // On Windows WDDM, consumer GeForce drivers may return NVML_VALUE_NOT_AVAILABLE (~0ULL)
-        // for per-process `usedGpuMemory`; `VK_EXT_memory_budget` queries WDDM DXGI
-        // `IDXGIAdapter3::QueryVideoMemoryInfo` (`CurrentUsage` of this process) on the exact
-        // active `VkPhysicalDevice` (safe on Optimus multi-GPU laptops).
-        if (h.vram_proc_gb <= 0.01f) {
-            if (const auto* vk_inst = g_vk_instance.load(std::memory_order_acquire);
-                vk_inst && vk_inst->CanReportMemoryUsage()) {
-                const u64 usage_bytes = vk_inst->GetDeviceMemoryUsage();
-                if (usage_bytes > 0) {
-                    h.vram_proc_gb = float(double(usage_bytes) * kInvGiB);
-                }
+        // Prefer zero-lock VK_EXT_memory_budget for per-process VRAM over NVML's
+        // GraphicsRunningProcesses/ComputeRunningProcesses, which acquire the NVIDIA kernel
+        // driver's global RM mutex and stall Vulkan submits/presents on Linux.
+        h.vram_proc_gb = 0.0f;
+        if (const auto* vk_inst = g_vk_instance.load(std::memory_order_acquire);
+            vk_inst && vk_inst->CanReportMemoryUsage()) {
+            const u64 usage_bytes = vk_inst->GetDeviceMemoryUsage();
+            if (usage_bytes > 0) {
+                h.vram_proc_gb = float(double(usage_bytes) * kInvGiB);
             }
         }
-#endif
+        if (h.vram_proc_gb <= 0.01f) {
+            unsigned long long proc_bytes = 0;
+            auto query_self_vram = [&](FnGetProcs fn) {
+                if (!fn) {
+                    return;
+                }
+                std::array<NvmlProcInfo, 128> procs{};
+                unsigned int count = static_cast<unsigned int>(procs.size());
+                if (fn(nvml_dev, &count, procs.data()) == 0) {
+                    const unsigned int n = std::min<unsigned int>(count, procs.size());
+                    for (unsigned int i = 0; i < n; ++i) {
+                        if (procs[i].pid == self_pid && procs[i].usedGpuMemory > 0 &&
+                            procs[i].usedGpuMemory < (1ULL << 48)) {
+                            proc_bytes = std::max(proc_bytes, procs[i].usedGpuMemory);
+                        }
+                    }
+                }
+            };
+            query_self_vram(fn_gfx_procs);
+            query_self_vram(fn_cmp_procs);
+            h.vram_proc_gb = proc_bytes > 0 ? float(double(proc_bytes) * kInvGiB) : 0.0f;
+        }
         return;
     }
 
@@ -1698,6 +1778,308 @@ void PollGpuHwSensors(HudBreakdown& h) noexcept {
     }
 }
 
+/// Offloads blocking GPU sensor queries (NVML/sysfs/fdinfo), HUD text file writes,
+/// Linux `/proc/self/task/*` scans, and `fflush(stdout)` off `bb:Present` so frame pacing
+/// never stalls for 10..35 ms on driver RM locks or filesystem I/O.
+class AsyncTelemetryWorker {
+public:
+    struct SensorSnapshot {
+        bool has_gpu_sensors = false;
+        float gpu_power_w = 0.0f;
+        int gpu_clock_mhz = 0;
+        int gpu_temp_c = 0;
+        int gpu_drv_util_pct = -1;
+        float vram_proc_gb = 0.0f;
+        float vram_used_gb = 0.0f;
+        float vram_total_gb = 0.0f;
+    };
+
+    static AsyncTelemetryWorker& Get() {
+        static AsyncTelemetryWorker inst;
+        return inst;
+    }
+
+    void CopySensorsInto(HudBreakdown& h) noexcept {
+        std::unique_lock lk{sensor_mutex, std::try_to_lock};
+        if (!lk.owns_lock()) {
+            return;
+        }
+        h.has_gpu_sensors = sensors.has_gpu_sensors;
+        h.gpu_power_w = sensors.gpu_power_w;
+        h.gpu_clock_mhz = sensors.gpu_clock_mhz;
+        h.gpu_temp_c = sensors.gpu_temp_c;
+        h.gpu_drv_util_pct = sensors.gpu_drv_util_pct;
+        h.vram_proc_gb = sensors.vram_proc_gb;
+        h.vram_used_gb = sensors.vram_used_gb;
+        h.vram_total_gb = sensors.vram_total_gb;
+    }
+
+    void EnqueueHudFileWrite(std::string text) {
+        {
+            std::scoped_lock lk{job_mutex};
+            pending_hud_file = std::move(text);
+            has_hud_file = true;
+        }
+        cv.notify_one();
+    }
+
+    void EnqueueThreadCpuAndFlush(bool sample_cpu, std::uint64_t frames, double window_sec,
+                                  bool print_cpu) {
+        {
+            std::scoped_lock lk{job_mutex};
+            if (sample_cpu) {
+                pending_cpu_sample = true;
+                pending_cpu_frames = frames;
+                pending_cpu_window = window_sec;
+                pending_cpu_print = print_cpu;
+            }
+            pending_stdout_flush = true;
+        }
+        cv.notify_one();
+    }
+
+    ~AsyncTelemetryWorker() {
+        {
+            std::scoped_lock lk{job_mutex};
+            stop = true;
+        }
+        cv.notify_one();
+        if (worker.joinable()) {
+            worker.join();
+        }
+    }
+
+private:
+    AsyncTelemetryWorker() : worker([this] { Run(); }) {}
+
+    void Run() {
+#ifdef __linux__
+        pthread_setname_np(pthread_self(), "bb:Telemetry");
+#endif
+        using Clock = std::chrono::steady_clock;
+        auto next_sensor_poll = Clock::now();
+        while (true) {
+            std::string hud_file_text;
+            bool do_hud_file = false;
+            bool do_cpu = false;
+            std::uint64_t cpu_frames = 0;
+            double cpu_window = 0.0;
+            bool cpu_print = false;
+            bool do_flush = false;
+            bool do_sensors = false;
+
+            {
+                std::unique_lock lk{job_mutex};
+                cv.wait_until(lk, next_sensor_poll, [this] {
+                    return stop || has_hud_file || pending_cpu_sample || pending_stdout_flush;
+                });
+                if (stop) {
+                    break;
+                }
+                if (has_hud_file) {
+                    hud_file_text = std::move(pending_hud_file);
+                    has_hud_file = false;
+                    do_hud_file = true;
+                }
+                if (pending_cpu_sample) {
+                    do_cpu = true;
+                    cpu_frames = pending_cpu_frames;
+                    cpu_window = pending_cpu_window;
+                    cpu_print = pending_cpu_print;
+                    pending_cpu_sample = false;
+                }
+                if (pending_stdout_flush) {
+                    do_flush = true;
+                    pending_stdout_flush = false;
+                }
+            }
+
+            const auto now = Clock::now();
+            if (now >= next_sensor_poll) {
+                do_sensors = true;
+                next_sensor_poll = now + std::chrono::milliseconds(1000);
+            }
+
+            if (do_sensors) {
+                HudBreakdown tmp{};
+                PollGpuHwSensors(tmp);
+                std::scoped_lock slk{sensor_mutex};
+                sensors.has_gpu_sensors = tmp.has_gpu_sensors;
+                sensors.gpu_power_w = tmp.gpu_power_w;
+                sensors.gpu_clock_mhz = tmp.gpu_clock_mhz;
+                sensors.gpu_temp_c = tmp.gpu_temp_c;
+                sensors.gpu_drv_util_pct = tmp.gpu_drv_util_pct;
+                sensors.vram_proc_gb = tmp.vram_proc_gb;
+                sensors.vram_used_gb = tmp.vram_used_gb;
+                sensors.vram_total_gb = tmp.vram_total_gb;
+            }
+
+            if (do_hud_file) {
+#ifndef _WIN32
+                if (FILE* f = std::fopen("/tmp/bb_frame_hud.txt", "w")) {
+                    std::fputs(hud_file_text.c_str(), f);
+                    std::fclose(f);
+                }
+#endif
+                if (FILE* f = std::fopen("logs/bb_frame_hud.txt", "w")) {
+                    std::fputs(hud_file_text.c_str(), f);
+                    std::fclose(f);
+                }
+            }
+
+#ifndef _WIN32
+            if (do_cpu) {
+                SampleThreadCpu(cpu_frames, cpu_window, cpu_print);
+            }
+#endif
+            if (do_flush) {
+                std::fflush(stdout);
+            }
+        }
+    }
+
+#ifndef _WIN32
+    void SampleThreadCpu(std::uint64_t frames, double window_sec, bool print_out) {
+        struct PrevEntry {
+            int tid;
+            std::uint64_t runtime_ns;
+        };
+        struct Row {
+            int tid;
+            std::uint64_t delta_ns;
+            char name[24];
+        };
+        static std::vector<PrevEntry> prev;
+        static bool seeded = false;
+        static const long clk_tck = std::max<long>(1, sysconf(_SC_CLK_TCK));
+        static const long hw_threads = std::max<long>(1, sysconf(_SC_NPROCESSORS_ONLN));
+
+        std::vector<PrevEntry> next;
+        std::vector<Row> rows;
+        next.reserve(64);
+        rows.reserve(64);
+
+        if (DIR* dir = opendir("/proc/self/task")) {
+            char path[128];
+            char buf[512];
+            while (struct dirent* ent = readdir(dir)) {
+                if (ent->d_name[0] < '0' || ent->d_name[0] > '9') {
+                    continue;
+                }
+                const int tid = std::atoi(ent->d_name);
+                if (tid <= 0) {
+                    continue;
+                }
+                std::snprintf(path, sizeof(path), "/proc/self/task/%d/stat", tid);
+                const int fd = open(path, O_RDONLY);
+                if (fd < 0) {
+                    continue;
+                }
+                const ssize_t n = read(fd, buf, sizeof(buf) - 1);
+                close(fd);
+                if (n <= 0) {
+                    continue;
+                }
+                buf[n] = '\0';
+                const char* rparen = std::strrchr(buf, ')');
+                if (!rparen || rparen[1] == '\0') {
+                    continue;
+                }
+                const char* p = rparen + 2;
+                for (int field = 0; field < 11 && *p; ++field) {
+                    while (*p == ' ') ++p;
+                    while (*p && *p != ' ') ++p;
+                }
+                char* endp = nullptr;
+                const unsigned long long utime = std::strtoull(p, &endp, 10);
+                if (!endp || endp == p) {
+                    continue;
+                }
+                const unsigned long long stime = std::strtoull(endp, &endp, 10);
+                const std::uint64_t runtime_ns =
+                    static_cast<std::uint64_t>((double(utime + stime) * 1e9) / double(clk_tck));
+                next.push_back({tid, runtime_ns});
+
+                if (seeded && print_out) {
+                    std::uint64_t prev_ns = 0;
+                    bool found = false;
+                    for (const auto& e : prev) {
+                        if (e.tid == tid) {
+                            prev_ns = e.runtime_ns;
+                            found = true;
+                            break;
+                        }
+                    }
+                    const std::uint64_t delta_ns =
+                        (found && runtime_ns >= prev_ns) ? (runtime_ns - prev_ns) : 0ULL;
+                    if (delta_ns == 0) {
+                        continue;
+                    }
+                    Row row{};
+                    row.tid = tid;
+                    row.delta_ns = delta_ns;
+                    const char* lparen = std::strchr(buf, '(');
+                    if (lparen && rparen > lparen + 1) {
+                        const std::size_t len =
+                            std::min<std::size_t>(static_cast<std::size_t>(rparen - lparen - 1),
+                                                  sizeof(row.name) - 1);
+                        std::memcpy(row.name, lparen + 1, len);
+                        row.name[len] = '\0';
+                    }
+                    if (row.name[0] == '\0') {
+                        std::snprintf(row.name, sizeof(row.name), "tid:%d", tid);
+                    }
+                    rows.push_back(row);
+                }
+            }
+            closedir(dir);
+        }
+
+        const bool was_seeded = seeded;
+        prev = std::move(next);
+        seeded = true;
+        if (!print_out || !was_seeded || rows.empty() || frames == 0 || window_sec <= 0.0) {
+            return;
+        }
+        std::uint64_t total_ns = 0;
+        for (const auto& r : rows) {
+            total_ns += r.delta_ns;
+        }
+        std::sort(rows.begin(), rows.end(),
+                  [](const Row& a, const Row& b) { return a.delta_ns > b.delta_ns; });
+        const double total_ms_pf = double(total_ns) / (double(frames) * 1e6);
+        const double pct_all =
+            (double(total_ns) / (window_sec * 1e9 * double(hw_threads))) * 100.0;
+        std::printf("Thread CPU (ms/frame, total %.2f ms = %.1f%% of %ldT):",
+                    total_ms_pf, pct_all, hw_threads);
+        const std::size_t show = std::min<std::size_t>(rows.size(), 14);
+        for (std::size_t i = 0; i < show; ++i) {
+            const double ms = double(rows[i].delta_ns) / (double(frames) * 1e6);
+            if (ms < 0.02 && i >= 6) {
+                break;
+            }
+            std::printf("%s %s %.2f", i ? "," : "", rows[i].name, ms);
+        }
+        std::printf("\n");
+    }
+#endif
+
+    std::mutex sensor_mutex;
+    SensorSnapshot sensors{};
+
+    std::mutex job_mutex;
+    std::condition_variable cv;
+    bool stop = false;
+    bool has_hud_file = false;
+    std::string pending_hud_file;
+    bool pending_cpu_sample = false;
+    std::uint64_t pending_cpu_frames = 0;
+    double pending_cpu_window = 0.0;
+    bool pending_cpu_print = false;
+    bool pending_stdout_flush = false;
+    std::thread worker;
+};
+
 void UpdateHudBreakdown(HudBreakdown& h) {
     using Clock = std::chrono::steady_clock;
     static bool first = true;
@@ -1795,7 +2177,7 @@ void UpdateHudBreakdown(HudBreakdown& h) {
     if (dt < 0.35) {
         return;
     }
-    PollGpuHwSensors(h);
+    AsyncTelemetryWorker::Get().CopySensorsInto(h);
     const std::uint32_t raw_df32 =
         static_cast<std::uint32_t>(cur_frames) - static_cast<std::uint32_t>(last_frames);
     const std::uint64_t df = raw_df32 > 0 ? static_cast<std::uint64_t>(raw_df32) : 1ULL;
@@ -2615,170 +2997,10 @@ void UpdateHudBreakdown(HudBreakdown& h) {
             h.hw_gpu_cat_ms[8], h.hw_gpu_subcat_ms[BbStats::GpuSub_Aa_Upscaler],
             h.hw_gpu_cat_ms[9], h.hw_gpu_subcat_ms[BbStats::GpuSub_Ui_ScaleformHud], h.hw_gpu_subcat_ms[BbStats::GpuSub_Ui_RcasPresent],
             h.bottleneck_en, h.bottleneck_ms, h.avg_bottleneck_ms);
-#ifndef _WIN32
-        if (FILE* f = std::fopen("/tmp/bb_frame_hud.txt", "w")) {
-            std::fputs(hud_buf, f);
-            std::fclose(f);
-        }
-#endif
-        if (FILE* f = std::fopen("logs/bb_frame_hud.txt", "w")) {
-            std::fputs(hud_buf, f);
-            std::fclose(f);
-        }
+        AsyncTelemetryWorker::Get().EnqueueHudFileWrite(std::string(hud_buf));
         static Clock::time_point last_log_print = now;
         static std::uint64_t last_log_frames = cur_frames;
 #ifndef _WIN32
-        auto sample_overlay_thread_cpu = [](std::uint64_t frames, double window_sec, bool print_out) {
-            struct PrevEntry {
-                int tid;
-                std::uint64_t runtime_ns;
-            };
-            struct Row {
-                int tid;
-                std::uint64_t delta_ns;
-                char name[24];
-            };
-            static std::vector<PrevEntry> prev;
-            static bool seeded = false;
-            static const long clk_tck = std::max<long>(1, sysconf(_SC_CLK_TCK));
-            static const long hw_threads = std::max<long>(1, sysconf(_SC_NPROCESSORS_ONLN));
-
-            std::vector<PrevEntry> next;
-            std::vector<Row> rows;
-            next.reserve(64);
-            if (print_out) {
-                rows.reserve(64);
-            }
-            const int main_tid = static_cast<int>(getpid());
-
-            if (DIR* dir = opendir("/proc/self/task")) {
-                while (const dirent* ent = readdir(dir)) {
-                    if (ent->d_name[0] < '1' || ent->d_name[0] > '9') {
-                        continue;
-                    }
-                    const int tid = std::atoi(ent->d_name);
-                    if (tid <= 0) {
-                        continue;
-                    }
-                    std::uint64_t runtime_ns = 0;
-                    bool got_time = false;
-                    char path[64];
-                    std::snprintf(path, sizeof(path), "/proc/self/task/%d/schedstat", tid);
-                    int fd = open(path, O_RDONLY);
-                    if (fd >= 0) {
-                        char buf[64]{};
-                        const ssize_t n = read(fd, buf, sizeof(buf) - 1);
-                        close(fd);
-                        if (n > 0) {
-                            runtime_ns = std::strtoull(buf, nullptr, 10);
-                            got_time = true;
-                        }
-                    }
-                    if (!got_time) {
-                        std::snprintf(path, sizeof(path), "/proc/self/task/%d/stat", tid);
-                        fd = open(path, O_RDONLY);
-                        if (fd >= 0) {
-                            char sbuf[512]{};
-                            const ssize_t n = read(fd, sbuf, sizeof(sbuf) - 1);
-                            close(fd);
-                            if (n > 0) {
-                                if (const char* rp = std::strrchr(sbuf, ')')) {
-                                    const char* p = rp + 2;
-                                    // Skip fields 3..13 (state..cmajflt) to reach 14 (utime) & 15 (stime).
-                                    for (int f = 3; f < 14 && *p; ++f) {
-                                        while (*p && *p != ' ') {
-                                            ++p;
-                                        }
-                                        while (*p == ' ') {
-                                            ++p;
-                                        }
-                                    }
-                                    char* endp = nullptr;
-                                    const unsigned long long ut = std::strtoull(p, &endp, 10);
-                                    const unsigned long long st =
-                                        (endp && *endp) ? std::strtoull(endp, nullptr, 10) : 0ULL;
-                                    runtime_ns =
-                                        ((ut + st) * 1000000000ULL) / static_cast<std::uint64_t>(clk_tck);
-                                    got_time = true;
-                                }
-                            }
-                        }
-                    }
-                    if (!got_time) {
-                        continue;
-                    }
-                    next.push_back({tid, runtime_ns});
-                    if (!print_out || !seeded) {
-                        continue;
-                    }
-                    std::uint64_t old_ns = 0;
-                    bool found = false;
-                    for (const auto& pe : prev) {
-                        if (pe.tid == tid) {
-                            old_ns = pe.runtime_ns;
-                            found = true;
-                            break;
-                        }
-                    }
-                    const std::uint64_t delta =
-                        found ? (runtime_ns >= old_ns ? runtime_ns - old_ns : 0ULL) : runtime_ns;
-                    if (delta == 0) {
-                        continue;
-                    }
-                    Row row{tid, delta, {}};
-                    if (tid == main_tid) {
-                        std::snprintf(row.name, sizeof(row.name), "Main");
-                    } else {
-                        std::snprintf(path, sizeof(path), "/proc/self/task/%d/comm", tid);
-                        const int cfd = open(path, O_RDONLY);
-                        if (cfd >= 0) {
-                            const ssize_t cn = read(cfd, row.name, sizeof(row.name) - 1);
-                            close(cfd);
-                            if (cn > 0) {
-                                for (ssize_t i = 0; i < cn; ++i) {
-                                    if (row.name[i] == '\n' || row.name[i] == '\r') {
-                                        row.name[i] = '\0';
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        if (row.name[0] == '\0') {
-                            std::snprintf(row.name, sizeof(row.name), "tid:%d", tid);
-                        }
-                    }
-                    rows.push_back(row);
-                }
-                closedir(dir);
-            }
-
-            const bool was_seeded = seeded;
-            prev = std::move(next);
-            seeded = true;
-            if (!print_out || !was_seeded || rows.empty() || frames == 0 || window_sec <= 0.0) {
-                return;
-            }
-            std::uint64_t total_ns = 0;
-            for (const auto& r : rows) {
-                total_ns += r.delta_ns;
-            }
-            std::sort(rows.begin(), rows.end(),
-                      [](const Row& a, const Row& b) { return a.delta_ns > b.delta_ns; });
-            const double total_ms_pf = double(total_ns) / (double(frames) * 1e6);
-            const double pct_all =
-                (double(total_ns) / (window_sec * 1e9 * double(hw_threads))) * 100.0;
-            std::printf("Thread CPU (ms/frame, total %.2f ms = %.1f%% of %ldT):",
-                        total_ms_pf, pct_all, hw_threads);
-            const std::size_t show = std::min<std::size_t>(rows.size(), 14);
-            for (std::size_t i = 0; i < show; ++i) {
-                const double ms = double(rows[i].delta_ns) / (double(frames) * 1e6);
-                if (ms < 0.02 && i >= 6) {
-                    break;
-                }
-                std::printf("%s %s %.2f", i ? "," : "", rows[i].name, ms);
-            }
-            std::printf("\n");
-        };
         static const bool frame_stats_on = [] {
             const char* e = std::getenv("BB_FRAME_STATS");
             return e && e[0] != '\0' && e[0] != '0';
@@ -2789,7 +3011,7 @@ void UpdateHudBreakdown(HudBreakdown& h) {
             last_log_print = now;
             last_log_frames = cur_frames;
             if (!frame_stats_on) {
-                sample_overlay_thread_cpu(0, 0.0, false);
+                AsyncTelemetryWorker::Get().EnqueueThreadCpuAndFlush(true, 0, 0.0, false);
             }
         }
 #endif
@@ -3162,11 +3384,11 @@ void UpdateHudBreakdown(HudBreakdown& h) {
                     static_cast<unsigned long long>(d_m_wake));
             }
 #ifndef _WIN32
-            if (!frame_stats_on) {
-                sample_overlay_thread_cpu(log_df, log_dt, true);
-            }
+            AsyncTelemetryWorker::Get().EnqueueThreadCpuAndFlush(!frame_stats_on, log_df, log_dt,
+                                                                 true);
+#else
+            AsyncTelemetryWorker::Get().EnqueueThreadCpuAndFlush(false, 0, 0.0, false);
 #endif
-            std::fflush(stdout);
         }
     }
 }

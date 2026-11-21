@@ -41,6 +41,10 @@ namespace Core {
 class MemoryManager;
 }
 
+namespace BbCp::DirectVk {
+struct NativePostProcessArgs;
+}
+
 namespace Vulkan {
 
 class GraphicsPipeline;
@@ -343,6 +347,7 @@ public:
     void DirectDecompressDepth(const DirectDecompressDepthArgs& args);
     void DirectEliminateFastClear(const DirectEliminateFastClearArgs& args);
     void DirectResolveColor(const DirectResolveColorArgs& args);
+    void DirectNativePostProcess(const BbCp::DirectVk::NativePostProcessArgs& args);
     void DirectUploadTextureSubresource(const DirectUploadTextureArgs& args);
     void DirectClearDepthStencil(const DirectClearDepthStencilArgs& args);
     /// bbport: whether FillBuffer/CopyBuffer into guest memory at `dst` may write it on the CPU
@@ -1172,6 +1177,8 @@ private:
         bool barrier = false;
     } texture_task;
     u8 frame_fx_mask = 0;
+    u8 frame_mb_mask = 0x0Au; // default: cam=2 (Default), obj=2 (Default)
+    u8 frame_mb_fps_q4 = 16u; // Q4.4 FPS normalization scale (16 = 1.0x at 30 FPS)
     bool frame_fx_mask_valid = false;
     /// Draws whose textures the helper bound completely, partly or not at all (BB_FRAME_STATS).
     u64 helper_full = 0, helper_partial = 0, helper_serial = 0;
@@ -1602,6 +1609,7 @@ private:
     std::unique_ptr<class OcclusionQueries> occlusion;
     std::atomic<bool> guest_occlusion_seen{false};
     std::unique_ptr<class ButtonPrompts> prompts; ///< bbport: the key guide icons for the device in use
+    std::unique_ptr<class NativePostFx> native_postfx; ///< Remaster v2: native Vulkan 1.3 PostFX (A/B vs Yebis2)
     std::unique_ptr<class GpuTimestamps> timestamps;
     std::unique_ptr<class IndirectGuard> indirect_guard; ///< stage B only (lazily)
     /// Submissions (prepared draws) kept alive until stage B reaches the position.

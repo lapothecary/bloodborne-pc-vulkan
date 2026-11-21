@@ -20,6 +20,7 @@
 #include <fmt/format.h>
 #include <xxhash.h>
 
+#include "bbport_frame_rate.h"
 #include "bbport_settings.h"
 #include "buffers/buffer_cache.h"
 #include "common/alignment.h"
@@ -3279,6 +3280,22 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
         if (settings.ssgi_enabled.load(std::memory_order_relaxed))    m |= 0x20u;
         return m;
     }();
+    const u8 mb_mask = []() noexcept -> u8 {
+        const auto& settings = BbSettings::Get();
+        const u8 cam = static_cast<u8>(
+            std::clamp(settings.motion_blur_camera.load(std::memory_order_relaxed), 0, 3));
+        const u8 obj = static_cast<u8>(
+            std::clamp(settings.motion_blur_object.load(std::memory_order_relaxed), 0, 3));
+        const u8 native_bit =
+            settings.native_postfx.load(std::memory_order_relaxed) ? 0x10u : 0x00u;
+        return static_cast<u8>((cam & 0x3u) | ((obj & 0x3u) << 2u) | native_bit);
+    }();
+    const u8 mb_fps_q4 = []() noexcept -> u8 {
+        const float frames = std::clamp(BbFrameRate::CurrentFramesPer30(), 0.05f, 1.5f);
+        const float fps_scale = std::clamp(1.0f / frames, 1.0f, 12.0f);
+        return static_cast<u8>(
+            std::clamp(static_cast<int>(std::lround(fps_scale * 16.0f)), 16, 255));
+    }();
     static const bool all_motion = [] {
         const char* value = std::getenv("BB_OBJECT_MOTION_ALL");
         return value && value[0] == '1';
@@ -4088,6 +4105,8 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
                         push_data.yscale =
                             (ctl.yscale_enable ? vp0.yscale : 1.f) * cur_ts.target_scale[1];
                         push_data.scene_size = cur_ts.scene_size;
+                        push_data.buf_offsets[37] = mb_fps_q4;
+                        push_data.buf_offsets[38] = mb_mask;
                         push_data.buf_offsets[39] = fx_mask;
                     }
 

@@ -1,0 +1,112 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Native Vulkan 1.3 Post-Process — Step 1: True-dt Auto-Exposure Adaptation from 256-bin Histogram.
+#version 460
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) buffer HistogramBuffer {
+    uint bins[256];
+} hist_buf;
+
+layout(set = 0, binding = 1, std430) buffer ExposureStateBuffer {
+    float adapted_exposure;
+    float adapted_luma;
+    float target_exposure;
+    uint initialized;
+} exp_state;
+
+layout(push_constant) uniform AutoExpPush {
+    float min_log_lum;
+    float log_lum_range;
+    float middle_gray;
+    float min_exposure;
+    float max_exposure;
+    float manual_exposure;
+    float dt_sec;
+    float bright_adapt_rate;
+    float dark_adapt_rate;
+    float bright_speed_limit;
+    float dark_speed_limit;
+    uint flags; // bit0 = enable_auto_exp, bit1 = reset_history
+} pc;
+
+shared float s_weighted_sum[256];
+shared uint s_count_sum[256];
+
+void main() {
+    const uint idx = gl_LocalInvocationIndex;
+    const uint count = hist_buf.bins[idx];
+    // Clear histogram in-place for the next frame.
+    hist_buf.bins[idx] = 0u;
+
+    // Bin 0 is near-black (< 1e-5); exclude from geometric mean so dark borders/void don't blow out exposure.
+    s_count_sum[idx] = (idx == 0u) ? 0u : count;
+    s_weighted_sum[idx] = (idx == 0u) ? 0.0 : (float(count) * float(idx));
+    barrier();
+
+    for (uint step = 128u; step > 0u; step >>= 1u) {
+        if (idx < step) {
+            s_count_sum[idx] += s_count_sum[idx + step];
+            s_weighted_sum[idx] += s_weighted_sum[idx + step];
+        }
+        barrier();
+    }
+
+    if (idx == 0u) {
+        const bool auto_on = (pc.flags & 1u) != 0u;
+        const bool reset = (pc.flags & 2u) != 0u || (exp_state.initialized == 0u);
+        const float min_exp = max(pc.min_exposure, 1e-3);
+        const float max_exp = max(pc.max_exposure, min_exp);
+
+        if (!auto_on) {
+            const float manual = max(pc.manual_exposure, 1e-3);
+            exp_state.adapted_exposure = manual;
+            exp_state.target_exposure = manual;
+            exp_state.adapted_luma = pc.middle_gray / manual;
+            exp_state.initialized = 1u;
+            return;
+        }
+
+        const uint non_black = s_count_sum[0];
+        float avg_luma = pc.middle_gray / clamp(max(pc.manual_exposure, 1e-3), min_exp, max_exp);
+        if (non_black > 0u) {
+            const float avg_bin = s_weighted_sum[0] / float(non_black);
+            const float norm = clamp((avg_bin - 1.0) / 254.0, 0.0, 1.0);
+            const float avg_log2 = pc.min_log_lum + norm * pc.log_lum_range;
+            avg_luma = max(exp2(avg_log2), 1e-4);
+        }
+
+        const float target_exp = clamp(pc.middle_gray / avg_luma, min_exp, max_exp);
+        exp_state.target_exposure = target_exp;
+
+        if (reset) {
+            const float init_exp = (pc.manual_exposure > 1e-3)
+                                       ? clamp(pc.manual_exposure, min_exp, max_exp)
+                                       : target_exp;
+            exp_state.adapted_exposure = init_exp;
+            exp_state.adapted_luma = avg_luma;
+            exp_state.initialized = 1u;
+            return;
+        }
+
+        const float prev_exp = clamp(exp_state.adapted_exposure, min_exp, max_exp);
+        const float dt = clamp(pc.dt_sec, 1e-4, 0.25);
+        // Going brighter => exposure decreases (prev_exp > target_exp); going darker => exposure increases.
+        const bool getting_brighter = (target_exp < prev_exp);
+        const float rate = max(getting_brighter ? pc.bright_adapt_rate : pc.dark_adapt_rate, 0.1);
+        const float speed_lim = getting_brighter ? pc.bright_speed_limit : pc.dark_speed_limit;
+
+        // Exponential adaptation in log2-EV space (completely FPS-invariant).
+        const float prev_ev = log2(prev_exp);
+        const float target_ev = log2(target_exp);
+        const float alpha = 1.0 - exp(-dt * rate);
+        float delta_ev = (target_ev - prev_ev) * alpha;
+        if (speed_lim > 1e-4) {
+            const float max_step = speed_lim * dt;
+            delta_ev = clamp(delta_ev, -max_step, max_step);
+        }
+        const float next_exp = clamp(exp2(prev_ev + delta_ev), min_exp, max_exp);
+        exp_state.adapted_exposure = next_exp;
+        exp_state.adapted_luma = mix(exp_state.adapted_luma, avg_luma, alpha);
+    }
+}

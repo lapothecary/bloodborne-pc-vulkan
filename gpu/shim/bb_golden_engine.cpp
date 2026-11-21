@@ -214,25 +214,55 @@ int GX_SYSV_ABI bb_direct_vk_is_effect_enabled(std::uint32_t effect_index) noexc
     return 1;
 }
 
-void GX_SYSV_ABI bb_direct_vk_motion_blur_scales(float* out_time_scale,
-                                                 float* out_max_len_scale,
-                                                 float* out_cam_thresh_scale) noexcept {
+std::uint32_t GX_SYSV_ABI bb_direct_vk_motion_blur_scales(float* out_time_scale,
+                                                          float* out_obj_vel_scale,
+                                                          float* out_max_len_scale,
+                                                          float* out_cam_thresh_scale) noexcept {
+    // Independent FPS-normalized Camera & Object Motion Blur (0=Off, 1=Low, 2=Default, 3=High):
     // Normalize Yebis2 1-frame velocity blur to 30 FPS shutter philosophy at any FPS
-    // (30 FPS -> 1.0x, 60 FPS -> 2.0x, 170 FPS -> 5.67x), modulated by user strength preset:
-    // 0 = Low (0.45x), 1 = Default (1.0x PS4 parity), 2 = High (1.75x).
+    // (30 FPS -> 1.0x, 60 FPS -> 2.0x, 170 FPS -> 5.67x).
+    const auto& s = BbSettings::Get();
+    const int cam_lvl = std::clamp(s.motion_blur_camera.load(std::memory_order_relaxed), 0, 3);
+    const int obj_lvl = std::clamp(s.motion_blur_object.load(std::memory_order_relaxed), 0, 3);
+    const std::uint32_t flags = (cam_lvl > 0 ? 1u : 0u) | (obj_lvl > 0 ? 2u : 0u);
+    if (!out_time_scale && !out_obj_vel_scale && !out_max_len_scale && !out_cam_thresh_scale) {
+        return flags;
+    }
+
+    static constexpr float kTimeMult[4] = {0.0f, 0.45f, 1.00f, 1.75f};
+    static constexpr float kLenMult[4]  = {0.0f, 0.65f, 1.00f, 1.60f};
+
     const float frames = std::clamp(BbFrameRate::CurrentFramesPer30(), 0.05f, 1.5f);
     const float fps_scale = std::clamp(1.0f / frames, 1.0f, 12.0f);
-    const int strength = std::clamp(
-        BbSettings::Get().motion_blur_strength.load(std::memory_order_relaxed), 0, 2);
-    const float time_mult = (strength == 0) ? 0.45f : ((strength == 2) ? 1.75f : 1.00f);
-    const float len_mult  = (strength == 0) ? 0.65f : ((strength == 2) ? 1.60f : 1.00f);
-    if (out_time_scale)       *out_time_scale       = fps_scale * time_mult;
-    if (out_max_len_scale)    *out_max_len_scale    = len_mult;
+
+    // Always feed Yebis2 the max active strength & real rawVelScale (1.0f) so Yebis2's internal
+    // recurrence planner always runs identically to combined mode; ps_d3c8bb21.frag then applies
+    // the exact independent per-layer Camera (obj.a==0) and Object (obj.a==1) weights directly!
+    const float max_time_mult = std::max(kTimeMult[cam_lvl], kTimeMult[obj_lvl]);
+    const float max_len_mult  = std::max(kLenMult[cam_lvl], kLenMult[obj_lvl]);
+
+    if (out_time_scale)       *out_time_scale       = fps_scale * max_time_mult;
+    if (out_obj_vel_scale)    *out_obj_vel_scale    = 1.0f;
+    if (out_max_len_scale)    *out_max_len_scale    = max_len_mult;
     if (out_cam_thresh_scale) *out_cam_thresh_scale = frames;
+    return flags;
 }
 
 extern "C" void GX_SYSV_ABI bb_direct_vk_note_vel_silhouette_mask() noexcept {
     Vulkan::ObjectVelocityCuller::NoteSilhouetteMaskActiveGlobal();
+}
+
+extern "C" int GX_SYSV_ABI bb_direct_vk_native_postfx_enabled() noexcept {
+    return BbSettings::Get().native_postfx.load(std::memory_order_relaxed) ? 1 : 0;
+}
+
+extern "C" float GX_SYSV_ABI bb_direct_vk_frame_dt_sec() noexcept {
+    const float frames30 = std::clamp(BbFrameRate::CurrentFramesPer30(), 0.01f, 7.5f);
+    return frames30 / 30.0f;
+}
+
+extern "C" int GX_SYSV_ABI bb_direct_vk_true_black_enabled() noexcept {
+    return BbSettings::Get().true_black_hdr.load(std::memory_order_relaxed) ? 1 : 0;
 }
 
 std::uint32_t GX_SYSV_ABI bb_direct_vk_gx_command_heap_bytes() noexcept {

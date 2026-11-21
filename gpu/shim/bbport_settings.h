@@ -241,8 +241,26 @@ struct Values {
     std::atomic<bool> pcss_shadows{false};
     /// Horizon-Based Screen-Space Global Illumination (HBIL indirect bounce lighting in GXLightComposite).
     std::atomic<bool> ssgi_enabled{false};
-    /// Motion Blur strength (FPS-normalized shutter): 0 = Low, 1 = Default (PS4 30-FPS parity), 2 = High.
-    std::atomic<int> motion_blur_strength{1};
+    /// Remaster v2: Native Vulkan 1.3 Post-Process pipeline (live A/B replacement for Yebis2 black-box).
+    std::atomic<bool> native_postfx{false};
+    /// Live tuning sliders (Insert overlay only, not persisted to game menu) for Native Vulkan PostFX:
+    /// - native_bloom_intensity: GPARAM GlareLuminance multiplier (calibrated default: 0.250).
+    /// - native_bloom_threshold: GPARAM GlareThreshold multiplier (calibrated default: 3.50).
+    /// - native_mb_obj_boost: extra multiplier on Pass 0x2e pure Object Self-Motion velocity.
+    /// - native_mb_debug_vis: visualize Motion Blur velocity map (R/G=Camera, Blue=ObjMask, Yellow=ObjVel).
+    std::atomic<float> native_bloom_intensity{0.25f};
+    std::atomic<float> native_bloom_threshold{3.50f};
+    std::atomic<float> native_mb_obj_boost{1.00f};
+    std::atomic<float> native_dof_strength{1.00f};
+    std::atomic<bool> native_mb_debug_vis{false};
+    /// Camera Motion Blur (world/background blur on camera turn, FPS-normalized):
+    /// 0 = Off, 1 = Low, 2 = Default (PS4 30-FPS parity), 3 = High.
+    std::atomic<int> motion_blur_camera{2};
+    /// Object Motion Blur (per-object / weapon / character velocity blur, FPS-normalized):
+    /// 0 = Off (also skips CPU Pass 0x2e), 1 = Low, 2 = Default (PS4 30-FPS parity), 3 = High.
+    std::atomic<int> motion_blur_object{2};
+    /// True once motion_blur_camera / motion_blur_object was explicitly loaded from bbport.ini.
+    std::atomic<bool> motion_blur_split_chosen{false};
 
     // --- Native Bloodborne System Options (CSOptionsData <-> bbport.ini <-> Launcher) -----------
     enum NativeMaskBit : std::uint32_t {

@@ -629,6 +629,12 @@ void DirectVkExecuteSecondaryTask(Vulkan::Rasterizer& rasterizer, const u8* data
     rasterizer.ExecuteSecondaryCmdBuf(worker_id, args.cmd_seq, recorded_draws, occ_block_id);
 }
 
+void DirectVkNativePostProcessTask(Vulkan::Rasterizer& rasterizer, const u8* data) {
+    DirectVk::NativePostProcessArgs args{};
+    std::memcpy(&args, data, sizeof(args));
+    rasterizer.DirectNativePostProcess(args);
+}
+
 } // namespace Tasks
 
 } // namespace BbCp

@@ -434,7 +434,7 @@ void PS4_SYSV_ABI FrameStep(u64 pacer) {
             const double target_d = double(target_f);
             if (cur_ep == dt_stab_epoch && target_f == dt_stab_target &&
                 std::isfinite(measured) && measured > 0.0f &&
-                double(dt) >= target_d * 0.55 && double(dt) <= target_d * 1.35) {
+                double(dt) >= target_d * 0.35 && double(dt) <= target_d * 1.85) {
                 const double want = double(dt) + dt_debt_s;
                 const double step = std::clamp(
                     target_d + (want - target_d) * 0.12, target_d * 0.88, target_d * 1.18);

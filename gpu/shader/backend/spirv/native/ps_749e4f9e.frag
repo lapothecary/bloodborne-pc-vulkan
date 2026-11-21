@@ -44,9 +44,14 @@ void main() {
         discard;
     }
 
+    const float fps_q = float((push_data.buf_offsets2.y >> 8u) & 0xFFu) * 0.0625;
+    const float obj_fps_scale = (fps_q >= 1.0) ? fps_q : 1.0;
+    const bool native_postfx = ((push_data.buf_offsets2.y >> 20u) & 1u) != 0u;
+    const vec2 enc_scale = native_postfx ? vec2(4.0) : vec2(s2f(d1 + 0u), s2f(d1 + 1u));
+
     vec2 cur_ndc  = fs_in_attr0_p.xy * (1.0 / fs_in_attr0_p.w);
     vec2 prev_ndc = fs_in_attr1_p.xy * (1.0 / fs_in_attr1_p.w);
-    vec2 vel = clamp((vec2(s2f(d1 + 0u), s2f(d1 + 1u)) * (cur_ndc - prev_ndc)) * 0.5 + 0.5, 0.0, 1.0);
+    vec2 vel = clamp((enc_scale * (cur_ndc - prev_ndc) * obj_fps_scale) * 0.5 + 0.5, 0.0, 1.0);
     float depth_norm = fs_in_attr0_p.w * (1.0 / (10.0 + fs_in_attr0_p.w));
 
     frag_color0 = vec4(vel, depth_norm, 1.0);

@@ -19,9 +19,20 @@ inline void NoteVelocitySilhouetteMask() noexcept {
 }
 
 // Minimum single-frame 3x4 bone matrix delta (~1.2 cm world translation or ~0.7 deg rotation)
-// required to produce >= 1 pixel of visible Yebis2 object motion blur. Idle character breathing
-// and gentle wind sway stay 5x-50x below this threshold, letting Yebis2 skip 6 fullscreen passes.
+// at 30 FPS required to produce >= 1 pixel of visible Yebis2 object motion blur.
+// Scaled dynamically by `frames = dt * 30` so high-FPS (90..300 FPS) weapon swings/dodges
+// are never culled as stationary while idle breathing remains well below threshold.
 inline constexpr float kObjectVelocityBoneDeltaThreshold = 0.012f;
+inline std::atomic<float> g_obj_vel_bone_thresh_scaled{kObjectVelocityBoneDeltaThreshold};
+
+inline void UpdateObjectVelocityThresholdScale(float frames_per_30) noexcept {
+    const float clamped = (frames_per_30 < 0.05f) ? 0.05f : ((frames_per_30 > 1.0f) ? 1.0f : frames_per_30);
+    g_obj_vel_bone_thresh_scaled.store(kObjectVelocityBoneDeltaThreshold * clamped, std::memory_order_relaxed);
+}
+
+inline float ObjectVelocityBoneDeltaThreshold() noexcept {
+    return g_obj_vel_bone_thresh_scaled.load(std::memory_order_relaxed);
+}
 
 // Hold counter across 3 frames so pipelined GXSkinningUpdateJob workers and trailing blur frames
 // never miss active character/enemy/weapon motion while the camera stands still.

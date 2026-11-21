@@ -525,7 +525,7 @@ void sub_21c8c50(void* self, const float* bone_matrices,
                         const float m01 = (diff_lanes[0] > diff_lanes[1]) ? diff_lanes[0] : diff_lanes[1];
                         const float m23 = (diff_lanes[2] > diff_lanes[3]) ? diff_lanes[2] : diff_lanes[3];
                         const float max_delta = (m01 > m23) ? m01 : m23;
-                        if (max_delta > gx_direct_vk::kObjectVelocityBoneDeltaThreshold) {
+                        if (max_delta > gx_direct_vk::ObjectVelocityBoneDeltaThreshold()) {
                             gx_direct_vk::NoteActiveObjectVelocity();
                         }
                     }

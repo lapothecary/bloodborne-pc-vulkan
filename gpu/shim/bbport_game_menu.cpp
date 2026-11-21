@@ -310,7 +310,7 @@ constexpr int DisplaySlotCount = 11; ///< all 11 Display settings fit on a singl
 constexpr int TotalDisplayItems = 12;
 constexpr int MaxDisplayScroll = TotalDisplayItems - DisplaySlotCount;
 constexpr int EffectsSlotCount = 11; ///< all 11 Effects settings fit on a single screen (0 scroll)
-constexpr int TotalEffectsItems = 14;
+constexpr int TotalEffectsItems = 16;
 constexpr int MaxEffectsScroll = TotalEffectsItems - EffectsSlotCount;
 constexpr int MaxChoicesPerSlot = 16;
 constexpr int DefaultResetSentinel = -999;
@@ -2422,9 +2422,12 @@ constexpr EffectsItemMeta EffectsItems[TotalEffectsItems] = {
     {"Depth of Field (DoF)", "Глубина резкости (DoF)",
      "Cinematic background blur for objects outside the camera focus plane",
      "Кинематографическое размытие дальнего фона и объектов вне фокуса камеры", true},
-    {"Motion Blur", "Размытие в движении",
-     "FPS-normalized camera & per-object motion blur (Off / Low / Default / High — identical feel at any FPS)",
-     "Размытие камеры и объектов с адаптацией под любой FPS (Выкл / Низкий / Стандарт / Высокий)", true},
+    {"Camera Motion Blur", "Размытие камеры",
+     "FPS-normalized world blur when turning the camera (Off / Low / Default / High — 0 extra CPU draws)",
+     "Размытие мира при повороте камеры под любой FPS (Выкл / Низкий / Стандарт / Высокий — 0 нагрузки CPU)", true},
+    {"Object Motion Blur", "Размытие объектов",
+     "Per-object velocity blur for characters, weapons, and cloth (Off / Low / Default / High — Off saves CPU)",
+     "Пообъектное размытие персонажей, оружия и плащей (Выкл / Низкий / Стандарт / Высокий — Выкл экономит CPU)", true},
     {"Ambient Occlusion (SSAO)", "Затенение SSAO",
      "Soft contact shading in corners, cobblestones, and cloth folds (adds depth)",
      "Мягкое контактное затенение в углах, щелях брусчатки и складках одежды", true},
@@ -2458,17 +2461,20 @@ constexpr EffectsItemMeta EffectsItems[TotalEffectsItems] = {
     {"Screen-Space GI (SSGI)", "Отражённый свет (SSGI)",
      "Vulkan 1.3 Remaster: horizon-based indirect bounce lighting from fire, lanterns, torches, and sunset sky",
      "Ремастер Vulkan 1.3: живой отражённый свет (SSGI) от костров, факелов, фонарей и закатного неба на камни и одежду", false},
+    {"Native Vulkan PostFX (A/B)", "Нативный пост-процесс (A/B)",
+     "Remaster v2 live A/B: native Vulkan 1.3 post-process replacing Yebis2 (Step 1: Tonemap, 3D LUT, Auto-Exposure, CA, Vignette)",
+     "Ремастер v2 (A/B): нативный Vulkan 1.3 пост-процесс вместо Yebis2 (Шаг 1: Tonemap, 3D LUT, Auto-Exposure, ХА, виньетка)", false},
 };
 
 constexpr int EffectsItemToEffectIdx(int item_idx) {
     switch (item_idx) {
     case 0: return 0; // effect_chromatic_aberration
     case 1: return 1; // effect_dof
-    case 2: return 2; // effect_motion_blur
-    case 3: return 3; // effect_ssao
-    case 4: return 5; // effect_dynamic_shadows (4 is effect_game_aa)
-    case 5: return 6; // effect_ssr
-    case 6: return 7; // effect_bloom
+    // 2 = Camera Motion Blur, 3 = Object Motion Blur (4-level Off/Low/Default/High)
+    case 4: return 3; // effect_ssao
+    case 5: return 5; // effect_dynamic_shadows (4 is effect_game_aa)
+    case 6: return 6; // effect_ssr
+    case 7: return 7; // effect_bloom
     default: return -1;
     }
 }
@@ -2478,15 +2484,27 @@ bool GetEffectsItemActive(int item_idx) {
     const int e = EffectsItemToEffectIdx(item_idx);
     if (e >= 0) return s.effects[e].load();
     switch (item_idx) {
-    case 7: return s.ssao_quality.load();
-    case 8: return s.contact_shadows.load();
-    case 9: return s.ssr_quality.load();
-    case 10: return s.true_black_hdr.load();
-    case 11: return s.hdr_output.load();
-    case 12: return s.pcss_shadows.load();
-    case 13: return s.ssgi_enabled.load();
+    case 2: return s.motion_blur_camera.load() > 0;
+    case 3: return s.motion_blur_object.load() > 0;
+    case 8: return s.ssao_quality.load();
+    case 9: return s.contact_shadows.load();
+    case 10: return s.ssr_quality.load();
+    case 11: return s.true_black_hdr.load();
+    case 12: return s.hdr_output.load();
+    case 13: return s.pcss_shadows.load();
+    case 14: return s.ssgi_enabled.load();
+    case 15: return s.native_postfx.load();
     default: return false;
     }
+}
+
+void SyncMotionBlurLegacyFlag() {
+    auto& s = BbSettings::Get();
+    const bool any_on = (s.motion_blur_camera.load() > 0) || (s.motion_blur_object.load() > 0);
+    s.effects[2] = any_on;
+    values[FirstEffect + 2] = any_on ? 1 : 0;
+    applied[FirstEffect + 2] = any_on ? 1 : 0;
+    bytes[FirstEffect + 2] = u8(any_on ? 1 : 0);
 }
 
 void SetEffectsItemActive(int item_idx, bool active) {
@@ -2494,24 +2512,30 @@ void SetEffectsItemActive(int item_idx, bool active) {
     const int e = EffectsItemToEffectIdx(item_idx);
     if (e >= 0) {
         s.effects[e] = active;
-        if (item_idx == 2 && active) {
-            s.motion_blur_strength = 1; // Default when Reset to Defaults runs
-        }
         values[FirstEffect + e] = active ? 1 : 0;
         applied[FirstEffect + e] = active ? 1 : 0;
         bytes[FirstEffect + e] = u8(active ? 1 : 0);
     } else {
         switch (item_idx) {
-        case 7: s.ssao_quality = active; break;
-        case 8: s.contact_shadows = active; break;
-        case 9: s.ssr_quality = active; break;
-        case 10: s.true_black_hdr = active; break;
-        case 11:
+        case 2:
+            s.motion_blur_camera = active ? 2 : 0; // Default when Reset to Defaults runs
+            SyncMotionBlurLegacyFlag();
+            break;
+        case 3:
+            s.motion_blur_object = active ? 2 : 0; // Default when Reset to Defaults runs
+            SyncMotionBlurLegacyFlag();
+            break;
+        case 8: s.ssao_quality = active; break;
+        case 9: s.contact_shadows = active; break;
+        case 10: s.ssr_quality = active; break;
+        case 11: s.true_black_hdr = active; break;
+        case 12:
             s.hdr_output = active;
             s.swapchain_generation.fetch_add(1, std::memory_order_relaxed);
             break;
-        case 12: s.pcss_shadows = active; break;
-        case 13: s.ssgi_enabled = active; break;
+        case 13: s.pcss_shadows = active; break;
+        case 14: s.ssgi_enabled = active; break;
+        case 15: s.native_postfx = active; break;
         default: break;
         }
     }
@@ -2519,17 +2543,18 @@ void SetEffectsItemActive(int item_idx, bool active) {
     BbSettings::Save();
 }
 
-int GetMotionBlurMenuChoiceIdx() {
+int GetMotionBlurItemChoiceIdx(int item_idx) {
     const auto& s = BbSettings::Get();
-    if (!s.effects[2].load()) return 0;
-    return std::clamp(s.motion_blur_strength.load(), 0, 2) + 1; // 1=Low, 2=Default, 3=High
+    if (item_idx == 2) return std::clamp(s.motion_blur_camera.load(), 0, 3);
+    if (item_idx == 3) return std::clamp(s.motion_blur_object.load(), 0, 3);
+    return 0;
 }
 
 void BuildEffectsSlotChoices(int slot, std::vector<u32>& out_choices, int& out_selected_idx) {
     out_choices.clear();
     const int item_idx = std::clamp(effects_scroll + slot, 0, TotalEffectsItems - 1);
     const u32 base_id = EffectsSlotChoices + u32(slot * 4);
-    if (item_idx == 2) {
+    if (item_idx == 2 || item_idx == 3) {
         SetDynamic(base_id + 0, "Off", "Выкл");
         SetDynamic(base_id + 1, "Low", "Низкий");
         SetDynamic(base_id + 2, "Default", "Стандарт");
@@ -2538,7 +2563,7 @@ void BuildEffectsSlotChoices(int slot, std::vector<u32>& out_choices, int& out_s
         out_choices.push_back(base_id + 1);
         out_choices.push_back(base_id + 2);
         out_choices.push_back(base_id + 3);
-        out_selected_idx = GetMotionBlurMenuChoiceIdx();
+        out_selected_idx = GetMotionBlurItemChoiceIdx(item_idx);
         return;
     }
     SetDynamic(base_id + 0, "Off", "Выкл");
@@ -2553,8 +2578,8 @@ void RefreshEffectsSlotTexts(int slot) {
     const auto& meta = EffectsItems[item_idx];
     SetDynamic(EffectsSlotName + u32(slot), meta.name_en, meta.name_ru);
     SetDynamic(EffectsSlotHelp + u32(slot), meta.help_en, meta.help_ru);
-    if (item_idx == 2) {
-        const int idx = GetMotionBlurMenuChoiceIdx();
+    if (item_idx == 2 || item_idx == 3) {
+        const int idx = GetMotionBlurItemChoiceIdx(item_idx);
         static constexpr const char* kEn[4] = {"Off", "Low", "Default", "High"};
         static constexpr const char* kRu[4] = {"Выкл", "Низкий", "Стандарт", "Высокий"};
         SetDynamic(EffectsSlotVal + u32(slot), kEn[idx], kRu[idx]);
@@ -2627,17 +2652,13 @@ void InitEffectsPage(void* page) {
 
 void ApplyEffectsSlotChoiceIndex(u8* row, int slot, int choice_idx) {
     const int item_idx = std::clamp(effects_scroll + slot, 0, TotalEffectsItems - 1);
-    if (item_idx == 2) {
+    if (item_idx == 2 || item_idx == 3) {
         const int clamped = std::clamp(choice_idx, 0, 3);
         auto& s = BbSettings::Get();
-        const bool new_active = (clamped != 0);
-        const int new_strength = (clamped > 0) ? (clamped - 1) : s.motion_blur_strength.load();
-        if (new_active != s.effects[2].load() || new_strength != s.motion_blur_strength.load()) {
-            s.motion_blur_strength = new_strength;
-            s.effects[2] = new_active;
-            values[FirstEffect + 2] = new_active ? 1 : 0;
-            applied[FirstEffect + 2] = new_active ? 1 : 0;
-            bytes[FirstEffect + 2] = u8(new_active ? 1 : 0);
+        auto& target = (item_idx == 2) ? s.motion_blur_camera : s.motion_blur_object;
+        if (clamped != target.load()) {
+            target = clamped;
+            SyncMotionBlurLegacyFlag();
             BbGuestHooks::ApplyGameEffects();
             BbSettings::Save();
         }
@@ -2656,8 +2677,8 @@ void ApplyEffectsSlotChoiceIndex(u8* row, int slot, int choice_idx) {
 void StepEffectsSlotSetting(u8* row, int slot, int delta) {
     if (delta == 0) return;
     const int item_idx = std::clamp(effects_scroll + slot, 0, TotalEffectsItems - 1);
-    if (item_idx == 2) {
-        const int cur = GetMotionBlurMenuChoiceIdx();
+    if (item_idx == 2 || item_idx == 3) {
+        const int cur = GetMotionBlurItemChoiceIdx(item_idx);
         const int next = (cur + (delta > 0 ? 1 : 3)) % 4;
         PlayMenuStepSound();
         ApplyEffectsSlotChoiceIndex(row, slot, next);

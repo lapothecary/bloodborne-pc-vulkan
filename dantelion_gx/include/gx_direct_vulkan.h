@@ -73,9 +73,10 @@ GX_HOST_IMPORT void bb_direct_vk_retire_shader_range(const void* gpu_addr,
 
 // V5.1: Native C++20 PC PostFX, Resolution, Heap & Hardware Fix Controls
 GX_HOST_IMPORT int bb_direct_vk_is_effect_enabled(uint32_t effect_index) noexcept;
-GX_HOST_IMPORT void bb_direct_vk_motion_blur_scales(float* out_time_scale,
-                                                    float* out_max_len_scale,
-                                                    float* out_cam_thresh_scale) noexcept;
+GX_HOST_IMPORT uint32_t bb_direct_vk_motion_blur_scales(float* out_time_scale,
+                                                        float* out_obj_vel_scale,
+                                                        float* out_max_len_scale,
+                                                        float* out_cam_thresh_scale) noexcept;
 GX_HOST_IMPORT uint32_t bb_direct_vk_gx_command_heap_bytes() noexcept;
 GX_HOST_IMPORT int bb_direct_vk_intel_tonemap_fix() noexcept;
 GX_HOST_IMPORT int bb_direct_vk_light_grid_override(uint32_t* out_w, uint32_t* out_h) noexcept;
@@ -113,6 +114,11 @@ GX_HOST_IMPORT void bb_direct_vk_mt_note_copy_batch(const void* raw_regions,
                                                     uint32_t count) noexcept;
 GX_HOST_IMPORT void bb_direct_vk_mt_invalidate_copy_shadow(uint64_t dst_va,
                                                            uint64_t byte_size) noexcept;
+
+// Remaster v2: Native Vulkan 1.3 Post-Process pipeline (live A/B switch vs Yebis2)
+GX_HOST_IMPORT int bb_direct_vk_native_postfx_enabled() noexcept;
+GX_HOST_IMPORT float bb_direct_vk_frame_dt_sec() noexcept;
+GX_HOST_IMPORT int bb_direct_vk_true_black_enabled() noexcept;
 }
 
 namespace gx_direct_vk {
@@ -461,16 +467,26 @@ inline bool IsEffectEnabled(uint32_t effect_index) noexcept {
     return bb_direct_vk_is_effect_enabled(effect_index) != 0;
 }
 
-inline void GetMotionBlurScales(float& out_time_scale,
-                                float& out_max_len_scale,
-                                float& out_cam_thresh_scale) noexcept {
+inline uint32_t GetMotionBlurScales(float& out_time_scale,
+                                    float& out_obj_vel_scale,
+                                    float& out_max_len_scale,
+                                    float& out_cam_thresh_scale) noexcept {
     out_time_scale = 1.0f;
+    out_obj_vel_scale = 1.0f;
     out_max_len_scale = 1.0f;
     out_cam_thresh_scale = 1.0f;
     if (!EnabledV5Sub(kV5Sub_NativePostFx) || !bb_direct_vk_motion_blur_scales) {
-        return;
+        return 3u; // Default PS4: Camera + Object
     }
-    bb_direct_vk_motion_blur_scales(&out_time_scale, &out_max_len_scale, &out_cam_thresh_scale);
+    return bb_direct_vk_motion_blur_scales(
+        &out_time_scale, &out_obj_vel_scale, &out_max_len_scale, &out_cam_thresh_scale);
+}
+
+inline uint32_t GetMotionBlurFlags() noexcept {
+    if (!EnabledV5Sub(kV5Sub_NativePostFx) || !bb_direct_vk_motion_blur_scales) {
+        return 3u;
+    }
+    return bb_direct_vk_motion_blur_scales(nullptr, nullptr, nullptr, nullptr);
 }
 
 inline uint32_t GxCommandHeapBytes() noexcept {
@@ -725,6 +741,8 @@ enum class Op : uint32_t {
     DrawBundle               = 34u,
     // Phase 4 Step 4.2: Execute pre-compiled GXWorker secondary VkCommandBuffer inside Dynamic Rendering
     ExecuteSecondaryCmds     = 35u,
+    // Remaster v2: Native Vulkan 1.3 Post-Process pipeline (replaces Yebis2 black-box when enabled)
+    NativePostProcess        = 36u,
 };
 
 // Tag stored in `CopyRegion::reserved` / `CopyRecord::reserved` when the C++20 engine itself
@@ -1039,6 +1057,113 @@ inline bool EmitUploadTextureSubresource(void* dcb_raw, const UploadTextureArgs&
 
 inline bool EmitClearDepthStencil(void* dcb_raw, const ClearDepthStencilArgs& args) noexcept {
     return EmitFixedPacket<Op::ClearDepthStencil>(dcb_raw, args);
+}
+
+inline constexpr uint32_t kNativePostFlag_Lut3d        = 1u << 0;
+inline constexpr uint32_t kNativePostFlag_AutoExposure = 1u << 1;
+inline constexpr uint32_t kNativePostFlag_Ca           = 1u << 2;
+inline constexpr uint32_t kNativePostFlag_TrueBlack    = 1u << 3;
+inline constexpr uint32_t kNativePostFlag_ResetHistory = 1u << 4;
+inline constexpr uint32_t kNativePostFlag_Bloom        = 1u << 5;
+inline constexpr uint32_t kNativePostFlag_MotionBlur   = 1u << 6;
+inline constexpr uint32_t kNativePostFlag_HasDepth     = 1u << 7;
+inline constexpr uint32_t kNativePostFlag_HasVel       = 1u << 8;
+inline constexpr uint32_t kNativePostFlag_Dof          = 1u << 9;
+inline constexpr uint32_t kNativePostFlag_DofCustom    = 1u << 10;
+inline constexpr uint32_t kNativePostFlag_DofNearCust  = 1u << 11;
+inline constexpr uint32_t kNativePostFlag_DofFarCust   = 1u << 12;
+inline constexpr uint32_t kNativePostFlag_DofAutoFocus = 1u << 13;
+
+struct NativePostProcessArgs {
+    uint64_t in_color_tsharp[4];
+    uint64_t lut3d_tsharp[4];
+    uint64_t in_depth_tsharp[4];
+    uint64_t vel_tsharp[4];
+    uint32_t out_cb_regs[11];
+    uint32_t flags;
+    int32_t  tone_type;
+    float    exposure;
+    float    gamma;
+    float    tone_factor;
+    float    filmic_contrast;
+    float    scene_lum_scale;
+    float    middle_gray;
+    float    min_exposure;
+    float    max_exposure;
+    float    meter_rect[4];
+    float    adapt_sens;
+    float    adapt_scale;
+    float    adapt_speed_limit;
+    float    dark_sens;
+    float    dark_scale;
+    float    dark_speed_limit;
+    float    hue_rad;
+    float    saturation;
+    float    value_scale;
+    float    contrast;
+    float    vig_power;
+    float    vig_fov_dep;
+    float    fov_y_rad;
+    float    aspect;
+    float    ca_lat_disp[2];
+    float    ca_uni_disp[2];
+    int32_t  ca_wave_samples;
+    float    delta_time_sec;
+    uint32_t frame_index;
+    uint32_t out_width;
+    uint32_t out_height;
+    // Step 2: Live GPARAM Bloom & Glare parameters
+    float    bloom_luminance;
+    float    bloom_threshold;
+    float    bloom_remap;
+    float    bloom_radius_scale;
+    float    bloom_luma_gamma;
+    float    bloom_dispersion;
+    int32_t  glare_shape;
+    uint32_t bloom_reserved;
+    // Step 3: Native Motion Blur (row-vector inv(curVP) * prevVP + live GPARAM MB settings)
+    float    clip_to_prev_clip[16];
+    float    mb_time_ratio;
+    float    mb_max_len;
+    float    mb_vel_scale;
+    float    mb_near_z;
+    // Step 4: Native Depth of Field (live GPARAM physical thin-lens + CustomDof + AutoFocus)
+    float    dof_focus_dist;     // param+0x1b0
+    float    dof_fstop;          // param+0x1b4
+    float    dof_ccd_diag_mm;    // param+0x1c0 (default 43.267 mm)
+    float    dof_scale;          // param+0x1d8 (clamped (0, 0.5])
+    float    dof_near_start;     // param+0x2dc
+    float    dof_near_end;       // param+0x2e0
+    float    dof_near_coc_size;  // param+0x2e4
+    float    dof_near_coc_scale; // param+0x2e8
+    float    dof_far_start;      // param+0x2ec
+    float    dof_far_end;        // param+0x2f0
+    float    dof_far_coc_size;   // param+0x2f4
+    float    dof_far_coc_scale;  // param+0x2f8
+    float    dof_far_cutoff;     // param+0x2fc
+    float    dof_view_near_z;    // linear depth near plane (m)
+    float    dof_view_far_z;     // linear depth far plane (m)
+    float    dof_af_sens;        // param+0x190 (AutoFocus speed)
+};
+static_assert(sizeof(NativePostProcessArgs) == 496, "NativePostProcessArgs is 124 dwords");
+
+inline bool IsNativePostFxEnabled() noexcept {
+    return bb_direct_vk_native_postfx_enabled && (bb_direct_vk_native_postfx_enabled() != 0);
+}
+
+inline float GetFrameDtSec() noexcept {
+    if (bb_direct_vk_frame_dt_sec) {
+        return bb_direct_vk_frame_dt_sec();
+    }
+    return 1.0f / 60.0f;
+}
+
+inline bool IsTrueBlackEnabled() noexcept {
+    return bb_direct_vk_true_black_enabled && (bb_direct_vk_true_black_enabled() != 0);
+}
+
+inline bool EmitNativePostProcess(void* dcb_raw, const NativePostProcessArgs& args) noexcept {
+    return EmitFixedPacket<Op::NativePostProcess>(dcb_raw, args);
 }
 
 // ============================================================================

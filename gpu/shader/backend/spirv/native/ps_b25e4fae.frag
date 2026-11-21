@@ -60,9 +60,14 @@ void main() {
     const vec2 vel_scale = vec2(uintBitsToFloat(ssbo_2.data[b1 + 0u]),
                                 uintBitsToFloat(ssbo_2.data[b1 + 1u]));
 
+    const float fps_q = float((push_data.buf_offsets2.y >> 8u) & 0xFFu) * 0.0625;
+    const float obj_fps_scale = (fps_q >= 1.0) ? fps_q : 1.0;
+    const bool native_postfx = ((push_data.buf_offsets2.y >> 20u) & 1u) != 0u;
+    const vec2 enc_scale = native_postfx ? vec2(4.0) : vel_scale;
+
     const float inv_cur_w  = 1.0 / fs_in_attr0.w;
     const float inv_prev_w = 1.0 / fs_in_attr1.w;
-    const vec2 vel = (fs_in_attr0.xy * inv_cur_w - fs_in_attr1.xy * inv_prev_w) * vel_scale;
+    const vec2 vel = (fs_in_attr0.xy * inv_cur_w - fs_in_attr1.xy * inv_prev_w) * enc_scale * obj_fps_scale;
     const vec2 enc = clamp(fma(vel, vec2(0.5), vec2(0.5)), vec2(0.0), vec2(1.0));
     const float z_enc = fs_in_attr0.w / (fs_in_attr0.w + 10.0);
 

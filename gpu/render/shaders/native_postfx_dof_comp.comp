@@ -1,0 +1,124 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Native Vulkan 1.3 Post-Process — Step 4: Full-Res Bilateral DoF Composite.
+// Computes exact per-pixel full-res signed CoC so in-focus silhouettes (Hunter, weapons,
+// branches, fences) stay 100% native 1440p/4K sharp with zero half-res edge softness.
+#version 460
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform texture2D hdr_scene;
+layout(set = 0, binding = 1) uniform texture2D depth_tex;
+layout(set = 0, binding = 2) uniform texture2D bokeh_tex;
+layout(set = 0, binding = 3) uniform sampler linear_samp;
+layout(set = 0, binding = 4, rgba16f) uniform writeonly image2D out_hdr_img;
+layout(set = 0, binding = 5, std140) uniform DofUbo {
+    vec4 clip_phys;   // x=nearZ, y=farZ, z=focusDist, w=physCocFactor
+    vec4 near_params; // x=nearStart, y=nearEnd, z=nearCocUv, w=negCocScale
+    vec4 far_params;  // x=farStart,  y=farEnd,  z=farCocUv,  w=posCocScale
+    vec4 misc_params; // x=farCutoff, y=maxCocUv, z=aspect, w=dofScale
+    uvec4 dims_flags; // x=half_w, y=half_h, z=full_w, w=full_h
+    uvec4 mode_flags; // x=flags (bit0=custom, bit1=nearCust, bit2=farCust), y=frame_index, z=0, w=0
+} u;
+layout(set = 0, binding = 6) uniform texture2D coc_tex;
+
+float LinearizeDepth(float d_raw) {
+    const float n = u.clip_phys.x;
+    const float f = u.clip_phys.y;
+    const float denom = max(f - clamp(d_raw, 0.0, 1.0) * (f - n), 1e-4);
+    return (n * f) / denom;
+}
+
+float ComputeSignedCoc(float linear_z) {
+    const uint flags = u.mode_flags.x;
+    const bool custom_on = (flags & 1u) != 0u;
+    const bool near_cust = (flags & 2u) != 0u;
+    const bool far_cust  = (flags & 4u) != 0u;
+
+    const float focus = max(u.clip_phys.z, 0.05);
+    const float base_coc = u.clip_phys.w * (linear_z - focus) / max(linear_z, 0.05);
+
+    float coc = base_coc;
+    if (custom_on) {
+        if (!near_cust) {
+            coc = base_coc;
+            if (coc < 0.0) {
+                coc *= u.near_params.w;
+            }
+        } else {
+            coc = 0.0;
+            if (linear_z < u.near_params.y) {
+                const float span = max(u.near_params.y - u.near_params.x, 1e-4);
+                const float t_near = clamp((linear_z - u.near_params.x) / span, 0.0, 1.0);
+                coc = -((1.0 - t_near) * u.near_params.z) * u.near_params.w;
+            }
+        }
+        if (far_cust && linear_z > u.far_params.x) {
+            const float span = max(u.far_params.y - u.far_params.x, 1e-4);
+            const float t_far = clamp((linear_z - u.far_params.x) / span, 0.0, 1.0);
+            coc = t_far * u.far_params.z;
+        }
+        if (coc > 0.0) {
+            coc *= u.far_params.w;
+        }
+        if (u.misc_params.x > 0.0 && linear_z > u.misc_params.x) {
+            coc = 0.0;
+        }
+    }
+    return clamp(coc, -u.misc_params.y, u.misc_params.y);
+}
+
+void main() {
+    const uvec2 px = gl_GlobalInvocationID.xy;
+    if (px.x >= u.dims_flags.z || px.y >= u.dims_flags.w) {
+        return;
+    }
+
+    const vec3 sharp_rgb = max(texelFetch(sampler2D(hdr_scene, linear_samp), ivec2(px), 0).rgb, vec3(0.0));
+    const float d_raw = texelFetch(sampler2D(depth_tex, linear_samp), ivec2(px), 0).r;
+    const float full_coc = ComputeSignedCoc(LinearizeDepth(d_raw));
+
+    // True 4-tap CoC-weighted bilateral upsample of half-res bokeh:
+    // prevents 720p sky/far bokeh texels from leaking onto sharp 1440p tree leaves and railings.
+    const vec2 half_pos = (vec2(px) + 0.5) * 0.5 - 0.5;
+    const ivec2 half_max = ivec2(int(u.dims_flags.x) - 1, int(u.dims_flags.y) - 1);
+    const ivec2 h0 = clamp(ivec2(floor(half_pos)), ivec2(0), half_max);
+    const ivec2 h1 = min(h0 + ivec2(1, 0), half_max);
+    const ivec2 h2 = min(h0 + ivec2(0, 1), half_max);
+    const ivec2 h3 = min(h0 + ivec2(1, 1), half_max);
+    const vec2 f = clamp(half_pos - vec2(h0), 0.0, 1.0);
+    const float b0 = (1.0 - f.x) * (1.0 - f.y);
+    const float b1 = f.x * (1.0 - f.y);
+    const float b2 = (1.0 - f.x) * f.y;
+    const float b3 = f.x * f.y;
+
+    const vec4 bk0 = texelFetch(sampler2D(bokeh_tex, linear_samp), h0, 0);
+    const vec4 bk1 = texelFetch(sampler2D(bokeh_tex, linear_samp), h1, 0);
+    const vec4 bk2 = texelFetch(sampler2D(bokeh_tex, linear_samp), h2, 0);
+    const vec4 bk3 = texelFetch(sampler2D(bokeh_tex, linear_samp), h3, 0);
+
+    const float c0 = texelFetch(sampler2D(coc_tex, linear_samp), h0, 0).a;
+    const float c1 = texelFetch(sampler2D(coc_tex, linear_samp), h1, 0).a;
+    const float c2 = texelFetch(sampler2D(coc_tex, linear_samp), h2, 0).a;
+    const float c3 = texelFetch(sampler2D(coc_tex, linear_samp), h3, 0).a;
+
+    // For near-field bleed (bk.a > 0) keep bilinear weight; for far-field gate strictly by CoC similarity.
+    const float w0 = b0 * max(bk0.a, exp(-abs(c0 - full_coc) * 1800.0));
+    const float w1 = b1 * max(bk1.a, exp(-abs(c1 - full_coc) * 1800.0));
+    const float w2 = b2 * max(bk2.a, exp(-abs(c2 - full_coc) * 1800.0));
+    const float w3 = b3 * max(bk3.a, exp(-abs(c3 - full_coc) * 1800.0));
+    const float w_sum = w0 + w1 + w2 + w3;
+    const vec4 bokeh = (w_sum > 1e-4)
+        ? ((bk0 * w0 + bk1 * w1 + bk2 * w2 + bk3 * w3) / w_sum)
+        : (bk0 * b0 + bk1 * b1 + bk2 * b2 + bk3 * b3);
+
+    // Smooth transition from native 1440p/4K sharp full-res to half-res HDR bokeh:
+    // - Sub-1.2px CoC (trees/midground at 10..18m) stays 100% razor-sharp native full-res!
+    // - Far-field smoothly ramps in from ~1.2px to ~3.0px radius (exact Yebis2 depth progression).
+    // - Near-field smoothly blends blurred foreground over sharp background using bokeh.a.
+    const float far_blend = smoothstep(0.00080, 0.00205, max(full_coc, 0.0));
+    const float near_self = smoothstep(0.00060, 0.00190, max(-full_coc, 0.0));
+    const float blend = clamp(max(far_blend, max(near_self, bokeh.a)), 0.0, 1.0);
+
+    const vec3 final_rgb = mix(sharp_rgb, max(bokeh.rgb, vec3(0.0)), blend);
+    imageStore(out_hdr_img, ivec2(px), vec4(final_rgb, 1.0));
+}

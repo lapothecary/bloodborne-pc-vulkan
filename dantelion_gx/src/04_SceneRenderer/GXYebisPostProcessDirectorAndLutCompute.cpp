@@ -2031,6 +2031,250 @@ void sub_21d5f80(void* self, void* renderCmdCtx, void* filterParam) {
     }
 
     // ========================================================================
+    // Remaster v2: Native Vulkan 1.3 Post-Process Pipeline (live A/B vs Yebis2)
+    // Intercepts after Part A (fresh biome 3D LUT computed) and replaces Part B +
+    // Part C (25-35 Yebis2 passes) + Part D1 (separate 3D LUT blit) with a single
+    // DirectVk::Op::NativePostProcess command in the main DCB.
+    // ========================================================================
+    if (gx_direct_vk::IsNativePostFxEnabled()) {
+        auto* const ppfxCtxFast = *reinterpret_cast<void**>(director + 0x2670);
+        auto* const inColorSrv  = *reinterpret_cast<uint8_t**>(param + 0x370);
+        auto* const outRtWrap   = *reinterpret_cast<uint8_t**>(param + 0x390);
+        if (ppfxCtxFast != nullptr &&
+            *reinterpret_cast<const int32_t*>(param + 0x000) != 0 &&
+            director[0x020] == 0 &&
+            inColorSrv != nullptr &&
+            outRtWrap != nullptr)
+        {
+            auto* const curDevCtx = *reinterpret_cast<uint8_t**>(cmdCtx + 0x000);
+            auto* const gnm       = *reinterpret_cast<uint8_t**>(curDevCtx + 0x008);
+            auto* const sceneView = *reinterpret_cast<uint8_t**>(cmdCtx + 0x210);
+            auto* const sceneRoot = static_cast<uint8_t*>(g_SceneRendererRoot_5540dd8);
+
+            static uint32_t s_nativePostFrameCounter = 0u;
+            gx_direct_vk::NativePostProcessArgs postArgs{};
+            std::memcpy(postArgs.in_color_tsharp, inColorSrv + 0x010, sizeof(postArgs.in_color_tsharp));
+            std::memcpy(postArgs.out_cb_regs, outRtWrap + 0x010, sizeof(postArgs.out_cb_regs));
+
+            uint32_t flags = 0u;
+            auto* const lut3dSrv = *reinterpret_cast<uint8_t**>(director + 0x030);
+            if (lut3dSrv != nullptr && *reinterpret_cast<const int32_t*>(param + 0x2b8) != 0) {
+                std::memcpy(postArgs.lut3d_tsharp, lut3dSrv + 0x010, sizeof(postArgs.lut3d_tsharp));
+                flags |= gx_direct_vk::kNativePostFlag_Lut3d;
+            }
+            auto* const inDepthWrap = *reinterpret_cast<uint8_t**>(param + 0x380);
+            if (inDepthWrap != nullptr) {
+                auto* const inDepthGnm = *reinterpret_cast<uint8_t**>(inDepthWrap + 0x048);
+                if (inDepthGnm != nullptr) {
+                    std::memcpy(postArgs.in_depth_tsharp, inDepthGnm + 0x010, sizeof(postArgs.in_depth_tsharp));
+                    flags |= gx_direct_vk::kNativePostFlag_HasDepth;
+                }
+            }
+            auto* const velWrap = *reinterpret_cast<uint8_t**>(param + 0x388);
+            if (velWrap != nullptr) {
+                auto* const velGnm = *reinterpret_cast<uint8_t**>(velWrap + 0x028);
+                if (velGnm != nullptr) {
+                    std::memcpy(postArgs.vel_tsharp, velGnm + 0x010, sizeof(postArgs.vel_tsharp));
+                    flags |= gx_direct_vk::kNativePostFlag_HasVel;
+                }
+            }
+
+            const uint32_t viewMode = sceneView ? *reinterpret_cast<const uint32_t*>(sceneView + 0x070) : 0u;
+            if (viewMode <= 1u && *reinterpret_cast<const int32_t*>(param + 0x050) != 0) {
+                flags |= gx_direct_vk::kNativePostFlag_AutoExposure;
+            }
+            const bool caEnabled = gx_direct_vk::IsEffectEnabled(gx_direct_vk::kEffectChromaticAberration) &&
+                                   (*reinterpret_cast<const int32_t*>(param + 0x0ac) != 0);
+            if (caEnabled) {
+                flags |= gx_direct_vk::kNativePostFlag_Ca;
+            }
+            if (gx_direct_vk::IsTrueBlackEnabled()) {
+                flags |= gx_direct_vk::kNativePostFlag_TrueBlack;
+            }
+            const bool bloomEnabled = gx_direct_vk::IsEffectEnabled(gx_direct_vk::kEffectBloom);
+            const int32_t glareShape = bloomEnabled
+                                           ? *reinterpret_cast<const int32_t*>(param + 0x0d8)
+                                           : -1;
+            const float rawBloomLum = *reinterpret_cast<const float*>(param + 0x0dc);
+            if (bloomEnabled && glareShape >= 0 && rawBloomLum > 1e-4f) {
+                flags |= gx_direct_vk::kNativePostFlag_Bloom;
+            }
+            const uint32_t resetFlags = *reinterpret_cast<const uint32_t*>(director + 0x271c);
+            *reinterpret_cast<uint32_t*>(director + 0x271c) = 0u;
+            if ((resetFlags & 1u) != 0u) {
+                flags |= gx_direct_vk::kNativePostFlag_ResetHistory;
+            }
+
+            // Keep motion-velocity culler threshold synced and consume active flag.
+            float mbDummy0 = 1.0f, mbDummy1 = 1.0f, mbDummy2 = 1.0f, mbCamThreshScale = 1.0f;
+            const uint32_t mbUserFlags = gx_direct_vk::GetMotionBlurScales(
+                mbDummy0, mbDummy1, mbDummy2, mbCamThreshScale);
+            gx_direct_vk::UpdateObjectVelocityThresholdScale(mbCamThreshScale);
+            (void)gx_direct_vk::ConsumeActiveObjectVelocity();
+            if (mbUserFlags != 0u && *reinterpret_cast<const int32_t*>(param + 0x1dc) != 0) {
+                flags |= gx_direct_vk::kNativePostFlag_MotionBlur;
+            }
+            const bool dofEnabled = gx_direct_vk::IsEffectEnabled(gx_direct_vk::kEffectDof) &&
+                                    (*reinterpret_cast<const int32_t*>(param + 0x1ac) != 0);
+            if (dofEnabled) {
+                flags |= gx_direct_vk::kNativePostFlag_Dof;
+                if (*reinterpret_cast<const int32_t*>(param + 0x2d0) != 0) {
+                    flags |= gx_direct_vk::kNativePostFlag_DofCustom;
+                }
+                if (*reinterpret_cast<const int32_t*>(param + 0x2d4) != 0) {
+                    flags |= gx_direct_vk::kNativePostFlag_DofNearCust;
+                }
+                if (*reinterpret_cast<const int32_t*>(param + 0x2d8) != 0) {
+                    flags |= gx_direct_vk::kNativePostFlag_DofFarCust;
+                }
+                if (*reinterpret_cast<const int32_t*>(param + 0x188) != 0) {
+                    flags |= gx_direct_vk::kNativePostFlag_DofAutoFocus;
+                }
+            }
+
+            postArgs.flags             = flags;
+            postArgs.tone_type         = *reinterpret_cast<const int32_t*>(param + 0x0a0);
+            postArgs.exposure          = *reinterpret_cast<const float*>(param + 0x098);
+            postArgs.gamma             = *reinterpret_cast<const float*>(param + 0x09c);
+            postArgs.tone_factor       = *reinterpret_cast<const float*>(param + 0x0a4);
+            postArgs.filmic_contrast   = *reinterpret_cast<const float*>(param + 0x0a8);
+            postArgs.scene_lum_scale   = *reinterpret_cast<const float*>(param + 0x094);
+            postArgs.middle_gray       = *reinterpret_cast<const float*>(param + 0x054);
+            postArgs.min_exposure      = *reinterpret_cast<const float*>(param + 0x05c);
+            postArgs.max_exposure      = *reinterpret_cast<const float*>(param + 0x060);
+            postArgs.meter_rect[0]     = *reinterpret_cast<const float*>(param + 0x064);
+            postArgs.meter_rect[1]     = *reinterpret_cast<const float*>(param + 0x068);
+            postArgs.meter_rect[2]     = *reinterpret_cast<const float*>(param + 0x06c);
+            postArgs.meter_rect[3]     = *reinterpret_cast<const float*>(param + 0x070);
+            postArgs.adapt_sens        = *reinterpret_cast<const float*>(param + 0x078);
+            postArgs.adapt_scale       = *reinterpret_cast<const float*>(param + 0x07c);
+            postArgs.adapt_speed_limit = *reinterpret_cast<const float*>(param + 0x080);
+            postArgs.dark_sens         = *reinterpret_cast<const float*>(param + 0x084);
+            postArgs.dark_scale        = *reinterpret_cast<const float*>(param + 0x088);
+            postArgs.dark_speed_limit  = *reinterpret_cast<const float*>(param + 0x08c);
+            postArgs.hue_rad           = (*reinterpret_cast<const float*>(param + 0x0c4) * fPi) / f180;
+            postArgs.saturation        = *reinterpret_cast<const float*>(param + 0x0c8);
+            postArgs.value_scale       = *reinterpret_cast<const float*>(param + 0x0cc);
+            postArgs.contrast          = *reinterpret_cast<const float*>(param + 0x248);
+            postArgs.vig_power         = *reinterpret_cast<const float*>(param + 0x0d0);
+            postArgs.vig_fov_dep       = *reinterpret_cast<const float*>(param + 0x0d4);
+            postArgs.fov_y_rad         = sceneView ? *reinterpret_cast<const float*>(sceneView + 0x050) : 0.785398f;
+            float aspect = sceneView ? *reinterpret_cast<const float*>(sceneView + 0x064) : 0.0f;
+            if (aspect <= 0.0f && sceneView != nullptr) {
+                const uint32_t vpW = *reinterpret_cast<const uint32_t*>(sceneView + 0x05c);
+                const uint32_t vpH = *reinterpret_cast<const uint32_t*>(sceneView + 0x060);
+                aspect = (vpH > 0u) ? (static_cast<float>(vpW) / static_cast<float>(vpH)) : (16.0f / 9.0f);
+            }
+            postArgs.aspect          = (aspect > 0.0f) ? aspect : (16.0f / 9.0f);
+            postArgs.ca_lat_disp[0]  = *reinterpret_cast<const float*>(param + 0x0b4);
+            postArgs.ca_lat_disp[1]  = *reinterpret_cast<const float*>(param + 0x0b8);
+            postArgs.ca_uni_disp[0]  = *reinterpret_cast<const float*>(param + 0x0bc);
+            postArgs.ca_uni_disp[1]  = *reinterpret_cast<const float*>(param + 0x0c0);
+            postArgs.ca_wave_samples = *reinterpret_cast<const int32_t*>(param + 0x0b0);
+            postArgs.delta_time_sec  = gx_direct_vk::GetFrameDtSec();
+            postArgs.frame_index     = ++s_nativePostFrameCounter;
+            postArgs.out_width       = sceneRoot ? *reinterpret_cast<const uint32_t*>(sceneRoot + 0x1e0) : 0u;
+            postArgs.out_height      = sceneRoot ? *reinterpret_cast<const uint32_t*>(sceneRoot + 0x1e4) : 0u;
+            // Step 2: Live GPARAM Bloom & Glare parameters (supports standard & custom shape == 14)
+            float bloomLum = rawBloomLum;
+            float bloomDisp = 1.0f;
+            if (glareShape == 14) {
+                const float customGlareLum = *reinterpret_cast<const float*>(param + 0x308);
+                const float customBloomLum = *reinterpret_cast<const float*>(param + 0x30c);
+                if (customGlareLum > 1e-4f && customBloomLum > 1e-4f) {
+                    bloomLum = rawBloomLum * customGlareLum * customBloomLum;
+                } else if (customBloomLum > 1e-4f) {
+                    bloomLum = rawBloomLum * customBloomLum;
+                }
+                const float customDisp = *reinterpret_cast<const float*>(param + 0x310);
+                if (customDisp > 1e-4f) {
+                    bloomDisp = customDisp;
+                }
+            }
+            postArgs.bloom_luminance    = bloomLum;
+            postArgs.bloom_threshold    = *reinterpret_cast<const float*>(param + 0x0e0);
+            postArgs.bloom_remap        = *reinterpret_cast<const float*>(param + 0x244);
+            postArgs.bloom_radius_scale = *reinterpret_cast<const float*>(param + 0x0f8);
+            postArgs.bloom_luma_gamma   = *reinterpret_cast<const float*>(param + 0x0fc);
+            postArgs.bloom_dispersion   = bloomDisp;
+            postArgs.glare_shape        = glareShape;
+            postArgs.bloom_reserved     = 0u;
+
+            // Step 3: Exact row-vector clip_to_prev_clip = inv(curVP) * prevVP for Camera Motion Blur.
+            static bool s_hasPrevVp = false;
+            alignas(16) static float s_prevVp[16] = {};
+            alignas(16) float curVp[16] = {};
+            if (sceneView != nullptr) {
+                sub_21aaa90(curVp, sceneView);
+            }
+            const bool resetCamera = ((resetFlags & 1u) != 0u) || !s_hasPrevVp || (sceneView == nullptr);
+            if (resetCamera) {
+                // Identity matrix -> zero camera velocity on cutscenes / warps / first frame.
+                for (int i = 0; i < 16; ++i) {
+                    postArgs.clip_to_prev_clip[i] = ((i & 3) == (i >> 2)) ? 1.0f : 0.0f;
+                }
+            } else {
+                alignas(16) float invCurVp[16] = {};
+                InvertMatrix4x4Simd(invCurVp, curVp);
+                // Row-vector multiply: M = invCurVp * prevVp (so cur_clip * M = prev_clip).
+                for (int r = 0; r < 4; ++r) {
+                    const float a0 = invCurVp[r * 4 + 0];
+                    const float a1 = invCurVp[r * 4 + 1];
+                    const float a2 = invCurVp[r * 4 + 2];
+                    const float a3 = invCurVp[r * 4 + 3];
+                    for (int c = 0; c < 4; ++c) {
+                        postArgs.clip_to_prev_clip[r * 4 + c] =
+                            a0 * s_prevVp[0 * 4 + c] + a1 * s_prevVp[1 * 4 + c] +
+                            a2 * s_prevVp[2 * 4 + c] + a3 * s_prevVp[3 * 4 + c];
+                    }
+                }
+            }
+            if (sceneView != nullptr) {
+                std::memcpy(s_prevVp, curVp, sizeof(s_prevVp));
+                s_hasPrevVp = true;
+            }
+            postArgs.mb_time_ratio = *reinterpret_cast<const float*>(param + 0x1e4);
+            postArgs.mb_max_len    = *reinterpret_cast<const float*>(param + 0x1e8);
+            postArgs.mb_vel_scale  = *reinterpret_cast<const float*>(param + 0x350);
+            postArgs.mb_near_z     = sceneView ? *reinterpret_cast<const float*>(sceneView + 0x054) : 0.1f;
+
+            // Step 4: Live GPARAM Depth of Field (physical thin-lens + CustomDof + view clip planes).
+            // Always read live camera near/far from sceneView (+0x54/+0x58) FIRST: pPostEffect
+            // (+0x57c/+0x580) is only updated by Yebis2 sub_bb2710 in Part B (which we bypass when
+            // NativePostFX is active, leaving pPostEffect stuck at its boot default nearZ=1.0!).
+            const auto* pPostEffect = *reinterpret_cast<const uint8_t* const*>(GX_VMA(0x5465ed0ULL));
+            const float dofNearZ = sceneView
+                                       ? *reinterpret_cast<const float*>(sceneView + 0x054)
+                                       : (pPostEffect ? *reinterpret_cast<const float*>(pPostEffect + 0x57c) : 0.1f);
+            const float dofFarZ  = sceneView
+                                       ? *reinterpret_cast<const float*>(sceneView + 0x058)
+                                       : (pPostEffect ? *reinterpret_cast<const float*>(pPostEffect + 0x580) : 1000.0f);
+            const float rawDofScale = *reinterpret_cast<const float*>(param + 0x1d8);
+            postArgs.dof_focus_dist     = *reinterpret_cast<const float*>(param + 0x1b0);
+            postArgs.dof_fstop          = *reinterpret_cast<const float*>(param + 0x1b4);
+            postArgs.dof_ccd_diag_mm    = *reinterpret_cast<const float*>(param + 0x1c0);
+            postArgs.dof_scale          = (rawDofScale <= 0.0f || rawDofScale > 0.5f) ? 0.5f : rawDofScale;
+            postArgs.dof_near_start     = *reinterpret_cast<const float*>(param + 0x2dc);
+            postArgs.dof_near_end       = *reinterpret_cast<const float*>(param + 0x2e0);
+            postArgs.dof_near_coc_size  = *reinterpret_cast<const float*>(param + 0x2e4);
+            postArgs.dof_near_coc_scale = *reinterpret_cast<const float*>(param + 0x2e8);
+            postArgs.dof_far_start      = *reinterpret_cast<const float*>(param + 0x2ec);
+            postArgs.dof_far_end        = *reinterpret_cast<const float*>(param + 0x2f0);
+            postArgs.dof_far_coc_size   = *reinterpret_cast<const float*>(param + 0x2f4);
+            postArgs.dof_far_coc_scale  = *reinterpret_cast<const float*>(param + 0x2f8);
+            postArgs.dof_far_cutoff     = *reinterpret_cast<const float*>(param + 0x2fc);
+            postArgs.dof_view_near_z    = (dofNearZ > 0.001f) ? dofNearZ : 0.1f;
+            postArgs.dof_view_far_z     = (dofFarZ > postArgs.dof_view_near_z + 1.0f) ? dofFarZ : 1000.0f;
+            postArgs.dof_af_sens        = *reinterpret_cast<const float*>(param + 0x190);
+
+            if (gx_direct_vk::EmitNativePostProcess(gnm + 0x010, postArgs)) {
+                sub_219fcf0(curDevCtx);
+                return;
+            }
+        }
+    }
+
+    // ========================================================================
     // Part B (0x21d666f..0x21d8093): Bind Yebis RT & Configure Yebis2 PPFX
     // ========================================================================
     {
@@ -2147,6 +2391,13 @@ void sub_21d5f80(void* self, void* renderCmdCtx, void* filterParam) {
             prevRow2 = _mm_loadu_ps(prevSrc2);
             prevRow1 = _mm_loadu_ps(prevSrc1);
         }
+
+        float mbTimeScale = 1.0f;
+        float mbObjVelScale = 1.0f;
+        float mbMaxLenScale = 1.0f;
+        float mbCamThreshScale = 1.0f;
+        const uint32_t mbFlags = gx_direct_vk::GetMotionBlurScales(
+            mbTimeScale, mbObjVelScale, mbMaxLenScale, mbCamThreshScale);
 
         // 0x21d6acb..0x21d6b2a: Camera FOV / Near / Far / Aspect
         sub_bb2710(ppfxCtx,
@@ -2546,14 +2797,11 @@ void sub_21d5f80(void* self, void* renderCmdCtx, void* filterParam) {
         const int32_t mbType = ((resetFlags & 2u) != 0u)
                                    ? 1
                                    : *reinterpret_cast<const int32_t*>(param + 0x1e0);
-        float mbTimeScale = 1.0f;
-        float mbMaxLenScale = 1.0f;
-        float mbCamThreshScale = 1.0f;
-        gx_direct_vk::GetMotionBlurScales(mbTimeScale, mbMaxLenScale, mbCamThreshScale);
+        gx_direct_vk::UpdateObjectVelocityThresholdScale(mbCamThreshScale);
         const bool objMoved  = gx_direct_vk::ConsumeActiveObjectVelocity();
         const bool hasObjVel = (mbType == 2) && (velWrap != nullptr) && objMoved;
         const bool camMoved  = (maxCamDelta > (f0_0001 * mbCamThreshScale)) || hasObjVel;
-        const bool mbAllowed = gx_direct_vk::IsEffectEnabled(gx_direct_vk::kEffectMotionBlur) &&
+        const bool mbAllowed = (mbFlags != 0u) &&
                                (*reinterpret_cast<const int32_t*>(param + 0x1dc) != 0) &&
                                camMoved;
         sub_bb3870(ppfxCtx, (velWrap != nullptr && mbAllowed) ? 1u : 0u);
@@ -2580,14 +2828,15 @@ void sub_21d5f80(void* self, void* renderCmdCtx, void* filterParam) {
 
         if (mbAllowed &&
             *reinterpret_cast<const int32_t*>(param + 0x1dc) != 0 &&
-            *reinterpret_cast<const int32_t*>(param + 0x1e0) == 2 &&
+            mbType == 2 &&
             velWrap != nullptr)
         {
             auto* velGnm = *reinterpret_cast<uint8_t**>(velWrap + 0x028) + 0x010;
             const uint32_t velW = *reinterpret_cast<const uint32_t*>(velWrap + 0x050);
             const uint32_t velH = *reinterpret_cast<const uint32_t*>(velWrap + 0x054);
             const float rawVelScale = *reinterpret_cast<const float*>(param + 0x1e8) *
-                                      *reinterpret_cast<const float*>(param + 0x350);
+                                      *reinterpret_cast<const float*>(param + 0x350) *
+                                      mbObjVelScale;
             const float scalePair[2] = {
                 (rawVelScale > f0_0001) ? rawVelScale : f0_0001,
                 (rawVelScale > f0_001)  ? rawVelScale : f0_001

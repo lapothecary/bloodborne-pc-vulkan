@@ -23990,7 +23990,7 @@ __attribute__((weak, visibility("hidden"))) void bb_direct_vk_retire_buffer_rang
 __attribute__((weak, visibility("hidden"))) void bb_direct_vk_register_shader_binary(const void*, uint32_t, const void*, uint32_t, uint32_t) noexcept {}
 __attribute__((weak, visibility("hidden"))) void bb_direct_vk_retire_shader_range(const void*, uint64_t) noexcept {}
 __attribute__((weak, visibility("hidden"))) int bb_direct_vk_is_effect_enabled(uint32_t) noexcept { return 1; }
-__attribute__((weak, visibility("hidden"))) void bb_direct_vk_motion_blur_scales(float* a, float* b, float* c) noexcept { if (a) *a = 1.0f; if (b) *b = 1.0f; if (c) *c = 1.0f; }
+__attribute__((weak, visibility("hidden"))) uint32_t bb_direct_vk_motion_blur_scales(float* a, float* b, float* c, float* d) noexcept { if (a) *a = 1.0f; if (b) *b = 1.0f; if (c) *c = 1.0f; if (d) *d = 1.0f; return 3u; }
 __attribute__((weak, visibility("hidden"))) void bb_direct_vk_note_vel_silhouette_mask() noexcept {}
 __attribute__((weak, visibility("hidden"))) uint32_t bb_direct_vk_gx_command_heap_bytes() noexcept { return 0; }
 __attribute__((weak, visibility("hidden"))) int bb_direct_vk_intel_tonemap_fix() noexcept { return 0; }
@@ -24008,6 +24008,9 @@ __attribute__((weak, visibility("hidden"))) void bb_direct_vk_mt_execute_seconda
 __attribute__((weak, visibility("hidden"))) int bb_direct_vk_mt_try_compile_cmd_list(const void*, void*) noexcept { return 0; }
 __attribute__((weak, visibility("hidden"))) void bb_direct_vk_mt_note_copy_batch(const void*, uint32_t) noexcept {}
 __attribute__((weak, visibility("hidden"))) void bb_direct_vk_mt_invalidate_copy_shadow(uint64_t, uint64_t) noexcept {}
+__attribute__((weak, visibility("hidden"))) int bb_direct_vk_native_postfx_enabled() noexcept { return 0; }
+__attribute__((weak, visibility("hidden"))) float bb_direct_vk_frame_dt_sec() noexcept { return 1.0f / 60.0f; }
+__attribute__((weak, visibility("hidden"))) int bb_direct_vk_true_black_enabled() noexcept { return 1; }
 __attribute__((weak, visibility("hidden"))) void BbGoldenEngine_OnYebisJitter(float, float) {}
 __attribute__((weak, visibility("hidden"))) void BbGoldenEngine_OnYebisCameraMatrix(uint32_t, const float*) {}
 __attribute__((weak, visibility("hidden"))) void BbGoldenEngine_OnYebisCameraParams(float, float, float) {}

@@ -412,7 +412,11 @@ __attribute__((noinline)) void sub_229e990(void* pSelf, void* pRenderDev, void* 
     if (passId == 0x3eu) {
         const uint32_t ctxFlags = *reinterpret_cast<const uint32_t*>(viewBytes + 0x48);
         if ((ctxFlags & 0x20u) != 0u) {
-            viewBytes[0x2969] = gx_direct_vk::IsEffectEnabled(gx_direct_vk::kEffectMotionBlur) ? 1u : 0u;
+            // Keep Pass 0x2e (Object-Velocity) active whenever EITHER Camera OR Object Motion Blur
+            // is enabled: Object Blur uses obj.xy, and Camera Blur uses obj.a as the exact mask to
+            // blur the entire environment while keeping the Hunter & weapons razor-sharp.
+            // Turning BOTH Off skips Pass 0x2e completely (0 CPU draws).
+            viewBytes[0x2969] = (gx_direct_vk::GetMotionBlurFlags() != 0u) ? 1u : 0u;
         }
         if ((ctxFlags & 0x10u) != 0u) {
             viewBytes[0x296a] = gx_direct_vk::IsEffectEnabled(gx_direct_vk::kEffectGameAa) ? 1u : 0u;
@@ -887,7 +891,7 @@ __attribute__((noinline)) void sub_229e990(void* pSelf, void* pRenderDev, void* 
                     (gx_direct_vk::IsEffectEnabled(gx_direct_vk::kEffectGameAa) && v0 != 0 && v4 == 0) ? 1u : 0u;
             }
 
-            if (gx_direct_vk::IsEffectEnabled(gx_direct_vk::kEffectMotionBlur)) {
+            if (gx_direct_vk::GetMotionBlurFlags() != 0u) {
                 float w6 = *reinterpret_cast<float*>(viewBytes + 0x2b60);
                 uint8_t* p6A = static_cast<uint8_t*>(sub_21fa460(*reinterpret_cast<void**>(selfBytes + 0x59a0), viewBytes + 0x2aa8));
                 uint8_t* p6B = static_cast<uint8_t*>(sub_21fa460(*reinterpret_cast<void**>(selfBytes + 0x59a0), viewBytes + 0x2b10));
@@ -937,13 +941,21 @@ __attribute__((noinline)) void sub_229e990(void* pSelf, void* pRenderDev, void* 
             resetInlineDLWString(evalBuf, 0x0d0, 0x171, true);
             resetInlineDLWString(evalBuf, 0x020, 0x0c1, false);
 
-            void* pCtxSurf = *reinterpret_cast<void**>(passCtx + 0x508);
+            // 0x22a451a: mov -0x368(%rbp), %rax; test %rax, %rax; cmove -0x4a8(%rbp), %rax
+            // passCtx is at -0x8a0(%rbp), so -0x368 - (-0x8a0) = +0x538 (pAltCam / prevCamera),
+            // and -0x4a8 - (-0x8a0) = +0x3f8 (pCamera / curCamera).
+            void* pCtxSurf = *reinterpret_cast<void**>(passCtx + 0x538);
             if (pCtxSurf == nullptr) {
                 pCtxSurf = *reinterpret_cast<void**>(passCtx + 0x3f8);
             }
             uint8_t* pRtSet = (*reinterpret_cast<uint8_t*>(GX_VMA(0x5540de0ULL)) != 0) ? (viewBytes + 0x5a8) : (viewBytes + 0x188);
             void* pOptData = nullptr;
-            if (viewBytes[0x2969] != 0 && selfBytes[0x78b0] == 0) {
+            // Always bind velWrap (viewBytes + 0xce0) whenever ANY Motion Blur (Camera or Object)
+            // is enabled so Yebis2 stays on its high-quality depth-aware bilateral mbType=2 pipeline
+            // (ps_d3c8bb21 -> ps_abf92450 -> ps_e0305cef) instead of legacy depth-unaware mbType=1.
+            // When Object Motion Blur is Off, viewBytes[0x2969] stays 0 (0 CPU Pass 0x2e draws) and
+            // ps_d3c8bb21 ignores velWrap via the near-zero scalePair sentinel.
+            if ((viewBytes[0x2969] != 0 || gx_direct_vk::GetMotionBlurFlags() != 0u) && selfBytes[0x78b0] == 0) {
                 pOptData = viewBytes + 0xce0;
             }
             sub_21d4860(pYebisSub, passCtx, 0x33, 8,

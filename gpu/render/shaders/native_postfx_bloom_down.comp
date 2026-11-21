@@ -1,0 +1,146 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Native Vulkan 1.3 Post-Process — Step 2: FP16 13-tap Jimenez Bloom Downsample
+// (is_prefilter == 1: exposure-aware soft-knee threshold + Karis firefly suppression).
+#version 460
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform texture2D src_tex;
+layout(set = 0, binding = 1) uniform sampler linear_samp;
+layout(set = 0, binding = 2, rgba16f) uniform writeonly image2D dst_img;
+layout(set = 0, binding = 3, std430) readonly buffer ExposureStateBuffer {
+    float adapted_exposure;
+    float adapted_luma;
+    float target_exposure;
+    uint initialized;
+} exp_state;
+
+layout(push_constant) uniform BloomDownPush {
+    uint dst_w;
+    uint dst_h;
+    float inv_src_w;
+    float inv_src_h;
+    float manual_exposure;
+    float inv_scene_lum_scale;
+    float threshold;
+    float knee;
+    float luma_gamma;
+    float remap_factor;
+    uint flags; // bit0 = is_prefilter, bit1 = auto_exp_on
+} pc;
+
+float Luma(vec3 c) {
+    return dot(c, vec3(0.2126, 0.7152, 0.0722));
+}
+
+float KarisWeight(vec3 c) {
+    return 1.0 / (1.0 + Luma(c));
+}
+
+vec3 PrefilterSample(vec3 raw_rgb, float exp_scale) {
+    // Convert raw HDR scene into Yebis2 post-exposure linear space (matches tonemap input).
+    vec3 c = max(raw_rgb * exp_scale, vec3(0.0));
+    // Anti-firefly guard: softly cap extreme subpixel specular spikes (keeps highlights vibrant without flicker).
+    const float peak = max(c.r, max(c.g, c.b));
+    if (peak > 32.0) {
+        c *= (32.0 / peak);
+    }
+    const float br = max(c.r, max(c.g, c.b));
+    const float thr = max(pc.threshold, 0.0);
+    const float knee = max(pc.knee, 1e-4);
+    float soft = clamp(br - thr + knee, 0.0, 2.0 * knee);
+    soft = (soft * soft) / (4.0 * knee);
+    const float contrib = max(soft, br - thr) / max(br, 1e-5);
+    vec3 out_c = c * max(contrib, 0.0);
+    // Optional Yebis2 BloomLuminanceGamma (GPARAM 0x0fc; identity when ~1.0).
+    if (abs(pc.luma_gamma - 1.0) > 0.02) {
+        const float l = Luma(out_c);
+        if (l > 1e-5) {
+            const float nl = pow(l, clamp(pc.luma_gamma, 0.25, 4.0));
+            out_c *= (nl / l);
+        }
+    }
+    // Soft highlight remap (GPARAM RemapFactor 0x244) prevents harsh white clipping in bright fires/moon.
+    if (pc.remap_factor > 1e-3) {
+        out_c = out_c / (vec3(1.0) + out_c * (0.12 * pc.remap_factor));
+    }
+    return out_c;
+}
+
+vec3 SampleSrc(vec2 uv) {
+    return max(textureLod(sampler2D(src_tex, linear_samp), uv, 0.0).rgb, vec3(0.0));
+}
+
+void main() {
+    const uvec2 px = gl_GlobalInvocationID.xy;
+    if (px.x >= pc.dst_w || px.y >= pc.dst_h) {
+        return;
+    }
+
+    const vec2 uv = (vec2(px) + 0.5) / vec2(float(pc.dst_w), float(pc.dst_h));
+    const vec2 texel = vec2(pc.inv_src_w, pc.inv_src_h);
+
+    // 13-tap Jimenez (Call of Duty: Advanced Warfare) filter pattern:
+    //  a . b . c
+    //  . d . e .
+    //  f . g . h
+    //  . i . j .
+    //  k . l . m
+    vec3 a = SampleSrc(uv + texel * vec2(-2.0, -2.0));
+    vec3 b = SampleSrc(uv + texel * vec2( 0.0, -2.0));
+    vec3 c = SampleSrc(uv + texel * vec2( 2.0, -2.0));
+    vec3 d = SampleSrc(uv + texel * vec2(-1.0, -1.0));
+    vec3 e = SampleSrc(uv + texel * vec2( 1.0, -1.0));
+    vec3 f = SampleSrc(uv + texel * vec2(-2.0,  0.0));
+    vec3 g = SampleSrc(uv);
+    vec3 h = SampleSrc(uv + texel * vec2( 2.0,  0.0));
+    vec3 i = SampleSrc(uv + texel * vec2(-1.0,  1.0));
+    vec3 j = SampleSrc(uv + texel * vec2( 1.0,  1.0));
+    vec3 k = SampleSrc(uv + texel * vec2(-2.0,  2.0));
+    vec3 l = SampleSrc(uv + texel * vec2( 0.0,  2.0));
+    vec3 m = SampleSrc(uv + texel * vec2( 2.0,  2.0));
+
+    vec3 result;
+    if ((pc.flags & 1u) != 0u) {
+        const bool auto_on = (pc.flags & 2u) != 0u;
+        const float exposure = (auto_on && exp_state.initialized != 0u)
+                                   ? exp_state.adapted_exposure
+                                   : pc.manual_exposure;
+        const float exp_scale = exposure * pc.inv_scene_lum_scale;
+
+        a = PrefilterSample(a, exp_scale);
+        b = PrefilterSample(b, exp_scale);
+        c = PrefilterSample(c, exp_scale);
+        d = PrefilterSample(d, exp_scale);
+        e = PrefilterSample(e, exp_scale);
+        f = PrefilterSample(f, exp_scale);
+        g = PrefilterSample(g, exp_scale);
+        h = PrefilterSample(h, exp_scale);
+        i = PrefilterSample(i, exp_scale);
+        j = PrefilterSample(j, exp_scale);
+        k = PrefilterSample(k, exp_scale);
+        l = PrefilterSample(l, exp_scale);
+        m = PrefilterSample(m, exp_scale);
+
+        // Partial Karis average over 5 overlapping 2x2 groups (eliminates specular shimmer).
+        const vec3 g0 = (d + e + i + j) * 0.25;
+        const vec3 g1 = (a + b + f + g) * 0.25;
+        const vec3 g2 = (b + c + g + h) * 0.25;
+        const vec3 g3 = (f + g + k + l) * 0.25;
+        const vec3 g4 = (g + h + l + m) * 0.25;
+
+        const float w0 = KarisWeight(g0) * 0.500;
+        const float w1 = KarisWeight(g1) * 0.125;
+        const float w2 = KarisWeight(g2) * 0.125;
+        const float w3 = KarisWeight(g3) * 0.125;
+        const float w4 = KarisWeight(g4) * 0.125;
+        result = (g0 * w0 + g1 * w1 + g2 * w2 + g3 * w3 + g4 * w4) / max(w0 + w1 + w2 + w3 + w4, 1e-5);
+    } else {
+        result = g * 0.125
+               + (a + c + k + m) * 0.03125
+               + (b + f + h + l) * 0.0625
+               + (d + e + i + j) * 0.125;
+    }
+
+    imageStore(dst_img, ivec2(px), vec4(max(result, vec3(0.0)), 1.0));
+}

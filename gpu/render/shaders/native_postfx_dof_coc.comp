@@ -1,0 +1,115 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Native Vulkan 1.3 Post-Process — Step 4: Half-Res Signed CoC + Karis-Weighted HDR Pre-Filter.
+// Implements exact Bloodborne physical thin-lens CoC + CustomDof (near/far ranges & farCutoff)
+// directly from live GPARAM in resolution-independent screen-height UV units.
+#version 460
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform texture2D hdr_scene;
+layout(set = 0, binding = 1) uniform texture2D depth_tex;
+layout(set = 0, binding = 2) uniform sampler linear_samp;
+layout(set = 0, binding = 3, rgba16f) uniform writeonly image2D out_coc_img;
+
+layout(set = 0, binding = 4, std140) uniform DofUbo {
+    vec4 clip_phys;   // x=nearZ, y=farZ, z=focusDist, w=physCocFactor (aperture*focal/(max(focus-focal)*sensorH))
+    vec4 near_params; // x=nearStart, y=nearEnd, z=nearCocUv, w=negCocScale
+    vec4 far_params;  // x=farStart,  y=farEnd,  z=farCocUv,  w=posCocScale
+    vec4 misc_params; // x=farCutoff, y=maxCocUv, z=aspect, w=dofScale
+    uvec4 dims_flags; // x=half_w, y=half_h, z=full_w, w=full_h
+    uvec4 mode_flags; // x=flags (bit0=custom, bit1=nearCust, bit2=farCust), y=frame_index, z=0, w=0
+} u;
+
+float LinearizeDepth(float d_raw) {
+    const float n = u.clip_phys.x;
+    const float f = u.clip_phys.y;
+    const float denom = max(f - clamp(d_raw, 0.0, 1.0) * (f - n), 1e-4);
+    return (n * f) / denom;
+}
+
+float ComputeSignedCoc(float linear_z) {
+    const uint flags = u.mode_flags.x;
+    const bool custom_on = (flags & 1u) != 0u;
+    const bool near_cust = (flags & 2u) != 0u;
+    const bool far_cust  = (flags & 4u) != 0u;
+
+    const float focus = max(u.clip_phys.z, 0.05);
+    const float base_coc = u.clip_phys.w * (linear_z - focus) / max(linear_z, 0.05);
+
+    float coc = base_coc;
+    if (custom_on) {
+        if (!near_cust) {
+            coc = base_coc;
+            if (coc < 0.0) {
+                coc *= u.near_params.w;
+            }
+        } else {
+            coc = 0.0;
+            if (linear_z < u.near_params.y) {
+                const float span = max(u.near_params.y - u.near_params.x, 1e-4);
+                const float t_near = clamp((linear_z - u.near_params.x) / span, 0.0, 1.0);
+                coc = -((1.0 - t_near) * u.near_params.z) * u.near_params.w;
+            }
+        }
+        if (far_cust && linear_z > u.far_params.x) {
+            const float span = max(u.far_params.y - u.far_params.x, 1e-4);
+            const float t_far = clamp((linear_z - u.far_params.x) / span, 0.0, 1.0);
+            coc = t_far * u.far_params.z;
+        }
+        if (coc > 0.0) {
+            coc *= u.far_params.w;
+        }
+        if (u.misc_params.x > 0.0 && linear_z > u.misc_params.x) {
+            coc = 0.0;
+        }
+    }
+    return clamp(coc, -u.misc_params.y, u.misc_params.y);
+}
+
+float KarisWeight(vec3 c) {
+    const float l = max(max(c.r, c.g), c.b);
+    return 1.0 / (1.0 + l);
+}
+
+void main() {
+    const uvec2 px = gl_GlobalInvocationID.xy;
+    if (px.x >= u.dims_flags.x || px.y >= u.dims_flags.y) {
+        return;
+    }
+
+    const ivec2 full_max = ivec2(int(u.dims_flags.z) - 1, int(u.dims_flags.w) - 1);
+    const ivec2 base_p = min(ivec2(px * 2u), max(full_max - ivec2(1), ivec2(0)));
+
+    const ivec2 p00 = base_p + ivec2(0, 0);
+    const ivec2 p10 = min(base_p + ivec2(1, 0), full_max);
+    const ivec2 p01 = min(base_p + ivec2(0, 1), full_max);
+    const ivec2 p11 = min(base_p + ivec2(1, 1), full_max);
+
+    const vec3 c00 = max(texelFetch(sampler2D(hdr_scene, linear_samp), p00, 0).rgb, vec3(0.0));
+    const vec3 c10 = max(texelFetch(sampler2D(hdr_scene, linear_samp), p10, 0).rgb, vec3(0.0));
+    const vec3 c01 = max(texelFetch(sampler2D(hdr_scene, linear_samp), p01, 0).rgb, vec3(0.0));
+    const vec3 c11 = max(texelFetch(sampler2D(hdr_scene, linear_samp), p11, 0).rgb, vec3(0.0));
+
+    const float coc00 = ComputeSignedCoc(LinearizeDepth(texelFetch(sampler2D(depth_tex, linear_samp), p00, 0).r));
+    const float coc10 = ComputeSignedCoc(LinearizeDepth(texelFetch(sampler2D(depth_tex, linear_samp), p10, 0).r));
+    const float coc01 = ComputeSignedCoc(LinearizeDepth(texelFetch(sampler2D(depth_tex, linear_samp), p01, 0).r));
+    const float coc11 = ComputeSignedCoc(LinearizeDepth(texelFetch(sampler2D(depth_tex, linear_samp), p11, 0).r));
+
+    // Depth/CoC-consistent 2x2 downsample:
+    // - Pick foreground-safe reference CoC (strongest negative near-field, otherwise smallest
+    //   far-field CoC) so sky/far background NEVER contaminates mid-ground tree leaves or railings.
+    // - Combine Karis luminance weighting (firefly suppression) with CoC similarity weighting.
+    const float min_coc = min(min(coc00, coc10), min(coc01, coc11));
+    const float max_coc = max(max(coc00, coc10), max(coc01, coc11));
+    const float avg_coc = 0.25 * (coc00 + coc10 + coc01 + coc11);
+    const bool has_edge = (max_coc - min_coc) > 0.00045;
+    const float out_coc = (min_coc < -0.0004 || has_edge) ? min_coc : avg_coc;
+
+    const float w00 = KarisWeight(c00) * exp(-abs(coc00 - out_coc) * 2000.0);
+    const float w10 = KarisWeight(c10) * exp(-abs(coc10 - out_coc) * 2000.0);
+    const float w01 = KarisWeight(c01) * exp(-abs(coc01 - out_coc) * 2000.0);
+    const float w11 = KarisWeight(c11) * exp(-abs(coc11 - out_coc) * 2000.0);
+    const vec3 avg_rgb = (c00 * w00 + c10 * w10 + c01 * w01 + c11 * w11) / max(w00 + w10 + w01 + w11, 1e-4);
+
+    imageStore(out_coc_img, ivec2(px), vec4(avg_rgb, out_coc));
+}
