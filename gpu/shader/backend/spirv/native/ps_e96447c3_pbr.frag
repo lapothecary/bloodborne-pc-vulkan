@@ -44,8 +44,7 @@ vec4 load_s1_v4(uint i) { return vec4(s1f(i), s1f(i + 1u), s1f(i + 2u), s1f(i + 
 vec3 load_s1_v3(uint i) { return vec3(s1f(i), s1f(i + 1u), s1f(i + 2u)); }
 vec3 load_s2_v3(uint i) { return vec3(s2f(i), s2f(i + 1u), s2f(i + 2u)); }
 
-float eval_cube_vsm(uint base, vec3 pos_v) {
-    vec3 sv = -pos_v + load_s2_v3(base + 20u);
+vec3 cube_uv_face_e9(vec3 sv) {
     vec3 nsv = -sv;
     bool is_z = (abs(nsv.z) >= abs(nsv.x)) && (abs(nsv.z) >= abs(nsv.y));
     bool is_y = (abs(nsv.y) >= abs(nsv.x));
@@ -57,15 +56,46 @@ float eval_cube_vsm(uint base, vec3 pos_v) {
              : (is_y ? -sv.x : ((nsv.x < 0.0) ? -sv.z : sv.z));
     float tc = is_z ? sv.y : (is_y ? ((nsv.y < 0.0) ? sv.z : -sv.z) : sv.y);
     float layer = fma(floor(face * 0.125), -2.0, face);
-    vec4 sm = texture(sampler2DArray(fs_img5, fs_samp1), vec3(sc * inv_ma + 0.5, tc * inv_ma + 0.5, layer));
+    return vec3(sc * inv_ma + 0.5, tc * inv_ma + 0.5, layer);
+}
+
+float eval_cube_vsm(uint base, vec3 pos_v) {
+    vec3 sv = -pos_v + load_s2_v3(base + 20u);
+    vec2 sm = textureLod(sampler2DArray(fs_img5, fs_samp1), cube_uv_face_e9(sv), 0.0).xy;
 
     float far_d = (-s2f(base + 17u)) / (s2f(base + 16u) + -1.0);
     float dist_n = max(abs(sv.z), max(abs(sv.x), abs(sv.y))) / far_d;
+    const uint fx_bits = push_data.buf_offsets2.y >> 24u;
+    const bool pcss_vsm = (fx_bits & 0x10u) != 0u;
+    float penumbra = 0.0;
+    if (pcss_vsm) {
+        const float gap = clamp((dist_n - sm.x) / max(sm.x, 0.04), 0.0, 1.0);
+        penumbra = sqrt(gap);
+        const float sv_len = length(sv);
+        if (sv_len > 1e-4) {
+            const vec3 d_dir = sv / sv_len;
+            const vec3 up_ref = (abs(d_dir.y) < 0.92) ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+            const vec3 t_axis = normalize(cross(up_ref, d_dir));
+            const vec3 b_axis = cross(d_dir, t_axis);
+            const float ign = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
+            const float ang0 = ign * 6.28318530718;
+            const float cone = mix(0.004, 0.038, penumbra) * sv_len;
+            vec2 mom = sm;
+            for (uint k = 0u; k < 4u; ++k) {
+                float a = ang0 + float(k) * 1.57079633;
+                vec3 tap_v = sv + (t_axis * cos(a) + b_axis * sin(a)) * cone;
+                mom += textureLod(sampler2DArray(fs_img5, fs_samp1), cube_uv_face_e9(tap_v), 0.0).xy;
+            }
+            sm = mom * 0.2;
+        }
+    }
     float lit = (sm.x >= dist_n) ? 1.0 : 0.0;
     float var = max(0.00100000005 / far_d, (-sm.x) * sm.x + sm.y);
     float diff_d = dist_n - sm.x;
     float p_max = max(lit, var / (diff_d * diff_d + var));
-    if (((push_data.buf_offsets2.y >> 24u) & 0x02u) != 0u) {
+    if (pcss_vsm) {
+        p_max = smoothstep(mix(0.32, 0.14, penumbra), 1.0, p_max);
+    } else if ((fx_bits & 0x02u) != 0u) {
         p_max = smoothstep(0.18, 1.0, p_max);
     }
     return s2f(base + 19u) * (-1.0 + p_max) + 1.0;

@@ -323,6 +323,8 @@ void Set(Values& v, const std::string& key, const std::string& value) {
         v.true_black_hdr = (value != "0" && value != "false" && value != "off");
     } else if (key == "hdr_output") {
         v.hdr_output = (value != "0" && value != "false" && value != "off");
+    } else if (key == "pcss_shadows") {
+        v.pcss_shadows = (value != "0" && value != "false" && value != "off");
     } else if (key == "bgm_volume") {
         v.bgm_volume = std::clamp(i, 0, 10);
         v.native_chosen_mask.fetch_or(Values::NativeBgmVolume, std::memory_order_relaxed);
@@ -723,7 +725,8 @@ void Load() {
         {"BB_FRAME_GEN", "frame_generation"},       {"BB_UI_UPSCALE", "ui_upscale"},
         {"BB_SSAO_QUALITY", "ssao_quality"},        {"BB_CONTACT_SHADOWS", "contact_shadows"},
         {"BB_SSR_QUALITY", "ssr_quality"},          {"BB_TRUE_BLACK_HDR", "true_black_hdr"},
-        {"BB_HDR_OUTPUT", "hdr_output"},            {"BB_CAMERA_FOLLOW", "camera_follow_mode"},
+        {"BB_HDR_OUTPUT", "hdr_output"},            {"BB_PCSS_SHADOWS", "pcss_shadows"},
+        {"BB_CAMERA_FOLLOW", "camera_follow_mode"},
     };
     // Frame generation is hidden in the menu until its artifacts are fixed: only BB_FRAME_GEN turns
     // it on, a saved setting does not.
@@ -926,6 +929,7 @@ void Save() {
     put("ssr_quality", flag(v.ssr_quality.load()));
     put("true_black_hdr", flag(v.true_black_hdr.load()));
     put("hdr_output", flag(v.hdr_output.load()));
+    put("pcss_shadows", flag(v.pcss_shadows.load()));
     const std::uint32_t nmask = v.native_chosen_mask.load(std::memory_order_relaxed);
     if (nmask & Values::NativeBgmVolume) put("bgm_volume", std::to_string(std::clamp(v.bgm_volume.load(), 0, 10)));
     if (nmask & Values::NativeSeVolume) put("se_volume", std::to_string(std::clamp(v.se_volume.load(), 0, 10)));

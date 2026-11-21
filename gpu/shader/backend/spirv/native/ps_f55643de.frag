@@ -1,4 +1,5 @@
 #version 460
+#extension GL_EXT_samplerless_texture_functions : require
 // Native GLSL replacement for 0xf55643de (Screen-Space Cascaded Shadow + Depth Packing Pass)
 
 layout(push_constant) uniform AuxData {
@@ -153,31 +154,90 @@ void main() {
                        v_c < (0.5 + uv_pad) || v_c > (1.0 - uv_pad) ||
                        dref <= 0.0 || dref >= 1.0);
 
+    const uint fx_bits = push_data.buf_offsets2.y >> 24u;
+    const bool enhanced_shadows = (fx_bits & 0x02u) != 0u;
+    const bool pcss_shadows = (fx_bits & 0x10u) != 0u;
+
     float pcf_avg = 1.0;
+    const float ign = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
+    const float base_ang = ign * 6.28318530718;
+
     if (!c3_outside) {
-        float s0 = textureLod(sampler2DShadow(fs_img1, fs_samp1), vec3((sx + db) * inv_sw, (sy - da) * inv_sw, dref), 0.0);
-        float s1 = textureLod(sampler2DShadow(fs_img1, fs_samp1), vec3((sx + da) * inv_sw, (sy + db) * inv_sw, dref), 0.0);
-        float s2 = textureLod(sampler2DShadow(fs_img1, fs_samp1), vec3((sx - da) * inv_sw, (sy - db) * inv_sw, dref), 0.0);
-        float s3 = textureLod(sampler2DShadow(fs_img1, fs_samp1), vec3((sx - db) * inv_sw, (sy + da) * inv_sw, dref), 0.0);
-        pcf_avg = (s0 + s1 + s2 + s3) * 0.25;
+        if (pcss_shadows && d < 0.9999) {
+            const vec2 tex_size = vec2(textureSize(fs_img1, 0));
+            const float texel = 1.0 / max(tex_size.x, 1.0);
+            const vec2 q_base = floor(vec2(u_c, v_c) * 2.0) * 0.5;
+            const vec2 q_min = q_base + vec2(texel);
+            const vec2 q_max = q_base + vec2(0.5 - texel);
+            const float c_scale = (cascade == 0u) ? 1.0
+                                : ((cascade == 1u) ? 0.48
+                                : ((cascade == 2u) ? 0.24 : 0.13));
+            const float min_r = 0.85 * texel;
+            const float max_r = max(min_r, 13.0 * texel * c_scale);
+            const float search_r = max(min_r * 1.5, 15.0 * texel * c_scale);
+
+            // Step 1: 12-tap IGN-rotated Vogel disk blocker search in raw CSM depth.
+            float blocker_sum = 0.0;
+            float blocker_count = 0.0;
+            for (uint i = 0u; i < 12u; ++i) {
+                float r = sqrt((float(i) + 0.5) * (1.0 / 12.0)) * search_r;
+                float theta = float(i) * 2.39996323 + base_ang;
+                vec2 suv = clamp(vec2(u_c, v_c) + vec2(cos(theta), sin(theta)) * r, q_min, q_max);
+                float z_occ = texelFetch(fs_img1, ivec2(suv * tex_size), 0).r;
+                if (z_occ < dref - 0.00028) {
+                    blocker_sum += z_occ;
+                    blocker_count += 1.0;
+                }
+            }
+
+            if (blocker_count > 0.5) {
+                // Step 2: Blocker-distance penumbra + 16-tap IGN-rotated hardware PCF.
+                const float avg_blocker = blocker_sum / blocker_count;
+                const float blocker_dist = max(dref - avg_blocker, 0.0);
+                const float penumbra_t = smoothstep(0.0, 1.0, sqrt(clamp(blocker_dist * 60.0, 0.0, 1.0)));
+                const float filter_r = mix(min_r, max_r, penumbra_t);
+                const float z_bias = clamp((filter_r - min_r) * 0.14, 0.0, 0.00038);
+                const float dref_pcss = max(dref - z_bias, 0.0);
+                float pcss_sum = 0.0;
+                for (uint i = 0u; i < 16u; ++i) {
+                    float r = sqrt((float(i) + 0.5) * (1.0 / 16.0)) * filter_r;
+                    float theta = float(i) * 2.39996323 + base_ang + 0.78539816;
+                    vec2 puv = clamp(vec2(u_c, v_c) + vec2(cos(theta), sin(theta)) * r, q_min, q_max);
+                    pcss_sum += textureLod(sampler2DShadow(fs_img1, fs_samp1), vec3(puv, dref_pcss), 0.0);
+                }
+                pcf_avg = pcss_sum * (1.0 / 16.0);
+            } else {
+                // Keep tight 4-tap contact check so ultra-close (<5 cm) contact shadows are never missed.
+                float s0 = textureLod(sampler2DShadow(fs_img1, fs_samp1), vec3((sx + db) * inv_sw, (sy - da) * inv_sw, dref), 0.0);
+                float s1 = textureLod(sampler2DShadow(fs_img1, fs_samp1), vec3((sx + da) * inv_sw, (sy + db) * inv_sw, dref), 0.0);
+                float s2 = textureLod(sampler2DShadow(fs_img1, fs_samp1), vec3((sx - da) * inv_sw, (sy - db) * inv_sw, dref), 0.0);
+                float s3 = textureLod(sampler2DShadow(fs_img1, fs_samp1), vec3((sx - db) * inv_sw, (sy + da) * inv_sw, dref), 0.0);
+                pcf_avg = (s0 + s1 + s2 + s3) * 0.25;
+            }
+        } else {
+            float s0 = textureLod(sampler2DShadow(fs_img1, fs_samp1), vec3((sx + db) * inv_sw, (sy - da) * inv_sw, dref), 0.0);
+            float s1 = textureLod(sampler2DShadow(fs_img1, fs_samp1), vec3((sx + da) * inv_sw, (sy + db) * inv_sw, dref), 0.0);
+            float s2 = textureLod(sampler2DShadow(fs_img1, fs_samp1), vec3((sx - da) * inv_sw, (sy - db) * inv_sw, dref), 0.0);
+            float s3 = textureLod(sampler2DShadow(fs_img1, fs_samp1), vec3((sx - db) * inv_sw, (sy + da) * inv_sw, dref), 0.0);
+            pcf_avg = (s0 + s1 + s2 + s3) * 0.25;
+            if (enhanced_shadows && d < 0.9999) {
+                const float rad_step = length(vec2(da, db));
+                if (rad_step > 0.0) {
+                    float vogel_sum = pcf_avg * 4.0;
+                    for (uint i = 0u; i < 8u; ++i) {
+                        float r = sqrt((float(i) + 0.5) * 0.125) * rad_step;
+                        float theta = float(i) * 2.39996323 + base_ang;
+                        vec2 off = vec2(cos(theta), sin(theta)) * r;
+                        vogel_sum += textureLod(sampler2DShadow(fs_img1, fs_samp1),
+                                                vec3((sx + off.x) * inv_sw, (sy + off.y) * inv_sw, dref), 0.0);
+                    }
+                    pcf_avg = vogel_sum * (1.0 / 12.0);
+                }
+            }
+        }
     }
 
-    const bool enhanced_shadows = ((push_data.buf_offsets2.y >> 24u) & 0x02u) != 0u;
     if (enhanced_shadows && d < 0.9999) {
-        const float ign = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
-        const float base_ang = ign * 6.28318530718;
-        const float rad_step = length(vec2(da, db));
-        if (!c3_outside && rad_step > 0.0) {
-            float vogel_sum = pcf_avg * 4.0;
-            for (uint i = 0u; i < 8u; ++i) {
-                float r = sqrt((float(i) + 0.5) * 0.125) * rad_step;
-                float theta = float(i) * 2.39996323 + base_ang;
-                vec2 off = vec2(cos(theta), sin(theta)) * r;
-                vogel_sum += textureLod(sampler2DShadow(fs_img1, fs_samp1),
-                                        vec3((sx + off.x) * inv_sw, (sy + off.y) * inv_sw, dref), 0.0);
-            }
-            pcf_avg = vogel_sum * (1.0 / 12.0);
-        }
 
         // Perspective- and cascade-atlas-invariant screen-space contact micro-shadows:
         // Quotient-rule gradients of (u = sx/sw, v = sy/sw, dref = sz/sw) cancel out both

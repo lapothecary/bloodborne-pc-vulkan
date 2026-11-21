@@ -87,6 +87,42 @@ vec3 cube_array_uv(vec3 d) {
     return vec3(u, v, layer);
 }
 
+float eval_vsm_pcss(texture2DArray sm_tex, vec3 sh_vec, float sh_dist, float sh_scale,
+                    bool enh_vsm, bool pcss_vsm) {
+    vec2 vsm = textureLod(sampler2DArray(sm_tex, fs_samp1), cube_array_uv(sh_vec), 0.0).xy;
+    float penumbra = 0.0;
+    if (pcss_vsm) {
+        const float gap = clamp((sh_dist - vsm.x) / max(vsm.x, 0.04), 0.0, 1.0);
+        penumbra = sqrt(gap);
+        const float sv_len = length(sh_vec);
+        if (sv_len > 1e-4) {
+            const vec3 d_dir = sh_vec / sv_len;
+            const vec3 up_ref = (abs(d_dir.y) < 0.92) ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+            const vec3 t_axis = normalize(cross(up_ref, d_dir));
+            const vec3 b_axis = cross(d_dir, t_axis);
+            const float ign = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
+            const float ang0 = ign * 6.28318530718;
+            const float cone = mix(0.004, 0.038, penumbra) * sv_len;
+            vec2 mom = vsm;
+            for (uint k = 0u; k < 4u; ++k) {
+                float a = ang0 + float(k) * 1.57079633;
+                vec3 tap_v = sh_vec + (t_axis * cos(a) + b_axis * sin(a)) * cone;
+                mom += textureLod(sampler2DArray(sm_tex, fs_samp1), cube_array_uv(tap_v), 0.0).xy;
+            }
+            vsm = mom * 0.2;
+        }
+    }
+    const float cmp = (vsm.x >= sh_dist) ? 1.0 : 0.0;
+    const float var = max(0.00100000005 / sh_scale, (-vsm.x) * vsm.x + vsm.y);
+    const float diff = sh_dist - vsm.x;
+    const float raw = max(cmp, var / (diff * diff + var));
+    if (pcss_vsm) {
+        const float lbr = mix(0.32, 0.14, penumbra);
+        return smoothstep(lbr, 1.0, raw);
+    }
+    return enh_vsm ? smoothstep(0.18, 1.0, raw) : raw;
+}
+
 void main() {
     const uint bo0 = push_data.buf_offsets0.x;
     const uint buf0_dword_off = bitfieldExtract(bo0, 0, 8) >> 2u;
@@ -176,7 +212,9 @@ void main() {
     const float gloss_scaled = gloss_exp * 0.0100021362;
     const float rim_clamp = no_trans ? 0.0 : max(0.0, 1.0 - dot(N, V));
     const float rim_term = 0.25 * (rim_clamp * rim_clamp);
-    const bool enh_vsm = ((push_data.buf_offsets2.y >> 24u) & 0x02u) != 0u;
+    const uint fx_bits = push_data.buf_offsets2.y >> 24u;
+    const bool enh_vsm = (fx_bits & 0x02u) != 0u;
+    const bool pcss_vsm = (fx_bits & 0x10u) != 0u;
 
     vec3 total_diff = vec3(0.0);
     vec3 total_spec = vec3(0.0);
@@ -193,12 +231,7 @@ void main() {
         const float sh0_scale = (-s2f(17u + buf1_dword_off)) * (1.0 / (s2f(16u + buf1_dword_off) - 1.0));
         const float sh0_dist = sh0_max * (1.0 / sh0_scale);
 
-        const vec2 vsm0 = textureLod(sampler2DArray(fs_img5, fs_samp1), cube_array_uv(sh0_vec), 0.0).xy;
-        const float vsm0_cmp = (vsm0.x >= sh0_dist) ? 1.0 : 0.0;
-        const float vsm0_var = max(0.00100000005 / sh0_scale, (-vsm0.x) * vsm0.x + vsm0.y);
-        const float vsm0_diff = sh0_dist - vsm0.x;
-        const float vsm0_raw = max(vsm0_cmp, vsm0_var / (vsm0_diff * vsm0_diff + vsm0_var));
-        const float vsm0_p = enh_vsm ? smoothstep(0.18, 1.0, vsm0_raw) : vsm0_raw;
+        const float vsm0_p = eval_vsm_pcss(fs_img5, sh0_vec, sh0_dist, sh0_scale, enh_vsm, pcss_vsm);
         const float sh0 = s2f(19u + buf1_dword_off) * (vsm0_p - 1.0) + 1.0;
 
         const float sp0_k = s2f(7u + buf1_dword_off);
@@ -225,7 +258,6 @@ void main() {
     // --- Light 1 ---
     if (in1) {
         const vec3 sh1_vec = neg_pos + vec3(s2f(44u + buf1_dword_off), s2f(45u + buf1_dword_off), s2f(46u + buf1_dword_off));
-        const vec2 vsm1 = textureLod(sampler2DArray(fs_img6, fs_samp1), cube_array_uv(sh1_vec), 0.0).xy;
         const float sh1_max = max(abs(sh1_vec.z), max(abs(sh1_vec.x), abs(sh1_vec.y)));
         const float sh1_scale = (-s2f(41u + buf1_dword_off)) * (1.0 / (s2f(40u + buf1_dword_off) - 1.0));
         const float sh1_dist = sh1_max * (1.0 / sh1_scale);
@@ -235,11 +267,7 @@ void main() {
         const float att1_t = 1.0 - sqrt(max(l1_norm2, 0.0));
         const float att1 = att1_t * att1_t;
 
-        const float vsm1_cmp = (vsm1.x >= sh1_dist) ? 1.0 : 0.0;
-        const float vsm1_var = max(0.00100000005 / sh1_scale, (-vsm1.x) * vsm1.x + vsm1.y);
-        const float vsm1_diff = sh1_dist - vsm1.x;
-        const float vsm1_raw = max(vsm1_cmp, vsm1_var / (vsm1_diff * vsm1_diff + vsm1_var));
-        const float vsm1_p = enh_vsm ? smoothstep(0.18, 1.0, vsm1_raw) : vsm1_raw;
+        const float vsm1_p = eval_vsm_pcss(fs_img6, sh1_vec, sh1_dist, sh1_scale, enh_vsm, pcss_vsm);
         const float sh1 = s2f(43u + buf1_dword_off) * (vsm1_p - 1.0) + 1.0;
 
         const float sp1_k = s2f(31u + buf1_dword_off);
@@ -266,7 +294,6 @@ void main() {
     // --- Light 2 ---
     if (in2) {
         const vec3 sh2_vec = neg_pos + vec3(s2f(68u + buf1_dword_off), s2f(69u + buf1_dword_off), s2f(70u + buf1_dword_off));
-        const vec2 vsm2 = textureLod(sampler2DArray(fs_img7, fs_samp1), cube_array_uv(sh2_vec), 0.0).xy;
         const float sh2_max = max(abs(sh2_vec.z), max(abs(sh2_vec.x), abs(sh2_vec.y)));
         const float sh2_scale = (-s2f(65u + buf1_dword_off)) * (1.0 / (s2f(64u + buf1_dword_off) - 1.0));
         const float sh2_dist = sh2_max * (1.0 / sh2_scale);
@@ -276,11 +303,7 @@ void main() {
         const float att2_t = 1.0 - sqrt(max(l2_norm2, 0.0));
         const float att2 = att2_t * att2_t;
 
-        const float vsm2_cmp = (vsm2.x >= sh2_dist) ? 1.0 : 0.0;
-        const float vsm2_var = max(0.00100000005 / sh2_scale, (-vsm2.x) * vsm2.x + vsm2.y);
-        const float vsm2_diff = sh2_dist - vsm2.x;
-        const float vsm2_raw = max(vsm2_cmp, vsm2_var / (vsm2_diff * vsm2_diff + vsm2_var));
-        const float vsm2_p = enh_vsm ? smoothstep(0.18, 1.0, vsm2_raw) : vsm2_raw;
+        const float vsm2_p = eval_vsm_pcss(fs_img7, sh2_vec, sh2_dist, sh2_scale, enh_vsm, pcss_vsm);
         const float sh2 = s2f(67u + buf1_dword_off) * (vsm2_p - 1.0) + 1.0;
 
         const float sp2_k = s2f(55u + buf1_dword_off);

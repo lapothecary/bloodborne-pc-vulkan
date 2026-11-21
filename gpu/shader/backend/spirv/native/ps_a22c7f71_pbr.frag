@@ -67,7 +67,34 @@ vec3 cube_uv_face(vec3 sv) {
     return vec3(u, v, layer);
 }
 
-mat2x3 eval_vsm_point_light(uint base, vec3 L_vec, float d2, vec4 sm, vec3 pos, vec3 N, vec3 V_dir, vec3 R_v, float exp_13, float trans, float rim_factor) {
+vec2 sample_vsm_pcss(texture2DArray sm_tex, vec3 sv, float sh_dist, out float out_penumbra) {
+    vec2 vsm = textureLod(sampler2DArray(sm_tex, fs_samp1), cube_uv_face(sv), 0.0).xy;
+    out_penumbra = 0.0;
+    if (((push_data.buf_offsets2.y >> 24u) & 0x10u) != 0u) {
+        const float gap = clamp((sh_dist - vsm.x) / max(vsm.x, 0.04), 0.0, 1.0);
+        out_penumbra = sqrt(gap);
+        const float sv_len = length(sv);
+        if (sv_len > 1e-4) {
+            const vec3 d_dir = sv / sv_len;
+            const vec3 up_ref = (abs(d_dir.y) < 0.92) ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+            const vec3 t_axis = normalize(cross(up_ref, d_dir));
+            const vec3 b_axis = cross(d_dir, t_axis);
+            const float ign = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
+            const float ang0 = ign * 6.28318530718;
+            const float cone = mix(0.004, 0.038, out_penumbra) * sv_len;
+            vec2 mom = vsm;
+            for (uint k = 0u; k < 4u; ++k) {
+                float a = ang0 + float(k) * 1.57079633;
+                vec3 tap_v = sv + (t_axis * cos(a) + b_axis * sin(a)) * cone;
+                mom += textureLod(sampler2DArray(sm_tex, fs_samp1), cube_uv_face(tap_v), 0.0).xy;
+            }
+            vsm = mom * 0.2;
+        }
+    }
+    return vsm;
+}
+
+mat2x3 eval_vsm_point_light(uint base, vec3 L_vec, float d2, texture2DArray sm_tex, vec3 pos, vec3 N, vec3 V_dir, vec3 R_v, float exp_13, float trans, float rim_factor) {
     vec3 L = L_vec * safe_rsq(d2);
     float NdotL = dot(N, L);
     float att = 1.0 - sqrt(clamp(s2f(base + 3u) * d2, 0.0, 1.0));
@@ -76,9 +103,14 @@ mat2x3 eval_vsm_point_light(uint base, vec3 L_vec, float d2, vec4 sm, vec3 pos, 
     vec3 sv = s2_v3(base + 20u) - pos;
     float sh_range = (-s2f(base + 17u)) / (s2f(base + 16u) - 1.0);
     float sh_dist = max(abs(sv.z), max(abs(sv.x), abs(sv.y))) / sh_range;
+    float penumbra = 0.0;
+    vec2 sm = sample_vsm_pcss(sm_tex, sv, sh_dist, penumbra);
     float var = max(0.00100000005 / sh_range, (-sm.x * sm.x) + sm.y);
     float p_max = max((sm.x >= sh_dist) ? 1.0 : 0.0, var / ((sh_dist - sm.x) * (sh_dist - sm.x) + var));
-    if (((push_data.buf_offsets2.y >> 24u) & 0x02u) != 0u) {
+    const uint fx_bits = push_data.buf_offsets2.y >> 24u;
+    if ((fx_bits & 0x10u) != 0u) {
+        p_max = smoothstep(mix(0.32, 0.14, penumbra), 1.0, p_max);
+    } else if ((fx_bits & 0x02u) != 0u) {
         p_max = smoothstep(0.18, 1.0, p_max);
     }
     float sh_factor = s2f(base + 19u) * (p_max - 1.0) + 1.0;
@@ -170,14 +202,12 @@ void main() {
     vec3 diff_acc = vec3(0.0);
     vec3 spec_acc = vec3(0.0);
     if (in0) {
-        vec4 sm0 = textureLod(sampler2DArray(fs_img5, fs_samp1), cube_uv_face(s2_v3(d1 + 20u) - pos), 0.0);
-        mat2x3 r0 = eval_vsm_point_light(d1 + 0u, L_vec0, d2_0, sm0, pos, N, V_dir, R_v, exp_13, trans, rim_factor);
+        mat2x3 r0 = eval_vsm_point_light(d1 + 0u, L_vec0, d2_0, fs_img5, pos, N, V_dir, R_v, exp_13, trans, rim_factor);
         diff_acc += r0[0];
         spec_acc += r0[1];
     }
     if (in1) {
-        vec4 sm1 = textureLod(sampler2DArray(fs_img6, fs_samp1), cube_uv_face(s2_v3(d1 + 44u) - pos), 0.0);
-        mat2x3 r1 = eval_vsm_point_light(d1 + 24u, L_vec1, d2_1, sm1, pos, N, V_dir, R_v, exp_13, trans, rim_factor);
+        mat2x3 r1 = eval_vsm_point_light(d1 + 24u, L_vec1, d2_1, fs_img6, pos, N, V_dir, R_v, exp_13, trans, rim_factor);
         diff_acc += r1[0];
         spec_acc += r1[1];
     }

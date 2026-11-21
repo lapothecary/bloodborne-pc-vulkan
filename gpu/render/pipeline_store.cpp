@@ -168,6 +168,21 @@ bool IsOpt38StageC2ShaderHash(u64 pgm_hash) noexcept {
     }
 }
 
+bool IsOpt39RemasterPcssShaderHash(u64 pgm_hash) noexcept {
+    switch (pgm_hash) {
+    // Remaster-v2 Stage 1.2: PCSS contact-hardening soft shadows (4K CSM + 5 cubemap VSM point-light shaders)
+    case 0x00000000f55643deULL:
+    case 0x000000006b42fc89ULL:
+    case 0x000000000ef50047ULL:
+    case 0x00000000a22c7f71ULL:
+    case 0x00000000e96447c3ULL:
+    case 0x00000000f40da260ULL:
+        return true;
+    default:
+        return false;
+    }
+}
+
 bool IsOpt37StageC1ShaderHash(u64 pgm_hash) noexcept {
     switch (pgm_hash) {
     // Stage C1: 4K shadow depth, motion blur alpha velocity
@@ -184,7 +199,7 @@ std::string OptBinaryName(u64 pgm_hash, size_t perm_idx) {
     const bool fast_fp = Shader::Backend::SPIRV::FastFpEnabled();
     const bool native_sh = Shader::Backend::SPIRV::NativeShadersEnabled();
     // Only shaders that actually have a native GLSL replacement differ between
-    // BB_NATIVE_SHADERS=1 and BB_NATIVE_SHADERS=0. Reusing the standard opt31..38
+    // BB_NATIVE_SHADERS=1 and BB_NATIVE_SHADERS=0. Reusing the standard opt31..39
     // cache for the other ~6,828 non-native shaders avoids re-optimizing the entire
     // 6,969-shader cache at startup whenever BB_NATIVE_SHADERS=0 is toggled.
     const bool use_native_prefix = native_sh || !Shader::Backend::SPIRV::HasNativeShader(pgm_hash);
@@ -193,23 +208,25 @@ std::string OptBinaryName(u64 pgm_hash, size_t perm_idx) {
     if (hw_interp) {
         if (fast_fp) {
             prefix = use_native_prefix
-                         ? (IsOpt38StageC2ShaderHash(pgm_hash)
-                                ? "opt38"
-                                : (IsOpt37StageC1ShaderHash(pgm_hash)
-                                       ? "opt37"
-                                       : (IsOpt36BgraFixShaderHash(pgm_hash)
-                                              ? "opt36"
-                                              : (IsOpt35Phase5ShaderHash(pgm_hash)
-                                                     ? "opt35"
-                                                     : (IsOpt33Phase2ShaderHash(pgm_hash)
-                                                            ? "opt33"
-                                                            : ((pgm_hash ==
-                                                                    0x0000000024042a9bULL ||
-                                                                pgm_hash ==
-                                                                    0x00000000f55643deULL ||
-                                                                ltb_patched)
-                                                                   ? "opt32"
-                                                                   : "opt31"))))))
+                         ? (IsOpt39RemasterPcssShaderHash(pgm_hash)
+                                ? "opt39"
+                                : (IsOpt38StageC2ShaderHash(pgm_hash)
+                                       ? "opt38"
+                                       : (IsOpt37StageC1ShaderHash(pgm_hash)
+                                              ? "opt37"
+                                              : (IsOpt36BgraFixShaderHash(pgm_hash)
+                                                     ? "opt36"
+                                                     : (IsOpt35Phase5ShaderHash(pgm_hash)
+                                                            ? "opt35"
+                                                            : (IsOpt33Phase2ShaderHash(pgm_hash)
+                                                                   ? "opt33"
+                                                                   : ((pgm_hash ==
+                                                                           0x0000000024042a9bULL ||
+                                                                       pgm_hash ==
+                                                                           0x00000000f55643deULL ||
+                                                                       ltb_patched)
+                                                                          ? "opt32"
+                                                                          : "opt31")))))))
                          : (ltb_patched ? "opt6_ltb2" : "opt6_nonat");
         } else {
             prefix = ltb_patched ? "opt3_ltb2" : "opt3_strict";

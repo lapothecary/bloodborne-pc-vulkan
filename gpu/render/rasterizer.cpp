@@ -3988,6 +3988,7 @@ void Rasterizer::ScaleToTarget(const GraphicsPipeline* pipeline) {
         if (settings.contact_shadows.load(std::memory_order_relaxed)) fx_mask |= 0x02u;
         if (settings.ssr_quality.load(std::memory_order_relaxed))     fx_mask |= 0x04u;
         if (settings.true_black_hdr.load(std::memory_order_relaxed))  fx_mask |= 0x08u;
+        if (settings.pcss_shadows.load(std::memory_order_relaxed))    fx_mask |= 0x10u;
         frame_fx_mask = fx_mask;
         frame_fx_mask_valid = true;
     }

@@ -310,7 +310,7 @@ constexpr int DisplaySlotCount = 11; ///< all 11 Display settings fit on a singl
 constexpr int TotalDisplayItems = 12;
 constexpr int MaxDisplayScroll = TotalDisplayItems - DisplaySlotCount;
 constexpr int EffectsSlotCount = 11; ///< all 11 Effects settings fit on a single screen (0 scroll)
-constexpr int TotalEffectsItems = 12;
+constexpr int TotalEffectsItems = 13;
 constexpr int MaxEffectsScroll = TotalEffectsItems - EffectsSlotCount;
 constexpr int MaxChoicesPerSlot = 16;
 constexpr int DefaultResetSentinel = -999;
@@ -2452,6 +2452,9 @@ constexpr EffectsItemMeta EffectsItems[TotalEffectsItems] = {
     {"Native HDR10 (PQ)", "Настоящий HDR10 (PQ)",
      "Vulkan 1.3 Remaster: 10-bit Rec.2020 ST.2084 PQ HDR output with highlight expansion (enable HDR in OS)",
      "Ремастер Vulkan 1.3: 10-битный вывод HDR10 (Rec.2020 PQ) с расширением яркости огня и луны (включи HDR в ОС)", false},
+    {"PCSS Soft Shadows", "Мягкие тени PCSS",
+     "Vulkan 1.3 Remaster: physical contact-hardening soft shadows for 4K sun/moon CSM and torch/lantern VSM",
+     "Ремастер Vulkan 1.3: физически мягкие тени PCSS (чёткие у основания, мягкие вдали) для луны, факелов и костров", false},
 };
 
 constexpr int EffectsItemToEffectIdx(int item_idx) {
@@ -2477,6 +2480,7 @@ bool GetEffectsItemActive(int item_idx) {
     case 9: return s.ssr_quality.load();
     case 10: return s.true_black_hdr.load();
     case 11: return s.hdr_output.load();
+    case 12: return s.pcss_shadows.load();
     default: return false;
     }
 }
@@ -2499,6 +2503,7 @@ void SetEffectsItemActive(int item_idx, bool active) {
             s.hdr_output = active;
             s.swapchain_generation.fetch_add(1, std::memory_order_relaxed);
             break;
+        case 12: s.pcss_shadows = active; break;
         default: break;
         }
     }

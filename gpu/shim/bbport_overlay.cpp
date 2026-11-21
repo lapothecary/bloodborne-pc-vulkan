@@ -872,6 +872,14 @@ void Menu() {
         "expansion for torches, bonfires, and moonlight. Requires HDR enabled in OS display settings.",
         "Переключает Vulkan swapchain на лету в 10-битный HDR10 (ST.2084 PQ) с расширением яркости "
         "факелов, костров и луны. Для полного эффекта включи HDR в настройках экрана ОС."));
+    Checkbox(BbSettings::MenuText("PCSS Soft Shadows (Contact-Hardening)",
+                                  "Мягкие тени PCSS (контактное размытие)"),
+             s.pcss_shadows);
+    Hint(BbSettings::MenuText(
+        "Physical blocker-distance penumbra for 4K sun/moon CSM shadows and VSM-PCSS tangent-cone "
+        "softening for torches, lanterns, and bonfires: sharp at contact, smoothly soft at distance.",
+        "Физическая полутень по дистанции до препятствия для 4K теней солнца/луны и мягкое "
+        "размытие теней от факелов, фонарей и костров: чёткие у основания, плавно мягкие вдали."));
     BbGuestHooks::ApplyGameEffects();
     Hint(BbSettings::MenuText(
         "All visual effects (including SSR reflections, Bloom, DoF, Motion Blur, SSAO, and Model LOD) "

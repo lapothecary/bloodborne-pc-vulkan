@@ -237,6 +237,8 @@ struct Values {
     std::atomic<bool> true_black_hdr{true};
     /// Native 10-bit HDR10 (Rec.2020 ST.2084 PQ) Vulkan swapchain output with highlight expansion.
     std::atomic<bool> hdr_output{false};
+    /// PCSS Contact-Hardening Soft Shadows (blocker-distance penumbra for 4K CSM + VSM point lights).
+    std::atomic<bool> pcss_shadows{false};
 
     // --- Native Bloodborne System Options (CSOptionsData <-> bbport.ini <-> Launcher) -----------
     enum NativeMaskBit : std::uint32_t {
