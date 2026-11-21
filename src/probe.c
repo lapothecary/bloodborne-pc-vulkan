@@ -465,12 +465,6 @@ void runtime_restart(void) {
 
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
-#ifndef _WIN32
-    /* Keep host heap objects handed to the guest (thread handles, TLS) in the
-       non-PIE brk heap, i.e. below 1 TiB: the guest packs pointers into 40 bits. */
-    mallopt(M_ARENA_MAX,1);
-    mallopt(M_MMAP_THRESHOLD,32*1024*1024);
-#endif
     if (argc == 2 && !strcmp(argv[1], "--vulkan-only")) return vulkan_smoke();
     /* Shader recipes (gpu/render/shader_rebuild.h): no game here, the guest's addresses stay free. */
     if (argc == 5 && !strcmp(argv[1], "--export-shader-recipes"))
@@ -501,6 +495,12 @@ int main(int argc, char **argv) {
         return bbgpu_merge_shader_packs(argv[2], argv[3], argv[4], argv[5], argv[6], argv[7], atoi(argv[8]));
     if (argc == 5 && !strcmp(argv[1], "--meta-reconstruct-test"))
         return bbgpu_meta_reconstruct_test(argv[2], argv[3], argv[4]);
+    /* Keep host heap objects handed to the guest (thread handles, TLS) in the
+       non-PIE brk heap, i.e. below 1 TiB: the guest packs pointers into 40 bits.
+       Must NOT run for offline shader tools (--bake-shaders etc.) which spawn
+       up to 24 worker threads doing heavy SPIRV-Tools allocations. */
+    mallopt(M_ARENA_MAX, 1);
+    mallopt(M_MMAP_THRESHOLD, 32 * 1024 * 1024);
 #endif
     print_environment();
     check_cpu();
