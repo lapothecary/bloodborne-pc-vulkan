@@ -179,6 +179,7 @@ BB_ENV(BB_GX_SKIP_MIN, DEBUG, "=N: lower bound for native GX draw skip bisection
 BB_ENV(BB_GX_SKIP_MODS, DEBUG, "=03,04,05,06,07: optional module filter restricting BB_GX_SKIP_MIN..MAX so core 01/02 stay intact")
 BB_ENV(BB_GHOST_TRACE, DEBUG, "=1: log ghost/suspect draws for debugging")
 BB_ENV(BB_HW_OCCLUSION_CULL, TUNING, "=1 / 0: hardware occlusion query culling")
+BB_ENV(BB_GBUF_SORT, TUNING, "=1 / 0: coarse 4-bucket front-to-back G-Buffer draw reordering (default 0: opt-in, breaks coplanar ground blood decals)")
 BB_ENV(BB_SKEL_OCCLUSION_CULL, TUNING, "=1 / 0: hardware occlusion query culling for distant (>=6m) skinned character/enemy meshes (default 1)")
 BB_ENV(BB_MICRO_SHADOW_CULL, TUNING, "=1 / 0: sub-texel shadow caster culling")
 BB_ENV(BB_NATIVE_SHADERS, TUNING, "=1 / 0: precompiled native SPIR-V shader replacements")

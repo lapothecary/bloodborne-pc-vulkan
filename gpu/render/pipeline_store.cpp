@@ -183,11 +183,16 @@ std::string OptBinaryName(u64 pgm_hash, size_t perm_idx) {
     const bool hw_interp = Shader::Backend::SPIRV::HwInterpEnabled();
     const bool fast_fp = Shader::Backend::SPIRV::FastFpEnabled();
     const bool native_sh = Shader::Backend::SPIRV::NativeShadersEnabled();
+    // Only shaders that actually have a native GLSL replacement differ between
+    // BB_NATIVE_SHADERS=1 and BB_NATIVE_SHADERS=0. Reusing the standard opt31..38
+    // cache for the other ~6,828 non-native shaders avoids re-optimizing the entire
+    // 6,969-shader cache at startup whenever BB_NATIVE_SHADERS=0 is toggled.
+    const bool use_native_prefix = native_sh || !Shader::Backend::SPIRV::HasNativeShader(pgm_hash);
     const bool ltb_patched = Shader::Backend::SPIRV::IsSpvPatchedLightAccPsHash(pgm_hash);
     const char* prefix = "opt1";
     if (hw_interp) {
         if (fast_fp) {
-            prefix = native_sh
+            prefix = use_native_prefix
                          ? (IsOpt38StageC2ShaderHash(pgm_hash)
                                 ? "opt38"
                                 : (IsOpt37StageC1ShaderHash(pgm_hash)
@@ -215,6 +220,18 @@ std::string OptBinaryName(u64 pgm_hash, size_t perm_idx) {
         prefix = "opt1_ltb2";
     }
     return fmt::format("{}_{:#018x}_{}", prefix, pgm_hash, perm_idx);
+}
+
+void OptimizeSpirvInWarmUp(std::vector<u32>& spv, u64 pgm_hash) {
+#ifndef _WIN32
+    // During live gameplay Linux sets mallopt(M_ARENA_MAX, 1) so guest-visible heap pointers
+    // stay below 1 TiB. Running SPIRV-Tools concurrently across 12 WarmUp threads under a
+    // single glibc arena causes >100x mutex thrashing; serializing only the SPIRV-Tools call
+    // makes cache-miss upgrades ~5x faster while file I/O and vkCreateShaderModule stay parallel.
+    static std::mutex s_linux_opt_mutex;
+    std::scoped_lock lk{s_linux_opt_mutex};
+#endif
+    Shader::Backend::SPIRV::OptimizeSPIRV(spv, pgm_hash);
 }
 
 const char* DriverCacheBlobName() noexcept {
@@ -517,7 +534,7 @@ bool PipelineCache::PreloadStage(Serialization::Archive& ar, const Shader::Info*
                     }
                     return false;
                 }
-                Shader::Backend::SPIRV::OptimizeSPIRV(spv, pgm_hash);
+                OptimizeSpirvInWarmUp(spv, pgm_hash);
                 upgraded_from_raw = !bypass_opt_cache;
             }
         } else {
@@ -934,7 +951,7 @@ void PipelineCache::WarmUp() {
                             if (spv.size() < 5 || spv[0] != 0x07230203u) {
                                 continue;
                             }
-                            Shader::Backend::SPIRV::OptimizeSPIRV(spv, pgm_hash);
+                            OptimizeSpirvInWarmUp(spv, pgm_hash);
                             upgraded = !bypass_opt_cache;
                         }
                     } else {

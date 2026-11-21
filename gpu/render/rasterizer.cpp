@@ -49,9 +49,95 @@ struct SceneOcclusionCuller {
     static constexpr u32 BucketWays = 8;
     static constexpr u32 TotalEntries = TableBuckets * BucketWays;
     static constexpr u32 SkelProbeBuckets = 4;
-    static constexpr float kMinSkelCullDistSq = 36.0f;   // >= 6.0m from camera (never player/melee)
+    static constexpr float kMinSkelCullDistSq = 36.0f;   // >= 6.0m from camera (never player/melee/near decals)
     static constexpr float kSkelTrackDistSq = 1.00f;     // 1.0m per-frame 3D anchor tracking radius
     static constexpr float kSkelSameSpotDistSq = 0.04f;  // 0.2m same-frame duplicate threshold
+    static constexpr u16 kMinZeroStreak = 5u;            // >= 5 consecutive occluded probes before skip
+    static constexpr u32 kMinCullIndices = 72u;          // Never cull 36-index decal cubes / tiny floor quads
+
+    [[nodiscard]] static bool IsSafeOpaqueGBufferDraw(const Gcn::Regs& regs, u32 mrt_mask,
+                                                      u32 expected_mrt_mask) noexcept {
+        if (mrt_mask != expected_mrt_mask || !regs.depth_control.depth_enable ||
+            !regs.depth_control.depth_write_enable ||
+            regs.depth_render_control.depth_clear_enable ||
+            regs.depth_render_control.stencil_clear_enable) {
+            return false;
+        }
+        // Never cull or reorder depth-biased decals / coplanar floor overlays (blood puddles, grime).
+        if (regs.polygon_control.NeedsBias()) {
+            return false;
+        }
+        // Reject if ANY of the 6 G-Buffer MRTs has blending enabled (not just CB0).
+        for (u32 cb = 0; cb < 6u; ++cb) {
+            if (regs.blend_control[cb].enable) {
+                return false;
+            }
+        }
+        // Reject non-standard depth compare ops (e.g. Equal/Always coplanar decal passes).
+        const auto df = regs.depth_control.depth_func;
+        if (df != Gcn::CompareFunc::Less && df != Gcn::CompareFunc::LessEqual &&
+            df != Gcn::CompareFunc::Greater && df != Gcn::CompareFunc::GreaterEqual) {
+            return false;
+        }
+        // Reject stencil-tested draws (decal / mask-gated passes).
+        if (regs.depth_control.stencil_enable &&
+            (regs.depth_control.stencil_ref_func != Gcn::CompareFunc::Always ||
+             (regs.depth_control.backface_enable &&
+              regs.depth_control.stencil_bf_func != Gcn::CompareFunc::Always))) {
+            return false;
+        }
+        return true;
+    }
+
+    [[nodiscard]] static bool IsNearCameraWorldObject(const u8* palette_ptr, u32 palette_size,
+                                                      u32 mat_byte_off, bool is_inst_gbuf_vs,
+                                                      u32 num_instances, const u8* inst_cb_ptr,
+                                                      u32 inst_cb_size, float cam_x, float cam_y,
+                                                      float cam_z) noexcept {
+        if (!palette_ptr || u64(mat_byte_off) + 48ull > u64(palette_size)) {
+            return false;
+        }
+        const float* mf = reinterpret_cast<const float*>(palette_ptr + mat_byte_off);
+        const float wx = mf[3];
+        const float wy = mf[7];
+        const float wz = mf[11];
+        if ((wx != 0.0f || wy != 0.0f || wz != 0.0f) && std::isfinite(wx) && std::isfinite(wy) &&
+            std::isfinite(wz)) {
+            const float dx = wx - cam_x;
+            const float dy = wy - cam_y;
+            const float dz = wz - cam_z;
+            if (dx * dx + dy * dy + dz * dz < kMinSkelCullDistSq) {
+                return true;
+            }
+        }
+        if (is_inst_gbuf_vs && num_instances > 1u && inst_cb_ptr && inst_cb_size > 0u) {
+            const u32 check_n = std::min<u32>(num_instances, 4u);
+            for (u32 k = 1u; k < check_n; ++k) {
+                const u32 ioff = k * 208u + 80u;
+                if (ioff + sizeof(u32) <= inst_cb_size) {
+                    u32 ibone = 0u;
+                    std::memcpy(&ibone, inst_cb_ptr + ioff, sizeof(u32));
+                    if (u64(ibone) * 48ull + 48ull <= u64(palette_size)) {
+                        const float* imf =
+                            reinterpret_cast<const float*>(palette_ptr + ibone * 48u);
+                        const float ix = imf[3];
+                        const float iy = imf[7];
+                        const float iz = imf[11];
+                        if ((ix != 0.0f || iy != 0.0f || iz != 0.0f) && std::isfinite(ix) &&
+                            std::isfinite(iy) && std::isfinite(iz)) {
+                            const float dx = ix - cam_x;
+                            const float dy = iy - cam_y;
+                            const float dz = iz - cam_z;
+                            if (dx * dx + dy * dy + dz * dz < kMinSkelCullDistSq) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return false;
+    }
 
     static constexpr size_t kMeshFilterSlots = 8192; // 16 KiB L1d active-occluded mesh refcounts
 
@@ -611,15 +697,15 @@ struct SceneOcclusionCuller {
                     ++zs;
                     e.zero_streak.store(zs, std::memory_order_relaxed);
                 }
-                if (zs >= 3u && !fast_turn) {
+                if (zs >= kMinZeroStreak && !fast_turn) {
                     const u32 stagger = static_cast<u32>(idx & 1u);
                     const bool skel = (e.is_skel.load(std::memory_order_relaxed) != 0u);
                     const u32 skip_len =
                         skel ? (cam_mov ? (1u + stagger)
-                                        : (zs >= 6u ? (3u + stagger) : (2u + stagger)))
-                             : (cam_mov ? (zs >= 6u ? (2u + stagger) : (1u + stagger))
-                                        : (zs >= 8u   ? (6u + static_cast<u32>(idx & 3u))
-                                           : zs >= 5u ? (4u + stagger)
+                                        : (zs >= 8u ? (3u + stagger) : (2u + stagger)))
+                             : (cam_mov ? (zs >= 8u ? (2u + stagger) : (1u + stagger))
+                                        : (zs >= 10u  ? (6u + static_cast<u32>(idx & 3u))
+                                           : zs >= 7u ? (4u + stagger)
                                                       : (2u + stagger)));
                     e.skip_until_frame.store(ref_frame + skip_len, std::memory_order_relaxed);
                     SetEntryOccActive(e, true);
@@ -1518,10 +1604,9 @@ Rasterizer::MtOcclusionDecision Rasterizer::EvaluateGBufferOcclusionMt(
     const u32 expected_mrt_mask = pipeline->GetGraphicsKey().motion_vectors ? 0x7fu : 0x3fu;
     if (!culler.enabled || !culler.mt_occ_cull || !culler.mt_pool ||
         guest_occlusion_seen.load(std::memory_order_relaxed) || !is_indexed ||
-        pipeline->GetGraphicsKey().mrt_mask != expected_mrt_mask || regs.blend_control[0].enable ||
-        !regs.depth_control.depth_enable || !regs.depth_control.depth_write_enable ||
-        regs.depth_render_control.depth_clear_enable ||
-        regs.depth_render_control.stencil_clear_enable || regs.num_indices < 36u) {
+        !SceneOcclusionCuller::IsSafeOpaqueGBufferDraw(regs, pipeline->GetGraphicsKey().mrt_mask,
+                                                       expected_mrt_mask) ||
+        regs.num_indices < SceneOcclusionCuller::kMinCullIndices) {
         return decision;
     }
 
@@ -1618,7 +1703,8 @@ Rasterizer::MtOcclusionDecision Rasterizer::EvaluateGBufferOcclusionMt(
         (has_model_cb && !is_inst_gbuf_vs && model_base_matrix_idx == 0u && palette_size >= 640u)) {
         is_skeleton = true;
     }
-    if (!palette_ptr || palette_size < 48u || (is_skeleton && !culler.skel_occ_cull)) {
+    if (!palette_ptr || palette_size < 48u || (is_skeleton && !culler.skel_occ_cull) ||
+        (regs.num_instances.NumInstances() > 1u && !is_inst_gbuf_vs)) {
         return decision;
     }
 
@@ -1687,6 +1773,21 @@ Rasterizer::MtOcclusionDecision Rasterizer::EvaluateGBufferOcclusionMt(
         e_idx = culler.FindOrInsertSkelEntry(skel_key, mesh_slot, skel_wx, skel_wy, skel_wz,
                                              frame_tag, inserted);
     } else {
+        float cam_x = worker_cam_pos[0];
+        float cam_y = worker_cam_pos[1];
+        float cam_z = worker_cam_pos[2];
+        bool have_cam = worker_has_cam;
+        if (!have_cam && culler.pub_cam_valid.load(std::memory_order_acquire)) {
+            cam_x = culler.pub_cam_pos[0].load(std::memory_order_relaxed);
+            cam_y = culler.pub_cam_pos[1].load(std::memory_order_relaxed);
+            cam_z = culler.pub_cam_pos[2].load(std::memory_order_relaxed);
+            have_cam = true;
+        }
+        if (have_cam && SceneOcclusionCuller::IsNearCameraWorldObject(
+                            palette_ptr, palette_size, mat_byte_off, is_inst_gbuf_vs,
+                            num_instances, inst_cb_ptr, inst_cb_size, cam_x, cam_y, cam_z)) {
+            return decision;
+        }
         if (out_candidates) {
             ++(*out_candidates);
         }
@@ -1776,7 +1877,7 @@ Rasterizer::MtOcclusionDecision Rasterizer::EvaluateGBufferOcclusionMt(
     if (gbuf_ord > 12u && e.multi_occ.load(std::memory_order_relaxed) == 0u && !local_fast_turn) {
         const u16 zs = e.zero_streak.load(std::memory_order_relaxed);
         const u8 p_if = e.probe_in_flight.load(std::memory_order_acquire);
-        if (zs >= 3u && p_if == 0u &&
+        if (zs >= SceneOcclusionCuller::kMinZeroStreak && p_if == 0u &&
             frame_tag < e.skip_until_frame.load(std::memory_order_relaxed)) {
             decision.skip_draw = true;
             if (out_skipped) {
@@ -2087,12 +2188,10 @@ bool Rasterizer::TryCullSceneOcclusionStageA(const GraphicsPipeline* pipeline,
     const u32 expected_mrt_mask = has_motion_mrt ? 0x7fu : 0x3fu;
     const u32 mrt_mask = pipeline->GetGraphicsKey().mrt_mask;
     const u32 num_indices = regs.num_indices;
-    if (!is_indexed || mrt_mask != expected_mrt_mask || num_indices < 36u ||
+    if (!is_indexed || num_indices < SceneOcclusionCuller::kMinCullIndices ||
         regs.color_control.mode == Gcn::ColorControl::OperationMode::Disable ||
-        regs.blend_control[0].enable || !regs.depth_control.depth_enable ||
-        !regs.depth_control.depth_write_enable || !regs.depth_buffer.DepthValid() ||
-        regs.depth_render_control.depth_clear_enable ||
-        regs.depth_render_control.stencil_clear_enable) {
+        !regs.depth_buffer.DepthValid() ||
+        !SceneOcclusionCuller::IsSafeOpaqueGBufferDraw(regs, mrt_mask, expected_mrt_mask)) {
         return false;
     }
     for (u32 cb = 0; cb < 6u; ++cb) {
@@ -2417,6 +2516,18 @@ bool Rasterizer::TryCullSceneOcclusionStageA(const GraphicsPipeline* pipeline,
         e_idx = culler.FindOrInsertSkelEntry(skel_key, mesh_slot, skel_wx, skel_wy, skel_wz,
                                              frame_tag, inserted);
     } else {
+        if (num_instances > 1u && !is_inst_gbuf_vs) {
+            return false;
+        }
+        if (culler.pub_cam_valid.load(std::memory_order_acquire) &&
+            SceneOcclusionCuller::IsNearCameraWorldObject(
+                palette_ptr, palette_size, mat_byte_off, is_inst_gbuf_vs, num_instances,
+                inst_cb_ptr, inst_cb_size,
+                culler.pub_cam_pos[0].load(std::memory_order_relaxed),
+                culler.pub_cam_pos[1].load(std::memory_order_relaxed),
+                culler.pub_cam_pos[2].load(std::memory_order_relaxed))) {
+            return false;
+        }
         culler.stat_gbuf_candidates.fetch_add(1, std::memory_order_relaxed);
         const u32 hash_bytes =
             std::min<u32>(palette_size - mat_byte_off, is_inst_gbuf_vs ? 384u : 192u);
@@ -2483,7 +2594,7 @@ bool Rasterizer::TryCullSceneOcclusionStageA(const GraphicsPipeline* pipeline,
         !culler.fast_camera_turn.load(std::memory_order_relaxed)) {
         const u16 zs = e.zero_streak.load(std::memory_order_relaxed);
         const u8 p_if = e.probe_in_flight.load(std::memory_order_acquire);
-        if (zs >= 3u && p_if == 0u &&
+        if (zs >= SceneOcclusionCuller::kMinZeroStreak && p_if == 0u &&
             frame_tag < e.skip_until_frame.load(std::memory_order_relaxed)) {
             culler.stat_gbuf_skipped.fetch_add(1, std::memory_order_relaxed);
             culler.stat_stage_a_skipped.fetch_add(1, std::memory_order_relaxed);
@@ -2781,13 +2892,10 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
         const u32 mrt_mask = pipeline->GetGraphicsKey().mrt_mask;
         const auto* ps_stage = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
         const bool is_gbuf_cull_cand =
-            is_indexed && mrt_mask == expected_mrt_mask &&
-            begin_memo.state.num_color_attachments == expected_num_cb &&
-            !regs.blend_control[0].enable && regs.depth_control.depth_enable &&
-            regs.depth_control.depth_write_enable && num_indices >= 36;
+            is_indexed && begin_memo.state.num_color_attachments == expected_num_cb &&
+            SceneOcclusionCuller::IsSafeOpaqueGBufferDraw(regs, mrt_mask, expected_mrt_mask) &&
+            num_indices >= SceneOcclusionCuller::kMinCullIndices;
         if (culler.enabled && culler.pool && begin_memo.valid &&
-            !regs.depth_render_control.depth_clear_enable &&
-            !regs.depth_render_control.stencil_clear_enable &&
             !guest_occlusion_seen.load(std::memory_order_relaxed) &&
             (!occlusion || occlusion->Events() == 0) && is_gbuf_cull_cand) {
             const u32 gbuf_ord = ++culler.gbuf_draws_in_frame;
@@ -3051,7 +3159,14 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
                                                                  inserted);
                         }
                     }
-                } else {
+                } else if ((num_instances <= 1u || is_inst_gbuf_vs) &&
+                           !(culler.pub_cam_valid.load(std::memory_order_acquire) &&
+                             SceneOcclusionCuller::IsNearCameraWorldObject(
+                                 palette_ptr, palette_size, mat_byte_off, is_inst_gbuf_vs,
+                                 num_instances, inst_cb_ptr, inst_cb_size,
+                                 culler.pub_cam_pos[0].load(std::memory_order_relaxed),
+                                 culler.pub_cam_pos[1].load(std::memory_order_relaxed),
+                                 culler.pub_cam_pos[2].load(std::memory_order_relaxed)))) {
                     culler.stat_gbuf_candidates.fetch_add(1, std::memory_order_relaxed);
                     const u32 hash_bytes =
                         std::min<u32>(palette_size - mat_byte_off, is_inst_gbuf_vs ? 384u : 192u);
@@ -3122,7 +3237,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
                             !culler.fast_camera_turn.load(std::memory_order_relaxed)) {
                             const u16 zs = e.zero_streak.load(std::memory_order_relaxed);
                             const u8 p_if = e.probe_in_flight.load(std::memory_order_acquire);
-                            if (zs >= 3u && p_if == 0u &&
+                            if (zs >= SceneOcclusionCuller::kMinZeroStreak && p_if == 0u &&
                                 frame_tag < e.skip_until_frame.load(std::memory_order_relaxed)) {
                                 culler.stat_gbuf_skipped.fetch_add(1, std::memory_order_relaxed);
                                 if (is_skeleton) {
@@ -3427,11 +3542,13 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
         vs_info.pgm_hash != 0x000000008747a367ULL &&
         (regs.num_indices > 6 || regs.num_instances.NumInstances() > 1);
 
-    // Step 2.2: Coarse 4-Bucket Front-to-Back G-Buffer Reordering (`Near -> Mid -> Far -> Cutout`)
-    // for hardware Hi-Z / Early-Z rejection with zero Stage A / Main overhead.
+    // Step 2.2: Coarse 4-Bucket Front-to-Back G-Buffer Reordering (`Near -> Mid -> Far -> Cutout`).
+    // Opt-in only (BB_GBUF_SORT=1): reordering opaque draws across B0 (<20m) and B1 (origin-baked
+    // MapPieces) breaks Bloodborne's coplanar GreaterEqual / stencil-ref ground blood decals under
+    // shallow camera angles, while SceneOcclusionCuller already skips ~48% of occluded G-Buffer draws.
     static const bool gbuf_sort_enabled = [] {
         const char* env = std::getenv("BB_GBUF_SORT");
-        return !(env && env[0] == '0');
+        return env && env[0] == '1';
     }();
     u32 gbuf_reorder_bucket = Scheduler::kNoReorderBucket;
     if (gbuf_sort_enabled && is_indexed && !will_begin_pass && !needs_barrier &&
@@ -3441,21 +3558,8 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
         const auto& gkey = pipeline->GetGraphicsKey();
         const u32 expected_mrt_mask = gkey.motion_vectors ? 0x7fu : 0x3fu;
         const u32 expected_num_cb = gkey.motion_vectors ? 7u : 6u;
-        const auto df = regs.depth_control.depth_func;
-        const bool std_depth_func =
-            df == Gcn::CompareFunc::Less || df == Gcn::CompareFunc::LessEqual ||
-            df == Gcn::CompareFunc::Greater || df == Gcn::CompareFunc::GreaterEqual;
-        const bool order_independent_stencil =
-            !regs.depth_control.stencil_enable ||
-            (regs.depth_control.stencil_ref_func == Gcn::CompareFunc::Always &&
-             (!regs.depth_control.backface_enable ||
-              regs.depth_control.stencil_bf_func == Gcn::CompareFunc::Always));
-        if (gkey.mrt_mask == expected_mrt_mask &&
-            state.num_color_attachments == expected_num_cb && !regs.blend_control[0].enable &&
-            regs.depth_control.depth_enable && regs.depth_control.depth_write_enable &&
-            !regs.depth_render_control.depth_clear_enable &&
-            !regs.depth_render_control.stencil_clear_enable && std_depth_func &&
-            order_independent_stencil) {
+        if (state.num_color_attachments == expected_num_cb &&
+            SceneOcclusionCuller::IsSafeOpaqueGBufferDraw(regs, gkey.mrt_mask, expected_mrt_mask)) {
             const u64 ps_h = ps_info_sort ? ps_info_sort->pgm_hash : 0ull;
             const bool is_cutout_ps =
                 (ps_info_sort && ps_info_sort->has_discard) || ps_h == 0x1c3953c6ull ||

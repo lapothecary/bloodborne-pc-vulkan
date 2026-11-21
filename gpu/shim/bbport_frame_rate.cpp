@@ -77,6 +77,10 @@ struct alignas(64) Live {
     float step_down = -0.1f;          ///< -0.1 per 30 FPS frame
     float step_up = 0.1f;             ///< +0.1 per 30 FPS frame
     float decay08 = 0.8f;             ///< 0.8 per 30 FPS frame
+    float grow12 = 1.2f;              ///< 1.2 per 30 FPS frame (run wall-check speed recovery)
+    float decay65 = 0.65f;            ///< 0.65 per 30 FPS frame (slope-slide damping, 0x1a46bd6)
+    float slope_accel = 1.0f;         ///< 1.0 per 30 FPS frame (slope-slide acceleration, 0x1a46c52)
+    float decay60 = 0.6f;             ///< 0.6 per 30 FPS frame (foot-IK pelvis Y-offset decay, 0x1515195)
     float cloth = 1.0f;               ///< cloth constraints' stiffness
     float model_turn = 0.0f;          ///< the model preview's turn per 30 FPS frame (radians per stick unit)
     float dt_half = Frame30 * 0.5f;   ///< 1/60 s at 30 FPS (0.5 * dt), used by foliage wave timers (0x2313870)
@@ -457,6 +461,10 @@ void PS4_SYSV_ABI FrameStep(u64 pacer) {
     live->step_down = -0.1f * frames;
     live->step_up = 0.1f * frames;
     live->decay08 = static_cast<float>(std::pow(0.8, frames_d));
+    live->grow12 = static_cast<float>(std::pow(1.2, frames_d));
+    live->decay65 = static_cast<float>(std::pow(0.65, frames_d));
+    live->slope_accel = frames;
+    live->decay60 = static_cast<float>(std::pow(0.6, frames_d));
     live->model_turn = model_turn_base * frames;
     live->dt_half = dt * 0.5f;
     // The cloth setups' range checks of Stiffness, Rigid Factor and Allowed Compression (0x80d800
@@ -549,9 +557,19 @@ constexpr Redirect Redirects[] = {
     {0x190854c, 0x4927fe0, LIVE(step_up)},
     {0x143e2b2, 0x4925e94, LIVE(approach30)}, // the follow camera's approaches
     {0x143af8c, 0x4925e68, LIVE(approach10)},
-    // Damping per frame:
-    {0x1a4abca, 0x490b5b0, LIVE(decay95)}, // a character's motion (0x1a4a730, x0.95 a frame)
-    {0x1514c4d, 0x4926334, LIVE(decay08)}, // the run's wall check (x0.8 a frame while blocked)
+    // Damping & acceleration per frame:
+    {0x1a4abca, 0x490b5b0, LIVE(decay95)},     // a character's motion (0x1a4a730, x0.95 a frame)
+    {0x1514c4d, 0x4926334, LIVE(decay08)},     // the run's wall check (x0.8 a frame while blocked)
+    {0x1514c77, 0x4926338, LIVE(grow12)},      // the run's wall check recovery (x1.2 a frame)
+    // Character slope sliding (sub_1a46bc0, called from sub_1a4a730 at 0x1a4aa13):
+    // Unscaled 1.0 m/s per frame pushback + x0.65 decay caused characters to stall and twitch on
+    // small beveled curbs/bumps (>35 deg normal) at >=90 FPS because slide_vel exceeded walk speed
+    // before crossing the bevel.
+    {0x1a46bd6, 0x5128374, LIVE(decay65)},     // slope-slide damping (x0.65 per 30 FPS frame)
+    {0x1a46c52, 0x5128370, LIVE(slope_accel)}, // slope-slide acceleration (1.0 * frames)
+    // Foot-IK ground height pelvis Y-offset smoothing (sub_1514500, 0x1515182..0x15151a6):
+    {0x1515182, 0x5127b28, LIVE(approach10)},  // pelvis Y-offset gain (+0.1 * delta per 30 FPS frame)
+    {0x1515195, 0x5127b2c, LIVE(decay60)},     // pelvis Y-offset decay (x0.6 per 30 FPS frame)
     // Cloth constraints' stiffness:
     {0x47c6dc, 0x47693f0, LIVE(cloth)},
     {0x7e45be, 0x47b63e4, LIVE(cloth)},
