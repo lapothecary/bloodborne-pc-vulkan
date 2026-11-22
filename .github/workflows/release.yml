@@ -35,21 +35,21 @@ jobs:
             libwebkit2gtk-4.1-dev libprotobuf-dev protobuf-compiler \
             nlohmann-json3-dev libssl-dev libminiupnpc-dev
 
-      - name: Cache Portable Linux Third-Party Deps (Vulkan 1.4.313, SDL3, Zydis, VMA)
+      - name: Cache Portable Linux Third-Party Deps (Vulkan 1.4.365, SDL3, Zydis, VMA)
         id: cache-linux-deps
         uses: actions/cache@v4
         with:
           path: /opt/bb-deps
-          key: linux-deps-v3-u2404-vk1.4.313-sdl3.2.10-zydis4.1.0-vma3.2.1
+          key: linux-deps-v4-u2404-vk1.4.365-sdl3.2.10-zydis4.1.0-vma3.2.1
 
-      - name: Build Portable Linux Deps (Vulkan 1.4.313 headers, SDL3, static Zydis, VMA)
+      - name: Build Portable Linux Deps (Vulkan 1.4.365 headers, SDL3, static Zydis, VMA)
         if: steps.cache-linux-deps.outputs.cache-hit != 'true'
         run: |
           sudo mkdir -p /opt/bb-deps && sudo chown "$USER:$USER" /opt/bb-deps
           mkdir -p /tmp/bb-deps-src /opt/bb-deps/include
-          # 0. Vulkan 1.4.313 C + Hpp headers (provides maintenance8 etc. on Ubuntu 24.04 glibc baseline)
-          git clone --depth 1 --branch v1.4.313 https://github.com/KhronosGroup/Vulkan-Headers.git /tmp/bb-deps-src/vk-headers
-          git clone --depth 1 --branch v1.4.313 https://github.com/KhronosGroup/Vulkan-Hpp.git /tmp/bb-deps-src/vk-hpp
+          # 0. Vulkan 1.4.365 C + Hpp headers (matches toolchain VK_HEADER_VERSION 365 on Ubuntu 24.04 glibc baseline)
+          git clone --depth 1 --branch v1.4.365 https://github.com/KhronosGroup/Vulkan-Headers.git /tmp/bb-deps-src/vk-headers
+          git clone --depth 1 --branch v1.4.365 https://github.com/KhronosGroup/Vulkan-Hpp.git /tmp/bb-deps-src/vk-hpp
           cp -r /tmp/bb-deps-src/vk-headers/include/vulkan /opt/bb-deps/include/
           cp -r /tmp/bb-deps-src/vk-headers/include/vk_video /opt/bb-deps/include/
           cp -f /tmp/bb-deps-src/vk-hpp/vulkan/*.hpp /opt/bb-deps/include/vulkan/
