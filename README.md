@@ -49,11 +49,13 @@ BloodBorne/
 
 ---
 
-## 🆕 Latest Release (`v1.2.0`)
+> **Hardware Requirements:** Because this port executes Bloodborne's original PS4 (`AMD Jaguar x86_64`) code natively on your CPU, it requires a **Vulkan 1.3 GPU** and an **x86-64-v3 CPU** supporting `AVX`, `BMI1`, `MOVBE`, `LZCNT`, and `POPCNT` (**Intel Haswell 4th-gen Core 2013+** or **AMD Ryzen / Steam Deck**; older pre-2013 CPUs such as Ivy Bridge `i7-3770K` or Sandy Bridge are not supported).  
+> **Linux Launcher Audio Tip (Arch / CachyOS):** Launcher BGM/SFX uses WebKitGTK + GStreamer — if launcher audio is silent on minimal installs, install `gst-plugins-base gst-plugins-good gst-plugin-pipewire`.
 
-- **Major Full-Pipeline CPU Breakthrough (+35–55% Higher CPU-Bound FPS)** — Overhauled the DirectVk RHI (`Stage A`), Vulkan command recording (`Stage B`), pipeline lookup, light/UI batching, and Bloodborne's 6-thread scene worker pool so heavy Central Yharnam vistas now push **330–375+ FPS** at native `1440p` (even becoming GPU-bound on an RTX 4090).
-- **Leaner Multi-Core Workers & Faster C++20 Draw Recording** — Replaced legacy kernel semaphore wakeups with an instant user-space worker coordinator, balanced work-stealing across all 6 graphics threads, and inlined hot C++20 shader/vertex binding paths.
-- **Upgraded `F9` Full-Engine X-Ray Overlay** — Live breakdown of all 4 pipeline stages: Game Engine CPU (`1a..1e`), DirectVk RHI (`Stage A`), Vulkan Record (`Stage B`), and GPU Render Passes.
+## 🆕 Latest Release (`v1.2.1`)
+
+- **Fixed Linux `CPU ISA level is lower than required` & `Shader baker exited with code 127`** — Linux prebuilt releases are now compiled cleanly in CI as portable **`x86-64-v3`** (zero AVX-512 / `x86-64-v4`) with bundled distro-independent libraries (`out/gpu/`), working out of the box on Ryzen 1000–5000 (`5700X3D`/`5800X3D`), Intel 4th–14th gen / Core Ultra, and Steam Deck across CachyOS, Arch, Ubuntu, Fedora, Bazzite, and SteamOS.
+- **Includes everything from `v1.2.0`** — +35–55% CPU FPS breakthrough (330–375+ FPS in Central Yharnam), 1.3 s death respawns, 57× faster Linux Shader Pre-Bake (~4 s), high-FPS curb & Havok Cloth fixes, and crisp 2×–4× UI upscaling.
 
 *(See [Releases](https://github.com/lapothecary/bloodborne-pc-vulkan/releases) for clean per-version changelogs.)*
 

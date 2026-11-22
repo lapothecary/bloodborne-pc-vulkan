@@ -112,14 +112,52 @@ if [[ -z ${PYTHON:-} ]]; then
     fi
 fi
 if [[ -z ${PYTHON:-} ]]; then echo 'Install Python 3 or set PYTHON.' >&2; exit 1; fi
-# BB_GAME_DIR: the game's folder (eboot.bin, sce_module, ...); default in or next to this directory.
+# BB_GAME_DIR: the game's folder (eboot.bin, sce_module, ...); read bbport.ini or scan up to 3 parent levels.
+if [[ -z ${BB_GAME_DIR:-} && -f $BB_CONFIG ]]; then
+    while IFS= read -r _line || [[ -n $_line ]]; do
+        _line=${_line%$'\r'}
+        if [[ $_line =~ ^[[:space:]]*game_dir[[:space:]]*=[[:space:]]*(.+[^[:space:]])[[:space:]]*$ ]]; then
+            _cand=${BASH_REMATCH[1]}
+            if [[ -f $_cand/eboot.bin ]]; then
+                BB_GAME_DIR=$_cand
+            fi
+        fi
+    done < "$BB_CONFIG"
+fi
 if [[ -z ${BB_GAME_DIR:-} ]]; then
-    for cand in ./CUSA03173 ../CUSA03173 ./CUSA00900 ../CUSA00900 ./CUSA00207 ../CUSA00207 ./CUSA01363 ../CUSA01363; do
-        if [[ -f "$cand/eboot.bin" ]]; then BB_GAME_DIR="$(realpath "$cand")"; break; fi
+    _bb_cur=$PWD
+    for _lvl in 0 1 2 3; do
+        for _name in CUSA03173 CUSA00900 CUSA00207 CUSA01363 game Bloodborne/CUSA03173 Bloodborne/CUSA00900 Bloodborne/game; do
+            if [[ -f $_bb_cur/$_name/eboot.bin ]]; then
+                BB_GAME_DIR=$(realpath "$_bb_cur/$_name")
+                break 2
+            fi
+        done
+        for _sub in "$_bb_cur"/*; do
+            [[ -d $_sub ]] || continue
+            _bn=${_sub##*/}
+            case $_bn in
+                .*|out|bin|logs|user|patches|scripts|gpu|mods|launcher|launcher_v2|data|fsr4_shaders|dantelion_gx|third_party|build_gpu|build_win32_gpu) continue ;;
+            esac
+            if [[ -f $_sub/eboot.bin ]]; then
+                BB_GAME_DIR=$(realpath "$_sub")
+                break 2
+            fi
+            for _name in CUSA03173 CUSA00900 CUSA00207 CUSA01363 game; do
+                if [[ -f $_sub/$_name/eboot.bin ]]; then
+                    BB_GAME_DIR=$(realpath "$_sub/$_name")
+                    break 3
+                fi
+            done
+        done
+        _bb_next=${_bb_cur%/*}
+        [[ -z $_bb_next ]] && _bb_next=/
+        [[ $_bb_next == "$_bb_cur" ]] && break
+        _bb_cur=$_bb_next
     done
 fi
 game=${BB_GAME_DIR:-../CUSA03173}
-if [[ ! -f $game/eboot.bin ]]; then echo "No eboot.bin in $game (set BB_GAME_DIR)." >&2; exit 1; fi
+if [[ ! -f $game/eboot.bin ]]; then echo "No eboot.bin in $game (set BB_GAME_DIR or select the game folder in bb-launcher)." >&2; exit 1; fi
 original_game=$game
 game=$("$PYTHON" scripts/mods.py "$game" --out "$out" \
     --mods-dir "${BB_MODS_DIR:-$data/mods}" --config "${BB_MODS_CONFIG:-$data/mods.json}" \
@@ -160,6 +198,42 @@ fps=${BB_FPS:-uncap}
 if [[ -n ${BB_PROBE:-} ]]; then caps=$(dirname -- "$BB_PROBE")/bb-gpu-capabilities
 elif [[ -n ${BB_PREBUILT:-} && -x bin/bb-gpu-capabilities ]]; then caps=bin/bb-gpu-capabilities
 else caps=out/bb-gpu-capabilities; fi
+# output_res=auto (and no key, the default): query the monitor's native resolution so patches.py
+# patches the whole engine + Yebis2 post-process to true native 1440p/4K instead of 1080p live fallback.
+_out_res=auto
+if [[ -f $BB_CONFIG ]]; then
+    while IFS= read -r _line || [[ -n $_line ]]; do
+        _line=${_line%$'\r'}
+        if [[ $_line =~ ^[[:space:]]*output_res[[:space:]]*=[[:space:]]*([^[:space:]]+) ]]; then
+            _out_res=${BASH_REMATCH[1]}
+        fi
+    done < "$BB_CONFIG"
+fi
+if [[ ${_out_res,,} == auto && -z ${BB_MONITOR_SIZE:-} && -x $caps ]]; then
+    _wanted=${BB_DISPLAY:-}
+    _idx=0
+    _first_mon=""
+    while IFS=$'\t' read -r _dname _dsize _dprim; do
+        [[ -n $_dsize ]] || continue
+        _idx=$(( _idx + 1 ))
+        [[ -z $_first_mon ]] && _first_mon=$_dsize
+        if [[ -n $_wanted ]]; then
+            if [[ $_wanted == "$_dname" || $_wanted == "$_idx" ]]; then
+                export BB_MONITOR_SIZE=$_dsize
+                break
+            fi
+        elif [[ $_dprim == 1 ]]; then
+            export BB_MONITOR_SIZE=$_dsize
+            break
+        fi
+    done < <("$caps" --displays 2>/dev/null || true)
+    if [[ -z ${BB_MONITOR_SIZE:-} && -n $_first_mon ]]; then
+        export BB_MONITOR_SIZE=$_first_mon
+    fi
+    if [[ -n ${BB_MONITOR_SIZE:-} ]]; then
+        echo "Output: the monitor's resolution, $BB_MONITOR_SIZE (output_res=auto)"
+    fi
+fi
 if [[ -z ${BB_RENDER_RES:-} ]]; then
     read -r scaled_render scaled_output < <("$PYTHON" scripts/patches.py --print-scaled --settings "$BB_CONFIG") || true
 fi

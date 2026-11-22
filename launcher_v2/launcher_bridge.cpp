@@ -300,24 +300,103 @@ bool LauncherBridge::IsValidGameDir(const fs::path& p) const {
            fs::is_directory(p / "dvdroot_ps4", ec);
 }
 
+fs::path LauncherBridge::NormalizePickedGameDir(const fs::path& raw) const {
+    if (raw.empty()) return {};
+    std::error_code ec;
+    fs::path p = fs::weakly_canonical(raw, ec);
+    if (ec || p.empty()) p = raw;
+
+    if (IsValidGameDir(p)) return p;
+    // User clicked inside dvdroot_ps4 or another immediate subfolder of CUSA*
+    if (p.has_parent_path() && IsValidGameDir(p.parent_path())) {
+        return p.parent_path();
+    }
+    // User selected a parent folder containing CUSA* / game (e.g. /mnt/SSD2/testBB)
+    static const char* const kKnownNames[] = {
+        "CUSA03173", "CUSA00900", "CUSA00207", "CUSA01363", "game"
+    };
+    for (const char* name : kKnownNames) {
+        fs::path c = p / name;
+        if (IsValidGameDir(c)) return c;
+    }
+    // Depth-1 scan of immediate child folders
+    for (const auto& entry : fs::directory_iterator(p, fs::directory_options::skip_permission_denied, ec)) {
+        if (!entry.is_directory(ec)) continue;
+        const std::string fn = entry.path().filename().string();
+        if (fn.empty() || fn[0] == '.') continue;
+        if (IsValidGameDir(entry.path())) return entry.path();
+        for (const char* name : kKnownNames) {
+            fs::path c = entry.path() / name;
+            if (IsValidGameDir(c)) return c;
+        }
+    }
+    return {};
+}
+
 fs::path LauncherBridge::ResolveGameDir() const {
     const std::string saved = ReadIniValue("game_dir");
-    if (!saved.empty() && IsValidGameDir(saved)) return fs::path(saved);
-
-    if (const char* env = std::getenv("BB_GAME_DIR")) {
-        if (*env && IsValidGameDir(env)) return fs::path(env);
+    if (!saved.empty()) {
+        fs::path norm = NormalizePickedGameDir(saved);
+        if (!norm.empty()) return norm;
     }
 
-    const fs::path parent = ctx_.package_dir.parent_path();
-    const std::vector<fs::path> candidates = {
-        ctx_.package_dir / "CUSA03173",
-        ctx_.package_dir / "CUSA00900",
-        parent / "CUSA03173",
-        parent / "CUSA00900",
-        parent / "CUSA00207",
+    if (const char* env = std::getenv("BB_GAME_DIR")) {
+        if (*env) {
+            fs::path norm = NormalizePickedGameDir(env);
+            if (!norm.empty()) return norm;
+        }
+    }
+
+    static const char* const kKnownNames[] = {
+        "CUSA03173", "CUSA00900", "CUSA00207", "CUSA01363", "game"
     };
-    for (const auto& c : candidates) {
-        if (IsValidGameDir(c)) return c;
+    auto is_ignored_dir = [](const std::string& fn) {
+        return fn.empty() || fn[0] == '.' || fn == "out" || fn == "bin" || fn == "logs" ||
+               fn == "user" || fn == "patches" || fn == "scripts" || fn == "gpu" ||
+               fn == "mods" || fn == "launcher" || fn == "launcher_v2" || fn == "data" ||
+               fn == "fsr4_shaders" || fn == "dantelion_gx" || fn == "third_party" ||
+               fn == "build_gpu" || fn == "build_win32_gpu";
+    };
+
+    // Walk up to 3 parent levels: ./, ../, ../../, ../../../
+    std::error_code ec;
+    fs::path cur = fs::weakly_canonical(ctx_.package_dir, ec);
+    if (ec || cur.empty()) cur = ctx_.package_dir;
+
+    std::vector<fs::path> roots;
+    for (int depth = 0; depth <= 3; ++depth) {
+        if (cur.empty()) break;
+        roots.push_back(cur);
+        fs::path next = cur.parent_path();
+        if (next == cur) break;
+        cur = next;
+    }
+
+    // Fast pass 1: check well-known folder names at each ancestor level
+    for (const auto& root : roots) {
+        for (const char* name : kKnownNames) {
+            fs::path c = root / name;
+            if (IsValidGameDir(c)) return c;
+        }
+        for (const char* name : kKnownNames) {
+            fs::path c = root / "Bloodborne" / name;
+            if (IsValidGameDir(c)) return c;
+        }
+    }
+
+    // Fast pass 2: scan immediate sibling folders at each ancestor level (depth 1 + known sub)
+    for (const auto& root : roots) {
+        std::error_code it_ec;
+        for (const auto& entry : fs::directory_iterator(root, fs::directory_options::skip_permission_denied, it_ec)) {
+            if (!entry.is_directory(it_ec)) continue;
+            const std::string fn = entry.path().filename().string();
+            if (is_ignored_dir(fn)) continue;
+            if (IsValidGameDir(entry.path())) return entry.path();
+            for (const char* name : kKnownNames) {
+                fs::path c = entry.path() / name;
+                if (IsValidGameDir(c)) return c;
+            }
+        }
     }
     return saved.empty() ? fs::path{} : fs::path(saved);
 }
@@ -358,7 +437,7 @@ void LauncherBridge::WriteIniValue(const std::string& key, const std::string& va
             if (!t.empty() && t[0] != '#' && t[0] != ';' && t[0] != '[' && eq != std::string::npos) {
                 std::string k = Trim(t.substr(0, eq));
                 if (k == key) {
-                    lines.push_back(key + " = " + value);
+                    lines.push_back(key + "=" + value);
                     updated = true;
                     continue;
                 }
@@ -366,7 +445,7 @@ void LauncherBridge::WriteIniValue(const std::string& key, const std::string& va
             lines.push_back(line);
         }
     }
-    if (!updated) lines.push_back(key + " = " + value);
+    if (!updated) lines.push_back(key + "=" + value);
     std::ofstream out(ini, std::ios::trunc);
     for (const auto& l : lines) out << l << "\n";
 }
@@ -389,11 +468,11 @@ int LauncherBridge::CountCachedShaders(const fs::path& user_dir) const {
 std::string LauncherBridge::ReadVersionTag() const {
     const fs::path vf = ctx_.package_dir / ".bbport-version.json";
     std::ifstream f(vf);
-    if (!f) return "v1.2.0";
+    if (!f) return "v1.2.1";
     std::stringstream ss;
     ss << f.rdbuf();
     std::string tag = ExtractJsonField(ss.str(), "tag");
-    return tag.empty() ? "v1.2.0" : tag;
+    return tag.empty() ? "v1.2.1" : tag;
 }
 
 std::string LauncherBridge::BuildModsJson() const {
@@ -479,14 +558,31 @@ bool LauncherBridge::OpenSystemFolder(const std::string& which) const {
 }
 
 bool LauncherBridge::LaunchGameProcess() const {
+    const fs::path game_dir = ResolveGameDir();
+    const bool has_valid = IsValidGameDir(game_dir);
+    if (has_valid) {
+        auto u8g = game_dir.u8string();
+        std::string gstr(reinterpret_cast<const char*>(u8g.data()), u8g.size());
+        if (ReadIniValue("game_dir") != gstr) {
+            WriteIniValue("game_dir", gstr);
+        }
+    }
 #ifdef _WIN32
+    if (has_valid) {
+        SetEnvironmentVariableW(L"BB_GAME_DIR", game_dir.wstring().c_str());
+    }
     const fs::path exe = ctx_.package_dir / "Bloodborne.exe";
     auto u8 = exe.u8string();
     std::string exe_utf8(reinterpret_cast<const char*>(u8.data()), u8.size());
     SpawnDetached({exe_utf8}, ctx_.package_dir);
 #else
     const fs::path sh = ctx_.package_dir / "play.sh";
-    SpawnDetached({"/bin/bash", sh.string()}, ctx_.package_dir);
+    if (has_valid) {
+        SpawnDetached({"/usr/bin/env", "BB_GAME_DIR=" + game_dir.string(), "/bin/bash", sh.string()},
+                      ctx_.package_dir);
+    } else {
+        SpawnDetached({"/bin/bash", sh.string()}, ctx_.package_dir);
+    }
 #endif
     return true;
 }
@@ -863,7 +959,15 @@ std::string LauncherBridge::HandleCommand(const std::string& action, const std::
     if (action == "pickGameFolder") {
         if (folder_picker_) {
             const std::string chosen = folder_picker_("Select folder containing eboot.bin");
-            if (!chosen.empty()) WriteIniValue("game_dir", chosen);
+            if (!chosen.empty()) {
+                fs::path norm = NormalizePickedGameDir(fs::path(chosen));
+                if (!norm.empty()) {
+                    auto u8 = norm.u8string();
+                    WriteIniValue("game_dir", std::string(reinterpret_cast<const char*>(u8.data()), u8.size()));
+                } else {
+                    WriteIniValue("game_dir", chosen);
+                }
+            }
         }
         return BuildStateJson();
     }

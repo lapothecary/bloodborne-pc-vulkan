@@ -23,7 +23,8 @@ set(BB_GX_COMMON_FLAGS
     -O3
     -DNDEBUG
     -march=x86-64-v3
-    -mtune=znver4
+    -mtune=generic
+    -mno-avx512f
     -fno-omit-frame-pointer
     -fshort-wchar
     -ffunction-sections

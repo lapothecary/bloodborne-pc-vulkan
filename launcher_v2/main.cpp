@@ -624,7 +624,61 @@ void EnsureLinuxWaylandDesktopIcon(const std::string& app_id,
     out << desired;
 }
 
+std::string PickLinuxFolderNative(GtkWindow* parent,
+                                  const std::string& title,
+                                  const fs::path& initial_dir) {
+    // GtkFileChooserNative talks to xdg-desktop-portal (when GTK_USE_PORTAL=1), opening the
+    // desktop's own native file manager dialog (KDE/Dolphin on Plasma/CachyOS/SteamOS,
+    // GNOME/Nautilus on Ubuntu/Fedora) and gracefully falling back to GTK3 if no portal exists.
+    GtkFileChooserNative* native = gtk_file_chooser_native_new(
+        title.c_str(), parent, GTK_FILE_CHOOSER_ACTION_SELECT_FOLDER, "_Select", "_Cancel");
+    std::error_code ec;
+    if (!initial_dir.empty() && fs::is_directory(initial_dir, ec)) {
+        gtk_file_chooser_set_current_folder(GTK_FILE_CHOOSER(native), initial_dir.c_str());
+    }
+    std::string chosen;
+    if (gtk_native_dialog_run(GTK_NATIVE_DIALOG(native)) == GTK_RESPONSE_ACCEPT) {
+        char* fn = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(native));
+        if (fn) {
+            chosen = fn;
+            g_free(fn);
+        }
+    }
+    g_object_unref(native);
+    return chosen;
+}
+
+int RunLinuxPickGameDirOnce(bb_launcher::LauncherContext ctx, int argc, char** argv) {
+    setenv("GTK_USE_PORTAL", "1", 0);
+    g_set_prgname("bloodborne-vulkan-launcher");
+    g_set_application_name("Bloodborne Vulkan Launcher");
+    if (!gtk_init_check(&argc, &argv)) return 1;
+
+    bb_launcher::LauncherBridge bridge(ctx);
+    std::error_code ec;
+    fs::path start = bridge.ResolveGameDir();
+    if (start.empty() || !fs::is_directory(start, ec)) {
+        start = ctx.package_dir.parent_path();
+        if (start.empty() || !fs::is_directory(start, ec)) start = ctx.package_dir;
+    }
+
+    const std::string chosen = PickLinuxFolderNative(
+        nullptr, "Select Bloodborne folder (containing eboot.bin)", start);
+    if (chosen.empty()) return 1;
+
+    fs::path norm = bridge.NormalizePickedGameDir(fs::path(chosen));
+    if (norm.empty() || !bridge.IsValidGameDir(norm)) return 1;
+
+    bridge.WriteIniValue("game_dir", norm.string());
+    std::cout << norm.string() << "\n";
+    return 0;
+}
+
 int RunLinuxWebView(bb_launcher::LauncherContext ctx, int argc, char** argv) {
+    // Enable xdg-desktop-portal by default so folder pickers use the OS's native file dialog
+    // (KDE/Dolphin, GNOME/Nautilus, etc.) while still letting users override with GTK_USE_PORTAL=0.
+    setenv("GTK_USE_PORTAL", "1", 0);
+
     // Use an authoritative PipeWire/PulseAudio application.name override so users upgrading
     // from v1.1.9 (whose WirePlumber state saved a mid-fade pulsesink volume under
     // "bloodborne-vulkan-launcher", e.g. 52% / -17 dB) immediately get a clean 100% (0 dB) stream.
@@ -671,20 +725,14 @@ int RunLinuxWebView(bb_launcher::LauncherContext ctx, int argc, char** argv) {
         gtk_window_set_icon_from_file(GTK_WINDOW(window), ctx.icon_png_path.c_str(), nullptr);
     }
 
-    app.bridge->SetFolderPicker([window](const std::string& title) -> std::string {
-        GtkWidget* dlg = gtk_file_chooser_dialog_new(
-            title.c_str(), GTK_WINDOW(window), GTK_FILE_CHOOSER_ACTION_SELECT_FOLDER,
-            "_Cancel", GTK_RESPONSE_CANCEL, "_Select", GTK_RESPONSE_ACCEPT, nullptr);
-        std::string chosen;
-        if (gtk_dialog_run(GTK_DIALOG(dlg)) == GTK_RESPONSE_ACCEPT) {
-            char* fn = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(dlg));
-            if (fn) {
-                chosen = fn;
-                g_free(fn);
-            }
+    app.bridge->SetFolderPicker([window, bridge_ptr = app.bridge.get(), pkg_dir = ctx.package_dir](const std::string& title) -> std::string {
+        std::error_code picker_ec;
+        fs::path start = bridge_ptr ? bridge_ptr->ResolveGameDir() : fs::path{};
+        if (start.empty() || !fs::is_directory(start, picker_ec)) {
+            start = pkg_dir.parent_path();
+            if (start.empty() || !fs::is_directory(start, picker_ec)) start = pkg_dir;
         }
-        gtk_widget_destroy(dlg);
-        return chosen;
+        return PickLinuxFolderNative(GTK_WINDOW(window), title, start);
     });
 
     WebKitUserContentManager* ucm = webkit_user_content_manager_new();
@@ -765,6 +813,11 @@ int main(int argc, char** argv) {
     auto ctx = ResolveContext(argv[0]);
 
     for (int i = 1; i < argc; ++i) {
+#ifndef _WIN32
+        if (std::strcmp(argv[i], "--pick-game-dir") == 0) {
+            return RunLinuxPickGameDirOnce(ctx, argc, argv);
+        }
+#endif
         if (std::strcmp(argv[i], "--test-sfx") == 0) {
             bb_launcher::LauncherBridge bridge(ctx);
             const std::string state = bridge.HandleCommand("getState", "{}");
