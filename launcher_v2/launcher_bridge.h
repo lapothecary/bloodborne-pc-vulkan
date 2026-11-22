@@ -57,12 +57,14 @@ public:
 
     const LauncherContext& ctx() const { return ctx_; }
 
-private:
     std::filesystem::path ResolveGameDir() const;
-    std::filesystem::path ResolveUserDir() const;
+    std::filesystem::path NormalizePickedGameDir(const std::filesystem::path& p) const;
     bool IsValidGameDir(const std::filesystem::path& p) const;
-    std::string ReadIniValue(const std::string& key, const std::string& fallback = "") const;
     void WriteIniValue(const std::string& key, const std::string& value) const;
+
+private:
+    std::filesystem::path ResolveUserDir() const;
+    std::string ReadIniValue(const std::string& key, const std::string& fallback = "") const;
     int CountCachedShaders(const std::filesystem::path& user_dir) const;
     std::string ReadVersionTag() const;
     std::string BuildStateJson() const;

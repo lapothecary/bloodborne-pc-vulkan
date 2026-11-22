@@ -112,14 +112,52 @@ if [[ -z ${PYTHON:-} ]]; then
     fi
 fi
 if [[ -z ${PYTHON:-} ]]; then echo 'Install Python 3 or set PYTHON.' >&2; exit 1; fi
-# BB_GAME_DIR: the game's folder (eboot.bin, sce_module, ...); default in or next to this directory.
+# BB_GAME_DIR: the game's folder (eboot.bin, sce_module, ...); read bbport.ini or scan up to 3 parent levels.
+if [[ -z ${BB_GAME_DIR:-} && -f $BB_CONFIG ]]; then
+    while IFS= read -r _line || [[ -n $_line ]]; do
+        _line=${_line%$'\r'}
+        if [[ $_line =~ ^[[:space:]]*game_dir[[:space:]]*=[[:space:]]*(.+[^[:space:]])[[:space:]]*$ ]]; then
+            _cand=${BASH_REMATCH[1]}
+            if [[ -f $_cand/eboot.bin ]]; then
+                BB_GAME_DIR=$_cand
+            fi
+        fi
+    done < "$BB_CONFIG"
+fi
 if [[ -z ${BB_GAME_DIR:-} ]]; then
-    for cand in ./CUSA03173 ../CUSA03173 ./CUSA00900 ../CUSA00900 ./CUSA00207 ../CUSA00207 ./CUSA01363 ../CUSA01363; do
-        if [[ -f "$cand/eboot.bin" ]]; then BB_GAME_DIR="$(realpath "$cand")"; break; fi
+    _bb_cur=$PWD
+    for _lvl in 0 1 2 3; do
+        for _name in CUSA03173 CUSA00900 CUSA00207 CUSA01363 game Bloodborne/CUSA03173 Bloodborne/CUSA00900 Bloodborne/game; do
+            if [[ -f $_bb_cur/$_name/eboot.bin ]]; then
+                BB_GAME_DIR=$(realpath "$_bb_cur/$_name")
+                break 2
+            fi
+        done
+        for _sub in "$_bb_cur"/*; do
+            [[ -d $_sub ]] || continue
+            _bn=${_sub##*/}
+            case $_bn in
+                .*|out|bin|logs|user|patches|scripts|gpu|mods|launcher|launcher_v2|data|fsr4_shaders|dantelion_gx|third_party|build_gpu|build_win32_gpu) continue ;;
+            esac
+            if [[ -f $_sub/eboot.bin ]]; then
+                BB_GAME_DIR=$(realpath "$_sub")
+                break 2
+            fi
+            for _name in CUSA03173 CUSA00900 CUSA00207 CUSA01363 game; do
+                if [[ -f $_sub/$_name/eboot.bin ]]; then
+                    BB_GAME_DIR=$(realpath "$_sub/$_name")
+                    break 3
+                fi
+            done
+        done
+        _bb_next=${_bb_cur%/*}
+        [[ -z $_bb_next ]] && _bb_next=/
+        [[ $_bb_next == "$_bb_cur" ]] && break
+        _bb_cur=$_bb_next
     done
 fi
 game=${BB_GAME_DIR:-../CUSA03173}
-if [[ ! -f $game/eboot.bin ]]; then echo "No eboot.bin in $game (set BB_GAME_DIR)." >&2; exit 1; fi
+if [[ ! -f $game/eboot.bin ]]; then echo "No eboot.bin in $game (set BB_GAME_DIR or select the game folder in bb-launcher)." >&2; exit 1; fi
 original_game=$game
 game=$("$PYTHON" scripts/mods.py "$game" --out "$out" \
     --mods-dir "${BB_MODS_DIR:-$data/mods}" --config "${BB_MODS_CONFIG:-$data/mods.json}" \

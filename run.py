@@ -199,27 +199,41 @@ def large_scene_memory(env, scene):
 
 
 def _discover_game_dir(base_dir):
-    candidates = [
-        base_dir / 'CUSA03173',
-        base_dir / 'game',
-        base_dir.parent / 'CUSA03173',
-        base_dir.parent / 'game',
-        base_dir.parent / 'Bloodborne' / 'CUSA03173',
-        base_dir.parent / 'Bloodborne' / 'game',
-    ]
-    for c in candidates:
-        if (c / 'eboot.bin').is_file():
-            return str(c.resolve())
-    for parent in (base_dir, base_dir.parent):
+    known = ('CUSA03173', 'CUSA00900', 'CUSA00207', 'CUSA01363', 'game')
+    ignored = {
+        'out', 'bin', 'logs', 'user', 'patches', 'scripts', 'gpu', 'mods',
+        'launcher', 'launcher_v2', 'data', 'fsr4_shaders', 'dantelion_gx',
+        'third_party', 'build_gpu', 'build_win32_gpu',
+    }
+    roots = []
+    cur = Path(base_dir).resolve()
+    for _ in range(4):
+        roots.append(cur)
+        if cur.parent == cur:
+            break
+        cur = cur.parent
+
+    for root in roots:
+        for name in known:
+            c = root / name
+            if (c / 'eboot.bin').is_file():
+                return str(c.resolve())
+        for name in known:
+            c = root / 'Bloodborne' / name
+            if (c / 'eboot.bin').is_file():
+                return str(c.resolve())
+
+    for root in roots:
         try:
-            for sub in parent.iterdir():
-                if sub.is_dir():
-                    if (sub / 'eboot.bin').is_file():
-                        return str(sub.resolve())
-                    for sub2 in ('CUSA03173', 'game', 'dvdroot_ps4'):
-                        p2 = sub / sub2
-                        if (p2 / 'eboot.bin').is_file():
-                            return str(p2.resolve())
+            for sub in root.iterdir():
+                if not sub.is_dir() or sub.name.startswith('.') or sub.name in ignored:
+                    continue
+                if (sub / 'eboot.bin').is_file():
+                    return str(sub.resolve())
+                for sub2 in known:
+                    p2 = sub / sub2
+                    if (p2 / 'eboot.bin').is_file():
+                        return str(p2.resolve())
         except OSError:
             pass
     return ''
@@ -376,7 +390,8 @@ def _prompt_game_dir_once(data, ini_path):
         if not chosen:
             return ''
         p = Path(chosen)
-        for cand in (p, p / 'CUSA03173', p / 'game', p / 'dvdroot_ps4'):
+        cands = [p, p.parent, p / 'CUSA03173', p / 'CUSA00900', p / 'CUSA00207', p / 'CUSA01363', p / 'game']
+        for cand in cands:
             if (cand / 'eboot.bin').is_file():
                 resolved = str(cand.resolve())
                 # Save into launcher-win.json and bbport.ini so future launches remember it
@@ -391,7 +406,7 @@ def _prompt_game_dir_once(data, ini_path):
                     jf.write_text(json.dumps(s, indent=2), encoding='utf-8')
                 with contextlib.suppress(OSError):
                     txt = ini_path.read_text(encoding='utf-8') if ini_path.is_file() else ''
-                    lines = [ln for ln in txt.splitlines() if not ln.strip().startswith('game_dir=')]
+                    lines = [ln for ln in txt.splitlines() if ln.split('=', 1)[0].strip() != 'game_dir']
                     lines.append(f'game_dir={resolved}')
                     ini_path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
                 return resolved
