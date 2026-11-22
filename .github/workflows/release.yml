@@ -40,7 +40,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: /opt/bb-deps
-          key: linux-deps-v2-u2404-vk1.4.313-sdl3.2.10-zydis4.1.0-vma3.2.1
+          key: linux-deps-v3-u2404-vk1.4.313-sdl3.2.10-zydis4.1.0-vma3.2.1
 
       - name: Build Portable Linux Deps (Vulkan 1.4.313 headers, SDL3, static Zydis, VMA)
         if: steps.cache-linux-deps.outputs.cache-hit != 'true'
@@ -57,15 +57,23 @@ jobs:
           mkdir -p /opt/bb-deps/include/vma
           curl -sSL https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator/v3.2.1/include/vk_mem_alloc.h \
             -o /opt/bb-deps/include/vma/vk_mem_alloc.h
-          # 2. Static Zydis v4.1.0 (x86-64-v3, no AVX-512)
+          # 2. Static Zycore + Zydis v4.1.0 (x86-64-v3, no AVX-512)
           git clone --depth 1 --branch v4.1.0 --recursive https://github.com/zyantific/zydis.git /tmp/bb-deps-src/zydis
-          cmake -S /tmp/bb-deps-src/zydis -B /tmp/bb-deps-src/zydis/build -G Ninja \
+          cmake -S /tmp/bb-deps-src/zydis/dependencies/zycore -B /tmp/bb-deps-src/zycore-build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/opt/bb-deps \
             -DCMAKE_C_FLAGS="-O3 -march=x86-64-v3 -mtune=generic -mno-avx512f -fPIC" \
-            -DZYDIS_BUILD_SHARED_LIB=OFF -DZYCORE_BUILD_SHARED_LIB=OFF \
+            -DZYCORE_BUILD_SHARED_LIB=OFF -DZYCORE_BUILD_EXAMPLES=OFF -DZYCORE_BUILD_TESTS=OFF \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+          ninja -C /tmp/bb-deps-src/zycore-build install
+          cmake -S /tmp/bb-deps-src/zydis -B /tmp/bb-deps-src/zydis-build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/opt/bb-deps \
+            -DCMAKE_PREFIX_PATH=/opt/bb-deps \
+            -DCMAKE_C_FLAGS="-O3 -march=x86-64-v3 -mtune=generic -mno-avx512f -fPIC" \
+            -DZYAN_SYSTEM_ZYCORE=ON \
+            -DZYDIS_BUILD_SHARED_LIB=OFF \
             -DZYDIS_BUILD_TOOLS=OFF -DZYDIS_BUILD_EXAMPLES=OFF -DZYDIS_BUILD_TESTS=OFF \
             -DCMAKE_POSITION_INDEPENDENT_CODE=ON
-          ninja -C /tmp/bb-deps-src/zydis/build install
+          ninja -C /tmp/bb-deps-src/zydis-build install
           # 3. Shared SDL3 release-3.2.10 (x86-64-v3, no AVX-512)
           git clone --depth 1 --branch release-3.2.10 https://github.com/libsdl-org/SDL.git /tmp/bb-deps-src/sdl3
           cmake -S /tmp/bb-deps-src/sdl3 -B /tmp/bb-deps-src/sdl3/build -G Ninja \
