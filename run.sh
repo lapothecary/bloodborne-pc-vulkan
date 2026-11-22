@@ -198,6 +198,42 @@ fps=${BB_FPS:-uncap}
 if [[ -n ${BB_PROBE:-} ]]; then caps=$(dirname -- "$BB_PROBE")/bb-gpu-capabilities
 elif [[ -n ${BB_PREBUILT:-} && -x bin/bb-gpu-capabilities ]]; then caps=bin/bb-gpu-capabilities
 else caps=out/bb-gpu-capabilities; fi
+# output_res=auto (and no key, the default): query the monitor's native resolution so patches.py
+# patches the whole engine + Yebis2 post-process to true native 1440p/4K instead of 1080p live fallback.
+_out_res=auto
+if [[ -f $BB_CONFIG ]]; then
+    while IFS= read -r _line || [[ -n $_line ]]; do
+        _line=${_line%$'\r'}
+        if [[ $_line =~ ^[[:space:]]*output_res[[:space:]]*=[[:space:]]*([^[:space:]]+) ]]; then
+            _out_res=${BASH_REMATCH[1]}
+        fi
+    done < "$BB_CONFIG"
+fi
+if [[ ${_out_res,,} == auto && -z ${BB_MONITOR_SIZE:-} && -x $caps ]]; then
+    _wanted=${BB_DISPLAY:-}
+    _idx=0
+    _first_mon=""
+    while IFS=$'\t' read -r _dname _dsize _dprim; do
+        [[ -n $_dsize ]] || continue
+        _idx=$(( _idx + 1 ))
+        [[ -z $_first_mon ]] && _first_mon=$_dsize
+        if [[ -n $_wanted ]]; then
+            if [[ $_wanted == "$_dname" || $_wanted == "$_idx" ]]; then
+                export BB_MONITOR_SIZE=$_dsize
+                break
+            fi
+        elif [[ $_dprim == 1 ]]; then
+            export BB_MONITOR_SIZE=$_dsize
+            break
+        fi
+    done < <("$caps" --displays 2>/dev/null || true)
+    if [[ -z ${BB_MONITOR_SIZE:-} && -n $_first_mon ]]; then
+        export BB_MONITOR_SIZE=$_first_mon
+    fi
+    if [[ -n ${BB_MONITOR_SIZE:-} ]]; then
+        echo "Output: the monitor's resolution, $BB_MONITOR_SIZE (output_res=auto)"
+    fi
+fi
 if [[ -z ${BB_RENDER_RES:-} ]]; then
     read -r scaled_render scaled_output < <("$PYTHON" scripts/patches.py --print-scaled --settings "$BB_CONFIG") || true
 fi
