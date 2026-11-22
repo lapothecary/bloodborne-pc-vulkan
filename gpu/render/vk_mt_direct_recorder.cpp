@@ -3278,8 +3278,33 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
         if (settings.true_black_hdr.load(std::memory_order_relaxed))  m |= 0x08u;
         if (settings.pcss_shadows.load(std::memory_order_relaxed))    m |= 0x10u;
         if (settings.ssgi_enabled.load(std::memory_order_relaxed))    m |= 0x20u;
+        if (settings.enhanced_fire.load(std::memory_order_relaxed))   m |= 0x80u;
         return m;
     }();
+    u32 fire_time_bits = 0u;
+    u8 fire_int_u8 = 108u;
+    u8 fire_turb_u8 = 128u;
+    u8 fire_emb_u8 = 128u;
+    if ((fx_mask & 0x80u) != 0u) {
+        static const auto s_mt_fire_t0 = std::chrono::steady_clock::now();
+        const double elapsed =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - s_mt_fire_t0).count();
+        const float t_sec = static_cast<float>(std::fmod(elapsed, 4096.0));
+        std::memcpy(&fire_time_bits, &t_sec, sizeof(fire_time_bits));
+        const auto& settings = BbSettings::Get();
+        const float f_int =
+            std::clamp(settings.fire_intensity.load(std::memory_order_relaxed), 0.40f, 2.40f);
+        const float f_turb =
+            std::clamp(settings.fire_turbulence.load(std::memory_order_relaxed), 0.00f, 2.00f);
+        const float f_emb =
+            std::clamp(settings.fire_embers.load(std::memory_order_relaxed), 0.00f, 2.00f);
+        fire_int_u8 = static_cast<u8>(
+            std::clamp(static_cast<int>(std::lround(((f_int - 0.40f) / 2.00f) * 255.0f)), 0, 255));
+        fire_turb_u8 = static_cast<u8>(
+            std::clamp(static_cast<int>(std::lround((f_turb / 2.00f) * 255.0f)), 0, 255));
+        fire_emb_u8 = static_cast<u8>(
+            std::clamp(static_cast<int>(std::lround((f_emb / 2.00f) * 255.0f)), 0, 255));
+    }
     const u8 mb_mask = []() noexcept -> u8 {
         const auto& settings = BbSettings::Get();
         const u8 cam = static_cast<u8>(
@@ -4105,8 +4130,22 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
                         push_data.yscale =
                             (ctl.yscale_enable ? vp0.yscale : 1.f) * cur_ts.target_scale[1];
                         push_data.scene_size = cur_ts.scene_size;
+                        u8 draw_mb_mask = mb_mask;
+                        if ((fx_mask & 0x80u) != 0u) {
+                            const auto& bc0 = pso->GetGraphicsKey().blend_controls[0];
+                            if (bc0.enable &&
+                                bc0.color_dst_factor == Gcn::BlendControl::BlendFactor::One &&
+                                bc0.color_func == Gcn::BlendControl::BlendFunc::Add) {
+                                draw_mb_mask |= 0x20u;
+                                push_data.buf_offsets[30] = fire_emb_u8;
+                                push_data.buf_offsets[31] = fire_turb_u8;
+                                std::memcpy(&push_data.buf_offsets[32], &fire_time_bits,
+                                            sizeof(fire_time_bits));
+                                push_data.buf_offsets[36] = fire_int_u8;
+                            }
+                        }
                         push_data.buf_offsets[37] = mb_fps_q4;
-                        push_data.buf_offsets[38] = mb_mask;
+                        push_data.buf_offsets[38] = draw_mb_mask;
                         push_data.buf_offsets[39] = fx_mask;
                     }
 
@@ -4588,6 +4627,15 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
                         }
                     }
                     ++w.recorded_draws;
+                    if (IsSfxFireDumpActive()) {
+                        const auto& pk = pso->GetGraphicsKey();
+                        RecordSfxFireDumpDraw(
+                            pso, static_cast<u32>(rregs.screen_scissor.bottom_right_x),
+                            static_cast<u32>(rregs.screen_scissor.bottom_right_y),
+                            pk.num_color_attachments,
+                            pk.z_format != Gcn::DepthBuffer::ZFormat::Invalid,
+                            static_cast<u32>(rregs.num_indices), num_instances, true, false);
+                    }
                 }
             }
 

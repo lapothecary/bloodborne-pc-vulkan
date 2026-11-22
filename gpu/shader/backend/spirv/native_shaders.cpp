@@ -21,6 +21,8 @@
 #include "bbgpu/shaders/ps_1ae03d75_vsm_moment_noclip_frag.h"
 #include "bbgpu/shaders/ps_1c3953c6_gbuf_frag.h"
 #include "bbgpu/shaders/ps_2390c887_gbuf7_frag.h"
+#include "bbgpu/shaders/ps_20739372_frag.h"
+#include "bbgpu/shaders/ps_2e86d610_frag.h"
 #include "bbgpu/shaders/ps_32e47788_atmos_fog_frag.h"
 #include "bbgpu/shaders/ps_38d65b32_frag.h"
 #include "bbgpu/shaders/ps_5c02eaf8_frag.h"
@@ -28,6 +30,7 @@
 #include "bbgpu/shaders/ps_6b42fc89_frag.h"
 #include "bbgpu/shaders/ps_71c96598_vfx_fog_frag.h"
 #include "bbgpu/shaders/ps_7cc2c044_pbr_frag.h"
+#include "bbgpu/shaders/ps_832cdf8d_frag.h"
 #include "bbgpu/shaders/ps_8aba0ecd_gbuf_frag.h"
 #include "bbgpu/shaders/ps_8c08444c_blur13_frag.h"
 #include "bbgpu/shaders/ps_a22c7f71_pbr_frag.h"
@@ -225,7 +228,7 @@ struct NativeShaderCandidate {
     const char* label;
 };
 
-constexpr std::array<NativeShaderCandidate, 142> kNativeRegistry{{
+constexpr std::array<NativeShaderCandidate, 145> kNativeRegistry{{
     {0x000000000f61fd27ull, PS_0F61FD27_VSM_BLUR_FRAG, "ps_0f61fd27_vsm_blur"},
     {0x000000001ae03d75ull, PS_1AE03D75_VSM_MOMENT_CLDIST_FRAG, "ps_1ae03d75_vsm_moment_cldist"},
     {0x000000001ae03d75ull, PS_1AE03D75_VSM_MOMENT_NOCLIP_FRAG, "ps_1ae03d75_vsm_moment_noclip"},
@@ -236,6 +239,9 @@ constexpr std::array<NativeShaderCandidate, 142> kNativeRegistry{{
     {0x0000000032e47788ull, PS_32E47788_ATMOS_FOG_FRAG, "ps_32e47788_atmos_fog"},
     {0x000000005e224cb6ull, PS_5E224CB6_VFX_FOG_FRAG, "ps_5e224cb6_vfx_fog"},
     {0x0000000071c96598ull, PS_71C96598_VFX_FOG_FRAG, "ps_71c96598_vfx_fog"},
+    {0x00000000832cdf8dull, PS_832CDF8D_FRAG, "ps_832cdf8d"},
+    {0x000000002e86d610ull, PS_2E86D610_FRAG, "ps_2e86d610"},
+    {0x0000000020739372ull, PS_20739372_FRAG, "ps_20739372_2mrt"},
     {0x000000009da6aacbull, VS_9DA6AACB_GBUF_VERT, "vs_9da6aacb_gbuf"},
     {0x000000006a833138ull, VS_6A833138_GBUF_INST_VERT, "vs_6a833138_gbuf_inst"},
     {0x000000007620368bull, VS_7620368B_GBUF_UV2_VERT, "vs_7620368b_gbuf_uv2"},

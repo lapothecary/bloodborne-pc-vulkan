@@ -3994,6 +3994,7 @@ void Rasterizer::ScaleToTarget(const GraphicsPipeline* pipeline) {
         if (settings.true_black_hdr.load(std::memory_order_relaxed))  fx_mask |= 0x08u;
         if (settings.pcss_shadows.load(std::memory_order_relaxed))    fx_mask |= 0x10u;
         if (settings.ssgi_enabled.load(std::memory_order_relaxed))    fx_mask |= 0x20u;
+        if (settings.enhanced_fire.load(std::memory_order_relaxed))   fx_mask |= 0x80u;
         frame_fx_mask = fx_mask;
         const u8 mb_cam = static_cast<u8>(
             std::clamp(settings.motion_blur_camera.load(std::memory_order_relaxed), 0, 3));
@@ -4006,10 +4007,41 @@ void Rasterizer::ScaleToTarget(const GraphicsPipeline* pipeline) {
         const float mb_fps_scale = std::clamp(1.0f / mb_frames, 1.0f, 12.0f);
         frame_mb_fps_q4 = static_cast<u8>(
             std::clamp(static_cast<int>(std::lround(mb_fps_scale * 16.0f)), 16, 255));
+        if ((fx_mask & 0x80u) != 0u) {
+            static const auto s_fire_t0 = std::chrono::steady_clock::now();
+            const double elapsed =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - s_fire_t0).count();
+            const float t_sec = static_cast<float>(std::fmod(elapsed, 4096.0));
+            std::memcpy(&frame_fire_time_bits, &t_sec, sizeof(frame_fire_time_bits));
+            const float f_int =
+                std::clamp(settings.fire_intensity.load(std::memory_order_relaxed), 0.40f, 2.40f);
+            const float f_turb =
+                std::clamp(settings.fire_turbulence.load(std::memory_order_relaxed), 0.00f, 2.00f);
+            const float f_emb =
+                std::clamp(settings.fire_embers.load(std::memory_order_relaxed), 0.00f, 2.00f);
+            frame_fire_int_u8 = static_cast<u8>(
+                std::clamp(static_cast<int>(std::lround(((f_int - 0.40f) / 2.00f) * 255.0f)), 0, 255));
+            frame_fire_turb_u8 = static_cast<u8>(
+                std::clamp(static_cast<int>(std::lround((f_turb / 2.00f) * 255.0f)), 0, 255));
+            frame_fire_emb_u8 = static_cast<u8>(
+                std::clamp(static_cast<int>(std::lround((f_emb / 2.00f) * 255.0f)), 0, 255));
+        }
         frame_fx_mask_valid = true;
     }
+    u8 draw_mb_mask = frame_mb_mask;
+    if ((frame_fx_mask & 0x80u) != 0u && pipeline) {
+        const auto& bc0 = pipeline->GetGraphicsKey().blend_controls[0];
+        if (bc0.enable && bc0.color_dst_factor == Gcn::BlendControl::BlendFactor::One &&
+            bc0.color_func == Gcn::BlendControl::BlendFunc::Add) {
+            draw_mb_mask |= 0x20u;
+            push_data.buf_offsets[30] = frame_fire_emb_u8;
+            push_data.buf_offsets[31] = frame_fire_turb_u8;
+            std::memcpy(&push_data.buf_offsets[32], &frame_fire_time_bits, sizeof(frame_fire_time_bits));
+            push_data.buf_offsets[36] = frame_fire_int_u8;
+        }
+    }
     push_data.buf_offsets[37] = frame_mb_fps_q4;
-    push_data.buf_offsets[38] = frame_mb_mask;
+    push_data.buf_offsets[38] = draw_mb_mask;
     push_data.buf_offsets[39] = frame_fx_mask;
 }
 
@@ -5542,6 +5574,12 @@ void Rasterizer::MarkPass(const GraphicsPipeline* pipeline, const RenderState& s
                scheduler.ActiveReorderBucket() == Scheduler::kNoReorderBucket) {
         GpuProfiler::HudOnSubPassChange(&scheduler, subcat);
     }
+    if (IsSfxFireDumpActive()) {
+        RecordSfxFireDumpDraw(pipeline, state.width, state.height, state.num_color_attachments,
+                              state.depth_stencil_attachment.has_depth, u32(Regs().num_indices),
+                              u32(std::max<u32>(1u, Regs().num_instances.NumInstances())), false,
+                              ui_pass_started || (upscaler && upscaler->InUiPhase()));
+    }
     if (!profiler) {
         return;
     }
@@ -5700,6 +5738,218 @@ void Rasterizer::WatchDraw(const GraphicsPipeline* pipeline, const RenderState& 
     }
     s.fields = std::move(fields);
     s.run = 0;
+}
+
+} // namespace Vulkan
+
+namespace Shader::Backend::SPIRV {
+[[nodiscard]] bool HasNativeShader(u64 pgm_hash) noexcept;
+} // namespace Shader::Backend::SPIRV
+
+namespace Vulkan {
+
+namespace {
+
+struct SfxFireDumpKey {
+    u64 ps_hash = 0;
+    u64 vs_hash = 0;
+    u32 blend_bits = 0;
+    u32 width = 0;
+    u32 height = 0;
+    u16 mrt_fmt = 0;
+    u8 flags = 0; // bit0=has_depth, bit1=has_tess, bit2=is_mt, bit3=blend_en
+
+    bool operator==(const SfxFireDumpKey& o) const noexcept = default;
+};
+
+struct SfxFireDumpKeyHash {
+    size_t operator()(const SfxFireDumpKey& k) const noexcept {
+        u64 h = k.ps_hash * 0x9E3779B97F4A7C15ull ^ (k.vs_hash * 0xD6E8FEB86659FD93ull);
+        h ^= u64(k.blend_bits) * 0xBF58476D1CE4E5B9ull;
+        h ^= (u64(k.width) << 32) | u64(k.height);
+        h ^= (u64(k.mrt_fmt) << 8) | u64(k.flags);
+        return size_t(h ^ (h >> 33));
+    }
+};
+
+struct SfxFireDumpStats {
+    u64 draws = 0;
+    u64 verts = 0;
+    u32 num_tex = 0;
+    u32 num_buf = 0;
+    bool is_native_ps = false;
+    bool is_native_vs = false;
+};
+
+const char* BlendFactorName(Gcn::BlendControl::BlendFactor f) noexcept {
+    using BF = Gcn::BlendControl::BlendFactor;
+    switch (f) {
+    case BF::Zero: return "0";
+    case BF::One: return "1";
+    case BF::SrcColor: return "SrcC";
+    case BF::OneMinusSrcColor: return "1-SrcC";
+    case BF::SrcAlpha: return "SrcA";
+    case BF::OneMinusSrcAlpha: return "1-SrcA";
+    case BF::DstAlpha: return "DstA";
+    case BF::OneMinusDstAlpha: return "1-DstA";
+    case BF::DstColor: return "DstC";
+    case BF::OneMinusDstColor: return "1-DstC";
+    case BF::ConstantColor: return "ConstC";
+    case BF::OneMinusConstantColor: return "1-ConstC";
+    case BF::ConstantAlpha: return "ConstA";
+    case BF::OneMinusConstantAlpha: return "1-ConstA";
+    default: return "?";
+    }
+}
+
+const char* BlendFuncName(Gcn::BlendControl::BlendFunc op) noexcept {
+    using Op = Gcn::BlendControl::BlendFunc;
+    switch (op) {
+    case Op::Add: return "+";
+    case Op::Subtract: return "-";
+    case Op::Min: return "min";
+    case Op::Max: return "max";
+    case Op::ReverseSubtract: return "rsub";
+    default: return "?";
+    }
+}
+
+std::atomic<bool> g_sfx_dump_active{false};
+std::atomic<s64> g_sfx_dump_deadline_ns{0};
+std::atomic<u32> g_sfx_dump_last_count{0};
+std::mutex g_sfx_dump_mutex;
+std::unordered_map<SfxFireDumpKey, SfxFireDumpStats, SfxFireDumpKeyHash> g_sfx_dump_map;
+
+void FlushSfxFireDumpLocked() noexcept {
+    std::vector<std::pair<SfxFireDumpKey, SfxFireDumpStats>> rows;
+    rows.reserve(g_sfx_dump_map.size());
+    for (const auto& kv : g_sfx_dump_map) {
+        rows.push_back(kv);
+    }
+    std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) {
+        const bool a_bl = (a.first.flags & 8u) != 0u;
+        const bool b_bl = (b.first.flags & 8u) != 0u;
+        if (a_bl != b_bl) return a_bl > b_bl;
+        if (a.second.draws != b.second.draws) return a.second.draws > b.second.draws;
+        return a.first.ps_hash < b.first.ps_hash;
+    });
+
+    auto write_file = [&](const char* path) {
+        FILE* f = std::fopen(path, "w");
+        if (!f) return false;
+        std::fprintf(f, "# Bloodborne SFX/Fire Draw Capture (%zu unique 1-MRT pipelines)\n",
+                     rows.size());
+        std::fprintf(f, "# Columns: ps_hash vs_hash native(PS/VS) blend(src op dst | aSrc aDst) "
+                        "depth tess mt wxh fmt tex buf draws verts\n");
+        for (const auto& [k, s] : rows) {
+            Gcn::BlendControl bc{};
+            std::memcpy(&bc, &k.blend_bits, sizeof(bc));
+            const bool bl_en = (k.flags & 8u) != 0u;
+            const char* bl_str = bl_en ? "BLEND" : "OPAQUE";
+            std::fprintf(
+                f,
+                "ps=%08llx vs=%08llx nat=%d/%d %s(%s %s %s | a:%s/%s) m=%d d=%d tess=%d mt=%d "
+                "%ux%u fmt=%u tex=%u buf=%u draws=%llu verts=%llu\n",
+                static_cast<unsigned long long>(k.ps_hash),
+                static_cast<unsigned long long>(k.vs_hash), s.is_native_ps ? 1 : 0,
+                s.is_native_vs ? 1 : 0, bl_str, BlendFactorName(bc.color_src_factor),
+                BlendFuncName(bc.color_func), BlendFactorName(bc.color_dst_factor),
+                BlendFactorName(bc.alpha_src_factor), BlendFactorName(bc.alpha_dst_factor),
+                (k.flags & 16u) ? 2 : 1, (k.flags & 1u) ? 1 : 0, (k.flags & 2u) ? 1 : 0,
+                (k.flags & 4u) ? 1 : 0, k.width,
+                k.height, u32(k.mrt_fmt), s.num_tex, s.num_buf,
+                static_cast<unsigned long long>(s.draws), static_cast<unsigned long long>(s.verts));
+        }
+        std::fclose(f);
+        return true;
+    };
+
+    const bool ok1 = write_file("logs/sfx_fire_dump.txt");
+    const bool ok2 = write_file("/tmp/bb_sfx_fire_dump.txt");
+    g_sfx_dump_last_count.store(u32(rows.size()), std::memory_order_relaxed);
+    std::printf("[SfxFireDump] Captured %zu unique 1-MRT pipelines -> logs/sfx_fire_dump.txt (%d) "
+                "/tmp/bb_sfx_fire_dump.txt (%d)\n",
+                rows.size(), ok1 ? 1 : 0, ok2 ? 1 : 0);
+    g_sfx_dump_map.clear();
+}
+
+} // namespace
+
+void StartSfxFireDump(u32 duration_ms) noexcept {
+    std::scoped_lock lk{g_sfx_dump_mutex};
+    g_sfx_dump_map.clear();
+    const s64 now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                           std::chrono::steady_clock::now().time_since_epoch())
+                           .count();
+    g_sfx_dump_deadline_ns.store(now_ns + s64(duration_ms) * 1000000LL, std::memory_order_relaxed);
+    g_sfx_dump_active.store(true, std::memory_order_release);
+    std::printf("[SfxFireDump] Started %u ms capture window...\n", duration_ms);
+}
+
+bool IsSfxFireDumpActive() noexcept {
+    return g_sfx_dump_active.load(std::memory_order_acquire);
+}
+
+u32 GetSfxFireDumpLastCount() noexcept {
+    return g_sfx_dump_last_count.load(std::memory_order_relaxed);
+}
+
+void RecordSfxFireDumpDraw(const GraphicsPipeline* pipeline, u32 width, u32 height, u32 num_mrts,
+                           bool has_depth, u32 num_indices, u32 num_instances, bool is_mt,
+                           bool is_ui_phase) noexcept {
+    if (!g_sfx_dump_active.load(std::memory_order_acquire)) {
+        return;
+    }
+    const s64 now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                           std::chrono::steady_clock::now().time_since_epoch())
+                           .count();
+    if (now_ns >= g_sfx_dump_deadline_ns.load(std::memory_order_relaxed)) {
+        std::scoped_lock lk{g_sfx_dump_mutex};
+        if (g_sfx_dump_active.exchange(false, std::memory_order_acq_rel)) {
+            FlushSfxFireDumpLocked();
+        }
+        return;
+    }
+    if (!pipeline || (num_mrts != 1u && num_mrts != 2u) || is_ui_phase) {
+        return;
+    }
+    const auto& stages = pipeline->GetStages();
+    const auto* vs = stages[u32(Shader::SwStage::Vertex)];
+    const auto* ps = stages[u32(Shader::SwStage::Fragment)];
+    if (!ps) {
+        return;
+    }
+    const auto& key = pipeline->GetGraphicsKey();
+    const Gcn::BlendControl bc = key.blend_controls[0];
+    // Capture ALL blended 1-MRT & 2-MRT draws (particles, fire, embers, smoke, lighting, heat) AND
+    // depth-tested 1-MRT draws (forward alpha/refraction/ribbons).
+    if (!bc.enable && (num_mrts != 1u || !has_depth)) {
+        return;
+    }
+
+    SfxFireDumpKey dk{};
+    dk.ps_hash = ps->pgm_hash;
+    dk.vs_hash = vs ? vs->pgm_hash : 0ull;
+    std::memcpy(&dk.blend_bits, &bc, sizeof(dk.blend_bits));
+    dk.width = width;
+    dk.height = height;
+    dk.mrt_fmt = static_cast<u16>(key.color_buffers[0].data_format);
+    dk.flags = (has_depth ? 1u : 0u) | (key.patch_control_points > 0u ? 2u : 0u) |
+               (is_mt ? 4u : 0u) | (bc.enable ? 8u : 0u) | (num_mrts == 2u ? 16u : 0u);
+
+    std::scoped_lock lk{g_sfx_dump_mutex};
+    if (!g_sfx_dump_active.load(std::memory_order_relaxed)) {
+        return;
+    }
+    auto& st = g_sfx_dump_map[dk];
+    if (st.draws == 0u) {
+        st.num_tex = u32(ps->images.size());
+        st.num_buf = u32(ps->buffers.size());
+        st.is_native_ps = Shader::Backend::SPIRV::HasNativeShader(dk.ps_hash);
+        st.is_native_vs = vs ? Shader::Backend::SPIRV::HasNativeShader(dk.vs_hash) : false;
+    }
+    ++st.draws;
+    st.verts += u64(num_indices) * u64(std::max<u32>(1u, num_instances));
 }
 
 } // namespace Vulkan

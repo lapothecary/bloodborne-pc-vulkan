@@ -28,6 +28,12 @@ extern "C" __declspec(dllimport) unsigned long __stdcall GetCurrentProcessId(voi
 #include "bbport_game_menu.h"
 #include "bbport_guest_hooks.h"
 #include "bbport_frame_rate.h"
+
+namespace Vulkan {
+void StartSfxFireDump(u32 duration_ms = 5000u) noexcept;
+[[nodiscard]] bool IsSfxFireDumpActive() noexcept;
+[[nodiscard]] u32 GetSfxFireDumpLastCount() noexcept;
+} // namespace Vulkan
 #include "bbport_sections.h"
 #include "bbport_settings.h"
 #include "bbport_toggles.h"
@@ -989,6 +995,54 @@ void Menu() {
         Checkbox(BbSettings::MenuText("Debug: Show Velocity Map (Cam=R/G, ObjMask=B, ObjVel=Y)",
                                       "Отладка: Карта скоростей (Мир=R/G, Маска=Синий, Герой=Жёлтый)"),
                  s.native_mb_debug_vis);
+        {
+            const bool capturing = Vulkan::IsSfxFireDumpActive();
+            if (capturing) {
+                ImGui::BeginDisabled();
+                ImGui::Button(BbSettings::MenuText("Capturing Fire/SFX Shaders (5s)...",
+                                                   "Запись SFX/огня (5 сек)..."));
+                ImGui::EndDisabled();
+            } else if (ImGui::Button(BbSettings::MenuText(
+                           "Capture Fire/SFX Shaders (5s -> logs/sfx_fire_dump.txt)",
+                           "Записать шейдеры огня/SFX (5 сек -> logs/sfx_fire_dump.txt)"))) {
+                Vulkan::StartSfxFireDump(5000u);
+            }
+            const u32 last_n = Vulkan::GetSfxFireDumpLastCount();
+            if (!capturing && last_n > 0u) {
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(0.45f, 0.95f, 0.55f, 1.0f),
+                                   "OK (%u pipelines)", last_n);
+            }
+        }
+        ImGui::Unindent(16.0f);
+    }
+
+    Checkbox(BbSettings::MenuText("Enhanced Fire & Embers (Blackbody HDR + 3D Flames)",
+                                  "Ремастер огня и искр (Blackbody HDR + 3D-пламя)"),
+             s.enhanced_fire);
+    Hint(BbSettings::MenuText(
+        "Stage 2.0 live A/B: 170-FPS 3D FBM flame tongues, physical Blackbody HDR core, and rising glowing embers on all bonfires, torches & Molotovs.",
+        "Этап 2.0 (живой A/B): чёткое 3D-пламя 170 FPS, физическое HDR-ядро (1400K-4800K) и искры для всех костров, факелов и Молотовых."));
+    if (s.enhanced_fire.load(std::memory_order_relaxed)) {
+        ImGui::Indent(16.0f);
+        float f_int = s.fire_intensity.load(std::memory_order_relaxed);
+        if (ImGui::SliderFloat(
+                BbSettings::MenuText("Fire HDR Intensity", "Яркость HDR-ядра огня"),
+                &f_int, 0.40f, 2.40f, "%.2f")) {
+            s.fire_intensity.store(std::clamp(f_int, 0.40f, 2.40f), std::memory_order_relaxed);
+        }
+        float f_turb = s.fire_turbulence.load(std::memory_order_relaxed);
+        if (ImGui::SliderFloat(
+                BbSettings::MenuText("Flame 3D Turbulence", "Детализация языков пламени"),
+                &f_turb, 0.00f, 2.00f, "%.2f")) {
+            s.fire_turbulence.store(std::clamp(f_turb, 0.00f, 2.00f), std::memory_order_relaxed);
+        }
+        float f_emb = s.fire_embers.load(std::memory_order_relaxed);
+        if (ImGui::SliderFloat(
+                BbSettings::MenuText("Glowing Embers / Sparks", "Раскалённые искры и угли"),
+                &f_emb, 0.00f, 2.00f, "%.2f")) {
+            s.fire_embers.store(std::clamp(f_emb, 0.00f, 2.00f), std::memory_order_relaxed);
+        }
         ImGui::Unindent(16.0f);
     }
     BbGuestHooks::ApplyGameEffects();

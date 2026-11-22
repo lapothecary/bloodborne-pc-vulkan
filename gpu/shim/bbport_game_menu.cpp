@@ -310,7 +310,7 @@ constexpr int DisplaySlotCount = 11; ///< all 11 Display settings fit on a singl
 constexpr int TotalDisplayItems = 12;
 constexpr int MaxDisplayScroll = TotalDisplayItems - DisplaySlotCount;
 constexpr int EffectsSlotCount = 11; ///< all 11 Effects settings fit on a single screen (0 scroll)
-constexpr int TotalEffectsItems = 16;
+constexpr int TotalEffectsItems = 17;
 constexpr int MaxEffectsScroll = TotalEffectsItems - EffectsSlotCount;
 constexpr int MaxChoicesPerSlot = 16;
 constexpr int DefaultResetSentinel = -999;
@@ -2462,8 +2462,11 @@ constexpr EffectsItemMeta EffectsItems[TotalEffectsItems] = {
      "Vulkan 1.3 Remaster: horizon-based indirect bounce lighting from fire, lanterns, torches, and sunset sky",
      "Ремастер Vulkan 1.3: живой отражённый свет (SSGI) от костров, факелов, фонарей и закатного неба на камни и одежду", false},
     {"Native Vulkan PostFX (A/B)", "Нативный пост-процесс (A/B)",
-     "Remaster v2 live A/B: native Vulkan 1.3 post-process replacing Yebis2 (Step 1: Tonemap, 3D LUT, Auto-Exposure, CA, Vignette)",
-     "Ремастер v2 (A/B): нативный Vulkan 1.3 пост-процесс вместо Yebis2 (Шаг 1: Tonemap, 3D LUT, Auto-Exposure, ХА, виньетка)", false},
+     "Remaster v2 live A/B: native Vulkan 1.3 FP16 post-process replacing Yebis2 (Tonemap, 3D LUT, Bloom, Motion Blur, DoF)",
+     "Ремастер v2 (A/B): нативный Vulkan 1.3 FP16 пост-процесс вместо Yebis2 (Tonemap, 3D LUT, Bloom, Motion Blur, DoF)", false},
+    {"Enhanced Fire & Embers", "Ремастер огня и искр",
+     "Remaster v2 Stage 2.0: 170-FPS 3D procedural flame sculpting, physical Blackbody HDR core (1400K-4800K), and rising glowing embers",
+     "Ремастер v2 (Этап 2.0): живое 3D-пламя 170 FPS, физическое HDR-ядро (Blackbody) и взлетающие искры для костров, факелов и Молотовых", false},
 };
 
 constexpr int EffectsItemToEffectIdx(int item_idx) {
@@ -2494,6 +2497,7 @@ bool GetEffectsItemActive(int item_idx) {
     case 13: return s.pcss_shadows.load();
     case 14: return s.ssgi_enabled.load();
     case 15: return s.native_postfx.load();
+    case 16: return s.enhanced_fire.load();
     default: return false;
     }
 }
@@ -2536,6 +2540,7 @@ void SetEffectsItemActive(int item_idx, bool active) {
         case 13: s.pcss_shadows = active; break;
         case 14: s.ssgi_enabled = active; break;
         case 15: s.native_postfx = active; break;
+        case 16: s.enhanced_fire = active; break;
         default: break;
         }
     }

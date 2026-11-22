@@ -329,6 +329,8 @@ void Set(Values& v, const std::string& key, const std::string& value) {
         v.ssgi_enabled = (value != "0" && value != "false" && value != "off");
     } else if (key == "native_postfx") {
         v.native_postfx = (value != "0" && value != "false" && value != "off");
+    } else if (key == "enhanced_fire") {
+        v.enhanced_fire = (value != "0" && value != "false" && value != "off");
     } else if (key == "motion_blur_camera" || key == "motion_blur_object") {
         auto parse_mb = [](std::string_view val) -> int {
             if (val == "off" || val == "0" || val == "false") return 0;
@@ -754,6 +756,7 @@ void Load() {
         {"BB_SSR_QUALITY", "ssr_quality"},          {"BB_TRUE_BLACK_HDR", "true_black_hdr"},
         {"BB_HDR_OUTPUT", "hdr_output"},            {"BB_PCSS_SHADOWS", "pcss_shadows"},
         {"BB_SSGI", "ssgi_enabled"},                {"BB_NATIVE_POSTFX", "native_postfx"},
+        {"BB_ENHANCED_FIRE", "enhanced_fire"},
         {"BB_MOTION_BLUR_CAMERA", "motion_blur_camera"},
         {"BB_MOTION_BLUR_OBJECT", "motion_blur_object"}, {"BB_CAMERA_FOLLOW", "camera_follow_mode"},
     };
@@ -961,6 +964,7 @@ void Save() {
     put("pcss_shadows", flag(v.pcss_shadows.load()));
     put("ssgi_enabled", flag(v.ssgi_enabled.load()));
     put("native_postfx", flag(v.native_postfx.load()));
+    put("enhanced_fire", flag(v.enhanced_fire.load()));
     auto mb_level_name = [](int lvl) -> const char* {
         switch (std::clamp(lvl, 0, 3)) {
         case 0: return "off";
