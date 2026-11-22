@@ -68,7 +68,7 @@ jobs:
           cmake -S /tmp/bb-deps-src/zydis -B /tmp/bb-deps-src/zydis-build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/opt/bb-deps \
             -DCMAKE_PREFIX_PATH=/opt/bb-deps \
-            -DCMAKE_C_FLAGS="-O3 -march=x86-64-v3 -mtune=generic -mno-avx512f -fPIC" \
+            -DCMAKE_C_FLAGS="-O3 -march=x86-64-v3 -mtune=generic -mno-avx512f -fPIC -I/opt/bb-deps/include" \
             -DZYAN_SYSTEM_ZYCORE=ON \
             -DZYDIS_BUILD_SHARED_LIB=OFF \
             -DZYDIS_BUILD_TOOLS=OFF -DZYDIS_BUILD_EXAMPLES=OFF -DZYDIS_BUILD_TESTS=OFF \
@@ -101,6 +101,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DCMAKE_C_COMPILER=gcc-14 -DCMAKE_CXX_COMPILER=g++-14 \
             -DCMAKE_PREFIX_PATH="/opt/bb-deps" \
+            -DCMAKE_SHARED_LINKER_FLAGS="-L/opt/bb-deps/lib -L/opt/bb-deps/lib/x86_64-linux-gnu" \
             -DVulkan_INCLUDE_DIR="/opt/bb-deps/include" \
             -DVMA_INCLUDE_DIR="/opt/bb-deps/include/vma" \
             -DBB_PORTABLE_ISA=ON -DBB_LTO=ON -DBB_PGO=off -DBB_NET=ON
