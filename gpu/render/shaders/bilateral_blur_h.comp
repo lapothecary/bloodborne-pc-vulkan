@@ -1,0 +1,114 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Pack #3: Native Vulkan Compute Horizontal 12-Tap Depth-Aware Bilateral Blur
+// Replaces horizontal pass of `ps_11ffdfb5` (GXScreenSpaceShadow_Blur.ppo) using
+// LDS tile caching (~1.09 texel fetches/px instead of 13, 0 SSBO reads, precomputed
+// depth unpack + reciprocal denominator, 0 LDS bank conflicts).
+#version 460
+#extension GL_EXT_samplerless_texture_functions : require
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform BilateralParams {
+    uint width;
+    uint height;
+    float z_a;
+    uint halo;
+    ivec4 delta0;
+    ivec4 delta1;
+    ivec4 delta2;
+    vec4 kw0;
+    vec4 kw1;
+    vec4 kw2;
+} pc;
+
+layout(set = 0, binding = 0) uniform texture2D src_tex;
+layout(set = 0, binding = 1, rgba8) writeonly uniform image2D dst_img;
+
+const int kBlockW = 128;
+const int kMaxHalo = 16;
+const int kTileW = kBlockW + 2 * kMaxHalo; // 160
+
+shared float s_d[kTileW];
+shared float s_inv[kTileW];
+shared float s_a[kTileW];
+
+float unpack_depth(vec3 rgb) {
+    return rgb.b + (rgb.g * 0.00392156886 + rgb.r * 1.53787005e-05);
+}
+
+float safe_inv(float denom) {
+    return (abs(denom) > 1e-12) ? (1.0 / denom) : 1e12;
+}
+
+void main() {
+    const int w = int(pc.width);
+    const int h = int(pc.height);
+    const int halo = int(pc.halo);
+    const int lx = int(gl_LocalInvocationID.x);
+    const int bx = int(gl_WorkGroupID.x) * kBlockW;
+    const int y = int(gl_WorkGroupID.y);
+    if (y >= h) {
+        return;
+    }
+
+    // 1. Coalesced main pixel load (1 texel per thread; keep s0 in registers for final store).
+    const int gx = bx + lx;
+    const int cx = clamp(gx, 0, w - 1);
+    const vec4 s0 = texelFetch(src_tex, ivec2(cx, y), 0);
+    const float d0 = unpack_depth(s0.rgb);
+    const int center = lx + halo;
+    s_d[center] = d0;
+    s_inv[center] = safe_inv(pc.z_a - d0);
+    s_a[center] = s0.a;
+
+    // 2. Left & right halo loads (2 * halo threads do 1 extra load each).
+    if (lx < 2 * halo) {
+        const bool is_left = lx < halo;
+        const int hx = clamp(is_left ? (bx - halo + lx) : (bx + kBlockW + (lx - halo)), 0, w - 1);
+        const int slot = is_left ? lx : (kBlockW + lx);
+        const vec4 sh = texelFetch(src_tex, ivec2(hx, y), 0);
+        const float dh = unpack_depth(sh.rgb);
+        s_d[slot] = dh;
+        s_inv[slot] = safe_inv(pc.z_a - dh);
+        s_a[slot] = sh.a;
+    }
+
+    barrier();
+
+    if (gx >= w) {
+        return;
+    }
+    if (d0 >= 0.99999) {
+        imageStore(dst_img, ivec2(gx, y), s0);
+        return;
+    }
+
+    float w_sum = 1.0;
+    float val_sum = s0.a;
+
+#define ACCUM_TAP(DELTA, KW)                                               \
+    do {                                                                   \
+        const int idx = center + (DELTA);                                  \
+        const float rel_dz = (d0 - s_d[idx]) * s_inv[idx];                 \
+        const float wk = (KW) * exp2((rel_dz * rel_dz) * (-144.269501));   \
+        w_sum += wk;                                                       \
+        val_sum += s_a[idx] * wk;                                          \
+    } while (false)
+
+    ACCUM_TAP(pc.delta0.x, pc.kw0.x);
+    ACCUM_TAP(pc.delta0.y, pc.kw0.y);
+    ACCUM_TAP(pc.delta0.z, pc.kw0.z);
+    ACCUM_TAP(pc.delta0.w, pc.kw0.w);
+    ACCUM_TAP(pc.delta1.x, pc.kw1.x);
+    ACCUM_TAP(pc.delta1.y, pc.kw1.y);
+    ACCUM_TAP(pc.delta1.z, pc.kw1.z);
+    ACCUM_TAP(pc.delta1.w, pc.kw1.w);
+    ACCUM_TAP(pc.delta2.x, pc.kw2.x);
+    ACCUM_TAP(pc.delta2.y, pc.kw2.y);
+    ACCUM_TAP(pc.delta2.z, pc.kw2.z);
+    ACCUM_TAP(pc.delta2.w, pc.kw2.w);
+
+#undef ACCUM_TAP
+
+    imageStore(dst_img, ivec2(gx, y), vec4(s0.rgb, val_sum / w_sum));
+}

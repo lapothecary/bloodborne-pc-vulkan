@@ -158,6 +158,11 @@
 #include "bbgpu/shaders/ps_0f54e5f9_arr_frag.h"
 #include "bbgpu/shaders/ps_d3c8bb21_frag.h"
 #include "bbgpu/shaders/ps_34bc187c_frag.h"
+#include "bbgpu/shaders/ps_a61e325d_frag.h"
+#include "bbgpu/shaders/ps_133eb139_frag.h"
+#include "bbgpu/shaders/ps_8a6c7657_frag.h"
+#include "bbgpu/shaders/ps_6720ae0d_frag.h"
+#include "bbgpu/shaders/ps_c31bd920_frag.h"
 
 namespace Shader::Backend::SPIRV {
 
@@ -229,7 +234,7 @@ struct NativeShaderCandidate {
     const char* label;
 };
 
-constexpr std::array<NativeShaderCandidate, 145> kNativeRegistry{{
+constexpr std::array<NativeShaderCandidate, 150> kNativeRegistry{{
     {0x000000000f61fd27ull, PS_0F61FD27_VSM_BLUR_FRAG, "ps_0f61fd27_vsm_blur"},
     {0x000000001ae03d75ull, PS_1AE03D75_VSM_MOMENT_CLDIST_FRAG, "ps_1ae03d75_vsm_moment_cldist"},
     {0x000000001ae03d75ull, PS_1AE03D75_VSM_MOMENT_NOCLIP_FRAG, "ps_1ae03d75_vsm_moment_noclip"},
@@ -375,6 +380,11 @@ constexpr std::array<NativeShaderCandidate, 145> kNativeRegistry{{
     {0x000000000f54e5f9ull, PS_0F54E5F9_ARR_FRAG, "ps_0f54e5f9_gbuf6_alpha_arr"},
     {0x00000000d3c8bb21ull, PS_D3C8BB21_FRAG, "ps_d3c8bb21_motblur_vel_combine"},
     {0x0000000034bc187cull, PS_34BC187C_FRAG, "ps_34bc187c_motblur_obj_vel_opaque"},
+    {0x00000000a61e325dull, PS_A61E325D_FRAG, "ps_a61e325d_glow_blur13"},
+    {0x00000000133eb139ull, PS_133EB139_FRAG, "ps_133eb139_decal_5mrt"},
+    {0x000000008a6c7657ull, PS_8A6C7657_FRAG, "ps_8a6c7657_fwd_pbr_csm"},
+    {0x000000006720ae0dull, PS_6720AE0D_FRAG, "ps_6720ae0d_fwd_lm_sss_csm"},
+    {0x00000000c31bd920ull, PS_C31BD920_FRAG, "ps_c31bd920_fwd_lm_ibl_csm"},
 }};
 
 struct DescSlot {
@@ -763,6 +773,7 @@ constexpr BgraMode ExpectedBgraMode(u64 pgm_hash) noexcept {
     case 0x00000000f7229091ull: // ps_f7229091_bgra_blit
     case 0x000000008c08444cull: // ps_8c08444c_blur13
     case 0x00000000ed4c7668ull: // ps_ed4c7668_lut3d
+    case 0x00000000a61e325dull: // ps_a61e325d_glow_blur13
         return BgraMode::SpecConstBgra;
     case 0x000000005c02eaf8ull: // ps_5c02eaf8_tonemap
     case 0x000000005e67d866ull: // ps_5e67d866_tonemap_hd

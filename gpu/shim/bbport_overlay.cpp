@@ -36,6 +36,7 @@ void StartSfxFireDump(u32 duration_ms = 5000u) noexcept;
 } // namespace Vulkan
 #include "bbport_sections.h"
 #include "bbport_settings.h"
+#include "bbport_system_info.h"
 #include "bbport_toggles.h"
 #include "imgui.h"
 #include "imgui_impl_vulkan.h"
@@ -116,8 +117,9 @@ float frame_ms_avg = 0.0f;
 double present_ms_sum_accum = 0.0;
 double present_ms_sq_sum_accum = 0.0;
 std::uint64_t present_ms_count_accum = 0;
-std::array<float, 4096> log_frame_ms_buf{};
+std::array<float, 8192> log_frame_ms_buf{};
 std::uint32_t log_frame_ms_cnt = 0;
+float log_max_frame_ms = 0.0f;
 
 float PixelDensity(SDL_WindowID id);
 
@@ -1488,6 +1490,15 @@ struct HudBreakdown {
     float vram_proc_gb = 0.0f;
     float vram_used_gb = 0.0f;
     float vram_total_gb = 0.0f;
+    // Live system RAM & CPU sensors (polled on background bb:Telemetry thread)
+    bool has_sys_ram = false;
+    float ram_proc_gb = 0.0f;
+    float ram_sys_used_gb = 0.0f;
+    float ram_sys_total_gb = 0.0f;
+    int proc_cpu_pct = -1;
+    int sys_cpu_pct = -1;
+    int cpu_clock_mhz = 0;
+    int cpu_temp_c = 0;
     // Stage 1: Game CPU / Gnm
     float idle_a_ms = 0.0f, avg_idle_a_ms = 0.0f;
     float gnm_wait_ms = 0.0f, avg_gnm_wait_ms = 0.0f;
@@ -1824,6 +1835,14 @@ public:
         float vram_proc_gb = 0.0f;
         float vram_used_gb = 0.0f;
         float vram_total_gb = 0.0f;
+        bool has_sys_ram = false;
+        float ram_proc_gb = 0.0f;
+        float ram_sys_used_gb = 0.0f;
+        float ram_sys_total_gb = 0.0f;
+        int proc_cpu_pct = -1;
+        int sys_cpu_pct = -1;
+        int cpu_clock_mhz = 0;
+        int cpu_temp_c = 0;
     };
 
     static AsyncTelemetryWorker& Get() {
@@ -1844,6 +1863,14 @@ public:
         h.vram_proc_gb = sensors.vram_proc_gb;
         h.vram_used_gb = sensors.vram_used_gb;
         h.vram_total_gb = sensors.vram_total_gb;
+        h.has_sys_ram = sensors.has_sys_ram;
+        h.ram_proc_gb = sensors.ram_proc_gb;
+        h.ram_sys_used_gb = sensors.ram_sys_used_gb;
+        h.ram_sys_total_gb = sensors.ram_sys_total_gb;
+        h.proc_cpu_pct = sensors.proc_cpu_pct;
+        h.sys_cpu_pct = sensors.sys_cpu_pct;
+        h.cpu_clock_mhz = sensors.cpu_clock_mhz;
+        h.cpu_temp_c = sensors.cpu_temp_c;
     }
 
     void EnqueueHudFileWrite(std::string text) {
@@ -1935,6 +1962,8 @@ private:
             if (do_sensors) {
                 HudBreakdown tmp{};
                 PollGpuHwSensors(tmp);
+                BbSysInfo::LiveSysSensors sys_tmp{};
+                BbSysInfo::PollLiveSystemSensors(sys_tmp);
                 std::scoped_lock slk{sensor_mutex};
                 sensors.has_gpu_sensors = tmp.has_gpu_sensors;
                 sensors.gpu_power_w = tmp.gpu_power_w;
@@ -1944,6 +1973,14 @@ private:
                 sensors.vram_proc_gb = tmp.vram_proc_gb;
                 sensors.vram_used_gb = tmp.vram_used_gb;
                 sensors.vram_total_gb = tmp.vram_total_gb;
+                sensors.has_sys_ram = sys_tmp.has_ram;
+                sensors.ram_proc_gb = sys_tmp.ram_proc_gb;
+                sensors.ram_sys_used_gb = sys_tmp.ram_sys_used_gb;
+                sensors.ram_sys_total_gb = sys_tmp.ram_sys_total_gb;
+                sensors.proc_cpu_pct = sys_tmp.proc_cpu_pct;
+                sensors.sys_cpu_pct = sys_tmp.sys_cpu_pct;
+                sensors.cpu_clock_mhz = sys_tmp.cpu_clock_mhz;
+                sensors.cpu_temp_c = sys_tmp.cpu_temp_c;
             }
 
             if (do_hud_file) {
@@ -2956,11 +2993,40 @@ void UpdateHudBreakdown(HudBreakdown& h) {
         const auto& s = BbSettings::Get();
         const auto out = BbSettings::CurrentOutput();
         const auto shd = Vulkan::DirectShaders::ReadTelemetry();
+        char sys_hw_line[192]{};
+        if (h.has_sys_ram || h.sys_cpu_pct >= 0 || h.cpu_clock_mhz > 0 || h.cpu_temp_c > 0) {
+            int pos = std::snprintf(sys_hw_line, sizeof(sys_hw_line), "SYS HW:");
+            if (h.has_sys_ram) {
+                pos += std::snprintf(sys_hw_line + pos, sizeof(sys_hw_line) - std::size_t(pos),
+                                     " RAM Proc %.2f GB (Sys %.1f/%.1f GB)",
+                                     h.ram_proc_gb, h.ram_sys_used_gb, h.ram_sys_total_gb);
+            }
+            if (h.proc_cpu_pct >= 0 && h.sys_cpu_pct >= 0) {
+                pos += std::snprintf(sys_hw_line + pos, sizeof(sys_hw_line) - std::size_t(pos),
+                                     " | CPU Proc %d%% (Sys %d%%)", h.proc_cpu_pct, h.sys_cpu_pct);
+            } else if (h.sys_cpu_pct >= 0) {
+                pos += std::snprintf(sys_hw_line + pos, sizeof(sys_hw_line) - std::size_t(pos),
+                                     " | SysCPU %d%%", h.sys_cpu_pct);
+            }
+            if (h.cpu_clock_mhz > 0) {
+                pos += std::snprintf(sys_hw_line + pos, sizeof(sys_hw_line) - std::size_t(pos),
+                                     " | %d MHz", h.cpu_clock_mhz);
+            }
+            if (h.cpu_temp_c > 0) {
+                pos += std::snprintf(sys_hw_line + pos, sizeof(sys_hw_line) - std::size_t(pos),
+                                     " | %d C", h.cpu_temp_c);
+            }
+            if (pos > 0 && std::size_t(pos) + 1 < sizeof(sys_hw_line)) {
+                sys_hw_line[pos++] = '\n';
+                sys_hw_line[pos] = '\0';
+            }
+        }
         char hud_buf[4096];
         std::snprintf(
             hud_buf, sizeof(hud_buf),
             "FPS: %.1f (%.2f ms/f) | Avg15s: %.1f FPS (%.2f ms/f, Jit %.2f ms) | Scene: %dx%d -> %dx%d | Upscaler: %s (%s)%s\n"
             "GPU HW: %.1f W | %d MHz | %d C | DrvBusy %d%% | VRAM Proc %.2f GB (Sys %.2f/%.2f GB)\n"
+            "%s"
             "Counts/f: Draws %.0f (Avg %.0f) | Disp %.0f (Avg %.0f) | Subm %.1f (Avg %.1f) | PipeDrains %.1f | Faults/s %.1f | NativeVkBuf %.1f%% | NativeVkTex %.1f%% | DescSaved %.1f%% | DontCare %llu/%llu\n"
             "DirectShaders: reg %llu | manifest %llu/%u | stageA_hits %llu | worker_hits %llu\n"
             "CPU 1. Game Engine: Work %.2f ms (Avg %.2f) | ThreadSync %.2f ms (Avg %.2f) | FpsCapSleep %.2f ms (Avg %.2f) | GnmWait %.2f ms (Avg %.2f)\n"
@@ -2982,6 +3048,7 @@ void UpdateHudBreakdown(HudBreakdown& h) {
             BbSettings::ResolutionNeedsRestart() ? " [NEEDS RESTART]" : "",
             h.gpu_power_w, h.gpu_clock_mhz, h.gpu_temp_c, h.gpu_drv_util_pct,
             h.vram_proc_gb > 0.01f ? h.vram_proc_gb : h.vram_used_gb, h.vram_used_gb, h.vram_total_gb,
+            sys_hw_line,
             h.draws_pf, h.avg_draws_pf, h.dispatches_pf, h.avg_dispatches_pf,
             h.submits_pf, h.avg_submits_pf, h.drains_pf,
             h.faults_ps, h.native_buf_pct, h.native_tex_pct,
@@ -3058,6 +3125,7 @@ void UpdateHudBreakdown(HudBreakdown& h) {
             last_log_print = now;
             last_log_frames = cur_frames;
             log_frame_ms_cnt = 0;
+            log_max_frame_ms = 0.0f;
             prev_pres_pace_ns = BbStats::present_pace_sleep_ns.load(std::memory_order_relaxed);
             prev_mouse_ev = BbStats::mouse_raw_events.load(std::memory_order_relaxed);
             prev_mouse_polls = BbStats::mouse_active_polls.load(std::memory_order_relaxed);
@@ -3068,14 +3136,33 @@ void UpdateHudBreakdown(HudBreakdown& h) {
             BbStats::mouse_ev_per_poll_min.store(0xFFFFFFFFu, std::memory_order_relaxed);
             BbStats::mouse_ev_per_poll_max.store(0u, std::memory_order_relaxed);
         }
+        static const double hud_log_interval_sec = [] {
+            if (const char* e = std::getenv("BB_HUD_LOG_SEC"); e && e[0] != '\0') {
+                const double v = std::atof(e);
+                if (v >= 2.0 && v <= 300.0) {
+                    return v;
+                }
+            }
+            return 15.0;
+        }();
+        static bool first_hud_logged = false;
         const double log_dt = std::chrono::duration<double>(now - last_log_print).count();
-        if (log_dt >= 5.0 && h.draws_pf >= 10.0f) {
+        const bool hitch_trigger = (log_max_frame_ms >= 50.0f && log_dt >= 5.0);
+        const double target_dt = first_hud_logged ? hud_log_interval_sec : std::min(5.0, hud_log_interval_sec);
+        if ((log_dt >= target_dt || hitch_trigger) && h.draws_pf >= 10.0f) {
+            const float peak_hitch = log_max_frame_ms;
+            log_max_frame_ms = 0.0f;
+            first_hud_logged = true;
             const std::uint32_t log_df32 =
                 static_cast<std::uint32_t>(cur_frames) - static_cast<std::uint32_t>(last_log_frames);
             const std::uint64_t log_df = log_df32 > 0 ? static_cast<std::uint64_t>(log_df32) : 1ULL;
             last_log_print = now;
             last_log_frames = cur_frames;
-            std::printf("\n[HUD Telemetry]\n%s", hud_buf);
+            if (hitch_trigger) {
+                std::printf("\n[HUD Telemetry] [HITCH %.1fms]\n%s", peak_hitch, hud_buf);
+            } else {
+                std::printf("\n[HUD Telemetry]\n%s", hud_buf);
+            }
             if (BbSections::main_xray.installed.load(std::memory_order_relaxed)) {
                 static std::array<std::uint64_t, BbSections::MainXRay::MaxGroups> prev_t0{};
                 static std::array<std::uint64_t, BbSections::MainXRay::MaxGroups> prev_wk{};
@@ -3406,10 +3493,10 @@ void UpdateHudBreakdown(HudBreakdown& h) {
                 std::printf(
                     "Pacing (%uf): min %.2f | p50 %.2f | p95 %.2f | p99 %.2f | max %.2f ms"
                     " | >1.25x:%u >1.5x:%u | PresPace %.2f ms | SimDt %.2f..%.2f ms\n"
-                    "Input (5s): Mouse %llu ev / %llu active-f (%.1f ev/f, batch %u..%u, 0-ev-gaps %llu)"
+                    "Input (%.0fs): Mouse %llu ev / %llu active-f (%.1f ev/f, batch %u..%u, 0-ev-gaps %llu)"
                     " | WinWake %llu\n",
                     cnt, min_ms, p50_ms, p95_ms, p99_ms, max_ms, over_125, over_150, pres_pace_ms,
-                    sim_min_ms, sim_max_ms, static_cast<unsigned long long>(d_m_ev),
+                    sim_min_ms, sim_max_ms, log_dt, static_cast<unsigned long long>(d_m_ev),
                     static_cast<unsigned long long>(d_m_polls), ev_per_poll,
                     m_min != 0xFFFFFFFFu ? m_min : 0u, m_max,
                     static_cast<unsigned long long>(d_m_zero),
@@ -4004,6 +4091,7 @@ void Init(const Vulkan::Instance& instance, vk::Format format, u32 image_count) 
     }
     initialized = true;
     std::printf("Overlay: menu ready (Insert or L3+R3)\n");
+    BbSysInfo::LogSystemPassport();
 }
 
 void SetSwapchainFormat(vk::Format format) {
@@ -4380,6 +4468,9 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
         ++present_ms_count_accum;
         if (log_frame_ms_cnt < log_frame_ms_buf.size()) {
             log_frame_ms_buf[log_frame_ms_cnt++] = ms;
+        }
+        if (ms > log_max_frame_ms) {
+            log_max_frame_ms = ms;
         }
     }
     UpdateHudBreakdown(g_hud);

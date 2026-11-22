@@ -171,6 +171,16 @@ public:
     FrameGeneration* GetFrameGeneration() const {
         return frame_generation.get();
     }
+    /// Pack #2: True when frame generation wants the display pass to populate its own buffer.
+    [[nodiscard]] bool FrameGenWanted() const noexcept;
+    /// Pack #2: True when the display pass input (`ui_color`) is redirected to `ui_image`.
+    [[nodiscard]] bool IsDisplayRedirected() const noexcept {
+        return display_redirect && !display_in_place;
+    }
+    /// Pack #2: Output extent of `ui_image` when `IsDisplayRedirected()` is true.
+    [[nodiscard]] vk::Extent2D UiExtent() const noexcept {
+        return vk::Extent2D{ui_width, ui_height};
+    }
     /// BB_PRESENT_DUMP_TRIGGER: whether this presented frame is to be saved (consumes the trigger).
     bool PresentDumpDue();
     /// Saves `image` (General layout, 4 bytes a pixel) as present_<w>x<h> in BB_DUMP_DIR.

@@ -9,6 +9,7 @@
 
 #include "render/raster_internal.h"
 #include "render/vk_native_postfx.h"
+#include "render/vk_vsm_blur_batcher.h"
 #include "textures/direct_textures.h"
 #include "../../dantelion_gx/include/gx_direct_vulkan.h"
 
@@ -969,6 +970,12 @@ void Rasterizer::DirectClearColorImage(const DirectClearColorArgs& args) {
                     : VideoCore::SubresourceRange{
                           .base = {.level = 0, .layer = 0},
                           .extent = image.info.resources};
+            if (vsm_blur_batcher && vsm_blur_batcher->HasPendingCopyBacks()) {
+                if (slice_layer < 0 ||
+                    vsm_blur_batcher->ConflictsWithCopyBack(image_id, 0u, u32(slice_layer))) {
+                    vsm_blur_batcher->FlushCopyBacks();
+                }
+            }
             if (VideoCore::True(image.flags & VideoCore::ImageFlagBits::DirectImmutable)) {
                 texture_cache.DemoteDirectImmutable(image_id);
             }
@@ -998,6 +1005,10 @@ void Rasterizer::DirectClearColorImage(const DirectClearColorArgs& args) {
                     .base = {.level = mip, .layer = layer},
                     .extent = {.levels = 1, .layers = 1},
                 };
+                if (vsm_blur_batcher &&
+                    vsm_blur_batcher->ConflictsWithCopyBack(resolved_id, mip, layer)) {
+                    vsm_blur_batcher->FlushCopyBacks();
+                }
                 if (VideoCore::True(image.flags & VideoCore::ImageFlagBits::DirectImmutable)) {
                     texture_cache.DemoteDirectImmutable(resolved_id);
                 }
@@ -1014,9 +1025,138 @@ void Rasterizer::DirectClearColorImage(const DirectClearColorArgs& args) {
     }
 }
 
+void Rasterizer::FlushDeferredVsmCopy() {
+    if (!vsm_blur_batcher) {
+        return;
+    }
+    VsmBlurBatcher::DeferredCopy copy{};
+    if (!vsm_blur_batcher->TakeDeferredCopy(copy)) {
+        return;
+    }
+    pending_tex_copies.push_back(copy.args);
+    FlushPendingTextureRegionCopies();
+}
+
+void Rasterizer::FlushVsmBlurCopyBacks() {
+    if (vsm_blur_batcher && vsm_blur_batcher->HasPendingCopyBacks()) {
+        vsm_blur_batcher->FlushCopyBacks();
+    }
+}
+
 void Rasterizer::DirectCopyTextureRegion(const DirectCopyTextureRegionArgs& args) {
     if (args.copy_w == 0 || args.copy_h == 0 || args.copy_d == 0) {
         return;
+    }
+    if (vsm_blur_batcher && vsm_blur_batcher->HasDeferredCopy()) {
+        FlushDeferredVsmCopy();
+    }
+    // Pack #4: Defer a standalone R16G16Sfloat VSM cubemap face copy (`F[slice] -> S`) so the
+    // immediately following `ps_0f61fd27` VSM blur draw can cancel the copy and run our native
+    // Compute blur directly on `F[slice]` (in-place LDS for 32/64, batched scratch for 128/256).
+    if (vsm_blur_batcher && VsmBlurBatcher::Enabled() && pending_tex_copies.empty() &&
+        !FrameCapture::Active() && args.copy_d == 1u && args.src_x == 0u && args.src_y == 0u &&
+        args.dst_x == 0u && args.dst_y == 0u && args.copy_w == args.copy_h &&
+        VsmBlurBatcher::IsSupportedDim(args.copy_w) && !NextPipePacketIsTextureRegionCopy()) {
+        const auto try_resolve_vsm = [&](const u64 raw_words[4], bool is_written,
+                                         VideoCore::ImageId& out_id,
+                                         VideoCore::SubresourceRange& out_range,
+                                         VAddr& out_tsharp_addr) -> bool {
+            Gcn::Image sharp{};
+            std::memcpy(&sharp, raw_words, sizeof(sharp));
+            u8 srv_gen8 = 0u;
+            const u16 srv_uid = VideoCore::DirectTextures::UnpackAndCleanSrv(sharp, srv_gen8);
+            if (!sharp.Valid()) {
+                return false;
+            }
+            out_tsharp_addr = sharp.Address();
+            Shader::ImageResource res{};
+            res.is_written = is_written;
+            res.needs_native = true;
+            auto& entry = ResolveImageDescEntry(sharp, srv_uid, srv_gen8, res, nullptr);
+            const u64 current_gen = texture_cache.RegistryGeneration();
+            if ((entry.found_generation == current_gen ||
+                 (entry.found_direct_immutable &&
+                  texture_cache.IsRegisteredImmutable(entry.found_id, entry.found_uid))) &&
+                entry.found_id && !BbToggle::Disabled(BbToggle::TextureBindingMemo)) {
+                entry.found_generation = current_gen;
+                out_id = entry.found_id;
+                out_range = entry.found_desc.view_info.range;
+                texture_cache.MarkFound(out_id);
+                texture_cache.UpdateImage(out_id);
+                return true;
+            }
+            const u64 gen_before = texture_cache.RegistryGeneration();
+            out_id = texture_cache.FindImage(entry.desc);
+            if (!out_id) {
+                return false;
+            }
+            out_range = entry.desc.view_info.range;
+            if (gen_before == texture_cache.RegistryGeneration()) {
+                auto& img = texture_cache.GetImageUntouched(out_id);
+                entry.found_generation = gen_before;
+                entry.found_id = out_id;
+                entry.found_uid = img.image_uid;
+                entry.found_direct_immutable =
+                    True(img.flags & VideoCore::ImageFlagBits::DirectImmutable) &&
+                    !texture_cache.GetAssociatedDepth(img);
+                entry.found_desc = entry.desc;
+                entry.view_memo = {};
+            }
+            texture_cache.UpdateImage(out_id);
+            return true;
+        };
+        VideoCore::ImageId src_id{};
+        VideoCore::SubresourceRange src_range{};
+        VAddr src_tsharp_addr = 0;
+        VideoCore::ImageId dst_id{};
+        VideoCore::SubresourceRange dst_range{};
+        VAddr dst_tsharp_addr = 0;
+        if (try_resolve_vsm(args.srv_tsharp, false, src_id, src_range, src_tsharp_addr) &&
+            try_resolve_vsm(args.uav_tsharp, true, dst_id, dst_range, dst_tsharp_addr) &&
+            src_id != dst_id) {
+            const auto& src_img = texture_cache.GetImage(src_id);
+            const auto& dst_img = texture_cache.GetImage(dst_id);
+            const u32 src_mip =
+                std::min(src_range.base.level, src_img.info.resources.levels - 1u);
+            const u32 dst_mip =
+                std::min(dst_range.base.level, dst_img.info.resources.levels - 1u);
+            const u32 src_layer =
+                std::min(src_range.base.layer, src_img.info.resources.layers - 1u);
+            const u32 dst_layer =
+                std::min(dst_range.base.layer, dst_img.info.resources.layers - 1u);
+            const u32 src_w = std::max(src_img.info.size.width >> src_mip, 1u);
+            const u32 src_h = std::max(src_img.info.size.height >> src_mip, 1u);
+            const u32 dst_w = std::max(dst_img.info.size.width >> dst_mip, 1u);
+            const u32 dst_h = std::max(dst_img.info.size.height >> dst_mip, 1u);
+            if (src_img.info.pixel_format == vk::Format::eR16G16Sfloat &&
+                dst_img.info.pixel_format == vk::Format::eR16G16Sfloat &&
+                src_img.info.num_samples == 1u && dst_img.info.num_samples == 1u &&
+                !src_img.info.props.is_depth && !dst_img.info.props.is_depth &&
+                !src_img.info.props.is_block && !dst_img.info.props.is_block &&
+                src_img.info.type != Gcn::ImageType::Color3D &&
+                dst_img.info.type != Gcn::ImageType::Color3D && src_w == args.copy_w &&
+                src_h == args.copy_h && dst_w == args.copy_w && dst_h == args.copy_h &&
+                !vsm_blur_batcher->ConflictsWithCopyBack(src_id, src_mip, src_layer) &&
+                !vsm_blur_batcher->ConflictsWithCopyBack(dst_id, dst_mip, dst_layer)) {
+                vsm_blur_batcher->SetDeferredCopy({
+                    .valid = true,
+                    .args = args,
+                    .src_id = src_id,
+                    .src_mip = src_mip,
+                    .src_layer = src_layer,
+                    .src_tsharp_addr = src_tsharp_addr,
+                    .dst_id = dst_id,
+                    .dst_mip = dst_mip,
+                    .dst_layer = dst_layer,
+                    .dst_tsharp_addr = dst_tsharp_addr,
+                    .dim = args.copy_w,
+                });
+                return;
+            }
+        }
+    }
+    if (vsm_blur_batcher && vsm_blur_batcher->HasPendingCopyBacks()) {
+        vsm_blur_batcher->FlushCopyBacks();
     }
     pending_tex_copies.push_back(args);
     if (pending_tex_copies.size() < 16 && NextPipePacketIsTextureRegionCopy()) {

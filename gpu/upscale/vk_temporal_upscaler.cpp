@@ -2818,6 +2818,10 @@ void TemporalUpscaler::OnDisplayPassStart(VAddr address) {
     }
 }
 
+bool TemporalUpscaler::FrameGenWanted() const noexcept {
+    return frame_generation && frame_generation->Wanted();
+}
+
 bool TemporalUpscaler::DisplayOverride(VAddr address, Display& display) {
     std::scoped_lock lock{display_mutex};
     const auto it = displays.find(address);

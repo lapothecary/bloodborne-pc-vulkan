@@ -90,7 +90,27 @@ static void print_environment(void) {
         if (kind == BB_ENV_INTERNAL || kind == BB_ENV_BUILD) continue;
         const int secret = name_has(entry, length, "PASSWORD") || name_has(entry, length, "TOKEN") ||
                            name_has(entry, length, "_KEY");
-        printf("%s %.*s=%s", printed++ ? "" : "Environment:", (int)length, entry, secret ? "(set)" : eq + 1);
+        if (secret) {
+            printf("%s %.*s=(set)", printed++ ? "" : "Environment:", (int)length, entry);
+        } else {
+            const char *val = eq + 1;
+#ifdef _WIN32
+            const char *home = getenv("USERPROFILE");
+            const char *alias = "%USERPROFILE%";
+#else
+            const char *home = getenv("HOME");
+            const char *alias = "~";
+#endif
+            size_t hlen = (home && home[0]) ? strlen(home) : 0;
+            while (hlen > 1 && (home[hlen - 1] == '/' || home[hlen - 1] == '\\')) --hlen;
+            if (hlen > 1 && !strncmp(val, home, hlen) &&
+                (val[hlen] == '\0' || val[hlen] == '/' || val[hlen] == '\\')) {
+                printf("%s %.*s=%s%s", printed++ ? "" : "Environment:", (int)length, entry, alias,
+                       val + hlen);
+            } else {
+                printf("%s %.*s=%s", printed++ ? "" : "Environment:", (int)length, entry, val);
+            }
+        }
     }
     if (printed) printf("\n");
 }

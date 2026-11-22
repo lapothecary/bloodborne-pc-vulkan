@@ -648,6 +648,8 @@ constexpr u32 kNativePostFlagDofCustom = 1u << 10;
 constexpr u32 kNativePostFlagDofNearCust = 1u << 11;
 constexpr u32 kNativePostFlagDofFarCust = 1u << 12;
 constexpr u32 kNativePostFlagDofAutoFocus = 1u << 13;
+constexpr u32 kNativePostFlagCamMoved = 1u << 14;
+constexpr u32 kNativePostFlagObjMoved = 1u << 15;
 struct NativePostProcessArgs {
     u64 in_color_tsharp[4];
     u64 lut3d_tsharp[4];

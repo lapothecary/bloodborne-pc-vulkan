@@ -393,4 +393,7 @@ inline std::atomic<std::uint64_t> gpu_signal_faults{0};
 /// Protection changes: calls and pages, those removing write access (TLB shootdowns) apart.
 inline std::atomic<std::uint64_t> protect_calls{0}, protect_pages{0}, protect_revoke_calls{0},
     protect_revoke_pages{0};
+/// Pack #1: True when NativePostFX observed >=2 consecutive static frames (no camera/object motion),
+/// allowing Rasterizer to safely skip redundant 2-pass ps_abf92450 velocity dilation.
+inline std::atomic<bool> mb_idle_skip_dilate{false};
 } // namespace BbStats

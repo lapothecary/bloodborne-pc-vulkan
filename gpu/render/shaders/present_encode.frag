@@ -9,6 +9,9 @@ layout(location = 0) in vec2 uv;
 layout(location = 0) out vec4 color;
 
 layout(binding = 0) uniform sampler2D source;
+#ifdef FUSE_GAMMA_LUT
+layout(binding = 1) uniform sampler1DArray gamma_lut1d;
+#endif
 
 layout(push_constant) uniform Settings {
     float gamma;
@@ -76,6 +79,32 @@ vec3 Decode(vec3 encoded) {
     return mix(curve, encoded / Slope, lessThan(encoded, vec3(Slope * Knee)));
 }
 
+#ifdef FUSE_GAMMA_LUT
+vec3 ApplyGammaLut(vec3 rgb) {
+    const float r = textureLod(gamma_lut1d, vec2(rgb.r, 0.0), 0.0).r;
+    const float g = textureLod(gamma_lut1d, vec2(rgb.g, 1.0), 0.0).r;
+    const float b = textureLod(gamma_lut1d, vec2(rgb.b, 2.0), 0.0).r;
+    return vec3(r, g, b);
+}
+
+// Perceptual-space RCAS (AMD FSR1 spec): runs directly on source before the single per-pixel
+// 1DArray gamma LUT lookup, avoiding 12 redundant LUT fetches and 15 redundant pow() calls.
+vec3 RcasPerceptual(vec3 e) {
+    const vec2 texel_size = 1.0 / vec2(textureSize(source, 0));
+    const vec3 b = clamp(texture(source, uv + vec2(0.0, -texel_size.y)).rgb, 0.0, 1.0);
+    const vec3 d = clamp(texture(source, uv + vec2(-texel_size.x, 0.0)).rgb, 0.0, 1.0);
+    const vec3 f = clamp(texture(source, uv + vec2(texel_size.x, 0.0)).rgb, 0.0, 1.0);
+    const vec3 h = clamp(texture(source, uv + vec2(0.0, texel_size.y)).rgb, 0.0, 1.0);
+    const vec3 mn4 = min(min(b, d), min(f, h));
+    const vec3 mx4 = max(max(b, d), max(f, h));
+    const vec3 hit_min = mn4 / max(4.0 * mx4, 1e-4);
+    const vec3 hit_max = (1.0 - mx4) / min(4.0 * mn4 - 4.0, -1e-4);
+    const vec3 lobe_rgb = max(-hit_min, hit_max);
+    const float lobe = max(-0.1875, min(max(lobe_rgb.r, max(lobe_rgb.g, lobe_rgb.b)), 0.0)) *
+                       min(settings.sharpen, 1.0);
+    return clamp((lobe * (b + d + f + h) + e) / (4.0 * lobe + 1.0), 0.0, 1.0);
+}
+#else
 vec3 Linear(vec3 rgb) {
     return (settings.srgb_input != 0u) ? Decode(rgb) : rgb;
 }
@@ -97,9 +126,35 @@ vec3 Rcas(vec3 e) {
                        min(settings.sharpen, 1.0);
     return (lobe * (b + d + f + h) + e) / (4.0 * lobe + 1.0);
 }
+#endif
 
 void main() {
     vec4 texel = texture(source, uv);
+#ifdef FUSE_GAMMA_LUT
+    // Match Presenter's unfused ImageViewInfo (mapping.a = eOne): display frames must be opaque.
+    texel.a = 1.0;
+    if (settings.hdr == 1u) {
+        color = texel;
+        return;
+    }
+    if (settings.sharpen > 0.0) {
+        texel.rgb = RcasPerceptual(clamp(texel.rgb, 0.0, 1.0));
+    }
+    texel.rgb = ApplyGammaLut(texel.rgb);
+    if (settings.hdr == 2u) {
+        const vec3 lin = (settings.srgb_input != 0u) ? Decode(texel.rgb) : texel.rgb;
+        color = vec4(EncodeHdr10PQ(lin), 1.0);
+        return;
+    }
+    // SDR fast-path: when input is already sRGB-encoded (cb0 Unorm) and user gamma == 1.0,
+    // Encode(Decode(x)) == x identically -> skip all 6 pow() calls!
+    if (settings.srgb_input != 0u && abs(settings.gamma - 1.0) <= 1e-4) {
+        color = vec4(texel.rgb, 1.0);
+        return;
+    }
+    const vec3 lin = (settings.srgb_input != 0u) ? Decode(texel.rgb) : texel.rgb;
+    color = vec4(Encode(lin), 1.0);
+#else
     if (settings.hdr == 1u) {
         color = texel;
         return;
@@ -113,4 +168,5 @@ void main() {
         return;
     }
     color = vec4(Encode(texel.rgb), texel.a);
+#endif
 }

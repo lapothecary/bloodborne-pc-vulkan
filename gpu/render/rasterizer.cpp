@@ -11,6 +11,8 @@
 #include "render/vk_light_tile_batch.h"
 #include "render/vk_mt_direct_recorder.h"
 #include "render/vk_vsm_shadow_memo.h"
+#include "render/vk_bilateral_blur.h"
+#include "render/vk_vsm_blur_batcher.h"
 #include "render/vk_obj_vel_cull.h"
 #include "render/vk_vfx_ui_batch.h"
 #include "render/vk_native_postfx.h"
@@ -930,7 +932,14 @@ struct SceneOcclusionCuller {
             std::array<u64, Scheduler::kNumReorderBuckets> rb_draws{};
             u64 rb_flushes = 0;
             scheduler.ConsumeReorderStats(rb_draws, rb_flushes);
-            if (cand > 0 || sh_skip > 0 || lt_cand > 0 || rb_flushes > 0) {
+            static const bool verbose_cull_log = [] {
+                const char* e = std::getenv("BB_CULL_LOG");
+                return e && e[0] != '\0' && e[0] != '0';
+            }();
+            static bool logged_cull_once = false;
+            if ((cand > 0 || sh_skip > 0 || lt_cand > 0 || rb_flushes > 0) &&
+                (!logged_cull_once || verbose_cull_log)) {
+                logged_cull_once = true;
                 std::printf(
                     "[BB-CULL] 600f: GBuf occluded skipped %llu/%llu (%.1f%%, stageA %llu, "
                     "vis_off %llu, sb_fb %llu, skel %llu/%llu, probed %llu, multi %llu), Lights "
@@ -1211,6 +1220,10 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     prompts = std::make_unique<ButtonPrompts>(instance, scheduler, buffer_cache);
     native_postfx = std::make_unique<NativePostFx>(instance, scheduler, texture_cache,
                                                    buffer_cache, runtime);
+    vsm_blur_batcher = std::make_unique<VsmBlurBatcher>(instance, scheduler, runtime,
+                                                        texture_cache);
+    bilateral_blur = std::make_unique<BilateralBlurCompute>(instance, scheduler, runtime,
+                                                            texture_cache);
     if (!EmulatorSettings.IsNullGPU()) {
         liverpool->BindRasterizer(this);
     }
@@ -1257,6 +1270,8 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
 }
 
 Rasterizer::~Rasterizer() {
+    bilateral_blur.reset();
+    vsm_blur_batcher.reset();
     mt_direct_recorder.reset();
     buffer_cache.SetDirectBuffersManager(nullptr);
     VideoCore::DirectBuffers::SetActiveCaches(nullptr, nullptr);
@@ -2621,6 +2636,16 @@ bool Rasterizer::TryCullSceneOcclusionStageA(const GraphicsPipeline* pipeline,
     return false;
 }
 
+bool Rasterizer::ConsumeFusedGammaDisplay(VAddr display_addr, FusedGammaDisplay& out) noexcept {
+    std::scoped_lock lock{fused_gamma_mutex};
+    if (!fused_gamma_display.valid || fused_gamma_display.display_addr != display_addr) {
+        return false;
+    }
+    out = fused_gamma_display;
+    fused_gamma_display = {};
+    return true;
+}
+
 void Rasterizer::Draw(bool is_indexed, u32 index_offset, const PreparedDraw* prepared) {
     BB_SECTION(ADraw);
     BbStats::draws.fetch_add(1, std::memory_order_relaxed);
@@ -3271,6 +3296,20 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
         }
     }
 
+    // Pack #1 (#6): Skip redundant 2-pass Yebis2 MotionBlurDilateVelocity (`0xabf92450`)
+    // when Native Vulkan PostFX is active and either Object MB is Off (Camera-only MB wants
+    // the crisp undilated silhouette mask) or the frame is static (when v==0, `dot(dir, v) > 0`
+    // in ps_abf92450 is mathematically false for all 8 compass taps).
+    if (const auto* skip_ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+        skip_ps && skip_ps->pgm_hash == 0x00000000abf92450ULL) [[unlikely]] {
+        const auto& s = BbSettings::Get();
+        if (s.native_postfx.load(std::memory_order_relaxed) &&
+            (s.motion_blur_object.load(std::memory_order_relaxed) == 0 ||
+             BbStats::mb_idle_skip_dilate.load(std::memory_order_relaxed))) {
+            return;
+        }
+    }
+
     bind_prepared = used_prepared;
     motion_draw = pipeline->GetGraphicsKey().motion_vectors;
     motion_geometry = 0;
@@ -3335,7 +3374,30 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
             cmd.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &all});
         });
     }
+    if (vsm_blur_batcher) {
+        const auto* vsm_ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+        const bool is_vsm_blur_ps = vsm_ps && vsm_ps->pgm_hash == 0x000000000f61fd27ULL;
+        if (vsm_blur_batcher->HasDeferredCopy() && !is_vsm_blur_ps) [[unlikely]] {
+            FlushDeferredVsmCopy();
+        }
+        if (vsm_blur_batcher->HasPendingCopyBacks() && !is_vsm_blur_ps) [[unlikely]] {
+            const auto& col0 = Regs().color_buffers[0];
+            const bool is_vsm_target = col0 && col0.GetDataFmt() == Gcn::DataFormat::Format16_16 &&
+                                       col0.GetNumberFmt() == Gcn::NumberFormat::Float;
+            if (!is_vsm_target) {
+                FlushVsmBlurCopyBacks();
+            }
+        }
+    }
     PrepareRenderState(pipeline);
+    if (vsm_blur_batcher && vsm_blur_batcher->HasPendingCopyBacks() && cb_descs[0].first)
+        [[unlikely]] {
+        const auto& cb0_range = cb_descs[0].second.view_info.range;
+        if (vsm_blur_batcher->ConflictsWithCopyBack(cb_descs[0].first, cb0_range.base.level,
+                                                    cb0_range.base.layer)) {
+            FlushVsmBlurCopyBacks();
+        }
+    }
     NoteUpscalerDraw(pipeline);
     const PreparedDraw* draw_prepared = bind_prepared;
     // bbport: vertex and index buffers are resolved while the helper binds textures (their
@@ -3349,6 +3411,280 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
         draw_inputs.pipeline = nullptr;
         return;
     }
+
+    // Pack #4 v2: Deferred Single-Wave Compute VSM Blur (`vs 0x0b0acf50 + ps 0x0f61fd27`).
+    // Cancels the preceding `Copy(F[slice] -> S)` and queues the face for a single concurrent
+    // Compute wave at the end of the shadow phase (`0` Graphics<->Compute switches per face).
+    if (vsm_blur_batcher && vsm_blur_batcher->HasDeferredCopy()) [[unlikely]] {
+        const auto& vsm_vs = pipeline->GetStage(Shader::SwStage::Vertex);
+        const auto* vsm_ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+        bool consumed = false;
+        if (vsm_vs.pgm_hash == 0x000000000b0acf50ULL && vsm_ps &&
+            vsm_ps->pgm_hash == 0x000000000f61fd27ULL && cb_descs[0].first &&
+            vsm_ps->buffers.size() == 2u && buffer_infos.size() >= 2u &&
+            vsm_ps->images.size() == 1u && !FrameCapture::Active()) {
+            // `SwStage::Fragment` is stage 0 in `GetStages()`, so PS buffers are slots 0 & 1
+            // (matching `ps_0f61fd27_vsm_blur.frag`: `buf_offsets[0]` and `buf_offsets[1]`).
+            constexpr u32 ssbo1_slot = 0u;
+            constexpr u32 ssbo2_slot = 1u;
+            const u32 d0_dw = static_cast<u32>(push_data.buf_offsets[ssbo1_slot]) >> 2u;
+            const u32 d1_dw = static_cast<u32>(push_data.buf_offsets[ssbo2_slot]) >> 2u;
+            const PreparedStage* ps_prep =
+                draw_prepared ? FindPreparedStage(*vsm_ps) : nullptr;
+            const Gcn::Image src_tsharp =
+                ps_prep ? ps_prep->image_sharps[0]
+                        : vsm_ps->images[0].GetSharpDirect(vsm_ps->FlatUserData().data());
+            const auto& cb0_range = cb_descs[0].second.view_info.range;
+            const VAddr cb0_addr = Regs().color_buffers[0] ? Regs().color_buffers[0].Address() : 0;
+            const auto is_immutable_cb = [&](vk::Buffer b) -> bool {
+                if (!b) return false;
+                if (b == buffer_cache.GetStreamBuffer().Handle()) return true;
+                if (constant_ring && b == constant_ring->Handle()) return true;
+                for (const auto& wr : worker_rings) {
+                    if (wr && b == wr->Handle()) return true;
+                }
+                return false;
+            };
+            consumed = vsm_blur_batcher->TryConsumeDeferredAndBlur(
+                cb_descs[0].first, cb0_range.base.level, cb0_range.base.layer, cb0_addr,
+                src_tsharp.Address(), buffer_infos[ssbo1_slot], buffer_infos[ssbo2_slot], d0_dw,
+                d1_dw, is_immutable_cb(buffer_infos[ssbo1_slot].buffer),
+                is_immutable_cb(buffer_infos[ssbo2_slot].buffer));
+        }
+        if (consumed) {
+            ResetBindings(true);
+            draw_inputs.pipeline = nullptr;
+            return;
+        }
+        // Fallback: flush the deferred copy and re-transition its destination back to ShaderReadOnly
+        // in case BindResources already bound it as a sampled texture for this draw.
+        VsmBlurBatcher::DeferredCopy fallback_copy{};
+        if (vsm_blur_batcher->TakeDeferredCopy(fallback_copy)) {
+            pending_tex_copies.push_back(fallback_copy.args);
+            FlushPendingTextureRegionCopies();
+            if (fallback_copy.dst_id) {
+                auto& dst_img = texture_cache.GetImage(fallback_copy.dst_id);
+                runtime.Transit(&dst_img, vk::ImageLayout::eShaderReadOnlyOptimal,
+                                vk::PipelineStageFlagBits2::eFragmentShader,
+                                vk::AccessFlagBits2::eShaderRead);
+                needs_barrier = true;
+            }
+        }
+    }
+
+    // Pack #3: Native Vulkan Compute + LDS 12-Tap Depth-Aware Bilateral Shadow Blur
+    // (`vs 0x061fbbf6 + ps 0x11ffdfb5`, `GXScreenSpaceShadow_Blur.ppo`).
+    if (bilateral_blur && BilateralBlurCompute::Enabled() && !FrameCapture::Active()) {
+        const auto* bilat_ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+        if (bilat_ps && bilat_ps->pgm_hash == 0x0000000011ffdfb5ULL) [[unlikely]] {
+            const auto& bilat_vs = pipeline->GetStage(Shader::SwStage::Vertex);
+            const bool state_ok =
+                bilat_vs.pgm_hash == 0x00000000061fbbf6ULL && cb_descs[0].first &&
+                !bound_images.empty() && bilat_ps->buffers.size() == 1u &&
+                bilat_ps->images.size() == 1u && ui_placement.edge_x == 0.0f &&
+                ui_placement.edge_y == 0.0f && !Regs().depth_control.depth_enable &&
+                !Regs().depth_control.stencil_enable && !Regs().blend_control[0].enable &&
+                (Regs().color_target_mask.GetMask(0) & 0xFu) == 0xFu;
+            if (!state_ok) {
+                static bool logged_state_miss = false;
+                if (!logged_state_miss) {
+                    logged_state_miss = true;
+                    std::printf("BilateralBlurCompute: state skip (vs=0x%llx cb0=%u bi=%zu "
+                                "bufs=%zu imgs=%zu d=%u s=%u bl=%u mask=0x%x)\n",
+                                static_cast<unsigned long long>(bilat_vs.pgm_hash),
+                                cb_descs[0].first.index, bound_images.size(),
+                                bilat_ps->buffers.size(), bilat_ps->images.size(),
+                                u32(Regs().depth_control.depth_enable),
+                                u32(Regs().depth_control.stencil_enable),
+                                u32(Regs().blend_control[0].enable),
+                                Regs().color_target_mask.GetMask(0));
+                }
+            } else {
+                const PreparedStage* ps_prep =
+                    draw_prepared ? FindPreparedStage(*bilat_ps) : nullptr;
+                const RingBinding* ring =
+                    (num_ring_stages != 0) ? FindRingBinding(*bilat_ps, 0u) : nullptr;
+                VAddr cue_base = 0;
+                VAddr cue_end = 0;
+                VideoCore::DirectBuffers::GetTransientCueHeapBounds(cue_base, cue_end);
+                const u8* cb_p = nullptr;
+                u32 cb_sz = 0u;
+                if (ring) {
+                    cb_sz = ring->size;
+                    if (ring->address != 0 && cb_sz >= 208u) {
+                        if ((ring->address >= cue_base && ring->address + cb_sz <= cue_end) ||
+                            VideoCore::DirectBuffers::IsTransientAuxCpuRing(ring->address, cb_sz) ||
+                            VideoCore::DirectBuffers::IsCpuReadableImmutableRange(ring->address,
+                                                                                  cb_sz)) {
+                            cb_p = reinterpret_cast<const u8*>(ring->address);
+                        } else if (const u8* m =
+                                       direct_buffers.TryGetCpuMirrorPtr(ring->address, cb_sz)) {
+                            cb_p = m;
+                        } else if (!VideoCore::DirectBuffers::OverlapsNativeOwnedRange(
+                                       ring->address, cb_sz) &&
+                                   !buffer_cache.IsConstRamRange(ring->address, cb_sz) &&
+                                   memory->ClampRangeSize(ring->address, cb_sz) == cb_sz) {
+                            cb_p = reinterpret_cast<const u8*>(ring->address);
+                        }
+                    }
+                    if (!cb_p && cb_sz >= 208u) {
+                        cb_p = (ring->ring == 0) ? constant_ring->Data(ring->offset)
+                                                 : worker_rings[ring->ring - 1]->Data(ring->offset);
+                    }
+                } else {
+                    const Gcn::Buffer sharp =
+                        ps_prep ? ps_prep->buffer_sharps[0]
+                                : bilat_ps->buffers[0].GetSharpDirect(
+                                      bilat_ps->FlatUserData().data(), bilat_ps->pgm_base);
+                    if (sharp.Valid()) {
+                        cb_sz = sharp.GetSize();
+                        const VAddr va = sharp.base_address;
+                        if (va != 0 && cb_sz >= 208u) {
+                            if ((va >= cue_base && va + cb_sz <= cue_end) ||
+                                VideoCore::DirectBuffers::IsTransientAuxCpuRing(va, cb_sz) ||
+                                VideoCore::DirectBuffers::IsCpuReadableImmutableRange(va, cb_sz)) {
+                                cb_p = reinterpret_cast<const u8*>(va);
+                            } else if (const u8* m = direct_buffers.TryGetCpuMirrorPtr(va, cb_sz)) {
+                                cb_p = m;
+                            } else if (!VideoCore::DirectBuffers::OverlapsNativeOwnedRange(va,
+                                                                                           cb_sz) &&
+                                       memory->ClampRangeSize(va, cb_sz) == cb_sz) {
+                                cb_p = reinterpret_cast<const u8*>(va);
+                            }
+                        }
+                    }
+                }
+                if (cb_p && cb_sz >= 208u) {
+                    const Gcn::Image src_tsharp =
+                        ps_prep ? ps_prep->image_sharps[0]
+                                : bilat_ps->images[0].GetSharpDirect(
+                                      bilat_ps->FlatUserData().data());
+                    const auto& cb0_range = cb_descs[0].second.view_info.range;
+                    // `PrepareRenderState()` pushes `cb_descs[0].first` into `bound_images[0]`
+                    // before `BindResources()` pushes `fs_img0` at `bound_images.back()`.
+                    VideoCore::ImageId src_id{};
+                    for (auto it = bound_images.rbegin(); it != bound_images.rend(); ++it) {
+                        if (*it && *it != cb_descs[0].first) {
+                            src_id = *it;
+                            break;
+                        }
+                    }
+                    const Gcn::Sampler ssharp =
+                        (!bilat_ps->samplers.empty())
+                            ? (ps_prep ? ps_prep->sampler_sharps[0]
+                                       : bilat_ps->samplers[0].GetSharpDirect(
+                                             bilat_ps->FlatUserData().data()))
+                            : Gcn::Sampler{};
+                    const bool is_nearest =
+                        !bilat_ps->samplers.empty() &&
+                        (ssharp.xy_mag_filter == Gcn::Filter::Point ||
+                         ssharp.xy_mag_filter == Gcn::Filter::AnisoPoint) &&
+                        (ssharp.xy_min_filter == Gcn::Filter::Point ||
+                         ssharp.xy_min_filter == Gcn::Filter::AnisoPoint);
+                    if (bilateral_blur->TryDispatch(src_id, src_tsharp.base_level,
+                                                    src_tsharp.base_array, cb_descs[0].first,
+                                                    cb0_range.base.level, cb0_range.base.layer,
+                                                    cb_p, cb_sz, is_nearest)) {
+                        ResetBindings(true);
+                        draw_inputs.pipeline = nullptr;
+                        return;
+                    }
+                } else {
+                    static bool logged_cb_miss = false;
+                    if (!logged_cb_miss) {
+                        logged_cb_miss = true;
+                        std::printf("BilateralBlurCompute: cb miss (ring=%d cb_sz=%u cb_p=%p)\n",
+                                    ring ? 1 : 0, cb_sz, static_cast<const void*>(cb_p));
+                    }
+                }
+            }
+        }
+    }
+
+    // Pack #2: Pass Fusion for Bloodborne's final 1DArray Display Gamma LUT pass (`ps_38d65b32`).
+    // Instead of reading 1440p from VRAM, running 3 1D-LUT lookups + BGRA swizzle, and writing
+    // 1440p sRGB back to VRAM right before Presenter reads it again, hand `fs_img0` + `fs_img1`
+    // directly to Presenter::EncodePass (`present_encode.frag` compiled with FUSE_GAMMA_LUT=1).
+    static const bool fuse_gamma_pass_enabled = [] {
+        const char* env = std::getenv("BB_FUSE_GAMMA_PASS");
+        return !(env && env[0] == '0');
+    }();
+    if (fuse_gamma_pass_enabled) {
+        const auto* fuse_ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+        const auto& fuse_regs = Regs();
+        const VAddr disp_addr = fuse_regs.color_buffers[0] ? fuse_regs.color_buffers[0].Address() : 0;
+        if (fuse_ps && fuse_ps->pgm_hash == 0x0000000038d65b32ULL) [[unlikely]] {
+            const auto cb_dfmt = fuse_regs.color_buffers[0].GetDataFmt();
+            const auto cb_nfmt = fuse_regs.color_buffers[0].GetNumberFmt();
+            const bool is_disp = disp_addr != 0 && FrameCapture::IsDisplayBuffer(disp_addr);
+            const bool fmt_ok = cb_dfmt == Gcn::DataFormat::Format8_8_8_8 &&
+                                (cb_nfmt == Gcn::NumberFormat::Unorm ||
+                                 cb_nfmt == Gcn::NumberFormat::Srgb);
+            const bool imgs_ok = pipeline->GetStage(Shader::SwStage::Vertex).images.empty() &&
+                                 fuse_ps->images.size() == 2u && fuse_ps->images[1].is_array &&
+                                 image_infos.size() >= 2u && image_infos[0].imageView &&
+                                 image_infos[1].imageView;
+            const bool env_ok = !FrameCapture::Active() && !upscaler->PresentDumpDue() &&
+                                !upscaler->FrameGenWanted();
+            if (is_disp && cb_descs[0].first && fmt_ok && imgs_ok && env_ok) {
+                scheduler.EndRendering();
+                runtime.FlushBarriers();
+                vk::Extent2D src_ext{};
+                if (upscaler->Enabled() && upscaler->IsDisplayRedirected()) {
+                    src_ext = upscaler->UiExtent();
+                } else {
+                    const auto& cb_img = texture_cache.GetImage(cb_descs[0].first);
+                    src_ext = vk::Extent2D{cb_img.info.size.width, cb_img.info.size.height};
+                }
+                {
+                    std::scoped_lock lock{fused_gamma_mutex};
+                    fused_gamma_display = {
+                        .display_addr = disp_addr,
+                        .src_view = image_infos[0].imageView,
+                        .src_layout = image_infos[0].imageLayout,
+                        .src_size = src_ext,
+                        .lut1d_view = image_infos[1].imageView,
+                        .lut1d_layout = image_infos[1].imageLayout,
+                        // When cb0 is Unorm, ps_38d65b32 stored sRGB-encoded LUT bytes directly and
+                        // Presenter's B8G8R8A8Srgb view HW-decoded sRGB->Linear; replicate that in EncodePass.
+                        .needs_srgb_decode = (cb_nfmt == Gcn::NumberFormat::Unorm),
+                        .valid = true,
+                    };
+                }
+                static bool logged_fuse_ok = false;
+                if (!logged_fuse_ok) {
+                    logged_fuse_ok = true;
+                    std::printf("PassFusion: ps_38d65b32 gamma LUT1D fused into Presenter::EncodePass "
+                                "(%ux%u, cb_nfmt=%u, srgb_decode=%d, redir=%d)\n",
+                                src_ext.width, src_ext.height, u32(cb_nfmt),
+                                cb_nfmt == Gcn::NumberFormat::Unorm ? 1 : 0,
+                                (upscaler->Enabled() && upscaler->IsDisplayRedirected()) ? 1 : 0);
+                }
+                ResetBindings(false);
+                draw_inputs.pipeline = nullptr;
+                return;
+            }
+            static bool logged_fuse_skip = false;
+            if (!logged_fuse_skip) {
+                logged_fuse_skip = true;
+                std::printf("PassFusion: ps_38d65b32 skipped (is_disp=%d cb0=%d dfmt=%u nfmt=%u "
+                            "vs_imgs=%zu ps_imgs=%zu arr1=%d infos=%zu env_ok=%d)\n",
+                            is_disp ? 1 : 0, cb_descs[0].first ? 1 : 0, u32(cb_dfmt), u32(cb_nfmt),
+                            pipeline->GetStage(Shader::SwStage::Vertex).images.size(),
+                            fuse_ps->images.size(),
+                            (fuse_ps->images.size() >= 2u && fuse_ps->images[1].is_array) ? 1 : 0,
+                            image_infos.size(), env_ok ? 1 : 0);
+            }
+        }
+        // Defensive guard: if any other draw targets the pending display buffer, drop stale fusion.
+        if (disp_addr != 0 && FrameCapture::IsDisplayBuffer(disp_addr)) [[unlikely]] {
+            std::scoped_lock lock{fused_gamma_mutex};
+            if (fused_gamma_display.valid && fused_gamma_display.display_addr == disp_addr) {
+                fused_gamma_display = {};
+            }
+        }
+    }
+
     const auto state = BeginRendering(pipeline);
 
     if (!inputs_resolved) {
@@ -4895,6 +5231,8 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
 
 void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_indexed,
                                     const IndirectDraw& indirect) {
+    FlushDeferredVsmCopy();
+    FlushVsmBlurCopyBacks();
     buffer_cache.NewPacket();
     if (DrawPipe::OnStageB()) {
         FrameCapture::Poll();
@@ -5111,6 +5449,8 @@ void Rasterizer::DispatchDirect() {
 
 void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
     BB_SECTION(DispatchRecord);
+    FlushDeferredVsmCopy();
+    FlushVsmBlurCopyBacks();
     buffer_cache.NewPacket();
     FrameCapture::Poll();
     gbuffer_draw = false;
@@ -5272,6 +5612,8 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
 
 void Rasterizer::DispatchIndirectRecord(const ComputePipeline* pipeline, VAddr address,
                                         u32 size) {
+    FlushDeferredVsmCopy();
+    FlushVsmBlurCopyBacks();
     if (HasPendingHleCopies()) {
         FlushPendingHleCopies(*this);
     }
@@ -5619,7 +5961,16 @@ void Rasterizer::MarkPass(const GraphicsPipeline* pipeline, const RenderState& s
         const u64 psh = ps ? ps->pgm_hash : 0;
         const char* nat_ps = Shader::Backend::SPIRV::NativeShaderName(psh);
         const char* nat_vs = Shader::Backend::SPIRV::NativeShaderName(vs.pgm_hash);
-        const char* tag = nat_ps ? nat_ps : (nat_vs ? nat_vs : "PS4-SPIRV");
+        std::string tag;
+        if (nat_ps) {
+            tag = nat_ps;
+        } else if (psh != 0) {
+            // Pack #1 (#11): Always surface untranslated Pixel Shaders as [PS4-SPIRV] so [0A]
+            // never hides a heavy PS behind a native VS label (e.g. ps_053bbf3b + vs_9da6aacb).
+            tag = nat_vs ? fmt::format("PS4-SPIRV | {}", nat_vs) : std::string{"PS4-SPIRV"};
+        } else {
+            tag = nat_vs ? nat_vs : "PS4-SPIRV";
+        }
         return fmt::format("{} {}x{} [{}] depth {} vs {:016x} ps {:016x} [{}]",
                            will_begin ? "pass" : "draw", state.width, state.height, targets,
                            db_desc.first ? vk::to_string(

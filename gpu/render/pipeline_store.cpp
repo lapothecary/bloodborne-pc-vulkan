@@ -234,6 +234,20 @@ bool IsOpt49RemasterFireShaderHash(u64 pgm_hash) noexcept {
     }
 }
 
+bool IsOpt56Pack5ShaderHash(u64 pgm_hash) noexcept {
+    switch (pgm_hash) {
+    // Pack #5 (v1.2.3): Native Vulkan 1.3 GLSL 460 for top 5 recurring PS4-SPIRV hotspots
+    case 0x00000000a61e325dULL: // Sample13WeightforGlowKernel
+    case 0x00000000133eb139ULL: // Deferred Decal_DifSpc 5-MRT
+    case 0x000000008a6c7657ULL: // Forward PBR + 4-tap CSM + cutout
+    case 0x000000006720ae0dULL: // Forward Lightmap + wrap/SSS + 4-tap CSM + cutout
+    case 0x00000000c31bd920ULL: // Forward Lightmap + IBL/SSR + wrap/SSS + 4-tap CSM + cutout
+        return true;
+    default:
+        return false;
+    }
+}
+
 std::string OptBinaryName(u64 pgm_hash, size_t perm_idx) {
     const bool hw_interp = Shader::Backend::SPIRV::HwInterpEnabled();
     const bool fast_fp = Shader::Backend::SPIRV::FastFpEnabled();
@@ -248,7 +262,9 @@ std::string OptBinaryName(u64 pgm_hash, size_t perm_idx) {
     if (hw_interp) {
         if (fast_fp) {
             prefix = use_native_prefix
-                         ? (IsOpt49RemasterFireShaderHash(pgm_hash)
+                         ? (IsOpt56Pack5ShaderHash(pgm_hash)
+                                ? "opt57"
+                                : (IsOpt49RemasterFireShaderHash(pgm_hash)
                                 ? "opt55"
                                 : (IsOpt46MotBlurObjFpsShaderHash(pgm_hash)
                                        ? "opt48"
@@ -272,7 +288,7 @@ std::string OptBinaryName(u64 pgm_hash, size_t perm_idx) {
                                                                                          0x00000000f55643deULL ||
                                                                                      ltb_patched)
                                                                                         ? "opt32"
-                                                                                        : "opt31"))))))))))
+                                                                                        : "opt31")))))))))))
                          : (ltb_patched ? "opt6_ltb2" : "opt6_nonat");
         } else {
             prefix = ltb_patched ? "opt3_ltb2" : "opt3_strict";

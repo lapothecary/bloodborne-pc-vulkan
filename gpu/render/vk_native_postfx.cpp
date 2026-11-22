@@ -1729,10 +1729,27 @@ bool NativePostFx::Execute(const BbCp::DirectVk::NativePostProcessArgs& args,
         }
     }
 
-    const bool mb_cam_active = mb_wanted && (mb_cam_lvl > 0) && has_depth;
-    const bool mb_obj_active = mb_wanted && (mb_obj_lvl > 0) && has_vel;
+    const bool cam_moved = (args.flags & BbCp::DirectVk::kNativePostFlagCamMoved) != 0u;
+    const bool obj_moved = (args.flags & BbCp::DirectVk::kNativePostFlagObjMoved) != 0u;
+    const bool mb_cam_active = mb_wanted && (mb_cam_lvl > 0) && has_depth && cam_moved;
+    const bool mb_obj_active = mb_wanted && (mb_obj_lvl > 0) && has_vel && obj_moved;
     const bool mb_active = (mb_cam_active || mb_obj_active || mb_debug_vis) &&
                            EnsureMotionBlurTargets(hdr_extent.width, hdr_extent.height);
+    // Pack #1 (#6 + #10): After >=2 consecutive static frames with neither camera nor object
+    // motion, let Rasterizer skip the redundant 2-pass ps_abf92450 velocity dilation (which is
+    // a mathematical no-op when v==0). Immediately cleared on any motion frame.
+    {
+        static u32 s_static_mb_streak = 0u;
+        if (mb_wanted && !cam_moved && !obj_moved && !mb_debug_vis) {
+            if (s_static_mb_streak < 2u) {
+                ++s_static_mb_streak;
+            }
+            BbStats::mb_idle_skip_dilate.store(s_static_mb_streak >= 2u, std::memory_order_relaxed);
+        } else {
+            s_static_mb_streak = 0u;
+            BbStats::mb_idle_skip_dilate.store(false, std::memory_order_relaxed);
+        }
+    }
     const bool dof_active =
         dof_wanted && has_depth && EnsureDofTargets(hdr_extent.width, hdr_extent.height);
 
@@ -2145,15 +2162,8 @@ bool NativePostFx::Execute(const BbCp::DirectVk::NativePostProcessArgs& args,
         .flags = (mb_cam_active ? 1u : 0u) | (mb_obj_active ? 2u : 0u) | (mb_debug_vis ? 4u : 0u),
     };
 
-    if (auto* prof = GpuProfiler::Get(); prof && prof->Records(&scheduler)) {
-        prof->Mark(0x9A71FE03ULL, [hdr_extent, out_extent, dof_active, mb_active, bloom_on, heat_haze_on] {
-            return fmt::format("NativePostFX: Execute {}x{}->{}x{} [DoF:{} MB:{} Bloom:{} Haze:{}] [VULKAN-NATIVE]",
-                               hdr_extent.width, hdr_extent.height, out_extent.width, out_extent.height,
-                               dof_active ? 1 : 0, mb_active ? 1 : 0, bloom_on ? 1 : 0, heat_haze_on ? 1 : 0);
-        });
-    }
-    scheduler.Record([=](vk::CommandBuffer cmdbuf) {
-        if (need_clear) {
+    if (need_clear) {
+        scheduler.Record([=](vk::CommandBuffer cmdbuf) {
             cmdbuf.fillBuffer(h_buf, 0, kHistBufBytes, 0u);
             cmdbuf.fillBuffer(e_buf, 0, kExpStateBufBytes, 0u);
             const vk::ImageMemoryBarrier2 blk_to_clear{
@@ -2207,10 +2217,19 @@ bool NativePostFx::Execute(const BbCp::DirectVk::NativePostProcessArgs& args,
                 .imageMemoryBarrierCount = u32(dummy_bars.size()),
                 .pImageMemoryBarriers = dummy_bars.data(),
             });
-        }
+        });
+    }
 
-        // Pass 0 (Compute): Native 16-tap Bilateral IGN Motion Blur (Camera Depth + Object velWrap).
-        if (mb_active) {
+    // Pass 0 (Compute): Native 16-tap Bilateral IGN Motion Blur (Camera Depth + Object velWrap).
+    if (mb_active) {
+        GpuProfiler::HudMarkPass(&scheduler, BbStats::GpuSub_Post_MotionBlur);
+        if (auto* prof = GpuProfiler::Get(); prof && prof->Records(&scheduler)) {
+            prof->Mark(0x9A71FE10ULL, [hdr_extent] {
+                return fmt::format("NativePostFX: MotionBlur {}x{} [VULKAN-NATIVE]",
+                                   hdr_extent.width, hdr_extent.height);
+            });
+        }
+        scheduler.Record([=](vk::CommandBuffer cmdbuf) {
             const vk::ImageSubresourceRange one_range{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
             const vk::ImageMemoryBarrier2 vel_to_write{
                 .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
@@ -2349,10 +2368,19 @@ bool NativePostFx::Execute(const BbCp::DirectVk::NativePostProcessArgs& args,
             };
             cmdbuf.pipelineBarrier2(
                 {.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &mb_to_sampled});
-        }
+        });
+    }
 
-        // Pass 0b (Compute): Native Resolution-Independent FP16 Bokeh Depth of Field (3 passes).
-        if (dof_active) {
+    // Pass 0b (Compute): Native Resolution-Independent FP16 Bokeh Depth of Field (3 passes).
+    if (dof_active) {
+        GpuProfiler::HudMarkPass(&scheduler, BbStats::GpuSub_Post_DoF);
+        if (auto* prof = GpuProfiler::Get(); prof && prof->Records(&scheduler)) {
+            prof->Mark(0x9A71FE11ULL, [hdr_extent] {
+                return fmt::format("NativePostFX: DoF {}x{} [VULKAN-NATIVE]",
+                                   hdr_extent.width, hdr_extent.height);
+            });
+        }
+        scheduler.Record([=](vk::CommandBuffer cmdbuf) {
             const vk::ImageSubresourceRange one_range{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
             const vk::DescriptorImageInfo samp_info{
                 .sampler = samp,
@@ -2551,8 +2579,23 @@ bool NativePostFx::Execute(const BbCp::DirectVk::NativePostProcessArgs& args,
             };
             cmdbuf.pipelineBarrier2(
                 {.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &dof_to_sampled});
-        }
+        });
+    }
 
+    // Pass 1 & 2 (Compute): True-dt Auto-Exposure + 5-level FP16 Dual-Kawase Bloom Pyramid.
+    if (auto_exp_on || bloom_on) {
+        GpuProfiler::HudMarkPass(&scheduler, bloom_on ? BbStats::GpuSub_Post_BloomGlare
+                                                      : BbStats::GpuSub_Post_TonemapLut);
+        if (auto* prof = GpuProfiler::Get(); prof && prof->Records(&scheduler)) {
+            prof->Mark(bloom_on ? 0x9A71FE12ULL : 0x9A71FE14ULL, [hdr_extent, bloom_on, heat_haze_on] {
+                return bloom_on
+                           ? fmt::format("NativePostFX: Bloom+AutoExp {}x{} [Haze:{}] [VULKAN-NATIVE]",
+                                         hdr_extent.width, hdr_extent.height, heat_haze_on ? 1 : 0)
+                           : fmt::format("NativePostFX: AutoExposure {}x{} [VULKAN-NATIVE]",
+                                         hdr_extent.width, hdr_extent.height);
+            });
+        }
+        scheduler.Record([=](vk::CommandBuffer cmdbuf) {
         // Pass 1 & 2 (Compute): True-dt Auto-Exposure (256-bin histogram + log2-EV adaptation).
         if (auto_exp_on) {
             const vk::DescriptorImageInfo hdr_info{
@@ -2818,8 +2861,19 @@ bool NativePostFx::Execute(const BbCp::DirectVk::NativePostProcessArgs& args,
                     {.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_sampled});
             }
         }
+        });
+    }
 
-        // Pass 3 (Graphics): Unified Tonemap + Bloom + Original 3D LUT + CA + Vignette + True Black.
+    // Pass 3 (Graphics): Unified Tonemap + Bloom + Original 3D LUT + CA + Vignette + True Black.
+    GpuProfiler::HudMarkPass(&scheduler, BbStats::GpuSub_Post_TonemapLut);
+    if (auto* prof = GpuProfiler::Get(); prof && prof->Records(&scheduler)) {
+        prof->Mark(0x9A71FE13ULL, [out_extent, bloom_on, heat_haze_on] {
+            return fmt::format("NativePostFX: Tonemap+LUT {}x{} [Bloom:{} Haze:{}] [VULKAN-NATIVE]",
+                               out_extent.width, out_extent.height, bloom_on ? 1 : 0,
+                               heat_haze_on ? 1 : 0);
+        });
+    }
+    scheduler.Record([=](vk::CommandBuffer cmdbuf) {
         const vk::DescriptorImageInfo hdr_info{
             .sampler = VK_NULL_HANDLE,
             .imageView = post_scene_view,
@@ -2901,7 +2955,6 @@ bool NativePostFx::Execute(const BbCp::DirectVk::NativePostProcessArgs& args,
     if (upscaler) {
         upscaler->OnColorTarget(out_id);
     }
-    GpuProfiler::HudMarkPass(&scheduler, BbStats::GpuSub_Post_TonemapLut);
     scheduler.BumpDescriptorStateEpoch();
     return true;
 }

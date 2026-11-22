@@ -26,10 +26,14 @@ public:
     EncodePass(vk::Device device, vk::Format sdr_output_format);
     ~EncodePass();
 
-    /// Draws `input` (shader read layout) over all of `output` (color attachment layout, left
-    /// in it).
+    /// Draws `input` (`input_layout`) over all of `output` (color attachment layout, left in it).
+    /// When `lut1d_view` is non-null (Pack #2 Pass Fusion of ps_38d65b32), samples Bloodborne's
+    /// 1DArray brightness/gamma LUT directly inside EncodePass instead of running a separate pass.
     void Render(vk::CommandBuffer cmdbuf, vk::ImageView input, vk::ImageView output,
-                vk::Extent2D output_size, const Settings& settings);
+                vk::Extent2D output_size, const Settings& settings,
+                vk::ImageLayout input_layout = vk::ImageLayout::eShaderReadOnlyOptimal,
+                vk::ImageView lut1d_view = VK_NULL_HANDLE,
+                vk::ImageLayout lut1d_layout = vk::ImageLayout::eShaderReadOnlyOptimal);
 
 private:
     vk::UniqueSampler sampler;
@@ -37,6 +41,10 @@ private:
     vk::UniquePipelineLayout layout;
     vk::UniquePipeline pipeline_sdr;
     vk::UniquePipeline pipeline_hdr;
+    vk::UniqueDescriptorSetLayout set_layout_fused;
+    vk::UniquePipelineLayout layout_fused;
+    vk::UniquePipeline pipeline_sdr_fused;
+    vk::UniquePipeline pipeline_hdr_fused;
 };
 
 } // namespace Vulkan

@@ -18,11 +18,12 @@ inline void NoteVelocitySilhouetteMask() noexcept {
     }
 }
 
-// Minimum single-frame 3x4 bone matrix delta (~1.2 cm world translation or ~0.7 deg rotation)
-// at 30 FPS required to produce >= 1 pixel of visible Yebis2 object motion blur.
-// Scaled dynamically by `frames = dt * 30` so high-FPS (90..300 FPS) weapon swings/dodges
-// are never culled as stationary while idle breathing remains well below threshold.
-inline constexpr float kObjectVelocityBoneDeltaThreshold = 0.012f;
+// Minimum single-frame 3x4 bone matrix delta (~4.5 cm world translation or ~2.5 deg rotation)
+// at 30 FPS required to produce >= 1 pixel of visible object motion blur (above NativePostFX's
+// 0.0065 NDC deadzone). Scaled dynamically by `frames = dt * 30` so high-FPS (90..300 FPS)
+// walks, dodges, and weapon swings trigger immediately while standing idle breathing / coat hem
+// wind sway / Doll idle sway stay cleanly below threshold (skipping 0.11 ms MB work at rest).
+inline constexpr float kObjectVelocityBoneDeltaThreshold = 0.045f;
 inline std::atomic<float> g_obj_vel_bone_thresh_scaled{kObjectVelocityBoneDeltaThreshold};
 
 inline void UpdateObjectVelocityThresholdScale(float frames_per_30) noexcept {

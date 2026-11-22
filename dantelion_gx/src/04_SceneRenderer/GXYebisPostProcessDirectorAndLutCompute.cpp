@@ -2110,9 +2110,12 @@ void sub_21d5f80(void* self, void* renderCmdCtx, void* filterParam) {
             const uint32_t mbUserFlags = gx_direct_vk::GetMotionBlurScales(
                 mbDummy0, mbDummy1, mbDummy2, mbCamThreshScale);
             gx_direct_vk::UpdateObjectVelocityThresholdScale(mbCamThreshScale);
-            (void)gx_direct_vk::ConsumeActiveObjectVelocity();
+            const bool objMoved = gx_direct_vk::ConsumeActiveObjectVelocity();
             if (mbUserFlags != 0u && *reinterpret_cast<const int32_t*>(param + 0x1dc) != 0) {
                 flags |= gx_direct_vk::kNativePostFlag_MotionBlur;
+                if (objMoved) {
+                    flags |= gx_direct_vk::kNativePostFlag_ObjMoved;
+                }
             }
             const bool dofEnabled = gx_direct_vk::IsEffectEnabled(gx_direct_vk::kEffectDof) &&
                                     (*reinterpret_cast<const int32_t*>(param + 0x1ac) != 0);
@@ -2208,12 +2211,21 @@ void sub_21d5f80(void* self, void* renderCmdCtx, void* filterParam) {
                 sub_21aaa90(curVp, sceneView);
             }
             const bool resetCamera = ((resetFlags & 1u) != 0u) || !s_hasPrevVp || (sceneView == nullptr);
+            bool camMoved = false;
             if (resetCamera) {
                 // Identity matrix -> zero camera velocity on cutscenes / warps / first frame.
                 for (int i = 0; i < 16; ++i) {
                     postArgs.clip_to_prev_clip[i] = ((i & 3) == (i >> 2)) ? 1.0f : 0.0f;
                 }
             } else {
+                float maxCamDelta = 0.0f;
+                for (int i = 0; i < 16; ++i) {
+                    const float d = std::fabs(curVp[i] - s_prevVp[i]);
+                    if (d > maxCamDelta) {
+                        maxCamDelta = d;
+                    }
+                }
+                camMoved = (maxCamDelta > (f0_0001 * mbCamThreshScale));
                 alignas(16) float invCurVp[16] = {};
                 InvertMatrix4x4Simd(invCurVp, curVp);
                 // Row-vector multiply: M = invCurVp * prevVp (so cur_clip * M = prev_clip).
@@ -2228,6 +2240,9 @@ void sub_21d5f80(void* self, void* renderCmdCtx, void* filterParam) {
                             a2 * s_prevVp[2 * 4 + c] + a3 * s_prevVp[3 * 4 + c];
                     }
                 }
+            }
+            if (camMoved) {
+                postArgs.flags |= gx_direct_vk::kNativePostFlag_CamMoved;
             }
             if (sceneView != nullptr) {
                 std::memcpy(s_prevVp, curVp, sizeof(s_prevVp));

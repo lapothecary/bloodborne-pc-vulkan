@@ -1,0 +1,120 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Pack #3: Native Vulkan Compute Vertical 12-Tap Depth-Aware Bilateral Blur
+// Replaces vertical pass of `ps_11ffdfb5` (GXScreenSpaceShadow_Blur.ppo) using a
+// 2D-coalesced 16x32 LDS tile (16x16 threads, 2 rows/thread, 16 KiB LDS = 100% SM occupancy,
+// 0 LDS bank conflicts, ~1.375 texel fetches/px instead of 13, 0 SSBO reads).
+#version 460
+#extension GL_EXT_samplerless_texture_functions : require
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(push_constant) uniform BilateralParams {
+    uint width;
+    uint height;
+    float z_a;
+    uint halo;
+    ivec4 delta0;
+    ivec4 delta1;
+    ivec4 delta2;
+    vec4 kw0;
+    vec4 kw1;
+    vec4 kw2;
+} pc;
+
+layout(set = 0, binding = 0) uniform texture2D src_tex;
+layout(set = 0, binding = 1, rgba8) writeonly uniform image2D dst_img;
+
+const int kBlockW = 16;
+const int kBlockH = 32;
+const int kMaxHalo = 16;
+const int kMaxTileH = kBlockH + 2 * kMaxHalo; // 64
+
+shared float s_d[kMaxTileH * kBlockW];
+shared float s_inv[kMaxTileH * kBlockW];
+shared float s_a[kMaxTileH * kBlockW];
+shared uint s_rgba[kMaxTileH * kBlockW];
+
+float unpack_depth(vec3 rgb) {
+    return rgb.b + (rgb.g * 0.00392156886 + rgb.r * 1.53787005e-05);
+}
+
+float safe_inv(float denom) {
+    return (abs(denom) > 1e-12) ? (1.0 / denom) : 1e12;
+}
+
+void main() {
+    const int w = int(pc.width);
+    const int h = int(pc.height);
+    const int halo = int(pc.halo);
+    const int lx = int(gl_LocalInvocationID.x);
+    const int ly = int(gl_LocalInvocationID.y);
+    const int bx = int(gl_WorkGroupID.x) * kBlockW;
+    const int by = int(gl_WorkGroupID.y) * kBlockH;
+    const int gx = bx + lx;
+    const int cx = clamp(gx, 0, w - 1);
+    const int tile_h = kBlockH + 2 * halo;
+
+    // 1. Coalesced 2D cooperative load into LDS (16-wide rows -> 64 B aligned, 0 bank conflicts).
+    for (int row = ly; row < tile_h; row += 16) {
+        const int cy = clamp(by - halo + row, 0, h - 1);
+        const vec4 s = texelFetch(src_tex, ivec2(cx, cy), 0);
+        const float d = unpack_depth(s.rgb);
+        const int idx = row * kBlockW + lx;
+        s_d[idx] = d;
+        s_inv[idx] = safe_inv(pc.z_a - d);
+        s_a[idx] = s.a;
+        s_rgba[idx] = packUnorm4x8(s);
+    }
+
+    barrier();
+
+    if (gx >= w) {
+        return;
+    }
+
+    // 2. Compute 2 vertical output pixels per thread (row ly and row ly + 16).
+    for (int p = 0; p < 2; ++p) {
+        const int local_y = ly + p * 16;
+        const int gy = by + local_y;
+        if (gy >= h) {
+            continue;
+        }
+        const int center_row = local_y + halo;
+        const int cidx = center_row * kBlockW + lx;
+        const float d0 = s_d[cidx];
+        const vec4 s0 = unpackUnorm4x8(s_rgba[cidx]);
+        if (d0 >= 0.99999) {
+            imageStore(dst_img, ivec2(gx, gy), s0);
+            continue;
+        }
+
+        float w_sum = 1.0;
+        float val_sum = s0.a;
+
+#define ACCUM_TAP(DELTA, KW)                                                     \
+        do {                                                                     \
+            const int idx = (center_row + (DELTA)) * kBlockW + lx;               \
+            const float rel_dz = (d0 - s_d[idx]) * s_inv[idx];                   \
+            const float wk = (KW) * exp2((rel_dz * rel_dz) * (-144.269501));     \
+            w_sum += wk;                                                         \
+            val_sum += s_a[idx] * wk;                                            \
+        } while (false)
+
+        ACCUM_TAP(pc.delta0.x, pc.kw0.x);
+        ACCUM_TAP(pc.delta0.y, pc.kw0.y);
+        ACCUM_TAP(pc.delta0.z, pc.kw0.z);
+        ACCUM_TAP(pc.delta0.w, pc.kw0.w);
+        ACCUM_TAP(pc.delta1.x, pc.kw1.x);
+        ACCUM_TAP(pc.delta1.y, pc.kw1.y);
+        ACCUM_TAP(pc.delta1.z, pc.kw1.z);
+        ACCUM_TAP(pc.delta1.w, pc.kw1.w);
+        ACCUM_TAP(pc.delta2.x, pc.kw2.x);
+        ACCUM_TAP(pc.delta2.y, pc.kw2.y);
+        ACCUM_TAP(pc.delta2.z, pc.kw2.z);
+        ACCUM_TAP(pc.delta2.w, pc.kw2.w);
+
+#undef ACCUM_TAP
+
+        imageStore(dst_img, ivec2(gx, gy), vec4(s0.rgb, val_sum / w_sum));
+    }
+}

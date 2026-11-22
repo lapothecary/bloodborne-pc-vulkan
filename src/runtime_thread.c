@@ -326,7 +326,9 @@ static int32_t create(GuestThread **out,ThreadAttr **attr_slot,GuestEntry entry,
     }
     sched_yield();
     pthread_mutex_lock(&lock); ++created; pthread_mutex_unlock(&lock);
-    printf("Runtime: guest thread '%s' created (stack=%llu, prio=%d)\n",t->name,(unsigned long long)stack,t->attr.prio);
+    if (bb_env_on("BB_VERBOSE_RUNTIME")) {
+        printf("Runtime: guest thread '%s' created (stack=%llu, prio=%d)\n",t->name,(unsigned long long)stack,t->attr.prio);
+    }
     return 0;
 }
 static ABI int32_t thread_create(GuestThread **out,ThreadAttr **attr,GuestEntry entry,void *argument,const char *name) {

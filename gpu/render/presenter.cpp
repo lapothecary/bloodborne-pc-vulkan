@@ -241,12 +241,20 @@ void Presenter::ReleaseFrame(Frame* frame) {
 Frame* Presenter::PrepareFrame(const BbVideoOut::BufferAttributeGroup& attribute,
                                VAddr cpu_address) {
     BbTimeline::Note(BbTimeline::PipeTask, 4, draw_scheduler.CurrentTick());
+    // Pack #2: Check if Rasterizer fused Bloodborne's final 1DArray Display Gamma LUT pass
+    // (`ps_38d65b32`) directly into EncodePass (eliminating a full-res 1440p VRAM round-trip).
+    Rasterizer::FusedGammaDisplay fused{};
+    const bool can_fuse_gamma =
+        attribute.attrib.pixel_format == BbVideoOut::PixelFormat::A8R8G8B8Srgb;
+    const bool fused_gamma =
+        can_fuse_gamma && rasterizer && rasterizer->ConsumeFusedGammaDisplay(cpu_address, fused);
+
     // Scaled upscaler presets: the output-size display buffer drawn by the port.
     TemporalUpscaler::Display display{};
     auto& upscaler = rasterizer->GetUpscaler();
-    const bool upscaled = upscaler.DisplayOverride(cpu_address, display);
+    const bool upscaled = !fused_gamma && upscaler.DisplayOverride(cpu_address, display);
     VideoCore::ImageId image_id{};
-    if (!upscaled) {
+    if (!fused_gamma && !upscaled) {
         auto desc = VideoCore::TextureCache::ImageDesc{attribute, cpu_address};
         image_id = texture_cache.FindImage(desc);
         texture_cache.UpdateImage(image_id);
@@ -254,6 +262,10 @@ Frame* Presenter::PrepareFrame(const BbVideoOut::BufferAttributeGroup& attribute
 
     Frame* frame = GetRenderFrame();
 
+    if (rasterizer) {
+        rasterizer->FlushDeferredVsmCopy();
+        rasterizer->FlushVsmBlurCopyBacks();
+    }
     if (HasPendingHleCopies()) {
         FlushPendingHleCopies(*rasterizer);
     }
@@ -266,8 +278,17 @@ Frame* Presenter::PrepareFrame(const BbVideoOut::BufferAttributeGroup& attribute
     // The frame is opaque: alpha would blend it with the overlay.
     view_info.mapping.a = vk::ComponentSwizzle::eOne;
     vk::ImageView source{};
+    vk::ImageLayout source_layout = vk::ImageLayout::eShaderReadOnlyOptimal;
+    vk::ImageView lut1d_view{};
+    vk::ImageLayout lut1d_layout = vk::ImageLayout::eShaderReadOnlyOptimal;
     vk::Extent2D source_size{};
-    if (upscaled) {
+    if (fused_gamma) {
+        source = fused.src_view;
+        source_layout = fused.src_layout;
+        source_size = fused.src_size;
+        lut1d_view = fused.lut1d_view;
+        lut1d_layout = fused.lut1d_layout;
+    } else if (upscaled) {
         const vk::Device device = instance.GetDevice();
         source = Check(device.createImageView({
             .image = display.image,
@@ -332,7 +353,10 @@ Frame* Presenter::PrepareFrame(const BbVideoOut::BufferAttributeGroup& attribute
     const EncodePass::Settings encode{
         .gamma = gamma.load(std::memory_order_relaxed),
         .hdr = hdr_mode,
-        .srgb_input = attribute.attrib.pixel_format == BbVideoOut::PixelFormat::A2R10G10B10Srgb,
+        .srgb_input = fused_gamma
+                          ? u32(fused.needs_srgb_decode)
+                          : u32(attribute.attrib.pixel_format ==
+                                BbVideoOut::PixelFormat::A2R10G10B10Srgb),
         // Sharpening without an upscaler, or with DLSS/DLAA (NGX DLSS 2.5.1+ removed internal sharpening).
         .sharpen = (BbSettings::EffectiveUpscaler() == BbSettings::UpscalerOff ||
                     BbSettings::EffectiveUpscaler() == BbSettings::UpscalerDlss) &&
@@ -350,7 +374,15 @@ Frame* Presenter::PrepareFrame(const BbVideoOut::BufferAttributeGroup& attribute
     // The encode pass holds no state: frames of different submissions may be recorded on two
     // threads at once.
     GpuProfiler::HudMarkPass(&draw_scheduler, BbStats::GpuSub_Ui_RcasPresent);
-    draw_scheduler.Record([this, frame, source, encode, stream, crumb](vk::CommandBuffer cmdbuf) {
+    if (auto* prof = GpuProfiler::Get(); prof && prof->Records(&draw_scheduler)) {
+        prof->Mark(fused_gamma ? 0x9A71FE20ULL : 0x9A71FE21ULL, [frame, fused_gamma, sharpen = encode.sharpen] {
+            return fmt::format("Presenter: EncodePass {}x{} [FusedGamma1D:{} RCAS:{}] [VULKAN-NATIVE]",
+                               frame->width, frame->height, fused_gamma ? 1 : 0,
+                               sharpen > 0.0f ? 1 : 0);
+        });
+    }
+    draw_scheduler.Record([this, frame, source, source_layout, lut1d_view, lut1d_layout, encode,
+                           stream, crumb](vk::CommandBuffer cmdbuf) {
         if (crumb) {
             Breadcrumbs::Mark(cmdbuf, stream, crumb, false);
         }
@@ -366,7 +398,8 @@ Frame* Presenter::PrepareFrame(const BbVideoOut::BufferAttributeGroup& attribute
             .subresourceRange = ColorRange,
         };
         cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_attachment});
-        encode_pass.Render(cmdbuf, source, frame->image_view, size, encode);
+        encode_pass.Render(cmdbuf, source, frame->image_view, size, encode, source_layout,
+                           lut1d_view, lut1d_layout);
         // Read by the present blit (or a dump) in the general layout, after a semaphore wait.
         const vk::ImageMemoryBarrier2 to_general{
             .srcStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,

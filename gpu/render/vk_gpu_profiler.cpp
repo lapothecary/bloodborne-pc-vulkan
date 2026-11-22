@@ -487,7 +487,9 @@ void GpuProfiler::Print(bool to_file) {
     std::vector<std::pair<u64, Total>> sorted(totals.begin(), totals.end());
     std::ranges::sort(sorted, [](const auto& a, const auto& b) { return a.second.ms > b.second.ms; });
     auto is_idle_key = [](u64 k) noexcept {
-        return k >= SubmissionGapKey && k < SubmissionGapKey + 0x20;
+        // 0x5B318 is `(submission start: copies and barriers)` — real active GPU work.
+        // 0x5B319 is `(after a frame's last submission: presenter, GPU idle)` and 0x5B320..0x5B32F are gaps.
+        return k == 0x5B319ull || (k >= 0x5B320ull && k < 0x5B330ull);
     };
     double sum = 0.0;
     double idle_sum = 0.0;
@@ -650,7 +652,15 @@ void GpuProfiler::Print(bool to_file) {
             const auto& st = sorted_draws[i];
             const char* nat_ps = Shader::Backend::SPIRV::NativeShaderName(st.ps_hash);
             const char* nat_vs = Shader::Backend::SPIRV::NativeShaderName(st.vs_hash);
-            const char* tag = nat_ps ? nat_ps : (nat_vs ? nat_vs : "PS4-SPIRV");
+            std::string tag_str;
+            if (nat_ps) {
+                tag_str = nat_ps;
+            } else if (st.ps_hash != 0) {
+                tag_str = nat_vs ? (std::string{"PS4-SPIRV | "} + nat_vs) : std::string{"PS4-SPIRV"};
+            } else {
+                tag_str = nat_vs ? nat_vs : "PS4-SPIRV";
+            }
+            const char* tag = tag_str.c_str();
             if (verbose) {
                 std::printf("    %6.1f draws/f %9.1f idx/f  %4ux%-4u [%u MRT] vs %016llx ps %016llx [%s]\n",
                             double(st.draws) * inv_df, double(st.vtx_instances) * inv_df, st.width,

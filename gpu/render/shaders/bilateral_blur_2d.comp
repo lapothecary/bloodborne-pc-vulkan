@@ -1,0 +1,181 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Pack #3 v2: High-Speed 2D 12-Tap Depth-Aware Bilateral Blur (32x16 LDS Tile, halo <= 6)
+// Optimizations vs v1:
+//  1. 32x16 output tile (2 pixels/thread, 16x16 workgroup) -> 16.1 KiB LDS = 100% Ada occupancy,
+//     1.875–2.41 texel fetches/px (vs 13.0 in fragment), 0 LDS bank conflicts (stride=48).
+//  2. Tile-level All-Sky early-out BEFORE halo loads / divisions / LDS writes (saves 100% of
+//     halo & SFU work on sky tiles).
+//  3. Zero integer division / modulo in cooperative halo load (exact 4-strip decomposition).
+//  4. Pre-scaled reciprocal `sqrt(144.269501) / (z_a - d)` in LDS -> saves 12 muls/px in loop.
+#version 460
+#extension GL_EXT_samplerless_texture_functions : require
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(push_constant) uniform Bilateral2DParams {
+    uint width;
+    uint height;
+    float z_a;
+    uint halo;
+    uvec4 dxy0; // taps 0..7
+    uvec2 dxy1; // taps 8..11
+    uvec2 pad;
+    vec4 kw0;   // taps 0..3
+    vec4 kw1;   // taps 4..7
+    vec4 kw2;   // taps 8..11
+} pc;
+
+layout(set = 0, binding = 0) uniform texture2D src_tex;
+layout(set = 0, binding = 1, rgba8) writeonly uniform image2D dst_img;
+
+const int kBlockW = 32;
+const int kBlockH = 16;
+const int kMaxHalo = 6;
+const int kMaxTileH = kBlockH + 2 * kMaxHalo; // 28
+const int kStride = 48;                       // odd multiple of 16 (>= 32+12=44) -> 0 LDS bank conflicts
+const float kSqrtExpScale = 12.011223959280756; // sqrt(144.269501)
+
+shared float s_d[kMaxTileH * kStride];
+shared float s_inv[kMaxTileH * kStride];
+shared float s_a[kMaxTileH * kStride];
+shared uint s_any_work;
+
+float unpack_depth(vec3 rgb) {
+    return rgb.b + (rgb.g * 0.00392156886 + rgb.r * 1.53787005e-05);
+}
+
+float safe_inv_scaled(float denom) {
+    return (abs(denom) > 1e-12) ? (kSqrtExpScale / denom) : (kSqrtExpScale * 1e12);
+}
+
+void load_halo_texel(int col, int row, int bx, int by, int halo, int w, int h) {
+    const int cx = clamp(bx - halo + col, 0, w - 1);
+    const int cy = clamp(by - halo + row, 0, h - 1);
+    const vec4 s = texelFetch(src_tex, ivec2(cx, cy), 0);
+    const float d = unpack_depth(s.rgb);
+    const int idx = row * kStride + col;
+    s_d[idx] = d;
+    s_inv[idx] = safe_inv_scaled(pc.z_a - d);
+    s_a[idx] = s.a;
+}
+
+float eval_12taps(int cx_l, int cy_l, float d0, float a0) {
+    float w_sum = 1.0;
+    float val_sum = a0;
+
+#define ACCUM_TAP2D(PACKED, SHIFT, KW)                                     \
+    do {                                                                   \
+        const int dx = bitfieldExtract(int(PACKED), (SHIFT), 8);           \
+        const int dy = bitfieldExtract(int(PACKED), (SHIFT) + 8, 8);       \
+        const int idx = (cy_l + dy) * kStride + (cx_l + dx);               \
+        const float x = (d0 - s_d[idx]) * s_inv[idx];                      \
+        const float wk = (KW) * exp2(-(x * x));                            \
+        w_sum += wk;                                                       \
+        val_sum += s_a[idx] * wk;                                          \
+    } while (false)
+
+    ACCUM_TAP2D(pc.dxy0.x,  0, pc.kw0.x);
+    ACCUM_TAP2D(pc.dxy0.x, 16, pc.kw0.y);
+    ACCUM_TAP2D(pc.dxy0.y,  0, pc.kw0.z);
+    ACCUM_TAP2D(pc.dxy0.y, 16, pc.kw0.w);
+    ACCUM_TAP2D(pc.dxy0.z,  0, pc.kw1.x);
+    ACCUM_TAP2D(pc.dxy0.z, 16, pc.kw1.y);
+    ACCUM_TAP2D(pc.dxy0.w,  0, pc.kw1.z);
+    ACCUM_TAP2D(pc.dxy0.w, 16, pc.kw1.w);
+    ACCUM_TAP2D(pc.dxy1.x,  0, pc.kw2.x);
+    ACCUM_TAP2D(pc.dxy1.x, 16, pc.kw2.y);
+    ACCUM_TAP2D(pc.dxy1.y,  0, pc.kw2.z);
+    ACCUM_TAP2D(pc.dxy1.y, 16, pc.kw2.w);
+
+#undef ACCUM_TAP2D
+
+    return val_sum / w_sum;
+}
+
+void main() {
+    const int w = int(pc.width);
+    const int h = int(pc.height);
+    const int halo = int(pc.halo);
+    const int lx = int(gl_LocalInvocationID.x);
+    const int ly = int(gl_LocalInvocationID.y);
+    const int bx = int(gl_WorkGroupID.x) * kBlockW;
+    const int by = int(gl_WorkGroupID.y) * kBlockH;
+
+    // 1. Load each thread's 2 output pixels into registers (100% coalesced).
+    const int gx0 = bx + lx;
+    const int gx1 = bx + lx + 16;
+    const int gy = by + ly;
+    const int cy = clamp(gy, 0, h - 1);
+    const vec4 s0 = texelFetch(src_tex, ivec2(clamp(gx0, 0, w - 1), cy), 0);
+    const vec4 s1 = texelFetch(src_tex, ivec2(clamp(gx1, 0, w - 1), cy), 0);
+    const float d0 = unpack_depth(s0.rgb);
+    const float d1 = unpack_depth(s1.rgb);
+
+    // 2. Fast tile-level All-Sky early-out (skips all halo loads, divisions & LDS writes).
+    if (lx == 0 && ly == 0) {
+        s_any_work = 0u;
+    }
+    barrier();
+    const bool valid_y = gy < h;
+    const bool work0 = valid_y && (gx0 < w) && (d0 < 0.99999);
+    const bool work1 = valid_y && (gx1 < w) && (d1 < 0.99999);
+    if (work0 || work1) {
+        s_any_work = 1u;
+    }
+    barrier();
+    if (s_any_work == 0u) {
+        if (valid_y) {
+            if (gx0 < w) imageStore(dst_img, ivec2(gx0, gy), s0);
+            if (gx1 < w) imageStore(dst_img, ivec2(gx1, gy), s1);
+        }
+        return;
+    }
+
+    // 3. Store inner 32x16 pixels into LDS (already in registers -> 0 duplicate fetches).
+    const int row_in = ly + halo;
+    const int idx0 = row_in * kStride + (lx + halo);
+    const int idx1 = row_in * kStride + (lx + 16 + halo);
+    s_d[idx0] = d0;
+    s_inv[idx0] = safe_inv_scaled(pc.z_a - d0);
+    s_a[idx0] = s0.a;
+    s_d[idx1] = d1;
+    s_inv[idx1] = safe_inv_scaled(pc.z_a - d1);
+    s_a[idx1] = s1.a;
+
+    // 4. Load 4 border halo strips with ZERO integer divisions / modulo.
+    const int two_halo = 2 * halo;
+    if (ly < two_halo) {
+        const int row_tb = (ly < halo) ? ly : (kBlockH + ly);
+        load_halo_texel(lx, row_tb, bx, by, halo, w, h);
+        load_halo_texel(lx + 16, row_tb, bx, by, halo, w, h);
+        if (lx < two_halo) {
+            load_halo_texel(lx + 32, row_tb, bx, by, halo, w, h);
+        }
+    }
+    if (lx < two_halo) {
+        const int col_lr = (lx < halo) ? lx : (kBlockW + lx);
+        load_halo_texel(col_lr, row_in, bx, by, halo, w, h);
+    }
+
+    barrier();
+
+    if (!valid_y) {
+        return;
+    }
+    if (gx0 < w) {
+        if (d0 >= 0.99999) {
+            imageStore(dst_img, ivec2(gx0, gy), s0);
+        } else {
+            imageStore(dst_img, ivec2(gx0, gy),
+                       vec4(s0.rgb, eval_12taps(lx + halo, row_in, d0, s0.a)));
+        }
+    }
+    if (gx1 < w) {
+        if (d1 >= 0.99999) {
+            imageStore(dst_img, ivec2(gx1, gy), s1);
+        } else {
+            imageStore(dst_img, ivec2(gx1, gy),
+                       vec4(s1.rgb, eval_12taps(lx + 16 + halo, row_in, d1, s1.a)));
+        }
+    }
+}

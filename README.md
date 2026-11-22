@@ -52,12 +52,12 @@ BloodBorne/
 > **Hardware Requirements:** Because this port executes Bloodborne's original PS4 (`AMD Jaguar x86_64`) code natively on your CPU, it requires a **Vulkan 1.3 GPU** and an **x86-64-v3 CPU** supporting `AVX`, `BMI1`, `MOVBE`, `LZCNT`, and `POPCNT` (**Intel Haswell 4th-gen Core 2013+** or **AMD Ryzen / Steam Deck**; older pre-2013 CPUs such as Ivy Bridge `i7-3770K` or Sandy Bridge are not supported).  
 > **Linux Launcher Audio Tip (Arch / CachyOS):** Launcher BGM/SFX uses WebKitGTK + GStreamer — if launcher audio is silent on minimal installs, install `gst-plugins-base gst-plugins-good gst-plugin-pipewire`.
 
-## 🆕 Latest Release (`v1.2.2`)
+## 🆕 Latest Release (`v1.2.3`)
 
-- **Native Vulkan 1.3 PostFX Default (Faster GPU, 1:1 Original Look)** — Replaces legacy Yebis 2 across all profiles with native Vulkan 1.3 compute/fragment shaders (Tonemap, 3D LUT, Auto-Exposure, Bloom, FPS-normalized Motion Blur, DoF), cutting PostFX GPU time nearly in half while keeping authentic PS4 colorimetry.
-- **Next-Gen Optional Remaster Visuals** — **Native HDR10 (`ST.2084 PQ`)** with live SDR↔HDR10 toggle, **PCSS Contact-Hardening Soft Shadows** (4K CSM + cubemap VSM), **Native Vulkan Half-Res HBIL SSGI v2**, **Fire Heat Haze**, and **60× frame-pacing jitter fix**.
-- **Issue #3 Controls Fix & Per-Draw GPU Profiler** — Fixed swapped `Camera X-Axis` / `Camera Y-Axis` bindings in `System → Controls`, and added a 1-click GPU bottleneck profiler (`logs/gpu_profile_dump.txt`) in `F8` Debug.
-- **Includes everything from `v1.2.1` & `v1.2.0`** — Portable Linux `x86-64-v3` builds (zero AVX-512), +35–55% CPU FPS boost, 1.3 s death respawns, 4-second Linux Shader Pre-Bake, high-FPS curb & Havok Cloth fixes, and 2×–4× UI upscaling.
+- **Lower GPU Load, Heat & Higher Smoothness** — Optimized shadows, lighting blur, idle motion blur, final color output, and 5 heavy world/foliage shaders across Yharnam, Iosefka's Clinic, and Hunter's Dream — cutting GPU load and power draw noticeably while increasing high-FPS headroom.
+- **Expanded Shader Pre-Bake Catalog (+1,095 New Recipes)** — Added 819 new graphics pipelines and 263 shader variants to `data/shader_recipes.bbrc` so fresh installs pre-compile even more of the game upfront with fewer in-game stutters.
+- **Cleaner, Privacy-Safe Diagnostic Logs** — Removed repetitive startup log spam (~3.5× smaller logs), scrubbed user home paths, and added a compact Windows/Linux hardware summary (OS, CPU, RAM, live usage, and automatic hitch alerts) for effortless bug reports.
+- **Includes everything from `v1.2.2` – `v1.2.0`** — Native Vulkan Post-Processing, Native HDR10, PCSS Soft Shadows, SSGI, Fire Heat Haze, glass-smooth frame pacing, portable Linux `x86-64-v3` builds, 1.3 s death respawns, high-FPS cloth/curb fixes, and 2×–4× UI upscaling.
 
 *(See [Releases](https://github.com/lapothecary/bloodborne-pc-vulkan/releases) for clean per-version changelogs.)*
 
@@ -73,7 +73,7 @@ BloodBorne/
 | :--- | :--- | :--- | :--- |
 | **Execution Model** | General-purpose PS4 emulator | Host runtime + PS4 graphics translation | `bbport` host runtime + **refactored C++20 Dantelion graphics engine** (`2,940` functions) wired into **DirectVk 1.3** |
 | **VRAM & Memory** | Unified memory page traps | Shared host RAM + hot VRAM mirrors | **True split PC VRAM (`DEVICE_LOCAL`)** — `0` page faults/s in gameplay, much lower RAM & VRAM footprint |
-| **Shaders & Stutter** | Runtime translation | Runtime translation + recipe cache | **Full `5,761`-shader pre-baker**, quiet background auto-baker, fast async shader fallback, and **`129` native Vulkan GLSL shaders** |
+| **Shaders & Stutter** | Runtime translation | Runtime translation + recipe cache | **Full `5,761`-shader pre-baker**, quiet background auto-baker, fast async shader fallback, and **`150` native Vulkan GLSL shaders** |
 | **Performance Features** | Frame-rate patches | Two-stage draw pipe + Vulkan occlusion | **DirectVk command stream**, **3D occlusion culling (`27–41%` skipped)**, front-to-back G-Buffer sorting, light-tile/UI batching, multi-core L3 cache pinning |
 | **PC Polish & UX** | External emulator UI | Upscalers (`DLSS`/`FSR`/`FG`), Ultrawide, raw mouse, basic in-game menus, online | **Full live in-game `Display`/`Effects`/`Controls` menus (28 actions)**, **smooth `Balanced` camera (`F4`)**, **4–5× faster loading**, **dual-stage frame pacing**, **4 optional remaster shaders**, **`2×/4×` UI upscaling**, **authentic C++20 native launcher**, and **1-click updates** |
 

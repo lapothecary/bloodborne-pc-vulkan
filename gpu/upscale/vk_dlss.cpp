@@ -13,6 +13,7 @@
 #include <thread>
 
 #include "bbport_settings.h"
+#include "bbport_system_info.h"
 #include "common/thread.h"
 #include "upscale/vk_dlss.h"
 
@@ -225,7 +226,7 @@ Dlss::Dlss() : impl{std::make_unique<Impl>()} {
     const auto data = UserDlssDirectory();
     std::error_code error;
     std::filesystem::create_directories(data, error);
-    std::printf("DLSS: NVIDIA's library from %s\n", ngx.string().c_str());
+    std::printf("DLSS: NVIDIA's library from %s\n", BbSysInfo::RedactHomePath(ngx.string()).c_str());
     if (!impl->api->Configure(ngx.wstring().c_str(), data.wstring().c_str(), BridgeLog)) {
         impl->Disable("bridge configuration failed");
     }

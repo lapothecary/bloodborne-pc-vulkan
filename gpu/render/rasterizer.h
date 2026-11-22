@@ -216,6 +216,20 @@ public:
 
     void Draw(bool is_indexed, u32 index_offset = 0, const PreparedDraw* prepared = nullptr);
 
+    /// Pack #2: Fused final 1DArray Display Gamma LUT pass (`ps_38d65b32`) handed directly
+    /// from Rasterizer to Presenter::PrepareFrame to eliminate a redundant fullscreen pass.
+    struct FusedGammaDisplay {
+        VAddr display_addr = 0;
+        vk::ImageView src_view{};
+        vk::ImageLayout src_layout = vk::ImageLayout::eShaderReadOnlyOptimal;
+        vk::Extent2D src_size{};
+        vk::ImageView lut1d_view{};
+        vk::ImageLayout lut1d_layout = vk::ImageLayout::eShaderReadOnlyOptimal;
+        bool needs_srgb_decode = false;
+        bool valid = false;
+    };
+    [[nodiscard]] bool ConsumeFusedGammaDisplay(VAddr display_addr, FusedGammaDisplay& out) noexcept;
+
     /// bbport: draw preparation workers (vk_draw_prep.h), fed and consumed by Liverpool.
     DrawPreparation& GetDrawPreparation() {
         return *draw_prep;
@@ -343,6 +357,8 @@ public:
     void DirectClearColorImage(const DirectClearColorArgs& args);
     void DirectCopyTextureRegion(const DirectCopyTextureRegionArgs& args);
     void FlushPendingTextureRegionCopies();
+    void FlushDeferredVsmCopy();
+    void FlushVsmBlurCopyBacks();
     [[nodiscard]] bool NextPipePacketIsTextureRegionCopy() const noexcept;
     void DirectDecompressDepth(const DirectDecompressDepthArgs& args);
     void DirectEliminateFastClear(const DirectEliminateFastClearArgs& args);
@@ -1610,6 +1626,8 @@ private:
     std::atomic<bool> guest_occlusion_seen{false};
     std::unique_ptr<class ButtonPrompts> prompts; ///< bbport: the key guide icons for the device in use
     std::unique_ptr<class NativePostFx> native_postfx; ///< Remaster v2: native Vulkan 1.3 PostFX (A/B vs Yebis2)
+    std::unique_ptr<class VsmBlurBatcher> vsm_blur_batcher; ///< Pack #4 v2: Deferred Single-Wave Compute VSM blur batcher
+    std::unique_ptr<class BilateralBlurCompute> bilateral_blur; ///< Pack #3: Compute + LDS 12-tap bilateral shadow blur (ps_11ffdfb5)
     std::unique_ptr<class GpuTimestamps> timestamps;
     std::unique_ptr<class IndirectGuard> indirect_guard; ///< stage B only (lazily)
     /// Submissions (prepared draws) kept alive until stage B reaches the position.
@@ -1644,6 +1662,8 @@ private:
     /// steady_clock nanoseconds of the last submission (written by both pipeline stages).
     std::atomic<s64> last_flush_ns{0};
     mutable std::atomic<VAddr> mt_scene_depth_addr{0};
+    std::mutex fused_gamma_mutex;
+    FusedGammaDisplay fused_gamma_display{};
 };
 
 /// Step 1 Fire/SFX Remaster diagnostic: records all 1-MRT forward/VFX/blended draws over a short

@@ -5,6 +5,7 @@
 #include "render/raster_internal.h"
 #include "render/vk_light_tile_batch.h"
 #include "render/vk_vsm_shadow_memo.h"
+#include "render/vk_vsm_blur_batcher.h"
 #include "render/vk_obj_vel_cull.h"
 #include "render/vk_vfx_ui_batch.h"
 #include "buffers/direct_buffers.h"
@@ -1715,6 +1716,21 @@ void Rasterizer::RunDrawPacket(void* context, const u8* data, u32 size) {
         if (!self.pending_tex_copies.empty() &&
             task.task != &BbCp::Tasks::DirectVkCopyTextureRegionTask) [[unlikely]] {
             self.FlushPendingTextureRegionCopies();
+        }
+        if (self.vsm_blur_batcher) {
+            const bool is_benign_meta_task =
+                task.task == &BbCp::Tasks::DirectVkCopyBatchTask ||
+                task.task == &BbCp::Tasks::DirectVkReleaseLabelsBatchTask ||
+                task.task == &BbCp::Tasks::DirectVkReleaseU32LabelsBatchTask;
+            if (self.vsm_blur_batcher->HasDeferredCopy() && !is_benign_meta_task) [[unlikely]] {
+                self.FlushDeferredVsmCopy();
+            }
+            if (self.vsm_blur_batcher->HasPendingCopyBacks() && !is_benign_meta_task &&
+                task.task != &BbCp::Tasks::DirectVkCopyTextureRegionTask &&
+                task.task != &BbCp::Tasks::DirectVkClearColorTask &&
+                task.task != &BbCp::Tasks::DirectVkClearDepthStencilTask) [[unlikely]] {
+                self.FlushVsmBlurCopyBacks();
+            }
         }
         if (BbSections::Enabled()) {
             const u64 t0 = __rdtsc();

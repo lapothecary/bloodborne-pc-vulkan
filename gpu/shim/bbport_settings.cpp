@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "bbport_settings.h"
 #include "bbport_frame_rate.h"
+#include "bbport_system_info.h"
 #include <cmath>
 
 #include <algorithm>
@@ -739,7 +740,7 @@ void Load() {
         }
         std::fclose(file);
         last_known_ini_mtime_ns.store(CurrentIniMtimeNs(Path()), std::memory_order_relaxed);
-        std::printf("Settings: %s\n", Path());
+        std::printf("Settings: %s\n", BbSysInfo::RedactHomePath(Path()).c_str());
     }
     // Environment overrides (scripts, A/B tests).
     if (const char* env = std::getenv("BB_UPSCALER")) {

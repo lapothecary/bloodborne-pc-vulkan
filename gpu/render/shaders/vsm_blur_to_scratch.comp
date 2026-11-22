@@ -1,0 +1,58 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Pack #4: Batched Out-of-Place 13-tap VSM Gaussian Blur (`128x128`, `256x256`, `512x512` R16G16Sfloat).
+// Reads directly from the cubemap face `F[slice]` via hardware linear filtering (eliminating the
+// serialized `Copy(F -> S)`!) and writes into a dedicated slice of our L2-resident scratch pool so
+// all faces across all lights execute concurrently on the GPU before a single grouped copy-back.
+#version 460
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    uint dim;     // 128, 256, or 512
+    uint d0_dw;   // dword offset in ssbo_1 (cbSampleOffset)
+    uint d1_dw;   // dword offset in ssbo_2 (scale at d1_dw + 4, d1_dw + 5)
+    uint pad;
+} pc;
+
+layout(set = 0, binding = 0) readonly buffer SSBO1 {
+    uint data[];
+} ssbo_1;
+
+layout(set = 0, binding = 1) readonly buffer SSBO2 {
+    uint data[];
+} ssbo_2;
+
+layout(set = 0, binding = 2) uniform sampler2D src_tex;
+layout(set = 0, binding = 3, rg16f) uniform writeonly image2D dst_img;
+
+// Pre-scaled 13 taps loaded once per workgroup (eliminates 39 SSBO loads/pixel).
+shared vec4 s_taps[13];
+
+void main() {
+    const uint lid = gl_LocalInvocationIndex;
+    if (lid < 13u) {
+        const vec2 scale = vec2(uintBitsToFloat(ssbo_2.data[pc.d1_dw + 4u]),
+                                uintBitsToFloat(ssbo_2.data[pc.d1_dw + 5u]));
+        const uint base = pc.d0_dw + (lid << 2u);
+        const vec2 off = vec2(uintBitsToFloat(ssbo_1.data[base]),
+                              uintBitsToFloat(ssbo_1.data[base + 1u]));
+        const float w = uintBitsToFloat(ssbo_1.data[base + 2u]);
+        s_taps[lid] = vec4(off * scale, w, 0.0);
+    }
+
+    barrier();
+
+    const ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    const int idim = int(pc.dim);
+    if (px.x >= idim || px.y >= idim) {
+        return;
+    }
+
+    const vec2 uv0 = (vec2(px) + vec2(0.5)) / float(pc.dim);
+    vec2 acc = s_taps[1].z * textureLod(src_tex, uv0 + s_taps[1].xy, 0.0).rg;
+    acc += s_taps[0].z * textureLod(src_tex, uv0 + s_taps[0].xy, 0.0).rg;
+    for (uint k = 2u; k < 13u; ++k) {
+        acc += s_taps[k].z * textureLod(src_tex, uv0 + s_taps[k].xy, 0.0).rg;
+    }
+    imageStore(dst_img, px, vec4(acc, 0.0, 0.0));
+}

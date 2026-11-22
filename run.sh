@@ -168,7 +168,7 @@ if [[ $game != "$(realpath "$original_game")" && $(basename -- "$game") == mod-g
     trap '"$PYTHON" -c '\''import shutil,sys; shutil.rmtree(sys.argv[1])'\'' "$mod_game"' EXIT
 fi
 if "$PYTHON" scripts/check_boot_cache.py "$game" --out "$out"; then
-    echo "[bb_vulkan] Boot image cache hit: $out/boot-linked.bin (skipped prepare/link)"
+    echo "[bb_vulkan] Boot image cache hit: ${out/#$HOME/\~}/boot-linked.bin (skipped prepare/link)"
 else
     "$PYTHON" scripts/prepare.py "$game" --out "$out"
     "$PYTHON" scripts/link_libc.py "$game" --out "$out"

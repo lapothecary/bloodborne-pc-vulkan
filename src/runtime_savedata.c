@@ -94,7 +94,8 @@ static void bloodborne_sound_hack(void) {
         int old=fseek(f,0x204E,SEEK_SET) ? EOF : fgetc(f);
         if (old!=EOF && old!=1 && !fseek(f,0x204E,SEEK_SET)) {
             fputc(1,f);
-            printf("Runtime: Bloodborne sound flag set in %s (was %d)\n",path,old);
+            printf("Runtime: Bloodborne sound flag set in savedata/%s/%s/SPRJ0005/userdata0010 (was %d)\n",
+                   e->d_name,title_id,old);
         }
         fclose(f);
     }
@@ -244,9 +245,12 @@ static int32_t mount(int32_t user, const char *title, const DirName *dir, uint32
         fprintf(stderr,"Runtime: save data '%s' could not be mounted: mount table full\n",dir->data);
     }
     ++mounts_done;
+    const int log_mount = (!exists || mounts_done == 1 || bb_env_on("BB_VERBOSE_RUNTIME"));
     pthread_mutex_unlock(&lock);
-    printf("Runtime: save data '%s' mounted at %s (%s%s)\n",dir->data,result->point.data,
-           exists ? "existing" : "created",(mode & MODE_RDONLY) ? ", read-only" : "");
+    if (log_mount) {
+        printf("Runtime: save data '%s' mounted at %s (%s%s)\n",dir->data,result->point.data,
+               exists ? "existing" : "created",(mode & MODE_RDONLY) ? ", read-only" : "");
+    }
     {
         char ev[128];
         snprintf(ev,sizeof(ev),"%s -> %s%s",dir->data,result->point.data,(mode & MODE_RDONLY) ? " (ro)" : " (rw)");
