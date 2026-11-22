@@ -26,8 +26,8 @@ jobs:
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
             -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" \
             build-essential gcc-14 g++-14 clang cmake ninja-build pkg-config patchelf git \
-            libvulkan-dev glslang-tools spirv-tools libspirv-tools-dev \
-            libfmt-dev libboost-dev libtsl-robin-map-dev libxxhash-dev zlib1g-dev \
+            libvulkan-dev glslang-tools spirv-tools \
+            libfmt-dev libboost-dev robin-map-dev libxxhash-dev zlib1g-dev \
             libavformat-dev libavcodec-dev libswscale-dev libswresample-dev libavutil-dev \
             libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxfixes-dev \
             libxss-dev libwayland-dev libxkbcommon-dev libdbus-1-dev \
@@ -81,14 +81,23 @@ jobs:
           ninja -C dantelion_gx/build bb_gx_engine_native
 
           # 2. Portable libbbgpu.so + libbbnet20.so (x86-64-v3, no AVX-512, gcc-14/g++-14)
-          rm -rf out/gpu
-          cmake -S gpu -B out/gpu -G Ninja \
+          rm -rf build_gpu out/gpu
+          mkdir -p out/gpu
+          cmake -S gpu -B build_gpu -G Ninja \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DCMAKE_C_COMPILER=gcc-14 -DCMAKE_CXX_COMPILER=g++-14 \
             -DCMAKE_PREFIX_PATH="/opt/bb-deps" \
             -DVMA_INCLUDE_DIR="/opt/bb-deps/include/vma" \
             -DBB_PORTABLE_ISA=ON -DBB_LTO=ON -DBB_PGO=off -DBB_NET=ON
-          ninja -C out/gpu bbgpu $(grep -q "^build bbnet20:" out/gpu/build.ninja && echo bbnet20)
+          targets="bbgpu"
+          if grep -q "^build bbnet20:" build_gpu/build.ninja; then
+            targets="$targets bbnet20"
+          fi
+          ninja -C build_gpu $targets
+          cp -f build_gpu/libbbgpu.so out/gpu/
+          if [ -f build_gpu/libbbnet20.so ]; then
+            cp -f build_gpu/libbbnet20.so out/gpu/
+          fi
 
           # 3. Portable bb-vulkan + bb-gpu-capabilities (Ubuntu baseline crt1.o + x86-64-v3)
           rm -rf out/atrac9 out/libatrac9.a

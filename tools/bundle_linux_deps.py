@@ -165,8 +165,9 @@ def bundle_deps(targets: list[Path]) -> list[Path]:
                 continue
             dst = GPU_DIR / soname
             if soname not in bundled:
-                shutil.copy2(resolved, dst)
-                os.chmod(dst, 0o755)
+                if resolved.resolve() != dst.resolve():
+                    shutil.copy2(resolved, dst)
+                    os.chmod(dst, 0o755)
                 bundled[soname] = dst
                 queue.append(dst)
 
@@ -206,7 +207,7 @@ def verify_isa_and_tls(own_binaries: list[Path], all_check_files: list[Path]) ->
             continue
         res = run(["objdump", "-d", str(f)], check=False)
         for line in res.stdout.splitlines():
-            if "%zmm" in line or "zmm" in line.lower().split("\t")[-1]:
+            if re.search(r"%zmm\d+", line):
                 errors.append(f"FORBIDDEN AVX-512 zmm instruction in {f}: {line.strip()}")
                 break
 

@@ -13,6 +13,7 @@ add_compile_options(-fno-omit-frame-pointer)
 option(BB_PORTABLE_ISA "Target portable x86-64-v3 without AVX-512 (fixes Ryzen 1000-5000 / Intel / Steam Deck)" ON)
 if (NOT WIN32 AND BB_PORTABLE_ISA)
     add_compile_options(-march=x86-64-v3 -mtune=generic -mno-avx512f)
+    add_link_options(-march=x86-64-v3 -mtune=generic -mno-avx512f)
 endif()
 
 # bbport: link-time optimization (BB_LTO, default on) and profile-guided optimization
