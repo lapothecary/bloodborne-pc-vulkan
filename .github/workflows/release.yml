@@ -15,12 +15,12 @@ concurrency:
 
 jobs:
   release:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install Linux x86_64 Build Dependencies (Ubuntu 24.04 baseline glibc)
+      - name: Install Linux x86_64 Build Dependencies (Ubuntu 24.04 baseline glibc 2.39)
         run: |
           sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
@@ -35,18 +35,24 @@ jobs:
             libwebkit2gtk-4.1-dev libprotobuf-dev protobuf-compiler \
             nlohmann-json3-dev libssl-dev libminiupnpc-dev
 
-      - name: Cache Portable Linux Third-Party Deps (SDL3, Zydis, VMA)
+      - name: Cache Portable Linux Third-Party Deps (Vulkan 1.4.313, SDL3, Zydis, VMA)
         id: cache-linux-deps
         uses: actions/cache@v4
         with:
           path: /opt/bb-deps
-          key: linux-deps-v1-sdl3.2.10-zydis4.1.0-vma3.2.1
+          key: linux-deps-v2-u2404-vk1.4.313-sdl3.2.10-zydis4.1.0-vma3.2.1
 
-      - name: Build Portable Linux Deps (SDL3, static Zydis, VMA)
+      - name: Build Portable Linux Deps (Vulkan 1.4.313 headers, SDL3, static Zydis, VMA)
         if: steps.cache-linux-deps.outputs.cache-hit != 'true'
         run: |
           sudo mkdir -p /opt/bb-deps && sudo chown "$USER:$USER" /opt/bb-deps
-          mkdir -p /tmp/bb-deps-src
+          mkdir -p /tmp/bb-deps-src /opt/bb-deps/include
+          # 0. Vulkan 1.4.313 C + Hpp headers (provides maintenance8 etc. on Ubuntu 24.04 glibc baseline)
+          git clone --depth 1 --branch v1.4.313 https://github.com/KhronosGroup/Vulkan-Headers.git /tmp/bb-deps-src/vk-headers
+          git clone --depth 1 --branch v1.4.313 https://github.com/KhronosGroup/Vulkan-Hpp.git /tmp/bb-deps-src/vk-hpp
+          cp -r /tmp/bb-deps-src/vk-headers/include/vulkan /opt/bb-deps/include/
+          cp -r /tmp/bb-deps-src/vk-headers/include/vk_video /opt/bb-deps/include/
+          cp -f /tmp/bb-deps-src/vk-hpp/vulkan/*.hpp /opt/bb-deps/include/vulkan/
           # 1. VMA single header
           mkdir -p /opt/bb-deps/include/vma
           curl -sSL https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator/v3.2.1/include/vk_mem_alloc.h \
@@ -87,6 +93,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DCMAKE_C_COMPILER=gcc-14 -DCMAKE_CXX_COMPILER=g++-14 \
             -DCMAKE_PREFIX_PATH="/opt/bb-deps" \
+            -DVulkan_INCLUDE_DIR="/opt/bb-deps/include" \
             -DVMA_INCLUDE_DIR="/opt/bb-deps/include/vma" \
             -DBB_PORTABLE_ISA=ON -DBB_LTO=ON -DBB_PGO=off -DBB_NET=ON
           targets="bbgpu"
@@ -99,7 +106,7 @@ jobs:
             cp -f build_gpu/libbbnet20.so out/gpu/
           fi
 
-          # 3. Portable bb-vulkan + bb-gpu-capabilities (Ubuntu baseline crt1.o + x86-64-v3)
+          # 3. Portable bb-vulkan + bb-gpu-capabilities (Ubuntu 24.04 baseline crt1.o + x86-64-v3)
           rm -rf out/atrac9 out/libatrac9.a
           mkdir -p out/atrac9
           for src in third_party/LibAtrac9/C/src/*.c; do
@@ -110,12 +117,12 @@ jobs:
           read -r -a includes <<< "$(pkg-config --cflags vulkan sdl3)"
           read -r -a libraries <<< "$(pkg-config --libs vulkan sdl3)"
           gcc-14 -std=c11 -O2 -march=x86-64-v3 -mtune=generic -mno-avx512f -g -Wall -Wextra -Werror \
-            -pthread -no-pie "${includes[@]}" -I. -Isrc \
+            -pthread -no-pie -I/opt/bb-deps/include "${includes[@]}" -I. -Isrc \
             src/probe.c src/runtime*.c src/vulkan_smoke.c out/libatrac9.a -lm \
             -Lout/gpu -lbbgpu -Wl,-rpath,'$ORIGIN/gpu' -rdynamic "${libraries[@]}" \
             -o out/bb-vulkan
           gcc-14 -std=c11 -O2 -march=x86-64-v3 -mtune=generic -mno-avx512f -Wall -Wextra -Werror \
-            "${includes[@]}" tools/gpu_capabilities.c "${libraries[@]}" \
+            -I/opt/bb-deps/include "${includes[@]}" tools/gpu_capabilities.c "${libraries[@]}" \
             -o out/bb-gpu-capabilities
 
           # 4. Portable C++20 WebView Launcher (baseline x86-64)
