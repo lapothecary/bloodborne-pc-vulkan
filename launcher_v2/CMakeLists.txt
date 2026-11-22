@@ -36,7 +36,7 @@ if(MSVC)
     target_compile_definitions(bb_atrac9 PUBLIC COMPILING_DLL)
     target_compile_options(bb_atrac9 PRIVATE /O2 /W0)
 else()
-    target_compile_options(bb_atrac9 PRIVATE -O2 -Wno-unused-variable -Wno-unused-but-set-variable -Wno-sign-compare)
+    target_compile_options(bb_atrac9 PRIVATE -O2 -march=x86-64 -mtune=generic -mno-avx512f -Wno-unused-variable -Wno-unused-but-set-variable -Wno-sign-compare)
 endif()
 
 set(LAUNCHER_SOURCES

@@ -74,16 +74,17 @@ fi
 gpu=(-Lout/gpu -lbbgpu -Wl,-rpath,'$ORIGIN/gpu' -Wl,-rpath,"$PWD/out/gpu" -rdynamic)
 runtime=(src/runtime*.c)
 # Third-party decoders: compiled once, without this project's -Werror policy.
+portable_arch=(-march=x86-64-v3 -mtune=generic -mno-avx512f)
 atrac9=(third_party/LibAtrac9/C/src/*.c)
 if [[ ! -f out/libatrac9.a || -n $(find third_party/LibAtrac9/C/src -newer out/libatrac9.a -name '*.c') ]]; then
     rm -rf out/atrac9 && mkdir -p out/atrac9
-    for source in "${atrac9[@]}"; do "$CC" -std=c99 -O2 -g -w -c "$source" -o "out/atrac9/$(basename "${source%.c}").o"; done
+    for source in "${atrac9[@]}"; do "$CC" -std=c99 -O2 "${portable_arch[@]}" -g -w -c "$source" -o "out/atrac9/$(basename "${source%.c}").o"; done
     ar rcs out/libatrac9.a out/atrac9/*.o
 fi
-"$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -no-pie "${includes[@]}" -I. -Isrc src/probe.c "${runtime[@]}" src/vulkan_smoke.c out/libatrac9.a -lm "${gpu[@]}" "${libraries[@]}" -o out/bb-vulkan
+"$CC" -std=c11 -O2 "${portable_arch[@]}" -g -Wall -Wextra -Werror -pthread -no-pie "${includes[@]}" -I. -Isrc src/probe.c "${runtime[@]}" src/vulkan_smoke.c out/libatrac9.a -lm "${gpu[@]}" "${libraries[@]}" -o out/bb-vulkan
 echo "Built $PWD/out/bb-vulkan"
 # GPU check for run.sh (live_resolution=auto) and the launcher's gamepad list (--gamepads).
-"$CC" -std=c11 -O2 -Wall -Wextra -Werror "${includes[@]}" tools/gpu_capabilities.c "${libraries[@]}" -o out/bb-gpu-capabilities
+"$CC" -std=c11 -O2 "${portable_arch[@]}" -Wall -Wextra -Werror "${includes[@]}" tools/gpu_capabilities.c "${libraries[@]}" -o out/bb-gpu-capabilities
 if [[ ${1:-} == --test ]]; then
     "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread "${includes[@]}" -I. -Isrc tests/test_pad.c "${libraries[@]}" -lm -o out/pad-test
     out/pad-test
