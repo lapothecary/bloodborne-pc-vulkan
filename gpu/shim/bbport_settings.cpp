@@ -329,8 +329,10 @@ void Set(Values& v, const std::string& key, const std::string& value) {
         v.ssgi_enabled = (value != "0" && value != "false" && value != "off");
     } else if (key == "native_postfx") {
         v.native_postfx = (value != "0" && value != "false" && value != "off");
+    } else if (key == "fire_heat_haze") {
+        v.fire_heat_haze = (value != "0" && value != "false" && value != "off");
     } else if (key == "enhanced_fire") {
-        v.enhanced_fire = (value != "0" && value != "false" && value != "off");
+        // Removed legacy key (archived).
     } else if (key == "motion_blur_camera" || key == "motion_blur_object") {
         auto parse_mb = [](std::string_view val) -> int {
             if (val == "off" || val == "0" || val == "false") return 0;
@@ -756,13 +758,17 @@ void Load() {
         {"BB_SSR_QUALITY", "ssr_quality"},          {"BB_TRUE_BLACK_HDR", "true_black_hdr"},
         {"BB_HDR_OUTPUT", "hdr_output"},            {"BB_PCSS_SHADOWS", "pcss_shadows"},
         {"BB_SSGI", "ssgi_enabled"},                {"BB_NATIVE_POSTFX", "native_postfx"},
-        {"BB_ENHANCED_FIRE", "enhanced_fire"},
+        {"BB_FIRE_HEAT_HAZE", "fire_heat_haze"},
         {"BB_MOTION_BLUR_CAMERA", "motion_blur_camera"},
         {"BB_MOTION_BLUR_OBJECT", "motion_blur_object"}, {"BB_CAMERA_FOLLOW", "camera_follow_mode"},
     };
     // Frame generation is hidden in the menu until its artifacts are fixed: only BB_FRAME_GEN turns
     // it on, a saved setting does not.
     v.frame_generation = false;
+    // Native Vulkan 1.3 PostFX is the default base renderer across all profiles (1:1 visual parity
+    // with Yebis2, faster & cleaner on GPU). Legacy Yebis2 remains available via BB_NATIVE_POSTFX=0
+    // or the hidden Developer A/B Debug section in the overlay.
+    v.native_postfx = true;
     for (const auto& [env, key] : env_keys) {
         if (const char* value = std::getenv(env)) {
             Set(v, key, value);
@@ -963,8 +969,7 @@ void Save() {
     put("hdr_output", flag(v.hdr_output.load()));
     put("pcss_shadows", flag(v.pcss_shadows.load()));
     put("ssgi_enabled", flag(v.ssgi_enabled.load()));
-    put("native_postfx", flag(v.native_postfx.load()));
-    put("enhanced_fire", flag(v.enhanced_fire.load()));
+    put("fire_heat_haze", flag(v.fire_heat_haze.load()));
     auto mb_level_name = [](int lvl) -> const char* {
         switch (std::clamp(lvl, 0, 3)) {
         case 0: return "off";

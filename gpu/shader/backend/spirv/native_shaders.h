@@ -14,6 +14,7 @@ namespace Shader::Backend::SPIRV {
 [[nodiscard]] bool NativeShadersEnabled() noexcept;
 [[nodiscard]] bool NativeShadersCustomRange() noexcept;
 [[nodiscard]] bool HasNativeShader(u64 pgm_hash) noexcept;
+[[nodiscard]] const char* NativeShaderName(u64 pgm_hash) noexcept;
 [[nodiscard]] u32 NativeShadersMinIdx() noexcept;
 [[nodiscard]] u32 NativeShadersMaxIdx() noexcept;
 

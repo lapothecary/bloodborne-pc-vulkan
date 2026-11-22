@@ -184,8 +184,9 @@ bool IsOpt46MotBlurObjFpsShaderHash(u64 pgm_hash) noexcept {
 
 bool IsOpt40RemasterSsgiShaderHash(u64 pgm_hash) noexcept {
     switch (pgm_hash) {
-    // Remaster-v2 Stage 1.3: Horizon-Based SSGI in GXLightComposite (ps_32e47788_atmos_fog)
+    // Remaster-v2 Performance Audit (opt54): Half-Res SSGI moved out of ps_32e47788 + PCSS umbra early-out in ps_f55643de
     case 0x0000000032e47788ULL:
+    case 0x00000000f55643deULL:
         return true;
     default:
         return false;
@@ -248,11 +249,11 @@ std::string OptBinaryName(u64 pgm_hash, size_t perm_idx) {
         if (fast_fp) {
             prefix = use_native_prefix
                          ? (IsOpt49RemasterFireShaderHash(pgm_hash)
-                                ? "opt50"
+                                ? "opt55"
                                 : (IsOpt46MotBlurObjFpsShaderHash(pgm_hash)
                                        ? "opt48"
                                        : (IsOpt40RemasterSsgiShaderHash(pgm_hash)
-                                       ? "opt41"
+                                       ? "opt54"
                                        : (IsOpt39RemasterPcssShaderHash(pgm_hash)
                                               ? "opt39"
                                               : (IsOpt38StageC2ShaderHash(pgm_hash)

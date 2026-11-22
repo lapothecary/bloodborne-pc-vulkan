@@ -176,11 +176,13 @@ void main() {
             const float max_r = max(min_r, 13.0 * texel * c_scale);
             const float search_r = max(min_r * 1.5, 15.0 * texel * c_scale);
 
-            // Step 1: 12-tap IGN-rotated Vogel disk blocker search in raw CSM depth.
+            // Step 1: IGN-rotated Vogel disk blocker search in raw CSM depth (12 taps near, 8 taps far).
+            const uint blocker_taps = (cascade < 2u) ? 12u : 8u;
+            const float inv_btaps = (cascade < 2u) ? (1.0 / 12.0) : (1.0 / 8.0);
             float blocker_sum = 0.0;
             float blocker_count = 0.0;
-            for (uint i = 0u; i < 12u; ++i) {
-                float r = sqrt((float(i) + 0.5) * (1.0 / 12.0)) * search_r;
+            for (uint i = 0u; i < blocker_taps; ++i) {
+                float r = sqrt((float(i) + 0.5) * inv_btaps) * search_r;
                 float theta = float(i) * 2.39996323 + base_ang;
                 vec2 suv = clamp(vec2(u_c, v_c) + vec2(cos(theta), sin(theta)) * r, q_min, q_max);
                 float z_occ = texelFetch(fs_img1, ivec2(suv * tex_size), 0).r;
@@ -190,22 +192,29 @@ void main() {
                 }
             }
 
-            if (blocker_count > 0.5) {
-                // Step 2: Blocker-distance penumbra + 16-tap IGN-rotated hardware PCF.
+            if (blocker_count >= float(blocker_taps) - 0.5 &&
+                (dref - (blocker_sum / blocker_count)) > 0.0008) {
+                // Umbra early-out: every tap across the wider blocker search disk is strictly occluded
+                // -> 100% deep shadow; skip the 16-tap PCF loop and contact raymarch cleanly!
+                pcf_avg = 0.0;
+            } else if (blocker_count > 0.5) {
+                // Step 2: Blocker-distance penumbra + IGN-rotated hardware PCF (16 taps near, 10 taps far).
                 const float avg_blocker = blocker_sum / blocker_count;
                 const float blocker_dist = max(dref - avg_blocker, 0.0);
                 const float penumbra_t = smoothstep(0.0, 1.0, sqrt(clamp(blocker_dist * 60.0, 0.0, 1.0)));
                 const float filter_r = mix(min_r, max_r, penumbra_t);
                 const float z_bias = clamp((filter_r - min_r) * 0.14, 0.0, 0.00038);
                 const float dref_pcss = max(dref - z_bias, 0.0);
+                const uint pcf_taps = (cascade < 2u) ? 16u : 10u;
+                const float inv_ptaps = (cascade < 2u) ? (1.0 / 16.0) : (1.0 / 10.0);
                 float pcss_sum = 0.0;
-                for (uint i = 0u; i < 16u; ++i) {
-                    float r = sqrt((float(i) + 0.5) * (1.0 / 16.0)) * filter_r;
+                for (uint i = 0u; i < pcf_taps; ++i) {
+                    float r = sqrt((float(i) + 0.5) * inv_ptaps) * filter_r;
                     float theta = float(i) * 2.39996323 + base_ang + 0.78539816;
                     vec2 puv = clamp(vec2(u_c, v_c) + vec2(cos(theta), sin(theta)) * r, q_min, q_max);
                     pcss_sum += textureLod(sampler2DShadow(fs_img1, fs_samp1), vec3(puv, dref_pcss), 0.0);
                 }
-                pcf_avg = pcss_sum * (1.0 / 16.0);
+                pcf_avg = pcss_sum * inv_ptaps;
             } else {
                 // Keep tight 4-tap contact check so ultra-close (<5 cm) contact shadows are never missed.
                 float s0 = textureLod(sampler2DShadow(fs_img1, fs_samp1), vec3((sx + db) * inv_sw, (sy - da) * inv_sw, dref), 0.0);

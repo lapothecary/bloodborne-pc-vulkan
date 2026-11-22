@@ -1179,10 +1179,6 @@ private:
     u8 frame_fx_mask = 0;
     u8 frame_mb_mask = 0x0Au; // default: cam=2 (Default), obj=2 (Default)
     u8 frame_mb_fps_q4 = 16u; // Q4.4 FPS normalization scale (16 = 1.0x at 30 FPS)
-    u8 frame_fire_int_u8 = 108u;
-    u8 frame_fire_turb_u8 = 128u;
-    u8 frame_fire_emb_u8 = 128u;
-    u32 frame_fire_time_bits = 0u;
     bool frame_fx_mask_valid = false;
     /// Draws whose textures the helper bound completely, partly or not at all (BB_FRAME_STATS).
     u64 helper_full = 0, helper_partial = 0, helper_serial = 0;

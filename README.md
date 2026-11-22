@@ -52,10 +52,12 @@ BloodBorne/
 > **Hardware Requirements:** Because this port executes Bloodborne's original PS4 (`AMD Jaguar x86_64`) code natively on your CPU, it requires a **Vulkan 1.3 GPU** and an **x86-64-v3 CPU** supporting `AVX`, `BMI1`, `MOVBE`, `LZCNT`, and `POPCNT` (**Intel Haswell 4th-gen Core 2013+** or **AMD Ryzen / Steam Deck**; older pre-2013 CPUs such as Ivy Bridge `i7-3770K` or Sandy Bridge are not supported).  
 > **Linux Launcher Audio Tip (Arch / CachyOS):** Launcher BGM/SFX uses WebKitGTK + GStreamer — if launcher audio is silent on minimal installs, install `gst-plugins-base gst-plugins-good gst-plugin-pipewire`.
 
-## 🆕 Latest Release (`v1.2.1`)
+## 🆕 Latest Release (`v1.2.2`)
 
-- **Fixed Linux `CPU ISA level is lower than required` & `Shader baker exited with code 127`** — Linux prebuilt releases are now compiled cleanly in CI as portable **`x86-64-v3`** (zero AVX-512 / `x86-64-v4`) with bundled distro-independent libraries (`out/gpu/`), working out of the box on Ryzen 1000–5000 (`5700X3D`/`5800X3D`), Intel 4th–14th gen / Core Ultra, and Steam Deck across CachyOS, Arch, Ubuntu, Fedora, Bazzite, and SteamOS.
-- **Includes everything from `v1.2.0`** — +35–55% CPU FPS breakthrough (330–375+ FPS in Central Yharnam), 1.3 s death respawns, 57× faster Linux Shader Pre-Bake (~4 s), high-FPS curb & Havok Cloth fixes, and crisp 2×–4× UI upscaling.
+- **Native Vulkan 1.3 PostFX Default (Faster GPU, 1:1 Original Look)** — Replaces legacy Yebis 2 across all profiles with native Vulkan 1.3 compute/fragment shaders (Tonemap, 3D LUT, Auto-Exposure, Bloom, FPS-normalized Motion Blur, DoF), cutting PostFX GPU time nearly in half while keeping authentic PS4 colorimetry.
+- **Next-Gen Optional Remaster Visuals** — **Native HDR10 (`ST.2084 PQ`)** with live SDR↔HDR10 toggle, **PCSS Contact-Hardening Soft Shadows** (4K CSM + cubemap VSM), **Native Vulkan Half-Res HBIL SSGI v2**, **Fire Heat Haze**, and **60× frame-pacing jitter fix**.
+- **Issue #3 Controls Fix & Per-Draw GPU Profiler** — Fixed swapped `Camera X-Axis` / `Camera Y-Axis` bindings in `System → Controls`, and added a 1-click GPU bottleneck profiler (`logs/gpu_profile_dump.txt`) in `F8` Debug.
+- **Includes everything from `v1.2.1` & `v1.2.0`** — Portable Linux `x86-64-v3` builds (zero AVX-512), +35–55% CPU FPS boost, 1.3 s death respawns, 4-second Linux Shader Pre-Bake, high-FPS curb & Havok Cloth fixes, and 2×–4× UI upscaling.
 
 *(See [Releases](https://github.com/lapothecary/bloodborne-pc-vulkan/releases) for clean per-version changelogs.)*
 

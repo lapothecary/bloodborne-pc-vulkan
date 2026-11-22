@@ -1,16 +1,45 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
+#include <filesystem>
 #include <unistd.h>
 
 #include "bbport_toggles.h"
 #include "render/vk_gpu_profiler.h"
+#include "shader/backend/spirv/native_shaders.h"
 #include "vulkan/instance.h"
 #include "render/scheduler.h"
 #include "../../dantelion_gx/include/gx_direct_vulkan.h"
 
 namespace Vulkan {
+
+namespace {
+std::atomic<bool> g_manual_req{false};
+std::atomic<bool> g_manual_req_per_draw{true};
+std::atomic<bool> g_manual_active{false};
+std::atomic<u32> g_manual_last_labels{0};
+std::atomic<u32> g_manual_last_draws{0};
+} // namespace
+
+void GpuProfiler::RequestManualCapture(bool per_draw) noexcept {
+    g_manual_req_per_draw.store(per_draw, std::memory_order_relaxed);
+    g_manual_req.store(true, std::memory_order_release);
+}
+
+bool GpuProfiler::IsManualCaptureActive() noexcept {
+    return g_manual_active.load(std::memory_order_relaxed) ||
+           g_manual_req.load(std::memory_order_relaxed);
+}
+
+u32 GpuProfiler::GetLastManualLabelCount() noexcept {
+    return g_manual_last_labels.load(std::memory_order_relaxed);
+}
+
+u32 GpuProfiler::GetLastManualDrawCount() noexcept {
+    return g_manual_last_draws.load(std::memory_order_relaxed);
+}
 
 void GpuProfiler::Init(const Instance& instance, Scheduler& scheduler) {
     if (stored_ptr) {
@@ -20,11 +49,13 @@ void GpuProfiler::Init(const Instance& instance, Scheduler& scheduler) {
     const char* env = std::getenv("BB_GPU_PROFILE");
     if (env && env[0] == '2') {
         stored_ptr->permanent = true;
+        const char* draws_env = std::getenv("BB_GPU_PROFILE_DRAWS");
+        stored_ptr->per_draw_mode = (draws_env && draws_env[0] == '1');
         instance_ptr = stored_ptr;
     }
 }
 
-void GpuProfiler::StartCapture() {
+void GpuProfiler::StartCapture(bool per_draw) {
     for (u32 i = 0; i < NumSlices; ++i) {
         if (used[i]) {
             device.resetQueryPool(*pool, i * SliceQueries, used[i]);
@@ -37,6 +68,7 @@ void GpuProfiler::StartCapture() {
     frames = 0;
     draw_frames = 0;
     current = 0;
+    per_draw_mode = per_draw;
     totals.clear();
     draw_stats.clear();
     gaps.clear();
@@ -52,6 +84,9 @@ void GpuProfiler::StopCapture() {
             cmdbuf.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, pool, query);
         });
     }
+    per_draw_mode = false;
+    manual_dump_mode = false;
+    g_manual_active.store(false, std::memory_order_release);
     instance_ptr = nullptr;
 }
 
@@ -82,6 +117,12 @@ void GpuProfiler::OnFrame() {
         return;
     }
     if (!stored_ptr->permanent) {
+        if (g_manual_req.exchange(false, std::memory_order_acq_rel)) {
+            stored_ptr->manual_dump_mode = true;
+            g_manual_active.store(true, std::memory_order_release);
+            stored_ptr->StartCapture(g_manual_req_per_draw.load(std::memory_order_relaxed));
+            return;
+        }
         static const bool auto_profile_env = [] {
             const char* e = std::getenv("BB_GPU_PROFILE");
             return e && e[0] != '\0' && e[0] != '0';
@@ -94,7 +135,9 @@ void GpuProfiler::OnFrame() {
             if (trigger_file) {
                 ::unlink("/tmp/bb_gpu_profile_trigger");
             }
-            stored_ptr->StartCapture();
+            const char* draws_env = std::getenv("BB_GPU_PROFILE_DRAWS");
+            stored_ptr->manual_dump_mode = false;
+            stored_ptr->StartCapture(draws_env && draws_env[0] == '1');
         }
     }
 }
@@ -366,6 +409,18 @@ void GpuProfiler::WriteTimestamp(u64 key) {
     });
 }
 
+void GpuProfiler::WriteTimestampInline(u64 key) {
+    if (used[slice] + 64 >= SliceQueries) {
+        return; // keep headroom for pass/frame end boundaries
+    }
+    const u32 query = slice * SliceQueries + used[slice]++;
+    keys[slice].push_back(key);
+    current = key;
+    scheduler.Record([pool = *pool, query](vk::CommandBuffer cmdbuf) {
+        cmdbuf.writeTimestamp2(vk::PipelineStageFlagBits2::eAllGraphics, pool, query);
+    });
+}
+
 void GpuProfiler::BeginFrame() {
     // Close the frame: one more timestamp without a label.
     if (used[slice] > 0 && used[slice] < SliceQueries) {
@@ -431,38 +486,123 @@ void GpuProfiler::Print(bool to_file) {
     window = now;
     std::vector<std::pair<u64, Total>> sorted(totals.begin(), totals.end());
     std::ranges::sort(sorted, [](const auto& a, const auto& b) { return a.second.ms > b.second.ms; });
-    double sum = 0;
+    auto is_idle_key = [](u64 k) noexcept {
+        return k >= SubmissionGapKey && k < SubmissionGapKey + 0x20;
+    };
+    double sum = 0.0;
+    double idle_sum = 0.0;
     for (const auto& [key, total] : sorted) {
         sum += total.ms;
+        if (is_idle_key(key)) {
+            idle_sum += total.ms;
+        }
     }
+    const double active_sum = std::max(0.0, sum - idle_sum);
     static const bool verbose = [] {
         const char* e = std::getenv("BB_VERBOSE_STATS");
         return e && e[0] == '1';
     }();
 #ifdef _WIN32
-    constexpr const char* kProfilePath = "logs/bb_gpu_profile.txt";
+    constexpr const char* kDefaultProfilePath = "logs/bb_gpu_profile.txt";
     constexpr const char* kSessionProfilePath = "logs/bb_gpu_profile_session.txt";
 #else
-    constexpr const char* kProfilePath = "/tmp/bb_gpu_profile.txt";
+    constexpr const char* kDefaultProfilePath = "/tmp/bb_gpu_profile.txt";
     constexpr const char* kSessionProfilePath = "/tmp/bb_gpu_profile_session.txt";
 #endif
-    FILE* f = std::fopen(kProfilePath, "w");
-    std::printf("GPU profile: %.2f ms/frame over %llu frames, %zu labels (details in %s)\n",
-                sum / frames, static_cast<unsigned long long>(frames), sorted.size(), kProfilePath);
-    if (f) {
-        std::fprintf(f, "GPU profile: %.2f ms/frame over %llu frames, %zu labels\n", sum / frames,
-                     static_cast<unsigned long long>(frames), sorted.size());
+    const char* profile_path = manual_dump_mode ? "logs/gpu_profile_dump.txt" : kDefaultProfilePath;
+    if (manual_dump_mode) {
+        std::error_code ec;
+        std::filesystem::create_directories("logs", ec);
     }
-    for (size_t i = 0; i < std::min<size_t>(sorted.size(), 40); ++i) {
+    const double total_ms_f = sum / double(frames);
+    const double idle_ms_f = idle_sum / double(frames);
+    const double active_ms_f = active_sum / double(frames);
+    const double gpu_w = double(BbStats::gpu_power_mw.load(std::memory_order_relaxed)) * 0.001;
+    const double active_w = (gpu_w > 32.0) ? (gpu_w - 30.0) : 0.0;
+    const size_t max_labels = manual_dump_mode ? sorted.size() : std::min<size_t>(sorted.size(), 40);
+    FILE* f = std::fopen(profile_path, "w");
+    std::printf("GPU profile: %.2f ms active (+ %.2f ms idle) over %llu frames, %zu labels (details in %s)\n",
+                active_ms_f, idle_ms_f, static_cast<unsigned long long>(frames), sorted.size(), profile_path);
+    if (f) {
+        std::fprintf(f, "=== Bloodborne PC Vulkan — GPU Pass & Draw Bottleneck Profile ===\n");
+        std::fprintf(f, "Frames: %llu | Per-Draw Timestamps: %s | Unique GPU segments: %zu | Unique shader pairs: %zu\n",
+                     static_cast<unsigned long long>(frames), per_draw_mode ? "ON" : "OFF",
+                     sorted.size(), draw_stats.size());
+        std::fprintf(f, "Active GPU Work: %.3f ms/frame | Idle/Cap Wait: %.3f ms/frame | Total Window: %.3f ms/frame\n",
+                     active_ms_f, idle_ms_f, total_ms_f);
+        std::fprintf(f, "Live Board Power: %.1f W (Est. Active Power: %.1f W above 30W idle)\n\n",
+                     gpu_w, active_w);
+
+        // [0] Smart Bottleneck Filter: automatically separates actionable [PS4-SPIRV] targets
+        // and heavy native passes (>= 3% active GPU) from known-cheap micro-draws (< 0.015 ms).
+        if (manual_dump_mode) {
+            std::fprintf(f, "--- [0A] ACTIONABLE [PS4-SPIRV] HOTSPOTS (>= 0.010 ms/frame, NOT YET NATIVE GLSL) ---\n");
+            std::fprintf(f, "  ms/frame | %%Act  |  ~W   | seg/f | description\n");
+            u32 spirv_hits = 0;
+            for (const auto& [key, total] : sorted) {
+                if (is_idle_key(key)) continue;
+                const double ms_f = total.ms / double(frames);
+                if (ms_f < 0.010) continue;
+                const auto& desc = described[key];
+                if (desc.find("[PS4-SPIRV]") == std::string::npos) continue;
+                const double pct = (active_ms_f > 1e-6) ? (ms_f * 100.0 / active_ms_f) : 0.0;
+                const double est_w = (active_ms_f > 1e-6) ? (active_w * (ms_f / active_ms_f)) : 0.0;
+                std::fprintf(f, "  %8.4f | %5.1f%% | %5.1f | %5.1f | %s\n",
+                             ms_f, pct, est_w, double(total.segments) / double(frames), desc.c_str());
+                ++spirv_hits;
+            }
+            if (spirv_hits == 0) {
+                std::fprintf(f, "  (none — all shaders >= 0.010 ms in this scene are already Native GLSL / Vulkan!)\n");
+            }
+            std::fprintf(f, "\n--- [0B] HEAVY NATIVE / VULKAN PASSES (>= 3.0%% OF ACTIVE GPU) ---\n");
+            std::fprintf(f, "  ms/frame | %%Act  |  ~W   | seg/f | description\n");
+            u32 heavy_native = 0;
+            for (const auto& [key, total] : sorted) {
+                if (is_idle_key(key)) continue;
+                const double ms_f = total.ms / double(frames);
+                const double pct = (active_ms_f > 1e-6) ? (ms_f * 100.0 / active_ms_f) : 0.0;
+                if (pct < 3.0) continue;
+                const auto& desc = described[key];
+                if (desc.find("[PS4-SPIRV]") != std::string::npos) continue;
+                const double est_w = (active_ms_f > 1e-6) ? (active_w * (ms_f / active_ms_f)) : 0.0;
+                std::fprintf(f, "  %8.4f | %5.1f%% | %5.1f | %5.1f | %s\n",
+                             ms_f, pct, est_w, double(total.segments) / double(frames), desc.c_str());
+                ++heavy_native;
+            }
+            if (heavy_native == 0) {
+                std::fprintf(f, "  (none)\n");
+            }
+            std::fprintf(f, "\n");
+        }
+
+        std::fprintf(f, "--- [1] ALL GPU PASSES & SHADER DRAWS SORTED BY GPU TIME (HEAVIEST FIRST) ---\n");
+        std::fprintf(f, "  ms/frame | %%Act  |  ~W   | seg/f | description\n");
+    }
+    for (size_t i = 0; i < max_labels; ++i) {
         const auto& [key, total] = sorted[i];
+        const double ms_f = total.ms / double(frames);
+        const bool is_idle = is_idle_key(key);
+        const double pct = (!is_idle && active_ms_f > 1e-6) ? (ms_f * 100.0 / active_ms_f) : 0.0;
+        const double est_w = (!is_idle && active_ms_f > 1e-6) ? (active_w * (ms_f / active_ms_f)) : 0.0;
         if (verbose) {
-            std::printf("  %6.3f ms/frame %5.1f/frame  %s\n", total.ms / frames,
-                        double(total.segments) / frames, described[key].c_str());
+            std::printf("  %6.3f ms/frame %5.1f/frame  %s\n", ms_f,
+                        double(total.segments) / double(frames), described[key].c_str());
         }
         if (f) {
-            std::fprintf(f, "  %6.3f ms/frame %5.1f/frame  %s\n", total.ms / frames,
-                         double(total.segments) / frames, described[key].c_str());
+            if (is_idle) {
+                std::fprintf(f, "  %8.4f |  IDLE |   0.0 | %5.1f | %s\n",
+                             ms_f, double(total.segments) / double(frames),
+                             described[key].c_str());
+            } else {
+                std::fprintf(f, "  %8.4f | %5.1f%% | %5.1f | %5.1f | %s\n",
+                             ms_f, pct, est_w, double(total.segments) / double(frames),
+                             described[key].c_str());
+            }
         }
+    }
+    if (manual_dump_mode) {
+        g_manual_last_labels.store(static_cast<u32>(sorted.size()), std::memory_order_relaxed);
+        g_manual_last_draws.store(static_cast<u32>(draw_stats.size()), std::memory_order_relaxed);
     }
     if (!gaps.empty()) {
         // The gaps one by one: the presenter's own submissions (outside this scheduler) fall in
@@ -501,24 +641,28 @@ void GpuProfiler::Print(bool to_file) {
                         sorted_draws.size(), static_cast<unsigned long long>(draw_frames));
         }
         if (f) {
-            std::fprintf(f, "  top shader pairs by draws/frame (%zu unique across %llu frames):\n",
+            std::fprintf(f, "\n--- [2] ALL UNIQUE SHADER PAIRS BY DRAWS/FRAME (%zu unique across %llu frames) ---\n",
                          sorted_draws.size(), static_cast<unsigned long long>(draw_frames));
         }
         const double inv_df = 1.0 / double(draw_frames);
-        for (size_t i = 0; i < std::min<size_t>(sorted_draws.size(), 25); ++i) {
+        const size_t max_draws = manual_dump_mode ? sorted_draws.size() : std::min<size_t>(sorted_draws.size(), 25);
+        for (size_t i = 0; i < max_draws; ++i) {
             const auto& st = sorted_draws[i];
+            const char* nat_ps = Shader::Backend::SPIRV::NativeShaderName(st.ps_hash);
+            const char* nat_vs = Shader::Backend::SPIRV::NativeShaderName(st.vs_hash);
+            const char* tag = nat_ps ? nat_ps : (nat_vs ? nat_vs : "PS4-SPIRV");
             if (verbose) {
-                std::printf("    %6.1f draws/f %9.1f idx/f  %4ux%-4u [%u MRT] vs %016llx ps %016llx\n",
+                std::printf("    %6.1f draws/f %9.1f idx/f  %4ux%-4u [%u MRT] vs %016llx ps %016llx [%s]\n",
                             double(st.draws) * inv_df, double(st.vtx_instances) * inv_df, st.width,
                             st.height, st.num_mrts, static_cast<unsigned long long>(st.vs_hash),
-                            static_cast<unsigned long long>(st.ps_hash));
+                            static_cast<unsigned long long>(st.ps_hash), tag);
             }
             if (f) {
                 std::fprintf(
-                    f, "    %6.1f draws/f %9.1f idx/f  %4ux%-4u [%u MRT] vs %016llx ps %016llx\n",
+                    f, "    %6.1f draws/f %9.1f idx/f  %4ux%-4u [%u MRT] vs %016llx ps %016llx [%s]\n",
                     double(st.draws) * inv_df, double(st.vtx_instances) * inv_df, st.width,
                     st.height, st.num_mrts, static_cast<unsigned long long>(st.vs_hash),
-                    static_cast<unsigned long long>(st.ps_hash));
+                    static_cast<unsigned long long>(st.ps_hash), tag);
             }
         }
     }

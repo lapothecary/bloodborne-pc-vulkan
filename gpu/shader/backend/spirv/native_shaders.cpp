@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <span>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -950,15 +951,20 @@ bool NativeShadersCustomRange() noexcept {
 }
 
 bool HasNativeShader(u64 pgm_hash) noexcept {
-    static const std::unordered_set<u64> hashes = [] {
-        std::unordered_set<u64> s;
-        s.reserve(kNativeRegistry.size() * 2u);
+    return NativeShaderName(pgm_hash) != nullptr;
+}
+
+const char* NativeShaderName(u64 pgm_hash) noexcept {
+    static const std::unordered_map<u64, const char*> names = [] {
+        std::unordered_map<u64, const char*> m;
+        m.reserve(kNativeRegistry.size() * 2u);
         for (const auto& entry : kNativeRegistry) {
-            s.insert(entry.pgm_hash);
+            m.emplace(entry.pgm_hash, entry.label);
         }
-        return s;
+        return m;
     }();
-    return hashes.contains(pgm_hash);
+    const auto it = names.find(pgm_hash);
+    return it != names.end() ? it->second : nullptr;
 }
 
 bool TryReplaceWithNativeShader(u64 pgm_hash, const std::vector<u32>& ref_spv,

@@ -231,8 +231,8 @@ struct CSOptionsData {
     u8 hud_display         = 1;  // +0x07: internal HUD flag (default 1, untouched by menu)
     u8 blood_expression    = 1;  // +0x08: Game.Option.Disp.Blood (0 = Off, 1 = On; default 1)
     u8 subtitles           = 1;  // +0x09: Game.Option.Disp.Subtitle (0 = Off, 1 = On; default 1)
-    u8 camera_up_down      = 1;  // +0x0a: Game.Option.Control.RotUD (1 = Normal, 0 = Inverted; default 1)
-    u8 camera_left_right   = 1;  // +0x0b: Game.Option.Control.RotLR (1 = Normal, 0 = Inverted; default 1)
+    u8 camera_left_right   = 1;  // +0x0a: Camera X-Axis (ID 113000, game_settings[0x9], read at 0x18205a0; 1 = Normal, 0 = Inverted)
+    u8 camera_up_down      = 1;  // +0x0b: Camera Y-Axis (ID 113001, game_settings[0xa], read at 0x1820610; 1 = Normal, 0 = Inverted)
     u8 auto_target         = 0;  // +0x0c: Auto-Target Switch (0 = Off, 1 = On; default 0)
     u8 camera_auto_adjust  = 1;  // +0x0d: Camera Wall Auto-Adjust (0 = Off, 1 = On; default 1)
     u8 unk_0e              = 0;  // +0x0e
@@ -250,7 +250,8 @@ struct CSOptionsData {
 static_assert(sizeof(CSOptionsData) == 0x80);
 static_assert(offsetof(CSOptionsData, music_volume) == 0x04);
 static_assert(offsetof(CSOptionsData, blood_expression) == 0x08);
-static_assert(offsetof(CSOptionsData, camera_up_down) == 0x0a);
+static_assert(offsetof(CSOptionsData, camera_left_right) == 0x0a);
+static_assert(offsetof(CSOptionsData, camera_up_down) == 0x0b);
 static_assert(offsetof(CSOptionsData, camera_auto_adjust) == 0x0d);
 static_assert(offsetof(CSOptionsData, network_region) == 0x10);
 static_assert(offsetof(CSOptionsData, player_name_display) == 0x11);

@@ -202,6 +202,8 @@ inline std::atomic<std::uint64_t> present_wait_ns{0};
 /// (zero-RenderPass-break submission-boundary Vulkan timestamp queries, collected 7 frames behind).
 inline std::atomic<std::uint64_t> hw_gpu_busy_ns{0}, hw_gpu_gap_ns{0}, hw_gpu_inter_gap_ns{0},
     hw_gpu_frames{0};
+/// Latest live GPU board power in milliwatts (updated by background telemetry thread from NVML/sysfs).
+inline std::atomic<std::uint32_t> gpu_power_mw{0};
 /// Per-category hardware GPU render-pass breakdown (10 semantic pass buckets, sum == hw_gpu_busy_ns).
 enum HudGpuCat : std::uint8_t {
     GpuCat_Shadows = 0,        // 1. Shadow Maps (CSM / Spot / VSM)

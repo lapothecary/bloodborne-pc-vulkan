@@ -22,7 +22,7 @@ layout(set = 0, binding = 4, std140) uniform PostFxParams {
     vec4 scene_vig;       // x=inv_scene_lum_scale, y=vig_power, z=vig_tan_half_fov, w=aspect
     vec4 color_corr;      // x=hue_rad, y=saturation, z=value_scale, w=contrast
     vec4 ca_params;       // xy=lat_disp, zw=uni_disp
-    vec4 bloom_params;    // x=bloom_intensity, y=reserved, z=reserved, w=reserved
+    vec4 bloom_params;    // x=bloom_intensity, y=heat_haze_str, z=time_sec, w=inv_out_h
     uvec4 flags_misc;     // x=flags, y=tone_type, z=ca_samples, w=frame_index
 } u;
 
@@ -114,8 +114,37 @@ void main() {
     const bool bgra_export = (flags & 16u) != 0u;
     const bool bloom_on = (flags & 32u) != 0u;
 
-    // 1. Sample linear HDR scene (with resolution-independent Chromatic Aberration if enabled).
-    vec3 scene_rgb = SampleSceneWithCA(uv, ca_on, u.ca_params.xy, u.ca_params.zw, u.flags_misc.z);
+    // 1. Sample linear HDR scene (with optional Stage 2.1 Convective Fire Heat Haze + CA).
+    vec2 scene_uv = uv;
+    const float heat_str = u.bloom_params.y;
+    if (bloom_on && heat_str > 0.001) {
+        // Sample pure GXFfx fire-emission mask (bloom_tex.a = post-VFX HDR minus pre-VFX opaque HDR)
+        // strictly BELOW current pixel (heat rises UPWARD in UV -Y!).
+        // Wet cobblestones, puddles & walls are opaque -> bloom_tex.a == 0.0 -> 0% ground blur!
+        const float h1 = textureLod(sampler2D(bloom_tex, linear_samp), clamp(uv + vec2(0.0, 0.016), 0.0, 1.0), 0.0).a;
+        const float h2 = textureLod(sampler2D(bloom_tex, linear_samp), clamp(uv + vec2(0.0, 0.048), 0.0, 1.0), 0.0).a;
+        const float h3 = textureLod(sampler2D(bloom_tex, linear_samp), clamp(uv + vec2(0.0, 0.088), 0.0, 1.0), 0.0).a;
+        const float h_src = h1 * 0.45 + h2 * 0.35 + h3 * 0.20;
+        const float h_energy = smoothstep(0.04, 0.40, h_src);
+        if (h_energy > 0.005) {
+            const float t_hh = u.bloom_params.z;
+            const vec2 wp = vec2(uv.x * u.scene_vig.w * 26.0, uv.y * 22.0 + t_hh * 5.8);
+            const float w1 = sin(wp.y + sin(wp.x * 0.75 + t_hh * 2.4) * 1.35);
+            const float w2 = cos(wp.x * 1.35 + wp.y * 0.80 - t_hh * 3.3);
+            const vec2 disp = vec2(w1 * 0.72 + w2 * 0.28, w2 * 0.32) * (h_energy * heat_str * 0.0018);
+            scene_uv = clamp(uv + disp, 0.0, 1.0);
+        }
+    }
+    vec3 scene_rgb = SampleSceneWithCA(scene_uv, ca_on, u.ca_params.xy, u.ca_params.zw, u.flags_misc.z);
+    if (scene_uv != uv) {
+        // Anti-bleed guard: prevent hot fire core pixels from smearing onto dark foreground silhouettes.
+        const vec3 orig_rgb = max(textureLod(sampler2D(hdr_scene, linear_samp), uv, 0.0).rgb, vec3(0.0));
+        const float l_orig = dot(orig_rgb, vec3(0.299, 0.587, 0.114));
+        const float l_dist = dot(scene_rgb, vec3(0.299, 0.587, 0.114));
+        if (l_dist > l_orig * 2.2 + 0.45) {
+            scene_rgb = orig_rgb;
+        }
+    }
 
     // 2. Optical Vignette (cos^power law from Yebis2, modulated by FOV dependence).
     float vig = 1.0;

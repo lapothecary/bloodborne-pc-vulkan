@@ -36,12 +36,28 @@ public:
     /// Runs the native Vulkan post-process pipeline for a single frame (returns true if rendered).
     bool Execute(const BbCp::DirectVk::NativePostProcessArgs& args, TemporalUpscaler* upscaler);
 
+    /// Captures a half-res snapshot of the opaque HDR scene right after `ps_32e47788_atmos_fog`
+    /// (before GXFfx fire sprites draw) so Heat Haze isolates 100% pure fire emission and NEVER
+    /// triggers on wet cobblestone specular reflections.
+    void CaptureOpaqueHdr(VideoCore::Image& hdr_image);
+
+    /// Runs Half-Res L2-resident 16-tap HBIL SSGI + Full-Res depth-aware bilateral upsample
+    /// directly onto `hdr_image` right after `ps_32e47788_atmos_fog` (~4x faster & -35..45W vs full-res).
+    void ExecuteHalfResSsgi(VideoCore::Image& hdr_image, vk::ImageView hdr_view,
+                            vk::ImageView g0_view, vk::ImageView depth_view,
+                            vk::ImageView g2_view, vk::ImageView diff_view,
+                            vk::ImageView amb_view, const vk::DescriptorBufferInfo& ssbo2_info,
+                            u32 d1_dword_offset);
+
 private:
     bool EnsureInit();
     bool EnsureBloomPyramid(u32 hdr_w, u32 hdr_h);
+    bool EnsureOpaqueHdrTarget(u32 hdr_w, u32 hdr_h);
+    bool EnsureSsgiTargets(u32 hdr_w, u32 hdr_h);
     bool EnsureMotionBlurTargets(u32 hdr_w, u32 hdr_h);
     bool EnsureDofTargets(u32 hdr_w, u32 hdr_h);
     vk::Pipeline GetOrCreateTonemapPipeline(vk::Format color_format);
+    vk::Pipeline GetOrCreateSsgiUpsamplePipeline(vk::Format color_format);
 
     static constexpr u32 kBloomMips = 5u;
 
@@ -66,6 +82,21 @@ private:
     std::array<vk::Extent2D, kBloomMips> bloom_mip_extents{};
     u32 bloom_base_w = 0u;
     u32 bloom_base_h = 0u;
+
+    VideoCore::HostImage opaque_hdr_half;
+    vk::UniqueImageView opaque_hdr_view;
+    vk::Extent2D opaque_hdr_extent{};
+    vk::Image opaque_hdr_src_vk = VK_NULL_HANDLE;
+    bool opaque_hdr_valid = false;
+
+    VideoCore::HostImage ssgi_rad_mip0;
+    vk::UniqueImageView ssgi_rad_mip0_view;
+    VideoCore::HostImage ssgi_rad_mip1;
+    vk::UniqueImageView ssgi_rad_mip1_view;
+    VideoCore::HostImage ssgi_raw_img;
+    vk::UniqueImageView ssgi_raw_view;
+    vk::Extent2D ssgi_half_extent{};
+    vk::Extent2D ssgi_quarter_extent{};
 
     VideoCore::HostImage mb_vel_img;
     vk::UniqueImageView mb_vel_view;
@@ -123,6 +154,19 @@ private:
     vk::UniqueDescriptorSetLayout dof_comp_ds_layout;
     vk::UniquePipelineLayout dof_comp_layout;
     vk::UniquePipeline dof_comp_pipeline;
+
+    vk::UniqueDescriptorSetLayout ssgi_prefilter_ds_layout;
+    vk::UniquePipelineLayout ssgi_prefilter_layout;
+    vk::UniquePipeline ssgi_prefilter_pipeline;
+
+    vk::UniqueDescriptorSetLayout ssgi_trace_ds_layout;
+    vk::UniquePipelineLayout ssgi_trace_layout;
+    vk::UniquePipeline ssgi_trace_pipeline;
+
+    vk::UniqueDescriptorSetLayout ssgi_upsample_ds_layout;
+    vk::UniquePipelineLayout ssgi_upsample_layout;
+    vk::UniqueShaderModule ssgi_upsample_fs;
+    std::unordered_map<vk::Format, vk::UniquePipeline> ssgi_upsample_pipelines;
 
     vk::UniqueDescriptorSetLayout tonemap_ds_layout;
     vk::UniquePipelineLayout tonemap_layout;

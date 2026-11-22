@@ -14,6 +14,7 @@
 #include "render/vk_obj_vel_cull.h"
 #include "render/vk_vfx_ui_batch.h"
 #include "render/vk_native_postfx.h"
+#include "shader/backend/spirv/native_shaders.h"
 #include "shim/bbport_frame_rate.h"
 #include "shim/bbport_settings.h"
 #include "textures/direct_textures.h"
@@ -3920,6 +3921,38 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     if (gbuf_reorder_bucket < Scheduler::kNumReorderBuckets) {
         scheduler.LeaveReorderBucket();
     }
+    if (ps_info_sort && ps_info_sort->pgm_hash == 0x0000000032e47788ULL && native_postfx &&
+        state.num_color_attachments > 0u && cb_descs[0].first) {
+        const auto& s = BbSettings::Get();
+        if (s.ssgi_enabled.load(std::memory_order_relaxed) &&
+            state.color_attachments[0].image_view && buffer_infos.size() >= 2u) {
+            vk::ImageView ps_imgs[6]{};
+            u32 img_count = 0u;
+            for (const auto& w : set_writes) {
+                if (w.descriptorType == vk::DescriptorType::eSampledImage && w.pImageInfo) {
+                    if (img_count < 6u) {
+                        ps_imgs[img_count++] = w.pImageInfo->imageView;
+                    } else {
+                        for (u32 k = 0u; k < 5u; ++k) ps_imgs[k] = ps_imgs[k + 1u];
+                        ps_imgs[5] = w.pImageInfo->imageView;
+                    }
+                }
+            }
+            if (img_count == 6u) {
+                const u32 ssbo2_slot = static_cast<u32>(buffer_infos.size() - 1u);
+                const u32 d1_dw = static_cast<u32>(push_data.buf_offsets[ssbo2_slot]) >> 2u;
+                native_postfx->ExecuteHalfResSsgi(
+                    texture_cache.GetImage(cb_descs[0].first),
+                    state.color_attachments[0].image_view,
+                    ps_imgs[0], ps_imgs[1], ps_imgs[2], ps_imgs[3], ps_imgs[5],
+                    buffer_infos[ssbo2_slot], d1_dw);
+            }
+        }
+        if (s.native_postfx.load(std::memory_order_relaxed) &&
+            s.fire_heat_haze.load(std::memory_order_relaxed)) {
+            native_postfx->CaptureOpaqueHdr(texture_cache.GetImage(cb_descs[0].first));
+        }
+    }
     }
     // BB_TRACE_SHADER with BB_GPU_PROFILE: a mark right after the traced vertex shader's draws,
     // so the profile splits their pass into the draw and what follows it unlabeled.
@@ -3994,7 +4027,6 @@ void Rasterizer::ScaleToTarget(const GraphicsPipeline* pipeline) {
         if (settings.true_black_hdr.load(std::memory_order_relaxed))  fx_mask |= 0x08u;
         if (settings.pcss_shadows.load(std::memory_order_relaxed))    fx_mask |= 0x10u;
         if (settings.ssgi_enabled.load(std::memory_order_relaxed))    fx_mask |= 0x20u;
-        if (settings.enhanced_fire.load(std::memory_order_relaxed))   fx_mask |= 0x80u;
         frame_fx_mask = fx_mask;
         const u8 mb_cam = static_cast<u8>(
             std::clamp(settings.motion_blur_camera.load(std::memory_order_relaxed), 0, 3));
@@ -4007,41 +4039,10 @@ void Rasterizer::ScaleToTarget(const GraphicsPipeline* pipeline) {
         const float mb_fps_scale = std::clamp(1.0f / mb_frames, 1.0f, 12.0f);
         frame_mb_fps_q4 = static_cast<u8>(
             std::clamp(static_cast<int>(std::lround(mb_fps_scale * 16.0f)), 16, 255));
-        if ((fx_mask & 0x80u) != 0u) {
-            static const auto s_fire_t0 = std::chrono::steady_clock::now();
-            const double elapsed =
-                std::chrono::duration<double>(std::chrono::steady_clock::now() - s_fire_t0).count();
-            const float t_sec = static_cast<float>(std::fmod(elapsed, 4096.0));
-            std::memcpy(&frame_fire_time_bits, &t_sec, sizeof(frame_fire_time_bits));
-            const float f_int =
-                std::clamp(settings.fire_intensity.load(std::memory_order_relaxed), 0.40f, 2.40f);
-            const float f_turb =
-                std::clamp(settings.fire_turbulence.load(std::memory_order_relaxed), 0.00f, 2.00f);
-            const float f_emb =
-                std::clamp(settings.fire_embers.load(std::memory_order_relaxed), 0.00f, 2.00f);
-            frame_fire_int_u8 = static_cast<u8>(
-                std::clamp(static_cast<int>(std::lround(((f_int - 0.40f) / 2.00f) * 255.0f)), 0, 255));
-            frame_fire_turb_u8 = static_cast<u8>(
-                std::clamp(static_cast<int>(std::lround((f_turb / 2.00f) * 255.0f)), 0, 255));
-            frame_fire_emb_u8 = static_cast<u8>(
-                std::clamp(static_cast<int>(std::lround((f_emb / 2.00f) * 255.0f)), 0, 255));
-        }
         frame_fx_mask_valid = true;
     }
-    u8 draw_mb_mask = frame_mb_mask;
-    if ((frame_fx_mask & 0x80u) != 0u && pipeline) {
-        const auto& bc0 = pipeline->GetGraphicsKey().blend_controls[0];
-        if (bc0.enable && bc0.color_dst_factor == Gcn::BlendControl::BlendFactor::One &&
-            bc0.color_func == Gcn::BlendControl::BlendFunc::Add) {
-            draw_mb_mask |= 0x20u;
-            push_data.buf_offsets[30] = frame_fire_emb_u8;
-            push_data.buf_offsets[31] = frame_fire_turb_u8;
-            std::memcpy(&push_data.buf_offsets[32], &frame_fire_time_bits, sizeof(frame_fire_time_bits));
-            push_data.buf_offsets[36] = frame_fire_int_u8;
-        }
-    }
     push_data.buf_offsets[37] = frame_mb_fps_q4;
-    push_data.buf_offsets[38] = draw_mb_mask;
+    push_data.buf_offsets[38] = frame_mb_mask;
     push_data.buf_offsets[39] = frame_fx_mask;
 }
 
@@ -5589,7 +5590,11 @@ void Rasterizer::MarkPass(const GraphicsPipeline* pipeline, const RenderState& s
         profiler->NoteDraw(vs.pgm_hash, ps_hash, state.width, state.height,
                            state.num_color_attachments, idx_inst);
     }
-    if (!will_begin) {
+    const bool per_draw_inline =
+        !will_begin && profiler->PerDrawMode() && profiler->Records(&scheduler) &&
+        !state.secondary_contents &&
+        scheduler.ActiveReorderBucket() == Scheduler::kNoReorderBucket;
+    if (!will_begin && !per_draw_inline) {
         return;
     }
     std::array<u64, Gcn::NUM_COLOR_BUFFERS + 6> parts{};
@@ -5603,7 +5608,7 @@ void Rasterizer::MarkPass(const GraphicsPipeline* pipeline, const RenderState& s
                             : 0;
     }
     const u64 key = XXH3_64bits(parts.data(), sizeof(parts));
-    profiler->Mark(key, [&] {
+    auto describe = [&] {
         std::string targets;
         for (u32 cb = 0; cb < state.num_color_attachments; ++cb) {
             targets += cb_descs[cb].first
@@ -5611,13 +5616,22 @@ void Rasterizer::MarkPass(const GraphicsPipeline* pipeline, const RenderState& s
                            : std::string{"-"};
             targets += ' ';
         }
-        return fmt::format("pass {}x{} [{}] depth {} vs {:016x} ps {:016x}", state.width,
-                           state.height, targets,
+        const u64 psh = ps ? ps->pgm_hash : 0;
+        const char* nat_ps = Shader::Backend::SPIRV::NativeShaderName(psh);
+        const char* nat_vs = Shader::Backend::SPIRV::NativeShaderName(vs.pgm_hash);
+        const char* tag = nat_ps ? nat_ps : (nat_vs ? nat_vs : "PS4-SPIRV");
+        return fmt::format("{} {}x{} [{}] depth {} vs {:016x} ps {:016x} [{}]",
+                           will_begin ? "pass" : "draw", state.width, state.height, targets,
                            db_desc.first ? vk::to_string(
                                                texture_cache.GetImage(db_desc.first).info.pixel_format)
                                          : std::string{"-"},
-                           vs.pgm_hash, ps ? ps->pgm_hash : 0);
-    });
+                           vs.pgm_hash, psh, tag);
+    };
+    if (will_begin) {
+        profiler->Mark(key, describe);
+    } else {
+        profiler->MarkInline(key, describe);
+    }
 }
 
 void Rasterizer::NoteFrameStart() {

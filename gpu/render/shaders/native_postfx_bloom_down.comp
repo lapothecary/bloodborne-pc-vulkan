@@ -14,6 +14,8 @@ layout(set = 0, binding = 3, std430) readonly buffer ExposureStateBuffer {
     float target_exposure;
     uint initialized;
 } exp_state;
+layout(set = 0, binding = 4) uniform texture2D opaque_hdr_tex;
+layout(set = 0, binding = 5) uniform texture2D raw_hdr_tex;
 
 layout(push_constant) uniform BloomDownPush {
     uint dst_w;
@@ -67,8 +69,9 @@ vec3 PrefilterSample(vec3 raw_rgb, float exp_scale) {
     return out_c;
 }
 
-vec3 SampleSrc(vec2 uv) {
-    return max(textureLod(sampler2D(src_tex, linear_samp), uv, 0.0).rgb, vec3(0.0));
+vec4 SampleSrc4(vec2 uv) {
+    const vec4 s = textureLod(sampler2D(src_tex, linear_samp), uv, 0.0);
+    return vec4(max(s.rgb, vec3(0.0)), clamp(s.a, 0.0, 1.0));
 }
 
 void main() {
@@ -86,21 +89,22 @@ void main() {
     //  f . g . h
     //  . i . j .
     //  k . l . m
-    vec3 a = SampleSrc(uv + texel * vec2(-2.0, -2.0));
-    vec3 b = SampleSrc(uv + texel * vec2( 0.0, -2.0));
-    vec3 c = SampleSrc(uv + texel * vec2( 2.0, -2.0));
-    vec3 d = SampleSrc(uv + texel * vec2(-1.0, -1.0));
-    vec3 e = SampleSrc(uv + texel * vec2( 1.0, -1.0));
-    vec3 f = SampleSrc(uv + texel * vec2(-2.0,  0.0));
-    vec3 g = SampleSrc(uv);
-    vec3 h = SampleSrc(uv + texel * vec2( 2.0,  0.0));
-    vec3 i = SampleSrc(uv + texel * vec2(-1.0,  1.0));
-    vec3 j = SampleSrc(uv + texel * vec2( 1.0,  1.0));
-    vec3 k = SampleSrc(uv + texel * vec2(-2.0,  2.0));
-    vec3 l = SampleSrc(uv + texel * vec2( 0.0,  2.0));
-    vec3 m = SampleSrc(uv + texel * vec2( 2.0,  2.0));
+    vec4 a4 = SampleSrc4(uv + texel * vec2(-2.0, -2.0));
+    vec4 b4 = SampleSrc4(uv + texel * vec2( 0.0, -2.0));
+    vec4 c4 = SampleSrc4(uv + texel * vec2( 2.0, -2.0));
+    vec4 d4 = SampleSrc4(uv + texel * vec2(-1.0, -1.0));
+    vec4 e4 = SampleSrc4(uv + texel * vec2( 1.0, -1.0));
+    vec4 f4 = SampleSrc4(uv + texel * vec2(-2.0,  0.0));
+    vec4 g4 = SampleSrc4(uv);
+    vec4 h4 = SampleSrc4(uv + texel * vec2( 2.0,  0.0));
+    vec4 i4 = SampleSrc4(uv + texel * vec2(-1.0,  1.0));
+    vec4 j4 = SampleSrc4(uv + texel * vec2( 1.0,  1.0));
+    vec4 k4 = SampleSrc4(uv + texel * vec2(-2.0,  2.0));
+    vec4 l4 = SampleSrc4(uv + texel * vec2( 0.0,  2.0));
+    vec4 m4 = SampleSrc4(uv + texel * vec2( 2.0,  2.0));
 
     vec3 result;
+    float fire_a = 0.0;
     if ((pc.flags & 1u) != 0u) {
         const bool auto_on = (pc.flags & 2u) != 0u;
         const float exposure = (auto_on && exp_state.initialized != 0u)
@@ -108,39 +112,57 @@ void main() {
                                    : pc.manual_exposure;
         const float exp_scale = exposure * pc.inv_scene_lum_scale;
 
-        a = PrefilterSample(a, exp_scale);
-        b = PrefilterSample(b, exp_scale);
-        c = PrefilterSample(c, exp_scale);
-        d = PrefilterSample(d, exp_scale);
-        e = PrefilterSample(e, exp_scale);
-        f = PrefilterSample(f, exp_scale);
-        g = PrefilterSample(g, exp_scale);
-        h = PrefilterSample(h, exp_scale);
-        i = PrefilterSample(i, exp_scale);
-        j = PrefilterSample(j, exp_scale);
-        k = PrefilterSample(k, exp_scale);
-        l = PrefilterSample(l, exp_scale);
-        m = PrefilterSample(m, exp_scale);
+        vec3 a = PrefilterSample(a4.rgb, exp_scale);
+        vec3 b = PrefilterSample(b4.rgb, exp_scale);
+        vec3 c = PrefilterSample(c4.rgb, exp_scale);
+        vec3 d = PrefilterSample(d4.rgb, exp_scale);
+        vec3 e = PrefilterSample(e4.rgb, exp_scale);
+        vec3 f = PrefilterSample(f4.rgb, exp_scale);
+        vec3 g = PrefilterSample(g4.rgb, exp_scale);
+        vec3 h = PrefilterSample(h4.rgb, exp_scale);
+        vec3 i = PrefilterSample(i4.rgb, exp_scale);
+        vec3 j = PrefilterSample(j4.rgb, exp_scale);
+        vec3 k = PrefilterSample(k4.rgb, exp_scale);
+        vec3 l = PrefilterSample(l4.rgb, exp_scale);
+        vec3 m = PrefilterSample(m4.rgb, exp_scale);
 
         // Partial Karis average over 5 overlapping 2x2 groups (eliminates specular shimmer).
         const vec3 g0 = (d + e + i + j) * 0.25;
         const vec3 g1 = (a + b + f + g) * 0.25;
         const vec3 g2 = (b + c + g + h) * 0.25;
         const vec3 g3 = (f + g + k + l) * 0.25;
-        const vec3 g4 = (g + h + l + m) * 0.25;
+        const vec3 g4v = (g + h + l + m) * 0.25;
 
         const float w0 = KarisWeight(g0) * 0.500;
         const float w1 = KarisWeight(g1) * 0.125;
         const float w2 = KarisWeight(g2) * 0.125;
         const float w3 = KarisWeight(g3) * 0.125;
-        const float w4 = KarisWeight(g4) * 0.125;
-        result = (g0 * w0 + g1 * w1 + g2 * w2 + g3 * w3 + g4 * w4) / max(w0 + w1 + w2 + w3 + w4, 1e-5);
+        const float w4 = KarisWeight(g4v) * 0.125;
+        result = (g0 * w0 + g1 * w1 + g2 * w2 + g3 * w3 + g4v * w4) / max(w0 + w1 + w2 + w3 + w4, 1e-5);
+
+        // Pure GXFfx Fire Emission mask in .a (post-VFX raw HDR minus pre-VFX opaque HDR):
+        // Wet cobblestones, golden floor reflections, armor & walls are identical in both -> 0.0!
+        if ((pc.flags & 4u) != 0u) {
+            const vec2 o_px = vec2(1.25 / float(pc.dst_w), 1.25 / float(pc.dst_h));
+            vec3 op_max = max(textureLod(sampler2D(opaque_hdr_tex, linear_samp), uv, 0.0).rgb, vec3(0.0));
+            op_max = max(op_max, textureLod(sampler2D(opaque_hdr_tex, linear_samp), uv + vec2( o_px.x, 0.0), 0.0).rgb);
+            op_max = max(op_max, textureLod(sampler2D(opaque_hdr_tex, linear_samp), uv + vec2(-o_px.x, 0.0), 0.0).rgb);
+            op_max = max(op_max, textureLod(sampler2D(opaque_hdr_tex, linear_samp), uv + vec2(0.0,  o_px.y), 0.0).rgb);
+            op_max = max(op_max, textureLod(sampler2D(opaque_hdr_tex, linear_samp), uv + vec2(0.0, -o_px.y), 0.0).rgb);
+            const vec3 cur_raw = max(textureLod(sampler2D(raw_hdr_tex, linear_samp), uv, 0.0).rgb, vec3(0.0));
+            const vec3 fire_delta = max(cur_raw - op_max * 1.18, vec3(0.0)) * exp_scale;
+            const float f_warm = smoothstep(1.30, 2.25, fire_delta.r / max(fire_delta.b, 0.02)) *
+                                 smoothstep(1.00, 1.28, fire_delta.r / max(fire_delta.g, 0.02));
+            fire_a = clamp(smoothstep(0.30, 2.00, fire_delta.r) * f_warm, 0.0, 1.0);
+        }
     } else {
-        result = g * 0.125
-               + (a + c + k + m) * 0.03125
-               + (b + f + h + l) * 0.0625
-               + (d + e + i + j) * 0.125;
+        const vec4 r4 = g4 * 0.125
+                      + (a4 + c4 + k4 + m4) * 0.03125
+                      + (b4 + f4 + h4 + l4) * 0.0625
+                      + (d4 + e4 + i4 + j4) * 0.125;
+        result = r4.rgb;
+        fire_a = clamp(r4.a, 0.0, 1.0);
     }
 
-    imageStore(dst_img, ivec2(px), vec4(max(result, vec3(0.0)), 1.0));
+    imageStore(dst_img, ivec2(px), vec4(max(result, vec3(0.0)), fire_a));
 }

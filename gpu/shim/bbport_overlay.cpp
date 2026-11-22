@@ -42,6 +42,7 @@ void StartSfxFireDump(u32 duration_ms = 5000u) noexcept;
 #include "vulkan/instance.h"
 #include "render/direct_shaders.h"
 #include "render/scheduler.h"
+#include "render/vk_gpu_profiler.h"
 #include "../../dantelion_gx/include/gx_direct_vulkan.h"
 
 // DejaVu Sans (Cyrillic), embedded (third_party/fonts, Bitstream Vera license).
@@ -932,116 +933,18 @@ void Menu() {
         "warm fire, lanterns, and crimson sky softly bounce onto cobblestones, arches, and cloaks.",
         "Горизонтно-окклюзионный отражённый свет (SSGI) в линейном пайплайне освещения: "
         "тёплый свет костров, факелов, фонарей и неба мягко отражается на камнях, стенах и плаще."));
-    Checkbox(BbSettings::MenuText("Native Vulkan PostFX (A/B vs Yebis2)",
-                                  "Нативный пост-процесс Vulkan (A/B вместо Yebis2)"),
-             s.native_postfx);
+    Checkbox(BbSettings::MenuText("Fire Heat Haze", "Тепловое марево над огнём"),
+             s.fire_heat_haze);
     Hint(BbSettings::MenuText(
-        "Experimental Remaster v2 live A/B toggle: replaces the 2013 Yebis2 black-box with a "
-        "native Vulkan 1.3 pipeline (True-dt Auto-Exposure, FP16 Bloom, 16-tap IGN Motion Blur, "
-        "Tonemap, original 3D LUT, True Black, Vignette, CA). Toggle live to compare vs Yebis2.",
-        "Экспериментальный живой A/B-переключатель: заменяет чёрный ящик Yebis2 2013 года на "
-        "чистый Vulkan 1.3 (честный Auto-Exposure, FP16 Bloom, 16-tap IGN Motion Blur, Tonemap, "
-        "оригинальный 3D LUT, True Black, виньетка, ХА). Переключай на лету для сравнения."));
-    if (s.native_postfx.load(std::memory_order_relaxed)) {
+        "Subtle convective hot-air refraction rising above blazing bonfires and torches.",
+        "Мягкое конвекционное дрожание горячего воздуха над кострами и факелами."));
+    if (s.fire_heat_haze.load(std::memory_order_relaxed)) {
         ImGui::Indent(16.0f);
-        float bloom_int = s.native_bloom_intensity.load(std::memory_order_relaxed);
+        float hh_str = s.fire_heat_haze_strength.load(std::memory_order_relaxed);
         if (ImGui::SliderFloat(
-                BbSettings::MenuText("Bloom Intensity (GPARAM scale)",
-                                     "Сила Bloom (множитель GPARAM)"),
-                &bloom_int, 0.00f, 0.40f, "%.3f")) {
-            s.native_bloom_intensity.store(std::clamp(bloom_int, 0.0f, 0.40f),
-                                           std::memory_order_relaxed);
-        }
-        Hint(BbSettings::MenuText(
-            "Multiplies each area's live GPARAM GlareLuminance. Calibrated default: 0.250.",
-            "Множитель над живым GPARAM GlareLuminance каждой локации. Откалиброванный стандарт: 0.250."));
-
-        float bloom_thr = s.native_bloom_threshold.load(std::memory_order_relaxed);
-        if (ImGui::SliderFloat(
-                BbSettings::MenuText("Bloom Threshold (GPARAM mult)",
-                                     "Порог Bloom (множитель GPARAM)"),
-                &bloom_thr, 0.50f, 5.00f, "%.2f")) {
-            s.native_bloom_threshold.store(std::clamp(bloom_thr, 0.50f, 5.00f),
-                                           std::memory_order_relaxed);
-        }
-        Hint(BbSettings::MenuText(
-            "Higher = only lanterns/fire/moon bloom (clean face & sky). Calibrated default: 3.50.",
-            "Выше = светятся только фонари/огонь/луна (чистое лицо и небо). Откалиброванный стандарт: 3.50."));
-
-        float obj_boost = s.native_mb_obj_boost.load(std::memory_order_relaxed);
-        if (ImGui::SliderFloat(
-                BbSettings::MenuText("Object Motion Blur Boost",
-                                     "Усиление Object Motion Blur"),
-                &obj_boost, 0.25f, 4.00f, "%.2fx")) {
-            s.native_mb_obj_boost.store(std::clamp(obj_boost, 0.25f, 4.00f),
-                                        std::memory_order_relaxed);
-        }
-        Hint(BbSettings::MenuText(
-            "Live tuning multiplier for Pass 0x2e per-object velocity (Hunter/weapon/enemies).",
-            "Живой множитель скорости объектов Pass 0x2e (Охотник, оружие, враги)."));
-
-        float dof_str = s.native_dof_strength.load(std::memory_order_relaxed);
-        if (ImGui::SliderFloat(
-                BbSettings::MenuText("Depth of Field Strength",
-                                     "Сила глубины резкости (DoF)"),
-                &dof_str, 0.25f, 3.00f, "%.2fx")) {
-            s.native_dof_strength.store(std::clamp(dof_str, 0.25f, 3.00f),
-                                        std::memory_order_relaxed);
-        }
-        Hint(BbSettings::MenuText(
-            "Scales live GPARAM bokeh CoC radius (1.00x = exact FromSoftware GPARAM strength).",
-            "Масштабирует радиус боке из живого GPARAM локации (1.00x = точный стандарт игры)."));
-
-        Checkbox(BbSettings::MenuText("Debug: Show Velocity Map (Cam=R/G, ObjMask=B, ObjVel=Y)",
-                                      "Отладка: Карта скоростей (Мир=R/G, Маска=Синий, Герой=Жёлтый)"),
-                 s.native_mb_debug_vis);
-        {
-            const bool capturing = Vulkan::IsSfxFireDumpActive();
-            if (capturing) {
-                ImGui::BeginDisabled();
-                ImGui::Button(BbSettings::MenuText("Capturing Fire/SFX Shaders (5s)...",
-                                                   "Запись SFX/огня (5 сек)..."));
-                ImGui::EndDisabled();
-            } else if (ImGui::Button(BbSettings::MenuText(
-                           "Capture Fire/SFX Shaders (5s -> logs/sfx_fire_dump.txt)",
-                           "Записать шейдеры огня/SFX (5 сек -> logs/sfx_fire_dump.txt)"))) {
-                Vulkan::StartSfxFireDump(5000u);
-            }
-            const u32 last_n = Vulkan::GetSfxFireDumpLastCount();
-            if (!capturing && last_n > 0u) {
-                ImGui::SameLine();
-                ImGui::TextColored(ImVec4(0.45f, 0.95f, 0.55f, 1.0f),
-                                   "OK (%u pipelines)", last_n);
-            }
-        }
-        ImGui::Unindent(16.0f);
-    }
-
-    Checkbox(BbSettings::MenuText("Enhanced Fire & Embers (Blackbody HDR + 3D Flames)",
-                                  "Ремастер огня и искр (Blackbody HDR + 3D-пламя)"),
-             s.enhanced_fire);
-    Hint(BbSettings::MenuText(
-        "Stage 2.0 live A/B: 170-FPS 3D FBM flame tongues, physical Blackbody HDR core, and rising glowing embers on all bonfires, torches & Molotovs.",
-        "Этап 2.0 (живой A/B): чёткое 3D-пламя 170 FPS, физическое HDR-ядро (1400K-4800K) и искры для всех костров, факелов и Молотовых."));
-    if (s.enhanced_fire.load(std::memory_order_relaxed)) {
-        ImGui::Indent(16.0f);
-        float f_int = s.fire_intensity.load(std::memory_order_relaxed);
-        if (ImGui::SliderFloat(
-                BbSettings::MenuText("Fire HDR Intensity", "Яркость HDR-ядра огня"),
-                &f_int, 0.40f, 2.40f, "%.2f")) {
-            s.fire_intensity.store(std::clamp(f_int, 0.40f, 2.40f), std::memory_order_relaxed);
-        }
-        float f_turb = s.fire_turbulence.load(std::memory_order_relaxed);
-        if (ImGui::SliderFloat(
-                BbSettings::MenuText("Flame 3D Turbulence", "Детализация языков пламени"),
-                &f_turb, 0.00f, 2.00f, "%.2f")) {
-            s.fire_turbulence.store(std::clamp(f_turb, 0.00f, 2.00f), std::memory_order_relaxed);
-        }
-        float f_emb = s.fire_embers.load(std::memory_order_relaxed);
-        if (ImGui::SliderFloat(
-                BbSettings::MenuText("Glowing Embers / Sparks", "Раскалённые искры и угли"),
-                &f_emb, 0.00f, 2.00f, "%.2f")) {
-            s.fire_embers.store(std::clamp(f_emb, 0.00f, 2.00f), std::memory_order_relaxed);
+                BbSettings::MenuText("Heat Haze Strength", "Сила теплового марева"),
+                &hh_str, 0.25f, 2.00f, "%.2f")) {
+            s.fire_heat_haze_strength.store(std::clamp(hh_str, 0.25f, 2.00f), std::memory_order_relaxed);
         }
         ImGui::Unindent(16.0f);
     }
@@ -1313,6 +1216,78 @@ void Menu() {
         if (ImGui::SmallButton(BbSettings::MenuText("Reset Avg", "Сбросить Avg"))) {
             reset_hud_avg.store(true, std::memory_order_relaxed);
         }
+    }
+
+    if (ImGui::CollapsingHeader(BbSettings::MenuText("Developer / Legacy A/B Debug",
+                                                     "Отладка разработчика / Legacy A/B"))) {
+        ImGui::Indent(12.0f);
+        Checkbox(BbSettings::MenuText("Native Vulkan PostFX (uncheck for Legacy Yebis2 A/B)",
+                                      "Нативный Vulkan PostFX (снять для Legacy Yebis2 A/B)"),
+                 s.native_postfx);
+        Hint(BbSettings::MenuText(
+            "Default base post-process renderer (1:1 visual parity with PS4 Yebis2, faster & cleaner on GPU). "
+            "Uncheck only for live A/B comparison against legacy Yebis2 (or launch with BB_NATIVE_POSTFX=0).",
+            "Базовый нативный Vulkan 1.3 пост-процесс (1-в-1 идентичен PS4 Yebis2, быстрее и чище по GPU). "
+            "Снимай только для живого A/B сравнения со старым Yebis2 (или запускай с BB_NATIVE_POSTFX=0)."));
+        if (s.native_postfx.load(std::memory_order_relaxed)) {
+            float bloom_int = s.native_bloom_intensity.load(std::memory_order_relaxed);
+            if (ImGui::SliderFloat(
+                    BbSettings::MenuText("Bloom Intensity (GPARAM scale)",
+                                         "Сила Bloom (множитель GPARAM)"),
+                    &bloom_int, 0.00f, 0.40f, "%.3f")) {
+                s.native_bloom_intensity.store(std::clamp(bloom_int, 0.0f, 0.40f),
+                                               std::memory_order_relaxed);
+            }
+            float bloom_thr = s.native_bloom_threshold.load(std::memory_order_relaxed);
+            if (ImGui::SliderFloat(
+                    BbSettings::MenuText("Bloom Threshold (GPARAM mult)",
+                                         "Порог Bloom (множитель GPARAM)"),
+                    &bloom_thr, 0.50f, 5.00f, "%.2f")) {
+                s.native_bloom_threshold.store(std::clamp(bloom_thr, 0.50f, 5.00f),
+                                               std::memory_order_relaxed);
+            }
+            float obj_boost = s.native_mb_obj_boost.load(std::memory_order_relaxed);
+            if (ImGui::SliderFloat(
+                    BbSettings::MenuText("Object Motion Blur Boost",
+                                         "Усиление Object Motion Blur"),
+                    &obj_boost, 0.25f, 4.00f, "%.2fx")) {
+                s.native_mb_obj_boost.store(std::clamp(obj_boost, 0.25f, 4.00f),
+                                            std::memory_order_relaxed);
+            }
+            float dof_str = s.native_dof_strength.load(std::memory_order_relaxed);
+            if (ImGui::SliderFloat(
+                    BbSettings::MenuText("Depth of Field Strength",
+                                         "Сила глубины резкости (DoF)"),
+                    &dof_str, 0.25f, 3.00f, "%.2fx")) {
+                s.native_dof_strength.store(std::clamp(dof_str, 0.25f, 3.00f),
+                                            std::memory_order_relaxed);
+            }
+            Checkbox(BbSettings::MenuText("Debug: Show Velocity Map (Cam=R/G, ObjMask=B, ObjVel=Y)",
+                                          "Отладка: Карта скоростей (Мир=R/G, Маска=Синий, Герой=Жёлтый)"),
+                     s.native_mb_debug_vis);
+        }
+        ImGui::Spacing();
+        {
+            const bool busy = Vulkan::GpuProfiler::IsManualCaptureActive();
+            if (busy) {
+                ImGui::BeginDisabled();
+                ImGui::Button(BbSettings::MenuText("Capturing GPU Bottlenecks (120f)...",
+                                                   "Сбор GPU-профиля (120 кадров)..."));
+                ImGui::EndDisabled();
+            } else if (ImGui::Button(BbSettings::MenuText(
+                           "Dump ALL GPU Passes & Draws (120f -> logs/gpu_profile_dump.txt)",
+                           "Выгрузить ВСЕ GPU-проходы и дроуколы (120f -> logs/gpu_profile_dump.txt)"))) {
+                Vulkan::GpuProfiler::RequestManualCapture(true);
+            }
+            const u32 n_lbl = Vulkan::GpuProfiler::GetLastManualLabelCount();
+            const u32 n_drw = Vulkan::GpuProfiler::GetLastManualDrawCount();
+            if (!busy && n_lbl > 0u) {
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(0.45f, 0.95f, 0.55f, 1.0f),
+                                   "OK (%u passes/draws, %u shaders)", n_lbl, n_drw);
+            }
+        }
+        ImGui::Unindent(12.0f);
     }
 
     ImGui::Spacing();
@@ -1671,6 +1646,7 @@ void PollGpuHwSensors(HudBreakdown& h) noexcept {
         NvmlMem mem{};
         if (fn_power && fn_power(nvml_dev, &mw) == 0) {
             h.gpu_power_w = float(mw) * 0.001f;
+            BbStats::gpu_power_mw.store(mw, std::memory_order_relaxed);
             h.has_gpu_sensors = true;
         }
         if (fn_clock && fn_clock(nvml_dev, 0, &mhz) == 0) {
@@ -1799,6 +1775,8 @@ void PollGpuHwSensors(HudBreakdown& h) noexcept {
                 }
                 if (val > 0) {
                     h.gpu_power_w = float(double(val) * 1e-6);
+                    BbStats::gpu_power_mw.store(static_cast<std::uint32_t>(val / 1000ull),
+                                                std::memory_order_relaxed);
                     std::snprintf(p, sizeof(p), "%s/hwmon/hwmon%d/temp1_input", card, hm);
                     if (read_sysfs_u64(p, val)) {
                         h.gpu_temp_c = int(val / 1000);
@@ -3491,8 +3469,9 @@ void FpsCounter() {
                : s.effects[4].load(std::memory_order_relaxed)  ? "FXAA"
                                                                : "Off");
     char upscaler_str[48];
-    const float rcas = s.sharpness.load(std::memory_order_relaxed);
-    if (rcas > 0.01f) {
+    const bool rcas_on = s.sharpen.load(std::memory_order_relaxed) &&
+                         s.sharpness.load(std::memory_order_relaxed) > 0.01f;
+    if (rcas_on) {
         std::snprintf(upscaler_str, sizeof(upscaler_str), "%s + RCAS", base_aa_str);
     } else {
         std::snprintf(upscaler_str, sizeof(upscaler_str), "%s", base_aa_str);
@@ -3788,12 +3767,17 @@ void FpsCounter() {
             "GPU 5. SSR Reflections & Mips",
             "GPU 6. Forward Alpha (Hair/VFX)",
             "GPU 7. Compute & Copies (HLE)",
-            "GPU 8. Yebis 2 Post-FX (DoF/LUT)",
+            "GPU 8. Native Post-FX (Vulkan)",
             "GPU 9. Anti-Aliasing / Upscaler",
             "GPU 10. Scaleform UI & Present",
         }};
+        const bool native_pfx_now = s.native_postfx.load(std::memory_order_relaxed);
         for (std::size_t c = 0; c < BbStats::GpuCat_Count; ++c) {
-            row_gpu(kPassLabels[c], h.hw_gpu_cat_ms[c],
+            const char* pass_label =
+                (c == BbStats::GpuCat_PostFxYebis && !native_pfx_now)
+                    ? "GPU 8. Yebis 2 Post-FX (Legacy)"
+                    : kPassLabels[c];
+            row_gpu(pass_label, h.hw_gpu_cat_ms[c],
                     h.avg_hw_gpu_cat_ms[c],
                     c == h.top_gpu_cat && h.hw_gpu_cat_ms[c] >= 0.25f);
             if (!xray) {

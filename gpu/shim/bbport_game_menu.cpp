@@ -310,7 +310,7 @@ constexpr int DisplaySlotCount = 11; ///< all 11 Display settings fit on a singl
 constexpr int TotalDisplayItems = 12;
 constexpr int MaxDisplayScroll = TotalDisplayItems - DisplaySlotCount;
 constexpr int EffectsSlotCount = 11; ///< all 11 Effects settings fit on a single screen (0 scroll)
-constexpr int TotalEffectsItems = 17;
+constexpr int TotalEffectsItems = 16;
 constexpr int MaxEffectsScroll = TotalEffectsItems - EffectsSlotCount;
 constexpr int MaxChoicesPerSlot = 16;
 constexpr int DefaultResetSentinel = -999;
@@ -992,13 +992,13 @@ void RefreshSlotTexts(int slot) {
         SetDynamic(name_id, "Camera X-Axis", "Камера по оси X");
         SetDynamic(help_id, "Horizontal camera rotation direction (Left/Right to toggle)",
                    "Направление вращения камеры по горизонтали (Влево/Вправо)");
-        const bool inv = active_game_settings && active_game_settings[0xa] == 0;
+        const bool inv = active_game_settings && active_game_settings[0x9] == 0;
         SetDynamic(val_id, inv ? "Inverted" : "Normal", inv ? "Инверсия" : "Обычная");
     } else if (item_idx == ItemCameraY) {
         SetDynamic(name_id, "Camera Y-Axis", "Камера по оси Y");
         SetDynamic(help_id, "Vertical camera rotation direction (Left/Right to toggle)",
                    "Направление вращения камеры по вертикали (Влево/Вправо)");
-        const bool inv = active_game_settings && active_game_settings[0x9] == 0;
+        const bool inv = active_game_settings && active_game_settings[0xa] == 0;
         SetDynamic(val_id, inv ? "Inverted" : "Normal", inv ? "Инверсия" : "Обычная");
     } else if (item_idx == ItemAutoTarget) {
         SetDynamic(name_id, "Auto Target Switch", "Автосмена цели");
@@ -1182,11 +1182,11 @@ void BuildControlsSlotChoices(int slot, std::vector<u32>& out_choices, int& out_
     } else if (item_idx == ItemCameraX) {
         add_choice("Normal", "Обычная");
         add_choice("Inverted", "Инверсия");
-        out_selected_idx = (active_game_settings && active_game_settings[0xa] == 0) ? 1 : 0;
+        out_selected_idx = (active_game_settings && active_game_settings[0x9] == 0) ? 1 : 0;
     } else if (item_idx == ItemCameraY) {
         add_choice("Normal", "Обычная");
         add_choice("Inverted", "Инверсия");
-        out_selected_idx = (active_game_settings && active_game_settings[0x9] == 0) ? 1 : 0;
+        out_selected_idx = (active_game_settings && active_game_settings[0xa] == 0) ? 1 : 0;
     } else if (item_idx == ItemAutoTarget) {
         add_choice("Off", "Выкл");
         add_choice("On", "Вкл");
@@ -1463,8 +1463,8 @@ void ApplySettingsToLiveNativeOptions(BbMenuEngine::CSOptionsData* opt) {
     if (in_controls_page.load(std::memory_order_relaxed) && active_game_settings) {
         active_game_settings[0x0] = opt->camera_speed;
         active_game_settings[0x1] = opt->pad_vibration;
-        active_game_settings[0x9] = opt->camera_up_down;
-        active_game_settings[0xa] = opt->camera_left_right;
+        active_game_settings[0x9] = opt->camera_left_right;
+        active_game_settings[0xa] = opt->camera_up_down;
         active_game_settings[0xb] = opt->auto_target;
         active_game_settings[0xc] = opt->camera_auto_adjust;
         RefreshControlsPage();
@@ -1535,10 +1535,10 @@ void ApplyControlsSlotChoiceIndex(u8* row, int slot, int choice_idx) {
     const int idx = std::clamp(choice_idx, 0, 1);
     bool native_changed = false;
     if (item_idx == ItemCameraX && active_game_settings) {
-        active_game_settings[0xa] = idx == 0 ? 1 : 0; // 1 = Normal, 0 = Inverted
+        active_game_settings[0x9] = idx == 0 ? 1 : 0; // 1 = Normal, 0 = Inverted (CSOptionsData +0x0a)
         native_changed = true;
     } else if (item_idx == ItemCameraY && active_game_settings) {
-        active_game_settings[0x9] = idx == 0 ? 1 : 0; // 1 = Normal, 0 = Inverted
+        active_game_settings[0xa] = idx == 0 ? 1 : 0; // 1 = Normal, 0 = Inverted (CSOptionsData +0x0b)
         native_changed = true;
     } else if (item_idx == ItemAutoTarget && active_game_settings) {
         active_game_settings[0xb] = idx == 1 ? 1 : 0; // 1 = On, 0 = Off
@@ -1598,10 +1598,10 @@ void StepSlotSetting(u8* row, int slot, int delta, bool wrap) {
             changed = true;
         }
     } else if (item_idx == ItemCameraX && active_game_settings) {
-        active_game_settings[0xa] = active_game_settings[0xa] ? 0 : 1;
+        active_game_settings[0x9] = active_game_settings[0x9] ? 0 : 1;
         changed = true;
     } else if (item_idx == ItemCameraY && active_game_settings) {
-        active_game_settings[0x9] = active_game_settings[0x9] ? 0 : 1;
+        active_game_settings[0xa] = active_game_settings[0xa] ? 0 : 1;
         changed = true;
     } else if (item_idx == ItemAutoTarget && active_game_settings) {
         active_game_settings[0xb] = active_game_settings[0xb] ? 0 : 1;
@@ -2461,12 +2461,9 @@ constexpr EffectsItemMeta EffectsItems[TotalEffectsItems] = {
     {"Screen-Space GI (SSGI)", "Отражённый свет (SSGI)",
      "Vulkan 1.3 Remaster: horizon-based indirect bounce lighting from fire, lanterns, torches, and sunset sky",
      "Ремастер Vulkan 1.3: живой отражённый свет (SSGI) от костров, факелов, фонарей и закатного неба на камни и одежду", false},
-    {"Native Vulkan PostFX (A/B)", "Нативный пост-процесс (A/B)",
-     "Remaster v2 live A/B: native Vulkan 1.3 FP16 post-process replacing Yebis2 (Tonemap, 3D LUT, Bloom, Motion Blur, DoF)",
-     "Ремастер v2 (A/B): нативный Vulkan 1.3 FP16 пост-процесс вместо Yebis2 (Tonemap, 3D LUT, Bloom, Motion Blur, DoF)", false},
-    {"Enhanced Fire & Embers", "Ремастер огня и искр",
-     "Remaster v2 Stage 2.0: 170-FPS 3D procedural flame sculpting, physical Blackbody HDR core (1400K-4800K), and rising glowing embers",
-     "Ремастер v2 (Этап 2.0): живое 3D-пламя 170 FPS, физическое HDR-ядро (Blackbody) и взлетающие искры для костров, факелов и Молотовых", false},
+    {"Fire Heat Haze", "Тепловое марево огня",
+     "Vulkan 1.3 Remaster: subtle convective hot-air refraction rising above bonfires and torches",
+     "Ремастер Vulkan 1.3: мягкое конвекционное дрожание горячего воздуха над кострами и факелами", true},
 };
 
 constexpr int EffectsItemToEffectIdx(int item_idx) {
@@ -2496,8 +2493,7 @@ bool GetEffectsItemActive(int item_idx) {
     case 12: return s.hdr_output.load();
     case 13: return s.pcss_shadows.load();
     case 14: return s.ssgi_enabled.load();
-    case 15: return s.native_postfx.load();
-    case 16: return s.enhanced_fire.load();
+    case 15: return s.fire_heat_haze.load();
     default: return false;
     }
 }
@@ -2539,8 +2535,7 @@ void SetEffectsItemActive(int item_idx, bool active) {
             break;
         case 13: s.pcss_shadows = active; break;
         case 14: s.ssgi_enabled = active; break;
-        case 15: s.native_postfx = active; break;
-        case 16: s.enhanced_fire = active; break;
+        case 15: s.fire_heat_haze = active; break;
         default: break;
         }
     }
@@ -3234,8 +3229,8 @@ u64 PS4_SYSV_ABI RowInputHook(u8* row, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, d
             if (active_game_settings) {
                 active_game_settings[0x0] = 5;  // Camera Sensitivity
                 active_game_settings[0x1] = 10; // Controller Vibration
-                active_game_settings[0x9] = 1;  // Camera Y-Axis (1 = Normal)
-                active_game_settings[0xa] = 1;  // Camera X-Axis (1 = Normal)
+                active_game_settings[0x9] = 1;  // Camera X-Axis (1 = Normal)
+                active_game_settings[0xa] = 1;  // Camera Y-Axis (1 = Normal)
                 active_game_settings[0xb] = 0;  // Auto Target Switch (0 = Off, matching CSOptionsData::InitDefaults)
                 active_game_settings[0xc] = 1;  // Camera Auto-Adjust (1 = On)
                 CommitActiveControlsNativeSettings();

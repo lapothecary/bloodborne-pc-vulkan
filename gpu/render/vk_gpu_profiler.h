@@ -38,6 +38,28 @@ public:
         WriteTimestamp(key);
     }
 
+    /// Inline per-draw timestamp inside an active Dynamic Rendering pass (never breaks the pass).
+    template <typename Describe>
+    void MarkInline(u64 key, Describe&& describe) {
+        if (key == current) {
+            return;
+        }
+        if (!described.contains(key)) {
+            described.emplace(key, describe());
+        }
+        WriteTimestampInline(key);
+    }
+
+    [[nodiscard]] bool PerDrawMode() const noexcept {
+        return per_draw_mode;
+    }
+
+    /// One-click manual capture (thread-safe trigger from UI overlay -> logs/gpu_profile_dump.txt).
+    static void RequestManualCapture(bool per_draw = true) noexcept;
+    [[nodiscard]] static bool IsManualCaptureActive() noexcept;
+    [[nodiscard]] static u32 GetLastManualLabelCount() noexcept;
+    [[nodiscard]] static u32 GetLastManualDrawCount() noexcept;
+
     /// The label of the open segment, for Resume after a nested segment (transfers).
     [[nodiscard]] u64 Current() const noexcept {
         return current;
@@ -70,9 +92,10 @@ public:
 
 private:
     GpuProfiler(const Instance& instance, Scheduler& scheduler);
-    void StartCapture();
+    void StartCapture(bool per_draw = false);
     void StopCapture();
     void WriteTimestamp(u64 key);
+    void WriteTimestampInline(u64 key);
     void Collect(u32 slice);
     void Print(bool to_file = false);
     [[nodiscard]] bool TryCollectHudSlice(u32 s);
@@ -84,6 +107,8 @@ private:
     static inline GpuProfiler* instance_ptr = nullptr;
     static inline GpuProfiler* stored_ptr = nullptr;
     bool permanent = false;
+    bool per_draw_mode = false;
+    bool manual_dump_mode = false;
     bool hud_enabled = false;
     u64 seen_frames = 0;
 

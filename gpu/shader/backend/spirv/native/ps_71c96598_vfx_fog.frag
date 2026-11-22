@@ -48,127 +48,6 @@ float s2f(uint idx) {
     return uintBitsToFloat(ssbo_2.data[idx]);
 }
 
-float FireHash31(vec3 p) {
-    p = fract(p * 0.1031);
-    p += dot(p, p.yzx + 33.33);
-    return fract((p.x + p.y) * p.z);
-}
-
-vec3 FireHash33(vec3 p) {
-    p = fract(p * vec3(0.1031, 0.1030, 0.0973));
-    p += dot(p, p.yxz + 33.33);
-    return fract((p.xxy + p.yxx) * p.zyx);
-}
-
-float FireNoise3(vec3 p) {
-    const vec3 i = floor(p);
-    const vec3 f = fract(p);
-    const vec3 u = f * f * (3.0 - 2.0 * f);
-    const float n000 = FireHash31(i + vec3(0.0, 0.0, 0.0));
-    const float n100 = FireHash31(i + vec3(1.0, 0.0, 0.0));
-    const float n010 = FireHash31(i + vec3(0.0, 1.0, 0.0));
-    const float n110 = FireHash31(i + vec3(1.0, 1.0, 0.0));
-    const float n001 = FireHash31(i + vec3(0.0, 0.0, 1.0));
-    const float n101 = FireHash31(i + vec3(1.0, 0.0, 1.0));
-    const float n011 = FireHash31(i + vec3(0.0, 1.0, 1.0));
-    const float n111 = FireHash31(i + vec3(1.0, 1.0, 1.0));
-    const float nx00 = mix(n000, n100, u.x);
-    const float nx10 = mix(n010, n110, u.x);
-    const float nx01 = mix(n001, n101, u.x);
-    const float nx11 = mix(n011, n111, u.x);
-    return mix(mix(nx00, nx10, u.y), mix(nx01, nx11, u.y), u.z);
-}
-
-vec3 FireBlackbodyHdr(float t) {
-    const vec3 c0 = vec3(1.05, 0.06, 0.004);
-    const vec3 c1 = vec3(2.15, 0.50, 0.030);
-    const vec3 c2 = vec3(3.55, 2.05, 0.52);
-    const vec3 c3 = vec3(5.60, 4.45, 2.55);
-    vec3 col = mix(c0, c1, smoothstep(0.08, 0.42, t));
-    col = mix(col, c2, smoothstep(0.40, 0.80, t));
-    col = mix(col, c3, smoothstep(0.78, 1.25, t));
-    return col;
-}
-
-void ApplyEnhancedFire2026(inout vec3 rgb, inout float alpha, vec3 world_pos, vec2 uv_lo, vec2 uv_hi) {
-    const uint b_hi = push_data.buf_offsets2.y;
-    const uint fx_mask = (b_hi >> 24u) & 0xFFu;
-    const uint mb_mask = (b_hi >> 16u) & 0xFFu;
-    if ((fx_mask & 0x80u) == 0u || (mb_mask & 0x20u) == 0u) {
-        return;
-    }
-    const vec2 duv = uv_hi - uv_lo;
-    if (dot(duv, duv) < 1e-6) {
-        return;
-    }
-    const float max_c = max(max(rgb.r, rgb.g), rgb.b);
-    if (max_c < 1e-4 || alpha < 1e-4) {
-        return;
-    }
-    const float eps = max(0.002 * max_c, 1e-5);
-    const float r_over_b = rgb.r / max(rgb.b, eps);
-    const float r_over_g = rgb.r / max(rgb.g, eps);
-    const float g_over_b = rgb.g / max(rgb.b, eps);
-    const float fire_mask = smoothstep(1.40, 2.35, r_over_b) *
-                            smoothstep(0.95, 1.22, r_over_g) *
-                            smoothstep(1.05, 1.65, max(r_over_b * 0.55, g_over_b));
-    if (fire_mask < 1e-3) {
-        return;
-    }
-
-    const float t_sec = uintBitsToFloat(push_data.buf_offsets2.x);
-    const float intensity = 0.40 + float(b_hi & 0xFFu) * (2.00 / 255.0);
-    const float turb = float((push_data.buf_offsets1.w >> 24u) & 0xFFu) * (2.00 / 255.0);
-    const float embers = float((push_data.buf_offsets1.w >> 16u) & 0xFFu) * (2.00 / 255.0);
-
-    const vec3 p0 = world_pos * 2.7 - vec3(0.0, t_sec * 4.6, 0.0);
-    const float wx = FireNoise3(p0 * 0.85 + vec3(3.1, 0.0, 7.4)) - 0.5;
-    const float wz = FireNoise3(p0 * 0.85 + vec3(11.7, 2.3, 1.9)) - 0.5;
-    const vec3 p_adv = p0 + vec3(wx * 1.15, -0.30 * wx, wz * 1.15);
-
-    const float n1 = FireNoise3(p_adv);
-    const float n2 = FireNoise3(p_adv * 2.15 - vec3(0.0, t_sec * 3.8, 0.0));
-    const float n3 = FireNoise3(p_adv * 4.50 - vec3(0.0, t_sec * 7.2, 0.0));
-    const float fbm = n1 * 0.52 + n2 * 0.31 + n3 * 0.17;
-    const float ridge = 1.0 - abs(n2 * 2.0 - 1.0);
-
-    const float raw_e = max(rgb.r * 0.55 + rgb.g * 0.35 + rgb.b * 0.10, max_c * 0.65);
-    const float raw_d = clamp(alpha * (0.55 + 0.45 * clamp(raw_e, 0.0, 2.0)), 0.0, 1.0);
-
-    const float turb_mix = clamp(turb * 0.80, 0.0, 1.0);
-    const float carve = mix(1.0, clamp(0.38 + 1.15 * fbm + 0.30 * (ridge - 0.45), 0.0, 1.60), turb_mix);
-    const float eroded = smoothstep(0.05 * min(turb, 1.5), 0.55, raw_d * carve);
-
-    const float temp = clamp((0.42 * clamp(raw_e, 0.0, 2.2) + 0.58 * eroded) *
-                             mix(1.0, 0.60 + 0.72 * fbm + 0.24 * ridge, turb_mix),
-                             0.0, 1.38);
-    const vec3 bb_col = FireBlackbodyHdr(temp);
-    const float energy_scale = min(raw_e * 0.82, 2.35) * intensity;
-    vec3 enh_rgb = bb_col * energy_scale;
-    float enh_alpha = alpha * mix(1.0, mix(0.28, 1.32, eroded) * clamp(0.48 + 0.82 * fbm, 0.15, 1.38), turb_mix);
-
-    if (embers > 0.02) {
-        const vec3 sway = vec3(sin(t_sec * 2.1 + world_pos.y * 2.4) * 0.55,
-                               t_sec * 7.4,
-                               cos(t_sec * 1.8 + world_pos.x * 2.4) * 0.55);
-        const vec3 ep = world_pos * 13.5 - sway;
-        const vec3 ec = floor(ep);
-        const vec3 ef = fract(ep);
-        const vec3 rnd = FireHash33(ec);
-        if (rnd.x > 0.76) {
-            const vec3 center = 0.2 + 0.6 * rnd;
-            const float d_sp = length(ef - center);
-            const float twinkle = 0.45 + 0.55 * sin(t_sec * 17.0 + rnd.y * 43.0);
-            const float sp = smoothstep(0.16, 0.025, d_sp) * twinkle * smoothstep(0.03, 0.28, alpha);
-            enh_rgb += vec3(8.5, 2.8, 0.38) * (sp * embers * intensity);
-            enh_alpha = max(enh_alpha, sp * 0.85 * min(embers, 1.2));
-        }
-    }
-
-    rgb = mix(rgb, enh_rgb, fire_mask);
-    alpha = mix(alpha, enh_alpha, fire_mask);
-}
-
 void main() {
     const uint b0 = push_data.buf_offsets0.x;
     const uint d0 = (b0 & 0xFFu) >> 2u;
@@ -203,7 +82,6 @@ void main() {
         rgb_out = tint.rgb * col;
     }
 
-    ApplyEnhancedFire2026(rgb_out, a_out, fs_in_attr3_p.xyz, fs_in_attr4_p.xy, fs_in_attr5_p.xy);
 
     const float scene_d = texture(sampler2D(fs_img1, fs_samp0), screen_uv).x;
     const float p16 = s1f(d0 + 16u);

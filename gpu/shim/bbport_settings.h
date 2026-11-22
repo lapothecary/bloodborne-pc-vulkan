@@ -241,15 +241,12 @@ struct Values {
     std::atomic<bool> pcss_shadows{false};
     /// Horizon-Based Screen-Space Global Illumination (HBIL indirect bounce lighting in GXLightComposite).
     std::atomic<bool> ssgi_enabled{false};
-    /// Remaster v2: Native Vulkan 1.3 Post-Process pipeline (live A/B replacement for Yebis2 black-box).
-    std::atomic<bool> native_postfx{false};
-    /// Remaster v2 Stage 2.0: Native Procedural 3D FBM + Physical Blackbody HDR Fire & Embers
-    /// (`fx_mask |= 0x80u` across GXFfx fire shaders `ps_832cdf8d/71c96598/5e224cb6/2e86d610`).
-    std::atomic<bool> enhanced_fire{false};
-    /// Live tuning sliders (Insert overlay only, not persisted to game menu) for Native Vulkan PostFX & Fire:
-    std::atomic<float> fire_intensity{1.25f};
-    std::atomic<float> fire_turbulence{1.00f};
-    std::atomic<float> fire_embers{1.00f};
+    /// Native Vulkan 1.3 Post-Process pipeline (default base renderer; legacy Yebis2 kept as hidden A/B debug).
+    std::atomic<bool> native_postfx{true};
+    /// Convective heat-haze air refraction rising above blazing fires & torches (Native PostFX).
+    std::atomic<bool> fire_heat_haze{true};
+    std::atomic<float> fire_heat_haze_strength{1.00f};
+    /// Live tuning sliders (Insert overlay only, not persisted to game menu) for Native Vulkan PostFX:
     /// - native_bloom_intensity: GPARAM GlareLuminance multiplier (calibrated default: 0.250).
     /// - native_bloom_threshold: GPARAM GlareThreshold multiplier (calibrated default: 3.50).
     /// - native_mb_obj_boost: extra multiplier on Pass 0x2e pure Object Self-Motion velocity.
