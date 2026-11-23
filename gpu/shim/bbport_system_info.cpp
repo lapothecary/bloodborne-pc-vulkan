@@ -373,6 +373,8 @@ std::string BuildActiveSettingsLine() {
     const std::string up_label = FormatActiveUpscalerLabel();
     const char* preset_str = BbSettings::PresetName(BbSettings::RenderPreset());
     const int dlss_p = s.dlss_preset.load(std::memory_order_relaxed);
+    const int tq = std::clamp(s.texture_quality.load(std::memory_order_relaxed), 0, 3);
+    const int sq = std::clamp(s.shadow_quality.load(std::memory_order_relaxed), 0, 4);
     const int af = s.anisotropic.load(std::memory_order_relaxed);
     const bool nat_pfx = s.native_postfx.load(std::memory_order_relaxed);
     const int dof_on = s.effects[1].load(std::memory_order_relaxed) ? 1 : 0;
@@ -398,10 +400,10 @@ std::string BuildActiveSettingsLine() {
         buf, sizeof(buf),
         "Active Settings: %dx%d -> %dx%d (%s, %s, Cap %d) | Up: %s (%s, P=%d, Jit=%d, FG=%d) | "
         "PostFX: %s (DoF=%d MB=%d/%d Bloom=%d Haze=%d CA=%d) | "
-        "SSAO=%d SSR=%d SSGI=%d PCSS=%d HDR=%d AF=%dx",
+        "SSAO=%d SSR=%d SSGI=%d PCSS=%d HDR=%d TQ=%d SQ=%d AF=%dx",
         rw, rh, out.width, out.height, win_str, vsync_str, cap, up_label.c_str(), preset_str,
         dlss_p, jitter_on, fg_on, nat_pfx ? "Native" : "Yebis2", dof_on, mb_cam, mb_obj, bloom_on,
-        haze_on, ca_on, ssao_on, ssr_on, ssgi_on, pcss_on, hdr_on, af);
+        haze_on, ca_on, ssao_on, ssr_on, ssgi_on, pcss_on, hdr_on, tq, sq, af);
     return std::string(buf);
 }
 

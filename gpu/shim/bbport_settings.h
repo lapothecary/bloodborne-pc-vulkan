@@ -215,6 +215,10 @@ struct Values {
     std::atomic<bool> loading_tips_timer{false};
     /// DLSS model preset: 11 = DLSS 4 Transformer (Preset K), 0 = DLSS 3 CNN Default.
     std::atomic<int> dlss_preset{11};
+    /// World BC texture quality mip skip: 0 = Default (Mip 0), 1 = Medium (Mip 1), 2 = Low (Mip 2), 3 = Very Low (Mip 3).
+    std::atomic<int> texture_quality{0};
+    /// Shadow quality preset: 0 = Off, 1 = Low (2K CSM), 2 = Default (4K CSM), 3 = High (4K Full + Contact), 4 = Ultra (8K CSM + PCSS).
+    std::atomic<int> shadow_quality{2};
     /// Forced anisotropic filtering on scene textures: 16, 8, 4, or 1/0 (game default).
     std::atomic<int> anisotropic{1};
     /// Persistent FPS limit (0 = Uncapped, or 30..1000).

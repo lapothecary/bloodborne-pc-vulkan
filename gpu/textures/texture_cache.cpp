@@ -2,9 +2,13 @@
 // The texture cache: construction, lookup, overlap resolution, bindings and samplers.
 #include "textures/texture_cache.h"
 
+#include <algorithm>
+#include <chrono>
+
 #include <xxhash.h>
 
 #include "bbport_button_prompts.h"
+#include "bbport_settings.h"
 #include "common/assert.h"
 #include "common/hash.h"
 #include "core/emulator_settings.h"
@@ -49,6 +53,10 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
     pressure_gc_samplers = max_samplers * 7 / 8;
     critical_gc_samplers = max_samplers * 15 / 16;
     UpdateMemoryBudget();
+    last_applied_tq =
+        std::clamp(BbSettings::Get().texture_quality.load(std::memory_order_relaxed), 0, 3);
+    last_applied_sq =
+        std::clamp(BbSettings::Get().shadow_quality.load(std::memory_order_relaxed), 0, 4);
     DirectTextures::SetActiveCache(this);
 }
 
@@ -86,6 +94,15 @@ std::string TextureCache::DescribeImagesIn(VAddr addr, u64 size) {
 ImageId TextureCache::InsertImage(const ImageInfo& info) {
     const ImageId id = slot_images.insert(instance, runtime, slot_image_views, info);
     RegisterImage(id);
+    if (Image::IsCsmShadowAtlas(info)) {
+        Image& img = slot_images[id];
+        if (img.backing && img.backing->image.image_ci.extent.width != info.size.width) {
+            runtime.ClearDepthStencilImage(&img, SubresourceRange{{0, 0}, info.resources},
+                                           vk::ImageAspectFlagBits::eDepth,
+                                           vk::ClearDepthStencilValue{1.0f, 0u});
+            img.flags &= ~ImageFlagBits::Dirty;
+        }
+    }
     return id;
 }
 
@@ -993,7 +1010,8 @@ ImageId TextureCache::TryFindExistingImageLocked(ImageDesc& desc) const {
 bool TextureCache::TryInspectTargetMt(ImageDesc& desc, ImageId& out_id, ImageInfo& out_info,
                                       u32& out_backing_samples, vk::Format& out_backing_fmt,
                                       vk::ImageAspectFlags& out_aspect_mask,
-                                      bool& out_has_scene_proxy, MtRejectDiag* out_diag) {
+                                      bool& out_has_scene_proxy, MtRejectDiag* out_diag,
+                                      vk::Extent2D* out_host_extent) {
     out_id = {};
     if (out_diag) {
         *out_diag = {
@@ -1051,6 +1069,10 @@ bool TextureCache::TryInspectTargetMt(ImageDesc& desc, ImageId& out_id, ImageInf
     out_backing_fmt = img.backing->image.image_ci.format;
     out_aspect_mask = img.aspect_mask;
     out_has_scene_proxy = img.scene_proxy;
+    if (out_host_extent) {
+        out_host_extent->width = img.backing->image.image_ci.extent.width;
+        out_host_extent->height = img.backing->image.image_ci.extent.height;
+    }
     return true;
 }
 
@@ -1353,6 +1375,278 @@ void TextureCache::ProcessDirectTextureEvents(Core::MemoryManager* memory) {
     if (needs_barrier_flush) {
         runtime.FlushBarriers();
     }
+}
+
+bool TextureCache::SyncTextureQualityLive(Core::MemoryManager* memory) {
+    ++tq_submit_counter;
+    while (!retired_tq_batches.empty() &&
+           tq_submit_counter >= retired_tq_batches.front().retire_after_submit) {
+        auto batch = std::make_unique<RetiredTqBatch>(std::move(retired_tq_batches.front()));
+        retired_tq_batches.pop_front();
+        scheduler.DeferOperation([this, batch = std::move(batch)]() mutable {
+            for (const ImageViewId vid : batch->view_ids) {
+                if (slot_image_views.is_allocated(vid)) {
+                    slot_image_views.erase(vid);
+                }
+            }
+            batch->images.clear();
+        });
+    }
+
+    const int cur_tq =
+        std::clamp(BbSettings::Get().texture_quality.load(std::memory_order_relaxed), 0, 3);
+    const int cur_sq =
+        std::clamp(BbSettings::Get().shadow_quality.load(std::memory_order_relaxed), 0, 4);
+    const bool tq_changed = (cur_tq != last_applied_tq);
+    const bool sq_changed = (cur_sq != last_applied_sq);
+    if (!tq_changed && !sq_changed) {
+        return false;
+    }
+
+    bool any_rebuilt = false;
+
+    if (sq_changed) {
+        const int old_sq = last_applied_sq;
+        last_applied_sq = cur_sq;
+        const u32 max_dim =
+            std::min(instance.GetMaxFramebufferWidth(), instance.GetMaxFramebufferHeight());
+        const u32 desired_ext = Image::ComputeDesiredCsmExtent(cur_sq, max_dim);
+
+        DirectTextures::BumpImmutableRoEpoch();
+        RetiredTqBatch csm_retired{};
+        csm_retired.retire_after_submit = tq_submit_counter + 4u;
+        u32 csm_count = 0;
+        u32 prev_ext = 0;
+        u64 old_csm_bytes = 0;
+        u64 new_csm_bytes = 0;
+
+        {
+            std::scoped_lock lock{mutex};
+            std::vector<ImageId> csm_ids;
+            lru_cache.ForEachItemBelow(0x7fffffffffffffffull, [&](ImageId id) {
+                if (!slot_images.is_allocated(id)) {
+                    return;
+                }
+                const Image& img = slot_images[id];
+                if (True(img.flags & ImageFlagBits::Registered) &&
+                    Image::IsCsmShadowAtlas(img.info) && img.backing &&
+                    img.backing_images.size() == 1u &&
+                    img.backing->image.image_ci.extent.width != desired_ext) {
+                    csm_ids.push_back(id);
+                }
+            });
+
+            constexpr auto ShaderStages = vk::PipelineStageFlagBits2::eAllGraphics |
+                                          vk::PipelineStageFlagBits2::eComputeShader;
+            bool need_flush = false;
+            for (const ImageId id : csm_ids) {
+                if (!slot_images.is_allocated(id)) {
+                    continue;
+                }
+                Image& img = slot_images[id];
+                prev_ext = img.backing->image.image_ci.extent.width;
+                vk::ImageCreateInfo new_ci = img.backing->image.image_ci;
+                new_ci.extent = vk::Extent3D{desired_ext, desired_ext, 1u};
+
+                old_csm_bytes += img.backing->image.size_bytes;
+                csm_retired.images.push_back(std::move(img.backing->image));
+                for (const ImageViewId vid : img.backing->image_view_ids) {
+                    csm_retired.view_ids.push_back(vid);
+                }
+                img.backing->image_view_infos.clear();
+                img.backing->image_view_ids.clear();
+                img.backing->last_view = 0;
+                img.backing->state = {};
+                img.backing->subresource_states.clear();
+                img.backing->settled = false;
+
+                img.image_uid = Image::NextUid();
+                img.backing->image = HostImage{instance.GetDevice(), instance.GetAllocator()};
+                img.backing->image.Create(new_ci);
+                Vulkan::SetObjectName(instance.GetDevice(), img.GetImage(),
+                                      "csm_atlas {}x{} {} {:#x}", desired_ext, desired_ext,
+                                      vk::to_string(img.info.pixel_format),
+                                      img.info.guest_address);
+                new_csm_bytes += img.backing->image.size_bytes;
+
+                runtime.ClearDepthStencilImage(&img, SubresourceRange{{0, 0}, img.info.resources},
+                                               vk::ImageAspectFlagBits::eDepth,
+                                               vk::ClearDepthStencilValue{1.0f, 0u});
+                img.flags &= ~ImageFlagBits::Dirty;
+                if (runtime.Transit(&img, vk::ImageLayout::eShaderReadOnlyOptimal, ShaderStages,
+                                    vk::AccessFlagBits2::eShaderRead)) {
+                    need_flush = true;
+                }
+                ++csm_count;
+            }
+            if (need_flush) {
+                runtime.FlushBarriers();
+            }
+            if (csm_count > 0u) {
+                found_images.fill({});
+                ++registry_generation;
+                DirectTextures::BumpImmutableRoEpoch();
+            }
+        }
+
+        if (!csm_retired.images.empty() || !csm_retired.view_ids.empty()) {
+            retired_tq_batches.push_back(std::move(csm_retired));
+            scheduler.Flush();
+        }
+        if (csm_count > 0u) {
+            any_rebuilt = true;
+            std::printf("[ShadowQuality] Live CSM atlas rebuild (SQ %d -> %d): %ux%u -> %ux%u "
+                        "(%.1f -> %.1f MiB)\n",
+                        old_sq, cur_sq, prev_ext, prev_ext, desired_ext, desired_ext,
+                        double(old_csm_bytes) / (1024.0 * 1024.0),
+                        double(new_csm_bytes) / (1024.0 * 1024.0));
+        }
+        if (!tq_changed) {
+            return any_rebuilt;
+        }
+    }
+
+    const int old_tq = last_applied_tq;
+    last_applied_tq = cur_tq;
+    const auto t0 = std::chrono::steady_clock::now();
+
+    // Immediately invalidate MT/fast SRV caches so GXWorker threads stop binding old views.
+    DirectTextures::BumpImmutableRoEpoch();
+    // Flip ping-pong world BC VMA pool so all newly sized textures pack cleanly into the new pool
+    // while the previous pool empties to 0 bytes after retirement and calls vkFreeMemory back to OS.
+    instance.SwapWorldBcPool();
+    const VmaPool target_pool = instance.GetActiveWorldBcPool();
+
+    RetiredTqBatch retired{};
+    retired.retire_after_submit = tq_submit_counter + 4u;
+
+    u64 old_bytes = 0;
+    u64 new_bytes = 0;
+    u32 rebuilt_count = 0;
+    u64 uploaded_bytes_since_flush = 0;
+    bool needs_barrier_flush = false;
+
+    std::vector<ImageId> candidates;
+    {
+        std::unique_lock lock{mutex};
+        lru_cache.ForEachItemBelow(0x7fffffffffffffffull, [&](ImageId id) {
+            if (!slot_images.is_allocated(id)) {
+                return;
+            }
+            const Image& img = slot_images[id];
+            if (False(img.flags & ImageFlagBits::Registered) ||
+                True(img.flags & (ImageFlagBits::GpuModified | ImageFlagBits::GpuDirty)) ||
+                img.binding.is_bound || img.binding.is_target || !img.backing ||
+                img.backing_images.size() != 1u || img.info.guest_address == 0 ||
+                img.info.guest_size == 0) {
+                return;
+            }
+            if (Image::ComputeDesiredHostMipOffset(img.info, cur_tq) != img.host_mip_offset) {
+                candidates.push_back(id);
+            }
+        });
+
+        constexpr auto ShaderStages = vk::PipelineStageFlagBits2::eAllGraphics |
+                                      vk::PipelineStageFlagBits2::eComputeShader;
+
+        for (const ImageId id : candidates) {
+            if (!slot_images.is_allocated(id)) {
+                continue;
+            }
+            Image& img = slot_images[id];
+            if (False(img.flags & ImageFlagBits::Registered) ||
+                True(img.flags & (ImageFlagBits::GpuModified | ImageFlagBits::GpuDirty)) ||
+                img.binding.is_bound || img.binding.is_target || !img.backing ||
+                img.backing_images.size() != 1u) {
+                continue;
+            }
+            const u8 desired = Image::ComputeDesiredHostMipOffset(img.info, cur_tq);
+            if (img.host_mip_offset == desired) {
+                continue;
+            }
+            if (memory && !memory->IsValidGpuMapping(img.info.guest_address, img.info.guest_size)) {
+                continue;
+            }
+
+            const bool was_ro =
+                img.backing->state.layout == vk::ImageLayout::eShaderReadOnlyOptimal ||
+                True(img.flags & ImageFlagBits::DirectImmutable);
+            vk::ImageCreateInfo new_ci = img.backing->image.image_ci;
+            const u32 host_w = std::max(img.info.size.width >> desired, 1u);
+            const u32 host_h = std::max(img.info.size.height >> desired, 1u);
+            const u32 host_levels =
+                img.info.resources.levels > desired ? (img.info.resources.levels - desired) : 1u;
+            new_ci.extent = vk::Extent3D{host_w, host_h, img.info.size.depth};
+            new_ci.mipLevels = host_levels;
+
+            old_bytes += img.backing->image.size_bytes;
+            retired.images.push_back(std::move(img.backing->image));
+            for (const ImageViewId vid : img.backing->image_view_ids) {
+                retired.view_ids.push_back(vid);
+            }
+            img.backing->image_view_infos.clear();
+            img.backing->image_view_ids.clear();
+            img.backing->last_view = 0;
+            img.backing->state = {};
+            img.backing->subresource_states.clear();
+            img.backing->settled = false;
+
+            img.host_mip_offset = desired;
+            img.image_uid = Image::NextUid();
+            img.backing->image = HostImage{instance.GetDevice(), instance.GetAllocator()};
+            img.backing->image.Create(new_ci, target_pool);
+            Vulkan::SetObjectName(instance.GetDevice(), img.GetImage(),
+                                  "image {}x{}x{} {} {} {:#x}+{:#x} L{} M{}(+{}) S{}", host_w,
+                                  host_h, img.info.size.depth, Gcn::NameOf(img.info.tile_mode),
+                                  vk::to_string(img.info.pixel_format), img.info.guest_address,
+                                  img.info.guest_size, img.info.resources.layers, host_levels,
+                                  u32(desired), img.info.num_samples);
+            new_bytes += img.backing->image.size_bytes;
+
+            img.flags |= ImageFlagBits::CpuDirty;
+            RefreshImage(img);
+
+            if (was_ro &&
+                runtime.Transit(&img, vk::ImageLayout::eShaderReadOnlyOptimal, ShaderStages,
+                                vk::AccessFlagBits2::eShaderRead)) {
+                needs_barrier_flush = true;
+            }
+            ++rebuilt_count;
+            uploaded_bytes_since_flush += img.info.guest_size;
+            if (uploaded_bytes_since_flush >= (32ull << 20)) {
+                if (needs_barrier_flush) {
+                    runtime.FlushBarriers();
+                    needs_barrier_flush = false;
+                }
+                uploaded_bytes_since_flush = 0;
+                lock.unlock();
+                scheduler.Flush();
+                lock.lock();
+            }
+        }
+
+        if (needs_barrier_flush) {
+            runtime.FlushBarriers();
+            needs_barrier_flush = false;
+        }
+        found_images.fill({});
+        ++registry_generation;
+        DirectTextures::BumpImmutableRoEpoch();
+    }
+
+    if (!retired.images.empty() || !retired.view_ids.empty()) {
+        retired_tq_batches.push_back(std::move(retired));
+        scheduler.Flush();
+    }
+
+    const double elapsed_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    const double old_mib = double(old_bytes) / (1024.0 * 1024.0);
+    const double new_mib = double(new_bytes) / (1024.0 * 1024.0);
+    std::printf("[TextureQuality] Live rebuild (TQ %d -> %d): %u images, host VRAM %.1f -> %.1f MiB "
+                "(%+.1f MiB) in %.1f ms\n",
+                old_tq, cur_tq, rebuilt_count, old_mib, new_mib, new_mib - old_mib, elapsed_ms);
+    return true;
 }
 
 } // namespace VideoCore

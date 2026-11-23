@@ -73,6 +73,8 @@ GX_HOST_IMPORT void bb_direct_vk_retire_shader_range(const void* gpu_addr,
 
 // V5.1: Native C++20 PC PostFX, Resolution, Heap & Hardware Fix Controls
 GX_HOST_IMPORT int bb_direct_vk_is_effect_enabled(uint32_t effect_index) noexcept;
+GX_HOST_IMPORT int bb_direct_vk_shadow_quality() noexcept;
+GX_HOST_IMPORT int bb_direct_vk_csm_cadence_allowed() noexcept;
 GX_HOST_IMPORT uint32_t bb_direct_vk_motion_blur_scales(float* out_time_scale,
                                                         float* out_obj_vel_scale,
                                                         float* out_max_len_scale,
@@ -487,6 +489,20 @@ inline uint32_t GetMotionBlurFlags() noexcept {
         return 3u;
     }
     return bb_direct_vk_motion_blur_scales(nullptr, nullptr, nullptr, nullptr);
+}
+
+inline int GetShadowQuality() noexcept {
+    if (!EnabledV5Sub(kV5Sub_NativePostFx) || !bb_direct_vk_shadow_quality) {
+        return 2; // Default (4K CSM)
+    }
+    return bb_direct_vk_shadow_quality();
+}
+
+inline bool CsmCadenceAllowed() noexcept {
+    if (!EnabledV5Sub(kV5Sub_NativePostFx) || !bb_direct_vk_csm_cadence_allowed) {
+        return true;
+    }
+    return bb_direct_vk_csm_cadence_allowed() != 0;
 }
 
 inline uint32_t GxCommandHeapBytes() noexcept {

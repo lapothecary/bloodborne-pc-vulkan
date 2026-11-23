@@ -26,6 +26,7 @@ class Runtime;
 
 VK_DEFINE_HANDLE(VmaAllocation)
 VK_DEFINE_HANDLE(VmaAllocator)
+VK_DEFINE_HANDLE(VmaPool)
 
 namespace VideoCore {
 
@@ -54,7 +55,7 @@ public:
     HostImage(HostImage&& other) noexcept;
     HostImage& operator=(HostImage&& other) noexcept;
 
-    void Create(const vk::ImageCreateInfo& create_info);
+    void Create(const vk::ImageCreateInfo& create_info, VmaPool pool = VK_NULL_HANDLE);
     void Destroy();
 
     operator vk::Image() const {
@@ -240,6 +241,28 @@ struct Image {
     u64 hash{};
     u64 hot_check_tick = ~0ull;
     u8 hot_page_hits = 0;
+    /// Physical mip-level offset dropped from host VkImage allocation (`0..3`) for Texture Quality
+    /// VRAM savings while `info` preserves original guest dimensions/layout for TextureCache lookups.
+    u8 host_mip_offset = 0;
+
+    [[nodiscard]] u32 HostMipLevels() const noexcept {
+        return info.resources.levels > host_mip_offset ? (info.resources.levels - host_mip_offset)
+                                                       : 1u;
+    }
+
+    /// Returns true if `info` is a qualifying world 2D BC texture managed by Texture Quality.
+    [[nodiscard]] static bool IsQualifyingWorldBc(const ImageInfo& info) noexcept;
+    /// Computes physical mip levels to drop (`0..3`) for qualifying world 2D BC textures.
+    [[nodiscard]] static u8 ComputeDesiredHostMipOffset(const ImageInfo& info, int tq) noexcept;
+    /// Returns true if `info` is Bloodborne's 4-cascade 4096x4096 D32 Sun/Moon CSM shadow atlas.
+    [[nodiscard]] static bool IsCsmShadowAtlas(const ImageInfo& info) noexcept;
+    /// Computes physical CSM shadow atlas dimension (`4 / 2048 / 4096 / 8192`) for Shadow Quality.
+    [[nodiscard]] static u32 ComputeDesiredCsmExtent(int sq, u32 max_dim = 8192u) noexcept;
+
+    /// Allocates a fresh unique image identity when a backing VkImage is replaced in-place.
+    [[nodiscard]] static u64 NextUid() noexcept {
+        return next_uid.Next();
+    }
 
 private:
     static Common::IncrementalIdProvider<u64> next_uid;

@@ -23,7 +23,12 @@ Rasterizer::ImageDescCacheEntry& Rasterizer::CachedImageDescEntry(const Gcn::Ima
     reinterpret_cast<u32*>(&sharp)[7] = 0u;
     std::array<u64, 4> key;
     std::memcpy(key.data(), &sharp, sizeof(key));
-    const u32 flags = u32(res.is_written) | u32(res.is_depth) << 1 | u32(res.is_array) << 2;
+    const u32 tq_bits =
+        static_cast<u32>(std::clamp(
+            BbSettings::Get().texture_quality.load(std::memory_order_relaxed), 0, 3))
+        << 4;
+    const u32 flags =
+        u32(res.is_written) | (u32(res.is_depth) << 1) | (u32(res.is_array) << 2) | tq_bits;
     // Two-way set associative: a frame binds a few thousand distinct T#s.
     auto* set = &image_desc_cache[(hash % (image_desc_cache.size() / 2)) * 2];
     const auto matches = [&](const ImageDescCacheEntry& e) {
@@ -66,7 +71,12 @@ Rasterizer::ImageDescCacheEntry& Rasterizer::ResolveImageDescEntry(
     const u64* prepared_hash) {
     if (srv_uid != 0 && srv_gen8 != 0 && native_srv_cache &&
         !BbToggle::Disabled(BbToggle::ImageDescCache)) {
-        const u32 flags = u32(res.is_written) | (u32(res.is_depth) << 1) | (u32(res.is_array) << 2);
+        const u32 tq_bits =
+            static_cast<u32>(std::clamp(
+                BbSettings::Get().texture_quality.load(std::memory_order_relaxed), 0, 3))
+            << 4;
+        const u32 flags =
+            u32(res.is_written) | (u32(res.is_depth) << 1) | (u32(res.is_array) << 2) | tq_bits;
         auto& entry = native_srv_cache[srv_uid];
         if (entry.srv_gen8 == srv_gen8 && entry.flags == flags) [[likely]] {
             return entry;
@@ -161,7 +171,10 @@ bool Rasterizer::TryBindTexturesFastOnHelper(const Shader::Info& stage,
         u64 qw0 = 0;
         std::memcpy(&qw0, &tsharp, sizeof(u64));
         const auto& fe = native_srv_fast_cache[uid];
-        const u8 rflags = (u8(res.is_depth) << 1) | (u8(res.is_array) << 2);
+        const u8 tq_bits = static_cast<u8>(
+            std::clamp(BbSettings::Get().texture_quality.load(std::memory_order_relaxed), 0, 3)
+            << 4);
+        const u8 rflags = (u8(res.is_depth) << 1) | (u8(res.is_array) << 2) | tq_bits;
         if (!fe.valid || fe.dw7_tag != dw7 || fe.qw0 != qw0 || fe.res_flags != rflags ||
             fe.imm_epoch16 != cur_imm_epoch16) {
             image_infos.resize(saved_img_sz);
@@ -345,7 +358,10 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
             u64 qw0 = 0;
             std::memcpy(&qw0, &tsharp, sizeof(u64));
             auto& fe = native_srv_fast_cache[uid];
-            const u8 rflags = (u8(res.is_depth) << 1) | (u8(res.is_array) << 2);
+            const u8 tq_bits = static_cast<u8>(
+                std::clamp(BbSettings::Get().texture_quality.load(std::memory_order_relaxed), 0, 3)
+                << 4);
+            const u8 rflags = (u8(res.is_depth) << 1) | (u8(res.is_array) << 2) | tq_bits;
             if (!fe.valid || fe.dw7_tag != dw7 || fe.qw0 != qw0 || fe.res_flags != rflags) {
                 fast_srv_ok = false;
                 break;
@@ -394,7 +410,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
                 std::copy_n(eff_image_hashes, stage_img_cnt, victim.hashes.begin());
                 victim.last_use = ++texture_set_use_counter;
                 victim.generation = texture_cache.RegistryGeneration();
-                victim.scene_generation = scene_targets->Generation();
+                const u64 tq_tag = static_cast<u64>(std::clamp(
+                    BbSettings::Get().texture_quality.load(std::memory_order_relaxed), 0, 3));
+                victim.scene_generation = (scene_targets->Generation() << 2) | tq_tag;
                 victim.imm_epoch16 = cur_imm_epoch16;
                 victim.count = static_cast<u8>(stage_img_cnt);
                 victim.native_count = static_cast<u8>(stage_img_cnt);
@@ -508,9 +526,13 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
                 ++resolved_native_count;
                 if (image_desc.mip_fallback_mode == Shader::MipStorageFallbackMode::None) {
                     resolved_srv_uids[image_index] = srv_uid;
+                    const u8 tq_bits = static_cast<u8>(
+                        std::clamp(
+                            BbSettings::Get().texture_quality.load(std::memory_order_relaxed), 0, 3)
+                        << 4);
                     resolved_res_flags[image_index] = u8(image_desc.is_written) |
                                                       (u8(image_desc.is_depth) << 1) |
-                                                      (u8(image_desc.is_array) << 2);
+                                                      (u8(image_desc.is_array) << 2) | tq_bits;
                     resolved_tagged_sharps[image_index] = raw_tagged_tsharp;
                 }
             }
@@ -920,7 +942,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
         // or across unrelated streaming registrations when all_direct_immutable holds.
         set_slot->last_use = ++texture_set_use_counter;
         set_slot->generation = texture_cache.RegistryGeneration();
-        set_slot->scene_generation = scene_targets->Generation();
+        const u64 tq_tag = static_cast<u64>(
+            std::clamp(BbSettings::Get().texture_quality.load(std::memory_order_relaxed), 0, 3));
+        set_slot->scene_generation = (scene_targets->Generation() << 2) | tq_tag;
         set_slot->count = static_cast<u8>(stage.images.size());
         set_slot->native_count = static_cast<u8>(resolved_native_count);
         bool all_imm = true;
@@ -1170,7 +1194,9 @@ bool Rasterizer::BindTexturesFromSet(const Shader::Info& stage, const u64* image
     // 8192 buckets (16384 ways) are utilized instead of only odd buckets.
     auto* pair = &texture_sets[((key >> 1) & ((texture_sets.size() / 2) - 1)) * 2];
     const u64 generation = texture_cache.RegistryGeneration();
-    const u64 scene_gen = scene_targets->Generation();
+    const u64 tq_tag = static_cast<u64>(
+        std::clamp(BbSettings::Get().texture_quality.load(std::memory_order_relaxed), 0, 3));
+    const u64 scene_gen = (scene_targets->Generation() << 2) | tq_tag;
 
     const auto key_matches = [&](const TextureSet& cand) {
         return cand.key == key && cand.stage == &stage &&
@@ -1392,7 +1418,9 @@ vk::ImageView Rasterizer::ResolveSrvViewMt(const Gcn::Image& raw_sharp,
         return {};
     }
     const u32 raw_dw7 = reinterpret_cast<const u32*>(&raw_sharp)[7];
-    const u8 rflags = (u8(res.is_depth) << 1) | (u8(res.is_array) << 2);
+    const u8 tq_bits = static_cast<u8>(
+        std::clamp(BbSettings::Get().texture_quality.load(std::memory_order_relaxed), 0, 3) << 4);
+    const u8 rflags = (u8(res.is_depth) << 1) | (u8(res.is_array) << 2) | tq_bits;
     const u16 cur_imm_epoch16 = VideoCore::DirectTextures::ImmutableRoEpoch16();
     u16 srv_uid = 0;
     u64 raw_qw0 = 0;

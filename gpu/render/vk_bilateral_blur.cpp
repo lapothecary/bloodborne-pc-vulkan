@@ -11,6 +11,7 @@
 #include "render/runtime.h"
 #include "render/scheduler.h"
 #include "render/vk_gpu_profiler.h"
+#include "shim/bbport_settings.h"
 #include "shim/bbport_toggles.h"
 #include "textures/image.h"
 #include "textures/image_view.h"
@@ -146,6 +147,47 @@ bool BilateralBlurCompute::TryDispatch(VideoCore::ImageId src_id, u32 src_mip, u
         return false;
     }
 
+    const VideoCore::SubresourceRange src_range{
+        .base = {src_mip, src_layer},
+        .extent = {1u, 1u},
+    };
+    const VideoCore::SubresourceRange dst_range{
+        .base = {dst_mip, dst_layer},
+        .extent = {1u, 1u},
+    };
+
+    // Shadow Quality screen-space blur control (0x11ffdfb5 = GXScreenSpaceShadow_Blur, 2 passes/f):
+    //   - Ultra (4, 8192x8192 CSM):
+    //       * PCSS OFF: bypass the heavy 2x PS4 screen-space blur completely via direct image copy
+    //         so every feather, iron spike, branch, and weapon edge stays razor-sharp (~-0.06 ms).
+    //       * PCSS ON: micro 0.18x (~1 px) depth-aware denoise removes IGN Vogel-disk grain in
+    //         penumbras while preserving razor-sharp contacts and crisp 8K silhouettes.
+    //   - High (3, 6144x6144 CSM): 0.45x (0.28x with PCSS) crisp edge AA instead of PS4 smear.
+    //   - Default (2, 4096x4096 CSM): 1.0x original PS4 blur (0.55x with PCSS so contact hardening
+    //     remains clearly visible).
+    //   - Off / Low (0..1): exact PS4 blur radius (1.0x).
+    const int sq =
+        std::clamp(BbSettings::Get().shadow_quality.load(std::memory_order_relaxed), 0, 4);
+    const bool pcss_on = BbSettings::Get().pcss_shadows.load(std::memory_order_relaxed);
+    if (sq >= 4 && !pcss_on) {
+        GpuProfiler::HudMarkPass(&scheduler, BbStats::GpuSub_Shadow_VsmAndPcf);
+        const vk::ImageCopy region{
+            .srcSubresource = {vk::ImageAspectFlagBits::eColor, src_mip, src_layer, 1u},
+            .srcOffset = {0, 0, 0},
+            .dstSubresource = {vk::ImageAspectFlagBits::eColor, dst_mip, dst_layer, 1u},
+            .dstOffset = {0, 0, 0},
+            .extent = {w, h, 1u},
+        };
+        runtime.CopyImageSubresource(&src_img, &dst_img, src_range, dst_range, region);
+        dst_img.gpu_write_tick = scheduler.CurrentTick();
+        return true;
+    }
+
+    const f32 tap_scale = (sq >= 4) ? 0.18f
+                        : (sq == 3) ? (pcss_on ? 0.28f : 0.45f)
+                        : (sq == 2) ? (pcss_on ? 0.55f : 1.0f)
+                                    : 1.0f;
+
     // Parse 52 floats (208 B) from `cbBlurParam`:
     //   [0] = z_a
     //   [4 + k*4 + 0..2] = (off_uv.x, off_uv.y, kw) for k = 0..11
@@ -173,13 +215,14 @@ bool BilateralBlurCompute::TryDispatch(VideoCore::ImageId src_id, u32 src_mip, u
         }
         kws[k] = kw;
 
-        const f32 tx = ox * fw;
-        const f32 ty = oy * fh;
+        const f32 tx = ox * fw * tap_scale;
+        const f32 ty = oy * fh * tap_scale;
         // For VK_FILTER_NEAREST, `floor((gx + 0.5) + tx) == gx + floor(0.5 + tx)` identically
         // for EVERY integer pixel `gx`, even when `tx` is fractional (e.g. 1080p -> 1440p scale!).
         const s32 ix = static_cast<s32>(std::floor(0.5f + tx));
         const s32 iy = static_cast<s32>(std::floor(0.5f + ty));
-        if (std::fabs(tx - std::round(tx)) > 0.04f || std::fabs(ty - std::round(ty)) > 0.04f) {
+        if (sq != 3 &&
+            (std::fabs(tx - std::round(tx)) > 0.04f || std::fabs(ty - std::round(ty)) > 0.04f)) {
             all_linear_exact = false;
         }
         dx[k] = ix;
@@ -222,15 +265,6 @@ bool BilateralBlurCompute::TryDispatch(VideoCore::ImageId src_id, u32 src_mip, u
 
     EnsurePipelines();
     scheduler.EndRendering();
-
-    const VideoCore::SubresourceRange src_range{
-        .base = {src_mip, src_layer},
-        .extent = {1u, 1u},
-    };
-    const VideoCore::SubresourceRange dst_range{
-        .base = {dst_mip, dst_layer},
-        .extent = {1u, 1u},
-    };
     runtime.Transit(&src_img, vk::ImageLayout::eShaderReadOnlyOptimal,
                     vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderRead,
                     src_range);

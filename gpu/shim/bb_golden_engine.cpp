@@ -214,6 +214,16 @@ int GX_SYSV_ABI bb_direct_vk_is_effect_enabled(std::uint32_t effect_index) noexc
     return 1;
 }
 
+int GX_SYSV_ABI bb_direct_vk_shadow_quality() noexcept {
+    return std::clamp(BbSettings::Get().shadow_quality.load(std::memory_order_relaxed), 0, 4);
+}
+
+int GX_SYSV_ABI bb_direct_vk_csm_cadence_allowed() noexcept {
+    // Disable temporal far-cascade cadence below ~55 FPS so 30/40/45 FPS players never see
+    // 100 ms moving-mob shadow blinking on Default/Low.
+    return BbFrameRate::CurrentFramesPer30() <= 0.55f ? 1 : 0;
+}
+
 std::uint32_t GX_SYSV_ABI bb_direct_vk_motion_blur_scales(float* out_time_scale,
                                                           float* out_obj_vel_scale,
                                                           float* out_max_len_scale,

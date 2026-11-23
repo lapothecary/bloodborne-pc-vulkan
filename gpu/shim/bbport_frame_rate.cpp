@@ -871,7 +871,7 @@ int HookClothFriction() {
 ///   (`1/60f = 0.01666667f`). Keeping `xmm14` fixed at `0x4929e70` prevents:
 ///   (a) 2x speed/amplitude exaggeration at 30 FPS when `live->dt = 1/30f`,
 ///   (b) amplitude/speed shrinkage to `60 / FPS` (~16% at 360 FPS), and
-///   (c) frame-to-frame phase jumps ("хоррор-рывки") from `live->dt * accumulated_time` jitter.
+///   (c) frame-to-frame phase jumps (jarring cadence hitches) from `live->dt * accumulated_time` jitter.
 /// - At 0x2314b35..0x2314b43, `xmm10` (the per-frame timer step added to `[r14 + 0x610/0x620]`
 ///   at 0x2314bdb, 0x231581a, 0x2315aa5) loads `[rbp - 0x170]` (`live->dt_half = 0.5f * dt`).
 bool HookFoliageSway() {

@@ -156,6 +156,13 @@ void TextureCache::RefreshImage(Image& image) {
     if (False(image.flags & ImageFlagBits::Dirty) || image.info.num_samples > 1) {
         return;
     }
+    // Scaled CSM shadow atlases (4x4 / 2048x2048 / 8192x8192) are pure GPU-rendered depth targets
+    // and must never copy 4096x4096 guest DMEM bytes into a different host extent.
+    if (Image::IsCsmShadowAtlas(image.info) && image.backing &&
+        image.backing->image.image_ci.extent.width != image.info.size.width) {
+        image.flags &= ~ImageFlagBits::Dirty;
+        return;
+    }
     BbStats::Timer timer{BbStats::t_refresh};
     const ImageInfo& info = image.info;
 
@@ -205,7 +212,8 @@ void TextureCache::RefreshImage(Image& image) {
     const bool gpu_modified = True(image.flags & ImageFlagBits::GpuModified);
     const bool gpu_written = gpu_modified && False(image.flags & ImageFlagBits::GpuDirty);
     boost::container::small_vector<vk::BufferImageCopy, 14> copies;
-    for (u32 level = 0; level < levels; ++level) {
+    const u32 mip_off = image.host_mip_offset;
+    for (u32 level = mip_off; level < levels; ++level) {
         const auto& layout = info.mips_layout[level];
         if (gpu_modified) {
             const u64 hash = XXH3_64bits(
@@ -224,7 +232,7 @@ void TextureCache::RefreshImage(Image& image) {
             .bufferImageHeight = layout.height,
             .imageSubresource{
                 .aspectMask = image.aspect_mask & ~vk::ImageAspectFlagBits::eStencil,
-                .mipLevel = level,
+                .mipLevel = level - mip_off,
                 .baseArrayLayer = 0,
                 .layerCount = layers,
             },

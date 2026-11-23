@@ -188,6 +188,8 @@ const char* TranslateForCurrentGameLang(const char* en) {
         {"Upscaler", "Mise à l'échelle", "Escalador", "Upscaler", "Upscaler", "Upscaler", "Skalowanie", "アップスケーラー", "업스케일러", "超分辨率"},
         {"Upscaler Mode", "Mode d'échelle", "Modo de escalado", "Upscaler-Modus", "Modalità Upscaler", "Modo do Upscaler", "Tryb skalowania", "アップスケールモード", "업스케일 모드", "缩放模式"},
         {"Sharpness (RCAS)", "Netteté (RCAS)", "Nitidez (RCAS)", "Schärfe (RCAS)", "Nitidezza (RCAS)", "Nitidez (RCAS)", "Ostrość (RCAS)", "シャープネス (RCAS)", "선명도 (RCAS)", "锐化 (RCAS)"},
+        {"Texture Quality", "Qualité des textures", "Calidad de texturas", "Texturqualität", "Qualità texture", "Qualidade de texturas", "Jakość tekstur", "テクスチャ品質", "텍스처 품질", "纹理质量"},
+        {"Shadow Quality", "Qualité des ombres", "Calidad de sombras", "Schattenqualität", "Qualità ombre", "Qualidade das sombras", "Jakość cieni", "シャドウ品質", "그림자 품질", "阴影质量"},
         {"Anisotropic Filtering", "Filtrage anisotrope", "Filtro anisotrópico", "Anisotrope Filterung", "Filtro anisotropico", "Filtro anisotrópico", "Filtrowanie anizotropowe", "異方性フィルタリング", "이방성 필터링", "各向异性过滤"},
         {"Model Detail (LOD)", "Détail des modèles (LOD)", "Detalle de modelos (LOD)", "Modelldetails (LOD)", "Dettaglio modelli (LOD)", "Detalhe dos modelos (LOD)", "Szczegółowość modeli (LOD)", "モデル詳細度 (LOD)", "모델 디테일 (LOD)", "模型细节 (LOD)"},
         {"UI & Icons Upscale", "Upscaling UI & Icônes", "Escalado de UI e iconos", "UI- & Icon-Upscaling", "Upscaling UI e icone", "Upscale de UI e ícones", "Skalowanie UI i ikon", "UI・アイコン高解像度化", "UI 및 아이콘 업스케일", "UI 与图标超分辨率"},
@@ -307,7 +309,7 @@ constexpr int ItemLoadingTipsTimer = FirstControlSettingItem + 8;
 constexpr int TotalControlsItems = BbSettings::KeyActionCount + 9; ///< 27 keybinds + Mouse Speed + Camera Follow + Loading Tips Timer + 6 native settings
 constexpr int MaxControlsScroll = TotalControlsItems - ControlsSlotCount;
 constexpr int DisplaySlotCount = 11; ///< all 11 Display settings fit on a single screen (0 scroll)
-constexpr int TotalDisplayItems = 12;
+constexpr int TotalDisplayItems = 14;
 constexpr int MaxDisplayScroll = TotalDisplayItems - DisplaySlotCount;
 constexpr int EffectsSlotCount = 11; ///< all 11 Effects settings fit on a single screen (0 scroll)
 constexpr int TotalEffectsItems = 16;
@@ -1734,7 +1736,7 @@ int GetDisplayItemSliderValue(int item_idx) {
 void SyncDisplaySlotSliderWidget(u8* row, int slot, bool is_focused) {
     const int item_idx = std::clamp(display_scroll + slot, 0, TotalDisplayItems - 1);
     const char16_t* combo_text =
-        (item_idx == 11) ? TextOf(DisplaySlotVal + u32(slot)) : nullptr;
+        (item_idx == 13) ? TextOf(DisplaySlotVal + u32(slot)) : nullptr;
     SyncPageSlotSliderWidget(active_display_page, row, slot, GetDisplayItemSliderValue(item_idx), is_focused,
                              combo_text);
 }
@@ -1955,7 +1957,26 @@ void BuildDisplaySlotChoices(int slot, std::vector<u32>& out_choices, int& out_s
     }
 
     if (item_idx == 9) {
-        add_choice("Off (PS4 Default)", "Выкл (Как на PS4)");
+        add_choice("Default", "Стандарт");
+        add_choice("Medium", "Среднее");
+        add_choice("Low", "Низкое");
+        add_choice("Very Low", "Очень низкое");
+        out_selected_idx = std::clamp(s.texture_quality.load(), 0, 3);
+        return;
+    }
+
+    if (item_idx == 10) {
+        add_choice("Off", "Выкл");
+        add_choice("Low", "Низкое");
+        add_choice("Default", "Стандарт");
+        add_choice("High", "Высокое");
+        add_choice("Ultra", "Ультра");
+        out_selected_idx = std::clamp(s.shadow_quality.load(), 0, 4);
+        return;
+    }
+
+    if (item_idx == 11) {
+        add_choice("Off", "Выкл");
         add_choice("4x (Medium)", "4x (Средняя)");
         add_choice("8x (High)", "8x (Высокая)");
         add_choice("16x (Ultra)", "16x (Ультра)");
@@ -1964,7 +1985,7 @@ void BuildDisplaySlotChoices(int slot, std::vector<u32>& out_choices, int& out_s
         return;
     }
 
-    if (item_idx == 10) {
+    if (item_idx == 12) {
         add_choice("Highest", "Максимальная");
         add_choice("Game Default", "Как в игре");
         add_choice("Lower", "Ниже");
@@ -1974,8 +1995,8 @@ void BuildDisplaySlotChoices(int slot, std::vector<u32>& out_choices, int& out_s
         return;
     }
 
-    if (item_idx == 11) {
-        add_choice("Off (PS4 Default)", "Выкл (Как на PS4)");
+    if (item_idx == 13) {
+        add_choice("Off", "Выкл");
         add_choice("On (AI / SDF 2x-4x)", "Вкл (AI / SDF 2x-4x)");
         out_selected_idx = s.ui_upscale.load() ? 1 : 0;
     }
@@ -2121,6 +2142,44 @@ void RefreshDisplaySlotTexts(int slot) {
     }
 
     if (item_idx == 9) {
+        SetDynamic(name_id, "Texture Quality", "Качество текстур");
+        SetDynamic(help_id,
+                   "World texture resolution: Default (full), Medium, Low, or Very Low (resizes textures in VRAM immediately without restarting; saves up to ~1 GB VRAM)",
+                   "Детализация текстур мира: Стандарт, Среднее, Низкое или Очень низкое (мгновенно перестраивает текстуры в VRAM без перезапуска; экономит до ~1 ГБ VRAM)");
+        const int tq = std::clamp(s.texture_quality.load(), 0, 3);
+        if (tq == 0) {
+            SetDynamic(val_id, "Default", "Стандарт");
+        } else if (tq == 1) {
+            SetDynamic(val_id, "Medium", "Среднее");
+        } else if (tq == 2) {
+            SetDynamic(val_id, "Low", "Низкое");
+        } else {
+            SetDynamic(val_id, "Very Low", "Очень низкое");
+        }
+        return;
+    }
+
+    if (item_idx == 10) {
+        SetDynamic(name_id, "Shadow Quality", "Качество теней");
+        SetDynamic(help_id,
+                   "Shadow map resolution & sharpness: Off (max FPS), Low (1K), Default (4K), High (6K Crisp), Ultra (8K Razor-Sharp) — applies live",
+                   "Разрешение и чёткость теней: Выкл (макс. FPS), Низкое (1K), Стандарт (4K), Высокое (6K чёткие), Ультра (8K бритвенные) — применяется мгновенно");
+        const int sq = std::clamp(s.shadow_quality.load(), 0, 4);
+        if (sq == 0) {
+            SetDynamic(val_id, "Off", "Выкл");
+        } else if (sq == 1) {
+            SetDynamic(val_id, "Low", "Низкое");
+        } else if (sq == 2) {
+            SetDynamic(val_id, "Default", "Стандарт");
+        } else if (sq == 3) {
+            SetDynamic(val_id, "High", "Высокое");
+        } else {
+            SetDynamic(val_id, "Ultra", "Ультра");
+        }
+        return;
+    }
+
+    if (item_idx == 11) {
         SetDynamic(name_id, "Anisotropic Filtering", "Фильтрация текстур");
         SetDynamic(help_id,
                    "Sharpens ground, cobblestones and wall textures at oblique angles (applies live)",
@@ -2133,12 +2192,12 @@ void RefreshDisplaySlotTexts(int slot) {
         } else if (aniso >= 4) {
             SetDynamic(val_id, "4x (Medium)", "4x (Средняя)");
         } else {
-            SetDynamic(val_id, "Off (PS4 Default)", "Выкл (Как на PS4)");
+            SetDynamic(val_id, "Off", "Выкл");
         }
         return;
     }
 
-    if (item_idx == 10) {
+    if (item_idx == 12) {
         SetDynamic(name_id, "Model Detail (LOD)", "Детализация моделей");
         SetDynamic(help_id, "Level of detail distance for 3D models and geometry (applies live)",
                    "Дальность максимальной детализации 3D-моделей (применяется мгновенно)");
@@ -2155,7 +2214,7 @@ void RefreshDisplaySlotTexts(int slot) {
         return;
     }
 
-    if (item_idx == 11) {
+    if (item_idx == 13) {
         SetDynamic(name_id, "UI & Icons Upscale", "Апскейл иконок и UI");
         SetDynamic(help_id,
                    "2x/4x GPU Super-Resolution (SDF + De-Block + Edge Reconstruction) for logos, icons & HUD (applies live)",
@@ -2163,7 +2222,7 @@ void RefreshDisplaySlotTexts(int slot) {
         if (s.ui_upscale.load()) {
             SetDynamic(val_id, "On (AI / SDF 2x-4x)", "Вкл (AI / SDF 2x-4x)");
         } else {
-            SetDynamic(val_id, "Off (PS4 Default)", "Выкл (Как на PS4)");
+            SetDynamic(val_id, "Off", "Выкл");
         }
     }
 }
@@ -2346,6 +2405,29 @@ void ApplyDisplaySlotChoiceIndex(u8* row, int slot, int choice_idx) {
     }
 
     if (item_idx == 9) {
+        const int new_tq = std::clamp(choice_idx, 0, 3);
+        if (new_tq != s.texture_quality.load()) {
+            s.texture_quality = new_tq;
+            BbSettings::Save();
+        }
+        RefreshDisplaySlotTexts(slot);
+        UpdateDisplaySlotRowDisplay(row, slot);
+        return;
+    }
+
+    if (item_idx == 10) {
+        const int old_sq = std::clamp(s.shadow_quality.load(), 0, 4);
+        const int new_sq = std::clamp(choice_idx, 0, 4);
+        if (new_sq != old_sq) {
+            s.shadow_quality = new_sq;
+            BbSettings::Save();
+        }
+        RefreshDisplaySlotTexts(slot);
+        UpdateDisplaySlotRowDisplay(row, slot);
+        return;
+    }
+
+    if (item_idx == 11) {
         const int new_aniso = AnisoValues[std::clamp(choice_idx, 0, AnisoValueCount - 1)];
         if (new_aniso != s.anisotropic.load()) {
             s.anisotropic = new_aniso;
@@ -2356,7 +2438,7 @@ void ApplyDisplaySlotChoiceIndex(u8* row, int slot, int choice_idx) {
         return;
     }
 
-    if (item_idx == 10) {
+    if (item_idx == 12) {
         const int idx = std::clamp(choice_idx, 0, 3);
         const int new_lod = LodValues[idx];
         if (new_lod != s.model_lod.load()) {
@@ -2371,7 +2453,7 @@ void ApplyDisplaySlotChoiceIndex(u8* row, int slot, int choice_idx) {
         return;
     }
 
-    if (item_idx == 11) {
+    if (item_idx == 13) {
         const bool new_ui_up = (choice_idx != 0);
         if (new_ui_up != s.ui_upscale.load()) {
             s.ui_upscale = new_ui_up;
@@ -3157,6 +3239,8 @@ u64 PS4_SYSV_ABI RowInputHook(u8* row, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, d
             s.fps_limit = 30;
             BbFrameRate::SetLimit(30);
             SetSharpnessStep(0);
+            s.texture_quality = 0;
+            s.shadow_quality = 2;
             s.anisotropic = 1;
             s.model_lod = 0;
             s.ui_upscale = true;
@@ -3183,7 +3267,7 @@ u64 PS4_SYSV_ABI RowInputHook(u8* row, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, d
             }
             return 0;
         }
-        if (item_idx == 11) {
+        if (item_idx == 12) {
             // 2-choice toggle row (UI & Icons Upscale): uses <| Off / On |> ComboBox arrows.
             SyncDisplaySlotSliderWidget(row, slot, is_focused);
             if (is_focused && in != 0) {

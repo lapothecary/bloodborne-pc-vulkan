@@ -272,7 +272,7 @@ std::string OptBinaryName(u64 pgm_hash, size_t perm_idx) {
                                 : (IsOpt46MotBlurObjFpsShaderHash(pgm_hash)
                                        ? "opt48"
                                        : (IsOpt40RemasterSsgiShaderHash(pgm_hash)
-                                       ? "opt54"
+                                       ? "opt62"
                                        : (IsOpt39RemasterPcssShaderHash(pgm_hash)
                                               ? "opt39"
                                               : (IsOpt38StageC2ShaderHash(pgm_hash)

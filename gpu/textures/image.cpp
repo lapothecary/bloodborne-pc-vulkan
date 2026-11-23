@@ -12,6 +12,7 @@
 
 #include <vk_mem_alloc.h>
 
+#include "bbport_settings.h"
 #include "bbport_toggles.h"
 #include "common/assert.h"
 #include "render/gcn_to_vk.h"
@@ -128,25 +129,38 @@ HostImage& HostImage::operator=(HostImage&& other) noexcept {
     return *this;
 }
 
-void HostImage::Create(const vk::ImageCreateInfo& create_info) {
+void HostImage::Create(const vk::ImageCreateInfo& create_info, VmaPool pool) {
     ASSERT(!image);
     image_ci = create_info;
-    VmaAllocationCreateFlags dedicated = 0;
-    if (device && DedicatedFrom() != 0) {
-        const vk::DeviceImageMemoryRequirements query{.pCreateInfo = &image_ci};
-        if (device.getImageMemoryRequirements(query).memoryRequirements.size >= DedicatedFrom()) {
-            dedicated = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
-        }
-    }
-    const VmaAllocationCreateInfo alloc_ci = {
-        .flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | dedicated,
-        .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
-    };
     const VkImageCreateInfo vk_create_info = image_ci;
     VkImage handle{};
     VmaAllocationInfo alloc_info{};
-    const VkResult result =
-        vmaCreateImage(allocator, &vk_create_info, &alloc_ci, &handle, &allocation, &alloc_info);
+    VkResult result = VK_ERROR_UNKNOWN;
+    if (pool != VK_NULL_HANDLE) {
+        const VmaAllocationCreateInfo pool_alloc_ci = {
+            .flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT,
+            .usage = VMA_MEMORY_USAGE_UNKNOWN,
+            .pool = pool,
+        };
+        result = vmaCreateImage(allocator, &vk_create_info, &pool_alloc_ci, &handle, &allocation,
+                                &alloc_info);
+    }
+    if (result != VK_SUCCESS) {
+        VmaAllocationCreateFlags dedicated = 0;
+        if (device && DedicatedFrom() != 0) {
+            const vk::DeviceImageMemoryRequirements query{.pCreateInfo = &image_ci};
+            if (device.getImageMemoryRequirements(query).memoryRequirements.size >=
+                DedicatedFrom()) {
+                dedicated = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
+            }
+        }
+        const VmaAllocationCreateInfo alloc_ci = {
+            .flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | dedicated,
+            .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+        };
+        result = vmaCreateImage(allocator, &vk_create_info, &alloc_ci, &handle, &allocation,
+                                &alloc_info);
+    }
     ASSERT_MSG(result == VK_SUCCESS, "image allocation: {}", vk::to_string(vk::Result{result}));
     image = handle;
     size_bytes = alloc_info.size;
@@ -161,6 +175,44 @@ void HostImage::Destroy() {
     vmaDestroyImage(allocator, image, allocation);
     image = vk::Image{};
     allocation = {};
+}
+
+bool Image::IsQualifyingWorldBc(const ImageInfo& info) noexcept {
+    return info.props.is_block && !info.props.is_depth && !info.props.is_volume &&
+           info.num_samples == 1 && info.resources.layers == 1 &&
+           (info.type == Gcn::ImageType::Color2D || info.type == Gcn::ImageType::Color2DArray) &&
+           info.size.width >= 128u && info.size.height >= 128u && info.resources.levels >= 5u;
+}
+
+u8 Image::ComputeDesiredHostMipOffset(const ImageInfo& info, int tq) noexcept {
+    tq = std::clamp(tq, 0, 3);
+    if (tq > 0 && IsQualifyingWorldBc(info)) {
+        return static_cast<u8>(std::min<u32>(static_cast<u32>(tq), info.resources.levels - 2u));
+    }
+    return 0u;
+}
+
+bool Image::IsCsmShadowAtlas(const ImageInfo& info) noexcept {
+    return info.props.is_depth && !info.props.has_stencil && !info.props.is_block &&
+           !info.props.is_volume && info.num_samples == 1 && info.resources.levels == 1 &&
+           info.resources.layers == 1 && info.size.width == 4096u && info.size.height == 4096u;
+}
+
+u32 Image::ComputeDesiredCsmExtent(int sq, u32 max_dim) noexcept {
+    sq = std::clamp(sq, 0, 4);
+    if (sq == 0) {
+        return 4u; // Off: tiny 4x4 depth map cleared to 1.0 (frees 64 MiB VRAM + unshadowed forward shaders)
+    }
+    if (sq == 1) {
+        return 1024u; // Low: 1024x1024 (512x512 per cascade, 16x fewer pixels, saves 60 MiB VRAM)
+    }
+    if (sq == 3) {
+        return std::min(6144u, std::max(4096u, max_dim)); // High: 6144x6144 (3K per cascade + crisp AA blur)
+    }
+    if (sq == 4) {
+        return std::min(8192u, std::max(4096u, max_dim)); // Ultra: 8192x8192 (4K per cascade + raw razor-sharp)
+    }
+    return 4096u; // Default: native 4096x4096 (2048x2048 per cascade)
 }
 
 Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
@@ -213,26 +265,47 @@ Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
                             ? properties.value.imageFormatProperties.sampleCounts
                             : vk::SampleCountFlagBits::e1;
 
+    const int tq =
+        std::clamp(BbSettings::Get().texture_quality.load(std::memory_order_relaxed), 0, 3);
+    host_mip_offset = ComputeDesiredHostMipOffset(info, tq);
+    u32 host_w = std::max(info.size.width >> host_mip_offset, 1u);
+    u32 host_h = std::max(info.size.height >> host_mip_offset, 1u);
+    if (IsCsmShadowAtlas(info)) {
+        const int sq =
+            std::clamp(BbSettings::Get().shadow_quality.load(std::memory_order_relaxed), 0, 4);
+        const u32 max_dim = std::min(instance.GetMaxFramebufferWidth(),
+                                     instance.GetMaxFramebufferHeight());
+        const u32 csm_ext = ComputeDesiredCsmExtent(sq, max_dim);
+        host_w = csm_ext;
+        host_h = csm_ext;
+    }
+    const u32 host_levels = HostMipLevels();
+
     backing = &backing_images.emplace_back();
     backing->num_samples = info.num_samples;
     backing->image = HostImage{instance.GetDevice(), instance.GetAllocator()};
-    backing->image.Create(vk::ImageCreateInfo{
-        .flags = create_flags,
-        .imageType = vk_type,
-        .format = format,
-        .extent{info.size.width, info.size.height, info.size.depth},
-        .mipLevels = info.resources.levels,
-        .arrayLayers = info.resources.layers,
-        .samples = Vulkan::GcnToVk::NumSamples(info.num_samples, supported_samples),
-        .tiling = vk::ImageTiling::eOptimal,
-        .usage = usage_flags,
-        .initialLayout = vk::ImageLayout::eUndefined,
-    });
-    Vulkan::SetObjectName(instance.GetDevice(), GetImage(), "image {}x{}x{} {} {} {:#x}+{:#x} L{} M{} S{}",
-                          info.size.width, info.size.height, info.size.depth,
-                          Gcn::NameOf(info.tile_mode), vk::to_string(info.pixel_format),
-                          info.guest_address, info.guest_size, info.resources.layers,
-                          info.resources.levels, info.num_samples);
+    const VmaPool bc_pool =
+        IsQualifyingWorldBc(info) ? instance.GetActiveWorldBcPool() : VK_NULL_HANDLE;
+    backing->image.Create(
+        vk::ImageCreateInfo{
+            .flags = create_flags,
+            .imageType = vk_type,
+            .format = format,
+            .extent{host_w, host_h, info.size.depth},
+            .mipLevels = host_levels,
+            .arrayLayers = info.resources.layers,
+            .samples = Vulkan::GcnToVk::NumSamples(info.num_samples, supported_samples),
+            .tiling = vk::ImageTiling::eOptimal,
+            .usage = usage_flags,
+            .initialLayout = vk::ImageLayout::eUndefined,
+        },
+        bc_pool);
+    Vulkan::SetObjectName(instance.GetDevice(), GetImage(),
+                          "image {}x{}x{} {} {} {:#x}+{:#x} L{} M{}(+{}) S{}",
+                          host_w, host_h, info.size.depth, Gcn::NameOf(info.tile_mode),
+                          vk::to_string(info.pixel_format), info.guest_address, info.guest_size,
+                          info.resources.layers, host_levels, u32(host_mip_offset),
+                          info.num_samples);
 }
 
 Image::~Image() = default;
@@ -286,8 +359,11 @@ void Image::GetBarriers(Barriers& out, vk::ImageLayout dst_layout, vk::AccessFla
                         vk::PipelineStageFlags2 dst_stage, std::optional<SubresourceRange> range) {
     auto& whole = backing->state;
     auto& parts = backing->subresource_states;
-    const bool partial = range && (range->base != SubresourceBase{} ||
-                                   range->extent != info.resources);
+    const bool covers_all_host_mips =
+        range && range->base.level <= host_mip_offset &&
+        range->base.level + range->extent.levels >= info.resources.levels &&
+        range->base.layer == 0 && range->extent.layers == info.resources.layers;
+    const bool partial = range && !covers_all_host_mips;
     const State target{dst_stage, dst_mask, dst_layout};
     const auto barrier = [&](const State& from, u32 level, u32 levels, u32 layer, u32 layers) {
         out.push_back(vk::ImageMemoryBarrier2{
@@ -388,8 +464,8 @@ void Image::GetBarriers(Barriers& out, vk::ImageLayout dst_layout, vk::AccessFla
             while (layer + run < end_layer && parts[index + run] == from) {
                 ++run;
             }
-            if (NeedsBarrier(from, dst_layout, dst_mask)) {
-                barrier(from, level, 1, layer, run);
+            if (level >= host_mip_offset && NeedsBarrier(from, dst_layout, dst_mask)) {
+                barrier(from, level - host_mip_offset, 1, layer, run);
             }
             std::fill_n(parts.begin() + index, run, target);
             layer += run;

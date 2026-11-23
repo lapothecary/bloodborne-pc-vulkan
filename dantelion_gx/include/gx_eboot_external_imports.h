@@ -23990,6 +23990,8 @@ __attribute__((weak, visibility("hidden"))) void bb_direct_vk_retire_buffer_rang
 __attribute__((weak, visibility("hidden"))) void bb_direct_vk_register_shader_binary(const void*, uint32_t, const void*, uint32_t, uint32_t) noexcept {}
 __attribute__((weak, visibility("hidden"))) void bb_direct_vk_retire_shader_range(const void*, uint64_t) noexcept {}
 __attribute__((weak, visibility("hidden"))) int bb_direct_vk_is_effect_enabled(uint32_t) noexcept { return 1; }
+__attribute__((weak, visibility("hidden"))) int bb_direct_vk_shadow_quality() noexcept { return 2; }
+__attribute__((weak, visibility("hidden"))) int bb_direct_vk_csm_cadence_allowed() noexcept { return 1; }
 __attribute__((weak, visibility("hidden"))) uint32_t bb_direct_vk_motion_blur_scales(float* a, float* b, float* c, float* d) noexcept { if (a) *a = 1.0f; if (b) *b = 1.0f; if (c) *c = 1.0f; if (d) *d = 1.0f; return 3u; }
 __attribute__((weak, visibility("hidden"))) void bb_direct_vk_note_vel_silhouette_mask() noexcept {}
 __attribute__((weak, visibility("hidden"))) uint32_t bb_direct_vk_gx_command_heap_bytes() noexcept { return 0; }

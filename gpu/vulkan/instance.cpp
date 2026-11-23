@@ -120,6 +120,12 @@ Instance::~Instance() {
     if (auto* dlss = Dlss::Get()) {
         dlss->Shutdown();
     }
+    for (VmaPool& pool : world_bc_pools) {
+        if (pool) {
+            vmaDestroyPool(allocator, pool);
+            pool = VK_NULL_HANDLE;
+        }
+    }
     vmaDestroyAllocator(allocator);
 }
 
@@ -586,6 +592,41 @@ void Instance::CreateAllocator() {
         .vulkanApiVersion = TargetVulkanApiVersion,
     };
     Check<"create the memory allocator">(vk::Result(vmaCreateAllocator(&info, &allocator)));
+
+    // Create two clean 16 MiB ping-pong pools exclusively for world 2D BC textures so live
+    // Texture Quality resizing never fragments shared 64 MiB VMA blocks and returns freed VRAM
+    // blocks immediately to the GPU driver.
+    VkImageCreateInfo sample_bc_ci{};
+    sample_bc_ci.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    sample_bc_ci.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT |
+                         (block_texel_view ? VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT : 0u);
+    sample_bc_ci.imageType = VK_IMAGE_TYPE_2D;
+    sample_bc_ci.format = VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
+    sample_bc_ci.extent = {256, 256, 1};
+    sample_bc_ci.mipLevels = 9;
+    sample_bc_ci.arrayLayers = 1;
+    sample_bc_ci.samples = VK_SAMPLE_COUNT_1_BIT;
+    sample_bc_ci.tiling = VK_IMAGE_TILING_OPTIMAL;
+    sample_bc_ci.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                         VK_IMAGE_USAGE_SAMPLED_BIT;
+    sample_bc_ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+    VmaAllocationCreateInfo sample_alloc_ci{};
+    sample_alloc_ci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+    uint32_t bc_mem_type = 0;
+    if (vmaFindMemoryTypeIndexForImageInfo(allocator, &sample_bc_ci, &sample_alloc_ci,
+                                           &bc_mem_type) == VK_SUCCESS) {
+        VmaPoolCreateInfo pool_ci{};
+        pool_ci.memoryTypeIndex = bc_mem_type;
+        pool_ci.blockSize = 16ull << 20;
+        pool_ci.minBlockCount = 0;
+        pool_ci.maxBlockCount = 0;
+        for (VmaPool& pool : world_bc_pools) {
+            if (vmaCreatePool(allocator, &pool_ci, &pool) != VK_SUCCESS) {
+                pool = VK_NULL_HANDLE;
+            }
+        }
+    }
     stats_instance = this;
 }
 

@@ -1502,20 +1502,29 @@ static u32 ClassifyMicroShadowLimit(const Gcn::Regs& regs, const GraphicsPipelin
         s32(regs.screen_scissor.bottom_right_x) - s32(regs.screen_scissor.top_left_x);
     const s32 sc_h =
         s32(regs.screen_scissor.bottom_right_y) - s32(regs.screen_scissor.top_left_y);
+    const int sq = std::clamp(BbSettings::Get().shadow_quality.load(std::memory_order_relaxed), 0, 4);
+    if (sq >= 4) {
+        return 0u; // Ultra: keep all local VSM micro-shadow casters
+    }
+    const auto scale_limit = [sq](u32 base) -> u32 {
+        if (sq == 3) return base * 2u; // High: double micro-shadow caster budget
+        if (sq == 1) return std::max(1u, base / 2u); // Low: tighter micro-shadow culling
+        return base;
+    };
     const bool is_32 = (vp_w > 0.0f && vp_w <= 33.0f && vp_h > 0.0f && vp_h <= 33.0f) ||
                        (sc_w > 0 && sc_w <= 32 && sc_h > 0 && sc_h <= 32);
     if (is_32) {
-        return 1u;
+        return scale_limit(1u);
     }
     const bool is_64 = (vp_w > 0.0f && vp_w <= 65.0f && vp_h > 0.0f && vp_h <= 65.0f) ||
                        (sc_w > 0 && sc_w <= 64 && sc_h > 0 && sc_h <= 64);
     if (is_64) {
-        return 2u;
+        return scale_limit(2u);
     }
     const bool is_128 = (vp_w > 0.0f && vp_w <= 129.0f && vp_h > 0.0f && vp_h <= 129.0f) ||
                         (sc_w > 0 && sc_w <= 128 && sc_h > 0 && sc_h <= 128);
     if (is_128 && regs.num_indices <= 180u) {
-        return 4u;
+        return scale_limit(4u);
     }
     return 0u;
 }
@@ -4354,13 +4363,15 @@ void Rasterizer::ScaleToTarget(const GraphicsPipeline* pipeline) {
     push_data.yoffset *= target_scale[1];
     if (!frame_fx_mask_valid) [[unlikely]] {
         const auto& settings = BbSettings::Get();
+        const int sq = std::clamp(settings.shadow_quality.load(std::memory_order_relaxed), 0, 4);
         u8 fx_mask = 0;
         if (settings.ssao_quality.load(std::memory_order_relaxed))    fx_mask |= 0x01u;
-        if (settings.contact_shadows.load(std::memory_order_relaxed)) fx_mask |= 0x02u;
+        if (sq >= 2 && settings.contact_shadows.load(std::memory_order_relaxed)) fx_mask |= 0x02u;
         if (settings.ssr_quality.load(std::memory_order_relaxed))     fx_mask |= 0x04u;
         if (settings.true_black_hdr.load(std::memory_order_relaxed))  fx_mask |= 0x08u;
-        if (settings.pcss_shadows.load(std::memory_order_relaxed))    fx_mask |= 0x10u;
+        if (sq >= 2 && settings.pcss_shadows.load(std::memory_order_relaxed))    fx_mask |= 0x10u;
         if (settings.ssgi_enabled.load(std::memory_order_relaxed))    fx_mask |= 0x20u;
+        if (sq == 0)                                                  fx_mask |= 0x40u;
         frame_fx_mask = fx_mask;
         const u8 mb_cam = static_cast<u8>(
             std::clamp(settings.motion_blur_camera.load(std::memory_order_relaxed), 0, 3));
@@ -5755,6 +5766,50 @@ void Rasterizer::OnSubmit() {
     }
     direct_buffers.FlushPendingWritebacks();
     ProcessDirectTextureEvents();
+    if (texture_cache.SyncTextureQualityLive(memory)) {
+        for (auto& entry : image_desc_cache) {
+            entry.view_memo = {};
+            entry.found_uid = 0;
+        }
+        if (native_srv_cache) {
+            for (u32 i = 0; i < VideoCore::DirectTextures::kMaxNativeSrvs; ++i) {
+                native_srv_cache[i].view_memo = {};
+                native_srv_cache[i].found_uid = 0;
+            }
+        }
+        if (native_srv_fast_cache) {
+            for (u32 i = 0; i < VideoCore::DirectTextures::kMaxNativeSrvs; ++i) {
+                native_srv_fast_cache[i].valid = 0u;
+                native_srv_fast_cache[i].view = vk::ImageView{};
+                native_srv_fast_cache[i].imm_epoch16 = 0u;
+            }
+        }
+        if (mt_srv_publish) {
+            for (u32 i = 0; i < VideoCore::DirectTextures::kMaxNativeSrvs; ++i) {
+                auto& mp = mt_srv_publish[i];
+                const u32 seq = mp.seq.load(std::memory_order_relaxed);
+                mp.seq.store(seq + 1u, std::memory_order_release);
+                mp.view = VK_NULL_HANDLE;
+                mp.dw7_tag = 0u;
+                mp.imm_epoch16 = 0u;
+                mp.seq.store(seq + 2u, std::memory_order_release);
+            }
+        }
+        for (auto& ts : texture_sets) {
+            ts.key = 0;
+        }
+        begin_memo.valid = false;
+        for (auto& tm : target_memo) {
+            tm.color_view_memo = {};
+            tm.depth_view_memo = {};
+        }
+        for (auto& dtc : direct_target_cache) {
+            dtc.color_view_memo = {};
+            dtc.depth_view_memo = {};
+        }
+        fallback_cb_view_memo = {};
+        fallback_db_view_memo = {};
+    }
     if (fault_process_pending) {
         fault_process_pending = false;
         buffer_cache.ProcessFaultBuffer();
@@ -5833,8 +5888,9 @@ u8 ClassifyHudRenderSubPass(u64 vs_hash, u64 ps_hash, u32 width, u32 height, u32
         ps_hash == 0x114b2257ull || ps_hash == 0x7efecca6ull || ps_hash == 0xb5f8c858ull) {
         return BbStats::GpuSub_Ssao_BilateralBlur;
     }
-    // 1. Shadow Maps (4096x4096 CSM/spot shadow atlas, depth-only passes, VSM moments/blur, CSM PCF)
-    if ((width == 4096 && height == 4096) ||
+    // 1. Shadow Maps (1K/4K/6K/8K CSM/spot shadow atlas, depth-only passes, VSM moments/blur, CSM PCF)
+    if ((width == 4096 && height == 4096) || (width == 6144 && height == 6144) ||
+        (width == 8192 && height == 8192) ||
         (num_mrts == 0 && has_depth && ps_hash != 0x4fd8db00ull) ||
         ps_hash == 0x006c079bull || ps_hash == 0xa0e88f56ull || ps_hash == 0xa2108f5eull) {
         return BbStats::GpuSub_Shadow_CascadeAtlas;

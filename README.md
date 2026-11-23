@@ -54,6 +54,7 @@ BloodBorne/
 
 ## 🆕 Latest Release (`v1.2.3`)
 
+- **Live Texture Quality & Shadow Quality** — Adjust `Texture Quality` (`Default` down to `Very Low`, saving up to ~1 GB of VRAM — capped at `Default` since native max-res textures aren't upscaled) and `Shadow Quality` (`Off / Low / Default / High / Ultra`, scaling both down for FPS/VRAM and up for sharper shadows) live in `System -> Display`.
 - **Cleaner AA & Proper Post-FX Order (~130 MB Less VRAM)** — Temporal anti-aliasing and upscaling (`DLAA / DLSS / FSR / TAA`) now run in true HDR space before post-processing — sharper thin geometry/hair with less shimmer, crisp Bloom/CA/Heat Haze, and ~130 MB less VRAM.
 - **All Post-Processing & Screen Effects Native in Vulkan** — Ambient occlusion (`152` native Vulkan shaders), glossy reflections, Motion Blur, Bloom, Auto-Exposure, Depth of Field, Chromatic Aberration, and shadows all run in fast native Vulkan passes with lower GPU load and power draw.
 - **Expanded Shader Pre-Bake Catalog (+1,095 New Recipes) & Clean Logs** — Added 819 graphics pipelines and 263 shader variants to `data/shader_recipes.bbrc` for smoother fresh installs, ~3.5× smaller privacy-safe logs, and a compact Windows/Linux hardware summary.

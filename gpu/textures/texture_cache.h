@@ -148,7 +148,8 @@ public:
                                           u32& out_backing_samples, vk::Format& out_backing_fmt,
                                           vk::ImageAspectFlags& out_aspect_mask,
                                           bool& out_has_scene_proxy,
-                                          MtRejectDiag* out_diag = nullptr);
+                                          MtRejectDiag* out_diag = nullptr,
+                                          vk::Extent2D* out_host_extent = nullptr);
     /// Phase 4.2b/4.3: Read-only thread-safe resolution of any clean existing SRV (including
     /// dynamic shadow/depth/HDR scene RTs and non-tagged textures) on `GXWorker:1..5`.
     [[nodiscard]] bool TryResolveSceneSrvViewMt(
@@ -364,6 +365,10 @@ public:
 
     /// Once per guest submission: evicts unused images and samplers when memory runs short.
     void RunGarbageCollector();
+    /// Live Texture Quality reallocation: shrinks or restores qualifying world 2D BC textures
+    /// in-place on the frame boundary when the user changes Texture Quality in the menu.
+    /// Returns true if any textures were rebuilt (caller should clear Stage-B view memos).
+    bool SyncTextureQualityLive(Core::MemoryManager* memory);
     /// VRAM ran out (any thread): for the next 30 s the collector evicts by submissions again
     /// instead of keeping textures unused for seconds.
     static void NoteVramShort();
@@ -534,6 +539,17 @@ private:
     tsl::robin_map<VAddr, MetaInfo> surface_metas;
     tsl::robin_map<VAddr, ImageId> direct_assets_by_addr; ///< V3.2: O(1) VAddr -> ImageId lookup
     std::unique_ptr<u8[]> hot_granule_hits; ///< Sticky 64 KiB hot-page counters for rotated CPU LUT rings
+
+    // Live Texture Quality reallocation state (deferred destruction for GPU + GXWorker safety).
+    struct RetiredTqBatch {
+        u64 retire_after_submit = 0;
+        std::vector<HostImage> images;
+        std::vector<ImageViewId> view_ids;
+    };
+    std::deque<RetiredTqBatch> retired_tq_batches;
+    u64 tq_submit_counter = 0;
+    int last_applied_tq = 0;
+    int last_applied_sq = 2;
 };
 
 } // namespace VideoCore

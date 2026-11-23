@@ -4,6 +4,8 @@
 // allocator, and the device's capabilities as the renderer and the shader translator ask them.
 #pragma once
 
+#include <array>
+#include <atomic>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -18,6 +20,7 @@ struct WindowSystemInfo;
 } // namespace Frontend
 
 VK_DEFINE_HANDLE(VmaAllocator)
+VK_DEFINE_HANDLE(VmaPool)
 
 namespace Vulkan {
 
@@ -43,6 +46,14 @@ public:
     }
     VmaAllocator GetAllocator() const {
         return allocator;
+    }
+    /// Dedicated ping-pong VMA pool for world 2D BC textures so live Texture Quality switches
+    /// return 100% of freed VRAM blocks back to the GPU driver without fragmentation.
+    VmaPool GetActiveWorldBcPool() const noexcept {
+        return world_bc_pools[active_world_bc_pool.load(std::memory_order_relaxed) & 1u];
+    }
+    void SwapWorldBcPool() const noexcept {
+        active_world_bc_pool.fetch_xor(1u, std::memory_order_relaxed);
     }
 
     // Queues. Presenting goes through the graphics queue.
@@ -388,6 +399,8 @@ private:
     vk::PhysicalDevice physical_device;
     vk::UniqueDevice device;
     VmaAllocator allocator{};
+    std::array<VmaPool, 2> world_bc_pools{};
+    mutable std::atomic<u32> active_world_bc_pool{0};
     vk::Queue graphics_queue;
     vk::Queue readback_queue;
     u32 graphics_family = 0;

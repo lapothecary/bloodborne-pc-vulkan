@@ -463,26 +463,46 @@ void Runtime::UploadImage(VideoCore::Image* dst, const VideoCore::Buffer* src,
 void Runtime::CopyBufferToImageSubresource(VideoCore::Image* dst, const VideoCore::Buffer* src,
                                            const VideoCore::SubresourceRange& dst_range,
                                            const vk::BufferImageCopy& copy) {
+    if (copy.imageSubresource.mipLevel < dst->host_mip_offset) {
+        return;
+    }
+    vk::BufferImageCopy adj_copy = copy;
+    adj_copy.imageSubresource.mipLevel -= dst->host_mip_offset;
     SetBackingSamples(dst, dst->info.num_samples, false);
     scheduler.EndRendering();
     const TransferMark mark{*this, "image subresource upload", *dst};
-    const u32 size = BufferImageCopySize(copy, dst->info.pixel_format);
+    const u32 size = BufferImageCopySize(adj_copy, dst->info.pixel_format);
     bool needs_flush = Transit(dst, Layout::eTransferDstOptimal, Stage::eCopy,
                                AccessBit::eTransferWrite, dst_range);
-    needs_flush |= IsBufferAccessed(src, copy.bufferOffset, size);
+    needs_flush |= IsBufferAccessed(src, adj_copy.bufferOffset, size);
     if (needs_flush) {
         FlushBarriers();
     }
     scheduler.Record([src_buf = src->Handle(), image = dst->GetImage(),
-                      copy](vk::CommandBuffer cmdbuf) {
-        cmdbuf.copyBufferToImage(src_buf, image, Layout::eTransferDstOptimal, 1, &copy);
+                      adj_copy](vk::CommandBuffer cmdbuf) {
+        cmdbuf.copyBufferToImage(src_buf, image, Layout::eTransferDstOptimal, 1, &adj_copy);
     });
-    AccessBuffer(src, copy.bufferOffset, size, Stage::eCopy, AccessBit::eTransferRead);
+    AccessBuffer(src, adj_copy.bufferOffset, size, Stage::eCopy, AccessBit::eTransferRead);
     MarkCopied(dst, VideoCore::ImageFlagBits::GpuModified);
 }
 
 void Runtime::DownloadImage(VideoCore::Image* src, const VideoCore::Buffer* dst,
                             std::span<const vk::BufferImageCopy> copies) {
+    boost::container::small_vector<vk::BufferImageCopy, 16> adj_copies;
+    if (src->host_mip_offset > 0) {
+        for (const auto& c : copies) {
+            if (c.imageSubresource.mipLevel < src->host_mip_offset) {
+                continue;
+            }
+            auto a = c;
+            a.imageSubresource.mipLevel -= src->host_mip_offset;
+            adj_copies.push_back(a);
+        }
+        if (adj_copies.empty()) {
+            return;
+        }
+        copies = adj_copies;
+    }
     SetBackingSamples(src, src->info.num_samples);
     scheduler.EndRendering();
     const TransferMark mark{*this, "image download", *src};
@@ -549,8 +569,9 @@ void Runtime::CopyImage(VideoCore::Image* src, VideoCore::Image* dst) {
     const u32 depth =
         dst->info.type == Gcn::ImageType::Color3D ? dst->info.size.depth : src->info.size.depth;
     const u32 levels = std::min(src->info.resources.levels, dst->info.resources.levels);
+    const u32 min_mip = std::max<u32>(src->host_mip_offset, dst->host_mip_offset);
     boost::container::small_vector<vk::ImageCopy, 16> regions;
-    for (u32 mip = 0; mip < levels; ++mip) {
+    for (u32 mip = min_mip; mip < levels; ++mip) {
         const u32 width = std::max(src->info.size.width >> mip, 1u);
         const u32 height = std::max(src->info.size.height >> mip, 1u);
         const u32 mip_depth = std::max(depth >> mip, 1u);
@@ -567,10 +588,13 @@ void Runtime::CopyImage(VideoCore::Image* src, VideoCore::Image* dst) {
             src_layers = dst_layers = std::min(src_layers, dst_layers);
         }
         regions.push_back({
-            .srcSubresource = {src_aspect, mip, 0, src_layers},
-            .dstSubresource = {dst_aspect, mip, 0, dst_layers},
+            .srcSubresource = {src_aspect, mip - src->host_mip_offset, 0, src_layers},
+            .dstSubresource = {dst_aspect, mip - dst->host_mip_offset, 0, dst_layers},
             .extent = {width, height, extent_depth},
         });
+    }
+    if (regions.empty()) {
+        return;
     }
     PrepareTransfer(src, dst, Stage::eCopy);
     CopyImageRegions(src, dst, regions);
@@ -785,8 +809,13 @@ void Runtime::ClearImage(VideoCore::Image* dst, const VideoCore::SubresourceRang
                 range)) {
         FlushImageBarriers();
     }
-    const vk::ImageSubresourceRange vk_range{vk::ImageAspectFlagBits::eColor, range.base.level,
-                                             range.extent.levels, range.base.layer,
+    const u32 mip_off = dst->host_mip_offset;
+    const u32 host_levels = dst->HostMipLevels();
+    const u32 vk_base_mip =
+        range.base.level > mip_off ? std::min(range.base.level - mip_off, host_levels - 1u) : 0u;
+    const u32 vk_level_count = std::clamp(range.extent.levels, 1u, host_levels - vk_base_mip);
+    const vk::ImageSubresourceRange vk_range{vk::ImageAspectFlagBits::eColor, vk_base_mip,
+                                             vk_level_count, range.base.layer,
                                              range.extent.layers};
     scheduler.Record([image = dst->GetImage(), color = value.color,
                       vk_range](vk::CommandBuffer cmdbuf) {
@@ -806,7 +835,8 @@ void Runtime::ZeroInitializeImage(VideoCore::Image* dst, std::optional<u32> skip
     scheduler.EndRendering();
     const TransferMark mark{*this, "image zero init", *dst};
     const bool is_3d = DimensionOf(dst->info.type) == vk::ImageType::e3D;
-    const u32 levels = dst->info.resources.levels;
+    const u32 mip_off = dst->host_mip_offset;
+    const u32 levels = dst->HostMipLevels();
     const u32 layers = is_3d ? 1u : dst->info.resources.layers;
 
     if (dst->info.props.is_depth) {
@@ -845,12 +875,13 @@ void Runtime::ZeroInitializeImage(VideoCore::Image* dst, std::optional<u32> skip
     boost::container::small_vector<vk::BufferImageCopy, 32> regions;
     u64 max_region_bytes = 0;
     for (u32 m = 0; m < levels; ++m) {
-        if (skip_full_mip && *skip_full_mip == m && layers == 1u) {
+        const u32 guest_m = m + mip_off;
+        if (skip_full_mip && *skip_full_mip == guest_m && layers == 1u) {
             continue;
         }
-        const u32 mw = std::max(1u, dst->info.size.width >> m);
-        const u32 mh = std::max(1u, dst->info.size.height >> m);
-        const u32 md = is_3d ? std::max(1u, dst->info.size.depth >> m) : 1u;
+        const u32 mw = std::max(1u, dst->info.size.width >> guest_m);
+        const u32 mh = std::max(1u, dst->info.size.height >> guest_m);
+        const u32 md = is_3d ? std::max(1u, dst->info.size.depth >> guest_m) : 1u;
         const u32 w_blocks = (mw + block[0] - 1u) / block[0];
         const u32 h_blocks = (mh + block[1] - 1u) / block[1];
         const u64 mip_slice_bytes =
@@ -950,8 +981,8 @@ void Runtime::ClearDepthStencilQuadrants(VideoCore::Image* dst, vk::ImageView de
         return;
     }
 
-    const u32 w = dst->info.size.width;
-    const u32 h = dst->info.size.height;
+    const u32 w = dst->backing ? dst->backing->image.image_ci.extent.width : dst->info.size.width;
+    const u32 h = dst->backing ? dst->backing->image.image_ci.extent.height : dst->info.size.height;
     const u32 hw = w >> 1;
     const u32 hh = h >> 1;
     const u32 rw = w - hw;

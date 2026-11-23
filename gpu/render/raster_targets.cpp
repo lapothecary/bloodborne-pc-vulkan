@@ -734,6 +734,7 @@ bool Rasterizer::InspectMtPassTargets(
     }
 
     VideoCore::ImageInfo db_info{};
+    vk::Extent2D db_host_extent{};
     bool db_eligible_scene = false;
     if (want_depth) {
         const VAddr htile_addr = regs.depth_htile_data_base.GetAddress();
@@ -746,7 +747,7 @@ bool Rasterizer::InspectMtPassTargets(
         bool has_proxy = false;
         VideoCore::TextureCache::MtRejectDiag rdiag{};
         if (!texture_cache.TryInspectTargetMt(desc, id, db_info, backing_samples, backing_fmt,
-                                              aspect, has_proxy, &rdiag)) {
+                                              aspect, has_proxy, &rdiag, &db_host_extent)) {
             out.diag_flags = rdiag.flags;
             out.diag_w = rdiag.width;
             out.diag_h = rdiag.height;
@@ -814,6 +815,12 @@ bool Rasterizer::InspectMtPassTargets(
             out.target_scale = {float(sz.width) / float(base.width),
                                 float(sz.height) / float(base.height)};
         }
+    } else if (!pass_reduced && active_guest_cb_mask == 0u && want_depth &&
+               db_host_extent.width != 0u && db_host_extent.height != 0u &&
+               (db_host_extent.width != db_info.size.width ||
+                db_host_extent.height != db_info.size.height)) {
+        out.target_scale = {float(db_host_extent.width) / float(db_info.size.width),
+                            float(db_host_extent.height) / float(db_info.size.height)};
     }
     out.sampler_lod_bias =
         (out.is_gbuffer && upscaler) ? upscaler->SceneMipBiasMt() : 0.0f;
@@ -1152,8 +1159,12 @@ void Rasterizer::BindDepthAttachment(RenderState& state, bool reduced, TargetRed
         needs_barrier |= runtime.Transit(&image, layout, dst_stage, dst_access,
                                          desc.view_info.range);
     }
-    state.width = std::min<u32>(state.width, image.info.size.width);
-    state.height = std::min<u32>(state.height, image.info.size.height);
+    const u32 depth_host_w =
+        image.backing ? image.backing->image.image_ci.extent.width : image.info.size.width;
+    const u32 depth_host_h =
+        image.backing ? image.backing->image.image_ci.extent.height : image.info.size.height;
+    state.width = std::min<u32>(state.width, depth_host_w);
+    state.height = std::min<u32>(state.height, depth_host_h);
     state.num_layers = std::min<u32>(state.num_layers, view.info.range.extent.layers);
 
     attachment.image_view = *view.image_view;
@@ -1314,6 +1325,23 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
         state.height = proxy.height;
         target_scale = {float(size.width) / float(base.width),
                         float(size.height) / float(base.height)};
+    } else if (db_desc.first && !redirect.depth) {
+        const bool depth_only = std::ranges::none_of(
+            std::span{state.color_attachments}.first(state.num_color_attachments),
+            [](const auto& color) { return bool(color.image_view); });
+        if (depth_only) {
+            const auto& depth_img = texture_cache.GetImage(db_desc.first);
+            if (depth_img.backing) {
+                const u32 host_w = depth_img.backing->image.image_ci.extent.width;
+                const u32 host_h = depth_img.backing->image.image_ci.extent.height;
+                if (host_w != depth_img.info.size.width || host_h != depth_img.info.size.height) {
+                    state.width = host_w;
+                    state.height = host_h;
+                    target_scale = {float(host_w) / float(depth_img.info.size.width),
+                                    float(host_h) / float(depth_img.info.size.height)};
+                }
+            }
+        }
     }
     if (FrameCapture::Active()) {
         std::array<const VideoCore::ImageInfo*, Gcn::NUM_COLOR_BUFFERS> colors{};

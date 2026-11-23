@@ -297,6 +297,32 @@ void Set(Values& v, const std::string& key, const std::string& value) {
         v.loading_tips_timer = i != 0;
     } else if (key == "dlss_preset") {
         v.dlss_preset = (i == 0 || i == 5 || i == 6 || (i >= 10 && i <= 13)) ? i : 11;
+    } else if (key == "texture_quality") {
+        if (value == "very_low" || value == "verylow") {
+            v.texture_quality = 3;
+        } else if (value == "low") {
+            v.texture_quality = 2;
+        } else if (value == "medium" || value == "med") {
+            v.texture_quality = 1;
+        } else if (value == "default" || value == "high" || value == "ultra") {
+            v.texture_quality = 0;
+        } else {
+            v.texture_quality = std::clamp(i, 0, 3);
+        }
+    } else if (key == "shadow_quality") {
+        if (value == "off") {
+            v.shadow_quality = 0;
+        } else if (value == "low") {
+            v.shadow_quality = 1;
+        } else if (value == "default" || value == "medium" || value == "med") {
+            v.shadow_quality = 2;
+        } else if (value == "high") {
+            v.shadow_quality = 3;
+        } else if (value == "ultra") {
+            v.shadow_quality = 4;
+        } else {
+            v.shadow_quality = std::clamp(i, 0, 4);
+        }
     } else if (key == "anisotropic") {
         v.anisotropic = (i >= 16) ? 16 : (i >= 8) ? 8 : (i >= 4) ? 4 : 0;
     } else if (key == "fps_limit") {
@@ -762,6 +788,7 @@ void Load() {
         {"BB_FIRE_HEAT_HAZE", "fire_heat_haze"},
         {"BB_MOTION_BLUR_CAMERA", "motion_blur_camera"},
         {"BB_MOTION_BLUR_OBJECT", "motion_blur_object"}, {"BB_CAMERA_FOLLOW", "camera_follow_mode"},
+        {"BB_TEXTURE_QUALITY", "texture_quality"},       {"BB_SHADOW_QUALITY", "shadow_quality"},
     };
     // Frame generation is hidden in the menu until its artifacts are fixed: only BB_FRAME_GEN turns
     // it on, a saved setting does not.
@@ -959,6 +986,8 @@ void Save() {
     put("camera_follow_mode", CameraFollowModeName(v.camera_follow_mode.load()));
     put("loading_tips_timer", flag(v.loading_tips_timer));
     put("dlss_preset", std::to_string(v.dlss_preset.load()));
+    put("texture_quality", std::to_string(std::clamp(v.texture_quality.load(), 0, 3)));
+    put("shadow_quality", std::to_string(std::clamp(v.shadow_quality.load(), 0, 4)));
     put("anisotropic", std::to_string(v.anisotropic.load()));
     put("fps_limit", std::to_string(v.fps_limit.load()));
     put("present_mode", PresentModeKey(v.vsync_mode.load()));

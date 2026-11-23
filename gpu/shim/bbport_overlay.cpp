@@ -785,8 +785,38 @@ void Menu() {
     ImGui::SeparatorText(BbSettings::MenuText("Game effects & Texture filtering",
                                               "Эффекты игры и фильтрация текстур"));
     {
+        const char* tq_labels[] = {
+            BbSettings::MenuText("Default", "Стандарт"),
+            BbSettings::MenuText("Medium", "Среднее"),
+            BbSettings::MenuText("Low", "Низкое"),
+            BbSettings::MenuText("Very Low", "Очень низкое")};
+        int tq_idx = std::clamp(s.texture_quality.load(), 0, 3);
+        if (ImGui::Combo(BbSettings::MenuText("Texture quality", "Качество текстур"),
+                         &tq_idx, tq_labels, 4)) {
+            Store(s.texture_quality, tq_idx, true);
+        }
+    }
+    {
+        const char* sq_labels[] = {
+            BbSettings::MenuText("Off", "Выкл"),
+            BbSettings::MenuText("Low", "Низкое"),
+            BbSettings::MenuText("Default", "Стандарт"),
+            BbSettings::MenuText("High", "Высокое"),
+            BbSettings::MenuText("Ultra", "Ультра")};
+        int sq_idx = std::clamp(s.shadow_quality.load(), 0, 4);
+        if (ImGui::Combo(BbSettings::MenuText("Shadow quality", "Качество теней"),
+                         &sq_idx, sq_labels, 5)) {
+            const int old_sq = std::clamp(s.shadow_quality.load(), 0, 4);
+            if (sq_idx != old_sq) {
+                s.shadow_quality = sq_idx;
+                BbSettings::Save();
+                BbSysInfo::LogSettingsIfChanged();
+            }
+        }
+    }
+    {
         const char* aniso_labels[] = {
-            BbSettings::MenuText("Off (PS4 Default)", "Выкл (Как на PS4)"),
+            BbSettings::MenuText("Off", "Выкл"),
             BbSettings::MenuText("4x (Medium)", "4x (Средняя)"),
             BbSettings::MenuText("8x (High)", "8x (Высокая)"),
             BbSettings::MenuText("16x (Ultra)", "16x (Ультра)")};
@@ -833,7 +863,7 @@ void Menu() {
             const char* mb_labels[4] = {
                 BbSettings::MenuText("Off", "Выкл"),
                 BbSettings::MenuText("Low (Subtle)", "Низкий (мягкий)"),
-                BbSettings::MenuText("Default (PS4 Parity)", "Стандарт (как на PS4)"),
+                BbSettings::MenuText("Default", "Стандарт"),
                 BbSettings::MenuText("High (Cinematic)", "Высокий (кинематографичный)"),
             };
             auto draw_mb_combo = [&](const char* label, std::atomic<int>& target) {

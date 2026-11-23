@@ -3271,13 +3271,15 @@ bool VkMtDirectRecorder::TryCompileDeferredCommandList(const void* /*ctx_base*/,
     const bool dynamic_vertex_input = instance.IsVertexInputDynamicState();
     const u8 fx_mask = []() noexcept -> u8 {
         const auto& settings = BbSettings::Get();
+        const int sq = std::clamp(settings.shadow_quality.load(std::memory_order_relaxed), 0, 4);
         u8 m = 0;
         if (settings.ssao_quality.load(std::memory_order_relaxed))    m |= 0x01u;
-        if (settings.contact_shadows.load(std::memory_order_relaxed)) m |= 0x02u;
+        if (sq >= 2 && settings.contact_shadows.load(std::memory_order_relaxed)) m |= 0x02u;
         if (settings.ssr_quality.load(std::memory_order_relaxed))     m |= 0x04u;
         if (settings.true_black_hdr.load(std::memory_order_relaxed))  m |= 0x08u;
-        if (settings.pcss_shadows.load(std::memory_order_relaxed))    m |= 0x10u;
+        if (sq >= 2 && settings.pcss_shadows.load(std::memory_order_relaxed))    m |= 0x10u;
         if (settings.ssgi_enabled.load(std::memory_order_relaxed))    m |= 0x20u;
+        if (sq == 0)                                                  m |= 0x40u;
         return m;
     }();
     const u8 mb_mask = []() noexcept -> u8 {

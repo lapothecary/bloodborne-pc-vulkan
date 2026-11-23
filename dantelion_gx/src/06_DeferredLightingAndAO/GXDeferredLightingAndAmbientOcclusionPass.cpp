@@ -115,7 +115,16 @@ static uint32_t selectCsmCascadeUpdateMask(
     uint32_t oldAtlasH,
     const void* pCsmDepthTarget) noexcept
 {
-    const uint32_t mode = getCsmCadenceMode();
+    const int sq = gx_direct_vk::GetShadowQuality();
+    static int s_last_sq = 2;
+    if (sq != s_last_sq) {
+        s_last_sq = sq;
+        return 0x0Fu; // Force all 4 cascades to populate freshly resized/re-enabled CSM atlas immediately
+    }
+    if (sq >= 3 || !gx_direct_vk::CsmCadenceAllowed()) {
+        return 0x0Fu; // High/Ultra or <55 FPS: update all 4 CSM cascades every frame (zero 30 FPS mob blinking)
+    }
+    const uint32_t mode = (sq == 1) ? 3u : getCsmCadenceMode();
     if (mode == 0u ||
         !gx_direct_vk::EnabledV1Sub(gx_direct_vk::kV1Sub_ClearDepthDraw) ||
         csm == nullptr || cam == nullptr || pCsmDepthTarget == nullptr ||
@@ -421,7 +430,16 @@ __attribute__((noinline)) void sub_229e990(void* pSelf, void* pRenderDev, void* 
         if ((ctxFlags & 0x10u) != 0u) {
             viewBytes[0x296a] = gx_direct_vk::IsEffectEnabled(gx_direct_vk::kEffectGameAa) ? 1u : 0u;
         }
-        viewBytes[0x296e] = gx_direct_vk::IsEffectEnabled(gx_direct_vk::kEffectDynamicShadows) ? 1u : 0u;
+        // Mirror eboot.bin+0x22c5989 (`cmpb $0, 0x1b88(%rbx); mov %cl, 0x296c(%rbx)`):
+        // viewBytes[0x1b88] is the view's persistent CSM-capable flag, so gating viewBytes[0x296c]
+        // on it cleanly disables BOTH CSM caster draws and screen-space CSM passes at Shadow Quality
+        // Off (0.00 ms 1.Shadow) and restores them immediately when switching back to Low..Ultra.
+        const bool shadowsOn = (gx_direct_vk::GetShadowQuality() != 0);
+        if (viewBytes[0x1b88] != 0u) {
+            viewBytes[0x296c] = shadowsOn ? 1u : 0u;
+        }
+        viewBytes[0x296e] =
+            (shadowsOn && gx_direct_vk::IsEffectEnabled(gx_direct_vk::kEffectDynamicShadows)) ? 1u : 0u;
         if ((ctxFlags & 0x8u) != 0u) {
             const uint8_t wantBloom = gx_direct_vk::IsEffectEnabled(gx_direct_vk::kEffectBloom) ? 1u : 0u;
             viewBytes[0x296b] = wantBloom;
@@ -1566,7 +1584,7 @@ void sub_229cb70(void* pSelf, void* pRenderDevHolder, const void* pCamera,
         return;
     }
     uint8_t* viewBytes = static_cast<uint8_t*>(pViewCtx);
-    if (viewBytes[0x296c] == 0) {
+    if (viewBytes[0x296c] == 0 || gx_direct_vk::GetShadowQuality() == 0) {
         return;
     }
 

@@ -3,6 +3,7 @@
 
 #include <algorithm>
 
+#include "bbport_settings.h"
 #include "common/logging/log.h"
 #include "shader/resource.h"
 #include "textures/image.h"
@@ -75,6 +76,21 @@ ImageViewInfo::ImageViewInfo(const Gcn::Image& image, const Shader::ImageResourc
     range.extent.layers = image.NumViewLayers(desc.is_array);
     type = image.GetViewType(desc.is_array);
     min_lod = u32(image.min_lod);
+    // Live Texture Quality mip skip (0=Default, 1=Medium, 2=Low, 3=Very Low) for world 2D BC
+    // textures with a full mip chain (>=128x128, >=5 levels, single layer); never touches UI,
+    // fonts, LUTs, cubemaps, depth/shadow maps, or render targets.
+    if (!is_storage && !desc.is_depth && !image.IsCube() && image.NumLayers() == 1u &&
+        (type == Gcn::ImageType::Color2D || type == Gcn::ImageType::Color2DArray) &&
+        Gcn::IsBlockCoded(image.GetDataFmt()) && image.width >= 127u && image.height >= 127u &&
+        range.extent.levels >= 5u) {
+        const int tq =
+            std::clamp(BbSettings::Get().texture_quality.load(std::memory_order_relaxed), 0, 3);
+        if (tq > 0) {
+            const u32 skip = std::min<u32>(static_cast<u32>(tq), range.extent.levels - 2u);
+            range.base.level += skip;
+            range.extent.levels -= skip;
+        }
+    }
     if (!is_storage) {
         mapping = ToVk::ComponentMapping(image.DstSelect());
     }
@@ -103,10 +119,19 @@ ImageView::ImageView(const Vulkan::Instance& instance, const ImageViewInfo& info
     if (!info.is_storage) {
         usage.usage &= ~vk::ImageUsageFlagBits::eStorage;
     }
+    const u32 mip_off = image.host_mip_offset;
+    const u32 host_levels = image.HostMipLevels();
+    const u32 vk_base_mip = info.range.base.level > mip_off
+                                ? std::min(info.range.base.level - mip_off, host_levels - 1u)
+                                : 0u;
+    const u32 max_avail = host_levels - vk_base_mip;
+    const u32 vk_level_count = std::clamp(info.range.extent.levels, 1u, max_avail);
+
     vk::ImageViewMinLodCreateInfoEXT min_lod{};
-    if (info.min_lod != 0 && instance.IsImageViewMinLodSupported()) {
-        const u32 last_level = info.range.base.level + info.range.extent.levels - 1;
-        min_lod.minLod = std::min(float(info.min_lod) / 256.0f, float(last_level));
+    const float eff_min_lod = std::max(0.0f, float(info.min_lod) / 256.0f - float(mip_off));
+    if (eff_min_lod > 0.0f && instance.IsImageViewMinLodSupported()) {
+        const u32 last_level = vk_base_mip + vk_level_count - 1u;
+        min_lod.minLod = std::min(eff_min_lod, float(last_level));
         usage.pNext = &min_lod;
     }
 
@@ -137,8 +162,8 @@ ImageView::ImageView(const Vulkan::Instance& instance, const ImageViewInfo& info
         .components = info.mapping,
         .subresourceRange{
             .aspectMask = aspect,
-            .baseMipLevel = info.range.base.level,
-            .levelCount = info.range.extent.levels,
+            .baseMipLevel = vk_base_mip,
+            .levelCount = vk_level_count,
             .baseArrayLayer = info.range.base.layer,
             .layerCount = info.range.extent.layers,
         },
