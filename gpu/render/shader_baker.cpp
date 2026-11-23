@@ -910,35 +910,155 @@ double ComputeDirectorySizeMiB(const std::filesystem::path& dir) {
     return double(bytes) / (1024.0 * 1024.0);
 }
 
-std::filesystem::path ResolveSiblingPatchRoot(const std::filesystem::path& game_dir) {
+std::u8string AsciiLowerU8(const std::u8string& s) {
+    std::u8string out = s;
+    for (auto& ch : out) {
+        if (ch >= u8'A' && ch <= u8'Z') {
+            ch = static_cast<char8_t>(ch - u8'A' + u8'a');
+        }
+    }
+    return out;
+}
+
+std::filesystem::path StripTrailingEmptyComponents(const std::filesystem::path& p) {
+    auto norm = p.lexically_normal();
+    while (!norm.empty() && (!norm.has_filename() || norm.filename() == ".")) {
+        auto parent = norm.parent_path();
+        if (parent == norm) {
+            break;
+        }
+        norm = std::move(parent);
+    }
+    return norm;
+}
+
+/// Resolves split base/patch game directories (e.g. shadPS4-style `CUSA03173` + `CUSA03173-patch`)
+/// regardless of whether `input_dir` points to the base folder OR the `-patch` / `-update` folder.
+void ResolveGameAndPatchRoots(const std::filesystem::path& input_dir,
+                              std::filesystem::path& out_base_dir,
+                              std::filesystem::path& out_patch_dir) {
+    static constexpr std::u8string_view kPatchSuffixes[] = {
+        u8"-patch", u8"_patch", u8".patch", u8"-update",
+        u8"_update", u8".update", u8"-patch0109", u8"-1.09",
+    };
+    auto has_shader_dir = [](const std::filesystem::path& dir) {
+        std::error_code ec;
+        return std::filesystem::is_directory(dir / "dvdroot_ps4" / "shader", ec);
+    };
+    auto has_base_shaders = [](const std::filesystem::path& dir) {
+        std::error_code ec;
+        return std::filesystem::is_regular_file(
+                   dir / "dvdroot_ps4" / "shader" / "gxshader.shaderbnd.dcx", ec) ||
+               (std::filesystem::is_directory(dir / "dvdroot_ps4" / "shader", ec) &&
+                std::filesystem::is_regular_file(dir / "sce_module" / "libc.prx", ec));
+    };
+
     std::error_code ec;
+    const auto norm = StripTrailingEmptyComponents(input_dir);
+    out_base_dir = norm;
+    out_patch_dir.clear();
+
+    const auto fname = norm.filename().u8string();
+    const auto fname_lower = AsciiLowerU8(fname);
+    const auto parent = norm.parent_path();
+
+    // Check if `input_dir` itself is a patch folder (e.g. `CUSA03173-patch`) or lacks base shaders.
+    std::u8string base_stem;
+    for (const auto suf : kPatchSuffixes) {
+        if (fname_lower.size() > suf.size() &&
+            std::u8string_view(fname_lower).substr(fname_lower.size() - suf.size()) == suf) {
+            base_stem = fname.substr(0, fname.size() - suf.size());
+            break;
+        }
+    }
+
+    const bool input_has_base = has_base_shaders(norm);
+    if ((!base_stem.empty() || !input_has_base) && !parent.empty() && parent != norm) {
+        std::filesystem::path resolved_base;
+        if (!base_stem.empty()) {
+            const auto direct = parent / std::filesystem::path(base_stem);
+            if (has_base_shaders(direct) || has_shader_dir(direct)) {
+                resolved_base = direct;
+            }
+        }
+        if (resolved_base.empty()) {
+            const auto base_stem_lower = AsciiLowerU8(base_stem);
+            std::filesystem::path fallback_base;
+            std::error_code it_ec;
+            for (const auto& entry : std::filesystem::directory_iterator(
+                     parent, std::filesystem::directory_options::skip_permission_denied, it_ec)) {
+                if (!entry.is_directory(it_ec)) {
+                    continue;
+                }
+                const auto cand = entry.path();
+                if (cand == norm) {
+                    continue;
+                }
+                if (!base_stem_lower.empty() &&
+                    AsciiLowerU8(cand.filename().u8string()) == base_stem_lower &&
+                    (has_base_shaders(cand) || has_shader_dir(cand))) {
+                    resolved_base = cand;
+                    break;
+                }
+                if (!input_has_base && fallback_base.empty() && has_base_shaders(cand)) {
+                    fallback_base = cand;
+                }
+            }
+            if (resolved_base.empty()) {
+                resolved_base = std::move(fallback_base);
+            }
+        }
+        if (!resolved_base.empty()) {
+            out_base_dir = std::move(resolved_base);
+            out_patch_dir = norm;
+            return;
+        }
+    }
+
+    // Standard case: `input_dir` is the base folder — locate sibling patch folder if present.
     if (const char* penv = std::getenv("BB_PATCH_DIR"); penv && *penv) {
         std::filesystem::path explicit_patch{
             std::u8string_view(reinterpret_cast<const char8_t*>(penv))};
         if (std::filesystem::exists(explicit_patch, ec)) {
-            return explicit_patch;
+            out_patch_dir = std::move(explicit_patch);
+            return;
         }
     }
-    auto norm = game_dir.lexically_normal();
-    if (!norm.has_filename()) {
-        norm = norm.parent_path();
-    }
-    const auto fname = norm.filename().u8string();
-    if (!fname.empty()) {
-        std::u8string patch_name = fname;
-        patch_name += u8"-patch";
-        const auto cand = norm.parent_path() / std::filesystem::path(patch_name);
-        if (std::filesystem::exists(cand, ec)) {
-            return cand;
+    if (!fname.empty() && !parent.empty() && parent != norm) {
+        for (const auto suf : kPatchSuffixes) {
+            std::u8string patch_name = fname;
+            patch_name.append(suf.data(), suf.size());
+            const auto cand = parent / std::filesystem::path(patch_name);
+            if (std::filesystem::is_directory(cand, ec)) {
+                out_patch_dir = cand;
+                return;
+            }
+        }
+        // Case-insensitive sibling match (for Linux case-sensitive filesystems)
+        std::error_code it_ec;
+        for (const auto& entry : std::filesystem::directory_iterator(
+                 parent, std::filesystem::directory_options::skip_permission_denied, it_ec)) {
+            if (!entry.is_directory(it_ec)) {
+                continue;
+            }
+            const auto cand_lower = AsciiLowerU8(entry.path().filename().u8string());
+            for (const auto suf : kPatchSuffixes) {
+                std::u8string wanted = fname_lower;
+                wanted.append(suf.data(), suf.size());
+                if (cand_lower == wanted) {
+                    out_patch_dir = entry.path();
+                    return;
+                }
+            }
         }
     }
-    return {};
 }
 
 /// Scans `eboot.bin` (or `out/boot.bin`) for embedded `Shdr\x07` shader containers:
 ///   - `00 03 E2 20` (`354` Scaleform GFx UI, internal GNM & Compute shaders -> `"gxgui"`),
 ///   - `00 03 0D 20` (`Yebis2` Post-FX shaders with `col_fmt != 9` -> `"eboot_yebis"`).
 void ScanEmbeddedEbootShaders(const std::filesystem::path& game_dir,
+                              const std::filesystem::path& patch_root,
                               std::vector<ParsedOrbShader>& cs_list,
                               std::vector<ParsedOrbShader>& ps_list,
                               std::vector<ParsedOrbShader>& vs_list,
@@ -947,7 +1067,6 @@ void ScanEmbeddedEbootShaders(const std::filesystem::path& game_dir,
                               std::unordered_map<u64, size_t>& vs_seen) {
     std::error_code ec;
     std::filesystem::path exe_path;
-    const auto patch_root = ResolveSiblingPatchRoot(game_dir);
     if (!patch_root.empty() && std::filesystem::exists(patch_root / "eboot.bin", ec)) {
         exe_path = patch_root / "eboot.bin";
     } else if (std::filesystem::exists(game_dir / "eboot.bin", ec)) {
@@ -1067,7 +1186,10 @@ void ScanEmbeddedEbootShaders(const std::filesystem::path& game_dir,
 
 int PipelineCache::BakeAllGameShaders(const std::filesystem::path& game_dir) {
     const auto t_start = std::chrono::steady_clock::now();
-    const auto shader_dir = game_dir / "dvdroot_ps4" / "shader";
+    std::filesystem::path base_dir;
+    std::filesystem::path patch_root;
+    ResolveGameAndPatchRoots(game_dir, base_dir, patch_root);
+    const auto shader_dir = base_dir / "dvdroot_ps4" / "shader";
     if (!std::filesystem::exists(shader_dir)) {
         std::fprintf(stderr, "[BB-BAKE] ERROR: shader directory not found: %s\n",
                      shader_dir.string().c_str());
@@ -1098,7 +1220,6 @@ int PipelineCache::BakeAllGameShaders(const std::filesystem::path& game_dir) {
     std::unordered_map<std::string, u64> stem_vs_hash;
     std::unordered_map<std::string, u64> stem_ps_hash;
 
-    const auto patch_root = ResolveSiblingPatchRoot(game_dir);
     const auto patch_shader_dir =
         patch_root.empty() ? std::filesystem::path{} : (patch_root / "dvdroot_ps4" / "shader");
     for (const char* bname : kBundles) {
@@ -1148,8 +1269,8 @@ int PipelineCache::BakeAllGameShaders(const std::filesystem::path& game_dir) {
             }
         }
     }
-    ScanEmbeddedEbootShaders(game_dir, cs_list, ps_list, vs_list, cs_by_hash, ps_by_hash,
-                             vs_by_hash);
+    ScanEmbeddedEbootShaders(base_dir, patch_root, cs_list, ps_list, vs_list, cs_by_hash,
+                             ps_by_hash, vs_by_hash);
 
     // Link paired VS <-> PS by bundle-qualified BND4 stem so PS interpolants & VS descriptor start offsets match.
     struct PassPairEntry {
@@ -1901,8 +2022,11 @@ void PipelineCache::StartBackgroundAutoBake() {
     if (!gdir_env || !*gdir_env) {
         return;
     }
-    const std::filesystem::path game_root_dir{
+    const std::filesystem::path raw_game_dir{
         std::u8string_view(reinterpret_cast<const char8_t*>(gdir_env))};
+    std::filesystem::path game_root_dir;
+    std::filesystem::path patch_root;
+    ResolveGameAndPatchRoots(raw_game_dir, game_root_dir, patch_root);
     const std::filesystem::path shader_dir = game_root_dir / "dvdroot_ps4" / "shader";
     std::error_code ec;
     if (!std::filesystem::exists(shader_dir, ec)) {
@@ -1927,7 +2051,8 @@ void PipelineCache::StartBackgroundAutoBake() {
     autobake_stop.store(false, std::memory_order_relaxed);
     BbStats::shader_autobake_active.store(true, std::memory_order_relaxed);
 
-    autobake_thread = std::thread([this, game_root_dir, shader_dir, warm = std::move(warm_hashes),
+    autobake_thread = std::thread([this, game_root_dir, patch_root, shader_dir,
+                                   warm = std::move(warm_hashes),
                                    warm_dig = std::move(warm_digests),
                                    ps_bnd_init = std::move(ps_bindings_map)]() mutable {
         SetPoliteAutoBakeThreadPriority();
@@ -1944,7 +2069,6 @@ void PipelineCache::StartBackgroundAutoBake() {
         std::unordered_map<u64, size_t> cs_seen, ps_seen, vs_seen;
         std::unordered_map<std::string, u64> stem_vs_hash, stem_ps_hash;
 
-        const auto patch_root = ResolveSiblingPatchRoot(game_root_dir);
         const auto patch_shader_dir =
             patch_root.empty() ? std::filesystem::path{} : (patch_root / "dvdroot_ps4" / "shader");
         for (const char* bname : kBundles) {
@@ -1999,8 +2123,8 @@ void PipelineCache::StartBackgroundAutoBake() {
                 }
             }
         }
-        ScanEmbeddedEbootShaders(game_root_dir, cs_list, ps_list, vs_list, cs_seen, ps_seen,
-                                 vs_seen);
+        ScanEmbeddedEbootShaders(game_root_dir, patch_root, cs_list, ps_list, vs_list, cs_seen,
+                                 ps_seen, vs_seen);
 
         const size_t total_all = cs_list.size() + ps_list.size() + vs_list.size();
         if (total_all == 0) {
