@@ -121,6 +121,28 @@ u64 RecipeCatalog::ComputeStageDigest(u64 pgm_hash, Shader::HwStage hw_stage,
     return Fnv1a64(bytes.data(), bytes.size());
 }
 
+u64 RecipeCatalog::ComputeCanonicalStageDigest(u64 pgm_hash, Shader::HwStage hw_stage,
+                                               Shader::SwStage sw_stage,
+                                               const Shader::StageSpecialization& spec) {
+    Shader::StageSpecialization norm = spec;
+    u32 binding = 0;
+    for (auto& b : norm.buffers) {
+        if (binding < Shader::StageSpecialization::MaxStageResources && !norm.bitset[binding]) {
+            b = {};
+        } else {
+            b.paged = false;
+        }
+        ++binding;
+    }
+    for (auto& img : norm.images) {
+        if (binding < Shader::StageSpecialization::MaxStageResources && !norm.bitset[binding]) {
+            img = {};
+        }
+        ++binding;
+    }
+    return ComputeStageDigest(pgm_hash, hw_stage, sw_stage, norm);
+}
+
 void RecipeCatalog::Initialize(const std::filesystem::path& catalog_path,
                                const std::filesystem::path& capture_path) {
     std::scoped_lock lk{mutex_};
@@ -256,6 +278,8 @@ bool RecipeCatalog::ParseStreamBytes(const u8* data, size_t size, bool store_rec
                     rec.spec.runtime_info.hw.vs.motion_vectors) {
                     break; // Session-local BDA motion VS: never cache/pre-bake.
                 }
+                rec.spec_digest =
+                    ComputeCanonicalStageDigest(rec.pgm_hash, rec.hw_stage, rec.sw_stage, rec.spec);
                 if (known_stage_digests_.insert(rec.spec_digest).second && store_recipes) {
                     stage_recipes_.push_back(std::move(rec));
                 }
@@ -369,7 +393,7 @@ void RecipeCatalog::CaptureStageIfUnknown(const Shader::Info& info,
         return;
     }
 
-    const u64 digest = ComputeStageDigest(info.pgm_hash, info.hw_stage, info.sw_stage, spec);
+    const u64 digest = ComputeCanonicalStageDigest(info.pgm_hash, info.hw_stage, info.sw_stage, spec);
 
     std::scoped_lock lk{mutex_};
     if (!capture_enabled_ || !known_stage_digests_.insert(digest).second) {

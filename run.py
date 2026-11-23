@@ -64,13 +64,27 @@ _log_file = None
 _log_start_mono = time.perf_counter()
 
 
+_HOME_DIR = os.path.expanduser('~').rstrip('/\\')
+_HOME_TOKEN = '%USERPROFILE%' if os.name == 'nt' else '~'
+
+
+def _redact_home(text):
+    if not _HOME_DIR or _HOME_DIR in ('~', '/', '\\') or len(_HOME_DIR) <= 3:
+        return text
+    out = text.replace(_HOME_DIR, _HOME_TOKEN)
+    alt = _HOME_DIR.replace('\\', '/') if '\\' in _HOME_DIR else _HOME_DIR.replace('/', '\\')
+    if alt != _HOME_DIR:
+        out = out.replace(alt, _HOME_TOKEN)
+    return out
+
+
 def _format_log_line(line):
     now = time.time()
     sec = int(now)
     ms = int((now - sec) * 1000.0)
     el = max(0.0, time.perf_counter() - _log_start_mono)
     ts = f'{time.strftime("%H:%M:%S", time.localtime(sec))}.{ms:03d} +{el:.3f}s'
-    return f'[{ts}] {line}'
+    return f'[{ts}] {_redact_home(str(line))}'
 
 
 def log(line):

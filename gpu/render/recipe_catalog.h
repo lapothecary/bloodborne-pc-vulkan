@@ -87,6 +87,14 @@ public:
     static u64 ComputeStageDigest(u64 pgm_hash, Shader::HwStage hw_stage, Shader::SwStage sw_stage,
                                   const Shader::StageSpecialization& spec);
 
+    /// OS/profile-independent canonical stage digest: ignores host-specific `BufferSpecialization::paged`
+    /// (which differs between Linux `BB_GUEST_IN_PLACE=1` and Windows `BB_GUEST_IN_PLACE=0`) and
+    /// clears unbound (`!bitset[b]`) resource slots so recipes match before/after
+    /// `StageSpecialization::NormalizeUnboundDefaults`.
+    static u64 ComputeCanonicalStageDigest(u64 pgm_hash, Shader::HwStage hw_stage,
+                                           Shader::SwStage sw_stage,
+                                           const Shader::StageSpecialization& spec);
+
     /// Appends a shader stage permutation to `logs/recipes/unknown_recipes.bbrc` if not yet known.
     /// Thread-safe, zero disk I/O when already known.
     void CaptureStageIfUnknown(const Shader::Info& info, const Shader::StageSpecialization& spec,

@@ -1186,6 +1186,9 @@ void ScanEmbeddedEbootShaders(const std::filesystem::path& game_dir,
 
 int PipelineCache::BakeAllGameShaders(const std::filesystem::path& game_dir) {
     const auto t_start = std::chrono::steady_clock::now();
+    // Wait for async WarmUp() to finish so `program_cache` and `graphics_pipelines` are complete
+    // before scanning/compiling, preventing duplicate work and unsynchronized concurrent writes.
+    EnsurePrewarmDone();
     std::filesystem::path base_dir;
     std::filesystem::path patch_root;
     ResolveGameAndPatchRoots(game_dir, base_dir, patch_root);
@@ -1469,6 +1472,7 @@ int PipelineCache::BakeAllGameShaders(const std::filesystem::path& game_dir) {
                             auto new_prog = std::make_unique<Program>(hw_st, sw_st, params);
                             new_prog->info = std::move(info);
                             spec.info = &new_prog->info;
+                            spec.NormalizeUnboundDefaults(profile);
                             if (!raw_spv.empty()) {
                                 PipelineStore::SaveShaderBinary(std::move(raw_spv), sh.hash, 0);
                             }
@@ -1480,15 +1484,23 @@ int PipelineCache::BakeAllGameShaders(const std::filesystem::path& game_dir) {
                             new_prog->AddPermut(mod, std::move(spec));
                             if (mod1) {
                                 spec1.info = &new_prog->info;
-                                if (!raw_spv1.empty()) {
-                                    PipelineStore::SaveShaderBinary(std::move(raw_spv1), sh.hash, 1);
+                                spec1.NormalizeUnboundDefaults(profile);
+                                if (spec1 == new_prog->modules[0].spec) {
+                                    instance.GetDevice().destroyShaderModule(mod1);
+                                } else {
+                                    if (!raw_spv1.empty()) {
+                                        PipelineStore::SaveShaderBinary(std::move(raw_spv1), sh.hash,
+                                                                        1);
+                                    }
+                                    if (!opt_spv1.empty()) {
+                                        PipelineStore::SaveOptShaderBinary(std::move(opt_spv1),
+                                                                           sh.hash, 1);
+                                    }
+                                    const u64 perm_hash1 = HashCombine(sh.hash, 1);
+                                    PipelineStore::SaveShaderMeta(info1, spec1, perm_hash1, 1,
+                                                                  false);
+                                    new_prog->AddPermut(mod1, std::move(spec1));
                                 }
-                                if (!opt_spv1.empty()) {
-                                    PipelineStore::SaveOptShaderBinary(std::move(opt_spv1), sh.hash, 1);
-                                }
-                                const u64 perm_hash1 = HashCombine(sh.hash, 1);
-                                PipelineStore::SaveShaderMeta(info1, spec1, perm_hash1, 1, false);
-                                new_prog->AddPermut(mod1, std::move(spec1));
                             }
                             new_prog->info_template = std::make_unique<Shader::Info>(new_prog->info);
                             program_cache.emplace(sh.hash, std::move(new_prog));
@@ -1548,7 +1560,7 @@ int PipelineCache::BakeAllGameShaders(const std::filesystem::path& game_dir) {
                 if (!prog) continue;
                 for (const auto& m : prog->modules) {
                     if (!m.module) continue;
-                    existing_digests.insert(RecipeCatalog::ComputeStageDigest(
+                    existing_digests.insert(RecipeCatalog::ComputeCanonicalStageDigest(
                         h, prog->info.hw_stage, prog->info.sw_stage, m.spec));
                 }
             }
@@ -1566,10 +1578,9 @@ int PipelineCache::BakeAllGameShaders(const std::filesystem::path& game_dir) {
                         for (size_t i = 0; i < pit->second->modules.size(); ++i) {
                             const auto& m = pit->second->modules[i];
                             if (m.module &&
-                                RecipeCatalog::ComputeStageDigest(rec.pgm_hash,
-                                                                  pit->second->info.hw_stage,
-                                                                  pit->second->info.sw_stage,
-                                                                  m.spec) == rec.spec_digest) {
+                                RecipeCatalog::ComputeCanonicalStageDigest(
+                                    rec.pgm_hash, pit->second->info.hw_stage,
+                                    pit->second->info.sw_stage, m.spec) == rec.spec_digest) {
                                 const u64 actual_h = HashCombine(rec.pgm_hash, i);
                                 if (actual_h != rec.perm_hash) {
                                     perm_hash_remap[rec.perm_hash] = actual_h;
@@ -1645,6 +1656,7 @@ int PipelineCache::BakeAllGameShaders(const std::filesystem::path& game_dir) {
                             auto new_prog = std::make_unique<Program>(rec.hw_stage, rec.sw_stage, params);
                             new_prog->info = std::move(info);
                             built_spec.info = &new_prog->info;
+                            built_spec.NormalizeUnboundDefaults(profile);
                             const size_t actual_idx = 0;
                             if (!raw_spv.empty()) {
                                 PipelineStore::SaveShaderBinary(std::move(raw_spv), rec.pgm_hash,
@@ -1668,6 +1680,8 @@ int PipelineCache::BakeAllGameShaders(const std::filesystem::path& game_dir) {
                         }
 
                         auto& prog = *pit->second;
+                        built_spec.info = &prog.info;
+                        built_spec.NormalizeUnboundDefaults(profile);
                         // Avoid duplicate specialization if another worker already added it.
                         bool dup = false;
                         for (size_t i = 0; i < prog.modules.size(); ++i) {
@@ -1926,6 +1940,72 @@ int PipelineCache::BakeAllGameShaders(const std::filesystem::path& game_dir) {
                 w.join();
             }
         }
+
+        // Phase 4.5B: Pre-warm driver VkPipelineCache with ComputePipeline recipes from
+        // RecipeCatalog (`perm >= 1` compute shaders such as 0x42f2a521 / 0x2da7fe60 that
+        // otherwise stall ~0.8-1.0s synchronously on first gameplay frame).
+        const auto& cs_recipes = RecipeCatalog::Get().GetComputePsoRecipes();
+        if (!cs_recipes.empty()) {
+            std::unordered_map<u64, std::pair<const Program*, size_t>> cs_perm_lookup;
+            cs_perm_lookup.reserve(program_cache.size());
+            for (const auto& [h, prog] : program_cache) {
+                if (!prog || prog->info.sw_stage != SwStage::Compute) continue;
+                for (size_t i = 0; i < prog->modules.size(); ++i) {
+                    if (prog->modules[i].module) {
+                        cs_perm_lookup.try_emplace(HashCombine(h, i), prog.get(), i);
+                    }
+                }
+            }
+
+            std::atomic<size_t> next_cs{0};
+            auto recipe_cs_worker = [&] {
+                for (;;) {
+                    const size_t cidx = next_cs.fetch_add(1, std::memory_order_relaxed);
+                    if (cidx >= cs_recipes.size()) {
+                        break;
+                    }
+                    ComputePipelineKey key = cs_recipes[cidx].key;
+                    if (const auto rm = perm_hash_remap.find(key.value);
+                        rm != perm_hash_remap.end()) {
+                        key.value = rm->second;
+                    }
+                    {
+                        std::scoped_lock lk{commit_mutex};
+                        if (compute_pipelines.contains(key)) {
+                            continue;
+                        }
+                    }
+                    const auto it = cs_perm_lookup.find(key.value);
+                    if (it == cs_perm_lookup.end()) {
+                        continue;
+                    }
+                    const Program* p = it->second.first;
+                    const size_t pidx = it->second.second;
+                    ComputePipeline::SerializationSupport cs_sdata{};
+                    auto built = std::make_unique<ComputePipeline>(
+                        instance, scheduler, desc_heap, profile, *pipeline_cache, key, p->info,
+                        p->modules[pidx].module, cs_sdata, false);
+                    {
+                        std::scoped_lock lk{commit_mutex};
+                        if (!compute_pipelines.contains(key)) {
+                            PipelineStore::SaveCompute(key, cs_sdata, false);
+                            compute_pipelines.emplace(key, std::move(built));
+                            recipe_pso_built.fetch_add(1, std::memory_order_relaxed);
+                            cs_pso_built.fetch_add(1, std::memory_order_relaxed);
+                        }
+                    }
+                }
+            };
+
+            std::vector<std::thread> cs_workers;
+            cs_workers.reserve(num_threads);
+            for (u32 t = 0; t < num_threads; ++t) {
+                cs_workers.emplace_back(recipe_cs_worker);
+            }
+            for (auto& w : cs_workers) {
+                w.join();
+            }
+        }
     }
 
     report_progress("saving", true);
@@ -1997,7 +2077,7 @@ void PipelineCache::StartBackgroundAutoBake() {
         if (!prog) continue;
         for (const auto& m : prog->modules) {
             if (!m.module) continue;
-            warm_digests.insert(RecipeCatalog::ComputeStageDigest(
+            warm_digests.insert(RecipeCatalog::ComputeCanonicalStageDigest(
                 h, prog->info.hw_stage, prog->info.sw_stage, m.spec));
         }
     }
@@ -2358,6 +2438,17 @@ void PipelineCache::StartBackgroundAutoBake() {
                         if (item->mod) {
                             item->spec =
                                 Shader::StageSpecialization(item->info, rt_info, profile, rec.spec.start);
+                            item->spec.NormalizeUnboundDefaults(profile);
+                            if (rec.sw_stage == SwStage::Compute) {
+                                // Pre-warm the driver VkPipelineCache for heavy perm>=1 compute PSOs
+                                // on the idle worker thread so gameplay never stalls synchronously.
+                                item->has_cs = true;
+                                item->cs_key.value =
+                                    HashCombine(rec.pgm_hash, static_cast<size_t>(rec.perm_idx));
+                                item->built_cs = std::make_unique<ComputePipeline>(
+                                    instance, scheduler, desc_heap, profile, *pipeline_cache,
+                                    item->cs_key, item->info, item->mod, item->cs_sdata, false);
+                            }
                         }
                     }
                     if (item->mod) {
@@ -2457,12 +2548,22 @@ void PipelineCache::DrainAutoBakeReadyStages() {
                                                        actual_idx);
                 }
                 item->spec.info = &prog.info;
+                item->spec.NormalizeUnboundDefaults(profile);
                 PipelineStore::SaveShaderMeta(item->info, item->spec,
                                               HashCombine(item->hash, actual_idx), actual_idx,
                                               false);
                 {
                     std::unique_lock lk{programs_mutex};
                     prog.AddPermut(item->mod, std::move(item->spec));
+                }
+                if (item->has_cs && item->built_cs) {
+                    const ComputePipelineKey actual_cs_key{HashCombine(item->hash, actual_idx)};
+                    if (actual_cs_key == item->cs_key && !compute_pipelines.contains(actual_cs_key)) {
+                        item->built_cs->SetStageInfo(static_cast<u32>(SwStage::Compute),
+                                                     &prog.info);
+                        PipelineStore::SaveCompute(actual_cs_key, item->cs_sdata, false);
+                        compute_pipelines.emplace(actual_cs_key, std::move(item->built_cs));
+                    }
                 }
                 any_committed = true;
                 continue;
