@@ -640,8 +640,7 @@ TemporalUpscaler::PrePostInput TemporalUpscaler::ResolvePrePostInput(
     const bool depth_eligible =
         !eff_depth_id || scene_targets.EligibleScene(texture_cache.GetImage(eff_depth_id));
 
-    if (!scaled_session && scene_targets.Reduced() && scene_targets.EligibleScene(hdr_img) &&
-        depth_eligible) {
+    if (scene_targets.Reduced() && scene_targets.EligibleScene(hdr_img) && depth_eligible) {
         VideoCore::ImageViewInfo ci{};
         ci.format = hdr_img.info.pixel_format;
         const auto cp = scene_targets.Read(
@@ -704,10 +703,10 @@ TemporalUpscaler::PrePostHdrResult TemporalUpscaler::RunPrePostHdr(
     const u32 oh = Scaled() ? target_height : hdr_guest.info.size.height;
     u32 w = src_extent.width;
     u32 h = src_extent.height;
-    const bool reduced_proxy = !scaled_session && scene_targets.Reduced() &&
+    const bool reduced_proxy = scene_targets.Reduced() &&
                                scene_targets.EligibleScene(hdr_guest) &&
                                scene_targets.EligibleScene(depth);
-    if (scaled_session && depth_blit) {
+    if (!reduced_proxy && scaled_session && depth_blit) {
         const auto req = SceneResolution::ForPreset(applied_preset, {ow, oh});
         if (req.width > 0 && req.height > 0 && req.width <= src_extent.width &&
             req.height <= src_extent.height) {
@@ -1053,7 +1052,8 @@ TemporalUpscaler::PrePostHdrResult TemporalUpscaler::RunPrePostHdr(
     // Tonemap render directly into ui_image at full output resolution (zero extra blit!).
     const bool fg_wanted = frame_generation && frame_generation->Wanted();
     const bool need_ui_target =
-        Scaled() && (out_extent_guest.width != ow || out_extent_guest.height != oh || fg_wanted);
+        Scaled() && (w != ow || h != oh || reduced_proxy ||
+                     out_extent_guest.width != ow || out_extent_guest.height != oh || fg_wanted);
     if (need_ui_target) {
         EnsureUiResources(ow, oh, out_format, depth_format);
         PrepareUiDepth(camera_motion.Depth());
