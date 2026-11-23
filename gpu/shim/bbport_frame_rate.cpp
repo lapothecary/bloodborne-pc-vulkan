@@ -103,6 +103,7 @@ u64 pacer_prev_exit_cpu_ns = 0;
 u64 pacer_next_deadline_ns = 0;
 u64 pacer_last_period_ns = 0;
 u64 pacer_seen_epoch = 0;
+std::uint32_t pacer_miss_streak = 0;
 
 u64 MonotonicNs() noexcept {
 #ifdef __linux__
@@ -335,6 +336,7 @@ u64 PS4_SYSV_ABI PacerWait(u64 pacer, std::uint32_t reset_flag) {
         pacer_seen_epoch = epoch;
         pacer_last_period_ns = period_ns;
         pacer_next_deadline_ns = entry_ns;
+        pacer_miss_streak = 0;
     } else {
         if (epoch != pacer_seen_epoch || period_ns != pacer_last_period_ns) {
             pacer_seen_epoch = epoch;
@@ -351,7 +353,10 @@ u64 PS4_SYSV_ABI PacerWait(u64 pacer, std::uint32_t reset_flag) {
         }
         if (entry_ns < pacer_next_deadline_ns) {
             did_wait = true;
+            pacer_miss_streak = 0;
             SleepUntilDeadlineImpl(entry_ns, pacer_next_deadline_ns, 0);
+        } else if (pacer_miss_streak < 100u) {
+            ++pacer_miss_streak;
         }
     }
 
@@ -433,12 +438,21 @@ void PS4_SYSV_ABI FrameStep(u64 pacer) {
             const float target_f = live->shortest;
             const double target_d = double(target_f);
             if (cur_ep == dt_stab_epoch && target_f == dt_stab_target &&
+                pacer_miss_streak < 2u &&
                 std::isfinite(measured) && measured > 0.0f &&
                 double(dt) >= target_d * 0.35 && double(dt) <= target_d * 1.85) {
                 const double want = double(dt) + dt_debt_s;
-                const double step = std::clamp(
+                double step = std::clamp(
                     target_d + (want - target_d) * 0.12, target_d * 0.88, target_d * 1.18);
-                dt_debt_s = std::clamp(want - step, -target_d * 1.5, target_d * 1.5);
+                // Strictly conserve real time: never discard excess positive debt (prevents
+                // slow-motion when GPU/CPU/VSync runs below the configured FPS cap).
+                const double max_debt = target_d * 0.5;
+                if (want - step > max_debt) {
+                    step = want - max_debt;
+                } else if (want - step < -max_debt) {
+                    step = want + max_debt;
+                }
+                dt_debt_s = want - step;
                 dt = std::clamp(static_cast<float>(step), min_dt, Frame30);
             } else {
                 dt_debt_s = 0.0;
