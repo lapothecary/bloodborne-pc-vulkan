@@ -620,6 +620,7 @@ void Menu() {
         }
         ImGui::EndCombo();
     }
+    ImGui::EndDisabled(); // preset only applies when an upscaler (DLSS/FSR) is active
     ImGui::Text(
         BbSettings::MenuText("Active scene render: %d x %d", "Активный рендер сцены: %d x %d"),
         s.active_render_width.load(), s.active_render_height.load());
@@ -716,7 +717,6 @@ void Menu() {
         "Синий: пиксель получил точный вектор объекта, а не только движение камеры. "
         "Движущийся предмет без синего и без красного/зелёного апскейлер считает "
         "неподвижным, отсюда шлейф."));
-    ImGui::EndDisabled(); // upscaler off
 
     ImGui::SeparatorText(BbSettings::MenuText("Output", "Вывод"));
     // The aspect ratio first; its resolutions follow (another one keeps the height).
