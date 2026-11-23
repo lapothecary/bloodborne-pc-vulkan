@@ -2990,9 +2990,12 @@ void UpdateHudBreakdown(HudBreakdown& h) {
 
     if (std::chrono::duration<double>(now - last_file_dump).count() >= 1.0) {
         last_file_dump = now;
+        BbSysInfo::LogSettingsIfChanged();
         const auto& s = BbSettings::Get();
         const auto out = BbSettings::CurrentOutput();
         const auto shd = Vulkan::DirectShaders::ReadTelemetry();
+        const std::string up_label = BbSysInfo::FormatActiveUpscalerLabel();
+        const int cap_limit = BbFrameRate::Limit();
         char sys_hw_line[192]{};
         if (h.has_sys_ram || h.sys_cpu_pct >= 0 || h.cpu_clock_mhz > 0 || h.cpu_temp_c > 0) {
             int pos = std::snprintf(sys_hw_line, sizeof(sys_hw_line), "SYS HW:");
@@ -3024,7 +3027,7 @@ void UpdateHudBreakdown(HudBreakdown& h) {
         char hud_buf[4096];
         std::snprintf(
             hud_buf, sizeof(hud_buf),
-            "FPS: %.1f (%.2f ms/f) | Avg15s: %.1f FPS (%.2f ms/f, Jit %.2f ms) | Scene: %dx%d -> %dx%d | Upscaler: %s (%s)%s\n"
+            "FPS: %.1f (%.2f ms/f) | Avg15s: %.1f FPS (%.2f ms/f, Jit %.2f ms) | Scene: %dx%d -> %dx%d | Cap %d | Up: %s (%s)%s\n"
             "GPU HW: %.1f W | %d MHz | %d C | DrvBusy %d%% | VRAM Proc %.2f GB (Sys %.2f/%.2f GB)\n"
             "%s"
             "Counts/f: Draws %.0f (Avg %.0f) | Disp %.0f (Avg %.0f) | Subm %.1f (Avg %.1f) | PipeDrains %.1f | Faults/s %.1f | NativeVkBuf %.1f%% | NativeVkTex %.1f%% | DescSaved %.1f%% | DontCare %llu/%llu\n"
@@ -3042,8 +3045,8 @@ void UpdateHudBreakdown(HudBreakdown& h) {
             "BOTTLENECK: %s (Now %.2f ms / Avg %.2f ms)\n",
             h.fps, h.frame_ms, h.avg_fps, h.avg_frame_ms, h.avg_jitter_ms,
             s.active_render_width.load(), s.active_render_height.load(),
-            out.width, out.height,
-            BbSettings::UpscalerName(s.upscaler),
+            out.width, out.height, cap_limit,
+            up_label.c_str(),
             BbSettings::PresetName(BbSettings::RenderPreset()),
             BbSettings::ResolutionNeedsRestart() ? " [NEEDS RESTART]" : "",
             h.gpu_power_w, h.gpu_clock_mhz, h.gpu_temp_c, h.gpu_drv_util_pct,

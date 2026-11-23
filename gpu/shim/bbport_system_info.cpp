@@ -14,6 +14,7 @@
 #include <string>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #include "bbport_frame_rate.h"
 #include "bbport_settings.h"
@@ -317,6 +318,110 @@ std::string RedactHomePath(std::string_view path) {
     return std::string{path};
 }
 
+std::string FormatActiveUpscalerLabel() {
+    const auto& s = BbSettings::Get();
+    const int eff_up = BbSettings::EffectiveUpscaler();
+    const int aa_mode = s.aa_mode.load(std::memory_order_relaxed);
+    const int cur_p = s.dlss_preset.load(std::memory_order_relaxed);
+    const bool dlaa_cnn =
+        (s.upscaler.load(std::memory_order_relaxed) == BbSettings::UpscalerOff &&
+         aa_mode == BbSettings::AaDlaaCnn) ||
+        cur_p == 6 || cur_p == 5;
+    const char* base_aa_str =
+        eff_up == BbSettings::UpscalerFsr3     ? "FSR 3.1"
+        : eff_up == BbSettings::UpscalerFsr4   ? "FSR 4"
+        : eff_up == BbSettings::UpscalerFsr411 ? "FSR 4.1.1"
+        : eff_up == BbSettings::UpscalerTaa
+            ? (aa_mode == BbSettings::AaSmaaT2x ? "SMAA T2x" : "TAA")
+        : eff_up == BbSettings::UpscalerDlss
+            ? (BbSettings::RenderPreset() == BbSettings::NativeAA
+                   ? (dlaa_cnn ? "DLAA 3 CNN" : "DLAA 4")
+                   : (cur_p == 13                  ? "DLSS 4.5 M"
+                      : cur_p == 12                ? "DLSS 4.5 L"
+                      : (cur_p == 6 || cur_p == 5) ? "DLSS 3 CNN"
+                      : cur_p != 0                 ? "DLSS 4 K"
+                                                   : "DLSS Auto"))
+            : (aa_mode == BbSettings::AaSmaaT2x               ? "SMAA T2x"
+               : aa_mode == BbSettings::AaSmaa                ? "SMAA 1x"
+               : s.effects[4].load(std::memory_order_relaxed) ? "FXAA"
+                                                              : "Off");
+    const bool rcas_on = s.sharpen.load(std::memory_order_relaxed) &&
+                         s.sharpness.load(std::memory_order_relaxed) > 0.01f;
+    if (rcas_on) {
+        return std::string(base_aa_str) + " + RCAS";
+    }
+    return std::string(base_aa_str);
+}
+
+namespace {
+
+std::mutex g_settings_log_mutex;
+std::string g_last_logged_settings;
+
+std::string BuildActiveSettingsLine() {
+    const auto& s = BbSettings::Get();
+    const auto out = BbSettings::CurrentOutput();
+    const int rw = s.active_render_width.load(std::memory_order_relaxed);
+    const int rh = s.active_render_height.load(std::memory_order_relaxed);
+    const int win_mode = s.window_mode.load(std::memory_order_relaxed);
+    const char* win_str = win_mode == BbSettings::WindowModeFullscreen   ? "Fullscreen"
+                          : win_mode == BbSettings::WindowModeBorderless ? "Borderless"
+                                                                         : "Windowed";
+    const char* vsync_str =
+        BbSettings::PresentModeKey(s.vsync_mode.load(std::memory_order_relaxed));
+    const int cap = BbFrameRate::Limit();
+    const std::string up_label = FormatActiveUpscalerLabel();
+    const char* preset_str = BbSettings::PresetName(BbSettings::RenderPreset());
+    const int dlss_p = s.dlss_preset.load(std::memory_order_relaxed);
+    const int af = s.anisotropic.load(std::memory_order_relaxed);
+    const bool nat_pfx = s.native_postfx.load(std::memory_order_relaxed);
+    const int dof_on = s.effects[1].load(std::memory_order_relaxed) ? 1 : 0;
+    const int mb_cam = s.effects[2].load(std::memory_order_relaxed)
+                           ? s.motion_blur_camera.load(std::memory_order_relaxed)
+                           : 0;
+    const int mb_obj = s.effects[2].load(std::memory_order_relaxed)
+                           ? s.motion_blur_object.load(std::memory_order_relaxed)
+                           : 0;
+    const int bloom_on = s.effects[7].load(std::memory_order_relaxed) ? 1 : 0;
+    const int haze_on = s.fire_heat_haze.load(std::memory_order_relaxed) ? 1 : 0;
+    const int ca_on = s.effects[0].load(std::memory_order_relaxed) ? 1 : 0;
+    const int ssao_on = s.effects[3].load(std::memory_order_relaxed) ? 1 : 0;
+    const int ssr_on = s.effects[6].load(std::memory_order_relaxed) ? 1 : 0;
+    const int ssgi_on = s.ssgi_enabled.load(std::memory_order_relaxed) ? 1 : 0;
+    const int pcss_on = s.pcss_shadows.load(std::memory_order_relaxed) ? 1 : 0;
+    const int hdr_on = s.hdr_output.load(std::memory_order_relaxed) ? 1 : 0;
+    const int fg_on = s.frame_generation.load(std::memory_order_relaxed) ? 1 : 0;
+    const int jitter_on = s.jitter.load(std::memory_order_relaxed) ? 1 : 0;
+
+    char buf[512];
+    std::snprintf(
+        buf, sizeof(buf),
+        "Active Settings: %dx%d -> %dx%d (%s, %s, Cap %d) | Up: %s (%s, P=%d, Jit=%d, FG=%d) | "
+        "PostFX: %s (DoF=%d MB=%d/%d Bloom=%d Haze=%d CA=%d) | "
+        "SSAO=%d SSR=%d SSGI=%d PCSS=%d HDR=%d AF=%dx",
+        rw, rh, out.width, out.height, win_str, vsync_str, cap, up_label.c_str(), preset_str,
+        dlss_p, jitter_on, fg_on, nat_pfx ? "Native" : "Yebis2", dof_on, mb_cam, mb_obj, bloom_on,
+        haze_on, ca_on, ssao_on, ssr_on, ssgi_on, pcss_on, hdr_on, af);
+    return std::string(buf);
+}
+
+} // namespace
+
+void LogSettingsIfChanged() {
+    std::string cur = BuildActiveSettingsLine();
+    std::scoped_lock lk{g_settings_log_mutex};
+    if (g_last_logged_settings.empty()) {
+        g_last_logged_settings = std::move(cur);
+        return;
+    }
+    if (cur == g_last_logged_settings) {
+        return;
+    }
+    g_last_logged_settings = cur;
+    std::printf("[Settings] %s\n", cur.c_str());
+    std::fflush(stdout);
+}
+
 void LogSystemPassport() {
     static std::once_flag once;
     std::call_once(once, [] {
@@ -476,46 +581,12 @@ void LogSystemPassport() {
 #endif
 
         // 4. Compact Active Graphics & Engine Settings Summary (1 line)
-        const auto& s = BbSettings::Get();
-        const auto out = BbSettings::CurrentOutput();
-        const int rw = s.active_render_width.load(std::memory_order_relaxed);
-        const int rh = s.active_render_height.load(std::memory_order_relaxed);
-        const int win_mode = s.window_mode.load(std::memory_order_relaxed);
-        const char* win_str = win_mode == BbSettings::WindowModeFullscreen   ? "Fullscreen"
-                              : win_mode == BbSettings::WindowModeBorderless ? "Borderless"
-                                                                             : "Windowed";
-        const char* vsync_str = BbSettings::PresentModeKey(s.vsync_mode.load(std::memory_order_relaxed));
-        const int cap = BbFrameRate::Limit();
-        const int eff_up = BbSettings::EffectiveUpscaler();
-        const char* up_str = BbSettings::UpscalerName(eff_up);
-        const char* preset_str = BbSettings::PresetName(BbSettings::RenderPreset());
-        const int dlss_p = s.dlss_preset.load(std::memory_order_relaxed);
-        const int af = s.anisotropic.load(std::memory_order_relaxed);
-        const bool nat_pfx = s.native_postfx.load(std::memory_order_relaxed);
-        const int dof_on = s.effects[1].load(std::memory_order_relaxed) ? 1 : 0;
-        const int mb_cam = s.effects[2].load(std::memory_order_relaxed)
-                               ? s.motion_blur_camera.load(std::memory_order_relaxed)
-                               : 0;
-        const int mb_obj = s.effects[2].load(std::memory_order_relaxed)
-                               ? s.motion_blur_object.load(std::memory_order_relaxed)
-                               : 0;
-        const int bloom_on = s.effects[7].load(std::memory_order_relaxed) ? 1 : 0;
-        const int haze_on = s.fire_heat_haze.load(std::memory_order_relaxed) ? 1 : 0;
-        const int ca_on = s.effects[0].load(std::memory_order_relaxed) ? 1 : 0;
-        const int ssao_on = s.effects[3].load(std::memory_order_relaxed) ? 1 : 0;
-        const int ssr_on = s.effects[6].load(std::memory_order_relaxed) ? 1 : 0;
-        const int ssgi_on = s.ssgi_enabled.load(std::memory_order_relaxed) ? 1 : 0;
-        const int pcss_on = s.pcss_shadows.load(std::memory_order_relaxed) ? 1 : 0;
-        const int hdr_on = s.hdr_output.load(std::memory_order_relaxed) ? 1 : 0;
-        const int fg_on = s.frame_generation.load(std::memory_order_relaxed) ? 1 : 0;
-
-        std::printf(
-            "Active Settings: %dx%d -> %dx%d (%s, %s, Cap %d) | Up: %s (%s, P=%d, FG=%d) | "
-            "PostFX: %s (DoF=%d MB=%d/%d Bloom=%d Haze=%d CA=%d) | "
-            "SSAO=%d SSR=%d SSGI=%d PCSS=%d HDR=%d AF=%dx\n",
-            rw, rh, out.width, out.height, win_str, vsync_str, cap, up_str, preset_str, dlss_p,
-            fg_on, nat_pfx ? "Native" : "Yebis2", dof_on, mb_cam, mb_obj, bloom_on, haze_on, ca_on,
-            ssao_on, ssr_on, ssgi_on, pcss_on, hdr_on, af);
+        const std::string settings_line = BuildActiveSettingsLine();
+        {
+            std::scoped_lock lk{g_settings_log_mutex};
+            g_last_logged_settings = settings_line;
+        }
+        std::printf("%s\n", settings_line.c_str());
         std::fflush(stdout);
     });
 }
@@ -604,6 +675,49 @@ void PollLiveSystemSensors(LiveSysSensors& out) {
             prev_proc_time = cur_proc;
         }
         cpu_seeded = true;
+    }
+
+    // 3. Live Average CPU Clock (MHz) via CallNtPowerInformation(ProcessorInformation) — no admin/driver needed
+    {
+        struct WinProcPowerInfo {
+            ULONG Number;
+            ULONG MaxMhz;
+            ULONG CurrentMhz;
+            ULONG MhzLimit;
+            ULONG MaxIdleState;
+            ULONG CurrentIdleState;
+        };
+        using FnCallNtPowerInfo = LONG(__stdcall*)(int, PVOID, ULONG, PVOID, ULONG);
+        static FnCallNtPowerInfo fn_power_info = []() -> FnCallNtPowerInfo {
+            if (HMODULE lib = LoadLibraryA("powrprof.dll")) {
+                return reinterpret_cast<FnCallNtPowerInfo>(
+                    GetProcAddress(lib, "CallNtPowerInformation"));
+            }
+            return nullptr;
+        }();
+        static const DWORD win_logical_cpus = []() -> DWORD {
+            SYSTEM_INFO si{};
+            GetNativeSystemInfo(&si);
+            return si.dwNumberOfProcessors > 0 ? si.dwNumberOfProcessors : 1u;
+        }();
+        if (fn_power_info && win_logical_cpus > 0 && win_logical_cpus <= 256u) {
+            std::vector<WinProcPowerInfo> info(win_logical_cpus);
+            const ULONG bytes = static_cast<ULONG>(info.size() * sizeof(WinProcPowerInfo));
+            // InformationLevel 11 == ProcessorInformation
+            if (fn_power_info(11, nullptr, 0, info.data(), bytes) == 0) {
+                std::uint64_t sum_mhz = 0;
+                int count = 0;
+                for (const auto& p : info) {
+                    if (p.CurrentMhz > 100 && p.CurrentMhz < 10000) {
+                        sum_mhz += p.CurrentMhz;
+                        ++count;
+                    }
+                }
+                if (count > 0) {
+                    out.cpu_clock_mhz = static_cast<int>((sum_mhz + count / 2) / count);
+                }
+            }
+        }
     }
 #else
     static const long page_size = std::max<long>(4096, ::sysconf(_SC_PAGESIZE));

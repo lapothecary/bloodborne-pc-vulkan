@@ -27,6 +27,13 @@ std::string RedactHomePath(std::string_view path);
 /// Logs a compact, privacy-safe 4-line System/OS/CPU/RAM/Settings passport once per process.
 void LogSystemPassport();
 
+/// Returns the exact active AA/upscaler profile label (e.g. "DLSS 4.5 M + RCAS", "DLAA 3 CNN", "Off").
+std::string FormatActiveUpscalerLabel();
+
+/// Logs a single "Active Settings: ..." line whenever the user changes graphics/cap/upscaler
+/// settings live in the Insert menu (no-op if unchanged since startup or previous log).
+void LogSettingsIfChanged();
+
 /// Samples live process/system RAM, process/system CPU %, CPU frequency, and CPU temp.
 /// Intended to run on the background telemetry thread (never on Present / Main threads).
 void PollLiveSystemSensors(LiveSysSensors& out);
