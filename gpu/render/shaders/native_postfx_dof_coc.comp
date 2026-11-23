@@ -18,6 +18,7 @@ layout(set = 0, binding = 4, std140) uniform DofUbo {
     vec4 misc_params; // x=farCutoff, y=maxCocUv, z=aspect, w=dofScale
     uvec4 dims_flags; // x=half_w, y=half_h, z=full_w, w=full_h
     uvec4 mode_flags; // x=flags (bit0=custom, bit1=nearCust, bit2=farCust), y=frame_index, z=0, w=0
+    vec4 depth_jitter; // xy=render-pixel jitter of depth_tex, zw=0
 } u;
 
 float LinearizeDepth(float d_raw) {
@@ -90,10 +91,20 @@ void main() {
     const vec3 c01 = max(texelFetch(sampler2D(hdr_scene, linear_samp), p01, 0).rgb, vec3(0.0));
     const vec3 c11 = max(texelFetch(sampler2D(hdr_scene, linear_samp), p11, 0).rgb, vec3(0.0));
 
-    const float coc00 = ComputeSignedCoc(LinearizeDepth(texelFetch(sampler2D(depth_tex, linear_samp), p00, 0).r));
-    const float coc10 = ComputeSignedCoc(LinearizeDepth(texelFetch(sampler2D(depth_tex, linear_samp), p10, 0).r));
-    const float coc01 = ComputeSignedCoc(LinearizeDepth(texelFetch(sampler2D(depth_tex, linear_samp), p01, 0).r));
-    const float coc11 = ComputeSignedCoc(LinearizeDepth(texelFetch(sampler2D(depth_tex, linear_samp), p11, 0).r));
+    // Support both native depth (depth_dim == full_dim) and reduced render-res depth (DLSS/FSR upscaling)
+    // so DoF always runs cleanly AFTER temporal upscaling in output resolution.
+    const ivec2 depth_dim = textureSize(sampler2D(depth_tex, linear_samp), 0);
+    const ivec2 depth_max = max(depth_dim - ivec2(1), ivec2(0));
+    const vec2 depth_scale = vec2(depth_dim) / max(vec2(u.dims_flags.zw), vec2(1.0));
+    const ivec2 dp00 = clamp(ivec2((vec2(p00) + 0.5) * depth_scale + u.depth_jitter.xy), ivec2(0), depth_max);
+    const ivec2 dp10 = clamp(ivec2((vec2(p10) + 0.5) * depth_scale + u.depth_jitter.xy), ivec2(0), depth_max);
+    const ivec2 dp01 = clamp(ivec2((vec2(p01) + 0.5) * depth_scale + u.depth_jitter.xy), ivec2(0), depth_max);
+    const ivec2 dp11 = clamp(ivec2((vec2(p11) + 0.5) * depth_scale + u.depth_jitter.xy), ivec2(0), depth_max);
+
+    const float coc00 = ComputeSignedCoc(LinearizeDepth(texelFetch(sampler2D(depth_tex, linear_samp), dp00, 0).r));
+    const float coc10 = ComputeSignedCoc(LinearizeDepth(texelFetch(sampler2D(depth_tex, linear_samp), dp10, 0).r));
+    const float coc01 = ComputeSignedCoc(LinearizeDepth(texelFetch(sampler2D(depth_tex, linear_samp), dp01, 0).r));
+    const float coc11 = ComputeSignedCoc(LinearizeDepth(texelFetch(sampler2D(depth_tex, linear_samp), dp11, 0).r));
 
     // Depth/CoC-consistent 2x2 downsample:
     // - Pick foreground-safe reference CoC (strongest negative near-field, otherwise smallest

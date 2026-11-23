@@ -55,11 +55,14 @@ void main() {
         float d_max = 1.0;
         if (has_depth) {
             const ivec2 depth_dim = textureSize(sampler2D(depth_tex, linear_samp), 0);
-            const ivec2 base_dp = clamp(ivec2(px * 2u), ivec2(0), max(depth_dim - ivec2(2), ivec2(0)));
-            const float d00 = texelFetch(sampler2D(depth_tex, linear_samp), base_dp + ivec2(0, 0), 0).r;
-            const float d10 = texelFetch(sampler2D(depth_tex, linear_samp), base_dp + ivec2(1, 0), 0).r;
-            const float d01 = texelFetch(sampler2D(depth_tex, linear_samp), base_dp + ivec2(0, 1), 0).r;
-            const float d11 = texelFetch(sampler2D(depth_tex, linear_samp), base_dp + ivec2(1, 1), 0).r;
+            const ivec2 max_dp = max(depth_dim - ivec2(1), ivec2(0));
+            const ivec2 base_dp = clamp(
+                ivec2((vec2(px) / max(vec2(u.dims_flags.xy), vec2(1.0))) * vec2(depth_dim)),
+                ivec2(0), max_dp);
+            const float d00 = texelFetch(sampler2D(depth_tex, linear_samp), base_dp, 0).r;
+            const float d10 = texelFetch(sampler2D(depth_tex, linear_samp), min(base_dp + ivec2(1, 0), max_dp), 0).r;
+            const float d01 = texelFetch(sampler2D(depth_tex, linear_samp), min(base_dp + ivec2(0, 1), max_dp), 0).r;
+            const float d11 = texelFetch(sampler2D(depth_tex, linear_samp), min(base_dp + ivec2(1, 1), max_dp), 0).r;
             d_min = min(min(d00, d10), min(d01, d11));
             d_max = max(max(d00, d10), max(d01, d11));
         }

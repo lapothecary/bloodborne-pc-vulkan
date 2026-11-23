@@ -56,7 +56,10 @@ void main() {
 
     const int kTaps = 24;
     const float kGoldenAngle = 2.39996323;
-    const float angle_off = IgnNoise(vec2(px), pc.frame_index) * 6.2831853;
+    // Static spatial IGN (no frame_index rotation): since DoF runs AFTER DLSS/FSR/TAA,
+    // per-frame angle rotation would flicker on static blurred backgrounds; spatial IGN
+    // eliminates ring banding with zero temporal vibration.
+    const float angle_off = IgnNoise(vec2(px), 0u) * 6.2831853;
     const float inv_taps = 1.0 / float(kTaps);
 
     vec3 far_accum = vec3(0.0);

@@ -125,14 +125,15 @@ struct MbBlurPush {
 static_assert(sizeof(MbBlurPush) == 24);
 
 struct DofUbo {
-    float clip_phys[4];   // x=nearZ, y=farZ, z=focusDist, w=physCocFactor
-    float near_params[4]; // x=nearStart, y=nearEnd, z=nearCocUv, w=negCocScale
-    float far_params[4];  // x=farStart,  y=farEnd,  z=farCocUv,  w=posCocScale
-    float misc_params[4]; // x=farCutoff, y=maxCocUv, z=aspect, w=dofScale
-    u32 dims_flags[4];    // x=half_w, y=half_h, z=full_w, w=full_h
-    u32 mode_flags[4];    // x=flags (bit0=custom, bit1=nearCust, bit2=farCust), y=frame_index, z=0, w=0
+    float clip_phys[4];    // x=nearZ, y=farZ, z=focusDist, w=physCocFactor
+    float near_params[4];  // x=nearStart, y=nearEnd, z=nearCocUv, w=negCocScale
+    float far_params[4];   // x=farStart,  y=farEnd,  z=farCocUv,  w=posCocScale
+    float misc_params[4];  // x=farCutoff, y=maxCocUv, z=aspect, w=dofScale
+    u32 dims_flags[4];     // x=half_w, y=half_h, z=full_w, w=full_h
+    u32 mode_flags[4];     // x=flags (bit0=custom, bit1=nearCust, bit2=farCust), y=frame_index, z=0, w=0
+    float depth_jitter[4]; // xy=render-pixel jitter of depth_tex, zw=0
 };
-static_assert(sizeof(DofUbo) == 96);
+static_assert(sizeof(DofUbo) == 112);
 
 struct DofBokehPush {
     u32 width;
@@ -1809,13 +1810,15 @@ bool NativePostFx::Execute(const BbCp::DirectVk::NativePostProcessArgs& args,
         }
     }
 
-    const bool prepost_before_mb_dof =
-        wants_prepost_hdr && (render_extent.width == post_aa_extent.width) &&
-        (render_extent.height == post_aa_extent.height);
-    const bool prepost_after_mb_dof = wants_prepost_hdr && !prepost_before_mb_dof;
-
+    // Unified AAA pipeline order (NVIDIA DLSS / AMD FSR Programming Guide):
+    // ALWAYS run temporal AA / upscaling (DLAA/DLSS/FSR 3.1/FSR 4/TAA) FIRST on raw, sharp,
+    // jittered Linear HDR BEFORE MotionBlur, DoF, Bloom, Heat Haze, Tonemap & CA.
+    // Running DoF before DLSS feeds stochastic IGN bokeh noise into the upscaler and ruins
+    // fine foliage reconstruction at low input resolutions (e.g. DLSS 4.5 Ultra Performance).
+    const std::array<float, 2> frame_depth_jitter =
+        (upscaler && wants_prepost_hdr) ? upscaler->Jitter() : std::array<float, 2>{0.0f, 0.0f};
     TemporalUpscaler::PrePostHdrResult aa_res{};
-    if (prepost_before_mb_dof) {
+    if (wants_prepost_hdr) {
         aa_res = upscaler->RunPrePostHdr(hdr_id, src_hdr_img, src_hdr_view, src_hdr_layout,
                                          render_extent, src_hdr_usage, /*src_is_guest_hdr=*/true,
                                          out_id, out_image.info.pixel_format, out_extent);
@@ -1856,7 +1859,7 @@ bool NativePostFx::Execute(const BbCp::DirectVk::NativePostProcessArgs& args,
     const bool dof_active =
         dof_wanted && has_depth && EnsureDofTargets(render_extent.width, render_extent.height);
 
-    if (!reduced_proxy && !(prepost_before_mb_dof && aa_res.executed)) {
+    if (!reduced_proxy && !(wants_prepost_hdr && aa_res.executed)) {
         runtime.Transit(&hdr_image, vk::ImageLayout::eShaderReadOnlyOptimal,
                         vk::PipelineStageFlagBits2::eComputeShader |
                             vk::PipelineStageFlagBits2::eFragmentShader,
@@ -2064,6 +2067,10 @@ bool NativePostFx::Execute(const BbCp::DirectVk::NativePostProcessArgs& args,
         dof_ubo.mode_flags[1] = args.frame_index;
         dof_ubo.mode_flags[2] = 0u;
         dof_ubo.mode_flags[3] = 0u;
+        dof_ubo.depth_jitter[0] = aa_res.executed ? frame_depth_jitter[0] : 0.0f;
+        dof_ubo.depth_jitter[1] = aa_res.executed ? frame_depth_jitter[1] : 0.0f;
+        dof_ubo.depth_jitter[2] = 0.0f;
+        dof_ubo.depth_jitter[3] = 0.0f;
         dof_ubo_offset = stream.Copy(&dof_ubo, sizeof(dof_ubo), 256);
     }
 
@@ -2589,34 +2596,8 @@ bool NativePostFx::Execute(const BbCp::DirectVk::NativePostProcessArgs& args,
         });
     }
 
-    // Phase 1 Case B (Upscaling: render_extent < output_extent): reconstruct output-res Linear HDR
-    // AFTER render-res MotionBlur/DoF and BEFORE output-res AutoExp, Bloom, Heat Haze, Tonemap & CA.
-    vk::ImageView raw_hdr_view = src_hdr_view;
-    vk::ImageLayout raw_hdr_layout = src_hdr_layout;
-    if (prepost_after_mb_dof) {
-        const vk::Image post_dof_img =
-            dof_active ? d_col_img : (mb_active ? mb_c_img : src_hdr_img);
-        const vk::ImageUsageFlags post_dof_usage =
-            (dof_active || mb_active)
-                ? (vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eStorage |
-                   vk::ImageUsageFlagBits::eTransferSrc)
-                : src_hdr_usage;
-        const bool post_dof_is_guest = !dof_active && !mb_active;
-        aa_res = upscaler->RunPrePostHdr(hdr_id, post_dof_img, post_scene_view, post_scene_layout,
-                                         render_extent, post_dof_usage, post_dof_is_guest, out_id,
-                                         out_image.info.pixel_format, out_extent);
-        if (aa_res.executed) {
-            post_scene_view = aa_res.view;
-            post_scene_layout = vk::ImageLayout::eShaderReadOnlyOptimal;
-            raw_hdr_view = aa_res.view;
-            raw_hdr_layout = vk::ImageLayout::eShaderReadOnlyOptimal;
-            post_aa_extent = aa_res.extent;
-            final_out_extent = aa_res.extent;
-        } else {
-            post_aa_extent = render_extent;
-            final_out_extent = out_extent;
-        }
-    }
+    const vk::ImageView raw_hdr_view = src_hdr_view;
+    const vk::ImageLayout raw_hdr_layout = src_hdr_layout;
 
     // Prepare final output target (direct ui_image on upscaled/FG frames, or guest out_image).
     const bool use_ui_target = aa_res.executed && aa_res.use_ui_target && aa_res.ui_image &&

@@ -18,6 +18,7 @@ layout(set = 0, binding = 5, std140) uniform DofUbo {
     vec4 misc_params; // x=farCutoff, y=maxCocUv, z=aspect, w=dofScale
     uvec4 dims_flags; // x=half_w, y=half_h, z=full_w, w=full_h
     uvec4 mode_flags; // x=flags (bit0=custom, bit1=nearCust, bit2=farCust), y=frame_index, z=0, w=0
+    vec4 depth_jitter; // xy=render-pixel jitter of depth_tex, zw=0
 } u;
 layout(set = 0, binding = 6) uniform texture2D coc_tex;
 
@@ -74,8 +75,66 @@ void main() {
     }
 
     const vec3 sharp_rgb = max(texelFetch(sampler2D(hdr_scene, linear_samp), ivec2(px), 0).rgb, vec3(0.0));
-    const float d_raw = texelFetch(sampler2D(depth_tex, linear_samp), ivec2(px), 0).r;
-    const float full_coc = ComputeSignedCoc(LinearizeDepth(d_raw));
+    const ivec2 depth_dim = textureSize(sampler2D(depth_tex, linear_samp), 0);
+    const ivec2 depth_max = max(depth_dim - ivec2(1), ivec2(0));
+    const bool reduced_or_jittered =
+        (depth_dim.x < int(u.dims_flags.z)) || (depth_dim.y < int(u.dims_flags.w)) ||
+        (dot(u.depth_jitter.xy, u.depth_jitter.xy) > 1e-6);
+
+    float full_coc;
+    float coc_closest;
+    float coc_max;
+    if (!reduced_or_jittered) {
+        const float d_raw = texelFetch(sampler2D(depth_tex, linear_samp), ivec2(px), 0).r;
+        full_coc = ComputeSignedCoc(LinearizeDepth(d_raw));
+        coc_closest = full_coc;
+        coc_max = full_coc;
+    } else {
+        // Un-jitter depth_tex (+jitter matches unjittered post-DLSS/FSR color) and compute smooth
+        // 4-tap bilinear CoC so low-res render depth never creates blocky 3x3 vibrating stairsteps.
+        const vec2 uv = (vec2(px) + 0.5) / max(vec2(u.dims_flags.zw), vec2(1.0));
+        const vec2 dpos = uv * vec2(depth_dim) + u.depth_jitter.xy - 0.5;
+        const ivec2 d0 = clamp(ivec2(floor(dpos)), ivec2(0), depth_max);
+        const ivec2 d1 = min(d0 + ivec2(1, 0), depth_max);
+        const ivec2 d2 = min(d0 + ivec2(0, 1), depth_max);
+        const ivec2 d3 = min(d0 + ivec2(1, 1), depth_max);
+        const vec2 df = clamp(dpos - vec2(d0), 0.0, 1.0);
+        const float dw0 = (1.0 - df.x) * (1.0 - df.y);
+        const float dw1 = df.x * (1.0 - df.y);
+        const float dw2 = (1.0 - df.x) * df.y;
+        const float dw3 = df.x * df.y;
+        const float rd0 = texelFetch(sampler2D(depth_tex, linear_samp), d0, 0).r;
+        const float rd1 = texelFetch(sampler2D(depth_tex, linear_samp), d1, 0).r;
+        const float rd2 = texelFetch(sampler2D(depth_tex, linear_samp), d2, 0).r;
+        const float rd3 = texelFetch(sampler2D(depth_tex, linear_samp), d3, 0).r;
+        const float dc0 = ComputeSignedCoc(LinearizeDepth(rd0));
+        const float dc1 = ComputeSignedCoc(LinearizeDepth(rd1));
+        const float dc2 = ComputeSignedCoc(LinearizeDepth(rd2));
+        const float dc3 = ComputeSignedCoc(LinearizeDepth(rd3));
+        full_coc = dc0 * dw0 + dc1 * dw1 + dc2 * dw2 + dc3 * dw3;
+        coc_max = max(max(dc0, dc1), max(dc2, dc3));
+        float d_min_raw = min(min(rd0, rd1), min(rd2, rd3));
+        // When render depth is lower-res than DLSS/FSR output (e.g. 854x480 -> 2560x1440),
+        // sub-pixel twigs (0.33 render-px wide) can slip between 2x2 depth samples on some jitter
+        // phases. Sample a +/-2 render-px cross to detect nearby in-focus foreground geometry
+        // (Forward-Z: smallest depth = closest) for color-guided silhouette protection.
+        if (depth_dim.x < int(u.dims_flags.z) || depth_dim.y < int(u.dims_flags.w)) {
+            const ivec2 dc = clamp(ivec2(round(dpos)), ivec2(0), depth_max);
+            d_min_raw = min(d_min_raw, texelFetch(sampler2D(depth_tex, linear_samp), clamp(dc + ivec2(-1,  0), ivec2(0), depth_max), 0).r);
+            d_min_raw = min(d_min_raw, texelFetch(sampler2D(depth_tex, linear_samp), clamp(dc + ivec2( 1,  0), ivec2(0), depth_max), 0).r);
+            d_min_raw = min(d_min_raw, texelFetch(sampler2D(depth_tex, linear_samp), clamp(dc + ivec2( 0, -1), ivec2(0), depth_max), 0).r);
+            d_min_raw = min(d_min_raw, texelFetch(sampler2D(depth_tex, linear_samp), clamp(dc + ivec2( 0,  1), ivec2(0), depth_max), 0).r);
+            d_min_raw = min(d_min_raw, texelFetch(sampler2D(depth_tex, linear_samp), clamp(dc + ivec2(-2,  0), ivec2(0), depth_max), 0).r);
+            d_min_raw = min(d_min_raw, texelFetch(sampler2D(depth_tex, linear_samp), clamp(dc + ivec2( 2,  0), ivec2(0), depth_max), 0).r);
+            d_min_raw = min(d_min_raw, texelFetch(sampler2D(depth_tex, linear_samp), clamp(dc + ivec2( 0, -2), ivec2(0), depth_max), 0).r);
+            d_min_raw = min(d_min_raw, texelFetch(sampler2D(depth_tex, linear_samp), clamp(dc + ivec2( 0,  2), ivec2(0), depth_max), 0).r);
+            d_min_raw = min(d_min_raw, texelFetch(sampler2D(depth_tex, linear_samp), clamp(dc + ivec2(-1, -1), ivec2(0), depth_max), 0).r);
+            d_min_raw = min(d_min_raw, texelFetch(sampler2D(depth_tex, linear_samp), clamp(dc + ivec2( 1, -1), ivec2(0), depth_max), 0).r);
+            d_min_raw = min(d_min_raw, texelFetch(sampler2D(depth_tex, linear_samp), clamp(dc + ivec2(-1,  1), ivec2(0), depth_max), 0).r);
+            d_min_raw = min(d_min_raw, texelFetch(sampler2D(depth_tex, linear_samp), clamp(dc + ivec2( 1,  1), ivec2(0), depth_max), 0).r);
+        }
+        coc_closest = ComputeSignedCoc(LinearizeDepth(d_min_raw));
+    }
 
     // True 4-tap CoC-weighted bilateral upsample of half-res bokeh:
     // prevents 720p sky/far bokeh texels from leaking onto sharp 1440p tree leaves and railings.
@@ -110,6 +169,20 @@ void main() {
     const vec4 bokeh = (w_sum > 1e-4)
         ? ((bk0 * w0 + bk1 * w1 + bk2 * w2 + bk3 * w3) / w_sum)
         : (bk0 * b0 + bk1 * b1 + bk2 * b2 + bk3 * b3);
+
+    // Color-guided foreground silhouette snap on reduced/jittered depth edges (e.g. sharp
+    // DLSS-reconstructed thin twigs/leaves or Hunter hat in front of blurred sky/moon/pillars):
+    // keeps 100% crisp full-res foreground edges even when a 1px twig falls between low-res depth
+    // samples, while background sky/moon/pillar bokeh stays silky smooth.
+    if (reduced_or_jittered && (coc_max - coc_closest) > 0.0007 &&
+        coc_closest > -0.0005 && coc_closest < 0.0010 && coc_max > 0.0014) {
+        const vec3 bk_rgb = max(bokeh.rgb, vec3(0.0));
+        const float l_sharp = dot(sharp_rgb, vec3(0.2126, 0.7152, 0.0722));
+        const float l_bokeh = dot(bk_rgb, vec3(0.2126, 0.7152, 0.0722));
+        const float col_diff = length(sharp_rgb - bk_rgb) / max(max(l_sharp, l_bokeh), 0.04);
+        const float fg_snap = smoothstep(0.14, 0.36, col_diff);
+        full_coc = mix(full_coc, coc_closest, fg_snap);
+    }
 
     // Smooth transition from native 1440p/4K sharp full-res to half-res HDR bokeh:
     // - Sub-1.2px CoC (trees/midground at 10..18m) stays 100% razor-sharp native full-res!
