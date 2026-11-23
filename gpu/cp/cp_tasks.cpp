@@ -635,6 +635,12 @@ void DirectVkNativePostProcessTask(Vulkan::Rasterizer& rasterizer, const u8* dat
     rasterizer.DirectNativePostProcess(args);
 }
 
+void DirectVkGenerateMipsSpdTask(Vulkan::Rasterizer& rasterizer, const u8* data) {
+    DirectVk::GenerateMipsSpdArgs args{};
+    std::memcpy(&args, data, sizeof(args));
+    rasterizer.DirectGenerateMipsSpd(args);
+}
+
 } // namespace Tasks
 
 } // namespace BbCp

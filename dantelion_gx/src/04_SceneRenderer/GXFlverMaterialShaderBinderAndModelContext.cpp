@@ -23,6 +23,7 @@
 #include <cstring>
 #include <algorithm>
 #include <immintrin.h>
+#include "gx_direct_vulkan.h"
 
 namespace Bloodborne::SceneRenderer {
 
@@ -1431,6 +1432,28 @@ extern "C" bool sub_21c2100(void* self, void* src_tex, void* dst_tex) {
     // from 22 RenderPasses down to 5 RenderPasses/frame.
     const std::uint32_t loop_mip_levels =
         (src_tex == nullptr && mip_levels > 6U) ? 6U : mip_levels;
+    // Phase 2 (v1.2.4): Single-Pass Downsampler (SPD) in LDS for SSR glossy mip pyramid.
+    // Replaces all 5 ps_6320bb24 RenderPasses + 4 temp RT allocations + 4 vkCmdCopyImage copies
+    // with ONE DirectVk Compute SPD dispatch (BB_SSR_SPD=0 falls back to the quad-draw loop).
+    if (src_tex == nullptr && loop_mip_levels >= 2U && loop_mip_levels <= 6U && width >= 16U &&
+        height >= 16U && gx_direct_vk::IsSsrSpdEnabled()) {
+        void* srv_obj = MemRef<void*>(dst_tex, 0x48);
+        void* cb_gnm = MemRef<void*>(render_ctx, 0x08);
+        if (srv_obj != nullptr && cb_gnm != nullptr) {
+            gx_direct_vk::GenerateMipsSpdArgs spd_args{};
+            std::memcpy(spd_args.tex_tsharp, static_cast<const std::uint8_t*>(srv_obj) + 0x10,
+                        sizeof(spd_args.tex_tsharp));
+            spd_args.base_width = width;
+            spd_args.base_height = height;
+            spd_args.num_mips = loop_mip_levels;
+            spd_args.flags = 0u;
+            if (gx_direct_vk::EmitGenerateMipsSpd(
+                    static_cast<std::uint8_t*>(cb_gnm) + 0x10, spd_args)) {
+                ReleaseRefCounted(cur_src);
+                return true;
+            }
+        }
+    }
     if (loop_mip_levels >= 2U) {
         void* rt_state = static_cast<std::uint8_t*>(render_ctx) + 0x1728;
         void* temp_rt = nullptr;

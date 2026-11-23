@@ -15,6 +15,7 @@ layout(set = 0, binding = 0) uniform texture2D depth_tex;
 layout(set = 0, binding = 1) uniform texture2D vel_tex;
 layout(set = 0, binding = 2) uniform sampler linear_samp;
 layout(set = 0, binding = 3, rgba16f) uniform writeonly image2D out_vel_img;
+layout(set = 0, binding = 5, r32f) uniform writeonly image2D out_tile_max_img;
 
 layout(set = 0, binding = 4, std140) uniform MbVelUbo {
     vec4 clip_to_prev[4]; // row-vector matrix: prev_clip = cur_clip.x*r0 + cur_clip.y*r1 + cur_clip.z*r2 + r3
@@ -22,6 +23,8 @@ layout(set = 0, binding = 4, std140) uniform MbVelUbo {
     vec4 params1;         // x=fps_q4, y=inv_enc_scale (0.25), z=self_deadzone_ndc, w=0
     uvec4 dims_flags;     // x=dst_w, y=dst_h, z=flags (bit0=cam_on, bit1=obj_on, bit2=has_depth, bit3=has_vel), w=reserved
 } u;
+
+shared float s_max_vel[256];
 
 vec2 ReprojectCamNdc(vec2 ndc, float d_raw) {
     const float z_clip = clamp(d_raw, 0.0, 0.99999);
@@ -37,109 +40,126 @@ vec2 ReprojectCamNdc(vec2 ndc, float d_raw) {
 
 void main() {
     const uvec2 px = gl_GlobalInvocationID.xy;
-    if (px.x >= u.dims_flags.x || px.y >= u.dims_flags.y) {
-        return;
-    }
+    float my_vel_px = 0.0;
+    if (px.x < u.dims_flags.x && px.y < u.dims_flags.y) {
+        const vec2 uv = (vec2(px) + 0.5) / vec2(float(u.dims_flags.x), float(u.dims_flags.y));
+        const vec2 ndc = vec2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+        const uint flags = u.dims_flags.z;
+        const bool cam_on = (flags & 1u) != 0u;
+        const bool obj_on = (flags & 2u) != 0u;
+        const bool has_depth = (flags & 4u) != 0u;
+        const bool has_vel = (flags & 8u) != 0u;
 
-    const vec2 uv = (vec2(px) + 0.5) / vec2(float(u.dims_flags.x), float(u.dims_flags.y));
-    const vec2 ndc = vec2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
-    const uint flags = u.dims_flags.z;
-    const bool cam_on = (flags & 1u) != 0u;
-    const bool obj_on = (flags & 2u) != 0u;
-    const bool has_depth = (flags & 4u) != 0u;
-    const bool has_vel = (flags & 8u) != 0u;
-
-    // Sample 2x2 full-res depth quad corresponding to this half-res texel (Forward-Z: smaller = closer).
-    float d_min = 1.0;
-    float d_max = 1.0;
-    if (has_depth) {
-        const ivec2 depth_dim = textureSize(sampler2D(depth_tex, linear_samp), 0);
-        const ivec2 base_dp = clamp(ivec2(px * 2u), ivec2(0), max(depth_dim - ivec2(2), ivec2(0)));
-        const float d00 = texelFetch(sampler2D(depth_tex, linear_samp), base_dp + ivec2(0, 0), 0).r;
-        const float d10 = texelFetch(sampler2D(depth_tex, linear_samp), base_dp + ivec2(1, 0), 0).r;
-        const float d01 = texelFetch(sampler2D(depth_tex, linear_samp), base_dp + ivec2(0, 1), 0).r;
-        const float d11 = texelFetch(sampler2D(depth_tex, linear_samp), base_dp + ivec2(1, 1), 0).r;
-        d_min = min(min(d00, d10), min(d01, d11));
-        d_max = max(max(d00, d10), max(d01, d11));
-    }
-
-    // 1. Camera velocity in NDC (+X right, +Y up) and UV (+U right, +V down).
-    vec2 raw_cam_ndc_fg = vec2(0.0);
-    vec2 cam_vel = vec2(0.0);
-    if (has_depth) {
-        raw_cam_ndc_fg = ReprojectCamNdc(ndc, d_min);
-        if (cam_on) {
-            vec2 raw_cam_uv = vec2(raw_cam_ndc_fg.x * 0.5, -raw_cam_ndc_fg.y * 0.5);
-            const float raw_len = length(raw_cam_uv);
-            if (raw_len > 0.0002) {
-                raw_cam_uv *= (raw_len - 0.0002) / raw_len;
-                cam_vel = raw_cam_uv * u.params0.x;
-                const float scaled_len = length(cam_vel);
-                if (scaled_len > u.params0.z) {
-                    cam_vel *= (u.params0.z / scaled_len);
-                }
-            }
+        // Sample 2x2 full-res depth quad corresponding to this half-res texel (Forward-Z: smaller = closer).
+        float d_min = 1.0;
+        float d_max = 1.0;
+        if (has_depth) {
+            const ivec2 depth_dim = textureSize(sampler2D(depth_tex, linear_samp), 0);
+            const ivec2 base_dp = clamp(ivec2(px * 2u), ivec2(0), max(depth_dim - ivec2(2), ivec2(0)));
+            const float d00 = texelFetch(sampler2D(depth_tex, linear_samp), base_dp + ivec2(0, 0), 0).r;
+            const float d10 = texelFetch(sampler2D(depth_tex, linear_samp), base_dp + ivec2(1, 0), 0).r;
+            const float d01 = texelFetch(sampler2D(depth_tex, linear_samp), base_dp + ivec2(0, 1), 0).r;
+            const float d11 = texelFetch(sampler2D(depth_tex, linear_samp), base_dp + ivec2(1, 1), 0).r;
+            d_min = min(min(d00, d10), min(d01, d11));
+            d_max = max(max(d00, d10), max(d01, d11));
         }
-    }
 
-    // 2. Pure per-object self-motion velocity: subtract depth-reprojected camera NDC velocity
-    // from Pass 0x2e total screen velocity so static NPCs (Gehrman/Doll) & standing Hunter have
-    // ZERO residual blur on fast camera rotation.
-    vec2 obj_vel = vec2(0.0);
-    float obj_mask = 0.0;
-    if (has_vel) {
-        const ivec2 vel_dim = textureSize(sampler2D(vel_tex, linear_samp), 0);
-        const ivec2 vel_px = clamp(ivec2(uv * vec2(vel_dim)), ivec2(0), max(vel_dim - ivec2(1), ivec2(0)));
-        const vec4 obj = texelFetch(sampler2D(vel_tex, linear_samp), vel_px, 0);
-        obj_mask = (obj.a > 0.5) ? 1.0 : 0.0;
-        if (obj_on && obj_mask > 0.5) {
-            const vec2 obj_raw = obj.xy * 2.0 - 1.0;
-            // Smoothly fade out self-motion diff if 8-bit UNORM velWrap hit saturation (+/-1.0)
-            // during an extreme camera whip so clamped static NPCs never show fake residual blur.
-            const float sat = max(abs(obj_raw.x), abs(obj_raw.y));
-            const float sat_fade = 1.0 - smoothstep(0.88, 0.97, sat);
-
-            // Exact NDC velocity at 30-FPS normalization (matches Pass 0x2e enc_scale = 4.0 * fps_q4).
-            const vec2 obj_ndc_30 = obj_raw * u.params1.y;
-            vec2 self_ndc_30 = obj_ndc_30;
-            if (has_depth) {
-                const vec2 cam_ndc_30_fg = raw_cam_ndc_fg * u.params1.x;
-                self_ndc_30 = obj_ndc_30 - cam_ndc_30_fg;
-                // On 1-pixel depth discontinuity silhouettes, pick whichever surface depth (fg/bg)
-                // matches the static object velocity to eliminate 1px shimmer on NPC hats/edges.
-                if ((d_max - d_min) > 0.001) {
-                    const vec2 cam_ndc_30_bg = ReprojectCamNdc(ndc, d_max) * u.params1.x;
-                    const vec2 diff_bg = obj_ndc_30 - cam_ndc_30_bg;
-                    if (dot(diff_bg, diff_bg) < dot(self_ndc_30, self_ndc_30)) {
-                        self_ndc_30 = diff_bg;
+        // 1. Camera velocity in NDC (+X right, +Y up) and UV (+U right, +V down).
+        vec2 raw_cam_ndc_fg = vec2(0.0);
+        vec2 cam_vel = vec2(0.0);
+        if (has_depth) {
+            raw_cam_ndc_fg = ReprojectCamNdc(ndc, d_min);
+            if (cam_on) {
+                vec2 raw_cam_uv = vec2(raw_cam_ndc_fg.x * 0.5, -raw_cam_ndc_fg.y * 0.5);
+                const float raw_len = length(raw_cam_uv);
+                if (raw_len > 0.0002) {
+                    raw_cam_uv *= (raw_len - 0.0002) / raw_len;
+                    cam_vel = raw_cam_uv * u.params0.x;
+                    const float scaled_len = length(cam_vel);
+                    if (scaled_len > u.params0.z) {
+                        cam_vel *= (u.params0.z / scaled_len);
                     }
                 }
             }
-            self_ndc_30 *= sat_fade;
+        }
 
-            const float slen = length(self_ndc_30);
-            const float dz = u.params1.z;
-            if (slen > dz) {
-                self_ndc_30 *= (slen - dz) / slen;
-                // Convert NDC (+Y up) to UV (+V down) and scale by object blur strength.
-                obj_vel = vec2(self_ndc_30.x * 0.5, -self_ndc_30.y * 0.5) * u.params0.y;
-                const float olen = length(obj_vel);
-                if (olen > u.params0.w) {
-                    obj_vel *= (u.params0.w / olen);
+        // 2. Pure per-object self-motion velocity: subtract depth-reprojected camera NDC velocity
+        // from Pass 0x2e total screen velocity so static NPCs (Gehrman/Doll) & standing Hunter have
+        // ZERO residual blur on fast camera rotation.
+        vec2 obj_vel = vec2(0.0);
+        float obj_mask = 0.0;
+        if (has_vel) {
+            const ivec2 vel_dim = textureSize(sampler2D(vel_tex, linear_samp), 0);
+            const ivec2 vel_px = clamp(ivec2(uv * vec2(vel_dim)), ivec2(0), max(vel_dim - ivec2(1), ivec2(0)));
+            const vec4 obj = texelFetch(sampler2D(vel_tex, linear_samp), vel_px, 0);
+            obj_mask = (obj.a > 0.5) ? 1.0 : 0.0;
+            if (obj_on && obj_mask > 0.5) {
+                const vec2 obj_raw = obj.xy * 2.0 - 1.0;
+                // Smoothly fade out self-motion diff if 8-bit UNORM velWrap hit saturation (+/-1.0)
+                // during an extreme camera whip so clamped static NPCs never show fake residual blur.
+                const float sat = max(abs(obj_raw.x), abs(obj_raw.y));
+                const float sat_fade = 1.0 - smoothstep(0.88, 0.97, sat);
+
+                // Exact NDC velocity at 30-FPS normalization (matches Pass 0x2e enc_scale = 4.0 * fps_q4).
+                const vec2 obj_ndc_30 = obj_raw * u.params1.y;
+                vec2 self_ndc_30 = obj_ndc_30;
+                if (has_depth) {
+                    const vec2 cam_ndc_30_fg = raw_cam_ndc_fg * u.params1.x;
+                    self_ndc_30 = obj_ndc_30 - cam_ndc_30_fg;
+                    // On 1-pixel depth discontinuity silhouettes, pick whichever surface depth (fg/bg)
+                    // matches the static object velocity to eliminate 1px shimmer on NPC hats/edges.
+                    if ((d_max - d_min) > 0.001) {
+                        const vec2 cam_ndc_30_bg = ReprojectCamNdc(ndc, d_max) * u.params1.x;
+                        const vec2 diff_bg = obj_ndc_30 - cam_ndc_30_bg;
+                        if (dot(diff_bg, diff_bg) < dot(self_ndc_30, self_ndc_30)) {
+                            self_ndc_30 = diff_bg;
+                        }
+                    }
+                }
+                self_ndc_30 *= sat_fade;
+
+                const float slen = length(self_ndc_30);
+                const float dz = u.params1.z;
+                if (slen > dz) {
+                    self_ndc_30 *= (slen - dz) / slen;
+                    // Convert NDC (+Y up) to UV (+V down) and scale by object blur strength.
+                    obj_vel = vec2(self_ndc_30.x * 0.5, -self_ndc_30.y * 0.5) * u.params0.y;
+                    const float olen = length(obj_vel);
+                    if (olen > u.params0.w) {
+                        obj_vel *= (u.params0.w / olen);
+                    }
                 }
             }
         }
+
+        // Additive physically decomposed velocity:
+        // - Camera MB = On, Object MB = Off -> cam_vel everywhere (world + static NPCs blur cleanly)
+        // - Camera MB = Off, Object MB = On -> pure obj_vel only where objects actually move themselves
+        // - Both On -> cam_vel + obj_vel
+        vec2 final_vel = cam_vel + obj_vel;
+        const float max_uv = max(u.params0.z, u.params0.w);
+        const float flen = length(final_vel);
+        if (flen > max_uv && max_uv > 1e-5) {
+            final_vel *= (max_uv / flen);
+        }
+        imageStore(out_vel_img, ivec2(px), vec4(final_vel.x, final_vel.y, d_min, obj_mask));
+
+        // Conservative full-res pixel motion magnitude for Phase 3 Step 3.2 tile early-out.
+        const vec2 full_res_hi = vec2(float(u.dims_flags.x * 2u + 2u), float(u.dims_flags.y * 2u + 2u));
+        my_vel_px = length(final_vel * full_res_hi);
     }
 
-    // Additive physically decomposed velocity:
-    // - Camera MB = On, Object MB = Off -> cam_vel everywhere (world + static NPCs blur cleanly)
-    // - Camera MB = Off, Object MB = On -> pure obj_vel only where objects actually move themselves
-    // - Both On -> cam_vel + obj_vel
-    vec2 final_vel = cam_vel + obj_vel;
-    const float max_uv = max(u.params0.z, u.params0.w);
-    const float flen = length(final_vel);
-    if (flen > max_uv && max_uv > 1e-5) {
-        final_vel *= (max_uv / flen);
+    // 16x16 half-res (= 32x32 full-res) tile max-velocity reduction in LDS.
+    const uint tid = gl_LocalInvocationIndex;
+    s_max_vel[tid] = my_vel_px;
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            s_max_vel[tid] = max(s_max_vel[tid], s_max_vel[tid + stride]);
+        }
+        barrier();
     }
-    imageStore(out_vel_img, ivec2(px), vec4(final_vel.x, final_vel.y, d_min, obj_mask));
+    if (tid == 0u) {
+        imageStore(out_tile_max_img, ivec2(gl_WorkGroupID.xy), vec4(s_max_vel[0], 0.0, 0.0, 0.0));
+    }
 }

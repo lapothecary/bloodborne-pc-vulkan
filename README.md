@@ -54,9 +54,9 @@ BloodBorne/
 
 ## 🆕 Latest Release (`v1.2.3`)
 
-- **Lower GPU Load, Heat & Higher Smoothness** — Optimized shadows, lighting blur, idle motion blur, final color output, and 5 heavy world/foliage shaders across Yharnam, Iosefka's Clinic, and Hunter's Dream — cutting GPU load and power draw noticeably while increasing high-FPS headroom.
-- **Expanded Shader Pre-Bake Catalog (+1,095 New Recipes)** — Added 819 new graphics pipelines and 263 shader variants to `data/shader_recipes.bbrc` so fresh installs pre-compile even more of the game upfront with fewer in-game stutters.
-- **Cleaner, Privacy-Safe Diagnostic Logs** — Removed repetitive startup log spam (~3.5× smaller logs), scrubbed user home paths, and added a compact Windows/Linux hardware summary (OS, CPU, RAM, live usage, and automatic hitch alerts) for effortless bug reports.
+- **Cleaner AA & Proper Post-FX Order (~130 MB Less VRAM)** — Temporal anti-aliasing and upscaling (`DLAA / DLSS / FSR / TAA`) now run in true HDR space before post-processing — sharper thin geometry/hair with less shimmer, crisp Bloom/CA/Heat Haze, and ~130 MB less VRAM.
+- **All Post-Processing & Screen Effects Native in Vulkan** — Ambient occlusion (`152` native Vulkan shaders), glossy reflections, Motion Blur, Bloom, Auto-Exposure, Depth of Field, Chromatic Aberration, and shadows all run in fast native Vulkan passes with lower GPU load and power draw.
+- **Expanded Shader Pre-Bake Catalog (+1,095 New Recipes) & Clean Logs** — Added 819 graphics pipelines and 263 shader variants to `data/shader_recipes.bbrc` for smoother fresh installs, ~3.5× smaller privacy-safe logs, and a compact Windows/Linux hardware summary.
 - **Includes everything from `v1.2.2` – `v1.2.0`** — Native Vulkan Post-Processing, Native HDR10, PCSS Soft Shadows, SSGI, Fire Heat Haze, glass-smooth frame pacing, portable Linux `x86-64-v3` builds, 1.3 s death respawns, high-FPS cloth/curb fixes, and 2×–4× UI upscaling.
 
 *(See [Releases](https://github.com/lapothecary/bloodborne-pc-vulkan/releases) for clean per-version changelogs.)*
@@ -73,7 +73,7 @@ BloodBorne/
 | :--- | :--- | :--- | :--- |
 | **Execution Model** | General-purpose PS4 emulator | Host runtime + PS4 graphics translation | `bbport` host runtime + **refactored C++20 Dantelion graphics engine** (`2,940` functions) wired into **DirectVk 1.3** |
 | **VRAM & Memory** | Unified memory page traps | Shared host RAM + hot VRAM mirrors | **True split PC VRAM (`DEVICE_LOCAL`)** — `0` page faults/s in gameplay, much lower RAM & VRAM footprint |
-| **Shaders & Stutter** | Runtime translation | Runtime translation + recipe cache | **Full `5,761`-shader pre-baker**, quiet background auto-baker, fast async shader fallback, and **`150` native Vulkan GLSL shaders** |
+| **Shaders & Stutter** | Runtime translation | Runtime translation + recipe cache | **Full `5,761`-shader pre-baker**, quiet background auto-baker, fast async shader fallback, and **`152` native Vulkan GLSL shaders** |
 | **Performance Features** | Frame-rate patches | Two-stage draw pipe + Vulkan occlusion | **DirectVk command stream**, **3D occlusion culling (`27–41%` skipped)**, front-to-back G-Buffer sorting, light-tile/UI batching, multi-core L3 cache pinning |
 | **PC Polish & UX** | External emulator UI | Upscalers (`DLSS`/`FSR`/`FG`), Ultrawide, raw mouse, basic in-game menus, online | **Full live in-game `Display`/`Effects`/`Controls` menus (28 actions)**, **smooth `Balanced` camera (`F4`)**, **4–5× faster loading**, **dual-stage frame pacing**, **4 optional remaster shaders**, **`2×/4×` UI upscaling**, **authentic C++20 native launcher**, and **1-click updates** |
 
@@ -147,5 +147,5 @@ BB_GX_SKIP_MODS="05,06" ./play.sh       # Skip specific C++20 graphics modules f
 - **[`bbport` (`deadinside28/bloodborne_pc`)](https://github.com/deadinside28/bloodborne_pc)** — Host ELF/PE loader, PS4 kernel/system runtime, Windows port foundation, upscaler bridges (`DLSS`, `FSR 3.1/4`, `Frame Gen`), Ultrawide, Havok cloth fixes, raw mouse look, and online (`bbnet20`).
 - **[`shadPS4` (`shadps4-emu/shadPS4`)](https://github.com/shadps4-emu/shadPS4)** — Original PS4 Vulkan video core and GCN-to-SPIR-V shader recompiler foundation (`GPL-2.0-or-later`).
 - **[`yharnam-pc` (`Jgamrot/yharnam-pc`)](https://github.com/Jgamrot/yharnam-pc)** — UX layout inspiration for the slim-rail launcher and first-time setup flow (`GPL-2.0`).
-- **`bloodborne-pc-vulkan` ([@lapothecary](https://github.com/lapothecary))** — Refactored C++20 Dantelion graphics engine, DirectVk split VRAM & occlusion/batching pipeline, `129` native Vulkan shaders, full `5,761`-shader pre-baker, frame pacing & `Balanced` camera, expanded live in-game menus, 4–5× fast loading, optional remaster shaders, and the native C++20 runtime-decoding launcher.
+- **`bloodborne-pc-vulkan` ([@lapothecary](https://github.com/lapothecary))** — Refactored C++20 Dantelion graphics engine, DirectVk split VRAM & occlusion/batching pipeline, `152` native Vulkan shaders, full `5,761`-shader pre-baker, frame pacing & `Balanced` camera, expanded live in-game menus, 4–5× fast loading, optional remaster shaders, and the native C++20 runtime-decoding launcher.
 - **License:** **[GNU General Public License v3.0](LICENSE)** (`GPL-3.0`).

@@ -16,6 +16,9 @@ layout(set = 0, binding = 3, std430) readonly buffer ExposureStateBuffer {
 } exp_state;
 layout(set = 0, binding = 4) uniform texture2D opaque_hdr_tex;
 layout(set = 0, binding = 5) uniform texture2D raw_hdr_tex;
+layout(set = 0, binding = 6, std430) buffer HistogramBuffer {
+    uint bins[256];
+} hist_buf;
 
 layout(push_constant) uniform BloomDownPush {
     uint dst_w;
@@ -28,8 +31,16 @@ layout(push_constant) uniform BloomDownPush {
     float knee;
     float luma_gamma;
     float remap_factor;
-    uint flags; // bit0 = is_prefilter, bit1 = auto_exp_on
+    uint flags; // bit0 = is_prefilter, bit1 = auto_exp_on, bit2 = use_opaque_diff, bit3 = fused_hist
+    float min_log_lum;
+    float inv_log_lum_range;
+    float meter_min_x;
+    float meter_min_y;
+    float meter_max_x;
+    float meter_max_y;
 } pc;
+
+shared uint s_bins[256];
 
 float Luma(vec3 c) {
     return dot(c, vec3(0.2126, 0.7152, 0.0722));
@@ -75,94 +86,128 @@ vec4 SampleSrc4(vec2 uv) {
 }
 
 void main() {
+    const bool do_hist = (pc.flags & 8u) != 0u;
+    const uint local_idx = gl_LocalInvocationIndex;
+    if (do_hist) {
+        s_bins[local_idx] = 0u;
+        barrier();
+    }
+
     const uvec2 px = gl_GlobalInvocationID.xy;
-    if (px.x >= pc.dst_w || px.y >= pc.dst_h) {
-        return;
-    }
+    if (px.x < pc.dst_w && px.y < pc.dst_h) {
+        const vec2 uv = (vec2(px) + 0.5) / vec2(float(pc.dst_w), float(pc.dst_h));
+        const vec2 texel = vec2(pc.inv_src_w, pc.inv_src_h);
 
-    const vec2 uv = (vec2(px) + 0.5) / vec2(float(pc.dst_w), float(pc.dst_h));
-    const vec2 texel = vec2(pc.inv_src_w, pc.inv_src_h);
+        // 13-tap Jimenez (Call of Duty: Advanced Warfare) filter pattern:
+        //  a . b . c
+        //  . d . e .
+        //  f . g . h
+        //  . i . j .
+        //  k . l . m
+        vec4 a4 = SampleSrc4(uv + texel * vec2(-2.0, -2.0));
+        vec4 b4 = SampleSrc4(uv + texel * vec2( 0.0, -2.0));
+        vec4 c4 = SampleSrc4(uv + texel * vec2( 2.0, -2.0));
+        vec4 d4 = SampleSrc4(uv + texel * vec2(-1.0, -1.0));
+        vec4 e4 = SampleSrc4(uv + texel * vec2( 1.0, -1.0));
+        vec4 f4 = SampleSrc4(uv + texel * vec2(-2.0,  0.0));
+        vec4 g4 = SampleSrc4(uv);
+        vec4 h4 = SampleSrc4(uv + texel * vec2( 2.0,  0.0));
+        vec4 i4 = SampleSrc4(uv + texel * vec2(-1.0,  1.0));
+        vec4 j4 = SampleSrc4(uv + texel * vec2( 1.0,  1.0));
+        vec4 k4 = SampleSrc4(uv + texel * vec2(-2.0,  2.0));
+        vec4 l4 = SampleSrc4(uv + texel * vec2( 0.0,  2.0));
+        vec4 m4 = SampleSrc4(uv + texel * vec2( 2.0,  2.0));
 
-    // 13-tap Jimenez (Call of Duty: Advanced Warfare) filter pattern:
-    //  a . b . c
-    //  . d . e .
-    //  f . g . h
-    //  . i . j .
-    //  k . l . m
-    vec4 a4 = SampleSrc4(uv + texel * vec2(-2.0, -2.0));
-    vec4 b4 = SampleSrc4(uv + texel * vec2( 0.0, -2.0));
-    vec4 c4 = SampleSrc4(uv + texel * vec2( 2.0, -2.0));
-    vec4 d4 = SampleSrc4(uv + texel * vec2(-1.0, -1.0));
-    vec4 e4 = SampleSrc4(uv + texel * vec2( 1.0, -1.0));
-    vec4 f4 = SampleSrc4(uv + texel * vec2(-2.0,  0.0));
-    vec4 g4 = SampleSrc4(uv);
-    vec4 h4 = SampleSrc4(uv + texel * vec2( 2.0,  0.0));
-    vec4 i4 = SampleSrc4(uv + texel * vec2(-1.0,  1.0));
-    vec4 j4 = SampleSrc4(uv + texel * vec2( 1.0,  1.0));
-    vec4 k4 = SampleSrc4(uv + texel * vec2(-2.0,  2.0));
-    vec4 l4 = SampleSrc4(uv + texel * vec2( 0.0,  2.0));
-    vec4 m4 = SampleSrc4(uv + texel * vec2( 2.0,  2.0));
+        vec3 result;
+        float fire_a = 0.0;
+        vec3 hist_rgb = g4.rgb;
+        if ((pc.flags & 1u) != 0u) {
+            const bool auto_on = (pc.flags & 2u) != 0u;
+            const float exposure = (auto_on && exp_state.initialized != 0u)
+                                       ? exp_state.adapted_exposure
+                                       : pc.manual_exposure;
+            const float exp_scale = exposure * pc.inv_scene_lum_scale;
 
-    vec3 result;
-    float fire_a = 0.0;
-    if ((pc.flags & 1u) != 0u) {
-        const bool auto_on = (pc.flags & 2u) != 0u;
-        const float exposure = (auto_on && exp_state.initialized != 0u)
-                                   ? exp_state.adapted_exposure
-                                   : pc.manual_exposure;
-        const float exp_scale = exposure * pc.inv_scene_lum_scale;
+            vec3 a = PrefilterSample(a4.rgb, exp_scale);
+            vec3 b = PrefilterSample(b4.rgb, exp_scale);
+            vec3 c = PrefilterSample(c4.rgb, exp_scale);
+            vec3 d = PrefilterSample(d4.rgb, exp_scale);
+            vec3 e = PrefilterSample(e4.rgb, exp_scale);
+            vec3 f = PrefilterSample(f4.rgb, exp_scale);
+            vec3 g = PrefilterSample(g4.rgb, exp_scale);
+            vec3 h = PrefilterSample(h4.rgb, exp_scale);
+            vec3 i = PrefilterSample(i4.rgb, exp_scale);
+            vec3 j = PrefilterSample(j4.rgb, exp_scale);
+            vec3 k = PrefilterSample(k4.rgb, exp_scale);
+            vec3 l = PrefilterSample(l4.rgb, exp_scale);
+            vec3 m = PrefilterSample(m4.rgb, exp_scale);
 
-        vec3 a = PrefilterSample(a4.rgb, exp_scale);
-        vec3 b = PrefilterSample(b4.rgb, exp_scale);
-        vec3 c = PrefilterSample(c4.rgb, exp_scale);
-        vec3 d = PrefilterSample(d4.rgb, exp_scale);
-        vec3 e = PrefilterSample(e4.rgb, exp_scale);
-        vec3 f = PrefilterSample(f4.rgb, exp_scale);
-        vec3 g = PrefilterSample(g4.rgb, exp_scale);
-        vec3 h = PrefilterSample(h4.rgb, exp_scale);
-        vec3 i = PrefilterSample(i4.rgb, exp_scale);
-        vec3 j = PrefilterSample(j4.rgb, exp_scale);
-        vec3 k = PrefilterSample(k4.rgb, exp_scale);
-        vec3 l = PrefilterSample(l4.rgb, exp_scale);
-        vec3 m = PrefilterSample(m4.rgb, exp_scale);
+            // Partial Karis average over 5 overlapping 2x2 groups (eliminates specular shimmer).
+            const vec3 g0 = (d + e + i + j) * 0.25;
+            const vec3 g1 = (a + b + f + g) * 0.25;
+            const vec3 g2 = (b + c + g + h) * 0.25;
+            const vec3 g3 = (f + g + k + l) * 0.25;
+            const vec3 g4v = (g + h + l + m) * 0.25;
 
-        // Partial Karis average over 5 overlapping 2x2 groups (eliminates specular shimmer).
-        const vec3 g0 = (d + e + i + j) * 0.25;
-        const vec3 g1 = (a + b + f + g) * 0.25;
-        const vec3 g2 = (b + c + g + h) * 0.25;
-        const vec3 g3 = (f + g + k + l) * 0.25;
-        const vec3 g4v = (g + h + l + m) * 0.25;
+            const float w0 = KarisWeight(g0) * 0.500;
+            const float w1 = KarisWeight(g1) * 0.125;
+            const float w2 = KarisWeight(g2) * 0.125;
+            const float w3 = KarisWeight(g3) * 0.125;
+            const float w4 = KarisWeight(g4v) * 0.125;
+            result = (g0 * w0 + g1 * w1 + g2 * w2 + g3 * w3 + g4v * w4) / max(w0 + w1 + w2 + w3 + w4, 1e-5);
 
-        const float w0 = KarisWeight(g0) * 0.500;
-        const float w1 = KarisWeight(g1) * 0.125;
-        const float w2 = KarisWeight(g2) * 0.125;
-        const float w3 = KarisWeight(g3) * 0.125;
-        const float w4 = KarisWeight(g4v) * 0.125;
-        result = (g0 * w0 + g1 * w1 + g2 * w2 + g3 * w3 + g4v * w4) / max(w0 + w1 + w2 + w3 + w4, 1e-5);
-
-        // Pure GXFfx Fire Emission mask in .a (post-VFX raw HDR minus pre-VFX opaque HDR):
-        // Wet cobblestones, golden floor reflections, armor & walls are identical in both -> 0.0!
-        if ((pc.flags & 4u) != 0u) {
-            const vec2 o_px = vec2(1.25 / float(pc.dst_w), 1.25 / float(pc.dst_h));
-            vec3 op_max = max(textureLod(sampler2D(opaque_hdr_tex, linear_samp), uv, 0.0).rgb, vec3(0.0));
-            op_max = max(op_max, textureLod(sampler2D(opaque_hdr_tex, linear_samp), uv + vec2( o_px.x, 0.0), 0.0).rgb);
-            op_max = max(op_max, textureLod(sampler2D(opaque_hdr_tex, linear_samp), uv + vec2(-o_px.x, 0.0), 0.0).rgb);
-            op_max = max(op_max, textureLod(sampler2D(opaque_hdr_tex, linear_samp), uv + vec2(0.0,  o_px.y), 0.0).rgb);
-            op_max = max(op_max, textureLod(sampler2D(opaque_hdr_tex, linear_samp), uv + vec2(0.0, -o_px.y), 0.0).rgb);
-            const vec3 cur_raw = max(textureLod(sampler2D(raw_hdr_tex, linear_samp), uv, 0.0).rgb, vec3(0.0));
-            const vec3 fire_delta = max(cur_raw - op_max * 1.18, vec3(0.0)) * exp_scale;
-            const float f_warm = smoothstep(1.30, 2.25, fire_delta.r / max(fire_delta.b, 0.02)) *
-                                 smoothstep(1.00, 1.28, fire_delta.r / max(fire_delta.g, 0.02));
-            fire_a = clamp(smoothstep(0.30, 2.00, fire_delta.r) * f_warm, 0.0, 1.0);
+            // Pure GXFfx Fire Emission mask in .a (post-VFX raw HDR minus pre-VFX opaque HDR):
+            // Wet cobblestones, golden floor reflections, armor & walls are identical in both -> 0.0!
+            if ((pc.flags & 4u) != 0u) {
+                const vec3 cur_raw = max(textureLod(sampler2D(raw_hdr_tex, linear_samp), uv, 0.0).rgb, vec3(0.0));
+                hist_rgb = cur_raw;
+                // Exact mathematical early-out: since op_max >= 0, fire_delta.r <= cur_raw.r * exp_scale;
+                // whenever cur_raw.r * exp_scale <= 0.28, smoothstep(0.30, 2.00, fire_delta.r) is strictly 0.0!
+                if (cur_raw.r * exp_scale > 0.28) {
+                    const vec2 o_px = vec2(1.25 / float(pc.dst_w), 1.25 / float(pc.dst_h));
+                    vec3 op_max = max(textureLod(sampler2D(opaque_hdr_tex, linear_samp), uv, 0.0).rgb, vec3(0.0));
+                    op_max = max(op_max, textureLod(sampler2D(opaque_hdr_tex, linear_samp), uv + vec2( o_px.x, 0.0), 0.0).rgb);
+                    op_max = max(op_max, textureLod(sampler2D(opaque_hdr_tex, linear_samp), uv + vec2(-o_px.x, 0.0), 0.0).rgb);
+                    op_max = max(op_max, textureLod(sampler2D(opaque_hdr_tex, linear_samp), uv + vec2(0.0,  o_px.y), 0.0).rgb);
+                    op_max = max(op_max, textureLod(sampler2D(opaque_hdr_tex, linear_samp), uv + vec2(0.0, -o_px.y), 0.0).rgb);
+                    const vec3 fire_delta = max(cur_raw - op_max * 1.18, vec3(0.0)) * exp_scale;
+                    const float f_warm = smoothstep(1.30, 2.25, fire_delta.r / max(fire_delta.b, 0.02)) *
+                                         smoothstep(1.00, 1.28, fire_delta.r / max(fire_delta.g, 0.02));
+                    fire_a = clamp(smoothstep(0.30, 2.00, fire_delta.r) * f_warm, 0.0, 1.0);
+                }
+            }
+        } else {
+            const vec4 r4 = g4 * 0.125
+                          + (a4 + c4 + k4 + m4) * 0.03125
+                          + (b4 + f4 + h4 + l4) * 0.0625
+                          + (d4 + e4 + i4 + j4) * 0.125;
+            result = r4.rgb;
+            fire_a = clamp(r4.a, 0.0, 1.0);
         }
-    } else {
-        const vec4 r4 = g4 * 0.125
-                      + (a4 + c4 + k4 + m4) * 0.03125
-                      + (b4 + f4 + h4 + l4) * 0.0625
-                      + (d4 + e4 + i4 + j4) * 0.125;
-        result = r4.rgb;
-        fire_a = clamp(r4.a, 0.0, 1.0);
+
+        imageStore(dst_img, ivec2(px), vec4(max(result, vec3(0.0)), fire_a));
+
+        // Phase 3 Step 3.1: Fused 256-bin Auto-Exposure Histogram (stride 2 on half-res = stride 4 on full-res,
+        // zero extra texture fetches — reuses already-loaded HDR scene sample in registers).
+        if (do_hist && ((px.x | px.y) & 1u) == 0u) {
+            if (uv.x >= pc.meter_min_x && uv.x <= pc.meter_max_x &&
+                uv.y >= pc.meter_min_y && uv.y <= pc.meter_max_y) {
+                const float luma = Luma(hist_rgb * pc.inv_scene_lum_scale);
+                uint bin = 0u;
+                if (luma > 1e-5) {
+                    const float norm = clamp((log2(luma) - pc.min_log_lum) * pc.inv_log_lum_range, 0.0, 1.0);
+                    bin = clamp(uint(norm * 254.0 + 1.0), 1u, 255u);
+                }
+                atomicAdd(s_bins[bin], 1u);
+            }
+        }
     }
 
-    imageStore(dst_img, ivec2(px), vec4(max(result, vec3(0.0)), fire_a));
+    if (do_hist) {
+        barrier();
+        const uint count = s_bins[local_idx];
+        if (count != 0u) {
+            atomicAdd(hist_buf.bins[local_idx], count);
+        }
+    }
 }

@@ -484,6 +484,7 @@ enum class Op : u32 {
     DrawBundle = 34u,
     ExecuteSecondaryCmds = 35u,
     NativePostProcess = 36u,
+    GenerateMipsSpd = 37u,
 };
 struct CopyRegion {
     u64 dst_va;
@@ -722,6 +723,14 @@ struct NativePostProcessArgs {
     float dof_af_sens;
 };
 static_assert(sizeof(NativePostProcessArgs) == 496);
+struct GenerateMipsSpdArgs {
+    u32 tex_tsharp[8];
+    u32 base_width;
+    u32 base_height;
+    u32 num_mips;
+    u32 flags;
+};
+static_assert(sizeof(GenerateMipsSpdArgs) == 48);
 } // namespace DirectVk
 
 template <typename Write, typename Irq>

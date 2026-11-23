@@ -992,6 +992,16 @@ CommandProcessor::Step CommandProcessor::Graphics(Work& work, Level& level, cons
                     }
                     break;
                 }
+                case DirectVk::Op::GenerateMipsSpd: {
+                    constexpr u32 kExpectedWords =
+                        2u + static_cast<u32>(sizeof(DirectVk::GenerateMipsSpdArgs) / 4u);
+                    if (rasterizer && body_words == kExpectedWords) {
+                        rasterizer->RunInOrder(&Tasks::DirectVkGenerateMipsSpdTask, body + 2u,
+                                               sizeof(DirectVk::GenerateMipsSpdArgs),
+                                               BbToggle::PipelinedMemoryWrites, false);
+                    }
+                    break;
+                }
                 case DirectVk::Op::DrawIndexAddr: {
                     if (rasterizer && body_words == 6u) {
                         const auto* prepared =

@@ -574,6 +574,7 @@ bool TemporalUpscaler::OnFrameStart() {
     ui_in_place = false;
     ui_read_barrier = false;
     done_this_frame = false;
+    hdr_prepost_done = false;
     smaa_done = false;
     ldr_target = {};
     scene_color = {};
@@ -612,6 +613,474 @@ void TemporalUpscaler::OnDispatch(u64 cs_hash) {
         return;
     }
     Run();
+}
+
+bool TemporalUpscaler::WantsPrePostHdr() const noexcept {
+    static const bool env_on = [] {
+        const char* env = std::getenv("BB_HDR_PREPOST_AA");
+        return !(env && env[0] == '0');
+    }();
+    return env_on && Active() && !failed && !done_this_frame && camera_motion.Ready() &&
+           bool(camera_motion.Depth());
+}
+
+TemporalUpscaler::PrePostInput TemporalUpscaler::ResolvePrePostInput(
+    VideoCore::ImageId hdr_id, vk::ImageView default_hdr_view, VideoCore::ImageId depth_id,
+    vk::ImageView default_depth_view) {
+    PrePostInput res{};
+    auto& hdr_img = texture_cache.GetImage(hdr_id);
+    const u32 iw = hdr_img.info.size.width;
+    const u32 ih = hdr_img.info.size.height;
+    const u32 ow = Scaled() ? target_width : iw;
+    const u32 oh = Scaled() ? target_height : ih;
+    res.output_extent = vk::Extent2D{ow, oh};
+
+    const VideoCore::ImageId cam_depth_id = camera_motion.Depth();
+    const VideoCore::ImageId eff_depth_id = depth_id ? depth_id : cam_depth_id;
+    const bool depth_eligible =
+        !eff_depth_id || scene_targets.EligibleScene(texture_cache.GetImage(eff_depth_id));
+
+    if (!scaled_session && scene_targets.Reduced() && scene_targets.EligibleScene(hdr_img) &&
+        depth_eligible) {
+        VideoCore::ImageViewInfo ci{};
+        ci.format = hdr_img.info.pixel_format;
+        const auto cp = scene_targets.Read(
+            hdr_id, ci,
+            vk::PipelineStageFlagBits2::eComputeShader | vk::PipelineStageFlagBits2::eFragmentShader,
+            vk::AccessFlagBits2::eShaderRead);
+        res.color_image = cp.image;
+        res.color_view = cp.view;
+        res.color_layout = cp.layout;
+        res.color_usage = cp.usage;
+        res.render_extent = vk::Extent2D{scene_targets.Size().width, scene_targets.Size().height};
+        res.reduced_proxy = true;
+
+        if (eff_depth_id) {
+            auto& d_img = texture_cache.GetImage(eff_depth_id);
+            VideoCore::ImageViewInfo di{};
+            di.format = d_img.info.pixel_format;
+            const auto dp = scene_targets.Read(eff_depth_id, di,
+                                               vk::PipelineStageFlagBits2::eComputeShader,
+                                               vk::AccessFlagBits2::eShaderRead);
+            res.depth_image = dp.image;
+            res.depth_view = dp.view;
+            res.depth_layout = dp.layout;
+            res.depth_format = d_img.info.pixel_format;
+        }
+        return res;
+    }
+
+    const auto [guest_w, guest_h] = Scaled() ? SceneSize(iw, ih) : std::array<u32, 2>{iw, ih};
+    res.color_image = hdr_img.GetImage();
+    res.color_view = default_hdr_view;
+    res.color_layout = vk::ImageLayout::eShaderReadOnlyOptimal;
+    res.color_usage = hdr_img.usage_flags;
+    res.render_extent = vk::Extent2D{guest_w, guest_h};
+    if (eff_depth_id) {
+        auto& d_img = texture_cache.GetImage(eff_depth_id);
+        res.depth_image = d_img.GetImage();
+        res.depth_view = default_depth_view;
+        res.depth_layout = vk::ImageLayout::eShaderReadOnlyOptimal;
+        res.depth_format = d_img.info.pixel_format;
+    }
+    return res;
+}
+
+TemporalUpscaler::PrePostHdrResult TemporalUpscaler::RunPrePostHdr(
+    VideoCore::ImageId hdr_id, vk::Image src_img, vk::ImageView src_view,
+    vk::ImageLayout src_layout, vk::Extent2D src_extent, vk::ImageUsageFlags src_usage,
+    bool src_is_guest_hdr, VideoCore::ImageId out_id, vk::Format out_format,
+    vk::Extent2D out_extent_guest) {
+    PrePostHdrResult result{};
+    if (!WantsPrePostHdr() || !hdr_id || !src_img || !src_view || !camera_motion.Depth()) {
+        return result;
+    }
+    auto& hdr_guest = texture_cache.GetImage(hdr_id);
+    auto& depth = texture_cache.GetImage(camera_motion.Depth());
+    if (hdr_guest.info.pixel_format != vk::Format::eR16G16B16A16Sfloat) {
+        return result;
+    }
+    const u32 ow = Scaled() ? target_width : hdr_guest.info.size.width;
+    const u32 oh = Scaled() ? target_height : hdr_guest.info.size.height;
+    u32 w = src_extent.width;
+    u32 h = src_extent.height;
+    const bool reduced_proxy = !scaled_session && scene_targets.Reduced() &&
+                               scene_targets.EligibleScene(hdr_guest) &&
+                               scene_targets.EligibleScene(depth);
+    if (scaled_session && depth_blit) {
+        const auto req = SceneResolution::ForPreset(applied_preset, {ow, oh});
+        if (req.width > 0 && req.height > 0 && req.width <= src_extent.width &&
+            req.height <= src_extent.height) {
+            w = req.width;
+            h = req.height;
+        }
+    }
+    if (w == 0 || h == 0 || ow == 0 || oh == 0 || w > ow || h > oh) {
+        return result;
+    }
+    if (!EnsureResources(w, h, ow, oh, /*hdr=*/true)) {
+        failed = true;
+        return result;
+    }
+
+    GpuProfiler::HudMarkPass(&scheduler, BbStats::GpuSub_Aa_Upscaler);
+    if (auto* profiler = GpuProfiler::Get()) {
+        const auto eff = BbSettings::EffectiveUpscaler();
+        const char* label =
+            eff == BbSettings::UpscalerDlss     ? "upscaler RunPrePostHdr (DLSS/DLAA) [Linear HDR]"
+            : eff == BbSettings::UpscalerFsr411 ? "upscaler RunPrePostHdr (FSR 4.1.1) [Linear HDR]"
+            : eff == BbSettings::UpscalerFsr4   ? "upscaler RunPrePostHdr (FSR 4) [Linear HDR]"
+            : eff == BbSettings::UpscalerTaa    ? "upscaler RunPrePostHdr (TAA) [Linear HDR]"
+                                                : "upscaler RunPrePostHdr (FSR 3.1) [Linear HDR]";
+        profiler->Mark(0xF5A2'0000ull ^ std::hash<std::string_view>{}(label),
+                       [label] { return std::string{label}; });
+    }
+
+    scheduler.EndRendering();
+    const auto depth_format = depth.info.pixel_format;
+    vk::Image input_color = src_img;
+    vk::ImageView input_color_view = src_view;
+    vk::ImageUsageFlags input_color_usage = src_usage;
+    vk::Image input_depth = depth.GetImage();
+    vk::ImageView input_depth_view{};
+    vk::ImageUsageFlags input_depth_usage = depth.usage_flags;
+    u32 source_width = src_extent.width;
+    u32 source_height = src_extent.height;
+
+    const auto record_barrier = [&](vk::Image image, vk::ImageAspectFlags aspect,
+                                    vk::ImageLayout old_layout, vk::PipelineStageFlags2 src_stage,
+                                    vk::AccessFlags2 src_access, vk::ImageLayout new_layout,
+                                    vk::PipelineStageFlags2 dst_stage, vk::AccessFlags2 dst_access) {
+        const vk::ImageMemoryBarrier2 b{
+            .srcStageMask = src_stage,
+            .srcAccessMask = src_access,
+            .dstStageMask = dst_stage,
+            .dstAccessMask = dst_access,
+            .oldLayout = old_layout,
+            .newLayout = new_layout,
+            .image = image,
+            .subresourceRange = {aspect, 0, 1, 0, 1},
+        };
+        scheduler.Record([b](vk::CommandBuffer cmdbuf) {
+            cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &b});
+        });
+    };
+
+    if (reduced_proxy) {
+        VideoCore::ImageViewInfo di{};
+        di.format = depth_format;
+        const auto dp = scene_targets.Read(camera_motion.Depth(), di);
+        input_depth = dp.image;
+        input_depth_view = dp.view;
+        input_depth_usage = dp.usage;
+        if (src_is_guest_hdr) {
+            VideoCore::ImageViewInfo ci{};
+            ci.format = hdr_guest.info.pixel_format;
+            const auto cp = scene_targets.Read(hdr_id, ci);
+            input_color = cp.image;
+            input_color_view = cp.view;
+            input_color_usage = cp.usage;
+        } else if (src_layout != vk::ImageLayout::eGeneral) {
+            record_barrier(input_color, vk::ImageAspectFlagBits::eColor, src_layout,
+                           vk::PipelineStageFlagBits2::eComputeShader,
+                           vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eShaderRead,
+                           vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eAllCommands,
+                           vk::AccessFlagBits2::eShaderRead);
+        }
+        source_width = w;
+        source_height = h;
+    } else if (w != src_extent.width || h != src_extent.height) {
+        EnsureLiveInputResources(w, h, vk::Format::eR16G16B16A16Sfloat, depth_format);
+        runtime.Transit(&depth, vk::ImageLayout::eTransferSrcOptimal,
+                        vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead);
+        if (src_is_guest_hdr) {
+            runtime.Transit(&hdr_guest, vk::ImageLayout::eTransferSrcOptimal,
+                            vk::PipelineStageFlagBits2::eTransfer,
+                            vk::AccessFlagBits2::eTransferRead);
+        }
+        runtime.FlushBarriers();
+        if (!src_is_guest_hdr) {
+            record_barrier(src_img, vk::ImageAspectFlagBits::eColor, src_layout,
+                           vk::PipelineStageFlagBits2::eComputeShader,
+                           vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eShaderRead,
+                           vk::ImageLayout::eTransferSrcOptimal,
+                           vk::PipelineStageFlagBits2::eTransfer,
+                           vk::AccessFlagBits2::eTransferRead);
+        }
+        const vk::Image src_c = src_img;
+        const vk::Image src_d = depth.GetImage();
+        const vk::Image dst_c = vk::Image(live_color_image);
+        const vk::Image dst_d = vk::Image(live_depth_image);
+        const auto d_aspect =
+            vk::ImageAspectFlagBits::eDepth |
+            (depth_format == vk::Format::eD32SfloatS8Uint ? vk::ImageAspectFlagBits::eStencil
+                                                          : vk::ImageAspectFlags{});
+        const vk::ImageBlit blit_c{
+            .srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+            .srcOffsets = std::array{vk::Offset3D{0, 0, 0},
+                                     vk::Offset3D{s32(src_extent.width), s32(src_extent.height), 1}},
+            .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+            .dstOffsets = std::array{vk::Offset3D{0, 0, 0}, vk::Offset3D{s32(w), s32(h), 1}},
+        };
+        const vk::ImageBlit blit_d{
+            .srcSubresource = {vk::ImageAspectFlagBits::eDepth, 0, 0, 1},
+            .srcOffsets = std::array{vk::Offset3D{0, 0, 0},
+                                     vk::Offset3D{s32(src_extent.width), s32(src_extent.height), 1}},
+            .dstSubresource = {vk::ImageAspectFlagBits::eDepth, 0, 0, 1},
+            .dstOffsets = std::array{vk::Offset3D{0, 0, 0}, vk::Offset3D{s32(w), s32(h), 1}},
+        };
+        scheduler.Record([src_c, src_d, dst_c, dst_d, d_aspect, blit_c, blit_d](vk::CommandBuffer cmd) {
+            const std::array<vk::ImageMemoryBarrier2, 2> pre{{
+                {.srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                 .srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+                 .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+                 .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                 .oldLayout = vk::ImageLayout::eUndefined,
+                 .newLayout = vk::ImageLayout::eTransferDstOptimal,
+                 .image = dst_c,
+                 .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}},
+                {.srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                 .srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+                 .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+                 .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                 .oldLayout = vk::ImageLayout::eUndefined,
+                 .newLayout = vk::ImageLayout::eTransferDstOptimal,
+                 .image = dst_d,
+                 .subresourceRange = {d_aspect, 0, 1, 0, 1}},
+            }};
+            cmd.pipelineBarrier2({.imageMemoryBarrierCount = 2, .pImageMemoryBarriers = pre.data()});
+            cmd.blitImage(src_c, vk::ImageLayout::eTransferSrcOptimal, dst_c,
+                          vk::ImageLayout::eTransferDstOptimal, blit_c, vk::Filter::eLinear);
+            cmd.blitImage(src_d, vk::ImageLayout::eTransferSrcOptimal, dst_d,
+                          vk::ImageLayout::eTransferDstOptimal, blit_d, vk::Filter::eNearest);
+            const std::array<vk::ImageMemoryBarrier2, 2> post{{
+                {.srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+                 .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                 .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                 .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+                 .oldLayout = vk::ImageLayout::eTransferDstOptimal,
+                 .newLayout = vk::ImageLayout::eGeneral,
+                 .image = dst_c,
+                 .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}},
+                {.srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+                 .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                 .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                 .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+                 .oldLayout = vk::ImageLayout::eTransferDstOptimal,
+                 .newLayout = vk::ImageLayout::eGeneral,
+                 .image = dst_d,
+                 .subresourceRange = {d_aspect, 0, 1, 0, 1}},
+            }};
+            cmd.pipelineBarrier2({.imageMemoryBarrierCount = 2, .pImageMemoryBarriers = post.data()});
+        });
+        input_color = dst_c;
+        input_color_view = *live_color_view;
+        input_color_usage = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled |
+                            vk::ImageUsageFlagBits::eTransferDst |
+                            vk::ImageUsageFlagBits::eTransferSrc;
+        input_depth = dst_d;
+        input_depth_view = *live_depth_view;
+        input_depth_usage = vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferDst |
+                            vk::ImageUsageFlagBits::eTransferSrc |
+                            vk::ImageUsageFlagBits::eDepthStencilAttachment;
+        source_width = w;
+        source_height = h;
+    } else {
+        input_depth_view = CachedView(depth, depth_format, vk::ImageAspectFlagBits::eDepth);
+        runtime.Transit(&depth, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eComputeShader,
+                        vk::AccessFlagBits2::eShaderRead);
+        if (src_is_guest_hdr) {
+            input_color_view = CachedView(hdr_guest, vk::Format::eR16G16B16A16Sfloat,
+                                          vk::ImageAspectFlagBits::eColor);
+            runtime.Transit(&hdr_guest, vk::ImageLayout::eGeneral,
+                            vk::PipelineStageFlagBits2::eComputeShader,
+                            vk::AccessFlagBits2::eShaderRead);
+            source_width = hdr_guest.info.size.width;
+            source_height = hdr_guest.info.size.height;
+        }
+        runtime.FlushBarriers();
+        if (!src_is_guest_hdr && src_layout != vk::ImageLayout::eGeneral) {
+            record_barrier(input_color, vk::ImageAspectFlagBits::eColor, src_layout,
+                           vk::PipelineStageFlagBits2::eComputeShader,
+                           vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eShaderRead,
+                           vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eAllCommands,
+                           vk::AccessFlagBits2::eShaderRead);
+        }
+    }
+
+    const auto all = vk::PipelineStageFlagBits2::eAllCommands;
+    const auto rw = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite;
+    record_barrier(vk::Image(motion_image), vk::ImageAspectFlagBits::eColor,
+                   vk::ImageLayout::eUndefined, all, vk::AccessFlagBits2::eNone,
+                   vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eComputeShader,
+                   vk::AccessFlagBits2::eShaderWrite);
+    record_barrier(vk::Image(output_image), vk::ImageAspectFlagBits::eColor,
+                   vk::ImageLayout::eUndefined, all, vk::AccessFlagBits2::eNone,
+                   vk::ImageLayout::eGeneral, all, rw);
+
+    camera_motion.RecordMotion(input_depth_view, *motion_view, w, h);
+    record_barrier(vk::Image(motion_image), vk::ImageAspectFlagBits::eColor,
+                   vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eComputeShader,
+                   vk::AccessFlagBits2::eShaderWrite, vk::ImageLayout::eGeneral, all,
+                   vk::AccessFlagBits2::eShaderRead);
+
+    const bool has_reactive = ReactiveOn() && (mask_ready || RecordReactive(input_color_view));
+
+    const auto now = std::chrono::steady_clock::now();
+    float frame_ms = std::chrono::duration<float, std::milli>(now - last_frame).count();
+    if (frame_ms <= 0.0f || frame_ms > 200.0f) {
+        frame_ms = 16.6f;
+    }
+    last_frame = now;
+    const bool frame_reset = reset;
+
+    bool dispatched = false;
+    const int eff_up = BbSettings::EffectiveUpscaler();
+    if (eff_up == BbSettings::UpscalerTaa || UseFsr4() || UseDlss()) {
+        const auto cmdbuf = scheduler.CommandBuffer();
+        if (eff_up == BbSettings::UpscalerTaa) {
+            RecordTaa(cmdbuf, input_color_view, input_depth_view);
+            dispatched = true;
+        } else if (UseDlss()) {
+            fsr4_linear_frame = false;
+            dispatched = RecordDlss(
+                cmdbuf,
+                {input_color, input_color_view, vk::Format::eR16G16B16A16Sfloat,
+                 vk::ImageAspectFlagBits::eColor, source_width, source_height},
+                {input_depth, input_depth_view, depth_format, vk::ImageAspectFlagBits::eDepth,
+                 source_width, source_height},
+                w, h, ow, oh, frame_ms, /*hdr=*/true);
+        } else {
+            // Native Linear HDR into FSR 4 / 4.1.1: skips both sRGB decode and re-encode passes!
+            fsr4_linear_frame = false;
+            dispatched = RecordFsr4(cmdbuf,
+                                    {input_color, input_color_view, source_width, source_height},
+                                    {input_depth, input_depth_view, source_width, source_height},
+                                    w, h, ow, oh, frame_ms);
+            if (dispatched && has_reactive) {
+                RecordFsr4Reactive(cmdbuf, input_color_view, w, h, ow, oh);
+            }
+        }
+        if (dispatched && eff_up != BbSettings::UpscalerTaa) {
+            ExtraSharpen(vk::Image(output_image), false, ow, oh);
+        }
+    } else {
+        const auto& settings = BbSettings::Get();
+        FfxVkPortableUpscaleDispatchInfo info{};
+        info.structSize = sizeof(info);
+        info.color = Describe(input_color, vk::Format::eR16G16B16A16Sfloat, source_width,
+                              source_height, input_color_usage, vk::ImageAspectFlagBits::eColor,
+                              FFX_VK_PORTABLE_RESOURCE_STATE_GENERIC_READ);
+        info.depth = Describe(input_depth, depth_format, source_width, source_height,
+                              input_depth_usage, vk::ImageAspectFlagBits::eDepth,
+                              FFX_VK_PORTABLE_RESOURCE_STATE_GENERIC_READ);
+        info.motionVectors = Describe(
+            vk::Image(motion_image), vk::Format::eR16G16Sfloat, w, h,
+            vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled,
+            vk::ImageAspectFlagBits::eColor, FFX_VK_PORTABLE_RESOURCE_STATE_GENERIC_READ);
+        info.output = Describe(
+            vk::Image(output_image), vk::Format::eR16G16B16A16Sfloat, ow, oh,
+            vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled |
+                vk::ImageUsageFlagBits::eTransferSrc,
+            vk::ImageAspectFlagBits::eColor, FFX_VK_PORTABLE_RESOURCE_STATE_UNORDERED_ACCESS);
+        info.exposure.structSize = sizeof(info.exposure);
+        info.reactiveMask.structSize = sizeof(info.reactiveMask);
+        if (has_reactive) {
+            info.reactiveMask = Describe(
+                vk::Image(reactive_image), vk::Format::eR8Unorm, w, h,
+                vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled,
+                vk::ImageAspectFlagBits::eColor, FFX_VK_PORTABLE_RESOURCE_STATE_GENERIC_READ);
+        }
+        info.transparencyAndCompositionMask.structSize =
+            sizeof(info.transparencyAndCompositionMask);
+        const float sign = BbToggle::Disabled(1u << 26) ? -1.0f : 1.0f;
+        info.jitterOffset = {sign * jitter[0], sign * jitter[1]};
+        info.motionVectorScale = {1.0f, 1.0f};
+        info.renderSize = {w, h};
+        info.outputSize = {ow, oh};
+        info.frameTimeMilliseconds = frame_ms;
+        info.preExposure = 1.0f;
+        info.cameraNear = camera_motion.Near();
+        info.cameraFar = 3000.0f;
+        info.cameraVerticalFovRadians = camera_motion.VerticalFov();
+        info.viewSpaceToMeters = 1.0f;
+        info.sharpness = std::min(settings.sharpness.load(), 1.0f);
+        info.enableSharpening = settings.sharpen ? VK_TRUE : VK_FALSE;
+        info.reset = reset ? VK_TRUE : VK_FALSE;
+        info.frameId = frame_id++;
+
+        FfxVkPortableUpscaleCreateInfo create_info{};
+        create_info.structSize = sizeof(create_info);
+        create_info.flags =
+            FFX_VK_PORTABLE_CONTEXT_HDR_COLOR_INPUT | FFX_VK_PORTABLE_CONTEXT_AUTO_EXPOSURE;
+        create_info.maxRenderSize = {w, h};
+        create_info.maxOutputSize = {ow, oh};
+        auto checked = info;
+        checked.commandBuffer = reinterpret_cast<VkCommandBuffer>(uintptr_t{1});
+        if (const u64 issues = ffxVkPortableValidateUpscaleDispatchInfo(&create_info, &checked)) {
+            PrintIssues("prepost hdr dispatch", issues);
+            failed = true;
+        } else {
+            scheduler.Record([this, ctx = context, info](vk::CommandBuffer cmdbuf) mutable {
+                info.commandBuffer = cmdbuf;
+                if (ffxVkPortableUpscaleContextRecordDispatch(ctx, &info) != FFX_VK_PORTABLE_OK) {
+                    std::printf("Upscaler: FSR 3 Linear HDR dispatch failed\n");
+                    dispatch_failed.store(true, std::memory_order_relaxed);
+                }
+            });
+            dispatched = true;
+            ExtraSharpen(vk::Image(output_image), false, ow, oh);
+        }
+    }
+
+    if (!dispatched) {
+        return result;
+    }
+
+    reset = false;
+    dispatched_last_frame = true;
+    done_this_frame = true;
+    hdr_prepost_done = true;
+
+    // Transition reconstructed Linear HDR output for downstream NativePostFX compute/fragment reads.
+    record_barrier(vk::Image(output_image), vk::ImageAspectFlagBits::eColor,
+                   vk::ImageLayout::eGeneral, all, rw, vk::ImageLayout::eShaderReadOnlyOptimal,
+                   vk::PipelineStageFlagBits2::eComputeShader |
+                       vk::PipelineStageFlagBits2::eFragmentShader,
+                   vk::AccessFlagBits2::eShaderRead);
+
+    // If output_extent != guest out_image (upscaling) or FrameGen needs ui_image, let NativePostFX
+    // Tonemap render directly into ui_image at full output resolution (zero extra blit!).
+    const bool fg_wanted = frame_generation && frame_generation->Wanted();
+    const bool need_ui_target =
+        Scaled() && (out_extent_guest.width != ow || out_extent_guest.height != oh || fg_wanted);
+    if (need_ui_target) {
+        EnsureUiResources(ow, oh, out_format, depth_format);
+        PrepareUiDepth(camera_motion.Depth());
+        record_barrier(vk::Image(ui_image), vk::ImageAspectFlagBits::eColor,
+                       vk::ImageLayout::eUndefined, all,
+                       vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+                       vk::ImageLayout::eColorAttachmentOptimal,
+                       vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+                       vk::AccessFlagBits2::eColorAttachmentWrite);
+        CaptureFrameGenScene(input_depth, depth_format, w, h, ow, oh, frame_ms, frame_reset);
+        ui_phase = true;
+        ui_in_place = false;
+        hudless_taken = false;
+        ui_color = out_id;
+        ui_depth = camera_motion.Depth();
+        mt_ui_color_id.store(out_id.index, std::memory_order_relaxed);
+        result.use_ui_target = true;
+        result.ui_image = vk::Image(ui_image);
+        result.ui_view = Mirror(vk::Image(ui_image), ui_views, out_format, {});
+    }
+
+    scheduler.BumpDescriptorStateEpoch();
+    result.executed = true;
+    result.image = vk::Image(output_image);
+    result.view = *output_view;
+    result.extent = vk::Extent2D{ow, oh};
+    return result;
 }
 
 bool TemporalUpscaler::EnsureResources(u32 w, u32 h, u32 ow, u32 oh, bool hdr) {
@@ -757,7 +1226,7 @@ bool TemporalUpscaler::EnsureResources(u32 w, u32 h, u32 ow, u32 oh, bool hdr) {
                vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled);
     fsr4_linear_view.reset();
     fsr4_linear_image = VideoCore::HostImage{};
-    if (use_fsr4) {
+    if (UseFsr4() && !hdr) {
         make_image(fsr4_linear_image, fsr4_linear_view, vk::Format::eR16G16B16A16Sfloat,
                    vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled);
     }
@@ -1805,7 +2274,7 @@ void TemporalUpscaler::OnDraw(u64 vs_hash, VideoCore::ImageId color,
         !FrameCapture::IsDisplayBuffer(image.info.guest_address);
     switch (UiComposition::Choose(Scaled(), ui_draw,
                                   camera_motion.Ready() && ldr_target == color,
-                                  Active() && !failed)) {
+                                  Active() && !failed && !hdr_prepost_done)) {
     case UiComposition::Background::None:
         return;
     case UiComposition::Background::Temporal:
@@ -1950,7 +2419,7 @@ void TemporalUpscaler::PrepareUiDepth(VideoCore::ImageId depth_id) {
 
 void TemporalUpscaler::RunUiOnly(VideoCore::ImageId color_id, VideoCore::ImageId depth_id) {
     const auto& color = texture_cache.GetImage(color_id);
-    const bool smaa_active = color_id == ldr_target && SmaaWanted();
+    const bool smaa_active = !hdr_prepost_done && color_id == ldr_target && SmaaWanted();
     const bool proxy_scene = camera_motion.Depth() && scene_targets.Reduced() &&
                              scene_targets.EligibleScene(color);
     const auto edges = UiComposition::ScreenEdges(target_width, target_height);
@@ -1960,14 +2429,16 @@ void TemporalUpscaler::RunUiOnly(VideoCore::ImageId color_id, VideoCore::ImageId
         !depth_id || (texture_cache.GetImage(depth_id).info.size.width == target_width &&
                       texture_cache.GetImage(depth_id).info.size.height == target_height);
 
-    // Zero-copy in-place UI composition when upscaler is Off and the guest scene target is
-    // already at full output resolution (e.g. 2560x1440->2560x1440 or 3840x2160->3840x2160):
+    // Zero-copy in-place UI composition when upscaler is Off (or already ran in Linear HDR before
+    // NativePostFX) and the guest scene target is already at full output resolution:
     // skips ui_image/ui_depth_image allocations, PrepareUiDepth, and the redundant full-screen
     // 1:1 color blit while still scaling Scaleform's 1920x1080 viewport/scissor to output size.
     if (color.info.size.width == target_width && color.info.size.height == target_height &&
         depth_matches && !smaa_active && !proxy_scene && !screen_only && !fg_wanted) {
         GpuProfiler::HudMarkPass(&scheduler, BbStats::GpuSub_Ui_ScaleformHud);
-        reset = true;
+        if (!hdr_prepost_done) {
+            reset = true;
+        }
         done_this_frame = ui_phase = ui_in_place = true;
         ui_width = target_width;
         ui_height = target_height;
@@ -2070,7 +2541,9 @@ void TemporalUpscaler::RunUiOnly(VideoCore::ImageId color_id, VideoCore::ImageId
         barrier.newLayout = vk::ImageLayout::eGeneral;
         cmd.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &barrier});
     });
-    reset = true; // returning to 3D must not reuse history from before a menu/loading screen
+    if (!hdr_prepost_done) {
+        reset = true; // returning to 3D must not reuse history from before a menu/loading screen
+    }
     done_this_frame = ui_phase = true;
     ui_color = color_id;
     ui_depth = depth_id;
@@ -2799,7 +3272,7 @@ void TemporalUpscaler::OnDisplayPassStart(VAddr address) {
         return !(value && value[0] == '0');
     }();
     if (finish_without_ui && Scaled() && !ui_phase && ldr_target && camera_motion.Ready()) {
-        if (Active() && !failed) {
+        if (Active() && !failed && !hdr_prepost_done) {
             RunScaled();
         }
         if (!ui_phase) {

@@ -163,6 +163,8 @@
 #include "bbgpu/shaders/ps_8a6c7657_frag.h"
 #include "bbgpu/shaders/ps_6720ae0d_frag.h"
 #include "bbgpu/shaders/ps_c31bd920_frag.h"
+#include "bbgpu/shaders/ps_83da8467_frag.h"
+#include "bbgpu/shaders/ps_c45c51cb_frag.h"
 
 namespace Shader::Backend::SPIRV {
 
@@ -234,7 +236,7 @@ struct NativeShaderCandidate {
     const char* label;
 };
 
-constexpr std::array<NativeShaderCandidate, 150> kNativeRegistry{{
+constexpr std::array<NativeShaderCandidate, 152> kNativeRegistry{{
     {0x000000000f61fd27ull, PS_0F61FD27_VSM_BLUR_FRAG, "ps_0f61fd27_vsm_blur"},
     {0x000000001ae03d75ull, PS_1AE03D75_VSM_MOMENT_CLDIST_FRAG, "ps_1ae03d75_vsm_moment_cldist"},
     {0x000000001ae03d75ull, PS_1AE03D75_VSM_MOMENT_NOCLIP_FRAG, "ps_1ae03d75_vsm_moment_noclip"},
@@ -385,6 +387,8 @@ constexpr std::array<NativeShaderCandidate, 150> kNativeRegistry{{
     {0x000000008a6c7657ull, PS_8A6C7657_FRAG, "ps_8a6c7657_fwd_pbr_csm"},
     {0x000000006720ae0dull, PS_6720AE0D_FRAG, "ps_6720ae0d_fwd_lm_sss_csm"},
     {0x00000000c31bd920ull, PS_C31BD920_FRAG, "ps_c31bd920_fwd_lm_ibl_csm"},
+    {0x0000000083da8467ull, PS_83DA8467_FRAG, "ps_83da8467_ssao_reproj"},
+    {0x00000000c45c51cbull, PS_C45C51CB_FRAG, "ps_c45c51cb_ssao_upscale"},
 }};
 
 struct DescSlot {
@@ -1016,6 +1020,11 @@ bool TryReplaceWithNativeShader(u64 pgm_hash, const std::vector<u32>& ref_spv,
     if (!ExtractInterfaceSig(ref_spv, ref_sig) || ref_sig.has_per_vertex_input) {
         return false;
     }
+    // ps_83da8467 perms _0/_1 are generic unnormalized-UV + sRGB-decode fallbacks; only replace
+    // the live runtime linear normalized-UV perm (_2, has_image_query_size == false).
+    if (pgm_hash == 0x0000000083da8467ull && ref_sig.has_image_query_size) {
+        return false;
+    }
     const BgraMode bgra_mode = ExpectedBgraMode(pgm_hash);
     if (ref_sig.exec_model == kExecModelFragment && ref_sig.out_loc_mask == 1ull &&
         ref_sig.has_frag0_swizzle) {
@@ -1178,7 +1187,7 @@ bool TryReplaceWithNativeShader(u64 pgm_hash, const std::vector<u32>& ref_spv,
             return false;
         }
         if ((pgm_hash == 0x000000002eacb983ull || pgm_hash == 0x000000008c13b984ull ||
-             pgm_hash == 0x00000000d3c8bb21ull) &&
+             pgm_hash == 0x00000000d3c8bb21ull || pgm_hash == 0x00000000c45c51cbull) &&
             !SpecializeConstantId0(out_spv, ref_sig.has_image_query_size ? 1u : 0u)) {
             return false;
         }

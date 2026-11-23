@@ -9,6 +9,7 @@
 
 #include "render/raster_internal.h"
 #include "render/vk_native_postfx.h"
+#include "render/vk_ssr_spd.h"
 #include "render/vk_vsm_blur_batcher.h"
 #include "textures/direct_textures.h"
 #include "../../dantelion_gx/include/gx_direct_vulkan.h"
@@ -1877,6 +1878,24 @@ void Rasterizer::DirectNativePostProcess(const BbCp::DirectVk::NativePostProcess
         FlushPendingHleCopies(*this);
     }
     if (native_postfx->Execute(args, upscaler.get())) {
+        bound_graphics_pipeline = nullptr;
+        bound_graphics_epoch = 0;
+        bound_bucket_pipeline.fill(nullptr);
+        bound_bucket_epoch.fill(0);
+    }
+}
+
+void Rasterizer::DirectGenerateMipsSpd(const BbCp::DirectVk::GenerateMipsSpdArgs& args) {
+    if (!ssr_spd) {
+        return;
+    }
+    if (!pending_tex_copies.empty()) {
+        FlushPendingTextureRegionCopies();
+    }
+    if (HasPendingHleCopies()) {
+        FlushPendingHleCopies(*this);
+    }
+    if (ssr_spd->Execute(args)) {
         bound_graphics_pipeline = nullptr;
         bound_graphics_epoch = 0;
         bound_bucket_pipeline.fill(nullptr);

@@ -43,6 +43,7 @@ class MemoryManager;
 
 namespace BbCp::DirectVk {
 struct NativePostProcessArgs;
+struct GenerateMipsSpdArgs;
 }
 
 namespace Vulkan {
@@ -364,6 +365,7 @@ public:
     void DirectEliminateFastClear(const DirectEliminateFastClearArgs& args);
     void DirectResolveColor(const DirectResolveColorArgs& args);
     void DirectNativePostProcess(const BbCp::DirectVk::NativePostProcessArgs& args);
+    void DirectGenerateMipsSpd(const BbCp::DirectVk::GenerateMipsSpdArgs& args);
     void DirectUploadTextureSubresource(const DirectUploadTextureArgs& args);
     void DirectClearDepthStencil(const DirectClearDepthStencilArgs& args);
     /// bbport: whether FillBuffer/CopyBuffer into guest memory at `dst` may write it on the CPU
@@ -1628,6 +1630,7 @@ private:
     std::unique_ptr<class NativePostFx> native_postfx; ///< Remaster v2: native Vulkan 1.3 PostFX (A/B vs Yebis2)
     std::unique_ptr<class VsmBlurBatcher> vsm_blur_batcher; ///< Pack #4 v2: Deferred Single-Wave Compute VSM blur batcher
     std::unique_ptr<class BilateralBlurCompute> bilateral_blur; ///< Pack #3: Compute + LDS 12-tap bilateral shadow blur (ps_11ffdfb5)
+    std::unique_ptr<class SsrSpdCompute> ssr_spd; ///< Phase 2 (v1.2.4): Compute SPD (LDS) for SSR glossy mips 1..5
     std::unique_ptr<class GpuTimestamps> timestamps;
     std::unique_ptr<class IndirectGuard> indirect_guard; ///< stage B only (lazily)
     /// Submissions (prepared draws) kept alive until stage B reaches the position.

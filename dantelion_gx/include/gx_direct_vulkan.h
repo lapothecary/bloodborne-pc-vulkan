@@ -743,6 +743,8 @@ enum class Op : uint32_t {
     ExecuteSecondaryCmds     = 35u,
     // Remaster v2: Native Vulkan 1.3 Post-Process pipeline (replaces Yebis2 black-box when enabled)
     NativePostProcess        = 36u,
+    // Phase 2 (v1.2.4): Single-Pass Downsampler (SPD) in LDS for SSR glossy mip pyramid
+    GenerateMipsSpd          = 37u,
 };
 
 // Tag stored in `CopyRegion::reserved` / `CopyRecord::reserved` when the C++20 engine itself
@@ -1166,6 +1168,27 @@ inline bool IsTrueBlackEnabled() noexcept {
 
 inline bool EmitNativePostProcess(void* dcb_raw, const NativePostProcessArgs& args) noexcept {
     return EmitFixedPacket<Op::NativePostProcess>(dcb_raw, args);
+}
+
+struct GenerateMipsSpdArgs {
+    uint32_t tex_tsharp[8]; // 32 B: full Gcn::Image T# of mipmapped target
+    uint32_t base_width;    // 4 B: mip 0 width
+    uint32_t base_height;   // 4 B: mip 0 height
+    uint32_t num_mips;      // 4 B: total mip levels (e.g. 6 -> generates mips 1..5)
+    uint32_t flags;         // 4 B: reserved (0)
+};
+static_assert(sizeof(GenerateMipsSpdArgs) == 48, "GenerateMipsSpdArgs is 12 dwords");
+
+inline bool IsSsrSpdEnabled() noexcept {
+    static const bool s_enabled = []() noexcept {
+        const char* env = std::getenv("BB_SSR_SPD");
+        return !(env && env[0] == '0');
+    }();
+    return s_enabled;
+}
+
+inline bool EmitGenerateMipsSpd(void* dcb_raw, const GenerateMipsSpdArgs& args) noexcept {
+    return EmitFixedPacket<Op::GenerateMipsSpd>(dcb_raw, args);
 }
 
 // ============================================================================

@@ -87,8 +87,14 @@ struct BloomDownPush {
     float luma_gamma;
     float remap_factor;
     u32 flags;
+    float min_log_lum;
+    float inv_log_lum_range;
+    float meter_min_x;
+    float meter_min_y;
+    float meter_max_x;
+    float meter_max_y;
 };
-static_assert(sizeof(BloomDownPush) == 44);
+static_assert(sizeof(BloomDownPush) == 68);
 
 struct BloomUpPush {
     u32 dst_w;
@@ -391,9 +397,9 @@ bool NativePostFx::EnsureInit() {
         device.destroyShaderModule(cs);
     }
 
-    // 5b. Compute pipeline 3: FP16 13-tap Jimenez Bloom Downsample (prefilter + Karis + Fire Heat Haze mask).
+    // 5b. Compute pipeline 3: FP16 13-tap Jimenez Bloom Downsample (prefilter + Karis + Fire Heat Haze + Fused AutoExp Hist).
     {
-        const std::array<vk::DescriptorSetLayoutBinding, 6> bindings{{
+        const std::array<vk::DescriptorSetLayoutBinding, 7> bindings{{
             {.binding = 0,
              .descriptorType = vk::DescriptorType::eSampledImage,
              .descriptorCount = 1,
@@ -416,6 +422,10 @@ bool NativePostFx::EnsureInit() {
              .stageFlags = vk::ShaderStageFlagBits::eCompute},
             {.binding = 5,
              .descriptorType = vk::DescriptorType::eSampledImage,
+             .descriptorCount = 1,
+             .stageFlags = vk::ShaderStageFlagBits::eCompute},
+            {.binding = 6,
+             .descriptorType = vk::DescriptorType::eStorageBuffer,
              .descriptorCount = 1,
              .stageFlags = vk::ShaderStageFlagBits::eCompute},
         }};
@@ -493,9 +503,9 @@ bool NativePostFx::EnsureInit() {
         device.destroyShaderModule(cs);
     }
 
-    // 5d. Compute pipeline 5: Half-res Combined Camera + Object Velocity Map.
+    // 5d. Compute pipeline 5: Half-res Combined Camera + Object Velocity Map + Tile-Max Reduction.
     {
-        const std::array<vk::DescriptorSetLayoutBinding, 5> bindings{{
+        const std::array<vk::DescriptorSetLayoutBinding, 6> bindings{{
             {.binding = 0,
              .descriptorType = vk::DescriptorType::eSampledImage,
              .descriptorCount = 1,
@@ -514,6 +524,10 @@ bool NativePostFx::EnsureInit() {
              .stageFlags = vk::ShaderStageFlagBits::eCompute},
             {.binding = 4,
              .descriptorType = vk::DescriptorType::eUniformBuffer,
+             .descriptorCount = 1,
+             .stageFlags = vk::ShaderStageFlagBits::eCompute},
+            {.binding = 5,
+             .descriptorType = vk::DescriptorType::eStorageImage,
              .descriptorCount = 1,
              .stageFlags = vk::ShaderStageFlagBits::eCompute},
         }};
@@ -539,9 +553,9 @@ bool NativePostFx::EnsureInit() {
         device.destroyShaderModule(cs);
     }
 
-    // 5e. Compute pipeline 6: Full-res 16-tap Bilateral IGN Motion Blur.
+    // 5e. Compute pipeline 6: Full-res 16-tap Bilateral IGN Motion Blur (with 3x3 Tile Early-Out).
     {
-        const std::array<vk::DescriptorSetLayoutBinding, 4> bindings{{
+        const std::array<vk::DescriptorSetLayoutBinding, 5> bindings{{
             {.binding = 0,
              .descriptorType = vk::DescriptorType::eSampledImage,
              .descriptorCount = 1,
@@ -556,6 +570,10 @@ bool NativePostFx::EnsureInit() {
              .stageFlags = vk::ShaderStageFlagBits::eCompute},
             {.binding = 3,
              .descriptorType = vk::DescriptorType::eStorageImage,
+             .descriptorCount = 1,
+             .stageFlags = vk::ShaderStageFlagBits::eCompute},
+            {.binding = 4,
+             .descriptorType = vk::DescriptorType::eSampledImage,
              .descriptorCount = 1,
              .stageFlags = vk::ShaderStageFlagBits::eCompute},
         }};
@@ -1414,8 +1432,11 @@ void NativePostFx::ExecuteHalfResSsgi(VideoCore::Image& hdr_image, vk::ImageView
 bool NativePostFx::EnsureMotionBlurTargets(u32 hdr_w, u32 hdr_h) {
     const u32 vel_w = std::max(hdr_w / 2u, 16u);
     const u32 vel_h = std::max(hdr_h / 2u, 16u);
-    if (mb_vel_img && mb_color_img && mb_vel_extent.width == vel_w &&
-        mb_vel_extent.height == vel_h && mb_color_extent.width == hdr_w &&
+    const u32 tile_w = (vel_w + 15u) / 16u;
+    const u32 tile_h = (vel_h + 15u) / 16u;
+    if (mb_vel_img && mb_tile_max_img && mb_color_img && mb_vel_extent.width == vel_w &&
+        mb_vel_extent.height == vel_h && mb_tile_extent.width == tile_w &&
+        mb_tile_extent.height == tile_h && mb_color_extent.width == hdr_w &&
         mb_color_extent.height == hdr_h) {
         return true;
     }
@@ -1445,6 +1466,27 @@ bool NativePostFx::EnsureMotionBlurTargets(u32 hdr_w, u32 hdr_h) {
     }));
     mb_vel_extent = vk::Extent2D{vel_w, vel_h};
 
+    mb_tile_max_view.reset();
+    mb_tile_max_img = VideoCore::HostImage(device, allocator);
+    mb_tile_max_img.Create(vk::ImageCreateInfo{
+        .imageType = vk::ImageType::e2D,
+        .format = vk::Format::eR32Sfloat,
+        .extent = {tile_w, tile_h, 1},
+        .mipLevels = 1,
+        .arrayLayers = 1,
+        .samples = vk::SampleCountFlagBits::e1,
+        .tiling = vk::ImageTiling::eOptimal,
+        .usage = vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eStorage,
+        .initialLayout = vk::ImageLayout::eUndefined,
+    });
+    mb_tile_max_view = Check<"create mb tile_max view">(device.createImageViewUnique({
+        .image = vk::Image(mb_tile_max_img),
+        .viewType = vk::ImageViewType::e2D,
+        .format = vk::Format::eR32Sfloat,
+        .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+    }));
+    mb_tile_extent = vk::Extent2D{tile_w, tile_h};
+
     mb_color_view.reset();
     mb_color_img = VideoCore::HostImage(device, allocator);
     mb_color_img.Create(vk::ImageCreateInfo{
@@ -1455,7 +1497,8 @@ bool NativePostFx::EnsureMotionBlurTargets(u32 hdr_w, u32 hdr_h) {
         .arrayLayers = 1,
         .samples = vk::SampleCountFlagBits::e1,
         .tiling = vk::ImageTiling::eOptimal,
-        .usage = vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eStorage,
+        .usage = vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eStorage |
+                 vk::ImageUsageFlagBits::eTransferSrc,
         .initialLayout = vk::ImageLayout::eUndefined,
     });
     mb_color_view = Check<"create mb color view">(device.createImageViewUnique({
@@ -1492,7 +1535,8 @@ bool NativePostFx::EnsureDofTargets(u32 hdr_w, u32 hdr_h) {
             .arrayLayers = 1,
             .samples = vk::SampleCountFlagBits::e1,
             .tiling = vk::ImageTiling::eOptimal,
-            .usage = vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eStorage,
+            .usage = vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eStorage |
+                     vk::ImageUsageFlagBits::eTransferSrc,
             .initialLayout = vk::ImageLayout::eUndefined,
         });
         view = Check<"create dof target view">(device.createImageViewUnique({
@@ -1657,16 +1701,15 @@ bool NativePostFx::Execute(const BbCp::DirectVk::NativePostProcessArgs& args,
         return false;
     }
 
-    // 4. Close any active guest dynamic render pass & transition images cleanly.
+    // 4. Close any active guest dynamic render pass & resolve Linear HDR Pre-Post AA/Upscaling.
     scheduler.EndRendering();
 
     const bool auto_exp_on = (args.flags & BbCp::DirectVk::kNativePostFlagAutoExposure) != 0u;
     const bool ca_on = (args.flags & BbCp::DirectVk::kNativePostFlagCa) != 0u;
     const bool true_black_on = (args.flags & BbCp::DirectVk::kNativePostFlagTrueBlack) != 0u;
     const bool reset_history = (args.flags & BbCp::DirectVk::kNativePostFlagResetHistory) != 0u;
-    const bool bloom_on = ((args.flags & BbCp::DirectVk::kNativePostFlagBloom) != 0u) &&
-                          (args.bloom_luminance > 1e-4f) &&
-                          EnsureBloomPyramid(hdr_extent.width, hdr_extent.height);
+    const bool bloom_flag_on =
+        ((args.flags & BbCp::DirectVk::kNativePostFlagBloom) != 0u) && (args.bloom_luminance > 1e-4f);
 
     // Step 3 & 4: Resolve Depth & Object Velocity (velWrap) when Motion Blur or DoF is enabled.
     const auto& settings = BbSettings::Get();
@@ -1729,12 +1772,72 @@ bool NativePostFx::Execute(const BbCp::DirectVk::NativePostProcessArgs& args,
         }
     }
 
+    // Phase 1 (v1.2.4): Linear HDR temporal AA / upscaling (DLAA/DLSS/FSR 3.1/FSR 4/TAA).
+    // - Case A (render == output, e.g. DLAA/NativeAA/TAA): runs FIRST on raw Linear HDR before
+    //   MotionBlur, DoF, Bloom, Fire Heat Haze, Tonemap & CA -> zero conflict between AA & PostFX.
+    // - Case B (render < output, e.g. DLSS/FSR Quality): MotionBlur & DoF run at render-res with
+    //   pixel-exact depth/vel, then upscaler reconstructs output-res Linear HDR before Bloom/Tonemap/CA.
+    const bool wants_prepost_hdr =
+        upscaler && upscaler->WantsPrePostHdr() &&
+        (hdr_image.info.pixel_format == vk::Format::eR16G16B16A16Sfloat);
+    vk::Image src_hdr_img = hdr_image.GetImage();
+    vk::ImageView src_hdr_view = *hdr_view_obj.image_view;
+    vk::ImageLayout src_hdr_layout = vk::ImageLayout::eShaderReadOnlyOptimal;
+    vk::ImageUsageFlags src_hdr_usage = hdr_image.usage_flags;
+    vk::Extent2D render_extent = hdr_extent;
+    vk::Extent2D post_aa_extent = hdr_extent;
+    vk::Extent2D final_out_extent = out_extent;
+    vk::ImageLayout depth_read_layout = vk::ImageLayout::eShaderReadOnlyOptimal;
+    bool reduced_proxy = false;
+    if (wants_prepost_hdr) {
+        const auto prepost_in =
+            upscaler->ResolvePrePostInput(hdr_id, src_hdr_view, depth_id, depth_view);
+        if (prepost_in.color_image && prepost_in.color_view && prepost_in.render_extent.width > 0u &&
+            prepost_in.render_extent.height > 0u) {
+            src_hdr_img = prepost_in.color_image;
+            src_hdr_view = prepost_in.color_view;
+            src_hdr_layout = prepost_in.color_layout;
+            src_hdr_usage = prepost_in.color_usage;
+            render_extent = prepost_in.render_extent;
+            post_aa_extent = prepost_in.output_extent;
+            final_out_extent = prepost_in.output_extent;
+            reduced_proxy = prepost_in.reduced_proxy;
+            if (reduced_proxy && prepost_in.depth_view) {
+                depth_view = prepost_in.depth_view;
+                depth_read_layout = prepost_in.depth_layout;
+            }
+        }
+    }
+
+    const bool prepost_before_mb_dof =
+        wants_prepost_hdr && (render_extent.width == post_aa_extent.width) &&
+        (render_extent.height == post_aa_extent.height);
+    const bool prepost_after_mb_dof = wants_prepost_hdr && !prepost_before_mb_dof;
+
+    TemporalUpscaler::PrePostHdrResult aa_res{};
+    if (prepost_before_mb_dof) {
+        aa_res = upscaler->RunPrePostHdr(hdr_id, src_hdr_img, src_hdr_view, src_hdr_layout,
+                                         render_extent, src_hdr_usage, /*src_is_guest_hdr=*/true,
+                                         out_id, out_image.info.pixel_format, out_extent);
+        if (aa_res.executed) {
+            src_hdr_img = aa_res.image;
+            src_hdr_view = aa_res.view;
+            src_hdr_layout = vk::ImageLayout::eShaderReadOnlyOptimal;
+            render_extent = aa_res.extent;
+            post_aa_extent = aa_res.extent;
+            final_out_extent = aa_res.extent;
+        } else {
+            post_aa_extent = hdr_extent;
+            final_out_extent = out_extent;
+        }
+    }
+
     const bool cam_moved = (args.flags & BbCp::DirectVk::kNativePostFlagCamMoved) != 0u;
     const bool obj_moved = (args.flags & BbCp::DirectVk::kNativePostFlagObjMoved) != 0u;
     const bool mb_cam_active = mb_wanted && (mb_cam_lvl > 0) && has_depth && cam_moved;
     const bool mb_obj_active = mb_wanted && (mb_obj_lvl > 0) && has_vel && obj_moved;
     const bool mb_active = (mb_cam_active || mb_obj_active || mb_debug_vis) &&
-                           EnsureMotionBlurTargets(hdr_extent.width, hdr_extent.height);
+                           EnsureMotionBlurTargets(render_extent.width, render_extent.height);
     // Pack #1 (#6 + #10): After >=2 consecutive static frames with neither camera nor object
     // motion, let Rasterizer skip the redundant 2-pass ps_abf92450 velocity dilation (which is
     // a mathematical no-op when v==0). Immediately cleared on any motion frame.
@@ -1751,13 +1854,15 @@ bool NativePostFx::Execute(const BbCp::DirectVk::NativePostProcessArgs& args,
         }
     }
     const bool dof_active =
-        dof_wanted && has_depth && EnsureDofTargets(hdr_extent.width, hdr_extent.height);
+        dof_wanted && has_depth && EnsureDofTargets(render_extent.width, render_extent.height);
 
-    runtime.Transit(&hdr_image, vk::ImageLayout::eShaderReadOnlyOptimal,
-                    vk::PipelineStageFlagBits2::eComputeShader |
-                        vk::PipelineStageFlagBits2::eFragmentShader,
-                    vk::AccessFlagBits2::eShaderRead);
-    if ((mb_active || dof_active) && has_depth && depth_id) {
+    if (!reduced_proxy && !(prepost_before_mb_dof && aa_res.executed)) {
+        runtime.Transit(&hdr_image, vk::ImageLayout::eShaderReadOnlyOptimal,
+                        vk::PipelineStageFlagBits2::eComputeShader |
+                            vk::PipelineStageFlagBits2::eFragmentShader,
+                        vk::AccessFlagBits2::eShaderRead);
+    }
+    if ((mb_active || dof_active) && has_depth && depth_id && !reduced_proxy) {
         auto& depth_image = texture_cache.GetImage(depth_id);
         runtime.Transit(&depth_image, vk::ImageLayout::eShaderReadOnlyOptimal,
                         vk::PipelineStageFlagBits2::eComputeShader,
@@ -1775,12 +1880,6 @@ bool NativePostFx::Execute(const BbCp::DirectVk::NativePostProcessArgs& args,
                         vk::PipelineStageFlagBits2::eFragmentShader,
                         vk::AccessFlagBits2::eShaderRead);
     }
-    if (VideoCore::True(out_image.flags & VideoCore::ImageFlagBits::DirectImmutable)) {
-        texture_cache.DemoteDirectImmutable(out_id);
-    }
-    runtime.Transit(&out_image, vk::ImageLayout::eColorAttachmentOptimal,
-                    vk::PipelineStageFlagBits2::eColorAttachmentOutput,
-                    vk::AccessFlagBits2::eColorAttachmentWrite);
     runtime.FlushBarriers();
 
     // Determine exact RGBA vs BGRA export from GNM ColorBuffer swizzle & Vulkan format.
@@ -1790,7 +1889,7 @@ bool NativePostFx::Execute(const BbCp::DirectVk::NativePostProcessArgs& args,
         (out_image.info.pixel_format == vk::Format::eR8G8B8A8Unorm ||
          out_image.info.pixel_format == vk::Format::eR8G8B8A8Srgb);
 
-    // Prepare UBO data in stream buffer (binding 4).
+    // Prepare shared exposure/optics scalars.
     const float safe_gamma = (args.gamma > 0.1f && args.gamma < 10.0f) ? args.gamma : 2.2f;
     const float safe_lum_scale =
         (args.scene_lum_scale > 0.01f && args.scene_lum_scale < 100.0f) ? args.scene_lum_scale
@@ -1803,7 +1902,7 @@ bool NativePostFx::Execute(const BbCp::DirectVk::NativePostProcessArgs& args,
     const float vig_tan = 0.57735027f + (tan_half_fov - 0.57735027f) * fov_dep;
     const float aspect = (args.aspect > 0.2f && args.aspect < 6.0f)
                              ? args.aspect
-                             : (float(out_extent.width) / float(out_extent.height));
+                             : (float(final_out_extent.width) / float(final_out_extent.height));
 
     // Opt-in diagnostic log (`BB_POSTFX_LOG=1`) of live GPARAM values for 1:1 Yebis2 parity tuning.
     static const bool s_postfx_log =
@@ -1830,10 +1929,10 @@ bool NativePostFx::Execute(const BbCp::DirectVk::NativePostProcessArgs& args,
                 "bloom=(on=%d lum=%.3f thr=%.3f rad=%.3f) "
                 "mb=(on=%d cam=%d obj=%d timeR=%.3f maxL=%.3f vScale=%.3f hasD=%d hasV=%d vel=%u:%ux%u) "
                 "dof=(on=%d cust=%d/%d/%d foc=%.2f f=%.2f near=%.1f..%.1f:%.2f*%.2f far=%.1f..%.1f:%.2f*%.2f cut=%.1f z=%.2f..%.0f) "
-                "hdrFmt=%u outFmt=%u bgra=%d lut3d=%d (%ux%u->%ux%u)\n",
+                "hdrFmt=%u outFmt=%u bgra=%d lut3d=%d preAA=%d (%ux%u->%ux%u)\n",
                 args.flags, args.tone_type, args.exposure, args.gamma, args.tone_factor,
                 args.filmic_contrast, args.scene_lum_scale, args.middle_gray, args.vig_power,
-                args.vig_fov_dep, bloom_on ? 1 : 0, args.bloom_luminance, args.bloom_threshold,
+                args.vig_fov_dep, bloom_flag_on ? 1 : 0, args.bloom_luminance, args.bloom_threshold,
                 args.bloom_radius_scale, mb_active ? 1 : 0, mb_cam_lvl, mb_obj_lvl,
                 args.mb_time_ratio, args.mb_max_len, args.mb_vel_scale, has_depth ? 1 : 0,
                 has_vel ? 1 : 0, vel_fmt_dbg, vel_w_dbg, vel_h_dbg, dof_active ? 1 : 0,
@@ -1845,67 +1944,13 @@ bool NativePostFx::Execute(const BbCp::DirectVk::NativePostProcessArgs& args,
                 args.dof_far_end, args.dof_far_coc_size, args.dof_far_coc_scale,
                 args.dof_far_cutoff, args.dof_view_near_z, args.dof_view_far_z,
                 u32(hdr_image.info.pixel_format), u32(out_image.info.pixel_format),
-                bgra_export ? 1 : 0, lut3d_active ? 1 : 0, hdr_extent.width, hdr_extent.height,
-                out_extent.width, out_extent.height);
+                bgra_export ? 1 : 0, lut3d_active ? 1 : 0, wants_prepost_hdr ? 1 : 0,
+                render_extent.width, render_extent.height, final_out_extent.width,
+                final_out_extent.height);
         }
     }
 
-    u32 shader_flags = 0u;
-    if (lut3d_active) shader_flags |= kShaderFlagLut3d;
-    if (auto_exp_on) shader_flags |= kShaderFlagAutoExp;
-    if (ca_on) shader_flags |= kShaderFlagCa;
-    if (true_black_on) shader_flags |= kShaderFlagTrueBlack;
-    if (bgra_export) shader_flags |= kShaderFlagBgraExport;
-    if (bloom_on) shader_flags |= kShaderFlagBloom;
-
-    float c832 = 1.0f;
-    float c833 = 0.0f;
-    ComputeYebisSensitometricParams(args.filmic_contrast, c832, c833);
-
-    // Live-tunable Bloom composite intensity from GPARAM GlareLuminance (0x0dc).
-    // Step 2 v1 was 0.220, Step 3 was 0.095, live Insert overlay slider defaults to 0.150.
-    const float bloom_int_scale =
-        std::clamp(settings.native_bloom_intensity.load(std::memory_order_relaxed), 0.0f, 0.40f);
-    const float bloom_intensity =
-        bloom_on ? std::clamp(args.bloom_luminance * bloom_int_scale, 0.0f, 2.25f) : 0.0f;
-
-    TonemapUbo ubo{};
-    ubo.tone_params[0] = (args.exposure > 1e-4f) ? args.exposure : 1.0f;
-    ubo.tone_params[1] = 1.0f / safe_gamma;
-    ubo.tone_params[2] = c832;
-    ubo.tone_params[3] = c833;
-    ubo.scene_vig[0] = inv_lum_scale;
-    ubo.scene_vig[1] = (args.vig_power > 0.0f) ? args.vig_power : 0.0f;
-    ubo.scene_vig[2] = vig_tan;
-    ubo.scene_vig[3] = aspect;
-    ubo.color_corr[0] = args.hue_rad;
-    ubo.color_corr[1] = (args.saturation >= 0.0f) ? args.saturation : 1.0f;
-    ubo.color_corr[2] = (args.value_scale >= 0.0f) ? args.value_scale : 1.0f;
-    ubo.color_corr[3] = (args.contrast >= 0.0f) ? args.contrast : 1.0f;
-    ubo.ca_params[0] = args.ca_lat_disp[0];
-    ubo.ca_params[1] = args.ca_lat_disp[1];
-    ubo.ca_params[2] = args.ca_uni_disp[0];
-    ubo.ca_params[3] = args.ca_uni_disp[1];
-    const bool heat_haze_on =
-        bloom_on && settings.fire_heat_haze.load(std::memory_order_relaxed);
-    const float heat_haze_str =
-        heat_haze_on
-            ? std::clamp(settings.fire_heat_haze_strength.load(std::memory_order_relaxed), 0.0f, 2.0f)
-            : 0.0f;
-    static const auto s_postfx_t0 = std::chrono::steady_clock::now();
-    const double now_sec_hh =
-        std::chrono::duration<double>(std::chrono::steady_clock::now() - s_postfx_t0).count();
-    ubo.bloom_params[0] = bloom_intensity;
-    ubo.bloom_params[1] = heat_haze_str;
-    ubo.bloom_params[2] = static_cast<float>(std::fmod(now_sec_hh, 4096.0));
-    ubo.bloom_params[3] = 1.0f / static_cast<float>(std::max(out_extent.height, 1u));
-    ubo.flags_misc[0] = shader_flags;
-    ubo.flags_misc[1] = static_cast<u32>(std::max(args.tone_type, 0));
-    ubo.flags_misc[2] = static_cast<u32>(std::clamp(args.ca_wave_samples, 3, 7));
-    ubo.flags_misc[3] = args.frame_index;
-
     auto& stream = buffer_cache.GetStreamBuffer();
-    const u64 ubo_offset = stream.Copy(&ubo, sizeof(ubo), 256);
     const vk::Buffer ubo_buffer = stream.Handle();
 
     // Prepare Step 3 Motion Blur UBO (independent FPS-normalized Camera & Object scales).
@@ -2013,8 +2058,8 @@ bool NativePostFx::Execute(const BbCp::DirectVk::NativePostProcessArgs& args,
         dof_ubo.misc_params[3] = dof_scale;
         dof_ubo.dims_flags[0] = dof_half_extent.width;
         dof_ubo.dims_flags[1] = dof_half_extent.height;
-        dof_ubo.dims_flags[2] = hdr_extent.width;
-        dof_ubo.dims_flags[3] = hdr_extent.height;
+        dof_ubo.dims_flags[2] = render_extent.width;
+        dof_ubo.dims_flags[3] = render_extent.height;
         dof_ubo.mode_flags[0] = dof_mode;
         dof_ubo.mode_flags[1] = args.frame_index;
         dof_ubo.mode_flags[2] = 0u;
@@ -2022,71 +2067,12 @@ bool NativePostFx::Execute(const BbCp::DirectVk::NativePostProcessArgs& args,
         dof_ubo_offset = stream.Copy(&dof_ubo, sizeof(dof_ubo), 256);
     }
 
-    // Metering rect from GPARAM (width, height, offX, offY).
-    const float mw = (args.meter_rect[0] > 0.05f && args.meter_rect[0] <= 1.0f) ? args.meter_rect[0]
-                                                                                 : 1.0f;
-    const float mh = (args.meter_rect[1] > 0.05f && args.meter_rect[1] <= 1.0f) ? args.meter_rect[1]
-                                                                                 : 1.0f;
-    const float mcx = 0.5f + std::clamp(args.meter_rect[2], -0.45f, 0.45f);
-    const float mcy = 0.5f + std::clamp(args.meter_rect[3], -0.45f, 0.45f);
-    const u32 hist_stride = 4u;
-    const HistPush hist_pc{
-        .width = hdr_extent.width,
-        .height = hdr_extent.height,
-        .min_log_lum = kMinLogLum,
-        .inv_log_lum_range = 1.0f / kLogLumRange,
-        .meter_min_x = std::clamp(mcx - 0.5f * mw, 0.0f, 1.0f),
-        .meter_min_y = std::clamp(mcy - 0.5f * mh, 0.0f, 1.0f),
-        .meter_max_x = std::clamp(mcx + 0.5f * mw, 0.0f, 1.0f),
-        .meter_max_y = std::clamp(mcy + 0.5f * mh, 0.0f, 1.0f),
-        .scene_lum_scale = inv_lum_scale,
-        .stride = hist_stride,
-    };
-
-    // Map Yebis2 adaptation parameters to real-time EV/sec rates (completely FPS-invariant).
-    const float bright_rate = std::clamp(
-        (args.adapt_scale > 1e-4f ? args.adapt_scale : 0.1f) * 18.0f, 0.5f, 12.0f);
-    const float dark_raw = (args.dark_scale > 1e-4f) ? args.dark_scale : args.adapt_scale;
-    const float dark_rate = std::clamp((dark_raw > 1e-4f ? dark_raw : 0.05f) * 12.0f, 0.25f, 10.0f);
-    const float bright_lim = (args.adapt_speed_limit > 1e-4f) ? args.adapt_speed_limit : 4.0f;
-    const float dark_lim =
-        (args.dark_speed_limit > 1e-4f) ? args.dark_speed_limit : bright_lim;
-
-    const AutoExpPush auto_exp_pc{
-        .min_log_lum = kMinLogLum,
-        .log_lum_range = kLogLumRange,
-        .middle_gray = (args.middle_gray > 1e-3f && args.middle_gray <= 2.0f) ? args.middle_gray
-                                                                               : 0.18f,
-        .min_exposure = (args.min_exposure > 1e-3f) ? args.min_exposure : 0.05f,
-        .max_exposure = (args.max_exposure > 1e-3f) ? args.max_exposure : 16.0f,
-        .manual_exposure = ubo.tone_params[0],
-        .dt_sec = std::clamp(args.delta_time_sec, 1e-4f, 0.25f),
-        .bright_adapt_rate = bright_rate,
-        .dark_adapt_rate = dark_rate,
-        .bright_speed_limit = bright_lim,
-        .dark_speed_limit = dark_lim,
-        .flags = (auto_exp_on ? 1u : 0u) | (reset_history ? 2u : 0u),
-    };
-
     const bool need_clear = !gpu_state_cleared;
     gpu_state_cleared = true;
 
-    const vk::ImageView hdr_view = *hdr_view_obj.image_view;
-    const vk::ImageView out_view = *out_view_obj.image_view;
     const vk::Sampler samp = *linear_sampler;
     const vk::Image dummy_img = vk::Image(dummy_lut3d);
     const vk::Image dummy_blk_img = vk::Image(dummy_black_2d);
-    const vk::ImageView bloom_final_view =
-        bloom_on ? *bloom_mip_views[0] : *dummy_black_2d_view;
-    const vk::Image bloom_img = bloom_on ? vk::Image(bloom_pyramid) : vk::Image{};
-    std::array<vk::ImageView, kBloomMips> b_views{};
-    std::array<vk::Extent2D, kBloomMips> b_extents{};
-    if (bloom_on) {
-        for (u32 i = 0; i < kBloomMips; ++i) {
-            b_views[i] = *bloom_mip_views[i];
-            b_extents[i] = bloom_mip_extents[i];
-        }
-    }
     const vk::Buffer h_buf = hist_buf;
     const vk::Buffer e_buf = exp_state_buf;
     const vk::Pipeline h_pipe = *hist_pipeline;
@@ -2112,9 +2098,13 @@ bool NativePostFx::Execute(const BbCp::DirectVk::NativePostProcessArgs& args,
     const vk::Image mb_v_img = mb_active ? vk::Image(mb_vel_img) : vk::Image{};
     const vk::ImageView mb_v_view = mb_active ? *mb_vel_view : *dummy_black_2d_view;
     const vk::Extent2D mb_v_ext = mb_vel_extent;
+    const vk::Image mb_tm_img = mb_active ? vk::Image(mb_tile_max_img) : vk::Image{};
+    const vk::ImageView mb_tm_view = mb_active ? *mb_tile_max_view : *dummy_black_2d_view;
     const vk::Image mb_c_img = mb_active ? vk::Image(mb_color_img) : vk::Image{};
-    const vk::ImageView mb_c_view = mb_active ? *mb_color_view : hdr_view;
-    const vk::ImageView after_mb_view = mb_active ? mb_c_view : hdr_view;
+    const vk::ImageView mb_c_view = mb_active ? *mb_color_view : src_hdr_view;
+    const vk::ImageView after_mb_view = mb_active ? mb_c_view : src_hdr_view;
+    const vk::ImageLayout after_mb_layout =
+        mb_active ? vk::ImageLayout::eShaderReadOnlyOptimal : src_hdr_layout;
 
     const vk::Image d_coc_img = dof_active ? vk::Image(dof_coc_img) : vk::Image{};
     const vk::ImageView d_coc_view = dof_active ? *dof_coc_view : *dummy_black_2d_view;
@@ -2123,7 +2113,9 @@ bool NativePostFx::Execute(const BbCp::DirectVk::NativePostProcessArgs& args,
     const vk::Extent2D d_half_ext = dof_half_extent;
     const vk::Image d_col_img = dof_active ? vk::Image(dof_color_img) : vk::Image{};
     const vk::ImageView d_col_view = dof_active ? *dof_color_view : after_mb_view;
-    const vk::ImageView post_scene_view = dof_active ? d_col_view : after_mb_view;
+    vk::ImageView post_scene_view = dof_active ? d_col_view : after_mb_view;
+    vk::ImageLayout post_scene_layout =
+        dof_active ? vk::ImageLayout::eShaderReadOnlyOptimal : after_mb_layout;
     const DofBokehPush dof_bokeh_pc{
         .width = d_half_ext.width,
         .height = d_half_ext.height,
@@ -2133,29 +2125,9 @@ bool NativePostFx::Execute(const BbCp::DirectVk::NativePostProcessArgs& args,
         .reserved = 0u,
     };
 
-    // Live-tunable Bloom threshold & knee (Insert overlay slider: v1=1.00, v2=2.80, default=1.80).
-    const float bloom_thr_mult =
-        std::clamp(settings.native_bloom_threshold.load(std::memory_order_relaxed), 0.50f, 5.00f);
-    const float bloom_thr = std::clamp(args.bloom_threshold * bloom_thr_mult, 0.20f, 4.00f);
-    const float bloom_knee = std::max(bloom_thr * 0.30f, 0.08f);
-    const float bloom_luma_gam =
-        (args.bloom_luma_gamma > 0.1f && args.bloom_luma_gamma < 10.0f) ? args.bloom_luma_gamma
-                                                                        : 1.0f;
-    const float bloom_remap = std::clamp(args.bloom_remap, 0.0f, 5.0f);
-    const float bloom_rad_scale =
-        std::clamp(args.bloom_radius_scale > 0.05f ? args.bloom_radius_scale : 1.0f, 0.35f, 4.0f);
-    const float bloom_disp =
-        std::clamp(args.bloom_dispersion > 0.05f ? args.bloom_dispersion : 1.0f, 0.25f, 2.5f);
-    const float bloom_up_w = 0.52f * std::pow(bloom_disp, 0.25f);
-    const float bloom_cur_w = 0.62f;
-    const float manual_exp = ubo.tone_params[0];
-    const bool use_opaque_diff =
-        heat_haze_on && opaque_hdr_valid && opaque_hdr_view && (opaque_hdr_src_vk == hdr_image.GetImage());
-    opaque_hdr_valid = false;
-    const vk::ImageView opaque_v = use_opaque_diff ? *opaque_hdr_view : *dummy_black_2d_view;
     const MbBlurPush mb_blur_pc{
-        .width = hdr_extent.width,
-        .height = hdr_extent.height,
+        .width = render_extent.width,
+        .height = render_extent.height,
         .inv_vel_w = (mb_v_ext.width > 0u) ? (1.0f / float(mb_v_ext.width)) : 0.0f,
         .inv_vel_h = (mb_v_ext.height > 0u) ? (1.0f / float(mb_v_ext.height)) : 0.0f,
         .frame_index = args.frame_index,
@@ -2224,30 +2196,38 @@ bool NativePostFx::Execute(const BbCp::DirectVk::NativePostProcessArgs& args,
     if (mb_active) {
         GpuProfiler::HudMarkPass(&scheduler, BbStats::GpuSub_Post_MotionBlur);
         if (auto* prof = GpuProfiler::Get(); prof && prof->Records(&scheduler)) {
-            prof->Mark(0x9A71FE10ULL, [hdr_extent] {
+            prof->Mark(0x9A71FE10ULL, [render_extent] {
                 return fmt::format("NativePostFX: MotionBlur {}x{} [VULKAN-NATIVE]",
-                                   hdr_extent.width, hdr_extent.height);
+                                   render_extent.width, render_extent.height);
             });
         }
         scheduler.Record([=](vk::CommandBuffer cmdbuf) {
             const vk::ImageSubresourceRange one_range{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
-            const vk::ImageMemoryBarrier2 vel_to_write{
-                .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-                .srcAccessMask = vk::AccessFlagBits2::eShaderRead,
-                .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
-                .dstAccessMask = vk::AccessFlagBits2::eShaderWrite,
-                .oldLayout = vk::ImageLayout::eUndefined,
-                .newLayout = vk::ImageLayout::eGeneral,
-                .image = mb_v_img,
-                .subresourceRange = one_range,
-            };
-            cmdbuf.pipelineBarrier2(
-                {.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &vel_to_write});
+            const std::array<vk::ImageMemoryBarrier2, 2> vel_to_write{{
+                {.srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                 .srcAccessMask = vk::AccessFlagBits2::eShaderRead,
+                 .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+                 .dstAccessMask = vk::AccessFlagBits2::eShaderWrite,
+                 .oldLayout = vk::ImageLayout::eUndefined,
+                 .newLayout = vk::ImageLayout::eGeneral,
+                 .image = mb_v_img,
+                 .subresourceRange = one_range},
+                {.srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                 .srcAccessMask = vk::AccessFlagBits2::eShaderRead,
+                 .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+                 .dstAccessMask = vk::AccessFlagBits2::eShaderWrite,
+                 .oldLayout = vk::ImageLayout::eUndefined,
+                 .newLayout = vk::ImageLayout::eGeneral,
+                 .image = mb_tm_img,
+                 .subresourceRange = one_range},
+            }};
+            cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = u32(vel_to_write.size()),
+                                     .pImageMemoryBarriers = vel_to_write.data()});
 
             const vk::DescriptorImageInfo d_info{
                 .sampler = VK_NULL_HANDLE,
                 .imageView = depth_view,
-                .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+                .imageLayout = depth_read_layout,
             };
             const vk::DescriptorImageInfo v_info{
                 .sampler = VK_NULL_HANDLE,
@@ -2264,12 +2244,17 @@ bool NativePostFx::Execute(const BbCp::DirectVk::NativePostProcessArgs& args,
                 .imageView = mb_v_view,
                 .imageLayout = vk::ImageLayout::eGeneral,
             };
+            const vk::DescriptorImageInfo out_tm_info{
+                .sampler = VK_NULL_HANDLE,
+                .imageView = mb_tm_view,
+                .imageLayout = vk::ImageLayout::eGeneral,
+            };
             const vk::DescriptorBufferInfo mb_ubo_info{
                 .buffer = ubo_buffer,
                 .offset = mb_ubo_offset,
                 .range = sizeof(MbVelUbo),
             };
-            const std::array<vk::WriteDescriptorSet, 5> mv_writes{{
+            const std::array<vk::WriteDescriptorSet, 6> mv_writes{{
                 {.dstBinding = 0,
                  .descriptorCount = 1,
                  .descriptorType = vk::DescriptorType::eSampledImage,
@@ -2290,12 +2275,16 @@ bool NativePostFx::Execute(const BbCp::DirectVk::NativePostProcessArgs& args,
                  .descriptorCount = 1,
                  .descriptorType = vk::DescriptorType::eUniformBuffer,
                  .pBufferInfo = &mb_ubo_info},
+                {.dstBinding = 5,
+                 .descriptorCount = 1,
+                 .descriptorType = vk::DescriptorType::eStorageImage,
+                 .pImageInfo = &out_tm_info},
             }};
             cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, mv_pipe);
             cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, mv_layout, 0, mv_writes);
             cmdbuf.dispatch((mb_v_ext.width + 15u) / 16u, (mb_v_ext.height + 15u) / 16u, 1u);
 
-            const std::array<vk::ImageMemoryBarrier2, 2> vel_done_bars{{
+            const std::array<vk::ImageMemoryBarrier2, 3> vel_done_bars{{
                 {.srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
                  .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
                  .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
@@ -2303,6 +2292,14 @@ bool NativePostFx::Execute(const BbCp::DirectVk::NativePostProcessArgs& args,
                  .oldLayout = vk::ImageLayout::eGeneral,
                  .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
                  .image = mb_v_img,
+                 .subresourceRange = one_range},
+                {.srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+                 .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
+                 .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+                 .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+                 .oldLayout = vk::ImageLayout::eGeneral,
+                 .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+                 .image = mb_tm_img,
                  .subresourceRange = one_range},
                 {.srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
                  .srcAccessMask = vk::AccessFlagBits2::eShaderRead,
@@ -2318,12 +2315,17 @@ bool NativePostFx::Execute(const BbCp::DirectVk::NativePostProcessArgs& args,
 
             const vk::DescriptorImageInfo hdr_in_info{
                 .sampler = VK_NULL_HANDLE,
-                .imageView = hdr_view,
-                .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+                .imageView = src_hdr_view,
+                .imageLayout = src_hdr_layout,
             };
             const vk::DescriptorImageInfo vel_read_info{
                 .sampler = VK_NULL_HANDLE,
                 .imageView = mb_v_view,
+                .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+            };
+            const vk::DescriptorImageInfo tm_read_info{
+                .sampler = VK_NULL_HANDLE,
+                .imageView = mb_tm_view,
                 .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
             };
             const vk::DescriptorImageInfo mb_out_info{
@@ -2331,7 +2333,7 @@ bool NativePostFx::Execute(const BbCp::DirectVk::NativePostProcessArgs& args,
                 .imageView = mb_c_view,
                 .imageLayout = vk::ImageLayout::eGeneral,
             };
-            const std::array<vk::WriteDescriptorSet, 4> mb_writes{{
+            const std::array<vk::WriteDescriptorSet, 5> mb_writes{{
                 {.dstBinding = 0,
                  .descriptorCount = 1,
                  .descriptorType = vk::DescriptorType::eSampledImage,
@@ -2348,12 +2350,16 @@ bool NativePostFx::Execute(const BbCp::DirectVk::NativePostProcessArgs& args,
                  .descriptorCount = 1,
                  .descriptorType = vk::DescriptorType::eStorageImage,
                  .pImageInfo = &mb_out_info},
+                {.dstBinding = 4,
+                 .descriptorCount = 1,
+                 .descriptorType = vk::DescriptorType::eSampledImage,
+                 .pImageInfo = &tm_read_info},
             }};
             cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, mb_pipe);
             cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, mb_layout, 0, mb_writes);
             cmdbuf.pushConstants(mb_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(MbBlurPush),
                                  &mb_blur_pc);
-            cmdbuf.dispatch((hdr_extent.width + 15u) / 16u, (hdr_extent.height + 15u) / 16u, 1u);
+            cmdbuf.dispatch((render_extent.width + 15u) / 16u, (render_extent.height + 15u) / 16u, 1u);
 
             const vk::ImageMemoryBarrier2 mb_to_sampled{
                 .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
@@ -2375,9 +2381,9 @@ bool NativePostFx::Execute(const BbCp::DirectVk::NativePostProcessArgs& args,
     if (dof_active) {
         GpuProfiler::HudMarkPass(&scheduler, BbStats::GpuSub_Post_DoF);
         if (auto* prof = GpuProfiler::Get(); prof && prof->Records(&scheduler)) {
-            prof->Mark(0x9A71FE11ULL, [hdr_extent] {
+            prof->Mark(0x9A71FE11ULL, [render_extent] {
                 return fmt::format("NativePostFX: DoF {}x{} [VULKAN-NATIVE]",
-                                   hdr_extent.width, hdr_extent.height);
+                                   render_extent.width, render_extent.height);
             });
         }
         scheduler.Record([=](vk::CommandBuffer cmdbuf) {
@@ -2395,12 +2401,12 @@ bool NativePostFx::Execute(const BbCp::DirectVk::NativePostProcessArgs& args,
             const vk::DescriptorImageInfo scene_in_info{
                 .sampler = VK_NULL_HANDLE,
                 .imageView = after_mb_view,
-                .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+                .imageLayout = after_mb_layout,
             };
             const vk::DescriptorImageInfo depth_in_info{
                 .sampler = VK_NULL_HANDLE,
                 .imageView = depth_view,
-                .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+                .imageLayout = depth_read_layout,
             };
 
             // 0b-1: Half-res CoC + Karis-weighted HDR pre-filter.
@@ -2564,7 +2570,8 @@ bool NativePostFx::Execute(const BbCp::DirectVk::NativePostProcessArgs& args,
             }};
             cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, dm_pipe);
             cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, dm_layout, 0, dm_writes);
-            cmdbuf.dispatch((hdr_extent.width + 15u) / 16u, (hdr_extent.height + 15u) / 16u, 1u);
+            cmdbuf.dispatch((render_extent.width + 15u) / 16u, (render_extent.height + 15u) / 16u,
+                            1u);
 
             const vk::ImageMemoryBarrier2 dof_to_sampled{
                 .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
@@ -2582,36 +2589,239 @@ bool NativePostFx::Execute(const BbCp::DirectVk::NativePostProcessArgs& args,
         });
     }
 
+    // Phase 1 Case B (Upscaling: render_extent < output_extent): reconstruct output-res Linear HDR
+    // AFTER render-res MotionBlur/DoF and BEFORE output-res AutoExp, Bloom, Heat Haze, Tonemap & CA.
+    vk::ImageView raw_hdr_view = src_hdr_view;
+    vk::ImageLayout raw_hdr_layout = src_hdr_layout;
+    if (prepost_after_mb_dof) {
+        const vk::Image post_dof_img =
+            dof_active ? d_col_img : (mb_active ? mb_c_img : src_hdr_img);
+        const vk::ImageUsageFlags post_dof_usage =
+            (dof_active || mb_active)
+                ? (vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eStorage |
+                   vk::ImageUsageFlagBits::eTransferSrc)
+                : src_hdr_usage;
+        const bool post_dof_is_guest = !dof_active && !mb_active;
+        aa_res = upscaler->RunPrePostHdr(hdr_id, post_dof_img, post_scene_view, post_scene_layout,
+                                         render_extent, post_dof_usage, post_dof_is_guest, out_id,
+                                         out_image.info.pixel_format, out_extent);
+        if (aa_res.executed) {
+            post_scene_view = aa_res.view;
+            post_scene_layout = vk::ImageLayout::eShaderReadOnlyOptimal;
+            raw_hdr_view = aa_res.view;
+            raw_hdr_layout = vk::ImageLayout::eShaderReadOnlyOptimal;
+            post_aa_extent = aa_res.extent;
+            final_out_extent = aa_res.extent;
+        } else {
+            post_aa_extent = render_extent;
+            final_out_extent = out_extent;
+        }
+    }
+
+    // Prepare final output target (direct ui_image on upscaled/FG frames, or guest out_image).
+    const bool use_ui_target = aa_res.executed && aa_res.use_ui_target && aa_res.ui_image &&
+                               aa_res.ui_view;
+    vk::ImageView final_out_view = *out_view_obj.image_view;
+    vk::Image final_out_ui_img{};
+    if (use_ui_target) {
+        final_out_view = aa_res.ui_view;
+        final_out_ui_img = aa_res.ui_image;
+    } else {
+        if (VideoCore::True(out_image.flags & VideoCore::ImageFlagBits::DirectImmutable)) {
+            texture_cache.DemoteDirectImmutable(out_id);
+        }
+        runtime.Transit(&out_image, vk::ImageLayout::eColorAttachmentOptimal,
+                        vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+                        vk::AccessFlagBits2::eColorAttachmentWrite);
+        runtime.FlushBarriers();
+    }
+
+    const bool bloom_on =
+        bloom_flag_on && EnsureBloomPyramid(post_aa_extent.width, post_aa_extent.height);
+    const bool heat_haze_on =
+        bloom_on && settings.fire_heat_haze.load(std::memory_order_relaxed);
+    const float heat_haze_str =
+        heat_haze_on
+            ? std::clamp(settings.fire_heat_haze_strength.load(std::memory_order_relaxed), 0.0f, 2.0f)
+            : 0.0f;
+
+    u32 shader_flags = 0u;
+    if (lut3d_active) shader_flags |= kShaderFlagLut3d;
+    if (auto_exp_on) shader_flags |= kShaderFlagAutoExp;
+    if (ca_on) shader_flags |= kShaderFlagCa;
+    if (true_black_on) shader_flags |= kShaderFlagTrueBlack;
+    if (bgra_export) shader_flags |= kShaderFlagBgraExport;
+    if (bloom_on) shader_flags |= kShaderFlagBloom;
+
+    float c832 = 1.0f;
+    float c833 = 0.0f;
+    ComputeYebisSensitometricParams(args.filmic_contrast, c832, c833);
+
+    const float bloom_int_scale =
+        std::clamp(settings.native_bloom_intensity.load(std::memory_order_relaxed), 0.0f, 0.40f);
+    const float bloom_intensity =
+        bloom_on ? std::clamp(args.bloom_luminance * bloom_int_scale, 0.0f, 2.25f) : 0.0f;
+
+    TonemapUbo ubo{};
+    ubo.tone_params[0] = (args.exposure > 1e-4f) ? args.exposure : 1.0f;
+    ubo.tone_params[1] = 1.0f / safe_gamma;
+    ubo.tone_params[2] = c832;
+    ubo.tone_params[3] = c833;
+    ubo.scene_vig[0] = inv_lum_scale;
+    ubo.scene_vig[1] = (args.vig_power > 0.0f) ? args.vig_power : 0.0f;
+    ubo.scene_vig[2] = vig_tan;
+    ubo.scene_vig[3] = aspect;
+    ubo.color_corr[0] = args.hue_rad;
+    ubo.color_corr[1] = (args.saturation >= 0.0f) ? args.saturation : 1.0f;
+    ubo.color_corr[2] = (args.value_scale >= 0.0f) ? args.value_scale : 1.0f;
+    ubo.color_corr[3] = (args.contrast >= 0.0f) ? args.contrast : 1.0f;
+    ubo.ca_params[0] = args.ca_lat_disp[0];
+    ubo.ca_params[1] = args.ca_lat_disp[1];
+    ubo.ca_params[2] = args.ca_uni_disp[0];
+    ubo.ca_params[3] = args.ca_uni_disp[1];
+    static const auto s_postfx_t0 = std::chrono::steady_clock::now();
+    const double now_sec_hh =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - s_postfx_t0).count();
+    ubo.bloom_params[0] = bloom_intensity;
+    ubo.bloom_params[1] = heat_haze_str;
+    ubo.bloom_params[2] = static_cast<float>(std::fmod(now_sec_hh, 4096.0));
+    ubo.bloom_params[3] = 1.0f / static_cast<float>(std::max(final_out_extent.height, 1u));
+    ubo.flags_misc[0] = shader_flags;
+    ubo.flags_misc[1] = static_cast<u32>(std::max(args.tone_type, 0));
+    ubo.flags_misc[2] = static_cast<u32>(std::clamp(args.ca_wave_samples, 3, 7));
+    ubo.flags_misc[3] = args.frame_index;
+    const u64 ubo_offset = stream.Copy(&ubo, sizeof(ubo), 256);
+
+    // Metering rect from GPARAM (width, height, offX, offY).
+    const float mw = (args.meter_rect[0] > 0.05f && args.meter_rect[0] <= 1.0f) ? args.meter_rect[0]
+                                                                                 : 1.0f;
+    const float mh = (args.meter_rect[1] > 0.05f && args.meter_rect[1] <= 1.0f) ? args.meter_rect[1]
+                                                                                 : 1.0f;
+    const float mcx = 0.5f + std::clamp(args.meter_rect[2], -0.45f, 0.45f);
+    const float mcy = 0.5f + std::clamp(args.meter_rect[3], -0.45f, 0.45f);
+    const u32 hist_stride = 4u;
+    const HistPush hist_pc{
+        .width = post_aa_extent.width,
+        .height = post_aa_extent.height,
+        .min_log_lum = kMinLogLum,
+        .inv_log_lum_range = 1.0f / kLogLumRange,
+        .meter_min_x = std::clamp(mcx - 0.5f * mw, 0.0f, 1.0f),
+        .meter_min_y = std::clamp(mcy - 0.5f * mh, 0.0f, 1.0f),
+        .meter_max_x = std::clamp(mcx + 0.5f * mw, 0.0f, 1.0f),
+        .meter_max_y = std::clamp(mcy + 0.5f * mh, 0.0f, 1.0f),
+        .scene_lum_scale = inv_lum_scale,
+        .stride = hist_stride,
+    };
+
+    const float bright_rate = std::clamp(
+        (args.adapt_scale > 1e-4f ? args.adapt_scale : 0.1f) * 18.0f, 0.5f, 12.0f);
+    const float dark_raw = (args.dark_scale > 1e-4f) ? args.dark_scale : args.adapt_scale;
+    const float dark_rate = std::clamp((dark_raw > 1e-4f ? dark_raw : 0.05f) * 12.0f, 0.25f, 10.0f);
+    const float bright_lim = (args.adapt_speed_limit > 1e-4f) ? args.adapt_speed_limit : 4.0f;
+    const float dark_lim =
+        (args.dark_speed_limit > 1e-4f) ? args.dark_speed_limit : bright_lim;
+
+    const AutoExpPush auto_exp_pc{
+        .min_log_lum = kMinLogLum,
+        .log_lum_range = kLogLumRange,
+        .middle_gray = (args.middle_gray > 1e-3f && args.middle_gray <= 2.0f) ? args.middle_gray
+                                                                               : 0.18f,
+        .min_exposure = (args.min_exposure > 1e-3f) ? args.min_exposure : 0.05f,
+        .max_exposure = (args.max_exposure > 1e-3f) ? args.max_exposure : 16.0f,
+        .manual_exposure = ubo.tone_params[0],
+        .dt_sec = std::clamp(args.delta_time_sec, 1e-4f, 0.25f),
+        .bright_adapt_rate = bright_rate,
+        .dark_adapt_rate = dark_rate,
+        .bright_speed_limit = bright_lim,
+        .dark_speed_limit = dark_lim,
+        .flags = (auto_exp_on ? 1u : 0u) | (reset_history ? 2u : 0u),
+    };
+
+    const vk::ImageView bloom_final_view =
+        bloom_on ? *bloom_mip_views[0] : *dummy_black_2d_view;
+    const vk::Image bloom_img = bloom_on ? vk::Image(bloom_pyramid) : vk::Image{};
+    std::array<vk::ImageView, kBloomMips> b_views{};
+    std::array<vk::Extent2D, kBloomMips> b_extents{};
+    if (bloom_on) {
+        for (u32 i = 0; i < kBloomMips; ++i) {
+            b_views[i] = *bloom_mip_views[i];
+            b_extents[i] = bloom_mip_extents[i];
+        }
+    }
+
+    const float bloom_thr_mult =
+        std::clamp(settings.native_bloom_threshold.load(std::memory_order_relaxed), 0.50f, 5.00f);
+    const float bloom_thr = std::clamp(args.bloom_threshold * bloom_thr_mult, 0.20f, 4.00f);
+    const float bloom_knee = std::max(bloom_thr * 0.30f, 0.08f);
+    const float bloom_luma_gam =
+        (args.bloom_luma_gamma > 0.1f && args.bloom_luma_gamma < 10.0f) ? args.bloom_luma_gamma
+                                                                        : 1.0f;
+    const float bloom_remap = std::clamp(args.bloom_remap, 0.0f, 5.0f);
+    const float bloom_rad_scale =
+        std::clamp(args.bloom_radius_scale > 0.05f ? args.bloom_radius_scale : 1.0f, 0.35f, 4.0f);
+    const float bloom_disp =
+        std::clamp(args.bloom_dispersion > 0.05f ? args.bloom_dispersion : 1.0f, 0.25f, 2.5f);
+    const float bloom_up_w = 0.52f * std::pow(bloom_disp, 0.25f);
+    const float bloom_cur_w = 0.62f;
+    const float manual_exp = ubo.tone_params[0];
+    const bool use_opaque_diff =
+        heat_haze_on && opaque_hdr_valid && opaque_hdr_view &&
+        (opaque_hdr_src_vk == hdr_image.GetImage());
+    opaque_hdr_valid = false;
+    const vk::ImageView opaque_v = use_opaque_diff ? *opaque_hdr_view : *dummy_black_2d_view;
+
     // Pass 1 & 2 (Compute): True-dt Auto-Exposure + 5-level FP16 Dual-Kawase Bloom Pyramid.
     if (auto_exp_on || bloom_on) {
         GpuProfiler::HudMarkPass(&scheduler, bloom_on ? BbStats::GpuSub_Post_BloomGlare
                                                       : BbStats::GpuSub_Post_TonemapLut);
         if (auto* prof = GpuProfiler::Get(); prof && prof->Records(&scheduler)) {
-            prof->Mark(bloom_on ? 0x9A71FE12ULL : 0x9A71FE14ULL, [hdr_extent, bloom_on, heat_haze_on] {
-                return bloom_on
-                           ? fmt::format("NativePostFX: Bloom+AutoExp {}x{} [Haze:{}] [VULKAN-NATIVE]",
-                                         hdr_extent.width, hdr_extent.height, heat_haze_on ? 1 : 0)
-                           : fmt::format("NativePostFX: AutoExposure {}x{} [VULKAN-NATIVE]",
-                                         hdr_extent.width, hdr_extent.height);
-            });
+            prof->Mark(bloom_on ? 0x9A71FE12ULL : 0x9A71FE14ULL,
+                       [post_aa_extent, bloom_on, heat_haze_on] {
+                           return bloom_on
+                                      ? fmt::format(
+                                            "NativePostFX: Bloom+AutoExp {}x{} [Haze:{}] [VULKAN-NATIVE]",
+                                            post_aa_extent.width, post_aa_extent.height,
+                                            heat_haze_on ? 1 : 0)
+                                      : fmt::format(
+                                            "NativePostFX: AutoExposure {}x{} [VULKAN-NATIVE]",
+                                            post_aa_extent.width, post_aa_extent.height);
+                       });
         }
         scheduler.Record([=](vk::CommandBuffer cmdbuf) {
-        // Pass 1 & 2 (Compute): True-dt Auto-Exposure (256-bin histogram + log2-EV adaptation).
-        if (auto_exp_on) {
+        const bool fused_hist = bloom_on && auto_exp_on;
+        const vk::DescriptorBufferInfo hist_info{
+            .buffer = h_buf,
+            .offset = 0,
+            .range = kHistBufBytes,
+        };
+        const vk::DescriptorBufferInfo exp_info{
+            .buffer = e_buf,
+            .offset = 0,
+            .range = kExpStateBufBytes,
+        };
+        const std::array<vk::WriteDescriptorSet, 2> ae_writes{{
+            {.dstBinding = 0,
+             .descriptorCount = 1,
+             .descriptorType = vk::DescriptorType::eStorageBuffer,
+             .pBufferInfo = &hist_info},
+            {.dstBinding = 1,
+             .descriptorCount = 1,
+             .descriptorType = vk::DescriptorType::eStorageBuffer,
+             .pBufferInfo = &exp_info},
+        }};
+
+        // Standalone Auto-Exposure path (only when Bloom is OFF; when Bloom is ON, histogram is
+        // fused directly into bloom_down mip 0 with zero extra HDR texture reads).
+        if (auto_exp_on && !fused_hist) {
             const vk::DescriptorImageInfo hdr_info{
                 .sampler = VK_NULL_HANDLE,
-                .imageView = hdr_view,
-                .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+                .imageView = raw_hdr_view,
+                .imageLayout = raw_hdr_layout,
             };
             const vk::DescriptorImageInfo samp_info{
                 .sampler = samp,
                 .imageView = VK_NULL_HANDLE,
                 .imageLayout = vk::ImageLayout::eUndefined,
-            };
-            const vk::DescriptorBufferInfo hist_info{
-                .buffer = h_buf,
-                .offset = 0,
-                .range = kHistBufBytes,
             };
             const std::array<vk::WriteDescriptorSet, 3> hist_writes{{
                 {.dstBinding = 0,
@@ -2631,8 +2841,8 @@ bool NativePostFx::Execute(const BbCp::DirectVk::NativePostProcessArgs& args,
             cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, h_layout, 0, hist_writes);
             cmdbuf.pushConstants(h_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(HistPush),
                                  &hist_pc);
-            const u32 sample_w = (hdr_extent.width + hist_stride - 1u) / hist_stride;
-            const u32 sample_h = (hdr_extent.height + hist_stride - 1u) / hist_stride;
+            const u32 sample_w = (post_aa_extent.width + hist_stride - 1u) / hist_stride;
+            const u32 sample_h = (post_aa_extent.height + hist_stride - 1u) / hist_stride;
             cmdbuf.dispatch((sample_w + 15u) / 16u, (sample_h + 15u) / 16u, 1u);
 
             const vk::MemoryBarrier2 hist_to_ae{
@@ -2644,21 +2854,6 @@ bool NativePostFx::Execute(const BbCp::DirectVk::NativePostProcessArgs& args,
             };
             cmdbuf.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &hist_to_ae});
 
-            const vk::DescriptorBufferInfo exp_info{
-                .buffer = e_buf,
-                .offset = 0,
-                .range = kExpStateBufBytes,
-            };
-            const std::array<vk::WriteDescriptorSet, 2> ae_writes{{
-                {.dstBinding = 0,
-                 .descriptorCount = 1,
-                 .descriptorType = vk::DescriptorType::eStorageBuffer,
-                 .pBufferInfo = &hist_info},
-                {.dstBinding = 1,
-                 .descriptorCount = 1,
-                 .descriptorType = vk::DescriptorType::eStorageBuffer,
-                 .pBufferInfo = &exp_info},
-            }};
             cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, ae_pipe);
             cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, ae_layout, 0, ae_writes);
             cmdbuf.pushConstants(ae_layout, vk::ShaderStageFlagBits::eCompute, 0,
@@ -2675,43 +2870,42 @@ bool NativePostFx::Execute(const BbCp::DirectVk::NativePostProcessArgs& args,
             cmdbuf.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &ae_to_next});
         }
 
-        // Pass 2b (Compute): 5-level FP16 Dual-Kawase / Jimenez Bloom Pyramid (down + up).
+        // Pass 2b (Compute): 5-level FP16 Dual-Kawase / Jimenez Bloom Pyramid (down + up),
+        // with Phase 3 Step 3.1 Fused Auto-Exposure Histogram in mip 0 & batched mip transitions.
         if (bloom_on) {
             const vk::DescriptorImageInfo samp_info{
                 .sampler = samp,
                 .imageView = VK_NULL_HANDLE,
                 .imageLayout = vk::ImageLayout::eUndefined,
             };
-            const vk::DescriptorBufferInfo exp_info{
-                .buffer = e_buf,
-                .offset = 0,
-                .range = kExpStateBufBytes,
-            };
 
-            // Downsample chain: mip 0 (prefilter + Karis from HDR) -> mip 1 -> 2 -> 3 -> 4.
+            // Transition all 5 bloom mips to eGeneral in ONE single batched barrier.
+            const vk::ImageMemoryBarrier2 all_mips_to_storage{
+                .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                .srcAccessMask = vk::AccessFlagBits2::eShaderRead,
+                .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+                .dstAccessMask = vk::AccessFlagBits2::eShaderWrite,
+                .oldLayout = vk::ImageLayout::eUndefined,
+                .newLayout = vk::ImageLayout::eGeneral,
+                .image = bloom_img,
+                .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, kBloomMips, 0, 1},
+            };
+            cmdbuf.pipelineBarrier2(
+                {.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &all_mips_to_storage});
+
+            // Downsample chain: mip 0 (prefilter + Karis + fused AutoExp hist) -> mip 1 -> 2 -> 3 -> 4.
             cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, bd_pipe);
             for (u32 mip = 0; mip < kBloomMips; ++mip) {
-                const vk::ImageMemoryBarrier2 to_storage{
-                    .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-                    .srcAccessMask = vk::AccessFlagBits2::eShaderRead,
-                    .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
-                    .dstAccessMask = vk::AccessFlagBits2::eShaderWrite,
-                    .oldLayout = vk::ImageLayout::eUndefined,
-                    .newLayout = vk::ImageLayout::eGeneral,
-                    .image = bloom_img,
-                    .subresourceRange = {vk::ImageAspectFlagBits::eColor, mip, 1, 0, 1},
-                };
-                cmdbuf.pipelineBarrier2(
-                    {.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_storage});
-
                 const vk::ImageView src_v = (mip == 0u) ? post_scene_view : b_views[mip - 1u];
-                const vk::Extent2D src_ext = (mip == 0u) ? hdr_extent : b_extents[mip - 1u];
+                const vk::ImageLayout src_l =
+                    (mip == 0u) ? post_scene_layout : vk::ImageLayout::eShaderReadOnlyOptimal;
+                const vk::Extent2D src_ext = (mip == 0u) ? post_aa_extent : b_extents[mip - 1u];
                 const vk::Extent2D dst_ext = b_extents[mip];
 
                 const vk::DescriptorImageInfo src_info{
                     .sampler = VK_NULL_HANDLE,
                     .imageView = src_v,
-                    .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+                    .imageLayout = src_l,
                 };
                 const vk::DescriptorImageInfo dst_info{
                     .sampler = VK_NULL_HANDLE,
@@ -2725,10 +2919,10 @@ bool NativePostFx::Execute(const BbCp::DirectVk::NativePostProcessArgs& args,
                 };
                 const vk::DescriptorImageInfo raw_hdr_info{
                     .sampler = VK_NULL_HANDLE,
-                    .imageView = hdr_view,
-                    .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+                    .imageView = raw_hdr_view,
+                    .imageLayout = raw_hdr_layout,
                 };
-                const std::array<vk::WriteDescriptorSet, 6> bd_writes{{
+                const std::array<vk::WriteDescriptorSet, 7> bd_writes{{
                     {.dstBinding = 0,
                      .descriptorCount = 1,
                      .descriptorType = vk::DescriptorType::eSampledImage,
@@ -2753,6 +2947,10 @@ bool NativePostFx::Execute(const BbCp::DirectVk::NativePostProcessArgs& args,
                      .descriptorCount = 1,
                      .descriptorType = vk::DescriptorType::eSampledImage,
                      .pImageInfo = &raw_hdr_info},
+                    {.dstBinding = 6,
+                     .descriptorCount = 1,
+                     .descriptorType = vk::DescriptorType::eStorageBuffer,
+                     .pBufferInfo = &hist_info},
                 }};
                 const BloomDownPush bd_pc{
                     .dst_w = dst_ext.width,
@@ -2766,7 +2964,14 @@ bool NativePostFx::Execute(const BbCp::DirectVk::NativePostProcessArgs& args,
                     .luma_gamma = bloom_luma_gam,
                     .remap_factor = bloom_remap,
                     .flags = ((mip == 0u) ? 1u : 0u) | (auto_exp_on ? 2u : 0u) |
-                             ((mip == 0u && use_opaque_diff) ? 4u : 0u),
+                             ((mip == 0u && use_opaque_diff) ? 4u : 0u) |
+                             ((mip == 0u && fused_hist) ? 8u : 0u),
+                    .min_log_lum = hist_pc.min_log_lum,
+                    .inv_log_lum_range = hist_pc.inv_log_lum_range,
+                    .meter_min_x = hist_pc.meter_min_x,
+                    .meter_min_y = hist_pc.meter_min_y,
+                    .meter_max_x = hist_pc.meter_max_x,
+                    .meter_max_y = hist_pc.meter_max_y,
                 };
                 cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, bd_layout, 0, bd_writes);
                 cmdbuf.pushConstants(bd_layout, vk::ShaderStageFlagBits::eCompute, 0,
@@ -2784,8 +2989,30 @@ bool NativePostFx::Execute(const BbCp::DirectVk::NativePostProcessArgs& args,
                     .image = bloom_img,
                     .subresourceRange = {vk::ImageAspectFlagBits::eColor, mip, 1, 0, 1},
                 };
-                cmdbuf.pipelineBarrier2(
-                    {.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_sampled});
+                if (mip == 0u && fused_hist) {
+                    const vk::MemoryBarrier2 hist_to_ae{
+                        .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+                        .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
+                        .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+                        .dstAccessMask = vk::AccessFlagBits2::eShaderRead |
+                                         vk::AccessFlagBits2::eShaderWrite,
+                    };
+                    cmdbuf.pipelineBarrier2({.memoryBarrierCount = 1,
+                                             .pMemoryBarriers = &hist_to_ae,
+                                             .imageMemoryBarrierCount = 1,
+                                             .pImageMemoryBarriers = &to_sampled});
+                    // Dispatch 1x1x1 Auto-Exposure reduction concurrently with bloom_down mips 1..4!
+                    cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, ae_pipe);
+                    cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, ae_layout, 0,
+                                                ae_writes);
+                    cmdbuf.pushConstants(ae_layout, vk::ShaderStageFlagBits::eCompute, 0,
+                                         sizeof(AutoExpPush), &auto_exp_pc);
+                    cmdbuf.dispatch(1u, 1u, 1u);
+                    cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, bd_pipe);
+                } else {
+                    cmdbuf.pipelineBarrier2(
+                        {.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_sampled});
+                }
             }
 
             // Upsample chain: mip 4 -> 3 -> 2 -> 1 -> 0 (9-tap tent progressive combine).
@@ -2857,8 +3084,22 @@ bool NativePostFx::Execute(const BbCp::DirectVk::NativePostProcessArgs& args,
                     .image = bloom_img,
                     .subresourceRange = {vk::ImageAspectFlagBits::eColor, umip, 1, 0, 1},
                 };
-                cmdbuf.pipelineBarrier2(
-                    {.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_sampled});
+                if (umip == 0u && fused_hist) {
+                    const vk::MemoryBarrier2 ae_to_tonemap{
+                        .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+                        .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
+                        .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader |
+                                        vk::PipelineStageFlagBits2::eFragmentShader,
+                        .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+                    };
+                    cmdbuf.pipelineBarrier2({.memoryBarrierCount = 1,
+                                             .pMemoryBarriers = &ae_to_tonemap,
+                                             .imageMemoryBarrierCount = 1,
+                                             .pImageMemoryBarriers = &to_sampled});
+                } else {
+                    cmdbuf.pipelineBarrier2(
+                        {.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_sampled});
+                }
             }
         }
         });
@@ -2867,9 +3108,9 @@ bool NativePostFx::Execute(const BbCp::DirectVk::NativePostProcessArgs& args,
     // Pass 3 (Graphics): Unified Tonemap + Bloom + Original 3D LUT + CA + Vignette + True Black.
     GpuProfiler::HudMarkPass(&scheduler, BbStats::GpuSub_Post_TonemapLut);
     if (auto* prof = GpuProfiler::Get(); prof && prof->Records(&scheduler)) {
-        prof->Mark(0x9A71FE13ULL, [out_extent, bloom_on, heat_haze_on] {
+        prof->Mark(0x9A71FE13ULL, [final_out_extent, bloom_on, heat_haze_on] {
             return fmt::format("NativePostFX: Tonemap+LUT {}x{} [Bloom:{} Haze:{}] [VULKAN-NATIVE]",
-                               out_extent.width, out_extent.height, bloom_on ? 1 : 0,
+                               final_out_extent.width, final_out_extent.height, bloom_on ? 1 : 0,
                                heat_haze_on ? 1 : 0);
         });
     }
@@ -2877,7 +3118,7 @@ bool NativePostFx::Execute(const BbCp::DirectVk::NativePostProcessArgs& args,
         const vk::DescriptorImageInfo hdr_info{
             .sampler = VK_NULL_HANDLE,
             .imageView = post_scene_view,
-            .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+            .imageLayout = post_scene_layout,
         };
         const vk::DescriptorImageInfo lut_info{
             .sampler = VK_NULL_HANDLE,
@@ -2931,28 +3172,46 @@ bool NativePostFx::Execute(const BbCp::DirectVk::NativePostProcessArgs& args,
              .pImageInfo = &bloom_info},
         }};
         const vk::RenderingAttachmentInfo color_att{
-            .imageView = out_view,
+            .imageView = final_out_view,
             .imageLayout = vk::ImageLayout::eColorAttachmentOptimal,
             .loadOp = vk::AttachmentLoadOp::eDontCare,
             .storeOp = vk::AttachmentStoreOp::eStore,
         };
         cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, tonemap_pipe);
-        cmdbuf.setViewport(0, vk::Viewport{0.0f, 0.0f, float(out_extent.width),
-                                           float(out_extent.height), 0.0f, 1.0f});
-        cmdbuf.setScissor(0, vk::Rect2D{{0, 0}, out_extent});
+        cmdbuf.setViewport(0, vk::Viewport{0.0f, 0.0f, float(final_out_extent.width),
+                                           float(final_out_extent.height), 0.0f, 1.0f});
+        cmdbuf.setScissor(0, vk::Rect2D{{0, 0}, final_out_extent});
         cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, tm_layout, 0, tm_writes);
         cmdbuf.beginRendering({
-            .renderArea = {{0, 0}, out_extent},
+            .renderArea = {{0, 0}, final_out_extent},
             .layerCount = 1,
             .colorAttachmentCount = 1,
             .pColorAttachments = &color_att,
         });
         cmdbuf.draw(3u, 1u, 0u, 0u);
         cmdbuf.endRendering();
+        if (use_ui_target && final_out_ui_img) {
+            const vk::ImageMemoryBarrier2 ui_ready{
+                .srcStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+                .srcAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
+                .dstStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput |
+                                vk::PipelineStageFlagBits2::eFragmentShader |
+                                vk::PipelineStageFlagBits2::eAllCommands,
+                .dstAccessMask = vk::AccessFlagBits2::eColorAttachmentRead |
+                                 vk::AccessFlagBits2::eColorAttachmentWrite |
+                                 vk::AccessFlagBits2::eShaderRead,
+                .oldLayout = vk::ImageLayout::eColorAttachmentOptimal,
+                .newLayout = vk::ImageLayout::eGeneral,
+                .image = final_out_ui_img,
+                .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+            };
+            cmdbuf.pipelineBarrier2(
+                {.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &ui_ready});
+        }
     });
 
     out_image.gpu_write_tick = scheduler.CurrentTick();
-    if (upscaler) {
+    if (upscaler && !use_ui_target) {
         upscaler->OnColorTarget(out_id);
     }
     scheduler.BumpDescriptorStateEpoch();

@@ -11,6 +11,7 @@ layout(set = 0, binding = 0) uniform texture2D hdr_scene;
 layout(set = 0, binding = 1) uniform texture2D vel_map;
 layout(set = 0, binding = 2) uniform sampler linear_samp;
 layout(set = 0, binding = 3, rgba16f) uniform writeonly image2D out_hdr_img;
+layout(set = 0, binding = 4) uniform texture2D tile_max_tex;
 
 layout(push_constant) uniform MbBlurPush {
     uint width;
@@ -18,8 +19,10 @@ layout(push_constant) uniform MbBlurPush {
     float inv_vel_w;
     float inv_vel_h;
     uint frame_index;
-    uint flags; // bit0=cam_on, bit1=obj_on
+    uint flags; // bit0=cam_on, bit1=obj_on, bit2=debug_vis
 } pc;
+
+shared float s_tile_max[9];
 
 float IgnNoise(vec2 px, uint frame_idx) {
     const vec2 p = px + vec2(float(frame_idx & 63u) * 5.588238, float(frame_idx & 63u) * 7.131917);
@@ -27,6 +30,20 @@ float IgnNoise(vec2 px, uint frame_idx) {
 }
 
 void main() {
+    // Phase 3 Step 3.2: Workgroup-uniform 3x3 tile max-velocity check (zero warp divergence!).
+    // Each 16x16 full-res workgroup lies strictly inside one 32x32 tile (16x16 half-res mb_vel WG).
+    const bool debug_vis = (pc.flags & 4u) != 0u;
+    const uint tid = gl_LocalInvocationIndex;
+    if (!debug_vis && tid < 9u) {
+        const ivec2 tile_dim = textureSize(sampler2D(tile_max_tex, linear_samp), 0);
+        const ivec2 base_tile = ivec2(gl_WorkGroupID.xy >> 1u);
+        const int dx = int(tid % 3u) - 1;
+        const int dy = int(tid / 3u) - 1;
+        const ivec2 tc = clamp(base_tile + ivec2(dx, dy), ivec2(0), max(tile_dim - ivec2(1), ivec2(0)));
+        s_tile_max[tid] = texelFetch(sampler2D(tile_max_tex, linear_samp), tc, 0).r;
+    }
+    barrier();
+
     const uvec2 px = gl_GlobalInvocationID.xy;
     if (px.x >= pc.width || px.y >= pc.height) {
         return;
@@ -36,11 +53,23 @@ void main() {
     const vec2 uv = (vec2(px) + 0.5) / res;
 
     const vec3 center_rgb = max(textureLod(sampler2D(hdr_scene, linear_samp), uv, 0.0).rgb, vec3(0.0));
+
+    if (!debug_vis) {
+        float tile_max_v = max(max(s_tile_max[0], s_tile_max[1]), max(s_tile_max[2], s_tile_max[3]));
+        tile_max_v = max(tile_max_v, max(max(s_tile_max[4], s_tile_max[5]), max(s_tile_max[6], s_tile_max[7])));
+        tile_max_v = max(tile_max_v, s_tile_max[8]);
+        // Entire 3x3 tile neighborhood has < 0.40 px motion: skip all 9 vel_map reads & 16-tap blur!
+        if (tile_max_v < 0.40) {
+            imageStore(out_hdr_img, ivec2(px), vec4(center_rgb, 1.0));
+            return;
+        }
+    }
+
     const vec4 center_v = textureLod(sampler2D(vel_map, linear_samp), uv, 0.0);
     const vec2 v_center = center_v.xy;
     const float d_center = center_v.z;
 
-    if ((pc.flags & 4u) != 0u) {
+    if (debug_vis) {
         // Live Velocity Debug View (Insert overlay checkbox):
         // - Dimmed scene base so silhouettes are recognizable
         // - Solid BLUE tint where velWrap.a > 0.5 (Pass 0x2e object mask: Hunter/weapon/enemies)

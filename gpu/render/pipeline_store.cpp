@@ -242,6 +242,9 @@ bool IsOpt56Pack5ShaderHash(u64 pgm_hash) noexcept {
     case 0x000000008a6c7657ULL: // Forward PBR + 4-tap CSM + cutout
     case 0x000000006720ae0dULL: // Forward Lightmap + wrap/SSS + 4-tap CSM + cutout
     case 0x00000000c31bd920ULL: // Forward Lightmap + IBL/SSR + wrap/SSS + 4-tap CSM + cutout
+    // Phase 2 (v1.2.4): Native Vulkan 1.3 GLSL 460 for SSAO Gen/Reproj & Bilateral Upscale
+    case 0x0000000083da8467ULL: // ScreenSpaceAO2_WithNormalReProj
+    case 0x00000000c45c51cbULL: // ScreenSpaceAO2_BilateralUpScale
         return true;
     default:
         return false;

@@ -12,6 +12,7 @@
 #include "render/vk_mt_direct_recorder.h"
 #include "render/vk_vsm_shadow_memo.h"
 #include "render/vk_bilateral_blur.h"
+#include "render/vk_ssr_spd.h"
 #include "render/vk_vsm_blur_batcher.h"
 #include "render/vk_obj_vel_cull.h"
 #include "render/vk_vfx_ui_batch.h"
@@ -1224,6 +1225,7 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
                                                         texture_cache);
     bilateral_blur = std::make_unique<BilateralBlurCompute>(instance, scheduler, runtime,
                                                             texture_cache);
+    ssr_spd = std::make_unique<SsrSpdCompute>(instance, scheduler, runtime, texture_cache);
     if (!EmulatorSettings.IsNullGPU()) {
         liverpool->BindRasterizer(this);
     }
@@ -3296,16 +3298,12 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
         }
     }
 
-    // Pack #1 (#6): Skip redundant 2-pass Yebis2 MotionBlurDilateVelocity (`0xabf92450`)
-    // when Native Vulkan PostFX is active and either Object MB is Off (Camera-only MB wants
-    // the crisp undilated silhouette mask) or the frame is static (when v==0, `dot(dir, v) > 0`
-    // in ps_abf92450 is mathematically false for all 8 compass taps).
+    // Phase 2 (v1.2.4): Unconditionally skip dead 2-pass Yebis2 MotionBlurDilateVelocity
+    // (`0xabf92450`) whenever Native Vulkan PostFX is active — NativePostFX computes velocity
+    // directly from depth + velWrap in `native_postfx_mb_vel.comp` and never reads this target.
     if (const auto* skip_ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
         skip_ps && skip_ps->pgm_hash == 0x00000000abf92450ULL) [[unlikely]] {
-        const auto& s = BbSettings::Get();
-        if (s.native_postfx.load(std::memory_order_relaxed) &&
-            (s.motion_blur_object.load(std::memory_order_relaxed) == 0 ||
-             BbStats::mb_idle_skip_dilate.load(std::memory_order_relaxed))) {
+        if (BbSettings::Get().native_postfx.load(std::memory_order_relaxed)) {
             return;
         }
     }

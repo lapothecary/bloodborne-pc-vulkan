@@ -79,6 +79,46 @@ public:
     /// Before a compute dispatch: the post-processing combine shader triggers the upscale.
     void OnDispatch(u64 cs_hash);
 
+    /// Phase 1 (v1.2.4): Linear HDR temporal AA / upscaling before NativePostFX.
+    /// True for DLAA/DLSS/FSR 3.1/FSR 4/TAA when BB_HDR_PREPOST_AA != 0 (false for SMAA/FXAA/Off).
+    [[nodiscard]] bool WantsPrePostHdr() const noexcept;
+
+    struct PrePostInput {
+        vk::Image color_image{};
+        vk::ImageView color_view{};
+        vk::ImageLayout color_layout = vk::ImageLayout::eShaderReadOnlyOptimal;
+        vk::ImageUsageFlags color_usage{};
+        vk::Extent2D render_extent{};
+        vk::Extent2D output_extent{};
+        vk::Image depth_image{};
+        vk::ImageView depth_view{};
+        vk::ImageLayout depth_layout = vk::ImageLayout::eShaderReadOnlyOptimal;
+        vk::Format depth_format = vk::Format::eUndefined;
+        bool reduced_proxy = false;
+    };
+    /// Resolves the true render-resolution Linear HDR & Depth inputs for NativePostFX, reading
+    /// reduced SceneTargets proxies directly without triggering a full-res resolve blit.
+    PrePostInput ResolvePrePostInput(VideoCore::ImageId hdr_id, vk::ImageView default_hdr_view,
+                                     VideoCore::ImageId depth_id, vk::ImageView default_depth_view);
+
+    struct PrePostHdrResult {
+        bool executed = false;
+        vk::Image image{};
+        vk::ImageView view{};
+        vk::Extent2D extent{};
+        bool use_ui_target = false;
+        vk::Image ui_image{};
+        vk::ImageView ui_view{};
+    };
+    /// Runs DLAA/DLSS/FSR 3.1/FSR 4/TAA in Linear HDR (`R16G16B16A16_SFLOAT`) inside NativePostFX.
+    /// Transitions `output_image` to `eShaderReadOnlyOptimal` for subsequent PostFX stages and
+    /// optionally prepares `ui_image` as Tonemap's direct output target (zero extra blit).
+    PrePostHdrResult RunPrePostHdr(VideoCore::ImageId hdr_id, vk::Image src_img,
+                                   vk::ImageView src_view, vk::ImageLayout src_layout,
+                                   vk::Extent2D src_extent, vk::ImageUsageFlags src_usage,
+                                   bool src_is_guest_hdr, VideoCore::ImageId out_id,
+                                   vk::Format out_format, vk::Extent2D out_extent_guest);
+
     /// Start of a frame in the command stream (display pass).
     bool OnFrameStart();
     bool RasterScaling() const;
@@ -268,6 +308,7 @@ private:
     u64 trigger_hash = 0x9a9cf8a9;
     VideoCore::ImageId scene_color{};
     bool done_this_frame = false;
+    bool hdr_prepost_done = false; ///< Phase 1: Linear HDR AA/upscale already ran inside NativePostFX
     u32 preset_file_frames = 0; ///< BB_PRESET_FILE polling
     u32 applied_output = 0; ///< BbSettings::PackSize
     float applied_aspect = 0.0f; ///< the output's, given to the game's camera

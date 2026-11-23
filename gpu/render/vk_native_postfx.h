@@ -101,6 +101,9 @@ private:
     VideoCore::HostImage mb_vel_img;
     vk::UniqueImageView mb_vel_view;
     vk::Extent2D mb_vel_extent{};
+    VideoCore::HostImage mb_tile_max_img;
+    vk::UniqueImageView mb_tile_max_view;
+    vk::Extent2D mb_tile_extent{};
     VideoCore::HostImage mb_color_img;
     vk::UniqueImageView mb_color_view;
     vk::Extent2D mb_color_extent{};

@@ -248,11 +248,11 @@ struct Values {
     std::atomic<float> fire_heat_haze_strength{1.00f};
     /// Live tuning sliders (Insert overlay only, not persisted to game menu) for Native Vulkan PostFX:
     /// - native_bloom_intensity: GPARAM GlareLuminance multiplier (calibrated default: 0.250).
-    /// - native_bloom_threshold: GPARAM GlareThreshold multiplier (calibrated default: 3.50).
+    /// - native_bloom_threshold: GPARAM GlareThreshold multiplier (calibrated default: 2.50).
     /// - native_mb_obj_boost: extra multiplier on Pass 0x2e pure Object Self-Motion velocity.
     /// - native_mb_debug_vis: visualize Motion Blur velocity map (R/G=Camera, Blue=ObjMask, Yellow=ObjVel).
     std::atomic<float> native_bloom_intensity{0.25f};
-    std::atomic<float> native_bloom_threshold{3.50f};
+    std::atomic<float> native_bloom_threshold{2.50f};
     std::atomic<float> native_mb_obj_boost{1.00f};
     std::atomic<float> native_dof_strength{1.00f};
     std::atomic<bool> native_mb_debug_vis{false};

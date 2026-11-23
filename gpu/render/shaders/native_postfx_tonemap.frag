@@ -50,6 +50,12 @@ vec3 SampleSceneWithCA(vec2 base_uv, bool ca_on, vec2 lat_disp, vec2 uni_disp, u
     const float r2 = dot(centered, centered);
     // Keep subtle physical lens shift (Yebis2 latDisp is typically 0.005..0.03 in Bloodborne).
     const vec2 shift = centered * (lat_disp * (0.35 + 1.30 * r2)) + uni_disp * 0.01;
+    // Phase 3 Step 3.3: Center-screen CA fast-path (< 0.20 px radial dispersion -> 1 tap, 0 visible diff).
+    const vec2 shift_h = vec2(shift.x * u.scene_vig.w, shift.y);
+    const float inv_h = u.bloom_params.w;
+    if (dot(shift_h, shift_h) < (0.04 * inv_h * inv_h)) {
+        return max(textureLod(sampler2D(hdr_scene, linear_samp), base_uv, 0.0).rgb, vec3(0.0));
+    }
 
     if (wave_samples <= 3u) {
         const float r = textureLod(sampler2D(hdr_scene, linear_samp), clamp(base_uv + shift, 0.0, 1.0), 0.0).r;

@@ -1,0 +1,125 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Phase 2 (v1.2.4): Single-Pass Downsampler (SPD) in LDS for Bloodborne's SSR Glossy Mip Pyramid.
+// Replaces 5 graphics RenderPasses (ps_6320bb24) + 4 vkCmdCopyImage subresource copies with ONE
+// compute dispatch: 16x16 workgroup processes a 64x64 mip-0 tile, generates mip 1..5 in-place
+// using only 4.25 KiB LDS (shared vec4 lds[16][17], 0 bank conflicts, 100% occupancy).
+#version 460
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform texture2D src_mip0;
+layout(set = 0, binding = 1) uniform sampler linear_samp;
+layout(set = 0, binding = 2, rgba16f) uniform writeonly image2D dst_mip1;
+layout(set = 0, binding = 3, rgba16f) uniform writeonly image2D dst_mip2;
+layout(set = 0, binding = 4, rgba16f) uniform writeonly image2D dst_mip3;
+layout(set = 0, binding = 5, rgba16f) uniform writeonly image2D dst_mip4;
+layout(set = 0, binding = 6, rgba16f) uniform writeonly image2D dst_mip5;
+
+layout(push_constant) uniform Push {
+    uvec2 mip1_size;
+    uvec2 mip2_size;
+    uvec2 mip3_size;
+    uvec2 mip4_size;
+    uvec2 mip5_size;
+    vec2 inv_mip1;
+    uint gen_mips; // 1..5
+    uint pad0;
+} pc;
+
+shared vec4 lds[16][17];
+
+vec4 sample_mip1(uvec2 p) {
+    // Hardware bilinear sample at exact center of the 2x2 block in mip 0 -> identical to ps_6320bb24.
+    const vec2 uv = (vec2(p) + 0.5) * pc.inv_mip1;
+    return textureLod(sampler2D(src_mip0, linear_samp), uv, 0.0);
+}
+
+void main() {
+    const uint lx = gl_LocalInvocationID.x;
+    const uint ly = gl_LocalInvocationID.y;
+    const uvec2 wg = gl_WorkGroupID.xy;
+
+    // 1. Mip 1 (32x32 per workgroup, 2x2 per thread) + register reduction to Mip 2 (16x16).
+    const uvec2 base1 = wg * 32u + uvec2(lx * 2u, ly * 2u);
+    const uvec2 p00 = min(base1 + uvec2(0u, 0u), pc.mip1_size - 1u);
+    const uvec2 p10 = min(base1 + uvec2(1u, 0u), pc.mip1_size - 1u);
+    const uvec2 p01 = min(base1 + uvec2(0u, 1u), pc.mip1_size - 1u);
+    const uvec2 p11 = min(base1 + uvec2(1u, 1u), pc.mip1_size - 1u);
+
+    const vec4 c00 = sample_mip1(p00);
+    const vec4 c10 = sample_mip1(p10);
+    const vec4 c01 = sample_mip1(p01);
+    const vec4 c11 = sample_mip1(p11);
+
+    if (base1.x < pc.mip1_size.x && base1.y < pc.mip1_size.y) {
+        imageStore(dst_mip1, ivec2(base1), c00);
+    }
+    if (base1.x + 1u < pc.mip1_size.x && base1.y < pc.mip1_size.y) {
+        imageStore(dst_mip1, ivec2(base1 + uvec2(1u, 0u)), c10);
+    }
+    if (base1.x < pc.mip1_size.x && base1.y + 1u < pc.mip1_size.y) {
+        imageStore(dst_mip1, ivec2(base1 + uvec2(0u, 1u)), c01);
+    }
+    if (base1.x + 1u < pc.mip1_size.x && base1.y + 1u < pc.mip1_size.y) {
+        imageStore(dst_mip1, ivec2(base1 + uvec2(1u, 1u)), c11);
+    }
+
+    if (pc.gen_mips < 2u) {
+        return;
+    }
+
+    // 2. Mip 2 (16x16 per workgroup, 1 texel per thread — zero barrier needed!).
+    const vec4 v2 = 0.25 * (c00 + c10 + c01 + c11);
+    const uvec2 p2 = wg * 16u + uvec2(lx, ly);
+    if (p2.x < pc.mip2_size.x && p2.y < pc.mip2_size.y) {
+        imageStore(dst_mip2, ivec2(p2), v2);
+    }
+    lds[ly][lx] = v2;
+    barrier();
+
+    if (pc.gen_mips < 3u) {
+        return;
+    }
+
+    // 3. Mip 3 (8x8 per workgroup).
+    if (lx < 8u && ly < 8u) {
+        const vec4 v3 = 0.25 * (lds[ly * 2u][lx * 2u] + lds[ly * 2u][lx * 2u + 1u] +
+                                lds[ly * 2u + 1u][lx * 2u] + lds[ly * 2u + 1u][lx * 2u + 1u]);
+        const uvec2 p3 = wg * 8u + uvec2(lx, ly);
+        if (p3.x < pc.mip3_size.x && p3.y < pc.mip3_size.y) {
+            imageStore(dst_mip3, ivec2(p3), v3);
+        }
+        lds[ly][lx] = v3;
+    }
+    barrier();
+
+    if (pc.gen_mips < 4u) {
+        return;
+    }
+
+    // 4. Mip 4 (4x4 per workgroup).
+    if (lx < 4u && ly < 4u) {
+        const vec4 v4 = 0.25 * (lds[ly * 2u][lx * 2u] + lds[ly * 2u][lx * 2u + 1u] +
+                                lds[ly * 2u + 1u][lx * 2u] + lds[ly * 2u + 1u][lx * 2u + 1u]);
+        const uvec2 p4 = wg * 4u + uvec2(lx, ly);
+        if (p4.x < pc.mip4_size.x && p4.y < pc.mip4_size.y) {
+            imageStore(dst_mip4, ivec2(p4), v4);
+        }
+        lds[ly][lx] = v4;
+    }
+    barrier();
+
+    if (pc.gen_mips < 5u) {
+        return;
+    }
+
+    // 5. Mip 5 (2x2 per workgroup).
+    if (lx < 2u && ly < 2u) {
+        const vec4 v5 = 0.25 * (lds[ly * 2u][lx * 2u] + lds[ly * 2u][lx * 2u + 1u] +
+                                lds[ly * 2u + 1u][lx * 2u] + lds[ly * 2u + 1u][lx * 2u + 1u]);
+        const uvec2 p5 = wg * 2u + uvec2(lx, ly);
+        if (p5.x < pc.mip5_size.x && p5.y < pc.mip5_size.y) {
+            imageStore(dst_mip5, ivec2(p5), v5);
+        }
+    }
+}
