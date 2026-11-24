@@ -41,12 +41,14 @@ LINUX_CORE_FILES = (
     "out/bb-vulkan",
     "out/bb-launcher",
     "launcher_v2/ui/app.js",
+    "data/shader_recipes.bbrc",
 )
 WINDOWS_CORE_FILES = (
     "bin/Bloodborne.exe",
     "Bloodborne.exe",
     "Launcher.exe",
     "launcher_v2/ui/app.js",
+    "data/shader_recipes.bbrc",
 )
 
 PROTECTED_NAMES = {
@@ -342,7 +344,7 @@ def _build_windows_apply_ps_script(
         "function Write-UpdLog([string]$msg) {\n"
         "    try {\n"
         "        $ld = Split-Path -Parent $logPath\n"
-        "        if ($ld -and -not (Test-Path -LiteralPath $ld)) { New-Item -ItemType Directory -Path $ld -Force | Out-Null }\n"
+        "        if ($ld -and -not (Test-Path -LiteralPath $ld)) { [void][System.IO.Directory]::CreateDirectory($ld) }\n"
         "        Add-Content -LiteralPath $logPath -Value ('[' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + '] ' + $msg) -Encoding UTF8\n"
         "    } catch {}\n"
         "}\n"
@@ -381,9 +383,9 @@ def _build_windows_apply_ps_script(
         "        if ($prot -contains $top -or $top -like 'CUSA*') { return }\n"
         "        $dst = Join-Path $portDir $rel\n"
         "        $dstDir = Split-Path -Parent $dst\n"
-        "        if ($dstDir -and -not (Test-Path -LiteralPath $dstDir)) { New-Item -ItemType Directory -Path $dstDir -Force | Out-Null }\n"
+        "        if ($dstDir -and -not (Test-Path -LiteralPath $dstDir)) { [void][System.IO.Directory]::CreateDirectory($dstDir) }\n"
         "        for ($try = 0; $try -lt 10; $try++) {\n"
-        "            try { Copy-Item -LiteralPath $_.FullName -Destination $dst -Force; break }\n"
+        "            try { [System.IO.File]::Copy($_.FullName, $dst, $true); break }\n"
         "            catch { Start-Sleep -Milliseconds 300 }\n"
         "        }\n"
         "    }\n"
@@ -401,12 +403,17 @@ def _build_windows_apply_ps_script(
         "    [Win32.ShellRefresh]::SHChangeNotify(0x08000000, 0, [IntPtr]::Zero, [IntPtr]::Zero)\n"
         "} catch {}\n"
         "try {\n"
+        "    # Use .NET ProcessStartInfo directly so brackets (`[FitGirl Repack]`) in paths\n"
+        "    # never trigger PowerShell Start-Process wildcard expansion.\n"
+        "    $psi = New-Object System.Diagnostics.ProcessStartInfo\n"
+        "    $psi.FileName = $relaunchExe\n"
+        "    $psi.WorkingDirectory = $portDir\n"
+        "    $psi.UseShellExecute = $false\n"
         "    if ($relaunchArgs.Count -gt 0) {\n"
         "        $quotedArgs = $relaunchArgs | ForEach-Object { '\"' + ($_ -replace '\"', '\\\"') + '\"' }\n"
-        "        Start-Process -FilePath $relaunchExe -ArgumentList $quotedArgs -WorkingDirectory $portDir\n"
-        "    } else {\n"
-        "        Start-Process -FilePath $relaunchExe -WorkingDirectory $portDir\n"
+        "        $psi.Arguments = ($quotedArgs -join ' ')\n"
         "    }\n"
+        "    [void][System.Diagnostics.Process]::Start($psi)\n"
         "    Write-UpdLog ('Relaunched: ' + $relaunchExe)\n"
         "} catch {\n"
         "    Write-UpdLog ('Relaunch failed: ' + $_.Exception.Message)\n"

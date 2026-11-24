@@ -532,10 +532,42 @@
       item.classList.toggle("selected", item.dataset.val === poolKey);
     });
 
-    const pct = Math.min(100, Math.round((state.shaderCount / Math.max(1, state.shaderTotal)) * 100));
-    document.getElementById("home-shader-val").textContent = `${pct}% (${state.shaderCount})`;
+    const totalShaders = Math.max(1, state.shaderTotal || 5761);
+    const shaderCount = state.shaderCount || 0;
+    const recipeCount = state.recipeCount || 0;
+    const recipeStages = state.recipeStages || 0;
+    const recipePsos = state.recipePsos || 0;
+    const fmtNum = (n) => Number(n || 0).toLocaleString("en-US");
+    const ruRecipeWord = (n) => {
+      const m100 = Math.abs(n) % 100;
+      const m10 = m100 % 10;
+      if (m100 >= 11 && m100 <= 19) return "рецептов";
+      if (m10 === 1) return "рецепт";
+      if (m10 >= 2 && m10 <= 4) return "рецепта";
+      return "рецептов";
+    };
+    const pct = Math.min(100, Math.round((shaderCount / totalShaders) * 100));
+    const titleEl = document.getElementById("shader-cache-title");
+    if (titleEl) {
+      if (recipeCount > 0) {
+        titleEl.textContent =
+          state.lang === "ru"
+            ? `Кэш шейдеров Vulkan (${fmtNum(totalShaders)} + ${fmtNum(recipeCount)} ${ruRecipeWord(recipeCount)})`
+            : `Vulkan Shader Cache (${fmtNum(totalShaders)} + ${fmtNum(recipeCount)} recipes)`;
+      } else {
+        titleEl.textContent = tr("shader_cache_title");
+      }
+    }
+    document.getElementById("home-shader-val").textContent =
+      recipeCount > 0
+        ? `${pct}% (${fmtNum(shaderCount)} + ${fmtNum(recipeCount)})`
+        : `${pct}% (${fmtNum(shaderCount)})`;
     document.getElementById("shader-cache-sub").textContent =
-      `${state.shaderCount} / ${state.shaderTotal} (${pct}%)`;
+      recipeCount > 0
+        ? (state.lang === "ru"
+            ? `${shaderCount} / ${totalShaders} (${pct}%) · +${fmtNum(recipeCount)} ${ruRecipeWord(recipeCount)} (${fmtNum(recipeStages)} перм., ${fmtNum(recipePsos)} PSO)`
+            : `${shaderCount} / ${totalShaders} (${pct}%) · +${fmtNum(recipeCount)} recipes (${fmtNum(recipeStages)} perms, ${fmtNum(recipePsos)} PSOs)`)
+        : `${shaderCount} / ${totalShaders} (${pct}%)`;
     document.getElementById("home-path-val").textContent = state.gameDir || "—";
 
     const sfxPct = Math.round((state.sfxVolume ?? 0.30) * 100);

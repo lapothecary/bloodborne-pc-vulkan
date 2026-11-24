@@ -567,6 +567,11 @@ bool ExtractCroppedTitleBmp(const fs::path& dcx_path, const fs::path& dst_bmp) {
 
 }  // namespace
 
+bool InflateZlibStream(const uint8_t* src, size_t src_len,
+                       std::vector<uint8_t>& dst, size_t expected_size) {
+    return InflateZlib(src, src_len, dst, expected_size);
+}
+
 std::string LoadOrExtractHeroArtUrl(const fs::path& game_dir, const fs::path& cache_dir) {
     if (game_dir.empty()) return {};
 

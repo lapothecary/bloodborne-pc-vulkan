@@ -7,8 +7,10 @@
 #include <algorithm>
 #include <cctype>
 #include <csignal>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <sstream>
 #include <vector>
@@ -465,6 +467,86 @@ int LauncherBridge::CountCachedShaders(const fs::path& user_dir) const {
     return (std::min)(base_spv, 5761);
 }
 
+ShaderRecipeStats LauncherBridge::ReadRecipeCatalogStats() const {
+    const fs::path bbrc_path = ctx_.package_dir / "data" / "shader_recipes.bbrc";
+    std::error_code ec;
+    if (!fs::is_regular_file(bbrc_path, ec)) {
+        return {};
+    }
+    const uintmax_t fsize = fs::file_size(bbrc_path, ec);
+    if (ec || fsize < 16u || fsize > 64u * 1024u * 1024u) {
+        return {};
+    }
+    const auto mtime = fs::last_write_time(bbrc_path, ec);
+
+    {
+        std::lock_guard<std::mutex> lk(recipe_mu_);
+        if (recipe_cache_valid_ && recipe_cache_size_ == fsize && recipe_cache_mtime_ == mtime) {
+            return recipe_cache_stats_;
+        }
+    }
+
+    std::ifstream f(bbrc_path, std::ios::binary);
+    if (!f) return {};
+    std::vector<uint8_t> raw(static_cast<size_t>(fsize));
+    if (!f.read(reinterpret_cast<char*>(raw.data()), static_cast<std::streamsize>(raw.size()))) {
+        return {};
+    }
+
+    auto read_le32 = [](const uint8_t* p) -> uint32_t {
+        return uint32_t(p[0]) | (uint32_t(p[1]) << 8) | (uint32_t(p[2]) << 16) |
+               (uint32_t(p[3]) << 24);
+    };
+
+    std::vector<uint8_t> inflated;
+    const uint8_t* stream = nullptr;
+    size_t stream_len = 0;
+
+    if (std::memcmp(raw.data(), "BBRC", 4) == 0) {
+        stream = raw.data() + 16u;
+        stream_len = raw.size() - 16u;
+    } else if (std::memcmp(raw.data(), "BBRZ", 4) == 0) {
+        if (raw.size() < 26u) return {};
+        const uint32_t expected_len = read_le32(raw.data() + 16u);
+        if (expected_len == 0u || expected_len > 64u * 1024u * 1024u) return {};
+        if (!InflateZlibStream(raw.data() + 20u, raw.size() - 20u, inflated, expected_len) ||
+            inflated.size() < expected_len) {
+            return {};
+        }
+        stream = inflated.data();
+        stream_len = expected_len;
+    } else {
+        return {};
+    }
+
+    ShaderRecipeStats stats{};
+    size_t pos = 0;
+    while (pos + 12u <= stream_len) {
+        const uint8_t kind = stream[pos];
+        const uint32_t payload_bytes = read_le32(stream + pos + 4u);
+        pos += 12u;
+        if (payload_bytes == 0u || pos + payload_bytes > stream_len) break;
+        pos += payload_bytes;
+        if (kind == 1u) {
+            ++stats.stages;
+        } else if (kind == 2u) {
+            ++stats.gfx_psos;
+        } else if (kind == 3u) {
+            ++stats.cs_psos;
+        }
+    }
+    stats.total = stats.stages + stats.gfx_psos + stats.cs_psos;
+
+    {
+        std::lock_guard<std::mutex> lk(recipe_mu_);
+        recipe_cache_valid_ = true;
+        recipe_cache_size_ = fsize;
+        recipe_cache_mtime_ = mtime;
+        recipe_cache_stats_ = stats;
+    }
+    return stats;
+}
+
 std::string LauncherBridge::ReadVersionTag() const {
     const fs::path vf = ctx_.package_dir / ".bbport-version.json";
     std::ifstream f(vf);
@@ -840,6 +922,7 @@ std::string LauncherBridge::BuildStateJson() const {
     const bool valid = IsValidGameDir(game_dir);
     const fs::path user_dir = ResolveUserDir();
     const int shaders = CountCachedShaders(user_dir);
+    const ShaderRecipeStats recipes = ReadRecipeCatalogStats();
 
     std::string lang = ReadIniValue("launcher_lang", "en");
     if (lang != "ru" && lang != "en") lang = "en";
@@ -866,6 +949,9 @@ std::string LauncherBridge::BuildStateJson() const {
        << "\"bgmTrack\":\"" << JsonEscape(bgm_track) << "\","
        << "\"shaderCount\":" << shaders << ","
        << "\"shaderTotal\":5761,"
+       << "\"recipeCount\":" << recipes.total << ","
+       << "\"recipeStages\":" << recipes.stages << ","
+       << "\"recipePsos\":" << (recipes.gfx_psos + recipes.cs_psos) << ","
        << "\"onlinePool\":\"" << JsonEscape(online_pool) << "\","
        << "\"onlineUpnp\":" << (online_upnp ? "true" : "false") << ","
        << "\"mods\":" << BuildModsJson()

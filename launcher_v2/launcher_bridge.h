@@ -15,6 +15,13 @@ struct LauncherContext {
     std::filesystem::path icon_png_path;
 };
 
+struct ShaderRecipeStats {
+    int total = 0;
+    int stages = 0;
+    int gfx_psos = 0;
+    int cs_psos = 0;
+};
+
 struct BakeProgress {
     bool running = false;
     bool finished = false;
@@ -66,6 +73,7 @@ private:
     std::filesystem::path ResolveUserDir() const;
     std::string ReadIniValue(const std::string& key, const std::string& fallback = "") const;
     int CountCachedShaders(const std::filesystem::path& user_dir) const;
+    ShaderRecipeStats ReadRecipeCatalogStats() const;
     std::string ReadVersionTag() const;
     std::string BuildStateJson() const;
     std::string BuildSfxJson() const;
@@ -96,6 +104,12 @@ private:
     mutable std::mutex upd_mu_;
     UpdateProgress upd_{};
     std::thread upd_thread_;
+
+    mutable std::mutex recipe_mu_;
+    mutable bool recipe_cache_valid_ = false;
+    mutable uintmax_t recipe_cache_size_ = 0;
+    mutable std::filesystem::file_time_type recipe_cache_mtime_{};
+    mutable ShaderRecipeStats recipe_cache_stats_{};
 };
 
 std::string JsonEscape(const std::string& s);
