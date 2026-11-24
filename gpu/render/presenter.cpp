@@ -34,6 +34,8 @@
 
 namespace Vulkan {
 
+std::atomic<u64> g_last_completed_frame_draws{0};
+
 namespace {
 
 constexpr vk::ImageSubresourceRange ColorRange{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
@@ -430,6 +432,16 @@ Frame* Presenter::PrepareFrame(const BbVideoOut::BufferAttributeGroup& attribute
 
     BbStats::frame_number.fetch_add(1, std::memory_order_relaxed);
     {
+        static u64 prev_flip_draws = 0;
+        static u64 prev_frame_draws = 0;
+        const u64 cur_draws = BbStats::draws.load(std::memory_order_relaxed);
+        const u64 frame_draws = cur_draws >= prev_flip_draws ? (cur_draws - prev_flip_draws) : 0ull;
+        prev_flip_draws = cur_draws;
+        g_last_completed_frame_draws.store(std::max(prev_frame_draws, frame_draws),
+                                           std::memory_order_relaxed);
+        prev_frame_draws = frame_draws;
+    }
+    {
         static u64 prev_sb_ns = 0;
         const u64 sb_now_ns = BbFrameRate::NowMonotonicNs();
         if (prev_sb_ns != 0 && sb_now_ns >= prev_sb_ns) {
@@ -464,6 +476,7 @@ Frame* Presenter::PrepareBlankFrame(bool present_thread) {
     // Presented as the black bars alone: nothing to render. A blank flip of the guest still
     // ends its submission, as any flip does: the guest may wait for work recorded before it.
     if (!present_thread) {
+        g_last_completed_frame_draws.store(0, std::memory_order_relaxed);
         draw_scheduler.EndRendering();
         SubmitInfo info{};
         draw_scheduler.Flush(info);

@@ -35,6 +35,7 @@
 #include "render/gcn_to_vk.h"
 #include "render/pipeline_cache.h"
 #include "render/pipeline_store.h"
+#include "render/presenter.h"
 #include "render/recipe_catalog.h"
 #include "render/scheduler.h"
 #include "render/shader_capture.h"
@@ -2695,10 +2696,8 @@ bool PipelineCache::AsyncSkippable(const PipelineSelection& selection, bool indi
         return false;
     }
     const u32 frame = BbStats::frame_number.load(std::memory_order_relaxed);
-    const u64 draws = BbStats::draws.load(std::memory_order_relaxed);
+    last_frame_draws = g_last_completed_frame_draws.load(std::memory_order_relaxed);
     if (frame != stats_frame) {
-        last_frame_draws = draws - frame_start_draws;
-        frame_start_draws = draws;
         stats_frame = frame;
         const u32 second = BbStats::coarse_second.load(std::memory_order_relaxed);
         if (async_started != 0 && second - stats_printed >= 5) {

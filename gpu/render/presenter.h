@@ -131,4 +131,9 @@ private:
     std::atomic<u32> expected_height{1080};
 };
 
+/// True per-frame draw count (2-frame sliding max) sampled once per completed frame in
+/// Presenter::PrepareFrame. Used by PipelineCache::AsyncSkippable so sparse FastPSO misses
+/// across async frame ticks never misread active combat as a <64-draw loading screen.
+extern std::atomic<u64> g_last_completed_frame_draws;
+
 } // namespace Vulkan

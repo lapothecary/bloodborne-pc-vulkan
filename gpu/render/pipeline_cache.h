@@ -367,7 +367,7 @@ private:
     u64 last_target_quick_key = ~0ull;
     u32 last_target_frame = ~0u;
     u32 stats_frame = ~0u;
-    u64 frame_start_draws = 0, last_frame_draws = 0;
+    u64 last_frame_draws = 0;
     u32 stats_printed = 0;
     u64 async_started = 0, async_skipped = 0, async_waited = 0; ///< statistics
     std::atomic<bool> driver_cache_dirty{false};
