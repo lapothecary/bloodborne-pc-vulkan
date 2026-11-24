@@ -1755,6 +1755,7 @@ bool GXParallelForTask_SplitAndDispatch(void* self, void* worker_pool) {
     if (num_splits > 0 && worker_cnt > 0) {
         int32_t base_items_per_split = total_items / num_splits;
         int32_t remainder = total_items - num_splits * base_items_per_split;
+        uint8_t* prev_task = task;
 
         for (int32_t idx = 0; idx < num_splits; ++idx) {
             int32_t chunk_len = base_items_per_split + ((remainder > idx) ? 1 : 0);
@@ -1770,8 +1771,8 @@ bool GXParallelForTask_SplitAndDispatch(void* self, void* worker_pool) {
                                     static_cast<size_t>(w_idx) * 0x60ULL;
                 sub_task = static_cast<uint8_t*>(GXInternalTaskPool_AllocateTaskNode(slot_ptr));
                 if (sub_task == nullptr) {
-                    // Pool exhausted: extend the first chunk to cover remaining items safely.
-                    *reinterpret_cast<int32_t*>(task + 0x14) = cur_end;
+                    // Pool exhausted: extend the previous chunk to cover remaining items with zero overlap.
+                    *reinterpret_cast<int32_t*>(prev_task + 0x14) = cur_end;
                     break;
                 }
                 *reinterpret_cast<void**>(sub_task + 0x08) = cb;
@@ -1792,6 +1793,7 @@ bool GXParallelForTask_SplitAndDispatch(void* self, void* worker_pool) {
                 workers_base + static_cast<size_t>(w_idx) * 0x530ULL + 0x18ULL;
             reinterpret_cast<void (*)(void*, void*)>(GX_VMA(0xe47ab0ULL))(target_deque, sub_task);
 
+            prev_task = sub_task;
             cur_start += chunk_len;
         }
     }

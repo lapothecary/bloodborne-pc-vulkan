@@ -1,3 +1,4 @@
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -15,6 +16,12 @@
 // ============================================================================
 
 namespace {
+
+// Serializes `sub_22a0a30` ONLY across views with `viewBytes[+0x68] != 0` (main scene `0x3e` and
+// the ~30 Hz dynamic cubemap `0x37..0x3c`) so parallel `ParScenePass` workers (`0x29487b0`) never
+// race on `pLightQueue` (`g_SceneMgr + 0x5878`) or the unlocked callback vector `g_SceneMgr + 0x7688`.
+// Planar water reflection (`0x36`, `[+0x68] == 0`) does not take this lock.
+std::atomic_flag g_sub22a0a30_shared_lock = ATOMIC_FLAG_INIT;
 
 struct CmdPacketHeader {
     uint32_t packedWord;
@@ -408,15 +415,29 @@ __attribute__((noinline)) void sub_229e990(void* pSelf, void* pRenderDev, void* 
         }
     }
 
-    // Live PostFX / effect toggle overrides apply ONLY to the main scene pass (`passId == 0x3e`).
-    // Secondary / planar reflection views (`passId == 0x35` from `sub_229d2b0` inside parallel
-    // `GXParallelFor` worker tasks `0x29487b0 -> 0xea8b80`, and `passId == 0x36`) intentionally
-    // zero `viewBytes[0x2968..0x296a]` and `viewBytes[0x296e]` at `eboot.bin+0x188dd60..0x188dd8b`:
-    // forcing `viewBytes[0x296e] = 1` on a parallel `passId == 0x35` view makes multiple GXWorker
-    // threads concurrently enter the non-thread-safe dynamic shadow pool allocator (`0x22a5c89 ->
-    // 0xea0a20 -> 0x2245320`), racing on `pool->used[tier]` (`[rdi+tier*4+0x100]`) past `cap`,
-    // overflowing into the adjacent GFX heap chunk and calling a null vtable slot (`0x535f3e0+0x18`).
-    // Also honor the original `ctxFlags` bit gates from `eboot.bin+0x22c5964..0x22c5989`
+    // Only the primary main scene view (`passId == 0x3eu`, `pParentView == nullptr`) owns the
+    // single global, unlocked `pLightQueue` (`g_SceneMgr + 0x5878`).
+    // Secondary views run concurrently with `0x3e` inside the parallel `ParScenePass` batch
+    // (`0x0ec4fa7 -> 0x29487b0`):
+    //   - `0x35` (`sub_229d2b0`): clears `[+0x296e]` at `eboot.bin+0x188dd8b`.
+    //   - `0x36` (`sub_22ae480`, planar water reflection `pVpState+0x128`): FromSoftware cleared
+    //     both `[+0x296c]` and `[+0x296e]` for sibling child `+0x120` at `eboot.bin+0x22c525f..0x22c5266`,
+    //     but omitted `mov byte [rax+0x296e], 0` on `+0x128` at `eboot.bin+0x22c535b`, leaving `[+0x296e] = 1`
+    //     from `ViewCtor` (`0x22c2532`).
+    //   - `0x37..0x3c` (`sub_22ae500`, dynamic cubemap `pMgr+0x2c60`): `ViewCtor` at `0x229599e`
+    //     also leaves `[+0x296e] = 1`.
+    // Allowing any secondary pass to enter `0x22a5cb0 -> sub_2245320/sub_2244cf0 -> sub_2248010`
+    // concurrently with `0x3e` races on `pLightQueue->entries.end` (`+0x170`) and `pool->used[tier]`,
+    // leaving all-zero `0x680`-byte holes that crash `GXWorker` in `sub_22b5b10 -> sub_2266b40(nullptr, &passCtx, 0, 0)`
+    // at `eboot.bin+0x2266b6c`.
+    const bool isChildView =
+        (*reinterpret_cast<const uint64_t*>(viewBytes + 0x1b90) != 0ULL);
+    if (passId != 0x3eu || isChildView) {
+        viewBytes[0x296e] = 0u;
+    }
+
+    // Live PostFX / effect toggle overrides apply ONLY to the main scene pass (`passId == 0x3eu`).
+    // Honor the original `ctxFlags` bit gates from `eboot.bin+0x22c5964..0x22c5989`
     // (`0x20` for Motion Blur `0x2969`, `0x10` for Game AA `0x296a`, `0x08` for Bloom/SSAO).
     if (passId == 0x3eu) {
         const uint32_t ctxFlags = *reinterpret_cast<const uint32_t*>(viewBytes + 0x48);
@@ -430,19 +451,9 @@ __attribute__((noinline)) void sub_229e990(void* pSelf, void* pRenderDev, void* 
         if ((ctxFlags & 0x10u) != 0u) {
             viewBytes[0x296a] = gx_direct_vk::IsEffectEnabled(gx_direct_vk::kEffectGameAa) ? 1u : 0u;
         }
-        // Mirror eboot.bin+0x22c5256..0x22c526d and eboot.bin+0x22c5989:
-        // Planar water-reflection child views have `*(void**)(viewBytes + 0x1b90) != nullptr`
-        // (`pParentView`) and explicitly force BOTH `viewBytes[0x296c] = 0` (CSM) and
-        // `viewBytes[0x296e] = 0` (dynamic point/spot light shadows). Never force `0x296e = 1`
-        // on a child reflection view, otherwise it populates `pLightQueue` (`0x5878`) a second
-        // time per frame without reset and crashes `GXWorker` (`sub_22b5b10 -> sub_2266b40(NULL)`).
-        const bool isChildReflectionView =
-            (*reinterpret_cast<const uint64_t*>(viewBytes + 0x1b90) != 0ULL);
-        if (!isChildReflectionView) {
+        if (!isChildView && viewBytes[0x1b88] != 0u) {
             const bool shadowsOn = (gx_direct_vk::GetShadowQuality() != 0);
-            if (viewBytes[0x1b88] != 0u) {
-                viewBytes[0x296c] = shadowsOn ? 1u : 0u;
-            }
+            viewBytes[0x296c] = shadowsOn ? 1u : 0u;
             viewBytes[0x296e] =
                 (shadowsOn && gx_direct_vk::IsEffectEnabled(gx_direct_vk::kEffectDynamicShadows)) ? 1u : 0u;
         }
@@ -484,7 +495,17 @@ __attribute__((noinline)) void sub_229e990(void* pSelf, void* pRenderDev, void* 
     } dispatchArgs = {
         pSelf, pRenderDev, pCamera, pArg4, pArg5, pViewCtx, viewIdx, passId, sceneQuery
     };
+    const bool touchesSharedLightShadowQueue =
+        (*reinterpret_cast<const uint32_t*>(viewBytes + 0x68) != 0u);
+    if (touchesSharedLightShadowQueue) {
+        while (g_sub22a0a30_shared_lock.test_and_set(std::memory_order_acquire)) {
+            _mm_pause();
+        }
+    }
     sub_22a0a30(&dispatchArgs);
+    if (touchesSharedLightShadowQueue) {
+        g_sub22a0a30_shared_lock.clear(std::memory_order_release);
+    }
 
     if (passId == 0x3e) {
         uint8_t* pGlobalPostCfg = reinterpret_cast<uint8_t*>(GX_VMA(0x55406e0ULL));
