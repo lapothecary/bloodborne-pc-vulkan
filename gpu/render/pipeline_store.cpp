@@ -254,6 +254,17 @@ bool IsOpt56Pack5ShaderHash(u64 pgm_hash) noexcept {
     }
 }
 
+bool IsOpt63GlowOptShaderHash(u64 pgm_hash) noexcept {
+    switch (pgm_hash) {
+    // Post-Yebis GXGlowFilter optimization: 5-tap moment-matched 2D hex composite + k=7/8 dedup
+    case 0x000000008c08444cULL: // ps_8c08444c_blur13
+    case 0x00000000a61e325dULL: // ps_a61e325d_glow_blur13
+        return true;
+    default:
+        return false;
+    }
+}
+
 std::string OptBinaryName(u64 pgm_hash, size_t perm_idx) {
     const bool hw_interp = Shader::Backend::SPIRV::HwInterpEnabled();
     const bool fast_fp = Shader::Backend::SPIRV::FastFpEnabled();
@@ -268,33 +279,35 @@ std::string OptBinaryName(u64 pgm_hash, size_t perm_idx) {
     if (hw_interp) {
         if (fast_fp) {
             prefix = use_native_prefix
-                         ? (IsOpt56Pack5ShaderHash(pgm_hash)
-                                ? "opt57"
-                                : (IsOpt49RemasterFireShaderHash(pgm_hash)
-                                ? "opt55"
-                                : (IsOpt46MotBlurObjFpsShaderHash(pgm_hash)
-                                       ? "opt48"
-                                       : (IsOpt40RemasterSsgiShaderHash(pgm_hash)
-                                       ? "opt62"
-                                       : (IsOpt39RemasterPcssShaderHash(pgm_hash)
-                                              ? "opt39"
-                                              : (IsOpt38StageC2ShaderHash(pgm_hash)
-                                                     ? "opt38"
-                                                     : (IsOpt37StageC1ShaderHash(pgm_hash)
-                                                            ? "opt37"
-                                                            : (IsOpt36BgraFixShaderHash(pgm_hash)
-                                                                   ? "opt36"
-                                                                   : (IsOpt35Phase5ShaderHash(pgm_hash)
-                                                                          ? "opt35"
-                                                                          : (IsOpt33Phase2ShaderHash(pgm_hash)
-                                                                                 ? "opt33"
-                                                                                 : ((pgm_hash ==
-                                                                                         0x0000000024042a9bULL ||
-                                                                                     pgm_hash ==
-                                                                                         0x00000000f55643deULL ||
-                                                                                     ltb_patched)
-                                                                                        ? "opt32"
-                                                                                        : "opt31")))))))))))
+                         ? (IsOpt63GlowOptShaderHash(pgm_hash)
+                                ? "opt63"
+                                : (IsOpt56Pack5ShaderHash(pgm_hash)
+                                       ? "opt57"
+                                       : (IsOpt49RemasterFireShaderHash(pgm_hash)
+                                              ? "opt55"
+                                              : (IsOpt46MotBlurObjFpsShaderHash(pgm_hash)
+                                                     ? "opt48"
+                                                     : (IsOpt40RemasterSsgiShaderHash(pgm_hash)
+                                                            ? "opt62"
+                                                            : (IsOpt39RemasterPcssShaderHash(pgm_hash)
+                                                                   ? "opt39"
+                                                                   : (IsOpt38StageC2ShaderHash(pgm_hash)
+                                                                          ? "opt38"
+                                                                          : (IsOpt37StageC1ShaderHash(pgm_hash)
+                                                                                 ? "opt37"
+                                                                                 : (IsOpt36BgraFixShaderHash(pgm_hash)
+                                                                                        ? "opt36"
+                                                                                        : (IsOpt35Phase5ShaderHash(pgm_hash)
+                                                                                               ? "opt35"
+                                                                                               : (IsOpt33Phase2ShaderHash(pgm_hash)
+                                                                                                      ? "opt33"
+                                                                                                      : ((pgm_hash ==
+                                                                                                              0x0000000024042a9bULL ||
+                                                                                                          pgm_hash ==
+                                                                                                              0x00000000f55643deULL ||
+                                                                                                          ltb_patched)
+                                                                                                             ? "opt32"
+                                                                                                             : "opt31"))))))))))))
                          : (ltb_patched ? "opt6_ltb2" : "opt6_nonat");
         } else {
             prefix = ltb_patched ? "opt3_ltb2" : "opt3_strict";

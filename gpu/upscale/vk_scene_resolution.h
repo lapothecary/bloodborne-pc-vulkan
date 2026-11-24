@@ -112,6 +112,8 @@ private:
         VideoCore::HostImage image;
         std::vector<std::pair<VideoCore::ImageViewInfo, vk::UniqueImageView>> views;
         vk::ImageLayout layout = vk::ImageLayout::eUndefined;
+        vk::PipelineStageFlags2 stages = vk::PipelineStageFlagBits2::eTopOfPipe;
+        vk::AccessFlags2 write_access{};
         SceneResolution::Coherence state;
     };
     static constexpr u64 Key(u64 uid, u32 level) {

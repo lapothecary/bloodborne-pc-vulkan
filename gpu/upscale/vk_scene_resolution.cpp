@@ -248,10 +248,21 @@ void SceneTargets::EndClear(VideoCore::Image& image, const VideoCore::Subresourc
 }
 void SceneTargets::Transition(Entry& e, vk::ImageAspectFlags aspect, vk::ImageLayout layout,
                                vk::PipelineStageFlags2 stages, vk::AccessFlags2 access) {
+    constexpr vk::AccessFlags2 kWriteAccessMask =
+        vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eShaderStorageWrite |
+        vk::AccessFlagBits2::eColorAttachmentWrite |
+        vk::AccessFlagBits2::eDepthStencilAttachmentWrite |
+        vk::AccessFlagBits2::eTransferWrite | vk::AccessFlagBits2::eMemoryWrite;
+    const vk::AccessFlags2 dst_writes = access & kWriteAccessMask;
+    if (e.layout == layout && !e.write_access && !dst_writes) {
+        e.stages |= stages;
+        return;
+    }
     scheduler.EndRendering();
+    const bool from_undef = (e.layout == vk::ImageLayout::eUndefined);
     const vk::ImageMemoryBarrier2 barrier{
-        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-        .srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+        .srcStageMask = from_undef ? vk::PipelineStageFlagBits2::eTopOfPipe : e.stages,
+        .srcAccessMask = from_undef ? vk::AccessFlags2{} : e.write_access,
         .dstStageMask = stages, .dstAccessMask = access,
         .oldLayout = e.layout, .newLayout = layout,
         .image = e.image, .subresourceRange = {aspect, 0, 1, 0, 1},
@@ -260,6 +271,8 @@ void SceneTargets::Transition(Entry& e, vk::ImageAspectFlags aspect, vk::ImageLa
         cmd.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &barrier});
     });
     e.layout = layout;
+    e.stages = stages;
+    e.write_access = dst_writes;
 }
 void SceneTargets::Copy(Entry& e, VideoCore::Image& original, bool to_native) {
     copying = true;

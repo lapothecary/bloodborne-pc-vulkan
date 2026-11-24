@@ -5873,19 +5873,29 @@ namespace {
 
 u8 ClassifyHudRenderSubPass(u64 vs_hash, u64 ps_hash, u32 width, u32 height, u32 num_mrts,
                             bool has_depth, bool in_ui_phase) noexcept {
-    // 10. UI (Scaleform) & Present (final gamma/LUT1D display blit or UI phase)
+    // 10. Explicit Scaleform UI & Present shaders first (always UI regardless of phase)
     if (ps_hash == 0x38d65b32ull) {
         return BbStats::GpuSub_Ui_RcasPresent;
     }
-    if (in_ui_phase || vs_hash == 0x34e8a281ull ||
+    if (vs_hash == 0x34e8a281ull ||
         ps_hash == 0xbabda34dull || ps_hash == 0xcfa96da9ull || ps_hash == 0x4baeaa00ull ||
         UiComposition::MovieShader(vs_hash)) {
         return BbStats::GpuSub_Ui_ScaleformHud;
     }
-    // 9. Anti-Aliasing (in-game DLAA / FXAA / FXAA3 / FXAA3HQ passes)
+    // 9. Anti-Aliasing (in-game DLAA / FXAA / FXAA3 / FXAA3HQ passes — may run after RunPrePostHdr
+    // already entered ui_phase so Tonemap could target ui_image directly)
     if (ps_hash == 0xda1faca9ull || ps_hash == 0x894de4ceull || ps_hash == 0x309a6f67ull ||
         ps_hash == 0x6c5edb96ull) {
         return BbStats::GpuSub_Aa_Upscaler;
+    }
+    // 8c. Post-Yebis FromSoftware GXGlowFilter passes (sub_e5bb70: runs right after NativePostFX,
+    // when RunPrePostHdr has already set ui_phase=true — classify before the generic ui_phase catch-all)
+    if (ps_hash == 0x57f3b8c2ull || ps_hash == 0x8c08444cull || ps_hash == 0xf7229091ull ||
+        ps_hash == 0xa61e325dull) {
+        return BbStats::GpuSub_Post_BloomGlare;
+    }
+    if (in_ui_phase) {
+        return BbStats::GpuSub_Ui_ScaleformHud;
     }
     // 2. G-Buffer (5/6/7-MRT deferred geometry & foliage)
     if (num_mrts >= 4) {

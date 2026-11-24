@@ -811,6 +811,9 @@ void ApplyWin32ThreadTopologyByName(const char* name) {
         boost = true;
     } else if (starts_with(name, "GXWorker")) {
         mask = topo.gx_workers ? topo.gx_workers : topo.game_workers;
+        // Match main/HavokWorker/GXRenderThread priority so AdhocDraw & ScaleformStep sync
+        // barriers never stall 15-30ms behind Windows quantum preemption on hybrid 6P+4E CPUs.
+        boost = true;
     } else if (starts_with(name, "HavokWorker") ||
                starts_with(name, "CSChrThread") ||
                starts_with(name, "CSClothThread") ||
@@ -822,6 +825,7 @@ void ApplyWin32ThreadTopologyByName(const char* name) {
                starts_with(name, "MorphemeWorker") ||
                starts_with(name, "EzTaskRunner") ||
                starts_with(name, "FD4TaskRunner") ||
+               starts_with(name, "CSMenu") ||
                (fast_load_res && starts_with(name, "Core.Res."))) {
         mask = topo.game_workers;
         if (starts_with(name, "HavokWorker") || starts_with(name, "GXRenderThread")) {
@@ -881,7 +885,6 @@ void ApplyWin32ThreadTopologyByName(const char* name) {
                starts_with(name, "SLSession") ||
                starts_with(name, "SL ") ||
                starts_with(name, "CSTrophy") ||
-               starts_with(name, "CSMenu") ||
                starts_with(name, "SaveData") ||
                starts_with(name, "FrpgNet") ||
                starts_with(name, "SystemService") ||

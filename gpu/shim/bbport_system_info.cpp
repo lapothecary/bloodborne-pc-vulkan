@@ -679,7 +679,9 @@ void PollLiveSystemSensors(LiveSysSensors& out) {
         cpu_seeded = true;
     }
 
-    // 3. Live Average CPU Clock (MHz) via CallNtPowerInformation(ProcessorInformation) — no admin/driver needed
+    // 3. Live Average CPU Clock (MHz) — prefer PDH `% Processor Performance` * nominal MaxMhz so
+    //    Intel HWP / AMD CPPC CPUs report real Turbo Boost MHz instead of stuck base clock;
+    //    fall back cleanly to CallNtPowerInformation(ProcessorInformation) CurrentMhz.
     {
         struct WinProcPowerInfo {
             ULONG Number;
@@ -702,24 +704,98 @@ void PollLiveSystemSensors(LiveSysSensors& out) {
             GetNativeSystemInfo(&si);
             return si.dwNumberOfProcessors > 0 ? si.dwNumberOfProcessors : 1u;
         }();
+        int fallback_cur_mhz = 0;
+        int nominal_max_mhz = 0;
         if (fn_power_info && win_logical_cpus > 0 && win_logical_cpus <= 256u) {
             std::vector<WinProcPowerInfo> info(win_logical_cpus);
             const ULONG bytes = static_cast<ULONG>(info.size() * sizeof(WinProcPowerInfo));
             // InformationLevel 11 == ProcessorInformation
             if (fn_power_info(11, nullptr, 0, info.data(), bytes) == 0) {
-                std::uint64_t sum_mhz = 0;
-                int count = 0;
+                std::uint64_t sum_cur = 0;
+                std::uint64_t sum_max = 0;
+                int count_cur = 0;
+                int count_max = 0;
                 for (const auto& p : info) {
                     if (p.CurrentMhz > 100 && p.CurrentMhz < 10000) {
-                        sum_mhz += p.CurrentMhz;
-                        ++count;
+                        sum_cur += p.CurrentMhz;
+                        ++count_cur;
+                    }
+                    if (p.MaxMhz > 100 && p.MaxMhz < 10000) {
+                        sum_max += p.MaxMhz;
+                        ++count_max;
                     }
                 }
-                if (count > 0) {
-                    out.cpu_clock_mhz = static_cast<int>((sum_mhz + count / 2) / count);
+                if (count_cur > 0) {
+                    fallback_cur_mhz = static_cast<int>((sum_cur + count_cur / 2) / count_cur);
+                }
+                if (count_max > 0) {
+                    nominal_max_mhz = static_cast<int>((sum_max + count_max / 2) / count_max);
                 }
             }
         }
+        int pdh_turbo_mhz = 0;
+        if (nominal_max_mhz > 0) {
+            struct WinPdhFmtValue {
+                DWORD c_status;
+                DWORD pad;
+                double double_val;
+            };
+            using FnPdhOpenQueryA = LONG(__stdcall*)(const char*, ULONG_PTR, void**);
+            using FnPdhAddEnglishCounterA = LONG(__stdcall*)(void*, const char*, ULONG_PTR, void**);
+            using FnPdhCollectQueryData = LONG(__stdcall*)(void*);
+            using FnPdhGetFormattedCounterValue =
+                LONG(__stdcall*)(void*, DWORD, DWORD*, WinPdhFmtValue*);
+            struct PdhState {
+                FnPdhCollectQueryData collect = nullptr;
+                FnPdhGetFormattedCounterValue format = nullptr;
+                void* query = nullptr;
+                void* counter = nullptr;
+                bool seeded = false;
+                PdhState() {
+                    HMODULE lib = LoadLibraryA("pdh.dll");
+                    if (!lib) {
+                        return;
+                    }
+                    auto fn_open = reinterpret_cast<FnPdhOpenQueryA>(
+                        GetProcAddress(lib, "PdhOpenQueryA"));
+                    auto fn_add = reinterpret_cast<FnPdhAddEnglishCounterA>(
+                        GetProcAddress(lib, "PdhAddEnglishCounterA"));
+                    collect = reinterpret_cast<FnPdhCollectQueryData>(
+                        GetProcAddress(lib, "PdhCollectQueryData"));
+                    format = reinterpret_cast<FnPdhGetFormattedCounterValue>(
+                        GetProcAddress(lib, "PdhGetFormattedCounterValue"));
+                    if (!fn_open || !fn_add || !collect || !format) {
+                        return;
+                    }
+                    if (fn_open(nullptr, 0, &query) != 0 || !query) {
+                        query = nullptr;
+                        return;
+                    }
+                    if (fn_add(query, "\\Processor Information(_Total)\\% Processor Performance",
+                               0, &counter) != 0 ||
+                        !counter) {
+                        counter = nullptr;
+                        return;
+                    }
+                    if (collect(query) == 0) {
+                        seeded = true;
+                    }
+                }
+            };
+            static PdhState pdh;
+            if (pdh.seeded && pdh.query && pdh.counter && pdh.collect(pdh.query) == 0) {
+                WinPdhFmtValue val{};
+                // 0x00000200 == PDH_FMT_DOUBLE
+                if (pdh.format(pdh.counter, 0x00000200u, nullptr, &val) == 0 &&
+                    val.c_status == 0 && val.double_val > 5.0 && val.double_val < 500.0) {
+                    const int est = static_cast<int>(nominal_max_mhz * (val.double_val / 100.0) + 0.5);
+                    if (est >= 200 && est <= 9500) {
+                        pdh_turbo_mhz = est;
+                    }
+                }
+            }
+        }
+        out.cpu_clock_mhz = (pdh_turbo_mhz > 0) ? pdh_turbo_mhz : fallback_cur_mhz;
     }
 #else
     static const long page_size = std::max<long>(4096, ::sysconf(_SC_PAGESIZE));

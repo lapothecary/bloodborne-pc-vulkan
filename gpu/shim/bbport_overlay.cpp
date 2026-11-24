@@ -3537,7 +3537,10 @@ void UpdateHudBreakdown(HudBreakdown& h) {
                     p99_ms = log_frame_ms_buf[(cnt * 99u) / 100u];
                     max_ms = log_frame_ms_buf[cnt - 1u];
                     const int cap_now = BbFrameRate::Limit();
-                    const float ref_ms = cap_now > 0 ? (1000.0f / float(cap_now)) : p50_ms;
+                    // Compare against max(cap_ms, p50_ms) so steady GPU/CPU-bound play below the
+                    // cap (e.g. 95-115 FPS with Cap 170) is not falsely flagged as >1.25x hitches.
+                    const float ref_ms =
+                        cap_now > 0 ? std::max(1000.0f / float(cap_now), p50_ms) : p50_ms;
                     for (std::uint32_t i = 0; i < cnt; ++i) {
                         if (log_frame_ms_buf[i] > ref_ms * 1.25f) {
                             ++over_125;

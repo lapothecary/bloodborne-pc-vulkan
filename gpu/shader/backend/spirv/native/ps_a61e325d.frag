@@ -51,7 +51,24 @@ void main() {
 
     vec4 acc = sample_tap(d0 + 4u, uv0, scale);
     acc += sample_tap(d0 + 0u, uv0, scale);
-    for (uint k = 2u; k < 13u; ++k) {
+    for (uint k = 2u; k < 7u; ++k) {
+        acc += sample_tap(d0 + (k << 2u), uv0, scale);
+    }
+    // Bit-exact uniform deduplication of FromSoftware's duplicated k=7/k=8 (+0.6667) tap in
+    // boot.bin 0x4739150 / 0x47391c0 (saves 1 texture fetch per pixel across all 4 glow passes).
+    const vec2 off7 = vec2(uintBitsToFloat(ssbo_1.data[d0 + 28u]),
+                           uintBitsToFloat(ssbo_1.data[d0 + 29u]));
+    const vec2 off8 = vec2(uintBitsToFloat(ssbo_1.data[d0 + 32u]),
+                           uintBitsToFloat(ssbo_1.data[d0 + 33u]));
+    const float w7 = uintBitsToFloat(ssbo_1.data[d0 + 30u]);
+    const float w8 = uintBitsToFloat(ssbo_1.data[d0 + 34u]);
+    if (off7 == off8) {
+        acc += (w7 + w8) * textureLod(sampler2D(fs_img0, fs_samp0), fma(scale, off7, uv0), 0.0);
+    } else {
+        acc += w7 * textureLod(sampler2D(fs_img0, fs_samp0), fma(scale, off7, uv0), 0.0);
+        acc += w8 * textureLod(sampler2D(fs_img0, fs_samp0), fma(scale, off8, uv0), 0.0);
+    }
+    for (uint k = 9u; k < 13u; ++k) {
         acc += sample_tap(d0 + (k << 2u), uv0, scale);
     }
 

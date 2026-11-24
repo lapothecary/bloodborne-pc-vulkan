@@ -343,6 +343,8 @@ def _build_windows_apply_ps_script(
         f"$waitPids = @({pids_literal})\n"
         "function Write-UpdLog([string]$msg) {\n"
         "    try {\n"
+        "        $up = $env:USERPROFILE\n"
+        "        if ($up -and $msg) { $msg = $msg -ireplace [regex]::Escape($up), '%USERPROFILE%' }\n"
         "        $ld = Split-Path -Parent $logPath\n"
         "        if ($ld -and -not (Test-Path -LiteralPath $ld)) { [void][System.IO.Directory]::CreateDirectory($ld) }\n"
         "        Add-Content -LiteralPath $logPath -Value ('[' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + '] ' + $msg) -Encoding UTF8\n"
