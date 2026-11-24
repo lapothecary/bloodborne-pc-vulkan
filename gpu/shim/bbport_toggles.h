@@ -298,8 +298,15 @@ inline std::array<std::atomic<std::uint64_t>, GpuSub_Count> hw_gpu_subcat_ns{};
 inline std::atomic<std::uint64_t> main_cpu_busy_ns{0}, main_cpu_frames{0};
 /// Monotonic wall nanoseconds spent inside the frame pacer (sleep + spin) and off-CPU thread sync outside the pacer.
 inline std::atomic<std::uint64_t> pacer_sleep_ns{0}, pacer_frames{0}, main_sync_wait_ns{0};
-/// Output present pacing sleep (nanoseconds on bb:Present) + simulation dt min/max (microseconds, reset per 5s HUD log).
+/// Output present pacing sleep (nanoseconds on bb:Present) + swapchain Acquire/Present wait + simulation dt min/max.
 inline std::atomic<std::uint64_t> present_pace_sleep_ns{0};
+inline std::atomic<std::uint64_t> swapchain_acquire_wait_ns{0};
+inline std::atomic<std::uint64_t> swapchain_present_wait_ns{0};
+inline std::atomic<std::uint64_t> last_nvml_poll_ns{0};
+inline std::atomic<std::uint64_t> last_nvml_poll_dur_ns{0};
+inline std::atomic<std::uint64_t> last_main_frame_dt_ns{0};
+inline std::atomic<std::uint64_t> last_gnm_flip_dt_ns{0};
+inline std::atomic<std::uint64_t> last_stageb_flip_dt_ns{0};
 inline std::atomic<std::uint32_t> sim_dt_min_us{0xFFFFFFFFu}, sim_dt_max_us{0u};
 /// Mouse event cadence telemetry (1000+ Hz event-driven window loop vs per-frame TakeMouse).
 inline std::atomic<std::uint64_t> mouse_raw_events{0}, mouse_active_polls{0}, mouse_zero_polls_moving{0}, mouse_window_wakeups{0};

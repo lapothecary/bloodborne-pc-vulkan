@@ -310,7 +310,7 @@ void Display::RunPresenter(std::function<void()> work, bool only_if_idle) {
 
 void Display::PresentThread(std::stop_token stop) {
     Common::SetCurrentThreadName("bb:Present");
-    BbThreads::PinToGpuDomain();
+    BbThreads::PinToPresentCore();
     while (true) {
         std::function<void()> work;
         {

@@ -421,6 +421,7 @@ bool UpdateFrameAndCheckBurst(std::uint64_t now_ns, std::uint64_t frame_draws) n
     //    NOT in runtime_memory's direct/flexible vmas[] table — so check offset < g_image_size
     //    instead of runtime_memory_is_mapped() on the .bss pointer itself!
     bool engine_now_loading = false;
+    bool have_menu_man = false;
     std::uint32_t observed_state = 0;
     float observed_timer_before = 0.0f;
     float observed_timer_after = 0.0f;
@@ -434,6 +435,7 @@ bool UpdateFrameAndCheckBurst(std::uint64_t now_ns, std::uint64_t frame_draws) n
             runtime_memory_is_mapped(
                 static_cast<std::uintptr_t>(menu_man + Vma::MenuMan_LoadingStateOff),
                 sizeof(std::uint32_t))) {
+            have_menu_man = true;
             observed_state = *reinterpret_cast<const std::uint32_t*>(
                 menu_man + Vma::MenuMan_LoadingStateOff);
             if (observed_state == 1u || observed_state == 2u ||
@@ -476,13 +478,16 @@ bool UpdateFrameAndCheckBurst(std::uint64_t now_ns, std::uint64_t frame_draws) n
     }
     prev_engine_loading = engine_now_loading;
 
-    // 2. Fallback heuristic for early boot / pre-MenuMan loads: recent .dcx inflate + non-3D draws.
+    // 2. Fallback heuristic ONLY for early boot before MenuMan exists. Once MenuMan is mapped,
+    //    trust engine_now_loading exclusively so background .dcx asset streaming during gameplay
+    //    never false-triggers 500 Hz burst / drops frames / bypasses PresentPacing.
     const std::uint64_t last_ns = g_last_inflate_ns.load(std::memory_order_relaxed);
     const bool recent_inflate =
         (last_ns != 0) && (now_ns >= last_ns ? (now_ns - last_ns <= kBurstActiveWindowNs) : true);
     const bool active =
-        (engine_now_loading && frame_draws < kMaxNowLoadingDraws) ||
-        (recent_inflate && frame_draws < kMaxLoadingScreenDraws);
+        have_menu_man
+            ? (engine_now_loading && frame_draws < kMaxNowLoadingDraws)
+            : (recent_inflate && frame_draws < kMaxLoadingScreenDraws);
     g_loading_burst_active.store(active, std::memory_order_relaxed);
     return active;
 }

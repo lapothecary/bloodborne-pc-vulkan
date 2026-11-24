@@ -22,6 +22,7 @@ extern "C" __declspec(dllimport) unsigned long __stdcall GetCurrentProcessId(voi
 #include <dirent.h>
 #include <fcntl.h>
 #include <unistd.h>
+extern "C" void runtime_wait_report(double frames);
 #endif
 
 #include <SDL3/SDL.h>
@@ -1986,12 +1987,18 @@ private:
             const auto now = Clock::now();
             if (now >= next_sensor_poll) {
                 do_sensors = true;
-                next_sensor_poll = now + std::chrono::milliseconds(1000);
+                const int poll_ms = Visible() ? 2000 : 5000;
+                next_sensor_poll = now + std::chrono::milliseconds(poll_ms);
             }
 
             if (do_sensors) {
                 HudBreakdown tmp{};
+                const u64 nvml_t0 = BbFrameRate::NowMonotonicNs();
                 PollGpuHwSensors(tmp);
+                const u64 nvml_t1 = BbFrameRate::NowMonotonicNs();
+                BbStats::last_nvml_poll_ns.store(nvml_t1, std::memory_order_relaxed);
+                BbStats::last_nvml_poll_dur_ns.store(
+                    nvml_t1 > nvml_t0 ? (nvml_t1 - nvml_t0) : 0ull, std::memory_order_relaxed);
                 BbSysInfo::LiveSysSensors sys_tmp{};
                 BbSysInfo::PollLiveSystemSensors(sys_tmp);
                 std::scoped_lock slk{sensor_mutex};
@@ -2029,6 +2036,15 @@ private:
 #ifndef _WIN32
             if (do_cpu) {
                 SampleThreadCpu(cpu_frames, cpu_window, cpu_print);
+                if (cpu_print && cpu_frames > 0) {
+                    static const bool wait_log_on = [] {
+                        const char* wl = std::getenv("BB_WAIT_LOG");
+                        return wl && wl[0] != '\0';
+                    }();
+                    if (wait_log_on) {
+                        runtime_wait_report(double(cpu_frames));
+                    }
+                }
             }
 #endif
             if (do_flush) {
@@ -3149,6 +3165,8 @@ void UpdateHudBreakdown(HudBreakdown& h) {
 #endif
         static bool log_pacing_seeded = false;
         static std::uint64_t prev_pres_pace_ns = 0;
+        static std::uint64_t prev_swap_acq_ns = 0;
+        static std::uint64_t prev_swap_pres_ns = 0;
         static std::uint64_t prev_mouse_ev = 0;
         static std::uint64_t prev_mouse_polls = 0;
         static std::uint64_t prev_mouse_zero = 0;
@@ -3160,6 +3178,8 @@ void UpdateHudBreakdown(HudBreakdown& h) {
             log_frame_ms_cnt = 0;
             log_max_frame_ms = 0.0f;
             prev_pres_pace_ns = BbStats::present_pace_sleep_ns.load(std::memory_order_relaxed);
+            prev_swap_acq_ns = BbStats::swapchain_acquire_wait_ns.load(std::memory_order_relaxed);
+            prev_swap_pres_ns = BbStats::swapchain_present_wait_ns.load(std::memory_order_relaxed);
             prev_mouse_ev = BbStats::mouse_raw_events.load(std::memory_order_relaxed);
             prev_mouse_polls = BbStats::mouse_active_polls.load(std::memory_order_relaxed);
             prev_mouse_zero = BbStats::mouse_zero_polls_moving.load(std::memory_order_relaxed);
@@ -3488,6 +3508,20 @@ void UpdateHudBreakdown(HudBreakdown& h) {
                         ? double(cur_pres_pace - prev_pres_pace_ns) / (double(log_df) * 1e6)
                         : 0.0;
                 prev_pres_pace_ns = cur_pres_pace;
+                const std::uint64_t cur_swap_acq =
+                    BbStats::swapchain_acquire_wait_ns.load(std::memory_order_relaxed);
+                const double swap_acq_ms =
+                    cur_swap_acq >= prev_swap_acq_ns
+                        ? double(cur_swap_acq - prev_swap_acq_ns) / (double(log_df) * 1e6)
+                        : 0.0;
+                prev_swap_acq_ns = cur_swap_acq;
+                const std::uint64_t cur_swap_pres =
+                    BbStats::swapchain_present_wait_ns.load(std::memory_order_relaxed);
+                const double swap_pres_ms =
+                    cur_swap_pres >= prev_swap_pres_ns
+                        ? double(cur_swap_pres - prev_swap_pres_ns) / (double(log_df) * 1e6)
+                        : 0.0;
+                prev_swap_pres_ns = cur_swap_pres;
 
                 const std::uint32_t dt_min_u =
                     BbStats::sim_dt_min_us.exchange(0xFFFFFFFFu, std::memory_order_relaxed);
@@ -3525,10 +3559,11 @@ void UpdateHudBreakdown(HudBreakdown& h) {
 
                 std::printf(
                     "Pacing (%uf): min %.2f | p50 %.2f | p95 %.2f | p99 %.2f | max %.2f ms"
-                    " | >1.25x:%u >1.5x:%u | PresPace %.2f ms | SimDt %.2f..%.2f ms\n"
+                    " | >1.25x:%u >1.5x:%u | PresPace %.2f Acq %.2f Pres %.2f ms | SimDt %.2f..%.2f ms\n"
                     "Input (%.0fs): Mouse %llu ev / %llu active-f (%.1f ev/f, batch %u..%u, 0-ev-gaps %llu)"
                     " | WinWake %llu\n",
                     cnt, min_ms, p50_ms, p95_ms, p99_ms, max_ms, over_125, over_150, pres_pace_ms,
+                    swap_acq_ms, swap_pres_ms,
                     sim_min_ms, sim_max_ms, log_dt, static_cast<unsigned long long>(d_m_ev),
                     static_cast<unsigned long long>(d_m_polls), ev_per_poll,
                     m_min != 0xFFFFFFFFu ? m_min : 0u, m_max,

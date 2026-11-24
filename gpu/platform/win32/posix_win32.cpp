@@ -404,6 +404,7 @@ struct Win32TopologyMasks {
     DWORD_PTR gpu_comm = 0;
     DWORD_PTR draw_rec = 0;
     DWORD_PTR vk_recorder = 0;
+    DWORD_PTR present = 0;
     DWORD_PTR game_workers = 0;
     DWORD_PTR gx_workers = 0;
     DWORD_PTR gpu = 0;
@@ -414,6 +415,7 @@ const DWORD g_main_thread_id = GetCurrentThreadId();
 std::atomic<DWORD> g_gpu_comm_thread_id{0};
 std::atomic<DWORD> g_draw_rec_thread_id{0};
 std::atomic<DWORD> g_vk_recorder_thread_id{0};
+std::atomic<DWORD> g_present_thread_id{0};
 
 const Win32TopologyMasks& GetWin32Topology() {
     static const Win32TopologyMasks topo = [] {
@@ -541,17 +543,79 @@ const Win32TopologyMasks& GetWin32Topology() {
             return domains[a].phys_count > domains[b].phys_count;
         });
 
+        // Pick the best available core index from `cores` matching `pred`, avoiding CPU 0
+        // (Windows's default DPC/ISR/DWM core, primary bit == 1) whenever another eligible core
+        // in the same pool has equal EfficiencyClass.
+        std::vector<uint8_t> core_used(cores.size(), 0);
+        auto pick_core = [&](auto&& pred, bool avoid_cpu0) -> size_t {
+            int max_e = -1;
+            for (size_t i = 0; i < cores.size(); ++i) {
+                if (!core_used[i] && pred(cores[i])) {
+                    max_e = std::max(max_e, cores[i].eff_class);
+                }
+            }
+            if (max_e < 0) {
+                return size_t(-1);
+            }
+            if (avoid_cpu0) {
+                for (size_t i = 0; i < cores.size(); ++i) {
+                    if (!core_used[i] && pred(cores[i]) && cores[i].eff_class == max_e &&
+                        cores[i].primary != DWORD_PTR(1)) {
+                        return i;
+                    }
+                }
+            }
+            for (size_t i = 0; i < cores.size(); ++i) {
+                if (!core_used[i] && pred(cores[i]) && cores[i].eff_class == max_e) {
+                    return i;
+                }
+            }
+            return size_t(-1);
+        };
+
+        // Carve `isolated_count` dedicated primary physical cores (marking them used so their
+        // primary + SMT siblings are excluded from worker pools), plus `shared_failover_count`
+        // additional primary cores added to the returned mask without removing them from workers
+        // so critical threads always have >= 2 physical cores to escape OS/DWM/DPC preemptions.
+        auto carve_pool = [&](auto&& pred, int isolated_count, int shared_failover_count,
+                              bool avoid_cpu0) -> DWORD_PTR {
+            DWORD_PTR mask = 0;
+            for (int k = 0; k < isolated_count; ++k) {
+                const size_t idx = pick_core(pred, avoid_cpu0);
+                if (idx == size_t(-1)) {
+                    break;
+                }
+                core_used[idx] = 1;
+                mask |= cores[idx].primary;
+            }
+            std::vector<size_t> temp_failover;
+            for (int k = 0; k < shared_failover_count; ++k) {
+                const size_t idx = pick_core(pred, avoid_cpu0);
+                if (idx == size_t(-1)) {
+                    break;
+                }
+                core_used[idx] = 1;
+                temp_failover.push_back(idx);
+                mask |= cores[idx].primary;
+            }
+            for (size_t idx : temp_failover) {
+                core_used[idx] = 0;
+            }
+            return mask;
+        };
+
         int game_dom = dom_order[0];
         if (domains.size() >= 2) {
             // CASE 1: Multi-CCD / Multi-L3-Domain CPU (e.g. Ryzen 9 5900X/5950X/7900X/7950X/7950X3D/9950X/9950X3D).
             // - Primary L3 domain (CCD0 / 3D V-Cache):
-            //   * Main game thread (`main`) gets Core 0 primary (with its SMT sibling left idle).
-            //   * All remaining physical + SMT threads in CCD0 (`c.mask`, 14 threads on 8-core CCD0)
-            //     run Havok, CSChr, CSCloth, SpCloth, FD4Job, GXRenderThread, and GXWorker* inside
-            //     the exact same L3 cache with zero Infinity Fabric crossings.
-            // - Secondary L3 domain(s) (CCD1+): Host Vulkan RHI (`bb:GpuComm`, `bb:VkRecorder*`,
-            //   `bb:Present`) + background streaming/decompression/audio helpers (`EzWorkPool*`,
-            //   `Core.Res.*`, `FMOD*`).
+            //   * Main game thread (`main`) gets a dedicated 2-core failover pool avoiding CPU 0
+            //     (SMT siblings idle when >= 8 phys cores; 1 isolated + 1 failover on 6-core CCD).
+            //   * Remaining physical + SMT threads in CCD0 run Havok, CSChr, CSCloth, SpCloth,
+            //     FD4Job, GXRenderThread, and GXWorker* inside the exact same L3 cache.
+            // - Secondary L3 domain(s) (CCD1+):
+            //   * bb:GpuComm, bb:DrawRec, bb:VkRecorder, and bb:Present share a dedicated 2-4 core
+            //     primary-only RHI critical pool (SMT siblings idle, zero single-core starvation).
+            //   * Remaining CCD1 cores host bb:Resolve*, driver workers, EzWorkPool*, Core.Res.*, FMOD*.
             int gpu_dom = -1;
             if (env_ccd && env_ccd[0] >= '0' && env_ccd[0] <= '9') {
                 gpu_dom = std::clamp(std::atoi(env_ccd), 0, int(domains.size()) - 1);
@@ -560,60 +624,42 @@ const Win32TopologyMasks& GetWin32Topology() {
                 }
             }
 
-            size_t best_idx = size_t(-1);
-            for (size_t i = 0; i < cores.size(); ++i) {
-                if (cores[i].domain == game_dom &&
-                    (best_idx == size_t(-1) || cores[i].eff_class > cores[best_idx].eff_class)) {
-                    best_idx = i;
-                }
-            }
-            size_t gcomm_idx = size_t(-1);
-            size_t drec_idx = size_t(-1);
-            size_t vkrec_idx = size_t(-1);
+            auto in_game_dom = [&](const PhysCore& c) { return c.domain == game_dom; };
+            auto in_gpu_dom = [&](const PhysCore& c) {
+                return c.domain != game_dom && (gpu_dom < 0 || c.domain == gpu_dom);
+            };
             int gpu_phys = 0;
-            for (size_t i = 0; i < cores.size(); ++i) {
-                if (cores[i].domain != game_dom && (gpu_dom < 0 || cores[i].domain == gpu_dom)) {
+            for (const auto& c : cores) {
+                if (in_gpu_dom(c)) {
                     ++gpu_phys;
-                    if (gcomm_idx == size_t(-1) || cores[i].eff_class > cores[gcomm_idx].eff_class) {
-                        gcomm_idx = i;
-                    }
                 }
             }
-            if (gpu_phys >= 6) {
-                for (size_t i = 0; i < cores.size(); ++i) {
-                    if (cores[i].domain != game_dom && (gpu_dom < 0 || cores[i].domain == gpu_dom) &&
-                        i != gcomm_idx &&
-                        (drec_idx == size_t(-1) || cores[i].eff_class > cores[drec_idx].eff_class)) {
-                        drec_idx = i;
-                    }
-                }
-                for (size_t i = 0; i < cores.size(); ++i) {
-                    if (cores[i].domain != game_dom && (gpu_dom < 0 || cores[i].domain == gpu_dom) &&
-                        i != gcomm_idx && i != drec_idx &&
-                        (vkrec_idx == size_t(-1) || cores[i].eff_class > cores[vkrec_idx].eff_class)) {
-                        vkrec_idx = i;
-                    }
-                }
+
+            if (domains[game_dom].phys_count >= 8) {
+                res.game_main = carve_pool(in_game_dom, 2, 0, true);
+            } else if (domains[game_dom].phys_count >= 6) {
+                res.game_main = carve_pool(in_game_dom, 1, 1, true);
             }
+
+            DWORD_PTR rhi_crit = 0;
+            if (gpu_phys >= 8) {
+                rhi_crit = carve_pool(in_gpu_dom, 4, 0, true);
+            } else if (gpu_phys >= 6) {
+                rhi_crit = carve_pool(in_gpu_dom, 3, 0, true);
+            } else if (gpu_phys >= 4) {
+                rhi_crit = carve_pool(in_gpu_dom, 2, 0, true);
+            }
+
             for (size_t i = 0; i < cores.size(); ++i) {
+                if (core_used[i]) {
+                    continue;
+                }
                 const auto& c = cores[i];
-                if (c.domain == game_dom) {
-                    if (domains[game_dom].phys_count >= 6 && i == best_idx) {
-                        res.game_main = c.primary; // c.smt intentionally left idle
-                    } else {
-                        res.game_workers |= c.mask;
-                    }
-                } else if (gpu_dom < 0 || c.domain == gpu_dom) {
-                    if (gpu_phys >= 4 && i == gcomm_idx) {
-                        res.gpu_comm = c.primary;     // c.smt intentionally left idle
-                    } else if (gpu_phys >= 6 && i == drec_idx) {
-                        res.draw_rec = c.primary;     // c.smt intentionally left idle (same CCD1 L3 as gpu_comm)
-                    } else if (gpu_phys >= 6 && i == vkrec_idx) {
-                        res.vk_recorder = c.primary;  // c.smt intentionally left idle (same CCD1 L3 as gpu_comm)
-                    } else {
-                        res.gpu |= c.mask;
-                        res.helper |= c.mask;
-                    }
+                if (in_game_dom(c)) {
+                    res.game_workers |= c.mask;
+                } else if (in_gpu_dom(c)) {
+                    res.gpu |= c.mask;
+                    res.helper |= c.mask;
                 }
             }
             if (res.game_main == 0) {
@@ -623,15 +669,13 @@ const Win32TopologyMasks& GetWin32Topology() {
             if (res.gpu == 0) {
                 res.gpu = res.game_workers;
             }
-            if (res.gpu_comm == 0) {
-                res.gpu_comm = res.gpu;
+            if (rhi_crit == 0) {
+                rhi_crit = res.gpu;
             }
-            if (res.draw_rec == 0) {
-                res.draw_rec = res.gpu;
-            }
-            if (res.vk_recorder == 0) {
-                res.vk_recorder = res.gpu;
-            }
+            res.gpu_comm = rhi_crit;
+            res.draw_rec = rhi_crit;
+            res.vk_recorder = rhi_crit;
+            res.present = rhi_crit;
             if (res.helper == 0) {
                 res.helper = res.gpu;
             }
@@ -644,20 +688,10 @@ const Win32TopologyMasks& GetWin32Topology() {
             // Single L3 domain: check Intel Hybrid P+E (`max_eff > min_eff`) vs Homogeneous (`>= 6` cores).
             DWORD_PTR p_mask = 0, e_mask = 0;
             size_t p_phys = 0;
-            size_t best_p = size_t(-1);
-            size_t second_p = size_t(-1);
-            size_t third_p = size_t(-1);
             if (max_eff > min_eff) {
                 for (size_t i = 0; i < cores.size(); ++i) {
                     if (cores[i].eff_class == max_eff) {
                         p_mask |= cores[i].mask;
-                        if (best_p == size_t(-1)) {
-                            best_p = i;
-                        } else if (second_p == size_t(-1)) {
-                            second_p = i;
-                        } else if (third_p == size_t(-1)) {
-                            third_p = i;
-                        }
                         ++p_phys;
                     } else {
                         e_mask |= cores[i].mask;
@@ -667,75 +701,76 @@ const Win32TopologyMasks& GetWin32Topology() {
 
             if (p_phys >= 4 && e_mask != 0) {
                 // CASE 2: Single-L3 Hybrid P-Core + E-Core (Intel 12th-15th Gen).
-                // Main + Game Workers + Vulkan RHI stay strictly on P-cores; Helpers/IO/Audio run on E-cores.
-                if (p_phys >= 6 && best_p != size_t(-1)) {
-                    res.game_main = cores[best_p].primary; // SMT sibling left idle
-                    const size_t gcomm_p = (p_phys >= 8) ? second_p : size_t(-1);
-                    const size_t drec_p = (p_phys >= 8) ? third_p : size_t(-1);
-                    if (gcomm_p != size_t(-1)) {
-                        res.gpu_comm = cores[gcomm_p].primary; // SMT sibling left idle
-                    }
-                    if (drec_p != size_t(-1)) {
-                        res.draw_rec = cores[drec_p].primary; // SMT sibling left idle
-                    }
-                    for (size_t i = 0; i < cores.size(); ++i) {
-                        if (cores[i].eff_class == max_eff && i != best_p && i != gcomm_p &&
-                            i != drec_p) {
-                            res.game_workers |= cores[i].mask;
-                        }
-                    }
+                // Main + Game Workers + Vulkan RHI stay strictly on P-cores (2-core failover for
+                // main avoiding CPU 0; dedicated 2-3 P-core RHI pool when >= 8P); Helpers/IO/Audio on E-cores.
+                auto is_p_core = [&](const PhysCore& c) { return c.eff_class == max_eff; };
+                DWORD_PTR rhi_crit = 0;
+                if (p_phys >= 8) {
+                    res.game_main = carve_pool(is_p_core, 2, 0, true);
+                    rhi_crit = (p_phys >= 10) ? carve_pool(is_p_core, 3, 0, true)
+                                              : carve_pool(is_p_core, 2, 1, true);
+                } else if (p_phys >= 6) {
+                    res.game_main = carve_pool(is_p_core, 1, 1, true);
                 } else {
                     res.game_main = p_mask;
+                }
+                for (size_t i = 0; i < cores.size(); ++i) {
+                    if (!core_used[i] && is_p_core(cores[i])) {
+                        res.game_workers |= cores[i].mask;
+                    }
+                }
+                if (res.game_workers == 0) {
                     res.game_workers = p_mask;
                 }
                 res.gx_workers = res.game_workers;
                 res.gpu = res.game_workers;
-                if (res.gpu_comm == 0) {
-                    res.gpu_comm = res.gpu;
+                if (rhi_crit == 0) {
+                    rhi_crit = res.gpu;
                 }
-                if (res.draw_rec == 0) {
-                    res.draw_rec = res.gpu;
-                }
-                if (res.vk_recorder == 0) {
-                    res.vk_recorder = res.gpu;
-                }
+                res.gpu_comm = rhi_crit;
+                res.draw_rec = rhi_crit;
+                res.vk_recorder = rhi_crit;
+                res.present = rhi_crit;
                 res.helper = e_mask;
             } else {
                 // CASE 3: Single-L3 Homogeneous CPU with >= 6 Physical Cores
                 // (e.g. Ryzen 5 5600X/7600X, Ryzen 7 5800X3D/7800X3D/9800X3D, Intel 6c/8c).
-                // Core 0 primary -> Main game thread; Core 1 -> GpuComm (>= 8 cores);
-                // Core 2 -> DrawRec (>= 8 cores) so 6-core CPUs keep 5 full physical cores.
-                res.game_main = cores[0].primary;
-                size_t start_w = 1;
-                if (cores.size() >= 8) {
-                    res.gpu_comm = cores[1].primary;
-                    res.draw_rec = cores[2].primary;
-                    start_w = 3;
-                }
+                // Always give main a 2-core failover pool (avoiding CPU 0) and share a dedicated
+                // 2-3 core RHI critical pool when >= 8 physical cores, leaving >= 5 cores for workers.
+                auto any_core = [](const PhysCore&) { return true; };
+                DWORD_PTR rhi_crit = 0;
                 if (cores.size() >= 10) {
-                    res.vk_recorder = cores[3].primary;
-                    start_w = 4;
+                    res.game_main = carve_pool(any_core, 2, 0, true);
+                    rhi_crit = carve_pool(any_core, 3, 0, true);
+                } else if (cores.size() >= 8) {
+                    res.game_main = carve_pool(any_core, 1, 1, true);
+                    rhi_crit = carve_pool(any_core, 2, 1, true);
+                } else {
+                    res.game_main = carve_pool(any_core, 1, 1, true);
                 }
-                for (size_t i = start_w; i < cores.size(); ++i) {
-                    res.game_workers |= cores[i].mask;
+                for (size_t i = 0; i < cores.size(); ++i) {
+                    if (!core_used[i]) {
+                        res.game_workers |= cores[i].mask;
+                    }
+                }
+                if (res.game_workers == 0) {
+                    res.game_workers = proc_mask;
                 }
                 res.gx_workers = res.game_workers;
                 res.gpu = res.game_workers;
-                if (res.gpu_comm == 0) {
-                    res.gpu_comm = res.gpu;
+                if (rhi_crit == 0) {
+                    rhi_crit = res.gpu;
                 }
-                if (res.draw_rec == 0) {
-                    res.draw_rec = res.gpu;
-                }
-                if (res.vk_recorder == 0) {
-                    res.vk_recorder = res.gpu;
-                }
+                res.gpu_comm = rhi_crit;
+                res.draw_rec = rhi_crit;
+                res.vk_recorder = rhi_crit;
+                res.present = rhi_crit;
                 res.helper = res.game_workers;
             }
         }
 
         std::printf("GPU: Win32 thread topology: %zu physical cores across %zu L3 domains "
-                    "(main=%#llx, gpu_comm=%#llx, workers=%#llx, gx_workers=%#llx, gpu=%#llx, helper=%#llx)\n",
+                    "(main=%#llx, rhi_crit=%#llx, workers=%#llx, gx_workers=%#llx, gpu=%#llx, helper=%#llx)\n",
                     cores.size(), domains.size(),
                     static_cast<unsigned long long>(res.game_main),
                     static_cast<unsigned long long>(res.gpu_comm),
@@ -811,10 +846,17 @@ void ApplyWin32ThreadTopologyByName(const char* name) {
                    ? topo.vk_recorder
                    : topo.gpu;
         boost = true;
+    } else if (std::strcmp(name, "bb:Present") == 0) {
+        DWORD expected = 0;
+        const DWORD self_tid = GetCurrentThreadId();
+        g_present_thread_id.compare_exchange_strong(expected, self_tid, std::memory_order_relaxed);
+        mask = (g_present_thread_id.load(std::memory_order_relaxed) == self_tid && topo.present != 0)
+                   ? topo.present
+                   : topo.gpu;
+        boost = true;
     } else if (starts_with(name, "bb:Resolve") ||
                std::strcmp(name, "bb:TexBind") == 0 ||
-               starts_with(name, "bb:VkRecorder") ||
-               std::strcmp(name, "bb:Present") == 0) {
+               starts_with(name, "bb:VkRecorder")) {
         mask = topo.gpu;
         boost = true;
     } else if (starts_with(name, "bb:") ||
@@ -1005,6 +1047,17 @@ void bb_win32_pin_vk_recorder_core(void) {
     const DWORD self_tid = GetCurrentThreadId();
     g_vk_recorder_thread_id.store(self_tid, std::memory_order_relaxed);
     const DWORD_PTR m = topo.vk_recorder != 0 ? topo.vk_recorder : topo.gpu;
+    if (m != 0) {
+        SetThreadAffinityMask(GetCurrentThread(), m);
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    }
+}
+
+void bb_win32_pin_present_core(void) {
+    const auto& topo = GetWin32Topology();
+    const DWORD self_tid = GetCurrentThreadId();
+    g_present_thread_id.store(self_tid, std::memory_order_relaxed);
+    const DWORD_PTR m = topo.present != 0 ? topo.present : topo.gpu;
     if (m != 0) {
         SetThreadAffinityMask(GetCurrentThread(), m);
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);

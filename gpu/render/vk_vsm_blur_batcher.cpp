@@ -26,7 +26,11 @@ namespace Vulkan {
 VsmBlurBatcher::VsmBlurBatcher(const Instance& instance_, Scheduler& scheduler_, Runtime& runtime_,
                                VideoCore::TextureCache& texture_cache_)
     : instance{instance_}, scheduler{scheduler_}, runtime{runtime_},
-      texture_cache{texture_cache_} {}
+      texture_cache{texture_cache_} {
+    if (Enabled()) {
+        EnsurePipelines();
+    }
+}
 
 VsmBlurBatcher::~VsmBlurBatcher() {
     if (params_buf && params_alloc) {

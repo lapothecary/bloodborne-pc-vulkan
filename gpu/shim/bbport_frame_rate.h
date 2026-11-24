@@ -37,4 +37,6 @@ std::uint64_t PacerEpoch() noexcept;
 bool PresentPacingEnabled() noexcept;
 /// Latest simulation frame delta in 30 FPS units (`dt * 30.0f`: 1.0 at 30 FPS, ~0.176 at 170 FPS).
 float CurrentFramesPer30() noexcept;
+/// Monotonic simulation frame sequence counter (increments once per FrameStep).
+std::uint64_t FrameSeq() noexcept;
 } // namespace BbFrameRate

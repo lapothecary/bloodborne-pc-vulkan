@@ -203,6 +203,12 @@ struct MainXRay {
     std::atomic<std::int32_t> movemap_last_state{-1};
     std::atomic<bool> adhoc_sub_installed{false};
 
+    // Per-frame slowest Thread-0 task snapshot (reset by PacerWait on MOMainThread; zero TLS).
+    std::atomic<std::uint64_t> frame_max_t0_cycles{0};
+    std::atomic<std::uint64_t> frame_max_t0_fn_off{0};
+    std::atomic<std::int32_t> frame_max_t0_group{-1};
+    std::atomic<std::int32_t> frame_max_t0_movemap_state{-1};
+
     // Per-callback breakdown inside `sub_2293060` (`dantelion_gx/06_DeferredLightingAndAO`):
     static constexpr std::size_t MaxPassCallbacks = 64;
     alignas(64) std::array<std::atomic<std::uint64_t>, MaxPassCallbacks> pass_cycles{};

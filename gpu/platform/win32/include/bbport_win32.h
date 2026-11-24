@@ -104,6 +104,7 @@ void bb_win32_critical_thread(int level);
 void bb_win32_pin_gpu_comm_core(void);
 void bb_win32_pin_draw_rec_core(void);
 void bb_win32_pin_vk_recorder_core(void);
+void bb_win32_pin_present_core(void);
 void bb_win32_pin_gpu_domain(void);
 void bb_win32_pin_helper_domain(void);
 void bb_win32_apply_thread_topology(void);

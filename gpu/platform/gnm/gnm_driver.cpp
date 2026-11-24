@@ -584,6 +584,17 @@ s32 PS4_SYSV_ABI sceGnmSubmitAndFlipCommandBuffers(u32 count, u32* dcbs[], u32* 
         return patched;
     }
     Vulkan::TemporalUpscaler::NoteGuestFlipSubmittedForMt();
+    {
+        static u64 prev_flip_ns = 0;
+        const u64 now_ns = static_cast<u64>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count());
+        if (prev_flip_ns != 0 && now_ns >= prev_flip_ns) {
+            BbStats::last_gnm_flip_dt_ns.store(now_ns - prev_flip_ns, std::memory_order_relaxed);
+        }
+        prev_flip_ns = now_ns;
+    }
     Submit(count, const_cast<const u32* const*>(dcbs), dcb_sizes,
            const_cast<const u32* const*>(ccbs), ccb_sizes);
     if (SubmitLockOnDecode() && !flip_lock) {

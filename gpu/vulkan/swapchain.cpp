@@ -194,7 +194,11 @@ void Swapchain::Create(u32 width_, u32 height_) {
     }
 
     images = Check<"get swapchain images">(device.getSwapchainImagesKHR(swapchain));
+    const u32 requested_images = image_count;
     image_count = u32(images.size());
+    std::printf("Swapchain: %ux%u, %s, %u images (requested %u), HDR=%d\n", extent.width,
+                extent.height, vk::to_string(present_mode).c_str(), image_count, requested_images,
+                use_hdr ? 1 : 0);
     views.resize(image_count);
     acquired.resize(image_count);
     present_ready.resize(image_count);

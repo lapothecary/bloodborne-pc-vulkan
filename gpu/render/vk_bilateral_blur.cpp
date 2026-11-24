@@ -30,7 +30,11 @@ BilateralBlurCompute::BilateralBlurCompute(const Instance& instance_, Scheduler&
                                            Runtime& runtime_,
                                            VideoCore::TextureCache& texture_cache_)
     : instance{instance_}, scheduler{scheduler_}, runtime{runtime_},
-      texture_cache{texture_cache_} {}
+      texture_cache{texture_cache_} {
+    if (Enabled()) {
+        EnsurePipelines();
+    }
+}
 
 BilateralBlurCompute::~BilateralBlurCompute() = default;
 

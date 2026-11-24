@@ -7,6 +7,9 @@
 #include <thread>
 #include <cstdlib>
 #include <limits>
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
 
 #include <vk_mem_alloc.h>
 
@@ -426,6 +429,14 @@ Frame* Presenter::PrepareFrame(const BbVideoOut::BufferAttributeGroup& attribute
     }
 
     BbStats::frame_number.fetch_add(1, std::memory_order_relaxed);
+    {
+        static u64 prev_sb_ns = 0;
+        const u64 sb_now_ns = BbFrameRate::NowMonotonicNs();
+        if (prev_sb_ns != 0 && sb_now_ns >= prev_sb_ns) {
+            BbStats::last_stageb_flip_dt_ns.store(sb_now_ns - prev_sb_ns, std::memory_order_relaxed);
+        }
+        prev_sb_ns = sb_now_ns;
+    }
     frame->ready_semaphore = draw_scheduler.GetWorkSemaphore()->Handle();
     frame->ready_tick = draw_scheduler.CurrentTick();
     SubmitInfo info{};
@@ -753,7 +764,26 @@ bool Presenter::PresentImage(Frame* frame, vk::Image source, bool last) {
         // Skip the single in-flight frame rendered in the old color space to avoid a 1-frame flash.
         return false;
     }
+    const u64 enter_ns = BbFrameRate::NowMonotonicNs();
+    static u64 pres_deadline_ns = 0;
+    static u64 pres_last_period_ns = 0;
+    static u64 pres_seen_epoch = 0;
+    static u64 prev_rec_end_ns = 0;
+    static u64 prev_pres_end_ns = 0;
+    static u64 prev_flush_ns = 0;
+    static u64 prev_pres_call_ns = 0;
+    bool pres_paced = false;
+    u64 active_period_ns = 0;
+    u64 wsub_ns = 0, wren_ns = 0, pace_ns = 0, pace_over_ns = 0, cushion_before_ns = 0;
+    u32 queued_before = 0;
     if (!blank && last && !source) {
+#ifdef __linux__
+        static bool pres_timerslack_set = false;
+        if (!pres_timerslack_set) {
+            pres_timerslack_set = true;
+            prctl(PR_SET_TIMERSLACK, 1UL, 0UL, 0UL, 0UL);
+        }
+#endif
         const u64 period_ns =
             (BbFrameRate::PresentPacingEnabled() && !BbFastLoad::IsLoadingBurstActive())
                 ? BbFrameRate::TargetPeriodNs()
@@ -761,26 +791,38 @@ bool Presenter::PresentImage(Frame* frame, vk::Image source, bool last) {
         const auto pmode = swapchain.GetPresentMode();
         if (period_ns > 0 && pmode != vk::PresentModeKHR::eFifo &&
             pmode != vk::PresentModeKHR::eFifoRelaxed) {
+            active_period_ns = period_ns;
+            pres_paced = true;
+            const u64 ws_t0 = BbFrameRate::NowMonotonicNs();
             if (frame->ready_semaphore == draw_scheduler.GetWorkSemaphore()->Handle()) {
                 draw_scheduler.WaitSubmitted(frame->ready_tick);
             }
+            const u64 wr_t0 = BbFrameRate::NowMonotonicNs();
+            wsub_ns = wr_t0 > ws_t0 ? (wr_t0 - ws_t0) : 0ull;
             WaitRendered(frame);
             const u64 ready_ns = BbFrameRate::NowMonotonicNs();
+            wren_ns = ready_ns > wr_t0 ? (ready_ns - wr_t0) : 0ull;
             const u64 epoch = BbFrameRate::PacerEpoch();
-            static u64 pres_deadline_ns = 0;
-            static u64 pres_last_period_ns = 0;
-            static u64 pres_seen_epoch = 0;
+            const u64 target_cushion_ns = std::min<u64>(period_ns / 2ull, 2'400'000ull);
+            queued_before = BbVideoOut::QueuedPresentCount();
             if (pres_deadline_ns == 0 || epoch != pres_seen_epoch ||
                 period_ns != pres_last_period_ns) {
                 pres_seen_epoch = epoch;
                 pres_last_period_ns = period_ns;
-                pres_deadline_ns = ready_ns;
+                // Prime with half target cushion so normal camera-turn GPU swings do not break lock.
+                pres_deadline_ns = ready_ns + (target_cushion_ns / 2ull);
             } else {
-                // When a second frame is already queued in BbVideoOut (transient catch-up),
-                // drain smoothly at ~0.78x period instead of resetting pres_deadline_ns=ready_ns,
-                // which would fire two frames 0.14..0.60 ms apart and trigger Mailbox frame drops.
+                // Smooth queue drain: having 1 frame queued in present_work is normal under
+                // FramesAhead=1, so trim ~3% normally (0.969x) or ~5% (0.95x) when the present
+                // cushion has grown past target_cushion_ns after an external compositor stall,
+                // draining backlog smoothly in ~10 frames without visible cadence sawtooth.
+                const bool high_cush = (pres_deadline_ns > ready_ns + target_cushion_ns);
                 const u64 step_ns =
-                    (BbVideoOut::QueuedPresentCount() > 0) ? ((period_ns * 3ull) / 4ull) : period_ns;
+                    (queued_before >= 2u)
+                        ? (period_ns - (period_ns / 10ull))
+                        : ((queued_before == 1u)
+                               ? (period_ns - (period_ns / (high_cush ? 20ull : 32ull)))
+                               : period_ns);
                 pres_deadline_ns += step_ns;
                 if (ready_ns >= pres_deadline_ns) {
                     pres_deadline_ns = ready_ns;
@@ -789,21 +831,27 @@ bool Presenter::PresentImage(Frame* frame, vk::Image source, bool last) {
                         pres_deadline_ns = ready_ns + period_ns;
                     }
                     const u64 cushion_ns = pres_deadline_ns - ready_ns;
-                    if (cushion_ns > 350'000ull) {
+                    cushion_before_ns = cushion_ns;
+                    if (cushion_ns > target_cushion_ns) {
                         const u64 pull =
-                            std::min<u64>((cushion_ns - 350'000ull) / 64ull, 20'000ull);
+                            std::min<u64>((cushion_ns - target_cushion_ns) / 64ull, 15'000ull);
                         pres_deadline_ns -= pull;
                     }
                     BbFrameRate::SleepUntilMonotonicNs(pres_deadline_ns, 1);
                     const u64 after_ns = BbFrameRate::NowMonotonicNs();
                     if (after_ns > ready_ns) {
+                        pace_ns = after_ns - ready_ns;
                         BbStats::present_pace_sleep_ns.fetch_add(
-                            after_ns - ready_ns, std::memory_order_relaxed);
+                            pace_ns, std::memory_order_relaxed);
+                    }
+                    if (after_ns > pres_deadline_ns) {
+                        pace_over_ns = after_ns - pres_deadline_ns;
                     }
                 }
             }
         }
     }
+    const u64 acq_t0 = BbFrameRate::NowMonotonicNs();
     if (!swapchain.AcquireNextImage()) {
         recreate();
         if (!swapchain.AcquireNextImage()) {
@@ -811,6 +859,11 @@ bool Presenter::PresentImage(Frame* frame, vk::Image source, bool last) {
             LOG_WARNING(Render_Vulkan, "Skipping a frame: no swapchain image");
             return false;
         }
+    }
+    const u64 acq_t1 = BbFrameRate::NowMonotonicNs();
+    const u64 acq_ns = acq_t1 > acq_t0 ? (acq_t1 - acq_t0) : 0ull;
+    if (acq_ns > 0) {
+        BbStats::swapchain_acquire_wait_ns.fetch_add(acq_ns, std::memory_order_relaxed);
     }
 
     const vk::Extent2D extent = swapchain.GetExtent();
@@ -841,10 +894,63 @@ bool Presenter::PresentImage(Frame* frame, vk::Image source, bool last) {
                           source ? "interp" : "real");
         }
     }
+    const u64 rec_t0 = BbFrameRate::NowMonotonicNs();
     RecordPresent(cmdbuf, blank ? nullptr : frame, swapchain.Image(), extent, source);
+    const u64 rec_t1 = BbFrameRate::NowMonotonicNs();
+    const u64 rec_ns = rec_t1 > rec_t0 ? (rec_t1 - rec_t0) : 0ull;
+
+    // Re-anchor pres_deadline_ns if sleep overslept or acquire/record stalled so the next frame
+    // never fires 0.2..0.4 ms later as an unpaced micro-frame.
+    if (pres_paced) {
+        static u64 prev_pres_draws = 0;
+        static double pres_draws_ema = 0.0;
+        const u64 cur_draws = BbStats::draws.load(std::memory_order_relaxed);
+        const u64 delta_draws = cur_draws >= prev_pres_draws ? (cur_draws - prev_pres_draws) : 0ull;
+        prev_pres_draws = cur_draws;
+        pres_draws_ema = pres_draws_ema * 0.9 + double(delta_draws) * 0.1;
+
+        const u64 slip_limit_ns = std::min<u64>(1'500'000ull, active_period_ns / 4ull);
+        if (rec_t1 > pres_deadline_ns + slip_limit_ns) {
+            pres_deadline_ns = rec_t1;
+        }
+        if (prev_rec_end_ns != 0 && rec_t1 > prev_rec_end_ns && pres_draws_ema >= 80.0) {
+            const u64 dt_ns = rec_t1 - prev_rec_end_ns;
+            const u64 hi_thresh_ns = std::max<u64>(9'500'000ull, (active_period_ns * 16ull) / 10ull);
+            const u64 lo_thresh_ns = (active_period_ns * 6ull) / 10ull;
+            if (dt_ns < 2'000'000'000ull && (dt_ns >= hi_thresh_ns || dt_ns <= lo_thresh_ns)) [[unlikely]] {
+                const u64 wait_q_ns =
+                    (prev_pres_end_ns != 0 && enter_ns > prev_pres_end_ns)
+                        ? (enter_ns - prev_pres_end_ns)
+                        : 0ull;
+                const u64 nvml_ns = BbStats::last_nvml_poll_ns.load(std::memory_order_relaxed);
+                const u64 nvml_dur_ns = BbStats::last_nvml_poll_dur_ns.load(std::memory_order_relaxed);
+                const long long nvml_age_ms =
+                    (nvml_ns != 0 && rec_t1 >= nvml_ns)
+                        ? static_cast<long long>((rec_t1 - nvml_ns) / 1'000'000ull)
+                        : -1ll;
+                const u64 main_dt_ns = BbStats::last_main_frame_dt_ns.load(std::memory_order_relaxed);
+                const u64 gnm_dt_ns = BbStats::last_gnm_flip_dt_ns.load(std::memory_order_relaxed);
+                const u64 sb_dt_ns = BbStats::last_stageb_flip_dt_ns.load(std::memory_order_relaxed);
+                BbStats::LogHitch(
+                    "[BB-HITCH][PRESENT] frame=%u dt=%.2f ms (prev_flush=%.2f prev_pres=%.2f "
+                    "wait_q=%.2f | w_sub=%.2f w_ren=%.2f pace=%.2f [over=+%.2f] acq=%.2f "
+                    "rec=%.2f | q=%u cush=%.2f | pipe[main=%.2f gnm=%.2f sb=%.2f] "
+                    "nvml=%lldms[%.2fms])\n",
+                    BbStats::frame_number.load(std::memory_order_relaxed), double(dt_ns) / 1e6,
+                    double(prev_flush_ns) / 1e6, double(prev_pres_call_ns) / 1e6,
+                    double(wait_q_ns) / 1e6, double(wsub_ns) / 1e6, double(wren_ns) / 1e6,
+                    double(pace_ns) / 1e6, double(pace_over_ns) / 1e6, double(acq_ns) / 1e6,
+                    double(rec_ns) / 1e6, queued_before, double(cushion_before_ns) / 1e6,
+                    double(main_dt_ns) / 1e6, double(gnm_dt_ns) / 1e6, double(sb_dt_ns) / 1e6,
+                    nvml_age_ms, double(nvml_dur_ns) / 1e6);
+            }
+        }
+        prev_rec_end_ns = rec_t1;
+    }
 
     // The frame's submission goes out from a recording thread (BB_ASYNC_SUBMIT); the present
     // one, waiting for it on the same queue, must not get there first.
+    const u64 fl_t0 = BbFrameRate::NowMonotonicNs();
     if (!blank && frame->ready_semaphore == draw_scheduler.GetWorkSemaphore()->Handle()) {
         draw_scheduler.WaitSubmitted(frame->ready_tick);
     }
@@ -858,9 +964,20 @@ bool Presenter::PresentImage(Frame* frame, vk::Image source, bool last) {
     }
     info.AddSignal(swapchain.GetPresentReadySemaphore());
     present_scheduler.Flush(info);
+    const u64 fl_t1 = BbFrameRate::NowMonotonicNs();
+    prev_flush_ns = fl_t1 > fl_t0 ? (fl_t1 - fl_t0) : 0ull;
     {
+        const u64 pres_t0 = fl_t1;
         std::scoped_lock lock{Scheduler::submit_mutex};
-        if (!swapchain.Present()) {
+        const bool ok = swapchain.Present();
+        const u64 pres_t1 = BbFrameRate::NowMonotonicNs();
+        const u64 pres_ns = pres_t1 > pres_t0 ? (pres_t1 - pres_t0) : 0ull;
+        prev_pres_call_ns = pres_ns;
+        prev_pres_end_ns = pres_t1;
+        if (pres_ns > 0) {
+            BbStats::swapchain_present_wait_ns.fetch_add(pres_ns, std::memory_order_relaxed);
+        }
+        if (!ok) {
             swapchain.Recreate(width, height);
             return false;
         }

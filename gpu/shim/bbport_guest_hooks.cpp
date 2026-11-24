@@ -9,6 +9,8 @@
 #include "bbport_fx_init_clear.h"
 #include "bbport_effect_flags.h"
 #include "bbport_camera_follow.h"
+#include "bbport_ladder_smooth.h"
+#include "bbport_frame_rate.h"
 #include "bbport_crash_blackbox.h"
 #include "platform/gnm/gnm.h"
 #include "../../dantelion_gx/include/gx_direct_vulkan.h"
@@ -1700,10 +1702,67 @@ void PS4_SYSV_ABI CameraEntry(u8* camera) {
     }
 }
 
-void PS4_SYSV_ABI CameraFollowEntryHook(u8* camera, u8* /*chr*/, float dt) {
+BbLadderSmooth::RuntimeState g_ladder_smoother;
+
+void PS4_SYSV_ABI LadderVisualYHook(u8* chr_ctrl, float* pos_xyz) {
+    if (!chr_ctrl || !pos_xyz) {
+        return;
+    }
+    const float dt = BbFrameRate::CurrentFramesPer30() * (1.0f / 30.0f);
+    const float offset_y =
+        g_ladder_smoother.UpdateAndGetOffset(chr_ctrl, pos_xyz[1], dt, BbFrameRate::FrameSeq());
+    if (offset_y != 0.0f) {
+        pos_xyz[1] += offset_y;
+    }
+}
+
+bool InstallLadderSmoothHook() {
+    if (!BbLadderSmooth::Enabled()) {
+        return false;
+    }
+    const u64 site_addr = ImageBase + BbLadderSmooth::kWorldMatPosSiteVma;
+    if (std::memcmp(reinterpret_cast<const void*>(site_addr),
+                    BbLadderSmooth::kWorldMatPosCode,
+                    sizeof(BbLadderSmooth::kWorldMatPosCode)) != 0) {
+        return false;
+    }
+    Emitter e;
+    // Execute the displaced store: vmovaps [rbp - 0xb0], xmm1
+    e.Bytes({0xc5, 0xf8, 0x29, 0x8d, 0x50, 0xff, 0xff, 0xff});
+    e.SaveVolatile();
+    e.SaveXmm();
+    e.Bytes({0x4c, 0x89, 0xf7});                         // mov rdi, r14 (ChrCtrl*)
+    e.Bytes({0x48, 0x8d, 0xb5, 0x50, 0xff, 0xff, 0xff}); // lea rsi, [rbp - 0xb0] (visual pos xyz)
+    e.CallAbs(reinterpret_cast<const void*>(&LadderVisualYHook));
+    e.RestoreXmm();
+    e.RestoreVolatile();
+    e.JmpAbs(site_addr + sizeof(BbLadderSmooth::kWorldMatPosCode));
+
+    const u64 stub = PlaceStub(e);
+    std::uint32_t rel = 0;
+    if (!stub || !Rel32To(site_addr + 5, stub, rel)) {
+        return false;
+    }
+
+    const long page_size = sysconf(_SC_PAGESIZE);
+    void* page = reinterpret_cast<void*>(site_addr & ~u64(page_size - 1));
+    const std::size_t span =
+        (site_addr + sizeof(BbLadderSmooth::kWorldMatPosCode)) - reinterpret_cast<u64>(page);
+    mprotect(page, span, PROT_READ | PROT_WRITE | PROT_EXEC);
+    reinterpret_cast<u8*>(site_addr)[0] = 0xcc;
+    for (std::size_t i = 5; i < sizeof(BbLadderSmooth::kWorldMatPosCode); ++i) {
+        reinterpret_cast<u8*>(site_addr)[i] = 0x90;
+    }
+    mprotect(page, span, Core::GuestCodeProtection());
+    WriteJumpOverTrap(site_addr, 0xe9, rel);
+    return true;
+}
+
+void PS4_SYSV_ABI CameraFollowEntryHook(u8* camera, u8* chr, float dt) {
     if (g_re_camera_enabled) {
         CameraEntry(camera);
     }
+    g_ladder_smoother.NotePlayerChr(chr);
     const bool mouse_look = BbSettings::Get().mouse_look.load(std::memory_order_relaxed);
     const int mode = BbSettings::Get().camera_follow_mode.load(std::memory_order_relaxed);
     g_cam_follow_state.PreUpdate(camera, dt, mouse_look, mode);
@@ -1712,6 +1771,10 @@ void PS4_SYSV_ABI CameraFollowEntryHook(u8* camera, u8* /*chr*/, float dt) {
 void PS4_SYSV_ABI CameraFollowPivotHook(u8* camera, const float* prev_pivot_rebased, float* xmm_area) {
     if (xmm_area) {
         BbCrashBlackBox::UpdatePlayerPosition(xmm_area[0], xmm_area[1], xmm_area[2]);
+        const float ladder_vis_off_y = g_ladder_smoother.CurrentOffsetY();
+        if (ladder_vis_off_y != 0.0f) {
+            xmm_area[1] += ladder_vis_off_y;
+        }
     }
     const int mode = BbSettings::Get().camera_follow_mode.load(std::memory_order_relaxed);
     g_cam_follow_state.ComputePivot(camera, prev_pivot_rebased, xmm_area, mode);
@@ -2070,6 +2133,7 @@ struct alignas(64) MxThreadSlot {
     s32 slot = -1;
     s32 task_slot = -1;
     u64 t0 = 0;
+    u64 task_entry_ptr = 0;
 };
 std::array<MxThreadSlot, 32> g_mx_threads{};
 
@@ -2218,85 +2282,97 @@ s32 FindOrAllocMainTaskSlot(u64 fn_off, s32 group_slot) noexcept {
     return result;
 }
 
+u64 ResolveMainTaskFnOff(u64 task_entry_ptr, u64& out_obj) noexcept {
+    auto valid_ptr = [](u64 p) noexcept -> bool {
+        return p >= 0x100000ULL && p < 0x0000800000000000ULL;
+    };
+    out_obj = 0;
+    if (!valid_ptr(task_entry_ptr)) {
+        return 0;
+    }
+    u64 fn_va = 0;
+    u64 obj = 0;
+    const u64 p8 = *reinterpret_cast<const u64*>(task_entry_ptr + 8ULL);
+    if (valid_ptr(p8)) {
+        obj = p8;
+        const u64 vt = *reinterpret_cast<const u64*>(p8);
+        if (valid_ptr(vt)) {
+            fn_va = *reinterpret_cast<const u64*>(vt + 0x10ULL);
+        }
+    } else {
+        const u64 p0 = *reinterpret_cast<const u64*>(task_entry_ptr);
+        if (valid_ptr(p0)) {
+            obj = p0;
+            const u64 vt = *reinterpret_cast<const u64*>(p0);
+            if (valid_ptr(vt)) {
+                fn_va = *reinterpret_cast<const u64*>(vt + 0x18ULL);
+            }
+        }
+    }
+    if (fn_va == 0) {
+        return 0;
+    }
+    auto to_off = [](u64 va) noexcept -> u64 {
+        return (va >= ImageBase && va < ImageBase + 0x6000000ULL) ? (va - ImageBase) : va;
+    };
+    u64 fn_off = to_off(fn_va);
+    // Unwrap SprjTask wrapper chain:
+    // 1) `0x20507c0`: `obj = *(obj+0x10); fn = *(*(obj)+0x18)`
+    // 2) `0x142de10`: `fn = *(*(obj)+0x20)`
+    // 3) `0x142de20` (Itanium PMF delegate):
+    //    `obj2 = *(obj+0x18) + *(obj+0x28); pmf = *(obj+0x20);`
+    //    `fn = (pmf & 1) ? *(*(obj2) + pmf - 1) : pmf`
+    if (fn_off == 0x20507c0ULL && valid_ptr(obj)) {
+        const u64 obj2 = *reinterpret_cast<const u64*>(obj + 0x10ULL);
+        if (valid_ptr(obj2)) {
+            obj = obj2;
+            const u64 vt2 = *reinterpret_cast<const u64*>(obj);
+            if (valid_ptr(vt2)) {
+                fn_off = to_off(*reinterpret_cast<const u64*>(vt2 + 0x18ULL));
+            }
+        }
+    }
+    if (fn_off == 0x142de10ULL && valid_ptr(obj)) {
+        const u64 vt2 = *reinterpret_cast<const u64*>(obj);
+        if (valid_ptr(vt2)) {
+            fn_off = to_off(*reinterpret_cast<const u64*>(vt2 + 0x20ULL));
+        }
+    }
+    if (fn_off < 0x6000000ULL && valid_ptr(obj)) {
+        static constexpr u8 pmf_sig[7] = {0x48, 0x89, 0xf8, 0x48, 0x8b, 0x78, 0x18};
+        const auto* code_ptr = reinterpret_cast<const u8*>(ImageBase + fn_off);
+        if (std::memcmp(code_ptr, pmf_sig, sizeof(pmf_sig)) == 0) {
+            const u64 raw_obj = *reinterpret_cast<const u64*>(obj + 0x18ULL);
+            const u64 pmf = *reinterpret_cast<const u64*>(obj + 0x20ULL);
+            const u64 adj = *reinterpret_cast<const u64*>(obj + 0x28ULL);
+            const u64 target_obj = raw_obj + adj;
+            if (valid_ptr(target_obj)) {
+                obj = target_obj;
+                if ((pmf & 1ULL) != 0ULL) {
+                    const u64 vt3 = *reinterpret_cast<const u64*>(obj);
+                    if (valid_ptr(vt3) && pmf < 0x10000ULL) {
+                        fn_off = to_off(*reinterpret_cast<const u64*>(vt3 + (pmf - 1ULL)));
+                    }
+                } else if (pmf != 0ULL) {
+                    fn_off = to_off(pmf);
+                }
+            }
+        }
+    }
+    out_obj = obj;
+    return fn_off;
+}
+
 void PS4_SYSV_ABI MainTaskGroupBeginHook(u32 group_id, u32 thread_idx, u64 task_entry_ptr) noexcept {
     auto& ts = g_mx_threads[thread_idx & 31u];
     const s32 slot = FindOrAllocMainGroupSlot(group_id);
     s32 tslot = -1;
-    auto valid_ptr = [](u64 p) noexcept -> bool {
-        return p >= 0x100000ULL && p < 0x0000800000000000ULL;
-    };
-    if (BbSections::main_xray.deep_enabled.load(std::memory_order_relaxed) &&
-        slot >= 0 && valid_ptr(task_entry_ptr)) {
-        u64 fn_va = 0;
+    if (BbSections::main_xray.deep_enabled.load(std::memory_order_relaxed) && slot >= 0) {
         u64 obj = 0;
-        const u64 p8 = *reinterpret_cast<const u64*>(task_entry_ptr + 8ULL);
-        if (valid_ptr(p8)) {
-            obj = p8;
-            const u64 vt = *reinterpret_cast<const u64*>(p8);
-            if (valid_ptr(vt)) {
-                fn_va = *reinterpret_cast<const u64*>(vt + 0x10ULL);
-            }
-        } else {
-            const u64 p0 = *reinterpret_cast<const u64*>(task_entry_ptr);
-            if (valid_ptr(p0)) {
-                obj = p0;
-                const u64 vt = *reinterpret_cast<const u64*>(p0);
-                if (valid_ptr(vt)) {
-                    fn_va = *reinterpret_cast<const u64*>(vt + 0x18ULL);
-                }
-            }
-        }
-        if (fn_va != 0) {
-            u64 fn_off =
-                (fn_va >= ImageBase && fn_va < ImageBase + 0x6000000ULL) ? (fn_va - ImageBase) : fn_va;
-            // Unwrap SprjTask wrapper chain:
-            // 1) `0x20507c0`: `obj = *(obj+0x10); fn = *(*(obj)+0x18)`
-            // 2) `0x142de10`: `fn = *(*(obj)+0x20)`
-            // 3) `0x142de20` (Itanium PMF delegate):
-            //    `obj2 = *(obj+0x18) + *(obj+0x28); pmf = *(obj+0x20);`
-            //    `fn = (pmf & 1) ? *(*(obj2) + pmf - 1) : pmf`
-            auto to_off = [&](u64 va) noexcept -> u64 {
-                return (va >= ImageBase && va < ImageBase + 0x6000000ULL) ? (va - ImageBase) : va;
-            };
-            if (fn_off == 0x20507c0ULL && valid_ptr(obj)) {
-                const u64 obj2 = *reinterpret_cast<const u64*>(obj + 0x10ULL);
-                if (valid_ptr(obj2)) {
-                    obj = obj2;
-                    const u64 vt2 = *reinterpret_cast<const u64*>(obj);
-                    if (valid_ptr(vt2)) {
-                        fn_off = to_off(*reinterpret_cast<const u64*>(vt2 + 0x18ULL));
-                    }
-                }
-            }
-            if (fn_off == 0x142de10ULL && valid_ptr(obj)) {
-                const u64 vt2 = *reinterpret_cast<const u64*>(obj);
-                if (valid_ptr(vt2)) {
-                    fn_off = to_off(*reinterpret_cast<const u64*>(vt2 + 0x20ULL));
-                }
-            }
-            if (fn_off < 0x6000000ULL && valid_ptr(obj)) {
-                static constexpr u8 pmf_sig[7] = {0x48, 0x89, 0xf8, 0x48, 0x8b, 0x78, 0x18};
-                const auto* code_ptr = reinterpret_cast<const u8*>(ImageBase + fn_off);
-                if (std::memcmp(code_ptr, pmf_sig, sizeof(pmf_sig)) == 0) {
-                    const u64 raw_obj = *reinterpret_cast<const u64*>(obj + 0x18ULL);
-                    const u64 pmf = *reinterpret_cast<const u64*>(obj + 0x20ULL);
-                    const u64 adj = *reinterpret_cast<const u64*>(obj + 0x28ULL);
-                    const u64 target_obj = raw_obj + adj;
-                    if (valid_ptr(target_obj)) {
-                        obj = target_obj;
-                        if ((pmf & 1ULL) != 0ULL) {
-                            const u64 vt3 = *reinterpret_cast<const u64*>(obj);
-                            if (valid_ptr(vt3) && pmf < 0x10000ULL) {
-                                fn_off = to_off(*reinterpret_cast<const u64*>(vt3 + (pmf - 1ULL)));
-                            }
-                        } else if (pmf != 0ULL) {
-                            fn_off = to_off(pmf);
-                        }
-                    }
-                }
-            }
+        const u64 fn_off = ResolveMainTaskFnOff(task_entry_ptr, obj);
+        if (fn_off != 0) {
             // If MoveMapStep::Execute (0x19386e0), record active state index [obj+0xc].
-            if (fn_off == 0x19386e0ULL && valid_ptr(obj)) {
+            if (fn_off == 0x19386e0ULL && obj >= 0x100000ULL && obj < 0x0000800000000000ULL) {
                 const s32 st = *reinterpret_cast<const s32*>(obj + 0x0cULL);
                 BbSections::main_xray.movemap_last_state.store(st, std::memory_order_relaxed);
             }
@@ -2305,6 +2381,7 @@ void PS4_SYSV_ABI MainTaskGroupBeginHook(u32 group_id, u32 thread_idx, u64 task_
     }
     ts.slot = slot;
     ts.task_slot = tslot;
+    ts.task_entry_ptr = task_entry_ptr;
     ts.t0 = (slot >= 0) ? __rdtsc() : 0ULL;
 }
 
@@ -2314,11 +2391,26 @@ void PS4_SYSV_ABI MainTaskGroupEndHook(u32 /*group_id*/, u32 thread_idx) noexcep
     const s32 tslot = ts.task_slot;
     if (slot >= 0) {
         const u64 dt = __rdtsc() - ts.t0;
+        const u64 entry_ptr = ts.task_entry_ptr;
         ts.slot = -1;
         ts.task_slot = -1;
+        ts.task_entry_ptr = 0;
         auto& arr = (thread_idx == 0) ? BbSections::main_xray.cycles_t0
                                       : BbSections::main_xray.cycles_wk;
         arr[static_cast<std::size_t>(slot)].fetch_add(dt, std::memory_order_relaxed);
+        if (thread_idx == 0 &&
+            dt > BbSections::main_xray.frame_max_t0_cycles.load(std::memory_order_relaxed)) {
+            u64 obj = 0;
+            const u64 fn_off = ResolveMainTaskFnOff(entry_ptr, obj);
+            s32 mm_st = -1;
+            if (fn_off == 0x19386e0ULL && obj >= 0x100000ULL && obj < 0x0000800000000000ULL) {
+                mm_st = *reinterpret_cast<const s32*>(obj + 0x0cULL);
+            }
+            BbSections::main_xray.frame_max_t0_cycles.store(dt, std::memory_order_relaxed);
+            BbSections::main_xray.frame_max_t0_fn_off.store(fn_off, std::memory_order_relaxed);
+            BbSections::main_xray.frame_max_t0_group.store(slot, std::memory_order_relaxed);
+            BbSections::main_xray.frame_max_t0_movemap_state.store(mm_st, std::memory_order_relaxed);
+        }
         if (tslot >= 0) {
             const auto ti = static_cast<std::size_t>(tslot);
             BbSections::main_xray.task_cycles[ti].fetch_add(dt, std::memory_order_relaxed);
@@ -2613,6 +2705,10 @@ void Install(RangeCallback on_gpu_range_allocated) {
                                   : "off",
                     BbSettings::CameraFollowModeName(
                         BbSettings::Get().camera_follow_mode.load(std::memory_order_relaxed)));
+        const bool ladder_smooth_ok = InstallLadderSmoothHook();
+        if (ladder_smooth_ok) {
+            std::printf("Guest hooks: ladder visual Y-smoothing on (PLL slide + climb dead-stop bridge)\n");
+        }
         if (const char* env = std::getenv("BB_RE_ADVANCE"); env && env[0] == '1') {
             std::printf("Guest hooks: UI advance probe %s\n", InstallEntryProbe(0x20f00) ? "on" : "not installed");
         }
