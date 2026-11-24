@@ -657,9 +657,52 @@ bool Update(u32 generation, Set& out) {
     if (now == 0) {
         now = 1;
     }
-    if (now == generation) {
+    static u32 last_checked_gen = 0;
+    static u64 last_visual_hash = 0;
+    static bool has_visual_hash = false;
+    if (now == generation || (has_visual_hash && now == last_checked_gen)) {
         return false;
     }
+
+    // Hash the effective prompt inputs (device + controls guide + mouse_look + each icon's
+    // resolved kind/label strings) before rasterizing all 22 icons (~25 ms on CPU). Saving any
+    // unrelated display/effect setting bumps `prompt_generation` via `runtime_pad_reload_bindings()`
+    // even when zero keybinds changed — skip the redundant 25 ms redraw whenever visually identical.
+    const int device = runtime_pad_prompt_device();
+    auto fnv_mix = [](u64 h, const void* p, std::size_t n) -> u64 {
+        const auto* b = static_cast<const std::uint8_t*>(p);
+        for (std::size_t i = 0; i < n; ++i) {
+            h ^= b[i];
+            h *= 1099511628211ULL;
+        }
+        return h;
+    };
+    u64 vhash = 14695981039346656037ULL;
+    vhash = fnv_mix(vhash, &device, sizeof(device));
+    const u8 guide_b = controls_guide_drawn ? 1u : 0u;
+    const int mlook = runtime_pad_mouse_look();
+    vhash = fnv_mix(vhash, &guide_b, sizeof(guide_b));
+    vhash = fnv_mix(vhash, &mlook, sizeof(mlook));
+    for (std::size_t i = 0; i < IconCount; ++i) {
+        if (icon_hashes[i] == 0) {
+            continue;
+        }
+        const auto& icon = Icons[i];
+        const bool single = icon.layout == Layout::Single;
+        for (int j = 0; j < 4 && icon.inputs[j]; ++j) {
+            char lbl[32] = {};
+            const int kind = runtime_pad_prompt(icon.inputs[j], single ? 1 : 0, lbl, sizeof(lbl));
+            vhash = fnv_mix(vhash, &kind, sizeof(kind));
+            vhash = fnv_mix(vhash, lbl, std::strlen(lbl) + 1);
+        }
+    }
+    last_checked_gen = now;
+    if (has_visual_hash && generation != 0 && vhash == last_visual_hash) {
+        return false;
+    }
+    last_visual_hash = vhash;
+    has_visual_hash = true;
+
     out.generation = now;
     out.count = u32(IconCount);
     out.drawn.assign(IconCount, false);
@@ -672,7 +715,6 @@ bool Update(u32 generation, Set& out) {
         }
     }
     static const char* const devices[] = {"the game's (PlayStation pad)", "the gamepad's", "the keyboard's and mouse's"};
-    const int device = runtime_pad_prompt_device();
     std::printf("Button prompts: %s\n", device >= 0 && device <= 2 ? devices[device] : "?");
     return true;
 }

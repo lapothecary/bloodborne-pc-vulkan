@@ -1032,13 +1032,15 @@ bool NativePostFx::EnsureOpaqueHdrTarget(u32 hdr_w, u32 hdr_h) {
     return true;
 }
 
-void NativePostFx::CaptureOpaqueHdr(VideoCore::Image& hdr_image) {
+void NativePostFx::CaptureOpaqueHdr(VideoCore::Image& hdr_image, vk::Image proxy_img,
+                                    u32 proxy_w, u32 proxy_h) {
     if (!EnsureInit()) {
         return;
     }
-    const u32 w = hdr_image.info.size.width;
-    const u32 h = hdr_image.info.size.height;
-    const vk::Image src_img = hdr_image.GetImage();
+    const bool use_proxy = (proxy_img != VK_NULL_HANDLE && proxy_w >= 64u && proxy_h >= 64u);
+    const u32 w = use_proxy ? proxy_w : hdr_image.info.size.width;
+    const u32 h = use_proxy ? proxy_h : hdr_image.info.size.height;
+    const vk::Image src_img = use_proxy ? proxy_img : hdr_image.GetImage();
     if (w < 64u || h < 64u || !src_img) {
         return;
     }
@@ -1047,9 +1049,11 @@ void NativePostFx::CaptureOpaqueHdr(VideoCore::Image& hdr_image) {
     }
 
     scheduler.EndRendering();
-    runtime.Transit(&hdr_image, vk::ImageLayout::eTransferSrcOptimal,
-                    vk::PipelineStageFlagBits2::eBlit, vk::AccessFlagBits2::eTransferRead);
-    runtime.FlushBarriers();
+    if (!use_proxy) {
+        runtime.Transit(&hdr_image, vk::ImageLayout::eTransferSrcOptimal,
+                        vk::PipelineStageFlagBits2::eBlit, vk::AccessFlagBits2::eTransferRead);
+        runtime.FlushBarriers();
+    }
 
     const vk::Image dst_img = vk::Image(opaque_hdr_half);
     const vk::Extent2D dst_ext = opaque_hdr_extent;
@@ -1059,19 +1063,45 @@ void NativePostFx::CaptureOpaqueHdr(VideoCore::Image& hdr_image) {
                                w, h, dst_ext.width, dst_ext.height);
         });
     }
-    scheduler.Record([src_img, dst_img, w, h, dst_ext](vk::CommandBuffer cmdbuf) {
+    scheduler.Record([src_img, dst_img, w, h, dst_ext, use_proxy](vk::CommandBuffer cmdbuf) {
         const vk::ImageSubresourceRange one_range{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
-        const vk::ImageMemoryBarrier2 to_dst{
-            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-            .srcAccessMask = vk::AccessFlagBits2::eShaderRead,
-            .dstStageMask = vk::PipelineStageFlagBits2::eBlit,
-            .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
-            .oldLayout = vk::ImageLayout::eUndefined,
-            .newLayout = vk::ImageLayout::eTransferDstOptimal,
-            .image = dst_img,
-            .subresourceRange = one_range,
-        };
-        cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_dst});
+        if (use_proxy) {
+            const vk::ImageMemoryBarrier2 src_to_transfer{
+                .srcStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+                .srcAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
+                .dstStageMask = vk::PipelineStageFlagBits2::eBlit,
+                .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+                .oldLayout = vk::ImageLayout::eColorAttachmentOptimal,
+                .newLayout = vk::ImageLayout::eTransferSrcOptimal,
+                .image = src_img,
+                .subresourceRange = one_range,
+            };
+            const vk::ImageMemoryBarrier2 to_dst{
+                .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                .srcAccessMask = vk::AccessFlagBits2::eShaderRead,
+                .dstStageMask = vk::PipelineStageFlagBits2::eBlit,
+                .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                .oldLayout = vk::ImageLayout::eUndefined,
+                .newLayout = vk::ImageLayout::eTransferDstOptimal,
+                .image = dst_img,
+                .subresourceRange = one_range,
+            };
+            const std::array<vk::ImageMemoryBarrier2, 2> pre{{src_to_transfer, to_dst}};
+            cmdbuf.pipelineBarrier2(
+                {.imageMemoryBarrierCount = u32(pre.size()), .pImageMemoryBarriers = pre.data()});
+        } else {
+            const vk::ImageMemoryBarrier2 to_dst{
+                .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                .srcAccessMask = vk::AccessFlagBits2::eShaderRead,
+                .dstStageMask = vk::PipelineStageFlagBits2::eBlit,
+                .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                .oldLayout = vk::ImageLayout::eUndefined,
+                .newLayout = vk::ImageLayout::eTransferDstOptimal,
+                .image = dst_img,
+                .subresourceRange = one_range,
+            };
+            cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_dst});
+        }
 
         const vk::ImageBlit region{
             .srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
@@ -1093,10 +1123,31 @@ void NativePostFx::CaptureOpaqueHdr(VideoCore::Image& hdr_image) {
             .image = dst_img,
             .subresourceRange = one_range,
         };
-        cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_read});
+        if (use_proxy) {
+            // Restore reduced proxy back to ColorAttachmentOptimal so SceneTargets' tracked layout
+            // stays exact for subsequent forward/GXFfx draws into the same proxy.
+            const vk::ImageMemoryBarrier2 src_back{
+                .srcStageMask = vk::PipelineStageFlagBits2::eBlit,
+                .srcAccessMask = vk::AccessFlagBits2::eTransferRead,
+                .dstStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+                .dstAccessMask = vk::AccessFlagBits2::eColorAttachmentRead |
+                                 vk::AccessFlagBits2::eColorAttachmentWrite,
+                .oldLayout = vk::ImageLayout::eTransferSrcOptimal,
+                .newLayout = vk::ImageLayout::eColorAttachmentOptimal,
+                .image = src_img,
+                .subresourceRange = one_range,
+            };
+            const std::array<vk::ImageMemoryBarrier2, 2> post{{to_read, src_back}};
+            cmdbuf.pipelineBarrier2(
+                {.imageMemoryBarrierCount = u32(post.size()), .pImageMemoryBarriers = post.data()});
+        } else {
+            cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_read});
+        }
     });
 
-    opaque_hdr_src_vk = src_img;
+    // Always tag with the guest hdr_image handle so Execute() matches in both native and reduced
+    // upscaler modes.
+    opaque_hdr_src_vk = hdr_image.GetImage();
     opaque_hdr_valid = true;
 }
 
@@ -1221,12 +1272,14 @@ void NativePostFx::ExecuteHalfResSsgi(VideoCore::Image& hdr_image, vk::ImageView
                                       vk::ImageView g2_view, vk::ImageView diff_view,
                                       vk::ImageView amb_view,
                                       const vk::DescriptorBufferInfo& ssbo2_info,
-                                      u32 d1_dword_offset) {
+                                      u32 d1_dword_offset, vk::Image proxy_img, u32 proxy_w,
+                                      u32 proxy_h) {
     if (!EnsureInit()) {
         return;
     }
-    const u32 w = hdr_image.info.size.width;
-    const u32 h = hdr_image.info.size.height;
+    const bool use_proxy = (proxy_img != VK_NULL_HANDLE && proxy_w >= 64u && proxy_h >= 64u);
+    const u32 w = use_proxy ? proxy_w : hdr_image.info.size.width;
+    const u32 h = use_proxy ? proxy_h : hdr_image.info.size.height;
     if (w < 64u || h < 64u || !hdr_view || !g0_view || !depth_view || !g2_view || !diff_view ||
         !amb_view || !ssbo2_info.buffer) {
         return;
@@ -1240,11 +1293,13 @@ void NativePostFx::ExecuteHalfResSsgi(VideoCore::Image& hdr_image, vk::ImageView
     }
 
     scheduler.EndRendering();
-    runtime.Transit(&hdr_image, vk::ImageLayout::eColorAttachmentOptimal,
-                    vk::PipelineStageFlagBits2::eColorAttachmentOutput,
-                    vk::AccessFlagBits2::eColorAttachmentRead |
-                        vk::AccessFlagBits2::eColorAttachmentWrite);
-    runtime.FlushBarriers();
+    if (!use_proxy) {
+        runtime.Transit(&hdr_image, vk::ImageLayout::eColorAttachmentOptimal,
+                        vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+                        vk::AccessFlagBits2::eColorAttachmentRead |
+                            vk::AccessFlagBits2::eColorAttachmentWrite);
+        runtime.FlushBarriers();
+    }
 
     const vk::Image m0_img = vk::Image(ssgi_rad_mip0);
     const vk::ImageView m0_view = *ssgi_rad_mip0_view;
@@ -1387,7 +1442,24 @@ void NativePostFx::ExecuteHalfResSsgi(VideoCore::Image& hdr_image, vk::ImageView
             .image = raw_img,
             .subresourceRange = one_range,
         };
-        cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &raw_ready});
+        if (use_proxy) {
+            const vk::ImageMemoryBarrier2 hdr_sync{
+                .srcStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+                .srcAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
+                .dstStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+                .dstAccessMask = vk::AccessFlagBits2::eColorAttachmentRead |
+                                 vk::AccessFlagBits2::eColorAttachmentWrite,
+                .oldLayout = vk::ImageLayout::eColorAttachmentOptimal,
+                .newLayout = vk::ImageLayout::eColorAttachmentOptimal,
+                .image = proxy_img,
+                .subresourceRange = one_range,
+            };
+            const std::array<vk::ImageMemoryBarrier2, 2> up_barriers{{raw_ready, hdr_sync}};
+            cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = u32(up_barriers.size()),
+                                     .pImageMemoryBarriers = up_barriers.data()});
+        } else {
+            cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &raw_ready});
+        }
 
         // 4. Full-Res 5-tap depth-aware bilateral upsample & blend directly onto hdr_image
         const vk::DescriptorImageInfo g0_in{VK_NULL_HANDLE, g0_view,

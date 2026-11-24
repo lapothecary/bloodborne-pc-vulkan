@@ -1207,6 +1207,43 @@ void WriteCrashReport(int sig, const void* fault_addr, void* ucontext_ptr,
                       static_cast<unsigned long long>(rip));
     }
 
+    auto redact_home_path = [](const char* src, char* dst, std::size_t dst_sz) -> const char* {
+        if (!src || !dst || dst_sz == 0) {
+            return src ? src : "";
+        }
+#ifdef _WIN32
+        const char* home = std::getenv("USERPROFILE");
+        const char* repl = "%USERPROFILE%";
+#else
+        const char* home = std::getenv("HOME");
+        const char* repl = "~";
+#endif
+        if (home && home[0] != '\0') {
+            std::size_t hlen = std::strlen(home);
+            while (hlen > 1 && (home[hlen - 1] == '/' || home[hlen - 1] == '\\')) {
+                --hlen;
+            }
+            bool match = (std::strlen(src) >= hlen);
+            for (std::size_t i = 0; match && i < hlen; ++i) {
+                char a = src[i];
+                char b = home[i];
+                if (a == '\\') a = '/';
+                if (b == '\\') b = '/';
+#ifdef _WIN32
+                if (a >= 'A' && a <= 'Z') a = static_cast<char>(a + ('a' - 'A'));
+                if (b >= 'A' && b <= 'Z') b = static_cast<char>(b + ('a' - 'A'));
+#endif
+                if (a != b) match = false;
+            }
+            if (match && (src[hlen] == '\0' || src[hlen] == '/' || src[hlen] == '\\')) {
+                std::snprintf(dst, dst_sz, "%s%s", repl, src + hlen);
+                return dst;
+            }
+        }
+        std::snprintf(dst, dst_sz, "%s", src);
+        return dst;
+    };
+
     // ========================================================================
     // 1. HEADER & AUTOMATIC HUMAN-READABLE DIAGNOSIS (Flushed BEFORE heap walk)
     // ========================================================================
@@ -1217,8 +1254,10 @@ void WriteCrashReport(int sig, const void* fault_addr, void* ucontext_ptr,
     sink.Printf("  Timestamp      : %s (uptime %.3f s, frame ~%u)\n",
                 wall_str, uptime_s, g_frame_counter.load(std::memory_order_relaxed));
     sink.Printf("  Platform       : %s\n", os_name);
+    char redacted_log_path[512]{};
     if (sink.file_path[0] != '\0') {
-        sink.Printf("  Crash Log File : %s\n", sink.file_path);
+        sink.Printf("  Crash Log File : %s\n",
+                    redact_home_path(sink.file_path, redacted_log_path, sizeof(redacted_log_path)));
     }
     if (g_extra_reason[0] != '\0') {
         sink.Printf("  Reason         : %s\n", g_extra_reason);
@@ -1264,9 +1303,11 @@ void WriteCrashReport(int sig, const void* fault_addr, void* ucontext_ptr,
     }
     {
         char save_dir[256]{};
+        char redacted_save[512]{};
         const int slot = runtime_savedata_active_slot(save_dir, sizeof(save_dir));
         if (slot >= 0) {
-            sink.Printf("  Active Save    : userdata%04d (%s)\n", slot, save_dir);
+            sink.Printf("  Active Save    : userdata%04d (%s)\n", slot,
+                        redact_home_path(save_dir, redacted_save, sizeof(redacted_save)));
         }
     }
     {
@@ -1619,7 +1660,8 @@ void WriteCrashReport(int sig, const void* fault_addr, void* ucontext_ptr,
 
     sink.Printf("================================================================================\n");
     if (sink.file_path[0] != '\0') {
-        sink.Printf("  Saved standalone crash report -> %s\n", sink.file_path);
+        sink.Printf("  Saved standalone crash report -> %s\n",
+                    redacted_log_path[0] != '\0' ? redacted_log_path : sink.file_path);
         sink.Printf("================================================================================\n");
     }
     sink.FlushAndClose();

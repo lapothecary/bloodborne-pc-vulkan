@@ -3086,7 +3086,7 @@ void UpdateHudBreakdown(HudBreakdown& h) {
             "  1.Shadow %.2f ms (1a.CSM/Spot %.2f | 1b.VSM/PCF %.2f) | 2.GBuf %.2f ms (2a.World/Chr %.2f | 2b.Foliage %.2f)\n"
             "  3.SSAO %.2f ms (3a.RawGen %.2f | 3b.Blur/Up %.3f) | 4.DefPBR %.2f ms (4a.Sun/IBL/Local %.2f | 4b.Sky/Fog/Shafts %.2f)\n"
             "  5.SSR %.2f ms (5a.Raymarch %.2f | 5b.HiZ/Mips %.2f) | 6.FwdAlpha %.2f ms (6a.Hair/Blood/Water %.2f | 6b.Particles/VFX %.2f)\n"
-            "  7.CompCopy %.2f ms (7a.ParticleCS %.2f | 7b.Copies/HLE %.2f) | 8.Yebis2 %.2f ms (8a.DoF %.2f | 8b.MotBlur %.2f | 8c.Bloom/Glow %.2f | 8d.Tonemap/LUT %.2f)\n"
+            "  7.CompCopy %.2f ms (7a.ParticleCS %.2f | 7b.Copies/HLE %.2f) | %s %.2f ms (8a.DoF %.2f | 8b.MotBlur %.2f | 8c.Bloom/Glow %.2f | 8d.Tonemap/LUT %.2f)\n"
             "  9.AA/Upscale %.2f ms (9a.Upscaler %.2f) | 10.UI/Present %.2f ms (10a.ScaleformHUD %.2f | 10b.RCAS+Overlay+Flip %.2f)\n"
             "BOTTLENECK: %s (Now %.2f ms / Avg %.2f ms)\n",
             h.fps, h.frame_ms, h.avg_fps, h.avg_frame_ms, h.avg_jitter_ms,
@@ -3140,6 +3140,7 @@ void UpdateHudBreakdown(HudBreakdown& h) {
             h.hw_gpu_cat_ms[4], h.hw_gpu_subcat_ms[BbStats::GpuSub_Ssr_Raymarch], h.hw_gpu_subcat_ms[BbStats::GpuSub_Ssr_HiZAndMips],
             h.hw_gpu_cat_ms[5], h.hw_gpu_subcat_ms[BbStats::GpuSub_Fwd_HairClothAlpha], h.hw_gpu_subcat_ms[BbStats::GpuSub_Fwd_SoftParticles],
             h.hw_gpu_cat_ms[6], h.hw_gpu_subcat_ms[BbStats::GpuSub_Comp_ParticlesCs], h.hw_gpu_subcat_ms[BbStats::GpuSub_Comp_CopiesAndHle],
+            s.native_postfx.load(std::memory_order_relaxed) ? "8.NativePostFX" : "8.Yebis2",
             h.hw_gpu_cat_ms[7], h.hw_gpu_subcat_ms[BbStats::GpuSub_Post_DoF], h.hw_gpu_subcat_ms[BbStats::GpuSub_Post_MotionBlur],
             h.hw_gpu_subcat_ms[BbStats::GpuSub_Post_BloomGlare], h.hw_gpu_subcat_ms[BbStats::GpuSub_Post_TonemapLut],
             h.hw_gpu_cat_ms[8], h.hw_gpu_subcat_ms[BbStats::GpuSub_Aa_Upscaler],

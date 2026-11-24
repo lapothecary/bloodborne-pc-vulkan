@@ -430,16 +430,22 @@ __attribute__((noinline)) void sub_229e990(void* pSelf, void* pRenderDev, void* 
         if ((ctxFlags & 0x10u) != 0u) {
             viewBytes[0x296a] = gx_direct_vk::IsEffectEnabled(gx_direct_vk::kEffectGameAa) ? 1u : 0u;
         }
-        // Mirror eboot.bin+0x22c5989 (`cmpb $0, 0x1b88(%rbx); mov %cl, 0x296c(%rbx)`):
-        // viewBytes[0x1b88] is the view's persistent CSM-capable flag, so gating viewBytes[0x296c]
-        // on it cleanly disables BOTH CSM caster draws and screen-space CSM passes at Shadow Quality
-        // Off (0.00 ms 1.Shadow) and restores them immediately when switching back to Low..Ultra.
-        const bool shadowsOn = (gx_direct_vk::GetShadowQuality() != 0);
-        if (viewBytes[0x1b88] != 0u) {
-            viewBytes[0x296c] = shadowsOn ? 1u : 0u;
+        // Mirror eboot.bin+0x22c5256..0x22c526d and eboot.bin+0x22c5989:
+        // Planar water-reflection child views have `*(void**)(viewBytes + 0x1b90) != nullptr`
+        // (`pParentView`) and explicitly force BOTH `viewBytes[0x296c] = 0` (CSM) and
+        // `viewBytes[0x296e] = 0` (dynamic point/spot light shadows). Never force `0x296e = 1`
+        // on a child reflection view, otherwise it populates `pLightQueue` (`0x5878`) a second
+        // time per frame without reset and crashes `GXWorker` (`sub_22b5b10 -> sub_2266b40(NULL)`).
+        const bool isChildReflectionView =
+            (*reinterpret_cast<const uint64_t*>(viewBytes + 0x1b90) != 0ULL);
+        if (!isChildReflectionView) {
+            const bool shadowsOn = (gx_direct_vk::GetShadowQuality() != 0);
+            if (viewBytes[0x1b88] != 0u) {
+                viewBytes[0x296c] = shadowsOn ? 1u : 0u;
+            }
+            viewBytes[0x296e] =
+                (shadowsOn && gx_direct_vk::IsEffectEnabled(gx_direct_vk::kEffectDynamicShadows)) ? 1u : 0u;
         }
-        viewBytes[0x296e] =
-            (shadowsOn && gx_direct_vk::IsEffectEnabled(gx_direct_vk::kEffectDynamicShadows)) ? 1u : 0u;
         if ((ctxFlags & 0x8u) != 0u) {
             const uint8_t wantBloom = gx_direct_vk::IsEffectEnabled(gx_direct_vk::kEffectBloom) ? 1u : 0u;
             viewBytes[0x296b] = wantBloom;

@@ -4266,34 +4266,59 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     }
     if (ps_info_sort && ps_info_sort->pgm_hash == 0x0000000032e47788ULL && native_postfx &&
         state.num_color_attachments > 0u && cb_descs[0].first) {
-        const auto& s = BbSettings::Get();
-        if (s.ssgi_enabled.load(std::memory_order_relaxed) &&
-            state.color_attachments[0].image_view && buffer_infos.size() >= 2u) {
-            vk::ImageView ps_imgs[6]{};
-            u32 img_count = 0u;
-            for (const auto& w : set_writes) {
-                if (w.descriptorType == vk::DescriptorType::eSampledImage && w.pImageInfo) {
-                    if (img_count < 6u) {
-                        ps_imgs[img_count++] = w.pImageInfo->imageView;
-                    } else {
-                        for (u32 k = 0u; k < 5u; ++k) ps_imgs[k] = ps_imgs[k + 1u];
-                        ps_imgs[5] = w.pImageInfo->imageView;
-                    }
+        auto& cb0_img = texture_cache.GetImage(cb_descs[0].first);
+        // Only run SSGI and Fire Heat Haze capture on the main scene HDR target, never on
+        // half-resolution planar water reflection passes (`eboot.bin+0x22c5199`): running on
+        // both passes ping-ponged target extents and forced scheduler.Finish() + VkImage
+        // reallocation 2-4x every single frame near water (~6 ms Stage B stall!).
+        const auto base_sz = scene_targets ? scene_targets->BaseSize() : SceneResolution::Size{};
+        const bool is_main_scene_hdr =
+            (base_sz.width == 0u || base_sz.height == 0u) ||
+            (cb0_img.info.size.width == base_sz.width &&
+             cb0_img.info.size.height == base_sz.height);
+        if (is_main_scene_hdr) {
+            vk::Image proxy_img = VK_NULL_HANDLE;
+            u32 proxy_w = 0u;
+            u32 proxy_h = 0u;
+            if (scene_targets && scene_targets->Reduced() &&
+                scene_targets->ProxyCurrent(cb0_img, 0u)) {
+                const auto tgt =
+                    scene_targets->Attachment(cb_descs[0].first, cb_descs[0].second.view_info);
+                if (tgt.image && tgt.view == state.color_attachments[0].image_view) {
+                    const auto psz = scene_targets->ProxySize(cb0_img, 0u);
+                    proxy_img = tgt.image;
+                    proxy_w = psz.width;
+                    proxy_h = psz.height;
                 }
             }
-            if (img_count == 6u) {
-                const u32 ssbo2_slot = static_cast<u32>(buffer_infos.size() - 1u);
-                const u32 d1_dw = static_cast<u32>(push_data.buf_offsets[ssbo2_slot]) >> 2u;
-                native_postfx->ExecuteHalfResSsgi(
-                    texture_cache.GetImage(cb_descs[0].first),
-                    state.color_attachments[0].image_view,
-                    ps_imgs[0], ps_imgs[1], ps_imgs[2], ps_imgs[3], ps_imgs[5],
-                    buffer_infos[ssbo2_slot], d1_dw);
+            const auto& s = BbSettings::Get();
+            if (s.ssgi_enabled.load(std::memory_order_relaxed) &&
+                state.color_attachments[0].image_view && buffer_infos.size() >= 2u) {
+                vk::ImageView ps_imgs[6]{};
+                u32 img_count = 0u;
+                for (const auto& w : set_writes) {
+                    if (w.descriptorType == vk::DescriptorType::eSampledImage && w.pImageInfo) {
+                        if (img_count < 6u) {
+                            ps_imgs[img_count++] = w.pImageInfo->imageView;
+                        } else {
+                            for (u32 k = 0u; k < 5u; ++k) ps_imgs[k] = ps_imgs[k + 1u];
+                            ps_imgs[5] = w.pImageInfo->imageView;
+                        }
+                    }
+                }
+                if (img_count == 6u) {
+                    const u32 ssbo2_slot = static_cast<u32>(buffer_infos.size() - 1u);
+                    const u32 d1_dw = static_cast<u32>(push_data.buf_offsets[ssbo2_slot]) >> 2u;
+                    native_postfx->ExecuteHalfResSsgi(
+                        cb0_img, state.color_attachments[0].image_view,
+                        ps_imgs[0], ps_imgs[1], ps_imgs[2], ps_imgs[3], ps_imgs[5],
+                        buffer_infos[ssbo2_slot], d1_dw, proxy_img, proxy_w, proxy_h);
+                }
             }
-        }
-        if (s.native_postfx.load(std::memory_order_relaxed) &&
-            s.fire_heat_haze.load(std::memory_order_relaxed)) {
-            native_postfx->CaptureOpaqueHdr(texture_cache.GetImage(cb_descs[0].first));
+            if (s.native_postfx.load(std::memory_order_relaxed) &&
+                s.fire_heat_haze.load(std::memory_order_relaxed)) {
+                native_postfx->CaptureOpaqueHdr(cb0_img, proxy_img, proxy_w, proxy_h);
+            }
         }
     }
     }

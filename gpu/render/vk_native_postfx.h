@@ -39,15 +39,19 @@ public:
     /// Captures a half-res snapshot of the opaque HDR scene right after `ps_32e47788_atmos_fog`
     /// (before GXFfx fire sprites draw) so Heat Haze isolates 100% pure fire emission and NEVER
     /// triggers on wet cobblestone specular reflections.
-    void CaptureOpaqueHdr(VideoCore::Image& hdr_image);
+    /// When reduced-resolution upscaling is active, pass the active reduced proxy image & extent
+    /// (`proxy_img != VK_NULL_HANDLE`), while keeping `hdr_image` as the guest identity tag.
+    void CaptureOpaqueHdr(VideoCore::Image& hdr_image, vk::Image proxy_img = VK_NULL_HANDLE,
+                          u32 proxy_w = 0u, u32 proxy_h = 0u);
 
     /// Runs Half-Res L2-resident 16-tap HBIL SSGI + Full-Res depth-aware bilateral upsample
-    /// directly onto `hdr_image` right after `ps_32e47788_atmos_fog` (~4x faster & -35..45W vs full-res).
+    /// directly onto `hdr_image` (or its active reduced proxy) right after `ps_32e47788_atmos_fog`.
     void ExecuteHalfResSsgi(VideoCore::Image& hdr_image, vk::ImageView hdr_view,
                             vk::ImageView g0_view, vk::ImageView depth_view,
                             vk::ImageView g2_view, vk::ImageView diff_view,
                             vk::ImageView amb_view, const vk::DescriptorBufferInfo& ssbo2_info,
-                            u32 d1_dword_offset);
+                            u32 d1_dword_offset, vk::Image proxy_img = VK_NULL_HANDLE,
+                            u32 proxy_w = 0u, u32 proxy_h = 0u);
 
 private:
     bool EnsureInit();
