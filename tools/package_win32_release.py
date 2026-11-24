@@ -100,7 +100,7 @@ def main() -> None:
 
     # 1. Freeze preparation/updater helper (bin/bb-helper.exe) via PyInstaller
     #    During normal gameplay, native Bloodborne.exe runs solo with 0% Python in RAM!
-    run_checked([sys.executable, "-m", "pip", "install", "--upgrade", "pip", "pyinstaller", "pillow"], "PIP_PYINSTALLER")
+    run_checked([sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "pyinstaller", "pillow"], "PIP_PYINSTALLER")
 
     hidden_modules = [
         "argparse", "base64", "bisect", "collections", "contextlib", "glob", "hashlib", "json",
@@ -165,7 +165,8 @@ def main() -> None:
         f"-DWEBVIEW2_SDK_DIR={wv2_dir.as_posix()}",
     ], "CMAKE_LAUNCHER_V2")
     run_checked([
-        "cmake", "--build", str(launcher_build), "--config", "Release", "--target", "Launcher", "BloodborneStarter",
+        "cmake", "--build", str(launcher_build), "--config", "Release", "--parallel",
+        "--target", "Launcher", "BloodborneStarter",
     ], "BUILD_LAUNCHER_V2")
     built_launcher_exe = launcher_build / "Release" / "Launcher.exe"
     built_starter_exe = launcher_build / "Release" / "Bloodborne.exe"

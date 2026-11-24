@@ -25,7 +25,7 @@ jobs:
           sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
             -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" \
-            build-essential gcc-14 g++-14 clang cmake ninja-build pkg-config patchelf git \
+            build-essential gcc-14 g++-14 clang ccache cmake ninja-build pkg-config patchelf git \
             libvulkan-dev glslang-tools spirv-tools \
             libfmt-dev libboost-dev robin-map-dev libxxhash-dev zlib1g-dev \
             libavformat-dev libavcodec-dev libswscale-dev libswresample-dev libavutil-dev \
@@ -83,15 +83,32 @@ jobs:
           ninja -C /tmp/bb-deps-src/sdl3/build install
           rm -rf /tmp/bb-deps-src
 
+      - name: Cache Linux Compiler Objects (ccache)
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: linux-ccache-v1-${{ github.sha }}
+          restore-keys: |
+            linux-ccache-v1-
+
       - name: Build Portable Linux x86-64-v3 Engine, GPU, Runtime & Launcher
         run: |
           export PKG_CONFIG_PATH="/opt/bb-deps/lib/pkgconfig:/opt/bb-deps/lib/x86_64-linux-gnu/pkgconfig:${PKG_CONFIG_PATH:-}"
           export CMAKE_PREFIX_PATH="/opt/bb-deps:${CMAKE_PREFIX_PATH:-}"
           export LD_LIBRARY_PATH="/opt/bb-deps/lib:/opt/bb-deps/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-}"
+          export CCACHE_DIR="$HOME/.ccache"
+          export CCACHE_BASEDIR="$PWD"
+          export CCACHE_NOHASHDIR=1
+          export CCACHE_COMPRESS=1
+          export CCACHE_COMPRESSLEVEL=6
+          export CCACHE_MAXSIZE=2G
+          export CCACHE_SLOPPINESS="pch_defines,time_macros,include_file_mtime,include_file_ctime"
+          ccache --zero-stats
 
           # 1. Native C++20 Dantelion2 GX Engine archive (x86-64-v3, no AVX-512)
           cmake -S dantelion_gx -B dantelion_gx/build -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=clang++
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
           ninja -C dantelion_gx/build bb_gx_engine_native
 
           # 2. Portable libbbgpu.so + libbbnet20.so (x86-64-v3, no AVX-512, gcc-14/g++-14)
@@ -101,6 +118,7 @@ jobs:
           cmake -S gpu -B build_gpu -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_COMPILER=gcc-14 -DCMAKE_CXX_COMPILER=g++-14 \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DCMAKE_PREFIX_PATH="/opt/bb-deps" \
             -DCMAKE_SHARED_LINKER_FLAGS="-L/opt/bb-deps/lib -L/opt/bb-deps/lib/x86_64-linux-gnu" \
             -DVulkan_INCLUDE_DIR="/opt/bb-deps/include" \
@@ -120,7 +138,7 @@ jobs:
           rm -rf out/atrac9 out/libatrac9.a
           mkdir -p out/atrac9
           for src in third_party/LibAtrac9/C/src/*.c; do
-            gcc-14 -std=c99 -O2 -march=x86-64-v3 -mtune=generic -mno-avx512f -g -w -c "$src" \
+            ccache gcc-14 -std=c99 -O2 -march=x86-64-v3 -mtune=generic -mno-avx512f -g -w -c "$src" \
               -o "out/atrac9/$(basename "${src%.c}").o"
           done
           ar rcs out/libatrac9.a out/atrac9/*.o
@@ -137,10 +155,12 @@ jobs:
 
           # 4. Portable C++20 WebView Launcher (baseline x86-64)
           cmake -S launcher_v2 -B launcher_v2/build_ci -G Ninja -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_C_COMPILER=gcc-14 -DCMAKE_CXX_COMPILER=g++-14
+            -DCMAKE_C_COMPILER=gcc-14 -DCMAKE_CXX_COMPILER=g++-14 \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
           ninja -C launcher_v2/build_ci
           cp -f launcher_v2/build_ci/bb-launcher out/bb-launcher
           chmod +x out/bb-launcher out/bb-vulkan out/bb-gpu-capabilities play.sh launcher.sh run.sh
+          ccache --show-stats
 
           # 5. Bundle non-system .so deps & enforce ZERO x86-64-v4 / ZERO zmm / PT_TLS <= 0x124e8
           python3 tools/bundle_linux_deps.py
@@ -201,13 +221,14 @@ jobs:
         with:
           msystem: CLANG64
           release: false
-          cache: false
+          cache: true
           update: true
           install: >-
             git
             zip
             mingw-w64-clang-x86_64-clang
             mingw-w64-clang-x86_64-lld
+            mingw-w64-clang-x86_64-ccache
             mingw-w64-clang-x86_64-cmake
             mingw-w64-clang-x86_64-ninja
             mingw-w64-clang-x86_64-pkgconf
@@ -231,47 +252,51 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Cache Windows GPU Build (build_win32_gpu)
+      - name: Cache Windows Compiler Objects (ccache)
         uses: actions/cache@v4
         with:
-          path: build_win32_gpu
-          key: win32-gpu-build-v118-${{ hashFiles('gpu/CMakeLists.txt', 'src/**', 'dantelion_gx/build_win32/libbb_gx_engine_native.a', 'gpu/shim/**', 'gpu/games/**', 'gpu/platform/**', 'gpu/render/**', 'gpu/buffers/**', 'gpu/cp/**', 'gpu/vulkan/**', 'gpu/shader/**') }}
+          path: .ccache_win32
+          key: win32-ccache-v1-${{ github.sha }}
           restore-keys: |
-            win32-gpu-build-v118-
-            win32-gpu-build-v116-
-            win32-gpu-build-v115-
+            win32-ccache-v1-
+
+      - name: Cache Windows WebView2 SDK & Pip Wheels
+        uses: actions/cache@v4
+        with:
+          path: |
+            dist_win/webview2_sdk
+            ~/AppData/Local/pip/Cache
+          key: win32-packdeps-v1-py312-wv2-1.0.2903.40
 
       - name: Build Windows x86_64 Bloodborne.exe & bb-gpu-capabilities.exe
         run: |
           echo "MSYS2_CLANG64_BIN=$(cygpath -w /clang64/bin)" >> "$GITHUB_ENV"
           cmd //c "if not exist D:\\a\\_temp\\msys64 mklink /J D:\\a\\_temp\\msys64 C:\\msys64" || true
+          export CCACHE_DIR="$(cygpath -m "$PWD/.ccache_win32")"
+          export CCACHE_BASEDIR="$(cygpath -m "$PWD")"
+          export CCACHE_NOHASHDIR=1
+          export CCACHE_COMPRESS=1
+          export CCACHE_COMPRESSLEVEL=6
+          export CCACHE_MAXSIZE=2G
+          export CCACHE_SLOPPINESS="pch_defines,time_macros,include_file_mtime,include_file_ctime"
+          ccache --zero-stats
+
           if [ ! -f dantelion_gx/build_win32/libbb_gx_engine_native.a ]; then
             python3 tools/build_gx_win32_coff.py
           fi
-          if [ -f build_win32_gpu/build.ninja ] && ! grep -q "our_cpp_100000_source" build_win32_gpu/build.ninja; then
-            find build_win32_gpu -type f \( -name "*.obj" -o -name "*.a" \) -exec touch {} +
-            touch gpu/CMakeLists.txt dantelion_gx/build_win32/libbb_gx_engine_native.a
-            rm -f build_win32_gpu/include/bbgpu/shaders/*.h build_win32_gpu/include/bbgpu/shaders/*.spv
-            find build_win32_gpu/CMakeFiles/bb-probe.dir -name "*.obj" -delete || true
-            find build_win32_gpu/CMakeFiles/bbgpu.dir/shader -name "*.obj" -delete || true
-            find build_win32_gpu/CMakeFiles/bbgpu.dir/common -name "*.obj" -delete || true
-            rm -f build_win32_gpu/CMakeFiles/bbgpu.dir/shim/*.obj build_win32_gpu/CMakeFiles/bbgpu.dir/games/*.obj build_win32_gpu/CMakeFiles/bbgpu.dir/gcn/*.obj build_win32_gpu/CMakeFiles/bbgpu.dir/textures/*.obj build_win32_gpu/CMakeFiles/bbgpu.dir/platform/gnm/*.obj build_win32_gpu/CMakeFiles/bbgpu.dir/platform/win32/*.obj build_win32_gpu/CMakeFiles/bbgpu.dir/platform/avplayer/*.obj build_win32_gpu/CMakeFiles/bbgpu.dir/platform/videoout/*.obj build_win32_gpu/CMakeFiles/bbgpu.dir/buffers/*.obj build_win32_gpu/CMakeFiles/bbgpu.dir/render/*.obj build_win32_gpu/CMakeFiles/bbgpu.dir/cp/*.obj build_win32_gpu/CMakeFiles/bbgpu.dir/vulkan/*.obj build_win32_gpu/CMakeFiles/bbgpu.dir/upscale/*.obj build_win32_gpu/libbbgpu.a build_win32_gpu/bb-probe.exe build_win32_gpu/Bloodborne.exe build_win32_gpu/libbbgpu.dll build_win32_gpu/bb-gpu-capabilities.exe
-            if ! grep -q "Bloodborne.exe" build_win32_gpu/build.ninja; then
-              cmake -S gpu -B build_win32_gpu -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBB_LTO=OFF -DBB_PGO=off -DBB_NET=OFF > cmake_win32.log 2>&1
-            fi
-          else
-            rm -rf build_win32_gpu
-            if ! cmake -S gpu -B build_win32_gpu -G Ninja \
-              -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-              -DBB_LTO=OFF -DBB_PGO=off -DBB_NET=OFF > cmake_win32.log 2>&1; then
-              cat cmake_win32.log
-              grep -E "CMake Error|error:|not found|Could NOT" cmake_win32.log | head -n 15 | while IFS= read -r line; do
-                echo "::error::CMAKE: $line"
-              done
-              exit 1
-            fi
+          rm -rf build_win32_gpu
+          if ! cmake -S gpu -B build_win32_gpu -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DBB_LTO=OFF -DBB_PGO=off -DBB_NET=OFF > cmake_win32.log 2>&1; then
             cat cmake_win32.log
+            grep -E "CMake Error|error:|not found|Could NOT" cmake_win32.log | head -n 15 | while IFS= read -r line; do
+              echo "::error::CMAKE: $line"
+            done
+            exit 1
           fi
+          cat cmake_win32.log
           if ! ninja -C build_win32_gpu bb-probe > ninja_win32.log 2>&1; then
             tail -n 120 ninja_win32.log
             grep -E "error:|undefined symbol:|ld.lld: error:|FAILED:" ninja_win32.log | head -n 15 | while IFS= read -r line; do
@@ -279,10 +304,9 @@ jobs:
             done
             exit 1
           fi
-          if [ ! -f build_win32_gpu/bb-gpu-capabilities.exe ]; then
-            clang -std=c11 -O2 -Wall -Wextra -I/clang64/include tools/gpu_capabilities.c \
-              -L/clang64/lib -lvulkan-1 -lSDL3 -o build_win32_gpu/bb-gpu-capabilities.exe
-          fi
+          clang -std=c11 -O2 -Wall -Wextra -I/clang64/include tools/gpu_capabilities.c \
+            -L/clang64/lib -lvulkan-1 -lSDL3 -o build_win32_gpu/bb-gpu-capabilities.exe
+          ccache --show-stats
 
       - name: Build Unified Python Launcher, DLSS 4.5 Bridge & Package ZIP
         shell: pwsh
