@@ -455,7 +455,7 @@ def download_and_apply_update(
             progress_cb(max(0.0, min(1.0, frac)), msg)
 
     try:
-        report(0.01, "Checking latest GitHub release manifest…")
+        report(0.01, "Checking latest GitHub release manifest...")
         fresh = check_for_update(port_dir, is_windows=is_windows)
         if fresh.get("ok") and fresh.get("archive_sha256"):
             info = fresh
@@ -477,7 +477,7 @@ def download_and_apply_update(
         tmp_root.mkdir(parents=True, exist_ok=True)
         archive_path = tmp_root / archive_name
 
-        report(0.02, "Connecting to GitHub Releases…")
+        report(0.02, "Connecting to GitHub Releases...")
         req = urllib.request.Request(
             archive_url,
             headers={
@@ -509,12 +509,12 @@ def download_and_apply_update(
                 else:
                     report(0.40, f"Downloading: {dl_mb:.1f} MB ({speed_mb:.1f} MB/s)")
 
-        report(0.82, "Verifying SHA-256 checksum…")
+        report(0.82, "Verifying SHA-256 checksum...")
         actual_sha = hasher.hexdigest().lower()
         if actual_sha != expected_sha:
             # A hotfix or new release may have finished publishing mid-download; re-fetch
             # the manifest once over HTTPS and accept only if the fresh SHA-256 matches 1:1.
-            report(0.84, "Re-checking release manifest…")
+            report(0.84, "Re-checking release manifest...")
             recheck = check_for_update(port_dir, is_windows=is_windows)
             if recheck.get("ok") and str(recheck.get("archive_sha256") or "").lower() == actual_sha:
                 info = recheck
@@ -526,12 +526,12 @@ def download_and_apply_update(
                     "ok": False,
                     "latest_info": recheck if recheck.get("ok") else info,
                     "error": (
-                        f"SHA-256 mismatch ({tag_lbl})! Expected {expected_sha[:16]}…, "
-                        f"got {actual_sha[:16]}…. Update aborted safely."
+                        f"SHA-256 mismatch ({tag_lbl})! Expected {expected_sha[:16]}..., "
+                        f"got {actual_sha[:16]}.... Update aborted safely."
                     ),
                 }
 
-        report(0.86, "Extracting verified package…")
+        report(0.86, "Extracting verified package...")
         extract_dir = tmp_root / "extracted"
         extract_dir.mkdir(parents=True, exist_ok=True)
         if archive_name.endswith(".zip"):
@@ -568,7 +568,7 @@ def download_and_apply_update(
         )
 
         if is_windows:
-            report(0.96, "Applying update & restarting Launcher…")
+            report(0.96, "Applying update & restarting Launcher...")
             pid = os.getpid()
             ppid = os.getppid()
             wait_pids = [pid] + ([ppid] if ppid and ppid != pid else [])
@@ -612,10 +612,10 @@ def download_and_apply_update(
                 close_fds=True,
                 creationflags=flags,
             )
-            report(1.0, "Restarting…")
+            report(1.0, "Restarting...")
             return {"ok": True, "restarting_external": True, "latest_info": info}
 
-        report(0.94, "Installing files atomically…")
+        report(0.94, "Installing files atomically...")
         exec_names = {
             "play.sh",
             "launcher.sh",
@@ -702,6 +702,13 @@ def write_build_manifest(
 
 
 if __name__ == "__main__":
+    for _stream in (sys.stdout, sys.stderr):
+        if _stream is not None and hasattr(_stream, "reconfigure"):
+            try:
+                _stream.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
     import argparse
 
     parser = argparse.ArgumentParser(description="Build manifest & SHA-256 updater helper")

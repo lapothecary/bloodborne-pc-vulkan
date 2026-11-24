@@ -711,6 +711,12 @@ NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 
 if __name__ == '__main__':
     if len(sys.argv) >= 3 and sys.argv[1] == '--run-script':
+        for _stream in (sys.stdout, sys.stderr):
+            if _stream is not None and hasattr(_stream, 'reconfigure'):
+                try:
+                    _stream.reconfigure(encoding='utf-8', errors='replace')
+                except Exception:
+                    pass
         target_script = sys.argv[2]
         sys.argv = sys.argv[2:]
         runpy.run_path(target_script, run_name='__main__')
