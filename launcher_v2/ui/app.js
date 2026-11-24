@@ -42,6 +42,7 @@
       bgm_sub: "Decoded locally from your sprj_smain.fsb (Hunter's Dream / Omen)",
       bgm_track_dream: "Hunter's Dream",
       bgm_track_omen: "Omen (Main Theme)",
+      lang_title: "Language",
       folders_title: "Quick Folders",
       folders_sub: "Open save data, crash logs, or change your game folder",
       btn_saves: "Saves",
@@ -101,6 +102,7 @@
       bgm_sub: "Декодируется локально из sprj_smain.fsb (Сон Охотника / Omen)",
       bgm_track_dream: "Сон Охотника",
       bgm_track_omen: "Omen (Главная тема)",
+      lang_title: "Язык",
       folders_title: "Служебные папки",
       folders_sub: "Быстрый доступ к сохранениям, логам крашей и папке игры",
       btn_saves: "Сейвы",
@@ -501,6 +503,9 @@
     });
     document.querySelectorAll("[data-i18n-title]").forEach((el) => {
       el.title = tr(el.dataset.i18nTitle);
+    });
+    document.querySelectorAll("[data-i18n-aria]").forEach((el) => {
+      el.setAttribute("aria-label", tr(el.dataset.i18nAria));
     });
     document.getElementById("btn-lang").textContent = state.lang.toUpperCase();
     if (lastUpdateInfo) {

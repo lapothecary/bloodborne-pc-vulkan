@@ -34,26 +34,38 @@
 
       <!-- Slim Left Navigation Rail (Hunter's Mark IS the Home button — zero duplicate) -->
       <aside class="rail">
-        <button class="rail-brand rail-btn active" data-tab="home" data-i18n-title="nav_home">
-          <img src="../../launcher/bloodborne.png" alt="Hunter's Mark" class="brand-icon" />
-        </button>
+        <div class="rail-item rail-brand-item">
+          <button class="rail-brand rail-btn active" data-tab="home" data-i18n-aria="nav_home" aria-label="Home">
+            <img src="../../launcher/bloodborne.png" alt="Hunter's Mark" class="brand-icon" />
+          </button>
+          <div class="rail-tooltip" role="tooltip" data-i18n="nav_home">Home</div>
+        </div>
 
         <div class="rail-sep"></div>
 
         <nav class="rail-nav" aria-label="Primary">
-          <button class="rail-btn" data-tab="mods" data-i18n-title="nav_mods">
-            <svg viewBox="0 0 24 24" class="ico"><path d="M4 7l8-4 8 4-8 4-8-4zm0 5l8 4 8-4m-16 5l8 4 8-4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>
-          </button>
-          <button class="rail-btn" data-tab="online" data-i18n-title="nav_online">
-            <svg viewBox="0 0 24 24" class="ico"><circle cx="12" cy="12" r="8.5" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M3.8 12h16.4M12 3.5c2.6 2.5 2.6 14.5 0 17M12 3.5c-2.6 2.5-2.6 14.5 0 17" fill="none" stroke="currentColor" stroke-width="1.4"/></svg>
-          </button>
-          <button class="rail-btn" data-tab="system" data-i18n-title="nav_system">
-            <svg viewBox="0 0 24 24" class="ico"><circle cx="12" cy="12" r="3.2" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M12 3v2.5M12 18.5V21M3 12h2.5M18.5 12H21M5.6 5.6l1.8 1.8M16.6 16.6l1.8 1.8M18.4 5.6l-1.8 1.8M7.4 16.6l-1.8 1.8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
-          </button>
+          <div class="rail-item">
+            <button class="rail-btn" data-tab="mods" data-i18n-aria="nav_mods" aria-label="Mods &amp; Patches">
+              <svg viewBox="0 0 24 24" class="ico"><path d="M4 7l8-4 8 4-8 4-8-4zm0 5l8 4 8-4m-16 5l8 4 8-4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>
+            </button>
+            <div class="rail-tooltip" role="tooltip" data-i18n="nav_mods">Mods &amp; Patches</div>
+          </div>
+          <div class="rail-item">
+            <button class="rail-btn" data-tab="online" data-i18n-aria="nav_online" aria-label="Online">
+              <svg viewBox="0 0 24 24" class="ico"><circle cx="12" cy="12" r="8.5" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M3.8 12h16.4M12 3.5c2.6 2.5 2.6 14.5 0 17M12 3.5c-2.6 2.5-2.6 14.5 0 17" fill="none" stroke="currentColor" stroke-width="1.4"/></svg>
+            </button>
+            <div class="rail-tooltip" role="tooltip" data-i18n="nav_online">Online</div>
+          </div>
+          <div class="rail-item">
+            <button class="rail-btn" data-tab="system" data-i18n-aria="nav_system" aria-label="System, Cache &amp; Files">
+              <svg viewBox="0 0 24 24" class="ico"><circle cx="12" cy="12" r="3.2" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M12 3v2.5M12 18.5V21M3 12h2.5M18.5 12H21M5.6 5.6l1.8 1.8M16.6 16.6l1.8 1.8M18.4 5.6l-1.8 1.8M7.4 16.6l-1.8 1.8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+            </button>
+            <div class="rail-tooltip" role="tooltip" data-i18n="nav_system">System, Cache &amp; Files</div>
+          </div>
         </nav>
 
         <div class="rail-footer">
-          <div class="rail-update-wrap">
+          <div class="rail-item rail-update-wrap">
             <button id="btn-rail-update" class="rail-mini rail-update checking" aria-label="Check Updates">
               <svg viewBox="0 0 24 24" class="upd-ico upd-ico-sync" aria-hidden="true">
                 <path d="M20 12a8 8 0 0 1-13.66 5.66M4 12a8 8 0 0 1 13.66-5.66" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
@@ -65,10 +77,19 @@
             </button>
             <div id="rail-update-tip" class="rail-tooltip" role="tooltip">Checking for updates...</div>
           </div>
-          <button id="btn-bgm" class="rail-mini" data-i18n-title="bgm_title" title="Ambient Music">♫</button>
-          <button id="btn-sfx" class="rail-mini" data-i18n-title="sfx_title" title="Menu SFX">♪</button>
-          <button id="btn-lang" class="rail-mini" title="Language">EN</button>
-          <span id="ver-badge" class="rail-ver">v1.2.2</span>
+          <div class="rail-item">
+            <button id="btn-bgm" class="rail-mini" data-i18n-aria="bgm_title" aria-label="Launcher Ambient Music">♫</button>
+            <div class="rail-tooltip" role="tooltip" data-i18n="bgm_title">Launcher Ambient Music</div>
+          </div>
+          <div class="rail-item">
+            <button id="btn-sfx" class="rail-mini" data-i18n-aria="sfx_title" aria-label="Bloodborne Menu SFX">♪</button>
+            <div class="rail-tooltip" role="tooltip" data-i18n="sfx_title">Bloodborne Menu SFX</div>
+          </div>
+          <div class="rail-item">
+            <button id="btn-lang" class="rail-mini" data-i18n-aria="lang_title" aria-label="Language">EN</button>
+            <div class="rail-tooltip" role="tooltip" data-i18n="lang_title">Language</div>
+          </div>
+          <span id="ver-badge" class="rail-ver">v1.2.3</span>
         </div>
       </aside>
 
