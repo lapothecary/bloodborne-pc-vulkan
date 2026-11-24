@@ -956,8 +956,12 @@ bool NativePostFx::EnsureInit() {
 }
 
 bool NativePostFx::EnsureBloomPyramid(u32 hdr_w, u32 hdr_h) {
-    const u32 base_w = std::max(hdr_w / 2u, 16u);
-    const u32 base_h = std::max(hdr_h / 2u, 16u);
+    // Quarter-res base at >=1080p (480x270 @ 1080p matches PS4 Yebis2, 640x360 @ 1440p, 960x540 @ 4K):
+    // 13-tap bilinear Jimenez downsample cleanly covers all 16 source pixels per 4x4 block with zero
+    // aliasing while keeping mip 0 L2-resident (~1.8 MB @ 1440p) and 4x lighter on mid-range GPUs.
+    const u32 div = (hdr_w > 1280u || hdr_h > 720u) ? 4u : 2u;
+    const u32 base_w = std::max(hdr_w / div, 16u);
+    const u32 base_h = std::max(hdr_h / div, 16u);
     if (bloom_pyramid && bloom_base_w == base_w && bloom_base_h == base_h) {
         return true;
     }
@@ -1077,8 +1081,8 @@ void NativePostFx::CaptureOpaqueHdr(VideoCore::Image& hdr_image, vk::Image proxy
                 .subresourceRange = one_range,
             };
             const vk::ImageMemoryBarrier2 to_dst{
-                .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-                .srcAccessMask = vk::AccessFlagBits2::eShaderRead,
+                .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+                .srcAccessMask = vk::AccessFlagBits2::eNone,
                 .dstStageMask = vk::PipelineStageFlagBits2::eBlit,
                 .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
                 .oldLayout = vk::ImageLayout::eUndefined,
@@ -1091,8 +1095,8 @@ void NativePostFx::CaptureOpaqueHdr(VideoCore::Image& hdr_image, vk::Image proxy
                 {.imageMemoryBarrierCount = u32(pre.size()), .pImageMemoryBarriers = pre.data()});
         } else {
             const vk::ImageMemoryBarrier2 to_dst{
-                .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-                .srcAccessMask = vk::AccessFlagBits2::eShaderRead,
+                .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+                .srcAccessMask = vk::AccessFlagBits2::eNone,
                 .dstStageMask = vk::PipelineStageFlagBits2::eBlit,
                 .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
                 .oldLayout = vk::ImageLayout::eUndefined,
@@ -1325,24 +1329,25 @@ void NativePostFx::ExecuteHalfResSsgi(VideoCore::Image& hdr_image, vk::ImageView
     scheduler.Record([=](vk::CommandBuffer cmdbuf) {
         const vk::ImageSubresourceRange one_range{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
         const std::array<vk::ImageMemoryBarrier2, 3> to_gen{{
-            {.srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-             .srcAccessMask = vk::AccessFlagBits2::eShaderRead,
+            {.srcStageMask = vk::PipelineStageFlagBits2::eComputeShader |
+                             vk::PipelineStageFlagBits2::eFragmentShader,
+             .srcAccessMask = vk::AccessFlagBits2::eNone,
              .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
              .dstAccessMask = vk::AccessFlagBits2::eShaderWrite,
              .oldLayout = vk::ImageLayout::eUndefined,
              .newLayout = vk::ImageLayout::eGeneral,
              .image = m0_img,
              .subresourceRange = one_range},
-            {.srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-             .srcAccessMask = vk::AccessFlagBits2::eShaderRead,
+            {.srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+             .srcAccessMask = vk::AccessFlagBits2::eNone,
              .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
              .dstAccessMask = vk::AccessFlagBits2::eShaderWrite,
              .oldLayout = vk::ImageLayout::eUndefined,
              .newLayout = vk::ImageLayout::eGeneral,
              .image = m1_img,
              .subresourceRange = one_range},
-            {.srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-             .srcAccessMask = vk::AccessFlagBits2::eShaderRead,
+            {.srcStageMask = vk::PipelineStageFlagBits2::eFragmentShader,
+             .srcAccessMask = vk::AccessFlagBits2::eNone,
              .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
              .dstAccessMask = vk::AccessFlagBits2::eShaderWrite,
              .oldLayout = vk::ImageLayout::eUndefined,
@@ -2283,16 +2288,16 @@ bool NativePostFx::Execute(const BbCp::DirectVk::NativePostProcessArgs& args,
         scheduler.Record([=](vk::CommandBuffer cmdbuf) {
             const vk::ImageSubresourceRange one_range{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
             const std::array<vk::ImageMemoryBarrier2, 2> vel_to_write{{
-                {.srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-                 .srcAccessMask = vk::AccessFlagBits2::eShaderRead,
+                {.srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+                 .srcAccessMask = vk::AccessFlagBits2::eNone,
                  .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
                  .dstAccessMask = vk::AccessFlagBits2::eShaderWrite,
                  .oldLayout = vk::ImageLayout::eUndefined,
                  .newLayout = vk::ImageLayout::eGeneral,
                  .image = mb_v_img,
                  .subresourceRange = one_range},
-                {.srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-                 .srcAccessMask = vk::AccessFlagBits2::eShaderRead,
+                {.srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+                 .srcAccessMask = vk::AccessFlagBits2::eNone,
                  .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
                  .dstAccessMask = vk::AccessFlagBits2::eShaderWrite,
                  .oldLayout = vk::ImageLayout::eUndefined,
@@ -2380,8 +2385,9 @@ bool NativePostFx::Execute(const BbCp::DirectVk::NativePostProcessArgs& args,
                  .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
                  .image = mb_tm_img,
                  .subresourceRange = one_range},
-                {.srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-                 .srcAccessMask = vk::AccessFlagBits2::eShaderRead,
+                {.srcStageMask = vk::PipelineStageFlagBits2::eComputeShader |
+                                 vk::PipelineStageFlagBits2::eFragmentShader,
+                 .srcAccessMask = vk::AccessFlagBits2::eNone,
                  .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
                  .dstAccessMask = vk::AccessFlagBits2::eShaderWrite,
                  .oldLayout = vk::ImageLayout::eUndefined,
@@ -2490,8 +2496,8 @@ bool NativePostFx::Execute(const BbCp::DirectVk::NativePostProcessArgs& args,
 
             // 0b-1: Half-res CoC + Karis-weighted HDR pre-filter.
             const vk::ImageMemoryBarrier2 coc_to_write{
-                .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-                .srcAccessMask = vk::AccessFlagBits2::eShaderRead,
+                .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+                .srcAccessMask = vk::AccessFlagBits2::eNone,
                 .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
                 .dstAccessMask = vk::AccessFlagBits2::eShaderWrite,
                 .oldLayout = vk::ImageLayout::eUndefined,
@@ -2543,8 +2549,8 @@ bool NativePostFx::Execute(const BbCp::DirectVk::NativePostProcessArgs& args,
                  .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
                  .image = d_coc_img,
                  .subresourceRange = one_range},
-                {.srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-                 .srcAccessMask = vk::AccessFlagBits2::eShaderRead,
+                {.srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+                 .srcAccessMask = vk::AccessFlagBits2::eNone,
                  .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
                  .dstAccessMask = vk::AccessFlagBits2::eShaderWrite,
                  .oldLayout = vk::ImageLayout::eUndefined,
@@ -2595,8 +2601,9 @@ bool NativePostFx::Execute(const BbCp::DirectVk::NativePostProcessArgs& args,
                  .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
                  .image = d_bok_img,
                  .subresourceRange = one_range},
-                {.srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-                 .srcAccessMask = vk::AccessFlagBits2::eShaderRead,
+                {.srcStageMask = vk::PipelineStageFlagBits2::eComputeShader |
+                                 vk::PipelineStageFlagBits2::eFragmentShader,
+                 .srcAccessMask = vk::AccessFlagBits2::eNone,
                  .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
                  .dstAccessMask = vk::AccessFlagBits2::eShaderWrite,
                  .oldLayout = vk::ImageLayout::eUndefined,
@@ -2934,8 +2941,9 @@ bool NativePostFx::Execute(const BbCp::DirectVk::NativePostProcessArgs& args,
 
             // Transition all 5 bloom mips to eGeneral in ONE single batched barrier.
             const vk::ImageMemoryBarrier2 all_mips_to_storage{
-                .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-                .srcAccessMask = vk::AccessFlagBits2::eShaderRead,
+                .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader |
+                                vk::PipelineStageFlagBits2::eFragmentShader,
+                .srcAccessMask = vk::AccessFlagBits2::eNone,
                 .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
                 .dstAccessMask = vk::AccessFlagBits2::eShaderWrite,
                 .oldLayout = vk::ImageLayout::eUndefined,
@@ -3018,7 +3026,12 @@ bool NativePostFx::Execute(const BbCp::DirectVk::NativePostProcessArgs& args,
                     .remap_factor = bloom_remap,
                     .flags = ((mip == 0u) ? 1u : 0u) | (auto_exp_on ? 2u : 0u) |
                              ((mip == 0u && use_opaque_diff) ? 4u : 0u) |
-                             ((mip == 0u && fused_hist) ? 8u : 0u),
+                             ((mip == 0u && fused_hist) ? 8u : 0u) |
+                             ((mip == 0u && fused_hist &&
+                               (post_aa_extent.width / std::max(dst_ext.width, 1u)) >= 3u)
+                                  ? 16u
+                                  : 0u) |
+                             ((mip == 0u && post_scene_view == raw_hdr_view) ? 32u : 0u),
                     .min_log_lum = hist_pc.min_log_lum,
                     .inv_log_lum_range = hist_pc.inv_log_lum_range,
                     .meter_min_x = hist_pc.meter_min_x,
@@ -3111,7 +3124,8 @@ bool NativePostFx::Execute(const BbCp::DirectVk::NativePostProcessArgs& args,
                      .descriptorType = vk::DescriptorType::eStorageImage,
                      .pImageInfo = &dst_info},
                 }};
-                const float rad_y = 0.0022f * bloom_rad_scale * float(1u << umip);
+                const float lower_inv_h = 1.0f / float(std::max(b_extents[umip + 1u].height, 1u));
+                const float rad_y = lower_inv_h * 0.85f * bloom_rad_scale;
                 const float rad_x = rad_y / aspect;
                 const BloomUpPush bu_pc{
                     .dst_w = dst_ext.width,
@@ -3249,10 +3263,12 @@ bool NativePostFx::Execute(const BbCp::DirectVk::NativePostProcessArgs& args,
                 .srcAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
                 .dstStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput |
                                 vk::PipelineStageFlagBits2::eFragmentShader |
-                                vk::PipelineStageFlagBits2::eAllCommands,
+                                vk::PipelineStageFlagBits2::eComputeShader |
+                                vk::PipelineStageFlagBits2::eTransfer,
                 .dstAccessMask = vk::AccessFlagBits2::eColorAttachmentRead |
                                  vk::AccessFlagBits2::eColorAttachmentWrite |
-                                 vk::AccessFlagBits2::eShaderRead,
+                                 vk::AccessFlagBits2::eShaderRead |
+                                 vk::AccessFlagBits2::eTransferRead,
                 .oldLayout = vk::ImageLayout::eColorAttachmentOptimal,
                 .newLayout = vk::ImageLayout::eGeneral,
                 .image = final_out_ui_img,

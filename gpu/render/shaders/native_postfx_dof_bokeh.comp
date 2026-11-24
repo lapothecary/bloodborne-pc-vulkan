@@ -54,7 +54,9 @@ void main() {
         return;
     }
 
-    const int kTaps = 24;
+    // Adaptive Vogel-disk tap count: subtle midground blur uses 12-16 taps (silky smooth with IGN),
+    // while strong far/near bokeh keeps the full 24-tap optical disk.
+    const int kTaps = (gather_r < 0.0022) ? 12 : ((gather_r < 0.0045) ? 16 : 24);
     const float kGoldenAngle = 2.39996323;
     // Static spatial IGN (no frame_index rotation): since DoF runs AFTER DLSS/FSR/TAA,
     // per-frame angle rotation would flicker on static blurred backgrounds; spatial IGN

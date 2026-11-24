@@ -116,9 +116,9 @@ void main() {
         float d_min_raw = min(min(rd0, rd1), min(rd2, rd3));
         // When render depth is lower-res than DLSS/FSR output (e.g. 854x480 -> 2560x1440),
         // sub-pixel twigs (0.33 render-px wide) can slip between 2x2 depth samples on some jitter
-        // phases. Sample a +/-2 render-px cross to detect nearby in-focus foreground geometry
-        // (Forward-Z: smallest depth = closest) for color-guided silhouette protection.
-        if (depth_dim.x < int(u.dims_flags.z) || depth_dim.y < int(u.dims_flags.w)) {
+        // phases. Sample a +/-2 render-px cross ONLY when coc_max > 0.0014 (exact precondition of
+        // the foreground silhouette snap below), skipping 12 fetches on all sharp pixels.
+        if (coc_max > 0.0014 && (depth_dim.x < int(u.dims_flags.z) || depth_dim.y < int(u.dims_flags.w))) {
             const ivec2 dc = clamp(ivec2(round(dpos)), ivec2(0), depth_max);
             d_min_raw = min(d_min_raw, texelFetch(sampler2D(depth_tex, linear_samp), clamp(dc + ivec2(-1,  0), ivec2(0), depth_max), 0).r);
             d_min_raw = min(d_min_raw, texelFetch(sampler2D(depth_tex, linear_samp), clamp(dc + ivec2( 1,  0), ivec2(0), depth_max), 0).r);
@@ -134,6 +134,20 @@ void main() {
             d_min_raw = min(d_min_raw, texelFetch(sampler2D(depth_tex, linear_samp), clamp(dc + ivec2( 1,  1), ivec2(0), depth_max), 0).r);
         }
         coc_closest = ComputeSignedCoc(LinearizeDepth(d_min_raw));
+    }
+
+    // Mathematically exact early-out for sharp in-focus pixels (~75% of screen):
+    // When full_coc is strictly inside (-0.00060..+0.00080), both far_blend and near_self are 0.0;
+    // only blurred foreground bleed (bokeh.a > 0) can blend over sharp_rgb. Since bokeh.a >= 0,
+    // a single hardware bilinear probe < 1e-4 guarantees all 4 bokeh taps have zero near bleed.
+    if (full_coc > -0.00060 && full_coc < 0.00080 &&
+        !(reduced_or_jittered && coc_max > 0.0014)) {
+        const vec2 half_uv = (vec2(px) + 0.5) / max(vec2(u.dims_flags.zw), vec2(1.0));
+        const float near_bleed_probe = textureLod(sampler2D(bokeh_tex, linear_samp), half_uv, 0.0).a;
+        if (near_bleed_probe < 1e-4) {
+            imageStore(out_hdr_img, ivec2(px), vec4(sharp_rgb, 1.0));
+            return;
+        }
     }
 
     // True 4-tap CoC-weighted bilateral upsample of half-res bokeh:

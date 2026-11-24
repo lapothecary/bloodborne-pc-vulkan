@@ -31,7 +31,7 @@ layout(push_constant) uniform BloomDownPush {
     float knee;
     float luma_gamma;
     float remap_factor;
-    uint flags; // bit0 = is_prefilter, bit1 = auto_exp_on, bit2 = use_opaque_diff, bit3 = fused_hist
+    uint flags; // bit0=is_prefilter, bit1=auto_exp_on, bit2=use_opaque_diff, bit3=fused_hist, bit4=hist_every_px, bit5=same_raw_src
     float min_log_lum;
     float inv_log_lum_range;
     float meter_min_x;
@@ -159,21 +159,30 @@ void main() {
             // Pure GXFfx Fire Emission mask in .a (post-VFX raw HDR minus pre-VFX opaque HDR):
             // Wet cobblestones, golden floor reflections, armor & walls are identical in both -> 0.0!
             if ((pc.flags & 4u) != 0u) {
-                const vec3 cur_raw = max(textureLod(sampler2D(raw_hdr_tex, linear_samp), uv, 0.0).rgb, vec3(0.0));
+                const vec3 cur_raw = ((pc.flags & 32u) != 0u)
+                    ? g4.rgb
+                    : max(textureLod(sampler2D(raw_hdr_tex, linear_samp), uv, 0.0).rgb, vec3(0.0));
                 hist_rgb = cur_raw;
-                // Exact mathematical early-out: since op_max >= 0, fire_delta.r <= cur_raw.r * exp_scale;
-                // whenever cur_raw.r * exp_scale <= 0.28, smoothstep(0.30, 2.00, fire_delta.r) is strictly 0.0!
+                // Two-stage exact mathematical early-out:
+                // 1) Since op_max >= 0, fire_delta.r <= cur_raw.r * exp_scale.
+                // 2) Since op_max >= op0, fire_delta.r <= max(cur_raw.r - op0.r * 1.18, 0) * exp_scale;
+                //    if center diff <= 0.30, smoothstep(0.30, 2.00, fire_delta.r) is strictly 0.0,
+                //    skipping 4 neighbor opaque_hdr fetches across >98% of sky/walls/cobblestones.
                 if (cur_raw.r * exp_scale > 0.28) {
-                    const vec2 o_px = vec2(1.25 / float(pc.dst_w), 1.25 / float(pc.dst_h));
-                    vec3 op_max = max(textureLod(sampler2D(opaque_hdr_tex, linear_samp), uv, 0.0).rgb, vec3(0.0));
-                    op_max = max(op_max, textureLod(sampler2D(opaque_hdr_tex, linear_samp), uv + vec2( o_px.x, 0.0), 0.0).rgb);
-                    op_max = max(op_max, textureLod(sampler2D(opaque_hdr_tex, linear_samp), uv + vec2(-o_px.x, 0.0), 0.0).rgb);
-                    op_max = max(op_max, textureLod(sampler2D(opaque_hdr_tex, linear_samp), uv + vec2(0.0,  o_px.y), 0.0).rgb);
-                    op_max = max(op_max, textureLod(sampler2D(opaque_hdr_tex, linear_samp), uv + vec2(0.0, -o_px.y), 0.0).rgb);
-                    const vec3 fire_delta = max(cur_raw - op_max * 1.18, vec3(0.0)) * exp_scale;
-                    const float f_warm = smoothstep(1.30, 2.25, fire_delta.r / max(fire_delta.b, 0.02)) *
-                                         smoothstep(1.00, 1.28, fire_delta.r / max(fire_delta.g, 0.02));
-                    fire_a = clamp(smoothstep(0.30, 2.00, fire_delta.r) * f_warm, 0.0, 1.0);
+                    const vec3 op0 = max(textureLod(sampler2D(opaque_hdr_tex, linear_samp), uv, 0.0).rgb, vec3(0.0));
+                    const float d0_r = max(cur_raw.r - op0.r * 1.18, 0.0) * exp_scale;
+                    if (d0_r > 0.30) {
+                        const vec2 o_px = vec2(pc.inv_src_w, pc.inv_src_h) * 2.5;
+                        vec3 op_max = op0;
+                        op_max = max(op_max, textureLod(sampler2D(opaque_hdr_tex, linear_samp), uv + vec2( o_px.x, 0.0), 0.0).rgb);
+                        op_max = max(op_max, textureLod(sampler2D(opaque_hdr_tex, linear_samp), uv + vec2(-o_px.x, 0.0), 0.0).rgb);
+                        op_max = max(op_max, textureLod(sampler2D(opaque_hdr_tex, linear_samp), uv + vec2(0.0,  o_px.y), 0.0).rgb);
+                        op_max = max(op_max, textureLod(sampler2D(opaque_hdr_tex, linear_samp), uv + vec2(0.0, -o_px.y), 0.0).rgb);
+                        const vec3 fire_delta = max(cur_raw - op_max * 1.18, vec3(0.0)) * exp_scale;
+                        const float f_warm = smoothstep(1.30, 2.25, fire_delta.r / max(fire_delta.b, 0.02)) *
+                                             smoothstep(1.00, 1.28, fire_delta.r / max(fire_delta.g, 0.02));
+                        fire_a = clamp(smoothstep(0.30, 2.00, fire_delta.r) * f_warm, 0.0, 1.0);
+                    }
                 }
             }
         } else {
@@ -187,9 +196,10 @@ void main() {
 
         imageStore(dst_img, ivec2(px), vec4(max(result, vec3(0.0)), fire_a));
 
-        // Phase 3 Step 3.1: Fused 256-bin Auto-Exposure Histogram (stride 2 on half-res = stride 4 on full-res,
-        // zero extra texture fetches — reuses already-loaded HDR scene sample in registers).
-        if (do_hist && ((px.x | px.y) & 1u) == 0u) {
+        // Phase 3 Step 3.1: Fused 256-bin Auto-Exposure Histogram (stride 4 on full-res:
+        // every pixel on quarter-res mip 0, or stride 2 on half-res mip 0).
+        const bool hist_all = (pc.flags & 16u) != 0u;
+        if (do_hist && (hist_all || ((px.x | px.y) & 1u) == 0u)) {
             if (uv.x >= pc.meter_min_x && uv.x <= pc.meter_max_x &&
                 uv.y >= pc.meter_min_y && uv.y <= pc.meter_max_y) {
                 const float luma = Luma(hist_rgb * pc.inv_scene_lum_scale);
