@@ -514,6 +514,10 @@ public:
     bool HasUnsubmittedSignals();
     /// For a stall report: the signals waiting for the GPU, the ticks and the draw pipe.
     std::string DescribeSignals();
+    /// Active OS thread ID of async `bb:PsoPrewarm` (0 once prewarm finishes).
+    [[nodiscard]] u32 PrewarmTid() const noexcept {
+        return pipeline_cache.PrewarmTid();
+    }
     /// bbport BB_GUEST_IN_PLACE (draw recording thread): `data` written into the game's memory by the
     /// GPU in stream order, like the command processor's writes; false when the range is not
     /// bound in place (the caller writes it with the CPU).

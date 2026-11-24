@@ -16,6 +16,7 @@
 #include <mutex>
 #include <thread>
 #include <unordered_set>
+#include <unistd.h>
 
 #include "bb_golden_engine.h"
 #include "bbport_sections.h"
@@ -571,19 +572,26 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         (export_env && export_env[0] == '1');
     if (sync_prewarm) {
         WarmUp();
+        prewarm_phase.store(8u, std::memory_order_release);
         prewarm_done.store(true, std::memory_order_release);
         if (auto_bake) {
             StartBackgroundAutoBake();
         }
     } else {
-        // Overlap V4.2 disk/driver PSO prewarm (~0.82 s) with `eboot.bin` CPU/IO boot (~1.31 s):
-        // finishes ~0.50 s before the first Vulkan draw call while cutting boot-to-menu time!
+        // Overlap V4.2 disk/driver PSO prewarm (~0.4-0.8 s) with `eboot.bin` CPU/IO boot (~1.31 s):
+        // finishes before the first Vulkan draw call while cutting boot-to-menu time!
         prewarm_thread = std::thread([this, auto_bake]() {
             Common::SetCurrentThreadName("bb:PsoPrewarm");
+            prewarm_tid.store(u32(gettid()), std::memory_order_release);
             WarmUp();
             if (auto_bake && !prewarm_cancel.load(std::memory_order_acquire)) {
+                prewarm_phase.store(7u, std::memory_order_release);
+                prewarm_done_items.store(0u, std::memory_order_relaxed);
+                prewarm_total_items.store(0u, std::memory_order_relaxed);
                 StartBackgroundAutoBake();
             }
+            prewarm_tid.store(0u, std::memory_order_release);
+            prewarm_phase.store(8u, std::memory_order_release);
             prewarm_done.store(true, std::memory_order_release);
         });
     }

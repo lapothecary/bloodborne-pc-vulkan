@@ -108,6 +108,8 @@ void bb_win32_pin_present_core(void);
 void bb_win32_pin_gpu_domain(void);
 void bb_win32_pin_helper_domain(void);
 void bb_win32_apply_thread_topology(void);
+/// Captures up to 24 unwound stack frames of `tid` into `out` (module basenames + RVA, no PII).
+size_t bb_win32_format_thread_stack(unsigned tid, char* out, size_t cap);
 
 #ifndef _countof
 #define _countof(array) (sizeof(array) / sizeof((array)[0]))

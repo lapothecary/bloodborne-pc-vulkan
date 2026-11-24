@@ -46,6 +46,11 @@ public:
     void Load(BlobType type, const std::string& name, std::vector<u8>& data);
     void Load(BlobType type, const std::string& name, std::vector<u32>& data);
     void ForEachBlob(BlobType type, const std::function<void(std::vector<u8>&& data)>& func);
+    /// Single-pass directory scan collecting `.key` and `.meta` paths for parallel WarmUp().
+    void ListWarmUpFiles(std::vector<std::filesystem::path>& key_files,
+                         std::vector<std::filesystem::path>& meta_files) const;
+    /// Thread-safe raw file read for parallel WarmUp() workers.
+    static bool LoadFile(const std::filesystem::path& path, std::vector<u8>& data);
 
 private:
     struct Write {

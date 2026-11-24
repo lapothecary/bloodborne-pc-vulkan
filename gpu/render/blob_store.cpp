@@ -149,14 +149,45 @@ void BlobStore::ForEachBlob(BlobType type,
         if (entry.path().extension() != ext) {
             continue;
         }
-        using namespace Common::FS;
-        const IOFile file{entry.path(), FileAccessMode::Read};
-        if (file.IsOpen()) {
-            std::vector<u8> data(file.GetSize());
-            file.Read(data);
+        std::vector<u8> data;
+        if (LoadFile(entry.path(), data)) {
             func(std::move(data));
         }
     }
+}
+
+void BlobStore::ListWarmUpFiles(std::vector<std::filesystem::path>& key_files,
+                                std::vector<std::filesystem::path>& meta_files) const {
+    key_files.clear();
+    meta_files.clear();
+    if (!opened) {
+        return;
+    }
+    const std::string key_ext = Extension(BlobType::PipelineKey);
+    const std::string meta_ext = Extension(BlobType::ShaderMeta);
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator{dir, ec}) {
+        const auto ext = entry.path().extension();
+        if (ext == key_ext) {
+            key_files.push_back(entry.path());
+        } else if (ext == meta_ext) {
+            meta_files.push_back(entry.path());
+        }
+    }
+}
+
+bool BlobStore::LoadFile(const std::filesystem::path& path, std::vector<u8>& data) {
+    using namespace Common::FS;
+    const IOFile file{path, FileAccessMode::Read};
+    if (!file.IsOpen()) {
+        data.clear();
+        return false;
+    }
+    data.resize(file.GetSize());
+    if (!data.empty()) {
+        file.Read(data);
+    }
+    return true;
 }
 
 void BlobStore::Clear() {

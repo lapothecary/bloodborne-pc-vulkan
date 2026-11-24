@@ -134,6 +134,7 @@ std::string Rasterizer::DescribeSignals() {
                            front.tick, front.label, front.value, back.tick, back.label, back.value);
     }
     out += '\n';
+    out += pipeline_cache.DescribePrewarmStatus();
     return out;
 }
 

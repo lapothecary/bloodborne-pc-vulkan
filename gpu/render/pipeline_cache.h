@@ -249,6 +249,13 @@ public:
     /// Full-game multi-threaded shader & PSO pre-baker ("0% -> 100%" from dvdroot_ps4/shader/*.shaderbnd.dcx).
     int BakeAllGameShaders(const std::filesystem::path& game_dir);
 
+    /// Lock-free status line for stall diagnostics while async startup WarmUp() is still running.
+    std::string DescribePrewarmStatus() const;
+    /// OS thread ID of `bb:PsoPrewarm` while active (0 once prewarm finishes).
+    [[nodiscard]] u32 PrewarmTid() const noexcept {
+        return prewarm_tid.load(std::memory_order_acquire);
+    }
+
 private:
     bool RefreshGraphicsKey(PipelineSelection& sel);
     bool RefreshGraphicsStages(PipelineSelection& sel);
@@ -278,9 +285,6 @@ private:
     void NoteDriverPipelineCacheDirty();
     void SaveProfile();
     void DropPreloaded();
-    bool PreloadStage(Serialization::Archive& ar, const Shader::Info*& out_info,
-                      vk::ShaderModule& out_module, Shader::RuntimeInfo& out_runtime,
-                      std::optional<Shader::Gcn::FetchShaderData>& out_fetch);
 
     const Instance& instance;
     Scheduler& scheduler;
@@ -377,6 +381,11 @@ private:
     u32 last_driver_cache_save_sec = 0;
     std::atomic<bool> prewarm_done{false};
     std::atomic<bool> prewarm_cancel{false};
+    std::atomic<u32> prewarm_phase{0};
+    std::atomic<u32> prewarm_done_items{0};
+    std::atomic<u32> prewarm_total_items{0};
+    std::atomic<u32> prewarm_tid{0};
+    std::atomic<u64> prewarm_start_ns{0};
     std::mutex prewarm_join_mutex;
     std::thread prewarm_thread;
     std::unique_ptr<PipelineCompiler> compiler; ///< last: its threads are joined first

@@ -48,7 +48,11 @@ bool ShouldLog(Level level) {
 void Write(std::string_view log_class, Level level, const char* file, int line,
            std::string&& message) {
     static std::mutex mutex;
-    const char* slash = std::strrchr(file, '/');
+    const char* slash_fwd = std::strrchr(file, '/');
+    const char* slash_bak = std::strrchr(file, '\\');
+    const char* slash =
+        (slash_fwd && slash_bak) ? (slash_fwd > slash_bak ? slash_fwd : slash_bak)
+                                 : (slash_fwd ? slash_fwd : slash_bak);
     const int index = int(level) >= 0 && int(level) < 6 ? int(level) : 5;
     std::scoped_lock lock{mutex};
     if (!ExternalTimestamps()) {

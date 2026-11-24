@@ -24,6 +24,7 @@
 
 #include "bbport_ce_stats.h"
 #include "bbport_free_check.h"
+#include "bbport_system_info.h"
 #include "bbport_threads.h"
 #include "bbport_timeline.h"
 #include "bbport_toggles.h"
@@ -1182,19 +1183,46 @@ void CommandProcessor::ReportStall(const char* why) {
     }
     out += "  last labels written for the guest (oldest first):\n";
     out += Diagnostics::RecentLabels(40);
-    // The command thread's frames (the runtime's SIGUSR2 handler prints its frame-pointer chain
-    // to stderr; addresses minus this library's base give the source lines).
+    // The command thread's frames (Linux: SIGUSR2 handler; Windows: RtlVirtualUnwind).
     Dl_info self{};
     if (dladdr(reinterpret_cast<void*>(&BodyWords), &self)) {
+        const std::string redacted_exe =
+            self.dli_fname ? BbSysInfo::RedactHomePath(self.dli_fname) : std::string("?");
         out += fmt::format("  command thread {} stack follows ({} at {:#x}):\n", thread_tid,
-                           self.dli_fname ? self.dli_fname : "?",
-                           reinterpret_cast<uintptr_t>(self.dli_fbase));
+                           redacted_exe, reinterpret_cast<uintptr_t>(self.dli_fbase));
     }
+#ifdef _WIN32
+    if (thread_tid != 0) {
+        char stack_buf[4096];
+        if (bb_win32_format_thread_stack(thread_tid, stack_buf, sizeof(stack_buf)) > 0) {
+            out += stack_buf;
+        }
+    }
+    if (rasterizer) {
+        const u32 prewarm_tid = rasterizer->PrewarmTid();
+        if (prewarm_tid != 0 && prewarm_tid != thread_tid) {
+            char pw_buf[4096];
+            out += fmt::format("  prewarm thread {} stack follows:\n", prewarm_tid);
+            if (bb_win32_format_thread_stack(prewarm_tid, pw_buf, sizeof(pw_buf)) > 0) {
+                out += pw_buf;
+            }
+        }
+    }
+#endif
     std::fputs(out.c_str(), stdout);
     std::fflush(stdout);
 #ifndef _WIN32
     if (thread_tid != 0) {
         syscall(SYS_tgkill, getpid(), thread_tid, SIGUSR2);
+    }
+    if (rasterizer) {
+        const u32 prewarm_tid = rasterizer->PrewarmTid();
+        if (prewarm_tid != 0 && prewarm_tid != thread_tid) {
+            std::fprintf(stdout, "  prewarm thread %u stack follows:\n", prewarm_tid);
+            std::fflush(stdout);
+            syscall(SYS_tgkill, getpid(), prewarm_tid, SIGUSR2);
+            std::this_thread::sleep_for(std::chrono::milliseconds(15));
+        }
     }
 #endif
 #ifndef _WIN32

@@ -1116,6 +1116,86 @@ void backtrace_symbols_fd(void* const* buffer, int size, int fd) {
     }
 }
 
+size_t bb_win32_format_thread_stack(unsigned tid, char* out, size_t cap) {
+    if (!out || cap == 0) {
+        return 0;
+    }
+    out[0] = '\0';
+    if (tid == 0 || tid == GetCurrentThreadId()) {
+        return 0;
+    }
+    HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
+                          FALSE, DWORD(tid));
+    if (!h) {
+        return 0;
+    }
+    DWORD64 pcs[24] = {};
+    unsigned count = 0;
+    if (SuspendThread(h) != DWORD(-1)) {
+        CONTEXT ctx{};
+        ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+        if (GetThreadContext(h, &ctx)) {
+            UNWIND_HISTORY_TABLE hist{};
+            bool leaf_stepped = false;
+            for (unsigned f = 0; f < 24 && ctx.Rip != 0; ++f) {
+                pcs[count++] = ctx.Rip;
+                DWORD64 img_base = 0;
+                PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(ctx.Rip, &img_base, &hist);
+                if (fn) {
+                    PVOID handler_data = nullptr;
+                    DWORD64 establisher = 0;
+                    RtlVirtualUnwind(UNW_FLAG_NHANDLER, img_base, ctx.Rip, fn, &ctx, &handler_data,
+                                     &establisher, nullptr);
+                } else if (!leaf_stepped && ctx.Rsp != 0 && (ctx.Rsp & 7u) == 0) {
+                    MEMORY_BASIC_INFORMATION mbi{};
+                    if (VirtualQuery(reinterpret_cast<LPCVOID>(ctx.Rsp), &mbi, sizeof(mbi)) &&
+                        mbi.State == MEM_COMMIT &&
+                        !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) {
+                        ctx.Rip = *reinterpret_cast<const DWORD64*>(ctx.Rsp);
+                        ctx.Rsp += sizeof(DWORD64);
+                        leaf_stepped = true;
+                    } else {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+        ResumeThread(h);
+    }
+    CloseHandle(h);
+
+    size_t pos = 0;
+    for (unsigned i = 0; i < count && pos + 1 < cap; ++i) {
+        HMODULE mod = nullptr;
+        char mod_name[MAX_PATH] = "?";
+        DWORD64 rva = pcs[i];
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               reinterpret_cast<LPCSTR>(pcs[i]), &mod) &&
+            mod) {
+            char full[MAX_PATH] = {};
+            if (GetModuleFileNameA(mod, full, MAX_PATH) > 0) {
+                const char* s1 = std::strrchr(full, '\\');
+                const char* s2 = std::strrchr(full, '/');
+                const char* base = (s1 && s2) ? (s1 > s2 ? s1 + 1 : s2 + 1)
+                                              : (s1 ? s1 + 1 : (s2 ? s2 + 1 : full));
+                std::snprintf(mod_name, sizeof(mod_name), "%s", base);
+            }
+            rva = pcs[i] - reinterpret_cast<DWORD64>(mod);
+        }
+        const int n = std::snprintf(out + pos, cap - pos, "    #%02u %s+%#llx\n", i, mod_name,
+                                    static_cast<unsigned long long>(rva));
+        if (n <= 0) {
+            break;
+        }
+        const size_t avail = cap - pos - 1;
+        pos += static_cast<size_t>(n) < avail ? static_cast<size_t>(n) : avail;
+    }
+    return pos;
+}
+
 } // extern "C"
 
 // bb_setjmp/bb_longjmp (bbport_jmp.h): the Win64 callee-saved state, no SEH unwinding (guest

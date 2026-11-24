@@ -271,9 +271,16 @@ bool ApplyHwInterpSpirvPass(const std::vector<u32>& in, std::vector<u32>& out) {
     ps.id_operands.reserve(in.size() / 2);
     ps.total_uses.assign(bound, 0u);
 
-    static const spv_context spv_ctx = spvContextCreate(SPV_ENV_VULKAN_1_3);
+    struct ScopedSpvContext {
+        spv_context ctx = spvContextCreate(SPV_ENV_VULKAN_1_3);
+        ~ScopedSpvContext() {
+            if (ctx) {
+                spvContextDestroy(ctx);
+            }
+        }
+    } spv_ctx_guard;
     const spv_result_t parse_res = spvBinaryParse(
-        spv_ctx, &ps, in.data(), in.size(), nullptr,
+        spv_ctx_guard.ctx, &ps, in.data(), in.size(), nullptr,
         [](void* user_data, const spv_parsed_instruction_t* inst) -> spv_result_t {
             auto& st = *static_cast<ParseState*>(user_data);
             if (inst->opcode == kOpFunction) {

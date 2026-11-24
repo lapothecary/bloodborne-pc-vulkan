@@ -7,7 +7,10 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <numeric>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -570,131 +573,29 @@ void PipelineCache::NoteDriverPipelineCacheDirty() {
     });
 }
 
-bool PipelineCache::PreloadStage(Serialization::Archive& ar, const Shader::Info*& out_info,
-                                 vk::ShaderModule& out_module, Shader::RuntimeInfo& out_runtime,
-                                 std::optional<Shader::Gcn::FetchShaderData>& out_fetch) {
-    auto program = std::make_unique<Program>();
-    Shader::StageSpecialization spec{};
-    spec.info = &program->info;
-    size_t perm_idx{};
-    if (!LoadShaderMeta(ar, program->info, spec, perm_idx, profile)) {
-        return false;
+std::string PipelineCache::DescribePrewarmStatus() const {
+    if (prewarm_done.load(std::memory_order_acquire)) {
+        return {};
     }
-    if (profile.paged_buffers && program->info.pgm_hash == profile.buffer_copy_shader_hash &&
-        (!program->info.uses_paged_buffers || perm_idx != 0 || spec.buffers.size() < 3 ||
-         !spec.buffers[1].paged || !spec.buffers[2].paged)) {
-        return false;
-    }
-    if (spec.fetch_shader_data) {
-        out_fetch = spec.fetch_shader_data; // the vertex stage's (as when selected)
-    }
-    out_runtime = spec.runtime_info;
-
-    const u64 pgm_hash = program->info.pgm_hash;
-    // Load SPIR-V and create VkShaderModule only when this (pgm_hash, perm_idx) is not already
-    // resident in program_cache. When BB_SPIRV_OPT=1 (default), loads opt1_<hash>_<perm>.spv or
-    // upgrades the existing raw <hash>_<perm>.spv in-place once and caches opt1_ on disk.
-    const auto load_and_compile = [&](vk::ShaderModule& out_mod) -> bool {
-        std::vector<u32> spv{};
-        bool upgraded_from_raw = false;
-        const bool bypass_opt_cache =
-            Shader::Backend::SPIRV::NativeShadersCustomRange() &&
-            Shader::Backend::SPIRV::HasNativeShader(pgm_hash);
-        if (Shader::Backend::SPIRV::SpirvOptEnabled()) {
-            if (!bypass_opt_cache) {
-                Store().Load(BbCache::BlobType::ShaderBinary, OptBinaryName(pgm_hash, perm_idx),
-                             spv);
-                if (!spv.empty() && (spv.size() < 5 || spv[0] != 0x07230203u)) {
-                    spv.clear();
-                }
-            }
-            if (spv.empty()) {
-                Store().Load(BbCache::BlobType::ShaderBinary, BinaryName(pgm_hash, perm_idx), spv);
-                if (spv.size() < 5 || spv[0] != 0x07230203u) {
-                    if (!spv.empty()) {
-                        throw Serialization::CorruptData{"damaged SPIR-V in the shader cache"};
-                    }
-                    return false;
-                }
-                OptimizeSpirvInWarmUp(spv, pgm_hash);
-                upgraded_from_raw = !bypass_opt_cache;
-            }
-        } else {
-            Store().Load(BbCache::BlobType::ShaderBinary, BinaryName(pgm_hash, perm_idx), spv);
-            if (spv.size() < 5 || spv[0] != 0x07230203u) {
-                if (!spv.empty()) {
-                    throw Serialization::CorruptData{"damaged SPIR-V in the shader cache"};
-                }
-                return false;
-            }
-        }
-        if (Shader::Backend::SPIRV::EnsureClipDistanceInitializedInSpv(spv)) {
-            upgraded_from_raw = !bypass_opt_cache;
-        }
-        // A module the driver rejects is a damaged entry (the cache is rebuilt), not a fatal error.
-        auto [result, created] = instance.GetDevice().createShaderModule(
-            {.codeSize = spv.size() * sizeof(u32), .pCode = spv.data()});
-        if (result != vk::Result::eSuccess) {
-            throw Serialization::CorruptData{"cached SPIR-V rejected by the driver"};
-        }
-        if (upgraded_from_raw) {
-            PipelineStore::SaveOptShaderBinary(std::move(spv), pgm_hash, perm_idx);
-            driver_cache_dirty.store(true, std::memory_order_relaxed);
-        }
-        out_mod = created;
-        return true;
+    static constexpr const char* kPhaseNames[] = {
+        "init",      "scan",       "keys",         "stages",
+        "psos",      "standalone", "driver_save",  "autobake_init",
+        "done",
     };
-
-    vk::ShaderModule module{};
-    auto [it_pgm, new_program] = program_cache.try_emplace(pgm_hash);
-    if (new_program) {
-        if (!load_and_compile(module)) {
-            program_cache.erase(it_pgm);
-            return false;
-        }
-        it_pgm.value() = std::move(program);
-        spec.info = &it_pgm.value()->info;
-        it_pgm.value()->info_template = std::make_unique<Shader::Info>(it_pgm.value()->info);
-        DirectShaders::NoteProgramCreated(it_pgm.value()->info.pgm_hash, it_pgm.value().get());
-    } else {
-        auto& existing = *it_pgm.value();
-        // Merge paged-buffer layout when a later permutation upgraded uses_paged_buffers while
-        // permutation 0's on-disk .meta predated the upgrade.
-        if (program->info.uses_paged_buffers && !existing.info.uses_paged_buffers) {
-            existing.info.uses_paged_buffers = true;
-            existing.info.buffers = program->info.buffers;
-            existing.info_template = std::make_unique<Shader::Info>(existing.info);
-        }
-        // Always rebind spec.info to the persistent Program in program_cache so it never dangles
-        // after the local `program` unique_ptr goes out of scope.
-        spec.info = &existing.info;
-
-        auto& modules = existing.modules;
-        if (perm_idx < modules.size() && modules[perm_idx].module) {
-            module = modules[perm_idx].module;
-        } else {
-            const auto it = std::ranges::find(modules, spec, &Program::Module::spec);
-            if (it == modules.end()) {
-                if (!load_and_compile(module)) {
-                    return false;
-                }
-            } else {
-                const size_t idx = std::distance(modules.begin(), it);
-                if (perm_idx != idx) {
-                    LOG_WARNING(Render_Vulkan,
-                                "Cached permutation {} of {}_{:x} conflicts with index {}, "
-                                "skipping preload",
-                                perm_idx, program->info.hw_stage, program->info.pgm_hash, idx);
-                    return false;
-                }
-                module = it->module;
-            }
-        }
-    }
-    it_pgm.value()->InsertPermut(module, std::move(spec), perm_idx);
-    out_info = &it_pgm.value()->info;
-    out_module = module;
-    return true;
+    const u32 phase = prewarm_phase.load(std::memory_order_acquire);
+    const char* name = phase < std::size(kPhaseNames) ? kPhaseNames[phase] : "?";
+    const u32 done = prewarm_done_items.load(std::memory_order_relaxed);
+    const u32 total = prewarm_total_items.load(std::memory_order_relaxed);
+    const u32 tid = prewarm_tid.load(std::memory_order_acquire);
+    const u64 start_ns = prewarm_start_ns.load(std::memory_order_relaxed);
+    const u64 now_ns = static_cast<u64>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+    const double elapsed_s =
+        (start_ns != 0 && now_ns >= start_ns) ? double(now_ns - start_ns) / 1e9 : 0.0;
+    return fmt::format("  prewarm status: active (tid={}, phase={} [{}], {}/{}, elapsed {:.2f} s)\n",
+                       tid, phase, name, done, total, elapsed_s);
 }
 
 namespace {
@@ -721,6 +622,30 @@ struct PreloadGraphicsItem {
     std::array<vk::ShaderModule, MaxShaderStages> modules{};
     std::unique_ptr<GraphicsPipeline> built;
 };
+
+bool ParseHexFilenameStem(const std::filesystem::path& path, u64& out_hash) noexcept {
+    const std::string stem = path.stem().string();
+    if (stem.size() != 18 || stem[0] != '0' || (stem[1] != 'x' && stem[1] != 'X')) {
+        return false;
+    }
+    u64 val = 0;
+    for (size_t i = 2; i < 18; ++i) {
+        const char c = stem[i];
+        u64 digit = 0;
+        if (c >= '0' && c <= '9') {
+            digit = static_cast<u64>(c - '0');
+        } else if (c >= 'a' && c <= 'f') {
+            digit = static_cast<u64>(10 + (c - 'a'));
+        } else if (c >= 'A' && c <= 'F') {
+            digit = static_cast<u64>(10 + (c - 'A'));
+        } else {
+            return false;
+        }
+        val = (val << 4) | digit;
+    }
+    out_hash = val;
+    return true;
+}
 } // namespace
 
 void PipelineCache::SaveProfile() {
@@ -759,6 +684,14 @@ void PipelineCache::DropPreloaded() {
 
 void PipelineCache::WarmUp() {
     const auto t0 = std::chrono::steady_clock::now();
+    prewarm_start_ns.store(
+        static_cast<u64>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(t0.time_since_epoch()).count()),
+        std::memory_order_relaxed);
+    prewarm_phase.store(0u, std::memory_order_release);
+    prewarm_done_items.store(0u, std::memory_order_relaxed);
+    prewarm_total_items.store(0u, std::memory_order_relaxed);
+
     DirectShaders::InitializeManifestLibrary();
     RecipeCatalog::Get().Initialize();
     if (!EmulatorSettings.IsPipelineCacheEnabled()) {
@@ -796,96 +729,435 @@ void PipelineCache::WarmUp() {
     size_t loaded_driver_bytes = 0;
     const bool had_driver_cache = InitDriverPipelineCache(true, &loaded_driver_bytes);
 
-    // Phase 1: Deserialize pipeline keys, deduplicate SPIR-V VkShaderModules into program_cache,
-    // and merge all multi-permutation Shader::Info layouts on the main thread so Program::info
-    // pointers are stable and immutable during Phase 2 parallel PSO creation.
-    std::vector<PreloadComputeItem> compute_items;
-    std::vector<PreloadGraphicsItem> graphics_items;
-    std::unordered_set<ComputePipelineKey> seen_compute;
-    std::unordered_set<GraphicsPipelineKey> seen_graphics;
-    u32 num_total = 0, num_damaged = 0;
+    const u32 hw_threads = std::max(1u, std::thread::hardware_concurrency());
+    const u32 io_workers = std::clamp(hw_threads, 2u, 12u);
 
-    Store().ForEachBlob(BbCache::BlobType::PipelineKey, [&](std::vector<u8>&& data) {
-        ++num_total;
-        try {
-            Serialization::Archive ar{std::move(data)};
-            Serialization::Reader reader{ar};
-            u32 version{}, is_compute{};
-            reader.Read(version);
-            if (version != PipelineStore::PipelineKeyVersion) {
-                return;
+    // Phase 1: Single-pass directory scan for `.key` and `.meta` paths.
+    const auto t_scan0 = std::chrono::steady_clock::now();
+    prewarm_phase.store(1u, std::memory_order_release);
+    std::vector<std::filesystem::path> key_files;
+    std::vector<std::filesystem::path> meta_files;
+    Store().ListWarmUpFiles(key_files, meta_files);
+    const double scan_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_scan0)
+            .count();
+
+    // Phase 1A: Parallel read & deserialization of all `.key` files across `io_workers` threads.
+    // Eliminates the Windows NTFS / Defender single-thread sequential open bottleneck.
+    const auto t_key0 = std::chrono::steady_clock::now();
+    prewarm_phase.store(2u, std::memory_order_release);
+    prewarm_done_items.store(0u, std::memory_order_relaxed);
+    prewarm_total_items.store(static_cast<u32>(key_files.size()), std::memory_order_relaxed);
+
+    struct ParsedKeyEntry {
+        bool valid = false;
+        bool is_compute = false;
+        ComputePipelineKey cs_key{};
+        ComputePipeline::SerializationSupport cs_sdata{};
+        GraphicsPipelineKey gfx_key{};
+        GraphicsPipeline::SerializationSupport gfx_sdata{};
+    };
+    std::vector<ParsedKeyEntry> parsed_keys(key_files.size());
+    std::atomic<u32> num_total_atomic{0};
+    std::atomic<u32> num_damaged_atomic{0};
+    {
+        std::atomic<size_t> next_key{0};
+        const auto key_worker = [&] {
+            for (;;) {
+                const size_t idx = next_key.fetch_add(1, std::memory_order_relaxed);
+                if (idx >= key_files.size()) {
+                    return;
+                }
+                std::vector<u8> data;
+                if (!BbCache::BlobStore::LoadFile(key_files[idx], data)) {
+                    prewarm_done_items.fetch_add(1, std::memory_order_relaxed);
+                    continue;
+                }
+                num_total_atomic.fetch_add(1, std::memory_order_relaxed);
+                try {
+                    Serialization::Archive ar{std::move(data)};
+                    Serialization::Reader reader{ar};
+                    u32 version{}, is_compute{};
+                    reader.Read(version);
+                    if (version == PipelineStore::PipelineKeyVersion) {
+                        reader.Read(is_compute);
+                        auto& out = parsed_keys[idx];
+                        out.is_compute = (is_compute != 0);
+                        if (is_compute) {
+                            out.cs_key.Deserialize(ar);
+                            out.cs_sdata.Deserialize(ar);
+                        } else {
+                            out.gfx_key.Deserialize(ar);
+                            out.gfx_sdata.Deserialize(ar);
+                        }
+                        out.valid = true;
+                    }
+                } catch (const std::exception& e) {
+                    if (num_damaged_atomic.fetch_add(1, std::memory_order_relaxed) == 0) {
+                        LOG_WARNING(Render, "Pipeline cache: damaged entry ({})", e.what());
+                    }
+                }
+                prewarm_done_items.fetch_add(1, std::memory_order_relaxed);
             }
-            reader.Read(is_compute);
-            if (is_compute) {
-                PreloadComputeItem item{};
-                item.key.Deserialize(ar);
-                item.sdata.Deserialize(ar);
-                if (seen_compute.contains(item.key)) {
-                    return;
-                }
-                std::vector<u8> meta;
-                Store().Load(BbCache::BlobType::ShaderMeta, MetaName(item.key.value), meta);
-                if (meta.empty()) {
-                    return;
-                }
-                Serialization::Archive meta_ar{std::move(meta)};
-                Shader::RuntimeInfo rt{};
-                std::optional<Shader::Gcn::FetchShaderData> fetch{};
-                if (!PreloadStage(meta_ar, item.info, item.module, rt, fetch)) {
-                    return;
-                }
-                seen_compute.insert(item.key);
-                compute_items.push_back(std::move(item));
-            } else {
-                PreloadGraphicsItem item{};
-                item.key.Deserialize(ar);
-                item.sdata.Deserialize(ar);
-                if (seen_graphics.contains(item.key)) {
-                    return;
-                }
-                for (u32 stage = 0; stage < MaxShaderStages; ++stage) {
-                    const u64 hash = item.key.stage_hashes[stage];
-                    if (!hash) {
-                        continue;
-                    }
-                    std::vector<u8> meta;
-                    Store().Load(BbCache::BlobType::ShaderMeta, MetaName(hash), meta);
-                    if (meta.empty()) {
-                        return;
-                    }
-                    Serialization::Archive meta_ar{std::move(meta)};
-                    if (!PreloadStage(meta_ar, item.infos[stage], item.modules[stage],
-                                      item.runtime_infos[stage], item.fetch_shader)) {
-                        return;
-                    }
-                }
-                seen_graphics.insert(item.key);
-                graphics_items.push_back(std::move(item));
+        };
+        const u32 key_threads =
+            key_files.size() < 16 ? 1u : std::min<u32>(io_workers, u32(key_files.size()));
+        if (key_threads <= 1) {
+            key_worker();
+        } else {
+            std::vector<std::thread> kw;
+            kw.reserve(key_threads);
+            for (u32 t = 0; t < key_threads; ++t) {
+                kw.emplace_back(key_worker);
             }
-        } catch (const std::exception& e) {
-            if (num_damaged++ == 0) {
-                LOG_WARNING(Render, "Pipeline cache: damaged entry ({})", e.what());
+            for (auto& w : kw) {
+                w.join();
             }
         }
-    });
-
-    if (num_damaged) {
-        LOG_WARNING(Render, "Pipeline cache: {} damaged entries, rebuilding it", num_damaged);
+    }
+    const u32 num_total = num_total_atomic.load(std::memory_order_relaxed);
+    if (const u32 damaged = num_damaged_atomic.load(std::memory_order_relaxed); damaged != 0) {
+        LOG_WARNING(Render, "Pipeline cache: {} damaged entries, rebuilding it", damaged);
         DropPreloaded();
         rebuild();
         return;
     }
 
+    // Deduplicate pipeline keys and collect every unique referenced stage perm_hash once
+    // (cuts ~4,200 redundant `.meta` disk opens down to ~1,800 unique stage loads).
+    std::vector<PreloadComputeItem> raw_compute_items;
+    std::vector<PreloadGraphicsItem> raw_graphics_items;
+    std::unordered_set<ComputePipelineKey> seen_compute;
+    std::unordered_set<GraphicsPipelineKey> seen_graphics;
+    std::unordered_set<u64> needed_stage_set;
+    std::vector<u64> unique_stage_hashes;
+    raw_compute_items.reserve(128);
+    raw_graphics_items.reserve(parsed_keys.size());
+    needed_stage_set.reserve(parsed_keys.size() * 2 + 64);
+    unique_stage_hashes.reserve(parsed_keys.size() * 2 + 64);
+
+    for (auto& entry : parsed_keys) {
+        if (!entry.valid) {
+            continue;
+        }
+        if (entry.is_compute) {
+            if (seen_compute.insert(entry.cs_key).second) {
+                if (needed_stage_set.insert(entry.cs_key.value).second) {
+                    unique_stage_hashes.push_back(entry.cs_key.value);
+                }
+                PreloadComputeItem item{};
+                item.key = entry.cs_key;
+                item.sdata = std::move(entry.cs_sdata);
+                raw_compute_items.push_back(std::move(item));
+            }
+        } else {
+            if (seen_graphics.insert(entry.gfx_key).second) {
+                for (u32 stage = 0; stage < MaxShaderStages; ++stage) {
+                    const u64 hash = entry.gfx_key.stage_hashes[stage];
+                    if (hash != 0 && needed_stage_set.insert(hash).second) {
+                        unique_stage_hashes.push_back(hash);
+                    }
+                }
+                PreloadGraphicsItem item{};
+                item.key = entry.gfx_key;
+                item.sdata = std::move(entry.gfx_sdata);
+                raw_graphics_items.push_back(std::move(item));
+            }
+        }
+    }
+    parsed_keys.clear();
+    parsed_keys.shrink_to_fit();
+    const double key_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_key0)
+            .count();
+
+    // Phase 1B: Parallel `.meta` + `.spv` load, SPIR-V upgrade, and vkCreateShaderModule for
+    // every unique referenced stage across `io_workers` threads.
+    const auto t_stg0 = std::chrono::steady_clock::now();
+    prewarm_phase.store(3u, std::memory_order_release);
+    prewarm_done_items.store(0u, std::memory_order_relaxed);
+    prewarm_total_items.store(static_cast<u32>(unique_stage_hashes.size()),
+                              std::memory_order_relaxed);
+
+    struct LoadedStageEntry {
+        u64 perm_hash = 0;
+        std::unique_ptr<Program> program;
+        Shader::StageSpecialization spec{};
+        size_t perm_idx = 0;
+        Shader::RuntimeInfo runtime_info{};
+        std::optional<Shader::Gcn::FetchShaderData> fetch_shader{};
+        vk::ShaderModule module{};
+        bool ok = false;
+    };
+    std::vector<LoadedStageEntry> loaded_stages(unique_stage_hashes.size());
+    const bool custom_native_range = Shader::Backend::SPIRV::NativeShadersCustomRange();
+    const bool spirv_opt_on = Shader::Backend::SPIRV::SpirvOptEnabled();
+    {
+        std::atomic<size_t> next_stg{0};
+        const auto stage_worker = [&] {
+            for (;;) {
+                const size_t idx = next_stg.fetch_add(1, std::memory_order_relaxed);
+                if (idx >= unique_stage_hashes.size()) {
+                    return;
+                }
+                const u64 perm_hash = unique_stage_hashes[idx];
+                auto& item = loaded_stages[idx];
+                item.perm_hash = perm_hash;
+                try {
+                    std::vector<u8> meta;
+                    Store().Load(BbCache::BlobType::ShaderMeta, MetaName(perm_hash), meta);
+                    if (meta.empty()) {
+                        prewarm_done_items.fetch_add(1, std::memory_order_relaxed);
+                        continue;
+                    }
+                    Serialization::Archive ar{std::move(meta)};
+                    item.program = std::make_unique<Program>();
+                    item.spec.info = &item.program->info;
+                    if (!LoadShaderMeta(ar, item.program->info, item.spec, item.perm_idx,
+                                        profile)) {
+                        prewarm_done_items.fetch_add(1, std::memory_order_relaxed);
+                        continue;
+                    }
+                    if (profile.paged_buffers &&
+                        item.program->info.pgm_hash == profile.buffer_copy_shader_hash &&
+                        (!item.program->info.uses_paged_buffers || item.perm_idx != 0 ||
+                         item.spec.buffers.size() < 3 || !item.spec.buffers[1].paged ||
+                         !item.spec.buffers[2].paged)) {
+                        prewarm_done_items.fetch_add(1, std::memory_order_relaxed);
+                        continue;
+                    }
+                    item.runtime_info = item.spec.runtime_info;
+                    if (item.spec.fetch_shader_data) {
+                        item.fetch_shader = item.spec.fetch_shader_data;
+                    }
+
+                    const u64 pgm_hash = item.program->info.pgm_hash;
+                    const bool bypass_opt_cache =
+                        custom_native_range && Shader::Backend::SPIRV::HasNativeShader(pgm_hash);
+                    std::vector<u32> spv;
+                    bool upgraded_from_raw = false;
+                    if (spirv_opt_on) {
+                        if (!bypass_opt_cache) {
+                            Store().Load(BbCache::BlobType::ShaderBinary,
+                                         OptBinaryName(pgm_hash, item.perm_idx), spv);
+                            if (!spv.empty() && (spv.size() < 5 || spv[0] != 0x07230203u)) {
+                                spv.clear();
+                            }
+                        }
+                        if (spv.empty()) {
+                            Store().Load(BbCache::BlobType::ShaderBinary,
+                                         BinaryName(pgm_hash, item.perm_idx), spv);
+                            if (spv.size() < 5 || spv[0] != 0x07230203u) {
+                                if (!spv.empty()) {
+                                    throw Serialization::CorruptData{
+                                        "damaged SPIR-V in the shader cache"};
+                                }
+                                prewarm_done_items.fetch_add(1, std::memory_order_relaxed);
+                                continue;
+                            }
+                            OptimizeSpirvInWarmUp(spv, pgm_hash);
+                            upgraded_from_raw = !bypass_opt_cache;
+                        }
+                    } else {
+                        Store().Load(BbCache::BlobType::ShaderBinary,
+                                     BinaryName(pgm_hash, item.perm_idx), spv);
+                        if (spv.size() < 5 || spv[0] != 0x07230203u) {
+                            if (!spv.empty()) {
+                                throw Serialization::CorruptData{
+                                    "damaged SPIR-V in the shader cache"};
+                            }
+                            prewarm_done_items.fetch_add(1, std::memory_order_relaxed);
+                            continue;
+                        }
+                    }
+                    if (Shader::Backend::SPIRV::EnsureClipDistanceInitializedInSpv(spv)) {
+                        upgraded_from_raw = !bypass_opt_cache;
+                    }
+                    auto [result, created] = instance.GetDevice().createShaderModule(
+                        {.codeSize = spv.size() * sizeof(u32), .pCode = spv.data()});
+                    if (result != vk::Result::eSuccess) {
+                        throw Serialization::CorruptData{"cached SPIR-V rejected by the driver"};
+                    }
+                    if (upgraded_from_raw) {
+                        PipelineStore::SaveOptShaderBinary(std::move(spv), pgm_hash, item.perm_idx);
+                        driver_cache_dirty.store(true, std::memory_order_relaxed);
+                    }
+                    item.module = created;
+                    item.ok = true;
+                } catch (const std::exception& e) {
+                    if (num_damaged_atomic.fetch_add(1, std::memory_order_relaxed) == 0) {
+                        LOG_WARNING(Render, "Pipeline cache: damaged entry ({})", e.what());
+                    }
+                }
+                prewarm_done_items.fetch_add(1, std::memory_order_relaxed);
+            }
+        };
+        const u32 stg_threads = unique_stage_hashes.size() < 8
+                                    ? 1u
+                                    : std::min<u32>(io_workers, u32(unique_stage_hashes.size()));
+        if (stg_threads <= 1) {
+            stage_worker();
+        } else {
+            std::vector<std::thread> sw;
+            sw.reserve(stg_threads);
+            for (u32 t = 0; t < stg_threads; ++t) {
+                sw.emplace_back(stage_worker);
+            }
+            for (auto& w : sw) {
+                w.join();
+            }
+        }
+    }
+    if (const u32 damaged = num_damaged_atomic.load(std::memory_order_relaxed); damaged != 0) {
+        for (auto& entry : loaded_stages) {
+            if (entry.module) {
+                instance.GetDevice().destroyShaderModule(entry.module);
+                entry.module = nullptr;
+            }
+        }
+        LOG_WARNING(Render, "Pipeline cache: {} damaged entries, rebuilding it", damaged);
+        DropPreloaded();
+        rebuild();
+        return;
+    }
+
+    // Merge unique stages into `program_cache` in deterministic `(pgm_hash, perm_idx)` order so
+    // `perm 0` always takes precedence over higher perms regardless of OS directory order and
+    // `Program::info` pointers are final & immutable before Phase 2 parallel PSO creation.
+    std::vector<size_t> valid_stage_indices;
+    valid_stage_indices.reserve(loaded_stages.size());
+    for (size_t i = 0; i < loaded_stages.size(); ++i) {
+        if (loaded_stages[i].ok && loaded_stages[i].program && loaded_stages[i].module) {
+            valid_stage_indices.push_back(i);
+        }
+    }
+    std::sort(valid_stage_indices.begin(), valid_stage_indices.end(),
+              [&](size_t a, size_t b) {
+                  const auto& ea = loaded_stages[a];
+                  const auto& eb = loaded_stages[b];
+                  if (ea.program->info.pgm_hash != eb.program->info.pgm_hash) {
+                      return ea.program->info.pgm_hash < eb.program->info.pgm_hash;
+                  }
+                  return ea.perm_idx < eb.perm_idx;
+              });
+
+    struct ResolvedStage {
+        const Shader::Info* info = nullptr;
+        vk::ShaderModule module{};
+        Shader::RuntimeInfo runtime_info{};
+        std::optional<Shader::Gcn::FetchShaderData> fetch_shader{};
+    };
+    std::unordered_map<u64, ResolvedStage> resolved_stages;
+    resolved_stages.reserve(valid_stage_indices.size() * 2 + 64);
+
+    for (const size_t idx : valid_stage_indices) {
+        auto& entry = loaded_stages[idx];
+        const u64 pgm_hash = entry.program->info.pgm_hash;
+        vk::ShaderModule chosen_mod = entry.module;
+        auto [it_pgm, new_program] = program_cache.try_emplace(pgm_hash);
+        if (new_program) {
+            it_pgm.value() = std::move(entry.program);
+            entry.spec.info = &it_pgm.value()->info;
+            it_pgm.value()->info_template = std::make_unique<Shader::Info>(it_pgm.value()->info);
+            DirectShaders::NoteProgramCreated(it_pgm.value()->info.pgm_hash, it_pgm.value().get());
+            it_pgm.value()->InsertPermut(chosen_mod, std::move(entry.spec), entry.perm_idx);
+        } else {
+            auto& existing = *it_pgm.value();
+            if (entry.program->info.uses_paged_buffers && !existing.info.uses_paged_buffers) {
+                existing.info.uses_paged_buffers = true;
+                existing.info.buffers = entry.program->info.buffers;
+                existing.info_template = std::make_unique<Shader::Info>(existing.info);
+            }
+            entry.spec.info = &existing.info;
+            auto& modules = existing.modules;
+            if (entry.perm_idx < modules.size() && modules[entry.perm_idx].module) {
+                instance.GetDevice().destroyShaderModule(entry.module);
+                chosen_mod = modules[entry.perm_idx].module;
+            } else {
+                const auto dup =
+                    std::ranges::find(modules, entry.spec, &Program::Module::spec);
+                if (dup != modules.end()) {
+                    const size_t existing_idx = std::distance(modules.begin(), dup);
+                    instance.GetDevice().destroyShaderModule(entry.module);
+                    if (entry.perm_idx != existing_idx) {
+                        LOG_WARNING(Render_Vulkan,
+                                    "Cached permutation {} of {}_{:x} conflicts with index {}, "
+                                    "skipping preload",
+                                    entry.perm_idx, entry.program->info.hw_stage,
+                                    entry.program->info.pgm_hash, existing_idx);
+                        continue;
+                    }
+                    chosen_mod = dup->module;
+                } else {
+                    existing.InsertPermut(chosen_mod, std::move(entry.spec), entry.perm_idx);
+                }
+            }
+        }
+        resolved_stages.emplace(entry.perm_hash,
+                                ResolvedStage{
+                                    .info = &it_pgm.value()->info,
+                                    .module = chosen_mod,
+                                    .runtime_info = entry.runtime_info,
+                                    .fetch_shader = std::move(entry.fetch_shader),
+                                });
+    }
+    loaded_stages.clear();
+    loaded_stages.shrink_to_fit();
+
+    std::vector<PreloadComputeItem> compute_items;
+    compute_items.reserve(raw_compute_items.size());
+    for (auto& item : raw_compute_items) {
+        const auto it = resolved_stages.find(item.key.value);
+        if (it == resolved_stages.end()) {
+            continue;
+        }
+        item.info = it->second.info;
+        item.module = it->second.module;
+        compute_items.push_back(std::move(item));
+    }
+    std::vector<PreloadGraphicsItem> graphics_items;
+    graphics_items.reserve(raw_graphics_items.size());
+    for (auto& item : raw_graphics_items) {
+        bool all_stages_ok = true;
+        for (u32 stage = 0; stage < MaxShaderStages; ++stage) {
+            const u64 hash = item.key.stage_hashes[stage];
+            if (!hash) {
+                continue;
+            }
+            const auto it = resolved_stages.find(hash);
+            if (it == resolved_stages.end()) {
+                all_stages_ok = false;
+                break;
+            }
+            item.infos[stage] = it->second.info;
+            item.modules[stage] = it->second.module;
+            item.runtime_infos[stage] = it->second.runtime_info;
+            if (it->second.fetch_shader) {
+                item.fetch_shader = it->second.fetch_shader;
+            }
+        }
+        if (all_stages_ok) {
+            graphics_items.push_back(std::move(item));
+        }
+    }
+    const double stg_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_stg0)
+            .count();
+
     // Phase 2: Parallel Vulkan graphics & compute PSO compilation against thread-safe
     // VkPipelineCache across worker threads.
+    const auto t_pso0 = std::chrono::steady_clock::now();
     const size_t num_compute = compute_items.size();
     const size_t num_graphics = graphics_items.size();
     const size_t total_items = num_compute + num_graphics;
-    const u32 hw_threads = std::max(1u, std::thread::hardware_concurrency());
+    prewarm_phase.store(4u, std::memory_order_release);
+    prewarm_done_items.store(0u, std::memory_order_relaxed);
+    prewarm_total_items.store(static_cast<u32>(total_items), std::memory_order_relaxed);
+
     const u32 num_workers =
         total_items < 8
             ? 1u
-            : std::min<u32>(std::clamp(hw_threads, 2u, 12u), static_cast<u32>(total_items));
+            : std::min<u32>(io_workers, static_cast<u32>(total_items));
 
     std::atomic<size_t> next_idx{0};
     std::atomic<u32> parallel_damaged{0};
@@ -918,6 +1190,7 @@ void PipelineCache::WarmUp() {
                 }
                 return;
             }
+            prewarm_done_items.fetch_add(1, std::memory_order_relaxed);
         }
     };
 
@@ -944,7 +1217,7 @@ void PipelineCache::WarmUp() {
         return;
     }
 
-    // Phase 3: Commit prewarmed PSOs into PipelineCache maps and persist driver VkPipelineCache.
+    // Phase 3: Commit prewarmed PSOs into PipelineCache maps.
     compute_pipelines.reserve(num_compute);
     for (auto& item : compute_items) {
         if (item.built) {
@@ -960,11 +1233,17 @@ void PipelineCache::WarmUp() {
             }
         }
     }
+    const double pso_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_pso0)
+            .count();
 
     // Phase 3B: Parallel preload of all standalone pre-baked ShaderMeta entries (from --bake-shaders)
-    // across `num_workers` threads so all ~5,700 game + Yebis2 + Scaleform shaders sit warm in < 250 ms.
+    // using the `.meta` list already gathered in Phase 1. Already-resident stage hashes are filtered
+    // by filename BEFORE opening any file, and remaining `.meta` + `.spv` reads run across `io_workers`.
+    const auto t_meta0 = std::chrono::steady_clock::now();
+    prewarm_phase.store(5u, std::memory_order_release);
     struct StandalonePreload {
-        std::vector<u8> raw_meta;
+        std::filesystem::path meta_path;
         std::unique_ptr<Program> program;
         Shader::StageSpecialization spec{};
         size_t perm_idx = 0;
@@ -984,21 +1263,19 @@ void PipelineCache::WarmUp() {
         }
     }
     std::vector<StandalonePreload> standalone_metas;
-    standalone_metas.reserve(6000);
-    Store().ForEachBlob(BbCache::BlobType::ShaderMeta, [&](std::vector<u8>&& data) {
-        if (data.size() >= 24) {
-            u64 ph_comb = 0;
-            std::memcpy(&ph_comb, data.data() + 8, sizeof(u64));
-            if (resident_perm_hashes.contains(ph_comb)) {
-                return;
-            }
+    standalone_metas.reserve(meta_files.size());
+    for (auto& mp : meta_files) {
+        u64 stem_hash = 0;
+        if (ParseHexFilenameStem(mp, stem_hash) && resident_perm_hashes.contains(stem_hash)) {
+            continue;
         }
-        standalone_metas.push_back(StandalonePreload{.raw_meta = std::move(data)});
-    });
+        standalone_metas.push_back(StandalonePreload{.meta_path = std::move(mp)});
+    }
+    prewarm_done_items.store(0u, std::memory_order_relaxed);
+    prewarm_total_items.store(static_cast<u32>(standalone_metas.size()),
+                              std::memory_order_relaxed);
     if (!standalone_metas.empty()) {
         std::atomic<size_t> next_meta{0};
-        const bool custom_native_range = Shader::Backend::SPIRV::NativeShadersCustomRange();
-        const bool spirv_opt_on = Shader::Backend::SPIRV::SpirvOptEnabled();
         auto meta_worker = [&] {
             for (;;) {
                 const size_t idx = next_meta.fetch_add(1, std::memory_order_relaxed);
@@ -1007,11 +1284,25 @@ void PipelineCache::WarmUp() {
                 }
                 auto& item = standalone_metas[idx];
                 try {
-                    Serialization::Archive ar{std::move(item.raw_meta)};
+                    std::vector<u8> raw_meta;
+                    if (!BbCache::BlobStore::LoadFile(item.meta_path, raw_meta)) {
+                        prewarm_done_items.fetch_add(1, std::memory_order_relaxed);
+                        continue;
+                    }
+                    if (raw_meta.size() >= 24) {
+                        u64 ph_comb = 0;
+                        std::memcpy(&ph_comb, raw_meta.data() + 8, sizeof(u64));
+                        if (resident_perm_hashes.contains(ph_comb)) {
+                            prewarm_done_items.fetch_add(1, std::memory_order_relaxed);
+                            continue;
+                        }
+                    }
+                    Serialization::Archive ar{std::move(raw_meta)};
                     item.program = std::make_unique<Program>();
                     item.spec.info = &item.program->info;
                     if (!LoadShaderMeta(ar, item.program->info, item.spec, item.perm_idx,
                                         profile)) {
+                        prewarm_done_items.fetch_add(1, std::memory_order_relaxed);
                         continue;
                     }
                     const u64 pgm_hash = item.program->info.pgm_hash;
@@ -1031,6 +1322,7 @@ void PipelineCache::WarmUp() {
                             Store().Load(BbCache::BlobType::ShaderBinary,
                                          BinaryName(pgm_hash, item.perm_idx), spv);
                             if (spv.size() < 5 || spv[0] != 0x07230203u) {
+                                prewarm_done_items.fetch_add(1, std::memory_order_relaxed);
                                 continue;
                             }
                             OptimizeSpirvInWarmUp(spv, pgm_hash);
@@ -1040,6 +1332,7 @@ void PipelineCache::WarmUp() {
                         Store().Load(BbCache::BlobType::ShaderBinary,
                                      BinaryName(pgm_hash, item.perm_idx), spv);
                         if (spv.size() < 5 || spv[0] != 0x07230203u) {
+                            prewarm_done_items.fetch_add(1, std::memory_order_relaxed);
                             continue;
                         }
                     }
@@ -1049,6 +1342,7 @@ void PipelineCache::WarmUp() {
                     auto [res, created] = instance.GetDevice().createShaderModule(
                         {.codeSize = spv.size() * sizeof(u32), .pCode = spv.data()});
                     if (res != vk::Result::eSuccess) {
+                        prewarm_done_items.fetch_add(1, std::memory_order_relaxed);
                         continue;
                     }
                     if (upgraded) {
@@ -1059,15 +1353,23 @@ void PipelineCache::WarmUp() {
                     item.ok = true;
                 } catch (const std::exception&) {
                 }
+                prewarm_done_items.fetch_add(1, std::memory_order_relaxed);
             }
         };
-        std::vector<std::thread> mworkers;
-        mworkers.reserve(num_workers);
-        for (u32 t = 0; t < num_workers; ++t) {
-            mworkers.emplace_back(meta_worker);
-        }
-        for (auto& w : mworkers) {
-            w.join();
+        const u32 meta_threads = standalone_metas.size() < 8
+                                     ? 1u
+                                     : std::min<u32>(io_workers, u32(standalone_metas.size()));
+        if (meta_threads <= 1) {
+            meta_worker();
+        } else {
+            std::vector<std::thread> mworkers;
+            mworkers.reserve(meta_threads);
+            for (u32 t = 0; t < meta_threads; ++t) {
+                mworkers.emplace_back(meta_worker);
+            }
+            for (auto& w : mworkers) {
+                w.join();
+            }
         }
         program_cache.reserve(program_cache.size() + standalone_metas.size());
         for (auto& item : standalone_metas) {
@@ -1101,10 +1403,30 @@ void PipelineCache::WarmUp() {
             }
         }
     }
+    const double meta_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_meta0)
+            .count();
 
+    prewarm_phase.store(6u, std::memory_order_release);
     if ((!had_driver_cache || driver_cache_dirty.load(std::memory_order_relaxed)) &&
         (total_items > 0 || !program_cache.empty())) {
-        SaveDriverPipelineCache();
+        const char* sync_env = std::getenv("BB_PREWARM_SYNC");
+        const char* exp_env = std::getenv("BB_EXPORT_RECIPES");
+        if ((sync_env && sync_env[0] == '1') || (exp_env && exp_env[0] == '1')) {
+            SaveDriverPipelineCache();
+        } else if (!driver_cache_save_inflight.exchange(true, std::memory_order_acq_rel)) {
+            last_driver_cache_save_sec = static_cast<u32>(
+                std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::steady_clock::now().time_since_epoch())
+                    .count());
+            if (driver_cache_save_thread.joinable()) {
+                driver_cache_save_thread.join();
+            }
+            driver_cache_save_thread = std::thread([this]() {
+                SaveDriverPipelineCache();
+                driver_cache_save_inflight.store(false, std::memory_order_release);
+            });
+        }
     }
 
     const auto opt_stats = Shader::Backend::SPIRV::GetAndResetSpirvOptStats();
@@ -1144,15 +1466,17 @@ void PipelineCache::WarmUp() {
     const double elapsed_ms =
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     std::printf("[bb_vulkan] V4.2 Prewarmed %zu graphics + %zu compute PSOs (%zu programs) across "
-                "%u threads in %.1f ms (VkPipelineCache=%s, %.2f MiB, SPIRV_OPT=%d, FAST_FP=%d, "
-                "HW_INTERP=%d, NATIVE=%d)\n",
+                "%u threads in %.1f ms [scan=%.0f key=%.0f stg=%.0f pso=%.0f meta=%.0f] "
+                "(VkPipelineCache=%s, %.2f MiB, SPIRV_OPT=%d, FAST_FP=%d, HW_INTERP=%d, NATIVE=%d)\n",
                 graphics_pipelines.size(), compute_pipelines.size(), program_cache.size(),
-                num_workers, elapsed_ms, had_driver_cache ? "HIT" : "SEEDED",
+                io_workers, elapsed_ms, scan_ms, key_ms, stg_ms, pso_ms, meta_ms,
+                had_driver_cache ? "HIT" : "SEEDED",
                 double(loaded_driver_bytes) / (1024.0 * 1024.0),
                 Shader::Backend::SPIRV::SpirvOptEnabled() ? 1 : 0,
                 Shader::Backend::SPIRV::FastFpEnabled() ? 1 : 0,
                 Shader::Backend::SPIRV::HwInterpEnabled() ? 1 : 0,
                 Shader::Backend::SPIRV::NativeShadersEnabled() ? 1 : 0);
+    std::fflush(stdout);
     LOG_INFO(Render, "Preloaded {} pipelines ({} graphics, {} compute) in {:.1f} ms",
              num_pipelines, graphics_pipelines.size(), compute_pipelines.size(), elapsed_ms);
     if (num_total > num_pipelines) {
