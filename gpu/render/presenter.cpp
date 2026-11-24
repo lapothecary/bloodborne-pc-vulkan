@@ -904,6 +904,7 @@ bool Presenter::PresentImage(Frame* frame, vk::Image source, bool last) {
     if (pres_paced) {
         static u64 prev_pres_draws = 0;
         static double pres_draws_ema = 0.0;
+        static double pres_dt_ema_ns = 0.0;
         const u64 cur_draws = BbStats::draws.load(std::memory_order_relaxed);
         const u64 delta_draws = cur_draws >= prev_pres_draws ? (cur_draws - prev_pres_draws) : 0ull;
         prev_pres_draws = cur_draws;
@@ -915,7 +916,12 @@ bool Presenter::PresentImage(Frame* frame, vk::Image source, bool last) {
         }
         if (prev_rec_end_ns != 0 && rec_t1 > prev_rec_end_ns && pres_draws_ema >= 80.0) {
             const u64 dt_ns = rec_t1 - prev_rec_end_ns;
-            const u64 hi_thresh_ns = std::max<u64>(9'500'000ull, (active_period_ns * 16ull) / 10ull);
+            if (pres_dt_ema_ns <= 0.0) {
+                pres_dt_ema_ns = double(std::clamp<u64>(dt_ns, active_period_ns, 50'000'000ull));
+            }
+            const u64 base_period_ns =
+                std::max<u64>(active_period_ns, static_cast<u64>(pres_dt_ema_ns));
+            const u64 hi_thresh_ns = std::max<u64>(9'500'000ull, (base_period_ns * 16ull) / 10ull);
             const u64 lo_thresh_ns = (active_period_ns * 6ull) / 10ull;
             if (dt_ns < 2'000'000'000ull && (dt_ns >= hi_thresh_ns || dt_ns <= lo_thresh_ns)) [[unlikely]] {
                 const u64 wait_q_ns =
@@ -943,6 +949,11 @@ bool Presenter::PresentImage(Frame* frame, vk::Image source, bool last) {
                     double(rec_ns) / 1e6, queued_before, double(cushion_before_ns) / 1e6,
                     double(main_dt_ns) / 1e6, double(gnm_dt_ns) / 1e6, double(sb_dt_ns) / 1e6,
                     nvml_age_ms, double(nvml_dur_ns) / 1e6);
+            }
+            if (dt_ns < 200'000'000ull) {
+                const double clamped_dt =
+                    double(std::clamp<u64>(dt_ns, active_period_ns, 50'000'000ull));
+                pres_dt_ema_ns = pres_dt_ema_ns * 0.94 + clamped_dt * 0.06;
             }
         }
         prev_rec_end_ns = rec_t1;

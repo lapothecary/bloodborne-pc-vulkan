@@ -701,8 +701,11 @@ const Win32TopologyMasks& GetWin32Topology() {
 
             if (p_phys >= 4 && e_mask != 0) {
                 // CASE 2: Single-L3 Hybrid P-Core + E-Core (Intel 12th-15th Gen).
-                // Main + Game Workers + Vulkan RHI stay strictly on P-cores (2-core failover for
-                // main avoiding CPU 0; dedicated 2-3 P-core RHI pool when >= 8P); Helpers/IO/Audio on E-cores.
+                // Main + critical Vulkan RHI threads stay strictly on P-cores (2-core failover for
+                // main avoiding CPU 0; dedicated 2-3 P-core RHI pool when >= 8P). On <= 7P CPUs
+                // (e.g. 6P+4E i7-13620H / 6P+8E i5-13600K), allow bursty game/GX worker pools to
+                // overflow onto E-cores via Windows Thread Director so 14+ threads do not starve
+                // on 5 P-cores and stall main in ThreadSync; Helpers/IO/Audio stay on E-cores.
                 auto is_p_core = [&](const PhysCore& c) { return c.eff_class == max_eff; };
                 DWORD_PTR rhi_crit = 0;
                 if (p_phys >= 8) {
@@ -714,23 +717,25 @@ const Win32TopologyMasks& GetWin32Topology() {
                 } else {
                     res.game_main = p_mask;
                 }
+                DWORD_PTR p_remaining = 0;
                 for (size_t i = 0; i < cores.size(); ++i) {
                     if (!core_used[i] && is_p_core(cores[i])) {
-                        res.game_workers |= cores[i].mask;
+                        p_remaining |= cores[i].mask;
                     }
                 }
-                if (res.game_workers == 0) {
-                    res.game_workers = p_mask;
+                if (p_remaining == 0) {
+                    p_remaining = p_mask;
                 }
-                res.gx_workers = res.game_workers;
-                res.gpu = res.game_workers;
+                res.gpu = p_remaining;
                 if (rhi_crit == 0) {
-                    rhi_crit = res.gpu;
+                    rhi_crit = p_remaining;
                 }
                 res.gpu_comm = rhi_crit;
                 res.draw_rec = rhi_crit;
                 res.vk_recorder = rhi_crit;
                 res.present = rhi_crit;
+                res.game_workers = p_remaining | e_mask;
+                res.gx_workers = (p_phys >= 8) ? p_remaining : (p_remaining | e_mask);
                 res.helper = e_mask;
             } else {
                 // CASE 3: Single-L3 Homogeneous CPU with >= 6 Physical Cores

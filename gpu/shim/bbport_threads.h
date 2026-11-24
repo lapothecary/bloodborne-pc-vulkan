@@ -550,20 +550,21 @@ inline const TopologyMasks& GetTopology() {
                 // =============================================================================
                 // CASE 2: Single-L3 Hybrid P-Core + E-Core CPU (Intel 12th-15th Gen).
                 // - MOMainThread gets a 2-P-core failover pool (avoiding CPU 0).
-                // - When >= 8 P-cores, critical RHI threads share a dedicated 2-3 P-core pool.
-                // - Game workers stay strictly on remaining P-cores; async/IO/FMOD run on E-cores.
+                // - Critical RHI threads stay strictly on P-cores (dedicated 2-3 P-core pool when >= 8P).
+                // - Bursty game/GX workers allow E-core overflow on <= 7P CPUs so 14+ threads do not
+                //   starve on 5 P-cores and stall main in ThreadSync; async/IO/FMOD stay on E-cores.
                 // =============================================================================
-                result.game_workers = p_cores;
+                cpu_set_t p_remaining = p_cores;
                 if (p_phys_cores >= 8) {
                     carve_critical_pool(p_cores, 2, 0, true, &result.game_main,
-                                        &result.game_workers, nullptr);
+                                        &p_remaining, nullptr);
                     cpu_set_t rhi_crit{};
                     if (p_phys_cores >= 10) {
-                        carve_critical_pool(result.game_workers, 3, 0, true, &rhi_crit,
-                                            &result.game_workers, nullptr);
+                        carve_critical_pool(p_remaining, 3, 0, true, &rhi_crit,
+                                            &p_remaining, nullptr);
                     } else {
-                        carve_critical_pool(result.game_workers, 2, 1, true, &rhi_crit,
-                                            &result.game_workers, nullptr);
+                        carve_critical_pool(p_remaining, 2, 1, true, &rhi_crit,
+                                            &p_remaining, nullptr);
                     }
                     result.gpu_comm = rhi_crit;
                     result.draw_rec = rhi_crit;
@@ -571,11 +572,11 @@ inline const TopologyMasks& GetTopology() {
                     result.present = rhi_crit;
                 } else if (p_phys_cores >= 6) {
                     carve_critical_pool(p_cores, 1, 1, true, &result.game_main,
-                                        &result.game_workers, nullptr);
-                    result.gpu_comm = result.game_workers;
-                    result.draw_rec = result.game_workers;
-                    result.vk_recorder = result.game_workers;
-                    result.present = result.game_workers;
+                                        &p_remaining, nullptr);
+                    result.gpu_comm = p_remaining;
+                    result.draw_rec = p_remaining;
+                    result.vk_recorder = p_remaining;
+                    result.present = p_remaining;
                 } else {
                     result.game_main = p_cores;
                     result.gpu_comm = p_cores;
@@ -583,8 +584,11 @@ inline const TopologyMasks& GetTopology() {
                     result.vk_recorder = p_cores;
                     result.present = p_cores;
                 }
-                result.gx_workers = result.game_workers;
-                result.gpu = result.game_workers;
+                cpu_set_t p_plus_e{};
+                CPU_OR(&p_plus_e, &p_remaining, &e_cores);
+                result.gpu = p_remaining;
+                result.game_workers = p_plus_e;
+                result.gx_workers = (p_phys_cores >= 8) ? p_remaining : p_plus_e;
                 result.helper = e_cores;
             } else if (total_phys_cores >= 6) {
                 // =============================================================================
