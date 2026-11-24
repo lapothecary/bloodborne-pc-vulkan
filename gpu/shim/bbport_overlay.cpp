@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -1852,9 +1853,32 @@ void PollGpuHwSensors(HudBreakdown& h) noexcept {
     }
 }
 
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((format(printf, 2, 3)))
+#endif
+static void AppendLogFmt(std::string& dst, const char* fmt, ...) {
+    char tmp[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    const int n = std::vsnprintf(tmp, sizeof(tmp), fmt, ap);
+    va_end(ap);
+    if (n <= 0) {
+        return;
+    }
+    if (static_cast<std::size_t>(n) < sizeof(tmp)) {
+        dst.append(tmp, static_cast<std::size_t>(n));
+        return;
+    }
+    std::string big(static_cast<std::size_t>(n) + 1u, '\0');
+    va_start(ap, fmt);
+    std::vsnprintf(big.data(), big.size(), fmt, ap);
+    va_end(ap);
+    dst.append(big.data(), static_cast<std::size_t>(n));
+}
+
 /// Offloads blocking GPU sensor queries (NVML/sysfs/fdinfo), HUD text file writes,
-/// Linux `/proc/self/task/*` scans, and `fflush(stdout)` off `bb:Present` so frame pacing
-/// never stalls for 10..35 ms on driver RM locks or filesystem I/O.
+/// periodic stdout telemetry writes, Linux `/proc/self/task/*` scans, and `fflush(stdout)`
+/// off `bb:Present` so frame pacing never stalls on driver RM locks or pipe/filesystem I/O.
 class AsyncTelemetryWorker {
 public:
     struct SensorSnapshot {
@@ -1914,9 +1938,15 @@ public:
     }
 
     void EnqueueThreadCpuAndFlush(bool sample_cpu, std::uint64_t frames, double window_sec,
-                                  bool print_cpu) {
+                                  bool print_cpu, std::string stdout_text = {}) {
         {
             std::scoped_lock lk{job_mutex};
+            if (!stdout_text.empty()) {
+                if (pending_stdout_log.size() > 64u * 1024u) {
+                    pending_stdout_log.clear();
+                }
+                pending_stdout_log += stdout_text;
+            }
             if (sample_cpu) {
                 pending_cpu_sample = true;
                 pending_cpu_frames = frames;
@@ -1950,6 +1980,7 @@ private:
         auto next_sensor_poll = Clock::now();
         while (true) {
             std::string hud_file_text;
+            std::string stdout_log;
             bool do_hud_file = false;
             bool do_cpu = false;
             std::uint64_t cpu_frames = 0;
@@ -1961,7 +1992,8 @@ private:
             {
                 std::unique_lock lk{job_mutex};
                 cv.wait_until(lk, next_sensor_poll, [this] {
-                    return stop || has_hud_file || pending_cpu_sample || pending_stdout_flush;
+                    return stop || has_hud_file || pending_cpu_sample || pending_stdout_flush ||
+                           !pending_stdout_log.empty();
                 });
                 if (stop) {
                     break;
@@ -1970,6 +2002,10 @@ private:
                     hud_file_text = std::move(pending_hud_file);
                     has_hud_file = false;
                     do_hud_file = true;
+                }
+                if (!pending_stdout_log.empty()) {
+                    stdout_log = std::move(pending_stdout_log);
+                    pending_stdout_log.clear();
                 }
                 if (pending_cpu_sample) {
                     do_cpu = true;
@@ -2031,6 +2067,10 @@ private:
                     std::fputs(hud_file_text.c_str(), f);
                     std::fclose(f);
                 }
+            }
+
+            if (!stdout_log.empty()) {
+                std::fwrite(stdout_log.data(), 1, stdout_log.size(), stdout);
             }
 
 #ifndef _WIN32
@@ -2187,6 +2227,7 @@ private:
     bool stop = false;
     bool has_hud_file = false;
     std::string pending_hud_file;
+    std::string pending_stdout_log;
     bool pending_cpu_sample = false;
     std::uint64_t pending_cpu_frames = 0;
     double pending_cpu_window = 0.0;
@@ -3212,10 +3253,12 @@ void UpdateHudBreakdown(HudBreakdown& h) {
             const std::uint64_t log_df = log_df32 > 0 ? static_cast<std::uint64_t>(log_df32) : 1ULL;
             last_log_print = now;
             last_log_frames = cur_frames;
+            std::string log_out;
+            log_out.reserve(4096);
             if (hitch_trigger) {
-                std::printf("\n[HUD Telemetry] [HITCH %.1fms]\n%s", peak_hitch, hud_buf);
+                AppendLogFmt(log_out, "\n[HUD Telemetry] [HITCH %.1fms]\n%s", peak_hitch, hud_buf);
             } else {
-                std::printf("\n[HUD Telemetry]\n%s", hud_buf);
+                AppendLogFmt(log_out, "\n[HUD Telemetry]\n%s", hud_buf);
             }
             if (BbSections::main_xray.installed.load(std::memory_order_relaxed)) {
                 static std::array<std::uint64_t, BbSections::MainXRay::MaxGroups> prev_t0{};
@@ -3252,7 +3295,7 @@ void UpdateHudBreakdown(HudBreakdown& h) {
                     if (mx_seeded && n > 0) {
                         std::sort(rows.begin(), rows.begin() + n,
                                   [](const MxRow& a, const MxRow& b) { return a.ms > b.ms; });
-                        std::printf("%s (%.2f ms tracked):", label, tot_ms);
+                        AppendLogFmt(log_out, "%s (%.2f ms tracked):", label, tot_ms);
                         const std::size_t show = std::min<std::size_t>(n, max_show);
                         for (std::size_t k = 0; k < show; ++k) {
                             const auto idx = rows[k].idx;
@@ -3260,9 +3303,9 @@ void UpdateHudBreakdown(HudBreakdown& h) {
                                 BbSections::main_xray.name_ready[idx].load(std::memory_order_acquire)
                                     ? BbSections::main_xray.names[idx]
                                     : "?";
-                            std::printf("%s %s %.2f", k ? " |" : "", nm, rows[k].ms);
+                            AppendLogFmt(log_out, "%s %s %.2f", k ? " |" : "", nm, rows[k].ms);
                         }
-                        std::printf("\n");
+                        log_out += '\n';
                     }
                 };
                 print_band("MainXRay/f [T0]", BbSections::main_xray.cycles_t0, prev_t0, 10);
@@ -3302,7 +3345,7 @@ void UpdateHudBreakdown(HudBreakdown& h) {
                     if (mx_seeded && tn > 0) {
                         std::sort(trows.begin(), trows.begin() + tn,
                                   [](const TfRow& a, const TfRow& b) { return a.ms > b.ms; });
-                        std::printf("TaskFnXRay/f:");
+                        log_out += "TaskFnXRay/f:";
                         const std::size_t show = std::min<std::size_t>(tn, 10);
                         for (std::size_t k = 0; k < show; ++k) {
                             const auto ti = trows[k].idx;
@@ -3314,12 +3357,12 @@ void UpdateHudBreakdown(HudBreakdown& h) {
                                      std::memory_order_acquire))
                                     ? BbSections::main_xray.names[static_cast<std::size_t>(gs)]
                                     : "?";
-                            std::printf("%s %s@0x%llx %.2f (%.0f/f)", k ? " |" : "", gnm,
-                                        static_cast<unsigned long long>(
-                                            BbSections::main_xray.task_fn_off[ti]),
-                                        trows[k].ms, trows[k].calls);
+                            AppendLogFmt(log_out, "%s %s@0x%llx %.2f (%.0f/f)", k ? " |" : "", gnm,
+                                         static_cast<unsigned long long>(
+                                             BbSections::main_xray.task_fn_off[ti]),
+                                         trows[k].ms, trows[k].calls);
                         }
-                        std::printf("\n");
+                        log_out += '\n';
                     }
                 }
                 if (BbSections::main_xray.adhoc_sub_installed.load(std::memory_order_relaxed)) {
@@ -3336,7 +3379,8 @@ void UpdateHudBreakdown(HudBreakdown& h) {
                         tot += ms[i];
                     }
                     if (mx_seeded && tot > 0.005) {
-                        std::printf(
+                        AppendLogFmt(
+                            log_out,
                             "SceneSubXRay/f (%.2f ms): GX_LightCull %.2f | Scene_1f5c1b0 %.2f | "
                             "Draw_1db6d70 %.2f | Queue_f5d780 %.2f | Init_Misc %.2f | MoveMapState #%d\n",
                             tot, ms[0], ms[1], ms[2], ms[3], ms[4],
@@ -3380,20 +3424,20 @@ void UpdateHudBreakdown(HudBreakdown& h) {
                         std::sort(prows.begin(), prows.begin() + pn,
                                   [](const PRow& a, const PRow& b) { return a.ms > b.ms; });
                         static constexpr const char* kKindTag[5] = {"?", "prep", "exec", "sort", "subm"};
-                        std::printf("Pass2293060XRay/f (items=%u, %.2f ms):",
-                                    BbSections::main_xray.pass_last_items.load(std::memory_order_relaxed),
-                                    ptot);
+                        AppendLogFmt(log_out, "Pass2293060XRay/f (items=%u, %.2f ms):",
+                                     BbSections::main_xray.pass_last_items.load(std::memory_order_relaxed),
+                                     ptot);
                         const std::size_t show = std::min<std::size_t>(pn, 10);
                         for (std::size_t k = 0; k < show; ++k) {
                             const auto pi = prows[k].idx;
                             const auto kd = BbSections::main_xray.pass_kind[pi];
-                            std::printf("%s %s@0x%llx %.2f (%.0f/f)", k ? " |" : "",
-                                        kKindTag[kd < 5u ? kd : 0u],
-                                        static_cast<unsigned long long>(
-                                            BbSections::main_xray.pass_fn_off[pi]),
-                                        prows[k].ms, prows[k].calls);
+                            AppendLogFmt(log_out, "%s %s@0x%llx %.2f (%.0f/f)", k ? " |" : "",
+                                         kKindTag[kd < 5u ? kd : 0u],
+                                         static_cast<unsigned long long>(
+                                             BbSections::main_xray.pass_fn_off[pi]),
+                                         prows[k].ms, prows[k].calls);
                         }
-                        std::printf("\n");
+                        log_out += '\n';
                     }
                 }
                 {
@@ -3409,7 +3453,8 @@ void UpdateHudBreakdown(HudBreakdown& h) {
                         const auto to_ms = [&](std::uint64_t c) {
                             return (double(c) / cyc_per_ms) / double(log_df);
                         };
-                        std::printf(
+                        AppendLogFmt(
+                            log_out,
                             "GxPoolXRay/f (workers=%u, flushes=%.1f/f, wakes=%.1f/f): "
                             "MainWork %.2f | MainSpin %.2f | WakeSem %.2f | WaitIdle %.2f\n",
                             BbSections::main_xray.gxpool_workers.load(std::memory_order_relaxed),
@@ -3464,16 +3509,16 @@ void UpdateHudBreakdown(HudBreakdown& h) {
                     if (mx_seeded && pn2 > 0) {
                         std::sort(parrows.begin(), parrows.begin() + pn2,
                                   [](const ParRow& a, const ParRow& b) { return a.tot_ms > b.tot_ms; });
-                        std::printf("GxParTaskXRay/f:");
+                        log_out += "GxParTaskXRay/f:";
                         const std::size_t show = std::min<std::size_t>(pn2, 8);
                         for (std::size_t k = 0; k < show; ++k) {
                             const auto& r = parrows[k];
-                            std::printf("%s 0x%llx tot=%.2f(t0=%.2f,max=%.2f,%.0fc/%.0fi)",
-                                        k ? " |" : "",
-                                        static_cast<unsigned long long>(BbSections::main_xray.par_fn_off[r.idx]),
-                                        r.tot_ms, r.t0_ms, r.max_ms, r.calls, r.items);
+                            AppendLogFmt(log_out, "%s 0x%llx tot=%.2f(t0=%.2f,max=%.2f,%.0fc/%.0fi)",
+                                         k ? " |" : "",
+                                         static_cast<unsigned long long>(BbSections::main_xray.par_fn_off[r.idx]),
+                                         r.tot_ms, r.t0_ms, r.max_ms, r.calls, r.items);
                         }
-                        std::printf("\n");
+                        log_out += '\n';
                     }
                 }
                 } // if (deep_enabled)
@@ -3558,7 +3603,8 @@ void UpdateHudBreakdown(HudBreakdown& h) {
                 const double ev_per_poll =
                     d_m_polls > 0 ? (double(d_m_ev) / double(d_m_polls)) : 0.0;
 
-                std::printf(
+                AppendLogFmt(
+                    log_out,
                     "Pacing (%uf): min %.2f | p50 %.2f | p95 %.2f | p99 %.2f | max %.2f ms"
                     " | >1.25x:%u >1.5x:%u | PresPace %.2f Acq %.2f Pres %.2f ms | SimDt %.2f..%.2f ms\n"
                     "Input (%.0fs): Mouse %llu ev / %llu active-f (%.1f ev/f, batch %u..%u, 0-ev-gaps %llu)"
@@ -3572,10 +3618,11 @@ void UpdateHudBreakdown(HudBreakdown& h) {
                     static_cast<unsigned long long>(d_m_wake));
             }
 #ifndef _WIN32
-            AsyncTelemetryWorker::Get().EnqueueThreadCpuAndFlush(!frame_stats_on, log_df, log_dt,
-                                                                 true);
+            AsyncTelemetryWorker::Get().EnqueueThreadCpuAndFlush(
+                !frame_stats_on, log_df, log_dt, true, std::move(log_out));
 #else
-            AsyncTelemetryWorker::Get().EnqueueThreadCpuAndFlush(false, 0, 0.0, false);
+            AsyncTelemetryWorker::Get().EnqueueThreadCpuAndFlush(
+                false, 0, 0.0, false, std::move(log_out));
 #endif
         }
     }
