@@ -272,24 +272,42 @@ def _load_saved_launcher_and_ini(env, data):
     else:
         default_ini = (
             "# bbport settings (in-game menu: Insert / L3+R3)\n"
-            "aa_mode=smaa_t2x\n"
+            "aa_mode=dlaa3\n"
             "upscaler=off\n"
             "preset=0\n"
             "dlss_preset=11\n"
             "anisotropic=16\n"
             "ui_upscale=1\n"
-            "fps_limit=0\n"
+            "fps_limit=auto\n"
+            "present_mode=Mailbox\n"
             "sharpen=1\n"
-            "sharpness=0.50\n"
+            "sharpness=0.80\n"
             "object_motion=0\n"
-            "show_fps=1\n"
+            "show_fps=0\n"
             "aspect_ratio=auto\n"
             "output_res=auto\n"
-            "window_mode=fullscreen\n"
+            "window_mode=borderless\n"
             "fullscreen=1\n"
-            "model_lod=0\n"
+            "model_lod=-2\n"
             "live_resolution=0\n"
+            "effect_chromatic_aberration=0\n"
+            "effect_dof=1\n"
+            "effect_motion_blur=1\n"
+            "motion_blur_camera=default\n"
+            "motion_blur_object=default\n"
+            "effect_ssao=1\n"
             "effect_game_aa=0\n"
+            "effect_dynamic_shadows=1\n"
+            "effect_ssr=1\n"
+            "effect_bloom=1\n"
+            "ssao_quality=1\n"
+            "contact_shadows=1\n"
+            "ssr_quality=1\n"
+            "true_black_hdr=1\n"
+            "hdr_output=0\n"
+            "pcss_shadows=1\n"
+            "ssgi_enabled=1\n"
+            "fire_heat_haze=1\n"
             "mouse_look=1\n"
             "mouse_sensitivity=1.00\n"
             "mouse_invert_y=0\n"
@@ -367,7 +385,8 @@ def _load_saved_launcher_and_ini(env, data):
 
     fps_limit = ini.get('fps_limit')
     if fps_limit is None:
-        fps_limit = str(s.get('fps_limit', 0) or 0)
+        raw_s_fps = s.get('fps_limit')
+        fps_limit = str(raw_s_fps) if raw_s_fps not in (None, '') else 'auto'
     setdefault(env, 'BB_FPS', 'uncap')
     setdefault(env, 'BB_FPS_LIMIT', str(fps_limit))
 

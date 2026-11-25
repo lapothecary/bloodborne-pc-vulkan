@@ -298,6 +298,7 @@ void Set(Values& v, const std::string& key, const std::string& value) {
     } else if (key == "dlss_preset") {
         v.dlss_preset = (i == 0 || i == 5 || i == 6 || (i >= 10 && i <= 13)) ? i : 11;
     } else if (key == "texture_quality") {
+        v.texture_quality_chosen = true;
         if (value == "very_low" || value == "verylow") {
             v.texture_quality = 3;
         } else if (value == "low") {
@@ -310,6 +311,7 @@ void Set(Values& v, const std::string& key, const std::string& value) {
             v.texture_quality = std::clamp(i, 0, 3);
         }
     } else if (key == "shadow_quality") {
+        v.shadow_quality_chosen = true;
         if (value == "off") {
             v.shadow_quality = 0;
         } else if (value == "low") {
@@ -326,7 +328,14 @@ void Set(Values& v, const std::string& key, const std::string& value) {
     } else if (key == "anisotropic") {
         v.anisotropic = (i >= 16) ? 16 : (i >= 8) ? 8 : (i >= 4) ? 4 : 0;
     } else if (key == "fps_limit") {
-        v.fps_limit = (i <= 0) ? 0 : std::clamp(i, 30, 5000);
+        if (value == "auto" || value == "-1") {
+            v.fps_limit_auto = true;
+            const int hz = MonitorRefreshHz();
+            v.fps_limit = (hz >= 30) ? hz : 0;
+        } else {
+            v.fps_limit_auto = false;
+            v.fps_limit = (i <= 0) ? 0 : std::clamp(i, 30, 5000);
+        }
     } else if (key == "present_mode" || key == "vsync") {
         if (value == "fifo" || value == "on" || value == "1") {
             v.vsync_mode = VsyncOn;
@@ -610,7 +619,7 @@ namespace {
 struct Group {
     const char* key;
     double ratio;
-    std::array<OutputSize, 10> sizes;
+    std::array<OutputSize, 12> sizes;
     int count;
 };
 constexpr Group Groups[AspectCount] = {
@@ -618,10 +627,11 @@ constexpr Group Groups[AspectCount] = {
     {"4:3", 4.0 / 3.0,
      {{{640, 480}, {800, 600}, {1024, 768}, {1280, 960}, {1440, 1080}, {1600, 1200}, {2048, 1536}, {2880, 2160}}}, 8},
     {"16:10", 16.0 / 10.0,
-     {{{640, 400}, {960, 600}, {1280, 800}, {1440, 900}, {1680, 1050}, {1920, 1200}, {2560, 1600}, {3840, 2400}}}, 8},
+     {{{640, 400}, {960, 600}, {1280, 800}, {1440, 900}, {1680, 1050}, {1920, 1200}, {2560, 1600}, {2880, 1800},
+       {3840, 2400}}}, 9},
     {"16:9", 16.0 / 9.0,
-     {{{640, 360}, {854, 480}, {960, 540}, {1280, 720}, {1600, 900}, {1920, 1080}, {2560, 1440}, {3200, 1800},
-       {3840, 2160}}}, 9},
+     {{{640, 360}, {854, 480}, {960, 540}, {1280, 720}, {1366, 768}, {1600, 900}, {1920, 1080}, {2560, 1440},
+       {3200, 1800}, {3840, 2160}, {5120, 2880}}}, 11},
     // 2560x1080 and 5120x2160 are 64:27, 3440x1440 43:18, 3840x1600 12:5: each output's own
     // ratio is the camera's.
     {"21:9", 64.0 / 27.0,
@@ -629,6 +639,7 @@ constexpr Group Groups[AspectCount] = {
     {"32:9", 32.0 / 9.0, {{{1280, 360}, {1920, 540}, {2560, 720}, {3840, 1080}, {5120, 1440}, {7680, 2160}}}, 6},
 };
 std::atomic<std::uint32_t> monitor{0}; // PackSize, 0 until known
+std::atomic<int> monitor_refresh_hz{0};
 } // namespace
 
 int OutputList::IndexOf(OutputSize size) const {
@@ -655,6 +666,10 @@ const char* PresentModeKey(int vsync_mode) {
 
 OutputSize Monitor() {
     return UnpackSize(monitor.load(std::memory_order_relaxed));
+}
+
+int MonitorRefreshHz() {
+    return monitor_refresh_hz.load(std::memory_order_relaxed);
 }
 
 int ResolvedAspect(int aspect) {
@@ -711,11 +726,21 @@ std::string SizeText(OutputSize size) {
     return std::to_string(size.width) + "x" + std::to_string(size.height);
 }
 
-void SetMonitor(int width, int height) {
+void SetMonitor(int width, int height, int refresh_hz) {
+    auto& v = Get();
+    if (refresh_hz >= 30 && refresh_hz <= 1000 &&
+        refresh_hz != monitor_refresh_hz.load(std::memory_order_relaxed)) {
+        monitor_refresh_hz.store(refresh_hz, std::memory_order_relaxed);
+        if (v.fps_limit_auto.load(std::memory_order_relaxed) &&
+            v.fps_limit.load(std::memory_order_relaxed) != refresh_hz) {
+            v.fps_limit = refresh_hz;
+            BbFrameRate::SetLimit(refresh_hz);
+            std::printf("FPS Limit: %d Hz (auto from monitor)\n", refresh_hz);
+        }
+    }
     const OutputSize m{width, height};
     if (width <= 0 || height <= 0 || m == Monitor()) return;
     monitor.store(PackSize(m), std::memory_order_relaxed);
-    auto& v = Get();
     if (v.output_res_auto.load(std::memory_order_relaxed)) {
         const OutputSize target =
             (FixedRenderSession() && v.startup_output.width > 0 && v.startup_output.height > 0)
@@ -806,7 +831,9 @@ void Load() {
         Set(v, "anisotropic", env);
     }
     if (const char* env = std::getenv("BB_FPS_LIMIT")) {
-        if (std::atoi(env) > 0) {
+        if (std::strcmp(env, "auto") == 0) {
+            Set(v, "fps_limit", "auto");
+        } else if (std::atoi(env) > 0) {
             Set(v, "fps_limit", env);
         }
     }
@@ -827,8 +854,7 @@ void Load() {
         } else if (std::strcmp(env, "borderless") == 0 || std::strcmp(env, "borderless_windowed") == 0 ||
                    std::strcmp(env, "2") == 0) {
             v.window_mode = WindowModeBorderless;
-        } else if ((std::strcmp(env, "1") == 0 || std::strcmp(env, "true") == 0 || std::strcmp(env, "fullscreen") == 0) &&
-                   !v.window_mode_chosen.load()) {
+        } else if (std::strcmp(env, "fullscreen") == 0 && !v.window_mode_chosen.load()) {
             v.window_mode = WindowModeFullscreen;
         }
     }
@@ -836,6 +862,9 @@ void Load() {
         if (v.upscaler.load() == UpscalerTaa) {
             v.aa_mode = AaTaa;
             v.upscaler = UpscalerOff;
+        } else if (v.upscaler.load() == UpscalerOff) {
+            v.aa_mode = AaDlaaCnn;
+            v.effects[4] = false;
         } else {
             v.aa_mode = AaOff;
         }
@@ -897,6 +926,36 @@ void ConfigureDlssSupport(bool available, const char* problem) {
                     kept.empty() ? "the DLSS bridge or NVIDIA's DLSS library is missing" : kept.c_str());
         v.upscaler = UpscalerFsr3;
     }
+    if (!available && (v.aa_mode == AaDlaa || v.aa_mode == AaDlaaCnn)) {
+        std::printf("Anti-Aliasing: DLAA unavailable (%s); falling back to SMAA T2x\n",
+                    kept.empty() ? "the DLSS bridge or NVIDIA's DLSS library is missing" : kept.c_str());
+        v.aa_mode = AaSmaaT2x;
+    }
+}
+
+void ConfigureVramDefaults(std::uint64_t vram_bytes) {
+    constexpr std::uint64_t LowVramThreshold = (4ULL << 30) + (512ULL << 20);
+    if (vram_bytes == 0 || vram_bytes > LowVramThreshold) {
+        return;
+    }
+    auto& v = Get();
+    bool adjusted_tex = false;
+    bool adjusted_shadow = false;
+    if (!v.texture_quality_chosen.load(std::memory_order_relaxed) &&
+        v.texture_quality.load(std::memory_order_relaxed) == 0) {
+        v.texture_quality = 1;
+        adjusted_tex = true;
+    }
+    if (!v.shadow_quality_chosen.load(std::memory_order_relaxed) &&
+        v.shadow_quality.load(std::memory_order_relaxed) == 2) {
+        v.shadow_quality = 1;
+        adjusted_shadow = true;
+    }
+    if (adjusted_tex || adjusted_shadow) {
+        std::printf("GPU: <= 4.5 GiB VRAM detected (%llu MiB); auto-setting Texture=%s, Shadow=%s\n",
+                    (unsigned long long)(vram_bytes >> 20), adjusted_tex ? "Medium" : "Default",
+                    adjusted_shadow ? "Low" : "Default");
+    }
 }
 
 bool FixedRenderSession() {
@@ -915,7 +974,7 @@ int EffectiveUpscaler() {
         return UpscalerTaa;
     }
     if (aa == AaDlaa || aa == AaDlaaCnn) {
-        return v.dlss_supported.load(std::memory_order_relaxed) ? UpscalerDlss : UpscalerTaa;
+        return v.dlss_supported.load(std::memory_order_relaxed) ? UpscalerDlss : UpscalerOff;
     }
     return UpscalerOff;
 }
@@ -989,7 +1048,7 @@ void Save() {
     put("texture_quality", std::to_string(std::clamp(v.texture_quality.load(), 0, 3)));
     put("shadow_quality", std::to_string(std::clamp(v.shadow_quality.load(), 0, 4)));
     put("anisotropic", std::to_string(v.anisotropic.load()));
-    put("fps_limit", std::to_string(v.fps_limit.load()));
+    put("fps_limit", v.fps_limit_auto.load() ? std::string("auto") : std::to_string(v.fps_limit.load()));
     put("present_mode", PresentModeKey(v.vsync_mode.load()));
     put("ui_upscale", flag(v.ui_upscale.load()));
     put("ssao_quality", flag(v.ssao_quality.load()));

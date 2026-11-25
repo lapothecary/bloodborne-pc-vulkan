@@ -847,7 +847,9 @@ void SetPointer(SDL_Window* window, float wx, float wy) {
     }
     const float aspect = std::max(bbgpu_frame_aspect(), 0.1f);
     const float frame_h = std::min(float(h), float(w) / aspect);
-    const float scale = frame_h / 1080.0f;
+    const float frame_w = frame_h * aspect;
+    // Scaleform ShowAll fits 1920x1080 proportionally inside frame_w x frame_h (width-limited on 4:3/16:10).
+    const float scale = std::min(frame_w / 1920.0f, frame_h / 1080.0f);
     pointer_x.store((wx - w * 0.5f) / scale + 960.0f, std::memory_order_relaxed);
     pointer_y.store((wy - h * 0.5f) / scale + 540.0f, std::memory_order_relaxed);
     pointer_in.store(true, std::memory_order_relaxed);

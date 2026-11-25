@@ -1,6 +1,7 @@
 // bbport: SDL3 window for the Vulkan swapchain (X11 or Wayland).
 #include <array>
 #include <atomic>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -126,9 +127,16 @@ SDL_DisplayID ChooseDisplay() {
     for (int i = 0; i < count; ++i) {
         const char* name = SDL_GetDisplayName(ids[i]);
         const SDL_DisplayMode* mode = SDL_GetDesktopDisplayMode(ids[i]);
-        std::printf("Display %d: %s %dx%d%s%s\n", i + 1, name ? name : "?", mode ? mode->w : 0,
-                    mode ? mode->h : 0, ids[i] == primary ? " (primary)" : "",
-                    ids[i] == display ? " <- the game's (BB_DISPLAY)" : "");
+        const int hz = (mode && mode->refresh_rate > 1.0f) ? int(std::lround(mode->refresh_rate)) : 0;
+        if (hz > 0) {
+            std::printf("Display %d: %s %dx%d @ %d Hz%s%s\n", i + 1, name ? name : "?", mode ? mode->w : 0,
+                        mode ? mode->h : 0, hz, ids[i] == primary ? " (primary)" : "",
+                        ids[i] == display ? " <- the game's (BB_DISPLAY)" : "");
+        } else {
+            std::printf("Display %d: %s %dx%d%s%s\n", i + 1, name ? name : "?", mode ? mode->w : 0,
+                        mode ? mode->h : 0, ids[i] == primary ? " (primary)" : "",
+                        ids[i] == display ? " <- the game's (BB_DISPLAY)" : "");
+        }
     }
     if (wanted && *wanted && !chosen) {
         std::printf("Display: BB_DISPLAY=%s matches none, the primary one is used\n", wanted);
@@ -137,11 +145,14 @@ SDL_DisplayID ChooseDisplay() {
     return display;
 }
 
-// The monitor the window is on, in pixels: the output's aspect ratio "Auto" follows it.
+// The monitor the window is on, in pixels and Hz: Auto aspect ratio and FPS Limit follow it.
 void TellMonitorDisplay(SDL_DisplayID display) {
     if (const SDL_DisplayMode* mode = SDL_GetDesktopDisplayMode(display)) {
         const float density = mode->pixel_density > 0.0f ? mode->pixel_density : 1.0f;
-        BbSettings::SetMonitor(int(mode->w * density + 0.5f), int(mode->h * density + 0.5f));
+        const int hz = (mode->refresh_rate >= 29.5f && mode->refresh_rate <= 1000.5f)
+                           ? int(std::lround(mode->refresh_rate))
+                           : 0;
+        BbSettings::SetMonitor(int(mode->w * density + 0.5f), int(mode->h * density + 0.5f), hz);
     }
 }
 

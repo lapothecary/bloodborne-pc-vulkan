@@ -1205,6 +1205,18 @@ void sub_21d2dd0(void* self) {
 
     if (alreadyHadContext != 0) {
         if (dir[0x20f8] != 0) {
+            // When NativePostFX bypasses Part B/C submit+reset, rewind the 4 MiB Yebis GfxContext
+            // DCB before sub_bb4b40 re-initializes it on warp so repeated map loads cannot overflow.
+            if (gx_direct_vk::IsNativePostFxEnabled() && g_YebisRingBuffersAllocated_56c3ce0 != 0) {
+                uint8_t* activeRing = &g_YebisContextSlotIdx_56a6d20 +
+                    static_cast<uint64_t>(g_YebisContextSlotIdx_56a6d20) * 0xe7b8ULL + 0x08ULL;
+                g_YebisActiveRingBase_56c3cb8 = activeRing;
+                sub_10946d0(activeRing);
+                g_YebisActiveRingCopy_56c3cc0    = activeRing;
+                g_YebisActiveRingPlus80_56c3cc8  = activeRing + 0x80;
+                g_YebisActiveRingQword0_56c3cd0  = *reinterpret_cast<void**>(activeRing + 0x00);
+                g_YebisActiveRingQword80_56c3cd8 = *reinterpret_cast<void**>(activeRing + 0x80);
+            }
             sub_bb4d70(yebisCtx, 0u);
             sub_bb4de0(yebisCtx, g_YebisContextSlotIdx_56a6d20);
             sub_bb4b40(yebisCtx, &cbTable, resW, resH, featureFlags, initCfg);

@@ -24,6 +24,7 @@
 #include "bbport_guest_hooks.h"
 #include "bbport_menu_engine.h"
 #include "bbport_settings.h"
+#include "bbport_system_info.h"
 #include "games/bloodborne_menu_pointer.h"
 #include <SDL3/SDL.h>
 #include <fmt/format.h>
@@ -32,6 +33,8 @@ extern "C" void runtime_file_drain_sync(void);
 extern "C" int runtime_savedata_sync_options(const void* options_128);
 
 namespace BbGameMenu {
+bool CommitDebouncedDisplaySettings(BbSettings::Values& s, bool force);
+
 namespace {
 
 using u8 = std::uint8_t;
@@ -68,6 +71,11 @@ constexpr u64 UpdatePageHelpBar = 0x1b1ab20;
 constexpr u64 UpdatePageButtonGuide = 0x1ad6450;
 /// (page, input, frame_time): processes Up/Down row navigation on an options page.
 constexpr u64 OptionsPageNavigate = 0x1b1b520;
+/// (page): called when the player confirms "Restore to default settings?" -> YES.
+/// SelectRow::ResetToDefault (0x1b26f50) unconditionally triggers ListSelect (0x1acf6b0 -> returns 1)
+/// and OnListSelect (0x1b27190), which immediately overwrites DefaultResetSentinel (-999) with 0.
+/// Detouring this function handles Defaults cleanly for Display, Effects, and Controls pages.
+constexpr u64 OptionsPageResetDefaults = 0x1b1a2d0;
 /// (page, game_settings): Bloodborne's native System -> Controls page content builder.
 constexpr u64 ControlsContent = 0x1b211a0;
 /// Menu input button check helpers (const u8* input -> bool / step).
@@ -241,6 +249,7 @@ const char* TranslateForCurrentGameLang(const char* en) {
         {"Locked (Rigid 1:1)", "Verrouillé (Rigide 1:1)", "Fijo (Rígido 1:1)", "Fixiert (Starr 1:1)", "Bloccato (Rigido 1:1)", "Fixo (Rígido 1:1)", "Sztywny (1:1)", "固定 (リジッド 1:1)", "고정 (1:1 직결)", "完全锁定 (1:1 刚性)"},
         {"Exit Game", "Quitter le jeu", "Salir del juego", "Spiel beenden", "Esci dal gioco", "Sair do jogo", "Wyjdź z gry", "ゲームを終了", "게임 종료", "退出游戏"},
         {"Exit Bloodborne and return to desktop.", "Quitter Bloodborne et revenir au bureau.", "Salir de Bloodborne y volver al escritorio.", "Bloodborne beenden und zum Desktop zurückkehren.", "Esci da Bloodborne e torna al desktop.", "Sair de Bloodborne e voltar para a área de trabalho.", "Zamknij Bloodborne i wróć do pulpitu.", "Bloodborneを終了してデスクトップに戻ります。", "Bloodborne을 종료하고 바탕 화면으로 돌아갑니다.", "退出《血源诅咒》并返回桌面。"},
+        {"Default", "Par défaut", "Predeterminado", "Standard", "Predefinito", "Padrão", "Domyślne", "標準", "기본값", "默认"},
     };
     for (const auto& e : Table) {
         if (std::strcmp(en, e.en) == 0) {
@@ -294,7 +303,7 @@ constexpr std::size_t DynamicLength = 128;
 struct DynamicText {
     char16_t english[DynamicLength]{}, russian[DynamicLength]{};
 };
-constexpr u32 OutputSlots = 12;    ///< BbSettings::OutputList
+constexpr u32 OutputSlots = 16;    ///< BbSettings::OutputList
 constexpr int ControlsSlotCount = 11; ///< all 11 visible rows in Controls scroll across all 35 items
 constexpr int FirstControlSettingItem = BbSettings::KeyActionCount;
 constexpr int ItemMouseSpeed = FirstControlSettingItem + 0;
@@ -314,7 +323,7 @@ constexpr int MaxDisplayScroll = TotalDisplayItems - DisplaySlotCount;
 constexpr int EffectsSlotCount = 11; ///< all 11 Effects settings fit on a single screen (0 scroll)
 constexpr int TotalEffectsItems = 16;
 constexpr int MaxEffectsScroll = TotalEffectsItems - EffectsSlotCount;
-constexpr int MaxChoicesPerSlot = 16;
+constexpr int MaxChoicesPerSlot = 24;
 constexpr int DefaultResetSentinel = -999;
 std::array<DynamicText, 1 + OutputSlots + 3 * ControlsSlotCount + 3 * DisplaySlotCount + 3 * EffectsSlotCount +
                         ControlsSlotCount * 4 + DisplaySlotCount * MaxChoicesPerSlot + EffectsSlotCount * 4>
@@ -1636,7 +1645,7 @@ void StepSlotSetting(u8* row, int slot, int delta, bool wrap) {
 
 // ---- Scrollable 9-item System -> Display Window ----
 constexpr int GameAaEffectIdx = 4; // "effect_game_aa" in BbSettings::Effects
-constexpr int FpsPresets[] = {0, 30, 60, 72, 90, 120, 144, 165, 170, 240, 360};
+constexpr int FpsPresets[] = {0, 30, 60, 72, 75, 90, 100, 120, 144, 165, 170, 180, 200, 240, 280, 300, 360, 480};
 constexpr int FpsPresetCount = int(sizeof(FpsPresets) / sizeof(FpsPresets[0]));
 constexpr int AnisoValues[] = {1, 4, 8, 16};
 constexpr int AnisoValueCount = 4;
@@ -1713,7 +1722,7 @@ int CurrentSharpnessStep() {
                : 0;
 }
 
-void SetSharpnessStep(int step) {
+void SetSharpnessStep(int step, bool save = true) {
     auto& s = BbSettings::Get();
     step = std::clamp(step, 0, SharpnessSteps - 1);
     s.sharpen = step != 0;
@@ -1723,7 +1732,9 @@ void SetSharpnessStep(int step) {
     values[Sharpness] = step;
     applied[Sharpness] = step;
     bytes[Sharpness] = u8(step);
-    BbSettings::Save();
+    if (save) {
+        BbSettings::Save();
+    }
 }
 
 int GetDisplayItemSliderValue(int item_idx) {
@@ -1742,17 +1753,35 @@ void SyncDisplaySlotSliderWidget(u8* row, int slot, bool is_focused) {
 }
 
 std::vector<int> BuildFpsValuesList(int* out_cur_idx) {
-    std::vector<int> vals(std::begin(FpsPresets), std::end(FpsPresets));
+    const auto& s = BbSettings::Get();
+    const bool is_auto = s.fps_limit_auto.load(std::memory_order_relaxed);
+    std::vector<int> vals;
+    vals.reserve(MaxChoicesPerSlot);
+    vals.push_back(-1); // Auto (Monitor Hz)
+    for (int p : FpsPresets) {
+        vals.push_back(p);
+    }
+    const int mon_hz = BbSettings::MonitorRefreshHz();
+    if (mon_hz >= 30 && std::find(vals.begin(), vals.end(), mon_hz) == vals.end() &&
+        int(vals.size()) < MaxChoicesPerSlot) {
+        vals.push_back(mon_hz);
+    }
     const int cur = std::max(0, BbFrameRate::Limit());
-    if (std::find(vals.begin(), vals.end(), cur) == vals.end() && int(vals.size()) < MaxChoicesPerSlot) {
+    if (!is_auto && cur > 0 && std::find(vals.begin(), vals.end(), cur) == vals.end() &&
+        int(vals.size()) < MaxChoicesPerSlot) {
         vals.push_back(cur);
-        std::sort(vals.begin(), vals.end());
+    }
+    // Keep -1 (Auto) and 0 (Uncapped) at the front, sort positive FPS targets ascending.
+    if (vals.size() > 2) {
+        std::sort(vals.begin() + 2, vals.end());
     }
     int cur_idx = 0;
-    for (int i = 0; i < int(vals.size()); ++i) {
-        if (vals[i] == cur) {
-            cur_idx = i;
-            break;
+    if (!is_auto) {
+        for (int i = 1; i < int(vals.size()); ++i) {
+            if (vals[i] == cur) {
+                cur_idx = i;
+                break;
+            }
         }
     }
     if (out_cur_idx) *out_cur_idx = cur_idx;
@@ -1886,8 +1915,13 @@ void BuildDisplaySlotChoices(int slot, std::vector<u32>& out_choices, int& out_s
     if (item_idx == 3) {
         int cur_idx = 0;
         const std::vector<int> fps_vals = BuildFpsValuesList(&cur_idx);
+        const int mon_hz = BbSettings::MonitorRefreshHz();
         for (int fps : fps_vals) {
-            if (fps <= 0) {
+            if (fps < 0) {
+                const std::string en = mon_hz >= 30 ? fmt::format("Auto ({} Hz)", mon_hz) : "Auto";
+                const std::string ru = mon_hz >= 30 ? fmt::format("Авто ({} Гц)", mon_hz) : "Авто";
+                add_choice(en.c_str(), ru.c_str());
+            } else if (fps == 0) {
                 add_choice("Uncapped", "Без лимита");
             } else {
                 bool is_preset = false;
@@ -1987,7 +2021,7 @@ void BuildDisplaySlotChoices(int slot, std::vector<u32>& out_choices, int& out_s
 
     if (item_idx == 12) {
         add_choice("Highest", "Максимальная");
-        add_choice("Game Default", "Как в игре");
+        add_choice("Default", "Стандарт");
         add_choice("Lower", "Ниже");
         add_choice("Lowest", "Минимальная");
         const int lod = s.model_lod.load();
@@ -2053,10 +2087,15 @@ void RefreshDisplaySlotTexts(int slot) {
     if (item_idx == 3) {
         SetDynamic(name_id, "FPS Limit", "Лимит FPS");
         SetDynamic(help_id,
-                   "Maximum frame rate target: Uncapped or fixed FPS (custom value in Insert overlay)",
-                   "Максимальная частота кадров: без лимита или точный FPS (свой в меню Insert)");
+                   "Maximum frame rate: Auto (matches monitor Hz), Uncapped, or fixed FPS (custom value in Insert overlay)",
+                   "Максимальная частота кадров: Авто (под герцовку монитора), без лимита или точный FPS (свой в Insert)");
         const int fps = BbFrameRate::Limit();
-        if (fps <= 0) {
+        if (s.fps_limit_auto.load(std::memory_order_relaxed)) {
+            const int mon_hz = BbSettings::MonitorRefreshHz();
+            const std::string en = mon_hz >= 30 ? fmt::format("Auto ({} Hz)", mon_hz) : "Auto";
+            const std::string ru = mon_hz >= 30 ? fmt::format("Авто ({} Гц)", mon_hz) : "Авто";
+            SetDynamic(val_id, en.c_str(), ru.c_str());
+        } else if (fps <= 0) {
             SetDynamic(val_id, "Uncapped", "Без лимита");
         } else {
             bool is_preset = false;
@@ -2205,7 +2244,7 @@ void RefreshDisplaySlotTexts(int slot) {
         if (lod <= -2) {
             SetDynamic(val_id, "Highest", "Максимальная");
         } else if (lod == 0) {
-            SetDynamic(val_id, "Game Default", "Как в игре");
+            SetDynamic(val_id, "Default", "Стандарт");
         } else if (lod == 1) {
             SetDynamic(val_id, "Lower", "Ниже");
         } else {
@@ -2332,11 +2371,25 @@ void ApplyDisplaySlotChoiceIndex(u8* row, int slot, int choice_idx) {
     if (item_idx == 3) {
         const std::vector<int> fps_vals = BuildFpsValuesList(nullptr);
         if (!fps_vals.empty()) {
-            const int new_fps = fps_vals[std::clamp(choice_idx, 0, int(fps_vals.size()) - 1)];
-            if (new_fps != BbFrameRate::Limit()) {
-                s.fps_limit = new_fps;
-                BbFrameRate::SetLimit(new_fps);
-                BbSettings::Save();
+            const int chosen = fps_vals[std::clamp(choice_idx, 0, int(fps_vals.size()) - 1)];
+            if (chosen < 0) {
+                const int hz = BbSettings::MonitorRefreshHz();
+                const int target = hz >= 30 ? hz : 0;
+                const bool changed = !s.fps_limit_auto.load() || target != BbFrameRate::Limit();
+                s.fps_limit_auto = true;
+                s.fps_limit = target;
+                BbFrameRate::SetLimit(target);
+                if (changed) {
+                    BbSettings::Save();
+                }
+            } else {
+                const bool changed = s.fps_limit_auto.load() || chosen != BbFrameRate::Limit();
+                s.fps_limit_auto = false;
+                s.fps_limit = chosen;
+                BbFrameRate::SetLimit(chosen);
+                if (changed) {
+                    BbSettings::Save();
+                }
             }
         }
         RefreshDisplaySlotTexts(slot);
@@ -2406,8 +2459,9 @@ void ApplyDisplaySlotChoiceIndex(u8* row, int slot, int choice_idx) {
 
     if (item_idx == 9) {
         const int new_tq = std::clamp(choice_idx, 0, 3);
-        if (new_tq != s.texture_quality.load()) {
+        if (new_tq != s.texture_quality.load() || !s.texture_quality_chosen.load()) {
             s.texture_quality = new_tq;
+            s.texture_quality_chosen = true;
             BbSettings::Save();
         }
         RefreshDisplaySlotTexts(slot);
@@ -2418,8 +2472,9 @@ void ApplyDisplaySlotChoiceIndex(u8* row, int slot, int choice_idx) {
     if (item_idx == 10) {
         const int old_sq = std::clamp(s.shadow_quality.load(), 0, 4);
         const int new_sq = std::clamp(choice_idx, 0, 4);
-        if (new_sq != old_sq) {
+        if (new_sq != old_sq || !s.shadow_quality_chosen.load()) {
             s.shadow_quality = new_sq;
+            s.shadow_quality_chosen = true;
             BbSettings::Save();
         }
         RefreshDisplaySlotTexts(slot);
@@ -2500,7 +2555,7 @@ struct EffectsItemMeta {
 constexpr EffectsItemMeta EffectsItems[TotalEffectsItems] = {
     {"Chromatic Aberration", "Хром. аберрация",
      "Red-blue color fringing near screen edges (turning it off makes the image cleaner)",
-     "Красно-синяя окантовка по краям кадра (отключение делает картинку заметно чище)", true},
+     "Красно-синяя окантовка по краям кадра (отключение делает картинку заметно чище)", false},
     {"Depth of Field (DoF)", "Глубина резкости (DoF)",
      "Cinematic background blur for objects outside the camera focus plane",
      "Кинематографическое размытие дальнего фона и объектов вне фокуса камеры", true},
@@ -2518,7 +2573,7 @@ constexpr EffectsItemMeta EffectsItems[TotalEffectsItems] = {
      "Тени в реальном времени от фонарей, факелов, костров и выстрелов", true},
     {"SSR Reflections", "Отражения SSR",
      "Hidden PS4 screen-space raymarched reflections on puddles, blood, and wet stone",
-     "Скрытая на PS4 трассировка экранных отражений в лужах, крови и мокром камне", false},
+     "Скрытая на PS4 трассировка экранных отражений в лужах, крови и мокром камне", true},
     {"Bloom", "Свечение (Bloom)",
      "Soft glow halo around lanterns, fire, moonlight, and arcane effects",
      "Мягкий ореол свечения вокруг фонарей, огня, луны и магии", true},
@@ -2539,10 +2594,10 @@ constexpr EffectsItemMeta EffectsItems[TotalEffectsItems] = {
      "Ремастер Vulkan 1.3: 10-битный вывод HDR10 (Rec.2020 PQ) с расширением яркости огня и луны (включи HDR в ОС)", false},
     {"PCSS Soft Shadows", "Мягкие тени PCSS",
      "Vulkan 1.3 Remaster: physical contact-hardening soft shadows for 4K sun/moon CSM and torch/lantern VSM",
-     "Ремастер Vulkan 1.3: физически мягкие тени PCSS (чёткие у основания, мягкие вдали) для луны, факелов и костров", false},
+     "Ремастер Vulkan 1.3: физически мягкие тени PCSS (чёткие у основания, мягкие вдали) для луны, факелов и костров", true},
     {"Screen-Space GI (SSGI)", "Отражённый свет (SSGI)",
      "Vulkan 1.3 Remaster: horizon-based indirect bounce lighting from fire, lanterns, torches, and sunset sky",
-     "Ремастер Vulkan 1.3: живой отражённый свет (SSGI) от костров, факелов, фонарей и закатного неба на камни и одежду", false},
+     "Ремастер Vulkan 1.3: живой отражённый свет (SSGI) от костров, факелов, фонарей и закатного неба на камни и одежду", true},
     {"Fire Heat Haze", "Тепловое марево огня",
      "Vulkan 1.3 Remaster: subtle convective hot-air refraction rising above bonfires and torches",
      "Ремастер Vulkan 1.3: мягкое конвекционное дрожание горячего воздуха над кострами и факелами", true},
@@ -2589,7 +2644,7 @@ void SyncMotionBlurLegacyFlag() {
     bytes[FirstEffect + 2] = u8(any_on ? 1 : 0);
 }
 
-void SetEffectsItemActive(int item_idx, bool active) {
+void SetEffectsItemActive(int item_idx, bool active, bool commit = true) {
     auto& s = BbSettings::Get();
     const int e = EffectsItemToEffectIdx(item_idx);
     if (e >= 0) {
@@ -2612,8 +2667,10 @@ void SetEffectsItemActive(int item_idx, bool active) {
         case 10: s.ssr_quality = active; break;
         case 11: s.true_black_hdr = active; break;
         case 12:
-            s.hdr_output = active;
-            s.swapchain_generation.fetch_add(1, std::memory_order_relaxed);
+            if (s.hdr_output.load() != active) {
+                s.hdr_output = active;
+                s.swapchain_generation.fetch_add(1, std::memory_order_relaxed);
+            }
             break;
         case 13: s.pcss_shadows = active; break;
         case 14: s.ssgi_enabled = active; break;
@@ -2621,8 +2678,10 @@ void SetEffectsItemActive(int item_idx, bool active) {
         default: break;
         }
     }
-    BbGuestHooks::ApplyGameEffects();
-    BbSettings::Save();
+    if (commit) {
+        BbGuestHooks::ApplyGameEffects();
+        BbSettings::Save();
+    }
 }
 
 int GetMotionBlurItemChoiceIdx(int item_idx) {
@@ -3139,6 +3198,101 @@ void SyncAllEffectsSliders(int new_sel) {
     }
 }
 
+void ResetDisplayPageToDefaults() {
+    auto& s = BbSettings::Get();
+    disp_aspect = BbSettings::AspectAuto;
+    menu_outputs = BbSettings::Outputs(disp_aspect);
+    disp_output_idx =
+        MenuOutputIndex(disp_aspect, BbSettings::NearestOutput(disp_aspect, BbSettings::Monitor()));
+    s.output_res = BbSettings::PackSize(MenuOutput(disp_aspect, disp_output_idx));
+    s.output_res_auto = true;
+    disp_upscaler_choice = DispUpOff;
+    disp_upscale_preset = BbSettings::NativeAA;
+    disp_aa_mode = s.dlss_supported.load() ? AaDlaaCnn : AaSmaaT2x;
+    MarkDisplayHeavyDirty();
+    CommitDebouncedDisplaySettings(s, true);
+    s.output_res_auto = true;
+    s.window_mode = BbSettings::WindowModeBorderless;
+    s.window_mode_chosen = true;
+    s.fps_limit_auto = true;
+    const int mon_hz = BbSettings::MonitorRefreshHz();
+    const int target_fps = (mon_hz >= 30) ? mon_hz : 0;
+    s.fps_limit = target_fps;
+    BbFrameRate::SetLimit(target_fps);
+    SetSharpnessStep(4, false);
+    s.texture_quality = 0;
+    s.texture_quality_chosen = false;
+    s.shadow_quality = 2;
+    s.shadow_quality_chosen = false;
+    s.anisotropic = 16;
+    s.model_lod = -2;
+    values[ModelLod] = 0;
+    applied[ModelLod] = 0;
+    BbGuestHooks::ApplyGameEffects();
+    s.ui_upscale = true;
+    if (s.vsync_mode.load() != BbSettings::VsyncFast) {
+        s.vsync_mode = BbSettings::VsyncFast;
+        s.vsync_mode_chosen = true;
+        s.swapchain_generation.fetch_add(1, std::memory_order_relaxed);
+    }
+    BbSettings::Save();
+    BbSysInfo::LogSettingsIfChanged();
+    RefreshDisplayPage();
+}
+
+void ResetEffectsPageToDefaults() {
+    for (int i = 0; i < TotalEffectsItems; ++i) {
+        SetEffectsItemActive(i, EffectsItems[i].default_on, false);
+    }
+    BbGuestHooks::ApplyGameEffects();
+    BbSettings::Save();
+    BbSysInfo::LogSettingsIfChanged();
+    RefreshEffectsPage();
+}
+
+void ResetControlsPageToDefaults() {
+    for (int k = 0; k < BbSettings::KeyActionCount; ++k) {
+        BbSettings::SetKeyBinding(k, BbSettings::GetKeyActionDef(k).default_val);
+    }
+    BbSettings::Get().camera_follow_mode.store(BbSettings::CameraFollowBalanced,
+                                               std::memory_order_relaxed);
+    BbSettings::Get().loading_tips_timer.store(false, std::memory_order_relaxed);
+    BbFastLoad::SyncLoadingTipsTimer(false);
+    SetMouseSpeedStep(5); // also saves bbport.ini
+    if (active_game_settings) {
+        active_game_settings[0x0] = 5;  // Camera Sensitivity
+        active_game_settings[0x1] = 10; // Controller Vibration
+        active_game_settings[0x9] = 1;  // Camera X-Axis (1 = Normal)
+        active_game_settings[0xa] = 1;  // Camera Y-Axis (1 = Normal)
+        active_game_settings[0xb] = 0;  // Auto Target Switch (0 = Off, matching CSOptionsData::InitDefaults)
+        active_game_settings[0xc] = 1;  // Camera Auto-Adjust (1 = On)
+        CommitActiveControlsNativeSettings();
+    }
+    RefreshControlsPage();
+}
+
+using OptionsPageResetDefaultsFn = void (PS4_SYSV_ABI*)(u8*);
+OptionsPageResetDefaultsFn options_page_reset_defaults_original = nullptr;
+
+void PS4_SYSV_ABI OptionsPageResetDefaultsHook(u8* page) {
+    if (page == active_display_page &&
+        ValidateActivePageRows(page, DisplaySlotCount, &values[FirstDisplaySlot], display_slot_rows)) {
+        ResetDisplayPageToDefaults();
+        return;
+    }
+    if (page == active_effects_page &&
+        ValidateActivePageRows(page, EffectsSlotCount, &values[FirstEffectsSlot], effects_slot_rows)) {
+        ResetEffectsPageToDefaults();
+        return;
+    }
+    if (page == active_controls_page &&
+        ValidateActivePageRows(page, ControlsSlotCount, &values[FirstSlot], slot_rows)) {
+        ResetControlsPageToDefaults();
+        return;
+    }
+    options_page_reset_defaults_original(page);
+}
+
 void PS4_SYSV_ABI OptionsPageNavigateHook(u8* page, u8* input, float frame_time) {
     BbMenuPointer::NoteMenuActive();
     static const u8* last_option_page = nullptr;
@@ -3223,34 +3377,7 @@ u64 PS4_SYSV_ABI RowInputHook(u8* row, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, d
         const int slot = int(val_ptr - &values[FirstDisplaySlot]);
         display_slot_rows[slot] = row;
         if (values[FirstDisplaySlot + slot] == DefaultResetSentinel) {
-            auto& s = BbSettings::Get();
-            disp_aspect = BbSettings::AspectAuto;
-            menu_outputs = BbSettings::Outputs(disp_aspect);
-            disp_output_idx =
-                MenuOutputIndex(disp_aspect, BbSettings::NearestOutput(disp_aspect, BbSettings::Monitor()));
-            s.output_res = BbSettings::PackSize(MenuOutput(disp_aspect, disp_output_idx));
-            s.output_res_auto = true;
-            disp_upscaler_choice = DispUpOff;
-            disp_upscale_preset = BbSettings::NativeAA;
-            disp_aa_mode = AaOff;
-            MarkDisplayHeavyDirty();
-            s.window_mode = BbSettings::WindowModeFullscreen;
-            s.window_mode_chosen = true;
-            s.fps_limit = 30;
-            BbFrameRate::SetLimit(30);
-            SetSharpnessStep(0);
-            s.texture_quality = 0;
-            s.shadow_quality = 2;
-            s.anisotropic = 1;
-            s.model_lod = 0;
-            s.ui_upscale = true;
-            if (s.vsync_mode.load() != BbSettings::VsyncFast) {
-                s.vsync_mode = BbSettings::VsyncFast;
-                s.vsync_mode_chosen = true;
-                s.swapchain_generation.fetch_add(1, std::memory_order_relaxed);
-            }
-            BbSettings::Save();
-            RefreshDisplayPage();
+            ResetDisplayPageToDefaults();
             return 0;
         }
         const int item_idx = std::clamp(display_scroll + slot, 0, TotalDisplayItems - 1);
@@ -3267,7 +3394,7 @@ u64 PS4_SYSV_ABI RowInputHook(u8* row, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, d
             }
             return 0;
         }
-        if (item_idx == 12) {
+        if (item_idx == 13) {
             // 2-choice toggle row (UI & Icons Upscale): uses <| Off / On |> ComboBox arrows.
             SyncDisplaySlotSliderWidget(row, slot, is_focused);
             if (is_focused && in != 0) {
@@ -3302,24 +3429,7 @@ u64 PS4_SYSV_ABI RowInputHook(u8* row, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, d
         slot_rows[slot] = row;
         // If the page's "Defaults" button was pressed, it sets values[FirstSlot + slot] = DefaultResetSentinel.
         if (values[FirstSlot + slot] == DefaultResetSentinel) {
-            for (int k = 0; k < BbSettings::KeyActionCount; ++k) {
-                BbSettings::SetKeyBinding(k, BbSettings::GetKeyActionDef(k).default_val);
-            }
-            BbSettings::Get().camera_follow_mode.store(BbSettings::CameraFollowBalanced,
-                                                       std::memory_order_relaxed);
-            BbSettings::Get().loading_tips_timer.store(false, std::memory_order_relaxed);
-            BbFastLoad::SyncLoadingTipsTimer(false);
-            SetMouseSpeedStep(5); // also saves bbport.ini
-            if (active_game_settings) {
-                active_game_settings[0x0] = 5;  // Camera Sensitivity
-                active_game_settings[0x1] = 10; // Controller Vibration
-                active_game_settings[0x9] = 1;  // Camera X-Axis (1 = Normal)
-                active_game_settings[0xa] = 1;  // Camera Y-Axis (1 = Normal)
-                active_game_settings[0xb] = 0;  // Auto Target Switch (0 = Off, matching CSOptionsData::InitDefaults)
-                active_game_settings[0xc] = 1;  // Camera Auto-Adjust (1 = On)
-                CommitActiveControlsNativeSettings();
-            }
-            RefreshControlsPage();
+            ResetControlsPageToDefaults();
             return 0;
         }
         const int item_idx = std::clamp(controls_scroll + slot, 0, TotalControlsItems - 1);
@@ -3419,10 +3529,7 @@ u64 PS4_SYSV_ABI RowInputHook(u8* row, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, d
         const int slot = int(val_ptr - &values[FirstEffectsSlot]);
         effects_slot_rows[slot] = row;
         if (values[FirstEffectsSlot + slot] == DefaultResetSentinel) {
-            for (int i = 0; i < TotalEffectsItems; ++i) {
-                SetEffectsItemActive(i, EffectsItems[i].default_on);
-            }
-            RefreshEffectsPage();
+            ResetEffectsPageToDefaults();
             return 0;
         }
         // Effects 2-choice toggle row: uses <| Off / On |> ComboBox arrows.
@@ -3731,6 +3838,9 @@ void PatchImage(unsigned char* image, std::uint64_t size) {
         Detour(image, OptionsPageNavigate, AddPageItemPrologue, sizeof(AddPageItemPrologue),
                reinterpret_cast<void*>(&OptionsPageNavigateHook),
                reinterpret_cast<void**>(&options_page_navigate_original), cursor) &&
+        Detour(image, OptionsPageResetDefaults, AddPageItemPrologue, sizeof(AddPageItemPrologue),
+               reinterpret_cast<void*>(&OptionsPageResetDefaultsHook),
+               reinterpret_cast<void**>(&options_page_reset_defaults_original), cursor) &&
         Detour(image, RowInput, RowInputPrologue, sizeof(RowInputPrologue),
                reinterpret_cast<void*>(&RowInputHook), reinterpret_cast<void**>(&row_input_original), cursor) &&
         Detour(image, BindCommandList, AddPageItemPrologue, sizeof(AddPageItemPrologue),

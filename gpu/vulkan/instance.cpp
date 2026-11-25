@@ -9,6 +9,7 @@
 #include <fmt/ranges.h>
 #include <vk_mem_alloc.h>
 
+#include "bbport_settings.h"
 #include "bbport_toggles.h"
 #include "render/gcn_to_vk.h"
 #include "sdl_window.h"
@@ -673,11 +674,17 @@ void Instance::ComputeMemoryBudget() {
     if (!IsIntegrated()) {
         // Some for the system.
         total_memory_budget -= std::min<u64>(total_memory_budget / 8, 1_GB);
+        const u64 effective_vram =
+            (VramLimit() != 0) ? std::min(local_memory, VramLimit()) : local_memory;
+        BbSettings::ConfigureVramDefaults(effective_vram);
         return;
     }
     // At least 8 GiB left for the system on integrated GPUs.
     const s64 available = s64(total_memory_budget - initial_usage);
     total_memory_budget = u64(std::max<s64>(available - s64(8_GB), s64(local_memory)));
+    const u64 effective_igpu_vram =
+        (VramLimit() != 0) ? std::min(total_memory_budget, VramLimit()) : total_memory_budget;
+    BbSettings::ConfigureVramDefaults(effective_igpu_vram);
 }
 
 u64 Instance::GetDeviceMemoryUsage() const {

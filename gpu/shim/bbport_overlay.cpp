@@ -795,6 +795,7 @@ void Menu() {
         int tq_idx = std::clamp(s.texture_quality.load(), 0, 3);
         if (ImGui::Combo(BbSettings::MenuText("Texture quality", "Качество текстур"),
                          &tq_idx, tq_labels, 4)) {
+            s.texture_quality_chosen = true;
             Store(s.texture_quality, tq_idx, true);
         }
     }
@@ -809,8 +810,9 @@ void Menu() {
         if (ImGui::Combo(BbSettings::MenuText("Shadow quality", "Качество теней"),
                          &sq_idx, sq_labels, 5)) {
             const int old_sq = std::clamp(s.shadow_quality.load(), 0, 4);
-            if (sq_idx != old_sq) {
+            if (sq_idx != old_sq || !s.shadow_quality_chosen.load()) {
                 s.shadow_quality = sq_idx;
+                s.shadow_quality_chosen = true;
                 BbSettings::Save();
                 BbSysInfo::LogSettingsIfChanged();
             }
@@ -841,7 +843,7 @@ void Menu() {
         "анизотропная реконструкция граней + векторный SDF-контур) для логотипа Bloodborne, "
         "иконок оружия/брони/предметов и атласов HUD."));
     const char* lods[] = {BbSettings::MenuText("Highest (-2)", "Максимальная (-2)"),
-                          BbSettings::MenuText("Game default", "Как в игре"),
+                          BbSettings::MenuText("Default (0)", "Стандарт (0)"),
                           BbSettings::MenuText("Lower (1)", "Ниже (1)"),
                           BbSettings::MenuText("Lowest (2)", "Минимальная (2)")};
     static constexpr int lod_values[] = {-2, 0, 1, 2};
@@ -1002,29 +1004,63 @@ void Menu() {
 
     ImGui::SeparatorText(BbSettings::MenuText("Frame rate limit", "Лимит кадров (FPS)"));
     {
-        static const int steps[] = {0, 30, 60, 90, 120, 144, 165, 170, 240, 360};
-        static const char* labels[] = {"Uncapped (Unlimited)", "30", "60", "90", "120", "144", "165", "170", "240", "360"};
-        static const char* labels_ru[] = {"Без лимита (Анлимит)", "30", "60", "90", "120", "144", "165", "170", "240", "360"};
-        constexpr int step_count = int(sizeof(steps) / sizeof(steps[0]));
+        static const int base_steps[] = {-1, 0, 30, 60, 72, 75, 90, 100, 120, 144, 165, 170, 180, 200, 240, 280, 300, 360, 480};
+        std::vector<int> steps(std::begin(base_steps), std::end(base_steps));
+        const int mon_hz = BbSettings::MonitorRefreshHz();
+        if (mon_hz >= 30 && std::find(steps.begin(), steps.end(), mon_hz) == steps.end()) {
+            steps.push_back(mon_hz);
+            std::sort(steps.begin() + 2, steps.end());
+        }
+        const bool is_auto = s.fps_limit_auto.load(std::memory_order_relaxed);
         const int cur_limit = BbFrameRate::Limit();
         int index = -1;
-        for (int i = 0; i < step_count; ++i) {
-            if (steps[i] == cur_limit) index = i;
-        }
-        char combo_preview[48];
-        if (index >= 0) {
-            std::snprintf(combo_preview, sizeof(combo_preview), "%s",
-                          BbSettings::MenuText(labels[index], labels_ru[index]));
+        if (is_auto) {
+            index = 0;
         } else {
-            std::snprintf(combo_preview, sizeof(combo_preview),
-                          BbSettings::MenuText("%d FPS (Custom)", "%d FPS (Свой)"), cur_limit);
+            for (int i = 1; i < int(steps.size()); ++i) {
+                if (steps[i] == cur_limit) {
+                    index = i;
+                    break;
+                }
+            }
+        }
+        auto format_fps_step = [&](int val) -> std::string {
+            if (val < 0) {
+                if (mon_hz >= 30) {
+                    char buf[48];
+                    std::snprintf(buf, sizeof(buf), BbSettings::MenuText("Auto (%d Hz)", "Авто (%d Гц)"), mon_hz);
+                    return buf;
+                }
+                return BbSettings::MenuText("Auto", "Авто");
+            }
+            if (val == 0) {
+                return BbSettings::MenuText("Uncapped (Unlimited)", "Без лимита (Анлимит)");
+            }
+            return std::to_string(val);
+        };
+        std::string combo_preview;
+        if (index >= 0) {
+            combo_preview = format_fps_step(steps[index]);
+        } else {
+            char buf[48];
+            std::snprintf(buf, sizeof(buf), BbSettings::MenuText("%d FPS (Custom)", "%d FPS (Свой)"), cur_limit);
+            combo_preview = buf;
         }
         if (ImGui::BeginCombo(BbSettings::MenuText("Preset (F3: 30 FPS toggle)", "Пресет (F3: 30 FPS вкл/выкл)"),
-                              combo_preview)) {
-            for (int i = 0; i < step_count; ++i) {
-                if (ImGui::Selectable(BbSettings::MenuText(labels[i], labels_ru[i]), i == index)) {
-                    Store(s.fps_limit, steps[i], true);
-                    BbFrameRate::SetLimit(steps[i]);
+                              combo_preview.c_str())) {
+            for (int i = 0; i < int(steps.size()); ++i) {
+                const std::string lbl = format_fps_step(steps[i]);
+                if (ImGui::Selectable(lbl.c_str(), i == index)) {
+                    if (steps[i] < 0) {
+                        const int target = (mon_hz >= 30) ? mon_hz : 0;
+                        s.fps_limit_auto = true;
+                        Store(s.fps_limit, target, true);
+                        BbFrameRate::SetLimit(target);
+                    } else {
+                        s.fps_limit_auto = false;
+                        Store(s.fps_limit, steps[i], true);
+                        BbFrameRate::SetLimit(steps[i]);
+                    }
                 }
             }
             ImGui::EndCombo();
@@ -1034,14 +1070,15 @@ void Menu() {
                                                   "Точный FPS (Ctrl+клик — ввести число)"),
                              &custom_fps, 0, 5000, custom_fps == 0 ? "Uncapped (Unlimited)" : "%d FPS")) {
             if (custom_fps > 0 && custom_fps < 30) custom_fps = 30;
+            s.fps_limit_auto = false;
             Store(s.fps_limit, custom_fps, true);
             BbFrameRate::SetLimit(custom_fps);
         }
         Hint(BbSettings::MenuText(
-            "Saved in bbport.ini. Set 0 for uncapped frame rate, or Ctrl+click the slider to type "
+            "Saved in bbport.ini. Auto matches your monitor Hz, 0 = uncapped, or Ctrl+click slider to type "
             "any exact target (e.g. 165, 170, 180). At 30 FPS the cinematic of Laurence does not hang.",
-            "Сохраняется в bbport.ini. 0 — без лимита, либо Ctrl+клик по ползунку для ввода любого "
-            "точного числа (например, 165, 170, 180). На 30 FPS кинематика Лоуренса не зависает."));
+            "Сохраняется в bbport.ini. Авто подбирает герцовку монитора, 0 — без лимита, либо Ctrl+клик по ползунку "
+            "для ввода точного числа. На 30 FPS кинематика Лоуренса не зависает."));
     }
     ImGui::SeparatorText(BbSettings::MenuText("Controls (Keyboard & Mouse)", "Управление (Клавиатура и мышь)"));
     if (ImGui::CollapsingHeader(

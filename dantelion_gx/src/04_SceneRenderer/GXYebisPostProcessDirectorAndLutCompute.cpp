@@ -2283,6 +2283,22 @@ void sub_21d5f80(void* self, void* renderCmdCtx, void* filterParam) {
             postArgs.dof_af_sens        = *reinterpret_cast<const float*>(param + 0x190);
 
             if (gx_direct_vk::EmitNativePostProcess(gnm + 0x010, postArgs)) {
+                // Keep Yebis2's 4 MiB GfxContext DCB/CCB rewound while NativePostFX bypasses
+                // Part B/C submit+reset so any setup commands never accumulate across frames/warps.
+                auto* activeYebis = static_cast<uint8_t*>(g_ActiveYebisGpuCtx_56c3cb8);
+                if (activeYebis != nullptr) {
+                    const uint64_t cmdBegin = *reinterpret_cast<const uint64_t*>(activeYebis + 0x000);
+                    const uint64_t cmdCur   = *reinterpret_cast<const uint64_t*>(activeYebis + 0x010);
+                    const uint64_t ccbBegin = *reinterpret_cast<const uint64_t*>(activeYebis + 0x080);
+                    const uint64_t ccbCur   = *reinterpret_cast<const uint64_t*>(activeYebis + 0x090);
+                    if (cmdCur > cmdBegin || ccbCur > ccbBegin) {
+                        sub_10946d0(activeYebis);
+                        g_ActiveYebisGfxc0_56c3cc0    = activeYebis;
+                        g_ActiveYebisGfxc1_56c3cc8    = activeYebis + 0x080;
+                        g_ActiveYebisCmdBase0_56c3cd0 = *reinterpret_cast<const uint64_t*>(activeYebis + 0x000);
+                        g_ActiveYebisCmdBase1_56c3cd8 = *reinterpret_cast<const uint64_t*>(activeYebis + 0x080);
+                    }
+                }
                 sub_219fcf0(curDevCtx);
                 return;
             }

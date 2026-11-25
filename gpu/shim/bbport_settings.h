@@ -38,13 +38,13 @@ struct Effect {
     bool default_on;
 };
 inline constexpr Effect Effects[] = {
-    {"effect_chromatic_aberration", "Chromatic aberration", "Хроматическая аберрация", true},
+    {"effect_chromatic_aberration", "Chromatic aberration", "Хроматическая аберрация", false},
     {"effect_dof", "Depth of field (DoF)", "Глубина резкости (DoF)", true},
     {"effect_motion_blur", "Motion blur", "Размытие в движении", true},
     {"effect_ssao", "Ambient occlusion (SSAO)", "Затенение SSAO", true},
-    {"effect_game_aa", "Game's own anti-aliasing", "Собственное сглаживание игры", true},
+    {"effect_game_aa", "Game's own anti-aliasing", "Собственное сглаживание игры", false},
     {"effect_dynamic_shadows", "Shadows from dynamic lights", "Тени от динамических источников", true},
-    {"effect_ssr", "Screen-space reflections (not in original game)", "Отражения SSR (не было в игре)", false},
+    {"effect_ssr", "Screen-space reflections (not in original game)", "Отражения SSR (не было в игре)", true},
     {"effect_bloom", "Bloom", "Свечение (Bloom)", true},
     {"skip_intro", "Skip startup intros", "Пропуск заставок при запуске", true},
     {"debug_camera", "Free camera (Cross + L3)", "Свободная камера (Cross + L3)", false},
@@ -132,7 +132,7 @@ constexpr OutputSize UnpackSize(std::uint32_t v) {
 }
 /// An aspect ratio's outputs, smallest first.
 struct OutputList {
-    std::array<OutputSize, 12> sizes{};
+    std::array<OutputSize, 16> sizes{};
     int count = 0;
     const OutputSize* begin() const { return sizes.data(); }
     const OutputSize* end() const { return sizes.data() + count; }
@@ -140,9 +140,10 @@ struct OutputList {
 };
 /// bbport.ini value ("auto", "4:3", "16:10", "16:9", "21:9", "32:9").
 const char* AspectKey(int aspect);
-/// The monitor the game's window is on (window.cpp): Auto follows it. 0x0 until known.
-void SetMonitor(int width, int height);
+/// The monitor the game's window is on (window.cpp): Auto follows it. 0x0 / 0 Hz until known.
+void SetMonitor(int width, int height, int refresh_hz = 0);
 OutputSize Monitor();
+int MonitorRefreshHz();
 /// Auto resolved to the group nearest the monitor's aspect ratio (16:9 until it is known).
 int ResolvedAspect(int aspect);
 /// The output resolutions of an aspect ratio (Auto: the monitor's group and its own size).
@@ -160,14 +161,14 @@ struct Values {
     /// the menu merely started with keeps following the launcher's (#134).
     std::atomic<bool> menu_language_chosen{false};
     std::atomic<int> upscaler{UpscalerOff};
-    std::atomic<int> aa_mode{AaOff};
+    std::atomic<int> aa_mode{AaDlaaCnn};
     std::atomic<bool> aa_mode_chosen{false};
     std::atomic<int> preset{NativeAA};
-    std::atomic<bool> sharpen{false};
-    std::atomic<float> sharpness{0.0f};
+    std::atomic<bool> sharpen{true};
+    std::atomic<float> sharpness{0.80f};
     std::atomic<bool> jitter{true};
     std::atomic<bool> reactive{false};
-    std::atomic<bool> object_motion{true};
+    std::atomic<bool> object_motion{false};
     std::atomic<float> reactive_scale{1.0f};
     std::atomic<float> reactive_threshold{0.2f};
     std::atomic<float> reactive_max{0.9f};
@@ -182,9 +183,9 @@ struct Values {
     std::atomic<int> active_render_width{1920}, active_render_height{1080};
     /// Applied at start (patches.py); the menu shows when a restart is needed.
     std::atomic<bool> effects[EffectCount]{};
-    std::atomic<int> model_lod{0}; ///< -2 highest .. 2 lowest, 0 the game's
+    std::atomic<int> model_lod{-2}; ///< -2 highest .. 2 lowest, 0 the game's
     std::atomic<int> aspect{AspectAuto};
-    std::atomic<int> window_mode{WindowModeFullscreen};
+    std::atomic<int> window_mode{WindowModeBorderless};
     std::atomic<bool> window_mode_chosen{false};
     /// The chosen output resolution (PackSize; CurrentOutput fits it to the aspect ratio).
     std::atomic<std::uint32_t> output_res{PackSize(OutputDefault)};
@@ -217,12 +218,15 @@ struct Values {
     std::atomic<int> dlss_preset{11};
     /// World BC texture quality mip skip: 0 = Default (Mip 0), 1 = Medium (Mip 1), 2 = Low (Mip 2), 3 = Very Low (Mip 3).
     std::atomic<int> texture_quality{0};
+    std::atomic<bool> texture_quality_chosen{false};
     /// Shadow quality preset: 0 = Off, 1 = Low (2K CSM), 2 = Default (4K CSM), 3 = High (4K Full + Contact), 4 = Ultra (8K CSM + PCSS).
     std::atomic<int> shadow_quality{2};
+    std::atomic<bool> shadow_quality_chosen{false};
     /// Forced anisotropic filtering on scene textures: 16, 8, 4, or 1/0 (game default).
-    std::atomic<int> anisotropic{1};
-    /// Persistent FPS limit (0 = Uncapped, or 30..1000).
-    std::atomic<int> fps_limit{30};
+    std::atomic<int> anisotropic{16};
+    /// Persistent FPS limit (0 = Uncapped, or 30..5000; auto = monitor refresh Hz).
+    std::atomic<int> fps_limit{0};
+    std::atomic<bool> fps_limit_auto{true};
     /// Swapchain VSync mode: 0 = Fast (Mailbox), 1 = On (Fifo), 2 = Off (Immediate).
     std::atomic<int> vsync_mode{VsyncFast};
     std::atomic<bool> vsync_mode_chosen{false};
@@ -242,9 +246,9 @@ struct Values {
     /// Native 10-bit HDR10 (Rec.2020 ST.2084 PQ) Vulkan swapchain output with highlight expansion.
     std::atomic<bool> hdr_output{false};
     /// PCSS Contact-Hardening Soft Shadows (blocker-distance penumbra for 4K CSM + VSM point lights).
-    std::atomic<bool> pcss_shadows{false};
+    std::atomic<bool> pcss_shadows{true};
     /// Horizon-Based Screen-Space Global Illumination (HBIL indirect bounce lighting in GXLightComposite).
-    std::atomic<bool> ssgi_enabled{false};
+    std::atomic<bool> ssgi_enabled{true};
     /// Native Vulkan 1.3 Post-Process pipeline (default base renderer; legacy Yebis2 kept as hidden A/B debug).
     std::atomic<bool> native_postfx{true};
     /// Convective heat-haze air refraction rising above blazing fires & torches (Native PostFX).
@@ -327,8 +331,10 @@ const char* MenuText(const char* english, const char* russian);
 void Load();
 /// Checks the loaded choice before the first frame; unsupported FSR 4 uses FSR 3.1.
 void ConfigureUpscalerSupport(bool fsr4, bool fsr411);
-/// After device creation: DLSS availability; a DLSS setting falls back to FSR 3.1 without it.
+/// After device creation: DLSS availability; a DLSS/DLAA setting falls back cleanly without it.
 void ConfigureDlssSupport(bool available, const char* problem);
+/// Caps unchosen Texture/Shadow defaults gently on <= 4.5 GiB VRAM GPUs to prevent paging stalls.
+void ConfigureVramDefaults(std::uint64_t vram_bytes);
 /// Startup-patched scene dimensions cannot change until run.sh prepares a new image.
 bool FixedRenderSession();
 int EffectiveUpscaler();
