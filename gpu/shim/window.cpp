@@ -179,10 +179,18 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
     const BbSettings::OutputSize init_out = BbSettings::CurrentOutput();
     const s32 init_w = init_out.width > 0 ? init_out.width : width_;
     const s32 init_h = init_out.height > 0 ? init_out.height : height_;
+    float init_density = 1.0f;
+    if (const SDL_DisplayMode* mode = SDL_GetDesktopDisplayMode(display);
+        mode && mode->pixel_density > 1.0f) {
+        init_density = mode->pixel_density;
+    }
+    const s32 init_logical_w = std::max<s32>(320, s32(std::lround(double(init_w) / init_density)));
+    const s32 init_logical_h = std::max<s32>(200, s32(std::lround(double(init_h) / init_density)));
     SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_X_NUMBER, SDL_WINDOWPOS_CENTERED_DISPLAY(display));
     SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_Y_NUMBER, SDL_WINDOWPOS_CENTERED_DISPLAY(display));
-    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_WIDTH_NUMBER, init_w);
-    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_HEIGHT_NUMBER, init_h);
+    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_WIDTH_NUMBER, init_logical_w);
+    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_HEIGHT_NUMBER, init_logical_h);
+    SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_HIGH_PIXEL_DENSITY_BOOLEAN, true);
     SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_RESIZABLE_BOOLEAN, true);
     SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_BORDERLESS_BOOLEAN,
                            init_mode == BbSettings::WindowModeBorderless);
@@ -481,6 +489,7 @@ bool WindowSDL::PollEvents() {
         }
         switch (event.type) {
         case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
+        case SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED:
         case SDL_EVENT_WINDOW_RESIZED: {
             int w = 0, h = 0;
             SDL_GetWindowSizeInPixels(window, &w, &h);
@@ -596,7 +605,11 @@ void WindowSDL::ApplyWindowMode(int mode, s32 target_w, s32 target_h) {
         SDL_RestoreWindow(window);
         SDL_SetWindowBordered(window, true);
         SDL_SetWindowResizable(window, true);
-        SDL_SetWindowSize(window, win_w, win_h);
+        const float density = SDL_GetWindowPixelDensity(window);
+        const float scale = density > 1.0f ? density : 1.0f;
+        const s32 logical_w = std::max<s32>(320, s32(std::lround(double(win_w) / scale)));
+        const s32 logical_h = std::max<s32>(200, s32(std::lround(double(win_h) / scale)));
+        SDL_SetWindowSize(window, logical_w, logical_h);
         SDL_SetWindowPosition(window, SDL_WINDOWPOS_CENTERED_DISPLAY(display),
                               SDL_WINDOWPOS_CENTERED_DISPLAY(display));
         SDL_SyncWindow(window);

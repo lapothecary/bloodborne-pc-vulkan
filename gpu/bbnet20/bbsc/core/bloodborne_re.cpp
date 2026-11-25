@@ -10950,16 +10950,13 @@ bool BbscMessagesEnabled() {
     return enabled;
 }
 
-// The string-offset table entry holding the text of (category, id), and the FMG it is relative
-// to; 0 when that category or id is not loaded.
-u64 FindBbscMessageSlot(u32 category, u32 id, u64* fmg_out) {
+u64 ResolveBbscCategories() {
     const u64 repo = ReadValue<u64>(image_base + MsgRepositoryPointerOffset, 0);
     const u64 versions = ReadablePointer(repo, 0x10) ? ReadValue<u64>(repo, 0x08) : 0;
-    const u64 categories = ReadablePointer(versions, 0x08) ? ReadValue<u64>(versions, 0x00) : 0;
-    if (categories == 0 || !ReadablePointer(categories, (category + 1) * sizeof(u64))) {
-        return 0;
-    }
-    const u64 fmg = ReadValue<u64>(categories, category * sizeof(u64));
+    return ReadablePointer(versions, 0x08) ? ReadValue<u64>(versions, 0x00) : 0;
+}
+
+u64 FindBbscMessageSlotInFmg(u64 fmg, u32 id) {
     if (!ReadablePointer(fmg, 0x30)) {
         return 0;
     }
@@ -10972,11 +10969,17 @@ u64 FindBbscMessageSlot(u32 category, u32 id, u64* fmg_out) {
         !ReadablePointer(fmg + 0x28, static_cast<size_t>(groups) * 0x10)) {
         return 0;
     }
+    // The entire group table is validated as one readable host mapping above: read entries
+    // directly instead of taking the VMA protection lock 3x per group.
+    const auto* group_base = reinterpret_cast<const u8*>(fmg + 0x28);
     for (s32 g = 0; g < groups; ++g) {
-        const u64 group = fmg + 0x28 + static_cast<u64>(g) * 0x10;
-        const s32 first_index = ReadValue<s32>(group, 0x00);
-        const u32 first_id = ReadValue<u32>(group, 0x04);
-        const u32 last_id = ReadValue<u32>(group, 0x08);
+        const u8* entry = group_base + static_cast<size_t>(g) * 0x10;
+        s32 first_index = 0;
+        u32 first_id = 0;
+        u32 last_id = 0;
+        std::memcpy(&first_index, entry + 0x00, sizeof(first_index));
+        std::memcpy(&first_id, entry + 0x04, sizeof(first_id));
+        std::memcpy(&last_id, entry + 0x08, sizeof(last_id));
         if (id < first_id || id > last_id) {
             continue;
         }
@@ -10984,36 +10987,82 @@ u64 FindBbscMessageSlot(u32 category, u32 id, u64* fmg_out) {
         if (!ReadablePointer(slot, 8)) {
             return 0;
         }
-        *fmg_out = fmg;
         return slot;
     }
     return 0;
 }
 
+// The string-offset table entry holding the text of (category, id), and the FMG it is relative
+// to; 0 when that category or id is not loaded.
+u64 FindBbscMessageSlot(u32 category, u32 id, u64* fmg_out) {
+    const u64 categories = ResolveBbscCategories();
+    if (categories == 0 || !ReadablePointer(categories, (category + 1) * sizeof(u64))) {
+        return 0;
+    }
+    const u64 fmg = ReadValue<u64>(categories, category * sizeof(u64));
+    const u64 slot = FindBbscMessageSlotInFmg(fmg, id);
+    if (slot == 0) {
+        return 0;
+    }
+    *fmg_out = fmg;
+    return slot;
+}
+
 void TickBbscMessages() {
+    struct CachedBbscSlot {
+        u64 fmg = 0;
+        u64 slot = 0;
+    };
     static s64 last_ms = 0;
     static size_t logged = 0;
+    static u64 cached_categories = 0;
+    static std::array<CachedBbscSlot, std::size(BbscMessages)> cache{};
     const s64 now = SteadyNowMs();
     if (image_base == 0 || !BbscMessagesEnabled() || now - last_ms < 2'000) {
         return;
     }
     last_ms = now;
+    const u64 categories = ResolveBbscCategories();
+    if (categories == 0) {
+        return;
+    }
+    if (categories != cached_categories) {
+        cache.fill({});
+        cached_categories = categories;
+    }
     size_t changed = 0;
     size_t in_place = 0;
-    for (const auto& message : BbscMessages) {
+    u32 last_category = ~0u;
+    u64 last_fmg = 0;
+    for (size_t i = 0; i < std::size(BbscMessages); ++i) {
+        const auto& message = BbscMessages[i];
         if (message.category == 30 && (message.id == 105199 || message.id == 105299)) {
             continue; // the boss battle line, see TickBbscBossLine
         }
-        u64 fmg = 0;
-        const u64 slot = FindBbscMessageSlot(message.category, message.id, &fmg);
-        if (slot == 0) {
+        if (message.category != last_category) {
+            last_category = message.category;
+            last_fmg = ReadablePointer(categories, (message.category + 1) * sizeof(u64))
+                           ? ReadValue<u64>(categories, message.category * sizeof(u64))
+                           : 0;
+        }
+        if (last_fmg == 0) {
             continue;
         }
-        const u64 wanted = reinterpret_cast<u64>(message.text) - fmg;
-        if (ReadValue<u64>(slot, 0) == wanted) {
+        auto& cached = cache[i];
+        if (cached.slot == 0 || cached.fmg != last_fmg) {
+            cached.fmg = last_fmg;
+            cached.slot = FindBbscMessageSlotInFmg(last_fmg, message.id);
+        }
+        if (cached.slot == 0) {
+            continue;
+        }
+        const u64 wanted = reinterpret_cast<u64>(message.text) - cached.fmg;
+        if (ReadValue<u64>(cached.slot, 0) == wanted) {
             ++in_place;
-        } else if (WriteValue<u64>(slot, 0, wanted)) {
+        } else if (WriteValue<u64>(cached.slot, 0, wanted)) {
             ++changed;
+        } else {
+            cached = {};
         }
     }
     if (changed != 0 || (in_place != logged && in_place == std::size(BbscMessages))) {

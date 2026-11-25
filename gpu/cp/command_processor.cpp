@@ -1374,8 +1374,8 @@ void CommandProcessor::Run(std::stop_token stop) {
                 queue.works.pop_front();
                 queue.pending_works.fetch_sub(1u, std::memory_order_release);
                 last_decoded = nullptr;
-                const u32 remaining = --num_submits;
                 std::scoped_lock submit_lock{submit_mutex};
+                const u32 remaining = --num_submits;
                 ++decoded_total;
                 frame_end = !frame_ends.empty() && frame_ends.front().first <= decoded_total;
                 if (remaining == 0 || frame_end) {
@@ -1655,7 +1655,9 @@ void CommandProcessor::SubmitGfx(std::span<const u32> dcb, std::span<const u32> 
     auto* draw_prep = rasterizer ? &rasterizer->GetDrawPreparation() : nullptr;
     auto prepared = draw_prep ? draw_prep->CreateRaw(dcb, work->copy) : nullptr;
     {
-        // Numbering, enqueueing and queueing under one lock keep the three orders the same.
+        // Numbering, enqueueing, queueing and submission accounting under one lock order
+        // (`queue.mutex` -> `submit_mutex`, matching `Run`) prevent the decoder from popping
+        // a newly queued item and decrementing `num_submits` before it is incremented.
         std::scoped_lock lock{queue.mutex};
         if (draw_prep) {
             work->seq = gfx_submit_seq++;
@@ -1664,13 +1666,15 @@ void CommandProcessor::SubmitGfx(std::span<const u32> dcb, std::span<const u32> 
         BbFreeCheck::NoteSubmit(work->seq, work->copy ? work->copy->guest_dcb : dcb.data(),
                                 dcb.size_bytes());
         queue.works.push_back(std::move(work));
+        {
+            std::scoped_lock submit_lock{submit_mutex};
+            ++num_submits;
+            ++submissions_total;
+            BbTimeline::Note(BbTimeline::GuestSubmit, 0, submissions_total);
+            work_retired = false;
+        }
         queue.pending_works.fetch_add(1u, std::memory_order_release);
     }
-    std::scoped_lock lock{submit_mutex};
-    ++num_submits;
-    ++submissions_total;
-    BbTimeline::Note(BbTimeline::GuestSubmit, 0, submissions_total);
-    work_retired = false;
     submit_cv.notify_one();
 }
 
@@ -1684,16 +1688,18 @@ void CommandProcessor::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
     {
         std::scoped_lock lock{queue.mutex};
         queue.works.push_back(std::move(work));
+        {
+            std::scoped_lock submit_lock{submit_mutex};
+            const u32 min_mapped = gnm_vqid + 1u;
+            if (min_mapped > num_mapped_queues.load(std::memory_order_relaxed)) {
+                num_mapped_queues.store(min_mapped, std::memory_order_release);
+            }
+            ++num_submits;
+            ++submissions_total;
+            work_retired = false;
+        }
         queue.pending_works.fetch_add(1u, std::memory_order_release);
     }
-    std::scoped_lock lock{submit_mutex};
-    const u32 min_mapped = gnm_vqid + 1u;
-    if (min_mapped > num_mapped_queues.load(std::memory_order_relaxed)) {
-        num_mapped_queues.store(min_mapped, std::memory_order_release);
-    }
-    ++num_submits;
-    ++submissions_total;
-    work_retired = false;
     submit_cv.notify_one();
 }
 

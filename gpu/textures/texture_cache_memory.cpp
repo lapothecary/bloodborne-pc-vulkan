@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <vector>
 
 #include "bbport_free_check.h"
 #include "common/scope_exit.h"
@@ -330,34 +331,53 @@ void TextureCache::GarbageCollectImages() {
 }
 
 void TextureCache::GarbageCollectSamplers() {
-    const u64 used = samplers.size();
-    if (used < trigger_gc_samplers) {
-        return;
-    }
-    std::scoped_lock lock{samplers_mutex};
-    size_t deletions = 0;
-    u64 below_tick = 0;
-    const auto configure = [&](bool allow_aggressive) {
-        const bool pressured = used >= pressure_gc_samplers;
-        const bool aggressive = allow_aggressive && used >= critical_gc_samplers;
-        below_tick = gc_tick - std::min<u64>(aggressive ? 160 : pressured ? 80 : 16, gc_tick);
-        deletions = aggressive ? 40 : pressured ? 20 : 10;
-    };
-    const auto evict = [&](u64 key) {
-        if (deletions == 0) {
-            return true;
+    std::vector<Sampler> retired;
+    {
+        std::scoped_lock lock{samplers_mutex};
+        if (gc_tick == 0 || samplers.size() < trigger_gc_samplers) {
+            return;
         }
-        --deletions;
-        sampler_lru.Free(samplers.at(key).lru_id);
-        samplers.erase(key);
-        sampler_evict_gen.fetch_add(1, std::memory_order_relaxed);
-        return false;
-    };
-    configure(false);
-    sampler_lru.ForEachItemBelow(below_tick, evict);
-    if (used >= critical_gc_samplers) {
-        configure(true);
-        sampler_lru.ForEachItemBelow(below_tick, evict);
+        size_t deletions = 0;
+        u64 below_tick = 0;
+        const auto run_pass = [&](u64 min_age, size_t max_deletions) {
+            // Never evict samplers used on the current `gc_tick` (strictly `below_tick < gc_tick`).
+            if (gc_tick <= min_age) {
+                return;
+            }
+            below_tick = gc_tick - min_age;
+            deletions = max_deletions;
+            const auto evict = [&](u64 key) {
+                if (deletions == 0) {
+                    return true;
+                }
+                auto it = samplers.find(key);
+                if (it == samplers.end()) {
+                    return false;
+                }
+                --deletions;
+                sampler_lru.Free(it->second.lru_id);
+                retired.push_back(std::move(it.value()));
+                samplers.erase(it);
+                sampler_evict_gen.fetch_add(1, std::memory_order_release);
+                return false;
+            };
+            sampler_lru.ForEachItemBelow(below_tick, evict);
+        };
+
+        const u64 used = samplers.size();
+        const bool pressured = used >= pressure_gc_samplers;
+        run_pass(pressured ? 64u : 160u, pressured ? 20u : 10u);
+        if (samplers.size() >= critical_gc_samplers) {
+            run_pass(16u, 40u);
+        }
+        if (samplers.size() >= critical_gc_samplers) {
+            // Emergency cap protection: evict any sampler older than the current tick.
+            run_pass(1u, 64u);
+        }
+    }
+    if (!retired.empty()) {
+        // Defer vkDestroySampler until all in-flight GPU work referencing these samplers finishes.
+        scheduler.DeferOperation([retired = std::move(retired)]() mutable { retired.clear(); });
     }
 }
 
