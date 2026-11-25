@@ -4293,21 +4293,20 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
             }
             const auto& s = BbSettings::Get();
             if (s.ssgi_enabled.load(std::memory_order_relaxed) &&
-                state.color_attachments[0].image_view && buffer_infos.size() >= 2u) {
+                state.color_attachments[0].image_view && ps_info_sort->buffers.size() >= 2u &&
+                buffer_infos.size() >= 2u) {
                 vk::ImageView ps_imgs[6]{};
                 u32 img_count = 0u;
                 for (const auto& w : set_writes) {
-                    if (w.descriptorType == vk::DescriptorType::eSampledImage && w.pImageInfo) {
-                        if (img_count < 6u) {
-                            ps_imgs[img_count++] = w.pImageInfo->imageView;
-                        } else {
-                            for (u32 k = 0u; k < 5u; ++k) ps_imgs[k] = ps_imgs[k + 1u];
-                            ps_imgs[5] = w.pImageInfo->imageView;
-                        }
+                    if (w.descriptorType == vk::DescriptorType::eSampledImage && w.pImageInfo &&
+                        img_count < 6u) {
+                        ps_imgs[img_count++] = w.pImageInfo->imageView;
                     }
                 }
                 if (img_count == 6u) {
-                    const u32 ssbo2_slot = static_cast<u32>(buffer_infos.size() - 1u);
+                    // SwStage::Fragment (0) is bound before SwStage::Vertex (3):
+                    // buffer_infos[0] = ps_32e47788 ssbo_1 (fog), buffer_infos[1] = ssbo_2 (invViewProj).
+                    constexpr u32 ssbo2_slot = 1u;
                     const u32 d1_dw = static_cast<u32>(push_data.buf_offsets[ssbo2_slot]) >> 2u;
                     native_postfx->ExecuteHalfResSsgi(
                         cb0_img, state.color_attachments[0].image_view,

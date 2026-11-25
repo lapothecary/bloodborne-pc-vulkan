@@ -44,51 +44,56 @@ void main() {
         float w_sum = 0.0;
 
         if (d_min >= 0.99995) {
-            // Sky quad: store sky dome radiance from amb_tex (fs_img5) with depth = 1.0.
+            // Sky quad: store sky dome radiance from amb_tex (fs_img5) with inv_depth = 0.0.
             rad_sum = max(texelFetch(amb_tex, p00, 0).rgb, vec3(0.0))
                     + max(texelFetch(amb_tex, p10, 0).rgb, vec3(0.0))
                     + max(texelFetch(amb_tex, p01, 0).rgb, vec3(0.0))
                     + max(texelFetch(amb_tex, p11, 0).rgb, vec3(0.0));
-            imageStore(dst_img, ivec2(px), vec4(rad_sum * 0.25, 1.0));
+            imageStore(dst_img, ivec2(px), vec4(rad_sum * 0.25, 0.0));
             return;
         }
 
         const float d_tol = max((1.0 - d_min) * 0.12, 2e-4);
         const ivec2 pts[4] = ivec2[4](p00, p10, p01, p11);
         const float ds[4]  = float[4](d00, d10, d01, d11);
+        float d_avg = 0.0;
         for (int i = 0; i < 4; ++i) {
             if (ds[i] < 0.99995 && abs(ds[i] - d_min) <= d_tol) {
                 const vec3 c = max(texelFetch(diff_tex, pts[i], 0).rgb, vec3(0.0)) +
                                max(texelFetch(amb_tex, pts[i], 0).rgb, vec3(0.0));
                 rad_sum += c;
+                d_avg += ds[i];
                 w_sum += 1.0;
             }
         }
         const vec3 rad = (w_sum > 0.0) ? (rad_sum / w_sum) : vec3(0.0);
-        imageStore(dst_img, ivec2(px), vec4(rad, d_min));
+        const float d_out = (w_sum > 0.0) ? (d_avg / w_sum) : d_min;
+        // Store inverted depth (1.0 - d) in FP16 alpha: shifts exponent down near the far plane,
+        // giving 64-256x higher precision than raw Forward-Z (0.98..0.999) in RGBA16F.
+        imageStore(dst_img, ivec2(px), vec4(rad, max(1.0 - d_out, 6e-5)));
     } else {
-        // Mip 1 (Quarter-Res): 2x2 downsample of Half-Res packed (radiance, depth).
+        // Mip 1 (Quarter-Res): smooth 2x2 downsample of (radiance, 1.0 - depth) without inflation.
         const vec4 s00 = texelFetch(depth_or_mip0_tex, p00, 0);
         const vec4 s10 = texelFetch(depth_or_mip0_tex, p10, 0);
         const vec4 s01 = texelFetch(depth_or_mip0_tex, p01, 0);
         const vec4 s11 = texelFetch(depth_or_mip0_tex, p11, 0);
 
-        const float d_min = min(min(s00.a, s10.a), min(s01.a, s11.a));
-        if (d_min >= 0.99995) {
-            imageStore(dst_img, ivec2(px), vec4((s00.rgb + s10.rgb + s01.rgb + s11.rgb) * 0.25, 1.0));
-            return;
-        }
-        const float d_tol = max((1.0 - d_min) * 0.20, 4e-4);
         const vec4 ss[4] = vec4[4](s00, s10, s01, s11);
         vec3 rad_sum = vec3(0.0);
+        float inv_d_sum = 0.0;
         float w_sum = 0.0;
         for (int i = 0; i < 4; ++i) {
-            if (ss[i].a < 0.99995 && abs(ss[i].a - d_min) <= d_tol) {
+            if (ss[i].a > 5e-5) {
                 rad_sum += ss[i].rgb;
+                inv_d_sum += ss[i].a;
                 w_sum += 1.0;
             }
         }
-        const vec3 rad = (w_sum > 0.0) ? (rad_sum / w_sum) : s00.rgb;
-        imageStore(dst_img, ivec2(px), vec4(rad, d_min));
+        if (w_sum <= 0.0) {
+            imageStore(dst_img, ivec2(px),
+                       vec4((s00.rgb + s10.rgb + s01.rgb + s11.rgb) * 0.25, 0.0));
+            return;
+        }
+        imageStore(dst_img, ivec2(px), vec4(rad_sum / w_sum, max(inv_d_sum / w_sum, 6e-5)));
     }
 }

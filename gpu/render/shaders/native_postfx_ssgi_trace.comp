@@ -3,6 +3,7 @@
 // Reads a single packed RGBA16F (radiance, depth) mip pair (< 4.5 MB, 100% L2-cache resident)
 // instead of 3 full-res 1440p textures -> ~4x faster & -35..45W lower GPU power.
 #version 460
+#extension GL_EXT_samplerless_texture_functions : require
 
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
@@ -13,6 +14,7 @@ layout(set = 0, binding = 3, rgba16f) uniform writeonly image2D dst_ssgi_img;
 layout(set = 0, binding = 4, std430) readonly buffer Ssbo2Buf {
     uint data[];
 } ssbo_2;
+layout(set = 0, binding = 5) uniform texture2D full_depth_tex;
 
 layout(push_constant) uniform SsgiTracePush {
     uint dst_w;
@@ -42,9 +44,14 @@ void main() {
         return;
     }
 
-    const vec2 inv_dim = vec2(1.0 / float(pc.dst_w), 1.0 / float(pc.dst_h));
-    const vec2 uv = (vec2(px) + 0.5) * inv_dim;
-    const float depth = textureLod(sampler2D(rad_mip0_tex, linear_samp), uv, 0.0).a;
+    // Read center depth and 4 neighbors from full-precision FP32 D32 depth buffer:
+    // avoids FP16 Forward-Z contour staircase artifacts on angled stone walls and cobblestones!
+    const ivec2 full_sz = max(textureSize(full_depth_tex, 0), ivec2(1));
+    const ivec2 full_max = full_sz - ivec2(1);
+    const vec2 inv_full = 1.0 / vec2(full_sz);
+    const ivec2 fp = min(ivec2(px) * 2, full_max);
+    const vec2 uv = (vec2(fp) + 0.5) * inv_full;
+    const float depth = texelFetch(full_depth_tex, fp, 0).r;
     if (depth >= 0.99995) {
         imageStore(dst_ssgi_img, ivec2(px), vec4(0.0));
         return;
@@ -59,22 +66,22 @@ void main() {
         return;
     }
 
-    // Edge-preserving geometric normal from 4-neighbor minimum depth slope (single packed mip0).
-    const vec2 uvL = vec2(max(uv.x - inv_dim.x, 0.0), uv.y);
-    const vec2 uvR = vec2(min(uv.x + inv_dim.x, 1.0), uv.y);
-    const vec2 uvU = vec2(uv.x, max(uv.y - inv_dim.y, 0.0));
-    const vec2 uvD = vec2(uv.x, min(uv.y + inv_dim.y, 1.0));
-    const float dL = textureLod(sampler2D(rad_mip0_tex, linear_samp), uvL, 0.0).a;
-    const float dR = textureLod(sampler2D(rad_mip0_tex, linear_samp), uvR, 0.0).a;
-    const float dU = textureLod(sampler2D(rad_mip0_tex, linear_samp), uvU, 0.0).a;
-    const float dD = textureLod(sampler2D(rad_mip0_tex, linear_samp), uvD, 0.0).a;
+    // Edge-preserving geometric normal from FP32 full-res depth neighbors (zero FP16 quantization).
+    const ivec2 fpL = max(fp - ivec2(1, 0), ivec2(0));
+    const ivec2 fpR = min(fp + ivec2(1, 0), full_max);
+    const ivec2 fpU = max(fp - ivec2(0, 1), ivec2(0));
+    const ivec2 fpD = min(fp + ivec2(0, 1), full_max);
+    const float dL = texelFetch(full_depth_tex, fpL, 0).r;
+    const float dR = texelFetch(full_depth_tex, fpR, 0).r;
+    const float dU = texelFetch(full_depth_tex, fpU, 0).r;
+    const float dD = texelFetch(full_depth_tex, fpD, 0).r;
 
     const vec3 dPdx = (abs(dR - depth) < abs(dL - depth))
-                          ? (ReconstructPos(uvR, dR, d1) - P)
-                          : (P - ReconstructPos(uvL, dL, d1));
+                          ? (ReconstructPos((vec2(fpR) + 0.5) * inv_full, dR, d1) - P)
+                          : (P - ReconstructPos((vec2(fpL) + 0.5) * inv_full, dL, d1));
     const vec3 dPdy = (abs(dD - depth) < abs(dU - depth))
-                          ? (ReconstructPos(uvD, dD, d1) - P)
-                          : (P - ReconstructPos(uvU, dU, d1));
+                          ? (ReconstructPos((vec2(fpD) + 0.5) * inv_full, dD, d1) - P)
+                          : (P - ReconstructPos((vec2(fpU) + 0.5) * inv_full, dU, d1));
     const vec3 N_raw = cross(dPdx, dPdy);
     const float N_len2 = dot(N_raw, N_raw);
     if (N_len2 <= 1e-12) {
@@ -89,20 +96,24 @@ void main() {
     }
 
     const float ign1 = fract(52.9829189 * fract(dot(vec2(px) + 0.5, vec2(0.06711056, 0.00583715))));
-    const float ign2 = fract(ign1 * 1.61803399 + 0.5);
+    const float ign2 = fract(52.9829189 * fract(dot(vec2(px) + vec2(17.3, 31.7), vec2(0.06711056, 0.00583715))));
     const float max_uv_r = clamp(0.85 / max(cam_dist, 2.0), 0.06, 0.34);
 
     vec3 gi_acc = vec3(0.0);
     float occ_acc = 0.0;
 
-    // 4 orthogonal IGN-rotated horizon sectors x 4 exponential radii = 16 single-fetch L2-resident taps.
+    // 4 orthogonal IGN-rotated horizon sectors x 6 seamless continuous-jittered radii (zero dead gaps).
     for (uint dir_idx = 0u; dir_idx < 4u; ++dir_idx) {
         const float ang = (float(dir_idx) + ign1) * 1.57079633;
         const vec2 ray_uv = vec2(cos(ang) / pc.aspect, sin(ang));
-        float max_sin_h = 0.12;
-        for (uint s = 0u; s < 4u; ++s) {
-            const float t_lin = (float(s) + 0.30 + 0.60 * ign2) * 0.25;
-            const vec2 uv_s = uv + ray_uv * (max_uv_r * t_lin * t_lin);
+        const float dir_jitter = fract(ign2 + float(dir_idx) * 0.38196601);
+        float max_sin_h = 0.14;
+        for (uint s = 0u; s < 6u; ++s) {
+            // Full [0, 1] stratified jitter per step eliminates discrete concentric banding rings.
+            const float step_j = fract(dir_jitter + float(s) * 0.61803399);
+            const float t_lin = max((float(s) + step_j) * (1.0 / 6.0), 0.035);
+            const float t_rad = t_lin * (0.28 + 0.72 * t_lin);
+            const vec2 uv_s = uv + ray_uv * (max_uv_r * t_rad);
             if (uv_s.x <= 0.002 || uv_s.x >= 0.998 || uv_s.y <= 0.002 || uv_s.y >= 0.998) {
                 break;
             }
@@ -114,48 +125,51 @@ void main() {
             const vec4 tap = (s < 2u)
                                  ? textureLod(sampler2D(rad_mip0_tex, linear_samp), uv_s, 0.0)
                                  : textureLod(sampler2D(rad_mip1_tex, linear_samp), uv_s, 0.0);
-            const float d_s = tap.a;
-            if (d_s >= 0.99995) {
+            // Alpha stores inverted depth (1.0 - depth); <= 5e-5 marks sky.
+            const float inv_d_s = tap.a;
+            if (inv_d_s <= 5e-5) {
                 const vec3 P_sky = ReconstructPos(uv_s, 0.9999, d1);
                 const float sky_len2 = dot(P_sky, P_sky);
                 if (sky_len2 > 1e-6) {
                     const float sin_h = dot(N, P_sky * inversesqrt(sky_len2));
                     if (sin_h > max_sin_h) {
-                        const float dw = sin_h - max_sin_h;
+                        // Exact cosine-weighted HBIL solid angle: integral(sin*cos) = 0.5 * sin^2.
+                        const float dw = sin_h * sin_h - max_sin_h * max_sin_h;
                         max_sin_h = sin_h;
                         vec3 L_sky = max(tap.rgb, vec3(0.0));
                         const float l_sky = dot(L_sky, vec3(0.2126, 0.7152, 0.0722));
                         L_sky = max(mix(vec3(l_sky), L_sky, 1.25), vec3(0.0)) / (1.0 + l_sky * 0.35);
-                        gi_acc += L_sky * (dw * 0.38 * edge_w);
+                        gi_acc += L_sky * (dw * 0.56 * edge_w);
                     }
                 }
             } else {
+                const float d_s = 1.0 - inv_d_s;
                 const vec3 P_s = ReconstructPos(uv_s, d_s, d1);
                 const vec3 diff = P_s - P;
                 const float dist2 = dot(diff, diff);
-                if (dist2 > 0.048 && dist2 < 90.25) {
+                if (dist2 > 0.002 && dist2 < 90.25) {
                     const float dist = sqrt(dist2);
                     const float sin_h = dot(N, diff / dist);
                     if (sin_h > max_sin_h) {
-                        const float dw = sin_h - max_sin_h;
+                        const float dw = sin_h * sin_h - max_sin_h * max_sin_h;
                         max_sin_h = sin_h;
+                        // Smooth near fade eliminates hard inner step rings around bodies/pillars
+                        // while preserving full warm bounce from torches, bonfires, lanterns & walls.
+                        const float near_fade = smoothstep(0.20, 0.65, dist);
                         const float range_fade = 1.0 - smoothstep(5.5, 9.5, dist);
-                        const float atten = range_fade / (1.0 + dist2 * 0.14);
+                        const float atten = (near_fade * range_fade) / (1.0 + dist2 * 0.14);
                         vec3 L_s = max(tap.rgb, vec3(0.0));
                         const float l_s = dot(L_s, vec3(0.2126, 0.7152, 0.0722));
                         L_s = max(mix(vec3(l_s), L_s, 1.28), vec3(0.0)) / (1.0 + l_s * 0.18);
                         gi_acc += L_s * (dw * atten * edge_w);
                     }
-                } else if (dist2 > 0.002 && dist2 <= 0.048) {
-                    const float sin_h = dot(N, diff * inversesqrt(dist2));
-                    max_sin_h = max(max_sin_h, sin_h);
                 }
             }
         }
-        occ_acc += clamp((max_sin_h - 0.12) * 1.15, 0.0, 1.0);
+        occ_acc += clamp((max_sin_h - 0.14) * 1.15, 0.0, 1.0);
     }
 
-    const vec3 gi_out = gi_acc * (5.4 / 4.0) * cam_fade;
+    const vec3 gi_out = gi_acc * (9.2 / 4.0) * cam_fade;
     const float occ_out = (occ_acc * 0.25) * cam_fade;
     imageStore(dst_ssgi_img, ivec2(px), vec4(max(gi_out, vec3(0.0)), clamp(occ_out, 0.0, 1.0)));
 }

@@ -849,7 +849,7 @@ bool NativePostFx::EnsureInit() {
         device.destroyShaderModule(cs);
     }
     {
-        const std::array<vk::DescriptorSetLayoutBinding, 5> bindings{{
+        const std::array<vk::DescriptorSetLayoutBinding, 6> bindings{{
             {.binding = 0,
              .descriptorType = vk::DescriptorType::eSampledImage,
              .descriptorCount = 1,
@@ -868,6 +868,10 @@ bool NativePostFx::EnsureInit() {
              .stageFlags = vk::ShaderStageFlagBits::eCompute},
             {.binding = 4,
              .descriptorType = vk::DescriptorType::eStorageBuffer,
+             .descriptorCount = 1,
+             .stageFlags = vk::ShaderStageFlagBits::eCompute},
+            {.binding = 5,
+             .descriptorType = vk::DescriptorType::eSampledImage,
              .descriptorCount = 1,
              .stageFlags = vk::ShaderStageFlagBits::eCompute},
         }};
@@ -1423,12 +1427,13 @@ void NativePostFx::ExecuteHalfResSsgi(VideoCore::Image& hdr_image, vk::ImageView
                                             vk::ImageLayout::eShaderReadOnlyOptimal};
         const vk::DescriptorImageInfo samp_in{samp, VK_NULL_HANDLE, vk::ImageLayout::eUndefined};
         const vk::DescriptorImageInfo raw_out{VK_NULL_HANDLE, raw_view, vk::ImageLayout::eGeneral};
-        const std::array<vk::WriteDescriptorSet, 5> tr_writes{{
+        const std::array<vk::WriteDescriptorSet, 6> tr_writes{{
             {.dstBinding = 0, .descriptorCount = 1, .descriptorType = vk::DescriptorType::eSampledImage, .pImageInfo = &m0_in},
             {.dstBinding = 1, .descriptorCount = 1, .descriptorType = vk::DescriptorType::eSampledImage, .pImageInfo = &m1_in},
             {.dstBinding = 2, .descriptorCount = 1, .descriptorType = vk::DescriptorType::eSampler, .pImageInfo = &samp_in},
             {.dstBinding = 3, .descriptorCount = 1, .descriptorType = vk::DescriptorType::eStorageImage, .pImageInfo = &raw_out},
             {.dstBinding = 4, .descriptorCount = 1, .descriptorType = vk::DescriptorType::eStorageBuffer, .pBufferInfo = &ssbo2_info},
+            {.dstBinding = 5, .descriptorCount = 1, .descriptorType = vk::DescriptorType::eSampledImage, .pImageInfo = &d_in},
         }};
         const SsgiTracePush tr_pc{half_ext.width, half_ext.height, d1_dword_offset,
                                   float(w) / float(std::max(h, 1u))};

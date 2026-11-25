@@ -2810,7 +2810,9 @@ uint32_t sub_21cfb30(
 
     if (origLod != 0u) {
         uint32_t lodBitmask = *reinterpret_cast<uint32_t*>(model + 0xb4);
-        if (((lodBitmask >> origLod) & 1u) != 0u) {
+        // Matches eboot.bin 0x21d3c0b (bt eax, ebx; jb 0x21d3c36): only fall back to a lower
+        // LOD when the requested `origLod` bit is NOT present in `model->lodBitmask`.
+        if (((lodBitmask >> origLod) & 1u) == 0u) {
             uint32_t probe = origLod - 1u;
             uint32_t resolvedLod = 0u;
             while (probe != 0u) {

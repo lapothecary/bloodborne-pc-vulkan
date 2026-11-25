@@ -3,6 +3,7 @@
 // Rendered onto hdr_image with hardware blend: dst_rgb = dst_rgb * frag_color0.a + frag_color0.rgb
 // (colorWriteMask = R|G|B, preserving hdr_image.a untouched and needing zero full-res copies).
 #version 460
+#extension GL_EXT_samplerless_texture_functions : require
 
 layout(location = 0) in vec2 uv;
 layout(location = 0) out vec4 frag_color0;
@@ -20,31 +21,37 @@ layout(push_constant) uniform SsgiUpsamplePush {
 } pc;
 
 void main() {
-    const float d_c = textureLod(sampler2D(depth_tex, linear_samp), uv, 0.0).r;
+    const ivec2 depth_max = max(textureSize(depth_tex, 0) - ivec2(1), ivec2(0));
+    const float d_c = texelFetch(depth_tex, min(ivec2(gl_FragCoord.xy), depth_max), 0).r;
     if (d_c >= 0.99995) {
         discard;
     }
 
-    // 5-tap depth-aware bilateral upsample & denoise from Half-Res SSGI:
-    // Eliminates 4x4 IGN grain while preserving razor-sharp silhouette depth boundaries!
-    const float inv_one_minus_d = 1.0 / max(1.0 - d_c, 1e-4);
-    const vec2 step_uv = vec2(pc.inv_half_w, pc.inv_half_h) * 0.85;
-    const vec2 offs[5] = vec2[5](
-        vec2( 0.0,  0.0),
+    // 9-tap (3x3) depth-aware bilateral upsample & wide denoise from Half-Res SSGI:
+    // Both `inv_d_c` and `rad_mip0_tex.a` store `1.0 - depth` (64-256x higher FP16 precision!).
+    const float inv_d_c = max(1.0 - d_c, 1e-5);
+    const float rcp_inv_d_c = 1.0 / inv_d_c;
+    const vec2 step_uv = vec2(pc.inv_half_w, pc.inv_half_h) * 1.35;
+    const vec2 offs[9] = vec2[9](
+        vec2( 0.0,        0.0),
+        vec2(-step_uv.x,  0.0),
+        vec2( step_uv.x,  0.0),
+        vec2( 0.0,       -step_uv.y),
+        vec2( 0.0,        step_uv.y),
         vec2(-step_uv.x, -step_uv.y),
         vec2( step_uv.x, -step_uv.y),
         vec2(-step_uv.x,  step_uv.y),
         vec2( step_uv.x,  step_uv.y)
     );
-    const float spatial_w[5] = float[5](1.0, 0.65, 0.65, 0.65, 0.65);
+    const float spatial_w[9] = float[9](1.0, 0.72, 0.72, 0.72, 0.72, 0.48, 0.48, 0.48, 0.48);
 
     vec4 acc = vec4(0.0);
     float w_sum = 0.0;
-    for (int i = 0; i < 5; ++i) {
+    for (int i = 0; i < 9; ++i) {
         const vec2 suv = clamp(uv + offs[i], vec2(0.001), vec2(0.999));
-        const float d_s = textureLod(sampler2D(rad_mip0_tex, linear_samp), suv, 0.0).a;
-        const float dz_rel = abs(d_s - d_c) * inv_one_minus_d;
-        const float w = spatial_w[i] * exp(-dz_rel * dz_rel * 28.0);
+        const float inv_d_s = textureLod(sampler2D(rad_mip0_tex, linear_samp), suv, 0.0).a;
+        const float dz_rel = abs(inv_d_s - inv_d_c) * rcp_inv_d_c;
+        const float w = spatial_w[i] * exp(-dz_rel * dz_rel * 36.0);
         acc += textureLod(sampler2D(ssgi_raw_tex, linear_samp), suv, 0.0) * w;
         w_sum += w;
     }
@@ -52,12 +59,12 @@ void main() {
                             ? (acc / w_sum)
                             : textureLod(sampler2D(ssgi_raw_tex, linear_samp), uv, 0.0);
 
-    // Exact physically conserved diffuse bounce reflectance (matches original Stage 1.3 calibration).
+    // Physically conserved diffuse bounce reflectance calibrated for Bloodborne's linear stone/cloth.
     const vec3 g0_rgb = textureLod(sampler2D(g0_tex, linear_samp), uv, 0.0).rgb;
     const vec3 g2_rgb = textureLod(sampler2D(g2_tex, linear_samp), uv, 0.0).rgb;
     const vec3 F0 = g0_rgb * g0_rgb;
     const vec3 diff_albedo = g2_rgb * max(vec3(1.0) - F0, vec3(0.0));
-    const vec3 bounce_albedo = mix(diff_albedo, sqrt(max(diff_albedo, vec3(0.0))) * 0.48, 0.45);
+    const vec3 bounce_albedo = mix(diff_albedo, sqrt(max(diff_albedo, vec3(0.0))) * 0.46, 0.38);
     const vec3 gi_bounce = bounce_albedo * gi_occ.rgb;
     const float gi_luma = dot(gi_bounce, vec3(0.2126, 0.7152, 0.0722));
     const float crevice_ao = clamp(1.0 - 0.16 * gi_occ.a * (1.0 - clamp(gi_luma * 6.0, 0.0, 1.0)), 0.80, 1.0);

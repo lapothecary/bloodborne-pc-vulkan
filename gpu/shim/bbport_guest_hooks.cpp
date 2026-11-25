@@ -334,12 +334,14 @@ void WriteHotCode(u64 address, const u8* bytes, std::size_t size, bool data) {
 
 // (counted below)
 extern "C" int runtime_memory_is_mapped(uintptr_t address, uint64_t size);
+std::atomic<bool> hot_effects_installed{false};
 
 void ApplyHotEffectsLocked(bool force, u64 fresh = 0) {
     auto& settings = BbSettings::Get();
-    // Live Model Detail (LOD) bias: VMA 0x1d6fc09 (0x216fc09 - 0x400000) reads int32_t at
-    // ImageBase + 0x5587d20 (0x1d6fc0f + 0x3818111, range -2..2).
-    if (runtime_memory_is_mapped(ImageBase + 0x5587d20, sizeof(std::int32_t))) {
+    // Live Model Detail (LOD) bias: static .bss int32_t at ImageBase + 0x5587d20 (range -2..2),
+    // read by all 5 FLVER LOD selectors (0x1d1875f/0x1d217a7/0x1d2487e/0x1d43040/0x1d6fc09).
+    // Note: static ELF segments under ImageBase are not tracked by runtime_memory_is_mapped().
+    if (hot_effects_installed.load(std::memory_order_acquire)) {
         const std::int32_t want_lod = std::clamp(settings.model_lod.load(std::memory_order_relaxed), -2, 2);
         auto* lod_ptr = reinterpret_cast<std::int32_t*>(ImageBase + 0x5587d20);
         __atomic_store_n(lod_ptr, want_lod, __ATOMIC_RELAXED);
@@ -453,7 +455,7 @@ void ApplyHotEffectsLocked(bool force, u64 fresh = 0) {
             WriteHotCode(ImageBase + 0x0063318,
                          reinterpret_cast<const u8*>(&target_step_scale), sizeof(float), true);
         }
-        if (runtime_memory_is_mapped(ImageBase + 0x5540dd8, 8)) {
+        if (hot_effects_installed.load(std::memory_order_acquire)) {
             const u64 dd8 = *reinterpret_cast<const u64*>(ImageBase + 0x5540dd8);
             if (dd8 && runtime_memory_is_mapped(dd8 + 0x6080, 8)) {
                 const u64 ssr_obj = *reinterpret_cast<const u64*>(dd8 + 0x6080);
@@ -613,6 +615,17 @@ bool InstallHotEffects() {
         WriteHotCode(ImageBase + 0x0063318, ssr_step_scale_val.data(), ssr_step_scale_val.size(), true);
         WriteHotCode(ImageBase + 0x0ea99e1, ssr_step_scale_rel.data(), ssr_step_scale_rel.size(), false);
     }
+    // Prevent sub_1d41d60's per-frame scene tick (0x1d41da6: mov [ImageBase+0x5587d20], eax) from
+    // overwriting our live Model Detail (LOD) bias back to 0 every frame.
+    {
+        static constexpr std::array<u8, 6> lod_store_orig = {0x89, 0x05, 0x74, 0x5f, 0x84, 0x03};
+        static constexpr std::array<u8, 6> lod_store_nop = {0x90, 0x90, 0x90, 0x90, 0x90, 0x90};
+        if (std::memcmp(reinterpret_cast<const void*>(ImageBase + 0x1d41da6), lod_store_orig.data(),
+                        lod_store_orig.size()) == 0) {
+            WriteHotCode(ImageBase + 0x1d41da6, lod_store_nop.data(), lod_store_nop.size(), false);
+        }
+    }
+    hot_effects_installed.store(true, std::memory_order_release);
     for (auto& code : hot_code) {
         if (code.ready) {
             effects_applied[code.effect].store(-1);
