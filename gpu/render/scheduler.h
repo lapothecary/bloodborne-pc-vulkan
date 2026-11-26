@@ -80,6 +80,7 @@ struct SubmitInfo {
     std::array<vk::Semaphore, MaxSemaphores> signal_semas{};
     std::array<u64, MaxSemaphores> signal_ticks{};
     vk::Fence fence{};
+    u64 present_id = 0; ///< VK_NV_low_latency2 submission presentID (0 = unassociated)
     u32 num_wait_semas = 0;
     u32 num_signal_semas = 0;
     /// Queue operations that go out right before the submission, in queue order (sparse

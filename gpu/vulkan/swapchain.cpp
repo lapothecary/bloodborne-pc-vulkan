@@ -10,6 +10,7 @@
 #include "core/emulator_settings.h"
 #include "sdl_window.h"
 #include "vulkan/instance.h"
+#include "vulkan/low_latency.h"
 #include "vulkan/platform.h"
 
 namespace Vulkan {
@@ -59,6 +60,7 @@ Swapchain::Swapchain(const Instance& instance_, const Frontend::WindowSDL& windo
 }
 
 Swapchain::~Swapchain() {
+    LowLatency::DetachSwapchain();
     DestroyResources();
     if (swapchain) {
         instance.GetDevice().destroySwapchainKHR(swapchain);
@@ -106,13 +108,23 @@ void Swapchain::QuerySurface() {
     }
     // One image more than the minimum: one to draw into while the others are shown.
     image_count = caps.minImageCount + 1;
-    if (present_mode == vk::PresentModeKHR::eMailbox ||
-        present_mode == vk::PresentModeKHR::eImmediate) {
-        // On high-refresh Wayland/XWayland compositors (e.g. 170 Hz Mailbox when FPS == Hz),
+#ifdef __linux__
+    if ((present_mode == vk::PresentModeKHR::eMailbox ||
+         present_mode == vk::PresentModeKHR::eImmediate) &&
+        !instance.IsLowVramDevice()) {
+        // On high-refresh Linux Wayland/XWayland compositors (e.g. 170 Hz Mailbox when FPS == Hz),
         // 3 images (1 scanout + 1 queued flip + 1 draw) can transiently starve vkAcquireNextImageKHR
         // across scanout boundaries, causing 1-refresh jitter spikes. Request 5 images when allowed.
+        // Kept off on Windows (where NVIDIA Vulkan WSI layers over DXGI Flip Model with native
+        // MaxFrameLatency=3, so 5 images oversubscribes the flip queue & stalls vkQueuePresentKHR)
+        // and on <= 4.5 GiB GPUs to save scanout VRAM.
         image_count = std::max(image_count, 5u);
     }
+#else
+    if (BbSettings::EffectiveFrameGen() != BbSettings::FrameGenOff && !instance.IsLowVramDevice()) {
+        image_count = std::max(image_count, 4u);
+    }
+#endif
     if (caps.maxImageCount > 0) {
         image_count = std::min(image_count, caps.maxImageCount);
     }
@@ -141,6 +153,7 @@ void Swapchain::Create(u32 width_, u32 height_) {
     // The old swapchain is retired through oldSwapchain, not destroyed first: NVIDIA's Wayland
     // WSI keeps a tearing controller per swapchain and rejected a fresh one on the same surface
     // ("Surface already has a tearing controller", SurfaceLost).
+    LowLatency::DetachSwapchain();
     DestroyResources();
     const vk::Device device = instance.GetDevice();
     const std::array families = {instance.GetGraphicsQueueFamilyIndex(),
@@ -148,7 +161,12 @@ void Swapchain::Create(u32 width_, u32 height_) {
     const bool exclusive = families[0] == families[1];
     const auto format = use_hdr ? HdrFormat : sdr_format;
     const vk::SwapchainKHR old = swapchain;
-    swapchain = Check<"create swapchain">(device.createSwapchainKHR({
+#ifdef VK_NV_LOW_LATENCY_2_EXTENSION_NAME
+    const vk::SwapchainLatencyCreateInfoNV latency_create_info{
+        .latencyModeEnable = vk::True,
+    };
+#endif
+    vk::SwapchainCreateInfoKHR create_info{
         .surface = surface,
         .minImageCount = image_count,
         .imageFormat = format.format,
@@ -165,10 +183,17 @@ void Swapchain::Create(u32 width_, u32 height_) {
         .presentMode = present_mode,
         .clipped = true,
         .oldSwapchain = old,
-    }));
+    };
+#ifdef VK_NV_LOW_LATENCY_2_EXTENSION_NAME
+    if (instance.IsLowLatency2Supported()) {
+        create_info.pNext = &latency_create_info;
+    }
+#endif
+    swapchain = Check<"create swapchain">(device.createSwapchainKHR(create_info));
     if (old) {
         device.destroySwapchainKHR(old);
     }
+    LowLatency::AttachSwapchain(swapchain);
     if (use_hdr && instance.IsHdrMetadataSupported()) {
         static const float peak_nits = [] {
             const char* env = std::getenv("BB_HDR_PEAK_NITS");

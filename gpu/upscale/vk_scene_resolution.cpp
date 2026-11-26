@@ -79,8 +79,11 @@ bool SceneTargets::ShaderResampled(const VideoCore::Image& image) const {
 // so the shaders' FragCoord conversion (1920 / scene width) stays correct for it.
 static u32 SizeDivisor(const VideoCore::ImageInfo& i, SceneResolution::Size scene,
                        SceneResolution::Size base) {
-    if (i.size.width == base.width && i.size.height == base.height) return 1;
-    if (i.size.width == base.width / 2 && i.size.height == base.height / 2 &&
+    if (SceneTargets::MatchesGnmSceneDim(i.size.width, i.size.height, base.width, base.height)) {
+        return 1;
+    }
+    if (SceneTargets::MatchesGnmSceneDim(i.size.width, i.size.height, base.width / 2,
+                                         base.height / 2) &&
         scene.width % 2 == 0 && scene.height % 2 == 0 &&
         !BbToggle::Disabled(BbToggle::SceneHalfRes)) {
         return 2;
@@ -102,8 +105,9 @@ bool SceneTargets::Eligible(const VideoCore::Image& image) const {
     return Blittable(image.backing->image.image_ci.format) || ShaderResampled(image);
 }
 bool SceneTargets::EligibleScene(const VideoCore::Image& image) const {
-    return image.info.size.width == base_size.width &&
-           image.info.size.height == base_size.height && Eligible(image);
+    return MatchesGnmSceneDim(image.info.size.width, image.info.size.height, base_size.width,
+                              base_size.height) &&
+           Eligible(image);
 }
 SceneResolution::Size SceneTargets::ProxySize(const VideoCore::Image& image, u32 level) const {
     const u32 div = std::max(1u, SizeDivisor(image.info, size, base_size));
@@ -139,7 +143,7 @@ bool SceneTargets::EligibleSceneInfoMt(const VideoCore::ImageInfo& i, u32 backin
                                        vk::Format backing_fmt,
                                        vk::ImageAspectFlags aspect_mask) const noexcept {
     const auto cur_base = BaseSizeMt();
-    return i.size.width == cur_base.width && i.size.height == cur_base.height &&
+    return MatchesGnmSceneDim(i.size.width, i.size.height, cur_base.width, cur_base.height) &&
            EligibleInfoMt(i, backing_samples, backing_fmt, aspect_mask);
 }
 SceneResolution::Size SceneTargets::ProxySizeInfoMt(const VideoCore::ImageInfo& i,

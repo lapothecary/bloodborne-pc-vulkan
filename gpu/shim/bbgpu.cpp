@@ -5,6 +5,7 @@
 #include "bbport_game_menu.h"
 #include "bbport_gnm_hooks.h"
 #include "bb_golden_engine.h"
+#include "cloth_exp/cloth_exp_registry.h"
 // bbport: glue between the C loader and the vendored shadPS4 video core.
 #include "bbport_overlay.h"
 #include "bbport_guest_hooks.h"
@@ -501,6 +502,7 @@ extern "C" void bbgpu_patch_image(unsigned char* image, uint64_t size) {
     BbGameMenu::PatchImage(image, size);
     BbFrameRate::PatchImage(image, size);
     BbGoldenEngine::PatchImage(image, size);
+    BbClothExp::PatchImage(image, size);
     BbFastLoad::PatchImage(image, size);
     BbCrashBlackBox::RecordEventFmt("BOOT", "Guest image patched (base=%p, size=0x%llx)",
                                     static_cast<void*>(image), static_cast<unsigned long long>(size));

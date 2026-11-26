@@ -173,7 +173,7 @@ jobs:
             play.sh launcher.sh run.sh run.py bin \
             scripts patches launcher launcher_v2/ui \
             out/bb-launcher out/bb-vulkan out/bb-gpu-capabilities \
-            out/libbbport_dlss.so out/libnvidia-ngx-dlss.so.310.9.1 \
+            out/libbbport_dlss.so out/libnvidia-ngx-dlss.so.310.9.1 out/libnvidia-ngx-dlssg.so.310.9.16 \
             out/gpu/*.so* \
             fsr4_shaders data
           sha256sum bloodborne-pc-vulkan-linux-x86_64-prebuilt.tar.gz > bloodborne-pc-vulkan-linux-x86_64-prebuilt.tar.gz.sha256

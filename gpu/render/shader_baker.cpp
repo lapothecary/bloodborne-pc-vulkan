@@ -679,9 +679,12 @@ struct SyntheticStageEnv {
 };
 
 struct ScopedRecipeReplay {
-    explicit ScopedRecipeReplay(const RecipeCatalog::StageRecipe& rec) noexcept {
-        Shader::flat_buf_replay =
-            !rec.flattened_ud_buf.empty() ? &rec.flattened_ud_buf : nullptr;
+    explicit ScopedRecipeReplay(const RecipeCatalog::StageRecipe& rec,
+                                const std::vector<u32>* flat_override = nullptr) noexcept {
+        const auto* flat = (flat_override && !flat_override->empty())
+                               ? flat_override
+                               : (!rec.flattened_ud_buf.empty() ? &rec.flattened_ud_buf : nullptr);
+        Shader::flat_buf_replay = flat;
         Shader::Gcn::fetch_shader_replay =
             rec.spec.fetch_shader_data ? &*rec.spec.fetch_shader_data : nullptr;
     }
@@ -690,6 +693,232 @@ struct ScopedRecipeReplay {
         Shader::Gcn::fetch_shader_replay = nullptr;
     }
 };
+
+template <typename T>
+void WriteSharpToFlatBuf(std::vector<u32>& flat, const Shader::SharpFetch<T>& fetch, const T& val,
+                         u32 num_dwords = Shader::SharpFetch<T>::N) noexcept {
+    u32 dwords[8]{};
+    std::memcpy(dwords, &val, sizeof(T));
+    for (u32 k = 0; k < num_dwords; ++k) {
+        if ((fetch.load_mask & (1u << k)) == 0) {
+            continue;
+        }
+        const auto off = fetch.offsets[k];
+        if (off != Shader::UNKNOWN_LOCATION && off < flat.size()) {
+            flat[off] = dwords[k];
+        }
+    }
+}
+
+/// Reconciles `rec.flattened_ud_buf` with `rec.spec` using `template_info`'s exact `SharpFetch`
+/// offsets. Older `BB_EXPORT_RECIPES=1` catalogs recorded `Program::info.flattened_ud_buf` from
+/// perm 0 alongside perm >= 1's `StageSpecialization`, causing offline replay to reproduce perm 0's
+/// V#/T#/S# descriptors (e.g. stride=0 instead of stride=16) and discard the perm as a duplicate.
+std::vector<u32> BuildReconciledRecipeFlatBuf(const Shader::Info* template_info,
+                                              const RecipeCatalog::StageRecipe& rec,
+                                              uintptr_t dummy_ptr) {
+    std::vector<u32> flat = rec.flattened_ud_buf;
+    if (!template_info) {
+        return flat;
+    }
+    const size_t min_dw = std::max<size_t>(16u, template_info->srt_info.flattened_bufsize_dw);
+    if (flat.size() < min_dw) {
+        flat.resize(min_dw, 0u);
+    }
+
+    u32 bnd = 0;
+    const size_t nbuf = std::min(template_info->buffers.size(), rec.spec.buffers.size());
+    for (size_t i = 0; i < nbuf; ++i, ++bnd) {
+        const auto& desc = template_info->buffers[i];
+        if (desc.IsSpecial()) {
+            continue;
+        }
+        const bool want_bound =
+            (bnd < Shader::StageSpecialization::MaxStageResources) && rec.spec.bitset[bnd];
+        if (!want_bound) {
+            if (desc.GetSharpDirect(flat.data(), 0)) {
+                WriteSharpToFlatBuf(flat, desc.sharp_fetch, Gcn::Buffer::Null());
+            }
+            continue;
+        }
+        Gcn::Buffer b{};
+        if (!desc.sharp_fetch.Fetch(flat.data(), &b) || !b.Valid() || !b) {
+            b = MakeSyntheticBuffer(dummy_ptr, 0);
+        }
+        const auto& bs = rec.spec.buffers[i];
+        b.type = 0;
+        b.stride = bs.stride;
+        b.swizzle_enable = bs.swizzle_enable;
+        if (b.num_records == 0) {
+            b.num_records = 1024u;
+        }
+        if (b.base_address == 0) {
+            b.base_address = static_cast<u64>(dummy_ptr) & ((1ULL << 40) - 1ULL);
+        }
+        if (u64(b.GetSize()) >= Shader::PagedBufferMinSize) {
+            b.num_records = 1024u;
+        }
+        if (bs.is_formatted) {
+            b.data_format = bs.data_format;
+            b.num_format = bs.num_format;
+            b.dst_sel_x = u32(bs.dst_select.r);
+            b.dst_sel_y = u32(bs.dst_select.g);
+            b.dst_sel_z = u32(bs.dst_select.b);
+            b.dst_sel_w = u32(bs.dst_select.a);
+        }
+        if (bs.swizzle_enable) {
+            b.index_stride = bs.index_stride;
+            b.element_size = bs.element_size;
+        }
+        WriteSharpToFlatBuf(flat, desc.sharp_fetch, b);
+    }
+
+    // Advance binding index past any extra buffer entries so images stay aligned with `bitset`.
+    bnd = static_cast<u32>(template_info->buffers.size());
+    const size_t nimg = std::min(template_info->images.size(), rec.spec.images.size());
+    for (size_t i = 0; i < nimg; ++i, ++bnd) {
+        const auto& desc = template_info->images[i];
+        const bool want_bound =
+            (bnd < Shader::StageSpecialization::MaxStageResources) && rec.spec.bitset[bnd];
+        const u32 ndw = desc.is_r128 ? 4u : 8u;
+        if (!want_bound) {
+            if (desc.GetSharpDirect(flat.data())) {
+                WriteSharpToFlatBuf(flat, desc.sharp_fetch, Gcn::Image::Null(desc.is_depth), ndw);
+            }
+            continue;
+        }
+        const auto& is = rec.spec.images[i];
+        const auto desired_type = is.is_cube ? Gcn::ImageType::Cube : is.type;
+        Gcn::Image im{};
+        if (!desc.Fetch(flat.data(), &im) || !im.Valid() || !im) {
+            im = MakeSyntheticImage(dummy_ptr, desired_type, is.is_storage);
+        }
+        im.type = u64(desired_type);
+        if (im.base_address == 0) {
+            const u64 shifted = (static_cast<u64>(dummy_ptr) >> 8) & ((1ULL << 38) - 1ULL);
+            im.base_address = shifted != 0 ? shifted : 0x2000ULL;
+        }
+        if (desc.is_depth) {
+            im.data_format = u64(Gcn::DataFormat::Format32);
+            im.num_format = u64(Gcn::NumberFormat::Float);
+        } else if (is.num_conversion != Gcn::NumberConversion::None) {
+            switch (is.num_conversion) {
+            case Gcn::NumberConversion::UintToUscaled:
+                im.data_format = u64(Gcn::DataFormat::Format8_8_8_8);
+                im.num_format = u64(Gcn::NumberFormat::Uscaled);
+                break;
+            case Gcn::NumberConversion::SintToSscaled:
+                im.data_format = u64(Gcn::DataFormat::Format8_8_8_8);
+                im.num_format = u64(Gcn::NumberFormat::Sscaled);
+                break;
+            case Gcn::NumberConversion::UnormToUbnorm:
+                im.data_format = u64(Gcn::DataFormat::Format8_8_8_8);
+                im.num_format = u64(Gcn::NumberFormat::Ubnorm);
+                break;
+            case Gcn::NumberConversion::Sint8ToSnormNz:
+                im.data_format = u64(Gcn::DataFormat::Format8_8_8_8);
+                im.num_format = u64(Gcn::NumberFormat::SnormNz);
+                break;
+            case Gcn::NumberConversion::Sint16ToSnormNz:
+                im.data_format = u64(Gcn::DataFormat::Format16_16_16_16);
+                im.num_format = u64(Gcn::NumberFormat::SnormNz);
+                break;
+            case Gcn::NumberConversion::Uint32ToUnorm:
+                im.data_format = u64(Gcn::DataFormat::Format32_32_32_32);
+                im.num_format = u64(Gcn::NumberFormat::Unorm);
+                break;
+            case Gcn::NumberConversion::SrgbToNorm:
+                im.data_format = u64(Gcn::DataFormat::FormatBc6);
+                im.num_format = u64(Gcn::NumberFormat::Srgb);
+                break;
+            default:
+                break;
+            }
+        } else if (is.is_srgb) {
+            im.data_format = u64(Gcn::DataFormat::Format8_8_8_8);
+            im.num_format = u64(Gcn::NumberFormat::Srgb);
+        } else if (is.is_integer) {
+            im.data_format = u64(Gcn::DataFormat::Format32_32_32_32);
+            im.num_format = u64(Gcn::NumberFormat::Uint);
+        } else if (Gcn::IsInteger(im.GetNumberFmt()) ||
+                   im.GetNumberFmt() == Gcn::NumberFormat::Srgb ||
+                   im.GetNumberConversion() != is.num_conversion) {
+            im.data_format = u64(is.is_storage ? Gcn::DataFormat::Format32_32_32_32
+                                               : Gcn::DataFormat::Format8_8_8_8);
+            im.num_format = u64(is.is_storage ? Gcn::NumberFormat::Float : Gcn::NumberFormat::Unorm);
+        }
+        if (is.is_storage) {
+            im.dst_sel_x = u64(is.dst_select.r);
+            im.dst_sel_y = u64(is.dst_select.g);
+            im.dst_sel_z = u64(is.dst_select.b);
+            im.dst_sel_w = u64(is.dst_select.a);
+        }
+        if (desc.mip_fallback_mode == Shader::MipStorageFallbackMode::DynamicIndex &&
+            is.num_bindings >= 1u) {
+            im.base_level = 0;
+            im.last_level = std::min<u64>(15u, is.num_bindings - 1u);
+        }
+        WriteSharpToFlatBuf(flat, desc.sharp_fetch, im, ndw);
+    }
+
+    const size_t nsmp = std::min(template_info->samplers.size(), rec.spec.samplers.size());
+    for (size_t i = 0; i < nsmp; ++i) {
+        const auto& desc = template_info->samplers[i];
+        const auto& ss = rec.spec.samplers[i];
+        Gcn::Sampler s{};
+        desc.sharp_fetch.Fetch(flat.data(), &s);
+        if (s.force_unnormalized != ss.force_unnormalized ||
+            s.force_degamma != ss.force_degamma) {
+            s.force_unnormalized = ss.force_unnormalized;
+            s.force_degamma = ss.force_degamma;
+            WriteSharpToFlatBuf(flat, desc.sharp_fetch, s);
+        }
+    }
+
+    return flat;
+}
+
+/// `StageRecipe::spec.runtime_info` is captured AFTER `TranslateProgram` runs
+/// `InjectClipDistanceAttributes` (which increments `hw.fs.num_inputs` by 1 when
+/// `clip_distance_emulation` is active). Undo that +1 before re-running `TranslateProgram`
+/// so offline replay compiles the exact same clip-distance attribute slot and matches `rec.spec`.
+Shader::RuntimeInfo PrepareRecipeRuntimeInfo(const RecipeCatalog::StageRecipe& rec) noexcept {
+    auto rt_info = rec.spec.runtime_info;
+    if (rec.sw_stage == SwStage::Fragment && rt_info.hw.fs.clip_distance_emulation &&
+        rt_info.hw.fs.num_inputs > 0) {
+        --rt_info.hw.fs.num_inputs;
+    }
+    return rt_info;
+}
+
+/// Returns true if an already-resident module `m_spec` covers `rec_spec` at runtime
+/// (matching `StageSpecialization::operator==` while ignoring session-local `paged` bit).
+bool StageSpecCoversRecipe(const Shader::StageSpecialization& m_spec,
+                           const Shader::StageSpecialization& rec_spec) {
+    if (!m_spec.Valid()) {
+        return false;
+    }
+    auto m_norm = m_spec;
+    auto r_norm = rec_spec;
+    for (auto& b : m_norm.buffers) {
+        b.paged = false;
+    }
+    for (auto& b : r_norm.buffers) {
+        b.paged = false;
+    }
+    return m_norm == r_norm;
+}
+
+/// Returns false when a catalog StageRecipe was captured by an older translator revision that
+/// produced a different resource count (`buffers`/`images`/`samplers`) for the same `pgm_hash`.
+/// Such recipes can never be produced or matched by the current translator, so skipping them
+/// avoids re-compiling unmatchable duplicates on every startup.
+bool IsRecipeResourceLayoutCompatible(const Shader::Info& info,
+                                      const RecipeCatalog::StageRecipe& rec) noexcept {
+    return info.buffers.size() == rec.spec.buffers.size() &&
+           info.images.size() == rec.spec.images.size() &&
+           info.samplers.size() == rec.spec.samplers.size();
+}
 
 Shader::RuntimeInfo BuildSyntheticRuntimeInfo(const ParsedOrbShader& sh,
                                               const Vulkan::Instance& instance,
@@ -1571,10 +1800,10 @@ int PipelineCache::BakeAllGameShaders(const std::filesystem::path& game_dir) {
             };
             std::vector<PendingPermJob> perm_jobs;
             for (const auto& rec : stage_recipes) {
-                if (existing_digests.contains(rec.spec_digest)) {
-                    // Already cached: record perm_hash remap if stored at a different index.
-                    if (const auto pit = program_cache.find(rec.pgm_hash);
-                        pit != program_cache.end() && pit->second) {
+                bool covered = existing_digests.contains(rec.spec_digest);
+                if (const auto pit = program_cache.find(rec.pgm_hash);
+                    pit != program_cache.end() && pit->second) {
+                    if (covered) {
                         for (size_t i = 0; i < pit->second->modules.size(); ++i) {
                             const auto& m = pit->second->modules[i];
                             if (m.module &&
@@ -1588,7 +1817,23 @@ int PipelineCache::BakeAllGameShaders(const std::filesystem::path& game_dir) {
                                 break;
                             }
                         }
+                    } else if (!IsRecipeResourceLayoutCompatible(pit->second->info, rec)) {
+                        covered = true;
+                    } else {
+                        for (size_t i = 0; i < pit->second->modules.size(); ++i) {
+                            const auto& m = pit->second->modules[i];
+                            if (m.module && StageSpecCoversRecipe(m.spec, rec.spec)) {
+                                const u64 actual_h = HashCombine(rec.pgm_hash, i);
+                                if (actual_h != rec.perm_hash) {
+                                    perm_hash_remap[rec.perm_hash] = actual_h;
+                                }
+                                covered = true;
+                                break;
+                            }
+                        }
                     }
+                }
+                if (covered) {
                     continue;
                 }
                 const auto sit = shader_by_hash.find(rec.pgm_hash);
@@ -1627,7 +1872,7 @@ int PipelineCache::BakeAllGameShaders(const std::filesystem::path& game_dir) {
                             .code = sh.code,
                             .hash = sh.hash,
                         };
-                        auto rt_info = rec.spec.runtime_info;
+                        auto rt_info = PrepareRecipeRuntimeInfo(rec);
                         auto run_bnd = rec.spec.start;
                         Shader::Info info(rec.hw_stage, rec.sw_stage, params);
                         std::vector<u32> raw_spv;
@@ -1635,8 +1880,20 @@ int PipelineCache::BakeAllGameShaders(const std::filesystem::path& game_dir) {
 
                         vk::ShaderModule mod{};
                         Shader::StageSpecialization built_spec{};
+                        const Shader::Info* tmpl_info = nullptr;
                         {
-                            ScopedRecipeReplay replay{rec};
+                            std::scoped_lock lk{commit_mutex};
+                            if (const auto pit = program_cache.find(rec.pgm_hash);
+                                pit != program_cache.end() && pit->second) {
+                                tmpl_info = pit->second->info_template
+                                                ? pit->second->info_template.get()
+                                                : &pit->second->info;
+                            }
+                        }
+                        const auto reconciled_flat = BuildReconciledRecipeFlatBuf(
+                            tmpl_info, rec, reinterpret_cast<uintptr_t>(env->dummy_mem.data()));
+                        {
+                            ScopedRecipeReplay replay{rec, &reconciled_flat};
                             mod = CompileModuleRaw(
                                 local_pools, info, rt_info, sh.code, rec.perm_idx, run_bnd,
                                 &raw_spv,
@@ -2083,7 +2340,26 @@ void PipelineCache::StartBackgroundAutoBake() {
     }
     size_t missing_recipe_perms = 0;
     for (const auto& rec : RecipeCatalog::Get().GetStageRecipes()) {
-        if (!warm_digests.contains(rec.spec_digest)) {
+        if (warm_digests.contains(rec.spec_digest)) {
+            continue;
+        }
+        bool covered = false;
+        if (const auto pit = program_cache.find(rec.pgm_hash);
+            pit != program_cache.end() && pit->second) {
+            if (!IsRecipeResourceLayoutCompatible(pit->second->info, rec)) {
+                covered = true;
+            } else {
+                for (const auto& m : pit->second->modules) {
+                    if (m.module && StageSpecCoversRecipe(m.spec, rec.spec)) {
+                        covered = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if (covered) {
+            warm_digests.insert(rec.spec_digest);
+        } else {
             ++missing_recipe_perms;
         }
     }
@@ -2115,12 +2391,15 @@ void PipelineCache::StartBackgroundAutoBake() {
 
     std::unordered_set<u64> warm_hashes;
     std::unordered_map<u64, Shader::Backend::Bindings> ps_bindings_map;
+    std::unordered_map<u64, const Shader::Info*> template_infos;
     warm_hashes.reserve(program_cache.size() + 512);
+    template_infos.reserve(program_cache.size() + 512);
     for (const auto& [h, prog] : program_cache) {
         if (!prog) {
             continue;
         }
         warm_hashes.insert(h);
+        template_infos.emplace(h, prog->info_template ? prog->info_template.get() : &prog->info);
         if (prog->info.sw_stage == SwStage::Fragment) {
             Shader::Backend::Bindings b{};
             prog->info.AddBindings(b);
@@ -2129,12 +2408,12 @@ void PipelineCache::StartBackgroundAutoBake() {
     }
 
     autobake_stop.store(false, std::memory_order_relaxed);
-    BbStats::shader_autobake_active.store(true, std::memory_order_relaxed);
 
     autobake_thread = std::thread([this, game_root_dir, patch_root, shader_dir,
                                    warm = std::move(warm_hashes),
                                    warm_dig = std::move(warm_digests),
-                                   ps_bnd_init = std::move(ps_bindings_map)]() mutable {
+                                   ps_bnd_init = std::move(ps_bindings_map),
+                                   tmpl_infos = std::move(template_infos)]() mutable {
         SetPoliteAutoBakeThreadPriority();
         const auto t0 = std::chrono::steady_clock::now();
 
@@ -2244,14 +2523,19 @@ void PipelineCache::StartBackgroundAutoBake() {
         }
 
         const size_t total_work = total_all + pending_recipes.size();
-        BbStats::shader_autobake_total.store(static_cast<u32>(total_work), std::memory_order_relaxed);
-        BbStats::shader_autobake_done.store(static_cast<u32>(already_warm_count),
-                                            std::memory_order_relaxed);
-
         if (already_warm_count >= total_all && pending_recipes.empty()) {
-            BbStats::shader_autobake_active.store(false, std::memory_order_relaxed);
+            BbStats::shader_autobake_done.store(static_cast<u32>(total_work),
+                                                std::memory_order_relaxed);
+            BbStats::shader_autobake_total.store(static_cast<u32>(total_work),
+                                                 std::memory_order_relaxed);
+            BbStats::shader_autobake_active.store(false, std::memory_order_release);
             return;
         }
+        BbStats::shader_autobake_total.store(static_cast<u32>(total_work),
+                                             std::memory_order_relaxed);
+        BbStats::shader_autobake_done.store(static_cast<u32>(already_warm_count),
+                                            std::memory_order_relaxed);
+        BbStats::shader_autobake_active.store(true, std::memory_order_release);
 
         const u32 hw_threads = std::max(1u, std::thread::hardware_concurrency());
         const u32 polite_workers = std::clamp(hw_threads / 6u, 1u, 3u);
@@ -2420,7 +2704,7 @@ void PipelineCache::StartBackgroundAutoBake() {
                         .code = sh.code,
                         .hash = sh.hash,
                     };
-                    auto rt_info = rec.spec.runtime_info;
+                    auto rt_info = PrepareRecipeRuntimeInfo(rec);
                     auto run_bnd = rec.spec.start;
                     auto item = std::make_shared<AutoBakeReadyStage>();
                     item->hw_stage = rec.hw_stage;
@@ -2429,8 +2713,14 @@ void PipelineCache::StartBackgroundAutoBake() {
                     item->is_extra_perm = true;
                     item->info = Shader::Info(rec.hw_stage, rec.sw_stage, params);
 
+                    const Shader::Info* tmpl_info = nullptr;
+                    if (const auto tit = tmpl_infos.find(rec.pgm_hash); tit != tmpl_infos.end()) {
+                        tmpl_info = tit->second;
+                    }
+                    const auto reconciled_flat = BuildReconciledRecipeFlatBuf(
+                        tmpl_info, rec, reinterpret_cast<uintptr_t>(env->dummy_mem.data()));
                     {
-                        ScopedRecipeReplay replay{rec};
+                        ScopedRecipeReplay replay{rec, &reconciled_flat};
                         item->mod = CompileModuleRaw(
                             local_pools, item->info, rt_info, sh.code, rec.perm_idx, run_bnd,
                             &item->raw_spv,

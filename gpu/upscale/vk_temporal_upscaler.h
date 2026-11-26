@@ -130,6 +130,7 @@ public:
     [[nodiscard]] u64 RedirectState() const noexcept {
         return u64(ui_phase) | u64(display_redirect) << 1 | u64(done_this_frame) << 2 |
                u64(ui_in_place) << 3 | u64(display_in_place) << 4 |
+               u64(ui_hud_started) << 5 | u64(hudless_taken) << 6 |
                u64(ui_color.index) << 8 | u64(ui_depth.index) << 36;
     }
 
@@ -164,7 +165,7 @@ public:
 
     /// After identifying this draw's targets, before drawing any UI pixels. Menus use
     /// spatial background copy and native UI, without needing scene depth or FSR history.
-    void OnDraw(u64 vs_hash, VideoCore::ImageId color, VideoCore::ImageId depth,
+    void OnDraw(u64 vs_hash, u64 ps_hash, VideoCore::ImageId color, VideoCore::ImageId depth,
                 bool native_viewport);
 
     /// A pass's first color target: the last render-size RGBA8 target before the UI is the
@@ -192,6 +193,17 @@ public:
     [[nodiscard]] bool RedirectsSampled(VideoCore::ImageId image) const {
         return display_redirect && !display_in_place && image == ui_color;
     }
+    /// Exact view format & component swizzle last used by RedirectSampled on `ui_image`,
+    /// so Presenter::EncodeInterpolated matches PassFusion's fused Gamma 1D LUT pass identically.
+    [[nodiscard]] bool LastSampledViewParams(vk::Format& out_format,
+                                             vk::ComponentMapping& out_mapping) const noexcept {
+        if (!has_last_sampled_view) {
+            return false;
+        }
+        out_format = last_sampled_format;
+        out_mapping = last_sampled_mapping;
+        return true;
+    }
 
     /// Presenter: the output-size display buffer standing in for the guest one at `address`.
     struct Display {
@@ -213,6 +225,10 @@ public:
     }
     /// Pack #2: True when frame generation wants the display pass to populate its own buffer.
     [[nodiscard]] bool FrameGenWanted() const noexcept;
+    /// Forwards Bloodborne's native Pass 0x2e (`velWrap`) object velocity view into CameraMotion
+    /// so both temporal upscalers and Frame Generation receive exact character/cloth/weapon MVs.
+    void SetNativeObjectVelocity(vk::ImageView view, vk::ImageLayout layout,
+                                 u32 fps_q4_int) noexcept;
     /// Pack #2: True when the display pass input (`ui_color`) is redirected to `ui_image`.
     [[nodiscard]] bool IsDisplayRedirected() const noexcept {
         return display_redirect && !display_in_place;
@@ -330,11 +346,15 @@ private:
     VideoCore::ImageId ui_color{}, ui_depth{};
     bool ui_phase = false;         ///< from the upscale to the next display pass
     bool ui_in_place = false;      ///< native-size guest target: scale UI viewport in-place without ui_image blit
+    bool ui_hud_started = false;   ///< true once the first actual Scaleform HUD draw begins (after post-Yebis Glow/AA)
     const bool ui_trace_on = std::getenv("BB_UI_TRACE") != nullptr; ///< diagnostics
     std::string ui_trace;
     bool display_redirect = false; ///< the display pass of an upscaled frame
     bool display_in_place = false; ///< display pass samples guest ui_color directly into host display.image
     bool ui_read_barrier = false;
+    bool has_last_sampled_view = false;
+    vk::Format last_sampled_format{};
+    vk::ComponentMapping last_sampled_mapping{};
     VideoCore::HostImage ui_image;
     VideoCore::HostImage ui_depth_image;
     vk::UniqueImageView ui_view;
@@ -374,9 +394,15 @@ private:
     std::unique_ptr<class Smaa> smaa;
     bool smaa_done = false; ///< this frame's SMAA ran at the game's own size (OnDraw)
     bool hudless_taken = false; ///< this frame's UI-less image went to frame generation
-    /// Inputs of this frame's scaled run, for frame generation (CaptureFrameGenScene).
-    void CaptureFrameGenScene(vk::Image depth_image, vk::Format depth_format, u32 w, u32 h, u32 ow,
-                              u32 oh, float frame_ms, bool frame_reset);
+    /// Inputs of this frame's scene run, for frame generation (CaptureFrameGenScene).
+    void CaptureFrameGenScene(vk::Image depth_image, vk::Format depth_format,
+                              vk::ImageLayout depth_layout, vk::Image motion_img,
+                              vk::ImageView motion_v, u32 w, u32 h, u32 ow, u32 oh, float frame_ms,
+                              bool frame_reset);
+    void EnsureFgMotionResources(u32 w, u32 h);
+    VideoCore::HostImage fg_motion_image;
+    vk::UniqueImageView fg_motion_view;
+    u32 fg_motion_w = 0, fg_motion_h = 0;
     bool fsr4_failed = false;
     bool dlss_failed = false;
     VideoCore::HostImage motion_image;

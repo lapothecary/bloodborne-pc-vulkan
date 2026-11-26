@@ -362,8 +362,9 @@ void LoadInpaintedGameFieldMv(FfxFloat32x2 fUv, out VectorFieldEntry vfElement)
         vfElement.bInPainted            = true;
     }
 
-    vfElement.bNegOutside = !IsUvInside(fUv - vfElement.fMotionVector);
-    vfElement.bPosOutside = !IsUvInside(fUv + vfElement.fMotionVector);
+    const FfxFloat32 fInterpT = InterpolationTime();
+    vfElement.bNegOutside = !IsUvInside(fUv - vfElement.fMotionVector * (2.0f * (1.0f - fInterpT)));
+    vfElement.bPosOutside = !IsUvInside(fUv + vfElement.fMotionVector * (2.0f * fInterpT));
     vfElement.fVelocity   = length(vfElement.fMotionVector);
 }
 #endif
@@ -409,8 +410,9 @@ void SampleOpticalFlowMotionVectorField(FfxFloat32x2 fUv, out VectorFieldEntry v
         vfElement.uLowPriorityFactor /= fWeightSum;
     }
 
-    vfElement.bNegOutside = !IsUvInside(fUv - vfElement.fMotionVector);
-    vfElement.bPosOutside = !IsUvInside(fUv + vfElement.fMotionVector);
+    const FfxFloat32 fInterpT = InterpolationTime();
+    vfElement.bNegOutside = !IsUvInside(fUv - vfElement.fMotionVector * (2.0f * (1.0f - fInterpT)));
+    vfElement.bPosOutside = !IsUvInside(fUv + vfElement.fMotionVector * (2.0f * fInterpT));
     vfElement.fVelocity   = length(vfElement.fMotionVector);
 }
 #endif

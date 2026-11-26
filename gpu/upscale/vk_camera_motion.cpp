@@ -246,6 +246,103 @@ std::array<std::array<float, 4>, 3> CameraMotion::TaaDepthParameters() const noe
             {transform[8], transform[9], transform[10], transform[11]}};
 }
 
+namespace {
+
+std::array<float, 16> Mul4x4(const std::array<float, 16>& a,
+                             const std::array<float, 16>& b) noexcept {
+    std::array<float, 16> out{};
+    for (int r = 0; r < 4; ++r) {
+        for (int c = 0; c < 4; ++c) {
+            float sum = 0.0f;
+            for (int k = 0; k < 4; ++k) {
+                sum += a[r * 4 + k] * b[k * 4 + c];
+            }
+            out[r * 4 + c] = sum;
+        }
+    }
+    return out;
+}
+
+std::array<float, 16> TransposeAffine3x4ToRowMat4(const std::array<float, 12>& t) noexcept {
+    return {
+        t[0], t[4], t[8],  0.0f,
+        t[1], t[5], t[9],  0.0f,
+        t[2], t[6], t[10], 0.0f,
+        t[3], t[7], t[11], 1.0f,
+    };
+}
+
+bool BuildProjPair(const std::array<float, 4>& proj, std::array<float, 16>& p_out,
+                   std::array<float, 16>& pinv_out) noexcept {
+    const float px = proj[0];
+    const float py_up = -proj[1];
+    const float zs = proj[2];
+    const float zo = proj[3];
+    if (px == 0.0f || py_up == 0.0f || zo == 0.0f || !std::isfinite(px) ||
+        !std::isfinite(py_up) || !std::isfinite(zs) || !std::isfinite(zo)) {
+        return false;
+    }
+    p_out = {
+        px,   0.0f,  0.0f, 0.0f,
+        0.0f, py_up, 0.0f, 0.0f,
+        0.0f, 0.0f,  zs,   1.0f,
+        0.0f, 0.0f,  zo,   0.0f,
+    };
+    const float inv_zo = 1.0f / zo;
+    pinv_out = {
+        1.0f / px, 0.0f,         0.0f, 0.0f,
+        0.0f,      1.0f / py_up, 0.0f, 0.0f,
+        0.0f,      0.0f,         0.0f, inv_zo,
+        0.0f,      0.0f,         1.0f, -zs * inv_zo,
+    };
+    return true;
+}
+
+bool AllFinite16(const std::array<float, 16>& m) noexcept {
+    for (float v : m) {
+        if (!std::isfinite(v)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+} // namespace
+
+CameraMotion::DlssgMatrices CameraMotion::ComputeDlssgMatricesFromCameras(
+    const std::array<float, 12>& cur_view, const std::array<float, 12>& cur_inv_view,
+    const std::array<float, 4>& cur_proj, const std::array<float, 12>& prev_view,
+    const std::array<float, 12>& prev_inv_view, const std::array<float, 4>& prev_proj) noexcept {
+    DlssgMatrices out{};
+    std::array<float, 16> p_cur{}, p_cur_inv{}, p_prev{}, p_prev_inv{};
+    if (!BuildProjPair(cur_proj, p_cur, p_cur_inv) ||
+        !BuildProjPair(prev_proj, p_prev, p_prev_inv)) {
+        return out;
+    }
+    const auto t_c2p = Multiply(prev_view, cur_inv_view);
+    const auto t_p2c = Multiply(cur_view, prev_inv_view);
+    const auto r_c2p = TransposeAffine3x4ToRowMat4(t_c2p);
+    const auto r_p2c = TransposeAffine3x4ToRowMat4(t_p2c);
+
+    out.camera_view_to_clip = p_cur;
+    out.clip_to_camera_view = p_cur_inv;
+    out.clip_to_prev_clip = Mul4x4(Mul4x4(p_cur_inv, r_c2p), p_prev);
+    out.prev_clip_to_clip = Mul4x4(Mul4x4(p_prev_inv, r_p2c), p_cur);
+    out.valid = AllFinite16(out.camera_view_to_clip) && AllFinite16(out.clip_to_camera_view) &&
+                AllFinite16(out.clip_to_prev_clip) && AllFinite16(out.prev_clip_to_clip);
+    return out;
+}
+
+bool CameraMotion::ComputeDlssgMatrices(DlssgMatrices& out) const noexcept {
+    if (!current.valid || !previous.valid) {
+        out = {};
+        return false;
+    }
+    out = ComputeDlssgMatricesFromCameras(current.view, current.inv_view, current.proj,
+                                          previous.view, previous.inv_view, previous.proj);
+    return out.valid;
+}
+
 vk::ImageView CameraMotion::ObjectMotionView() const noexcept {
     return object_motion && object_motion->Enabled() ? object_motion->View() : vk::ImageView{};
 }
@@ -259,8 +356,15 @@ void CameraMotion::RecordMotion(vk::ImageView depth_view, vk::ImageView motion_v
                                 u32 height) {
     CommitFrameCamera();
     bool object_valid = false;
-    const vk::ImageView object_view = object_motion && object_motion->Enabled()
+    vk::ImageView object_view = object_motion && object_motion->Enabled()
         ? object_motion->PrepareRead(width, height, object_valid) : depth_view;
+    vk::ImageLayout object_layout = vk::ImageLayout::eGeneral;
+    u32 mode = object_valid ? 1u : 0u;
+    if (!object_valid && native_vel_view && native_vel_fps_q4 >= 16u) {
+        object_view = native_vel_view;
+        object_layout = native_vel_layout;
+        mode = native_vel_fps_q4;
+    }
     const PushConstants push{
         .reproject = Multiply(previous.view, current.inv_view),
         .proj = current.proj,
@@ -268,11 +372,12 @@ void CameraMotion::RecordMotion(vk::ImageView depth_view, vk::ImageView motion_v
         .size = {float(width), float(height)},
         .jitter = jitter,
         .previous_jitter = previous_jitter,
-        .mode = object_valid ? 1u : 0u,
+        .mode = mode,
     };
     // bbport: everything the pass reads is captured: it may be recorded on a recording thread
     // while this thread goes on with the next frame's camera.
-    scheduler.RecordCrumb({.name = "camera motion"}, [push, depth_view, motion_view, object_view, width, height,
+    scheduler.RecordCrumb({.name = "camera motion"}, [push, depth_view, motion_view, object_view,
+                      object_layout, width, height,
                       pipeline = *motion_pipeline,
                       layout = *motion_pipeline_layout](vk::CommandBuffer cmdbuf) {
         const vk::DescriptorImageInfo depth_info{.imageView = depth_view,
@@ -280,7 +385,7 @@ void CameraMotion::RecordMotion(vk::ImageView depth_view, vk::ImageView motion_v
         const vk::DescriptorImageInfo motion_info{.imageView = motion_view,
                                                   .imageLayout = vk::ImageLayout::eGeneral};
         const vk::DescriptorImageInfo object_info{.imageView = object_view,
-                                                  .imageLayout = vk::ImageLayout::eGeneral};
+                                                  .imageLayout = object_layout};
         const std::array<vk::WriteDescriptorSet, 3> writes = {{
             {.dstBinding = 0,
              .descriptorCount = 1,
@@ -445,6 +550,8 @@ void CameraMotion::OnDisplayPass(VideoCore::ImageId frame) {
     committed = false;
     frame_gbuffer_passes = 0;
     depth_id = {};
+    native_vel_view = vk::ImageView{};
+    native_vel_fps_q4 = 0;
 }
 
 void CameraMotion::Overlay(VideoCore::ImageId frame) {

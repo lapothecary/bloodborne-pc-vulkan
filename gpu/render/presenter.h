@@ -47,13 +47,16 @@ struct Frame {
     vk::Fence present_done{};
     vk::Semaphore ready_semaphore{};
     u64 ready_tick = 0;
+    u64 present_id = 0; ///< monotonic low-latency frame ID (Reflex / Anti-Lag 2)
     bool is_hdr = false;
     u8 id = 0;
-    /// Frame generation: the frame interpolated before this one, encoded like it (shown first).
-    VmaAllocation interp_allocation{};
-    vk::Image interp_image{};
-    vk::ImageView interp_view{};
-    bool has_interp = false;
+    /// Frame generation: interpolated frames before this one, encoded identically (shown first).
+    static constexpr u32 MaxInterpSlots = 3;
+    std::array<VmaAllocation, MaxInterpSlots> interp_allocations{};
+    std::array<vk::Image, MaxInterpSlots> interp_images{};
+    std::array<vk::ImageView, MaxInterpSlots> interp_views{};
+    u32 interp_count = 0;
+    int interp_backend = 0;
 };
 
 class Presenter {
@@ -77,10 +80,15 @@ public:
 
     /// Command processor thread: the display buffer at `cpu_address` into a free frame.
     Frame* PrepareFrame(const BbVideoOut::BufferAttributeGroup& attribute, VAddr cpu_address);
-    /// Frame generation's frame interpolated before `frame` (PrepareFrame): encoded into the
-    /// frame's second image like the real one.
-    void EncodeInterpolated(Frame* frame, vk::Image image, vk::Format format, u32 width, u32 height,
-                            vk::Format display_view_format, const EncodePass::Settings& encode);
+    /// Frame generation's interpolated frames before `frame` (PrepareFrame): encoded into
+    /// `frame->interp_images[slot]` like the real one (including PassFusion's fused Gamma 1D LUT).
+    void EncodeInterpolated(Frame* frame, u32 slot, vk::Image image, vk::Format format, u32 width,
+                            u32 height, vk::Format display_view_format,
+                            const EncodePass::Settings& encode, bool fused_gamma = false,
+                            vk::Format fused_src_format = {},
+                            vk::ComponentMapping fused_src_mapping = {},
+                            vk::ImageView lut1d_view = {},
+                            vk::ImageLayout lut1d_layout = vk::ImageLayout::eShaderReadOnlyOptimal);
     /// A black frame (no GPU work until it is presented).
     Frame* PrepareBlankFrame(bool present_thread);
     /// Present thread: shows `frame` and frees it (unless `is_reusing_frame`).
@@ -100,7 +108,11 @@ private:
                        vk::Extent2D extent, vk::Image source = {});
     /// Shows `source` (or the frame's image) in the next swapchain image; false: none shown.
     /// `last`: the frame's final present (signals its fence).
-    bool PresentImage(Frame* frame, vk::Image source, bool last);
+    /// `fg_slot_period_ns`: non-zero when Frame Generation paces both interpolated and real slots
+    /// on a unified half-frame monotonic grid; `wait_gpu_done` skips redundant WaitRendered on the
+    /// second slot of a pair after the first slot already waited for `frame->ready_tick`.
+    bool PresentImage(Frame* frame, vk::Image source, bool last, u64 fg_slot_period_ns = 0,
+                      bool wait_gpu_done = true);
 
     Frontend::WindowSDL& window;
     Instance instance;

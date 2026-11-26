@@ -347,6 +347,7 @@ if (NOT WIN32)
 endif()
 pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavformat libavcodec libavutil libswscale libswresample)
 file(GLOB SHIM_SOURCES CONFIGURE_DEPENDS shim/*.cpp shim/*/*.cpp)
+file(GLOB CLOTH_EXP_SOURCES CONFIGURE_DEPENDS cloth_exp/*.cpp)
 # The layer's own modules (independent of the shadPS4 code): layer/.
 file(GLOB LAYER_SOURCES CONFIGURE_DEPENDS layer/*.cpp)
 # Game profiles (what the translator knows about one game, out of its core): games/.
@@ -364,7 +365,7 @@ if (WIN32)
 else()
     set(BBGPU_LIBRARY_TYPE SHARED)
 endif()
-add_library(bbgpu ${BBGPU_LIBRARY_TYPE} ${RECOMPILER} ${COMMON} ${PLATFORM_SOURCES} ${SHIM_SOURCES} ${LAYER_SOURCES} ${GAME_SOURCES} ${CP_SOURCES}
+add_library(bbgpu ${BBGPU_LIBRARY_TYPE} ${RECOMPILER} ${COMMON} ${PLATFORM_SOURCES} ${SHIM_SOURCES} ${CLOTH_EXP_SOURCES} ${LAYER_SOURCES} ${GAME_SOURCES} ${CP_SOURCES}
     ${RENDER_SOURCES} ${UPSCALE_SOURCES})
 add_dependencies(bbgpu host_shaders)
 # In-game settings menu: Dear ImGui (third_party/imgui, MIT) with its Vulkan backend, and an

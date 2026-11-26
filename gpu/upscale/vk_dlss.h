@@ -10,6 +10,7 @@
 
 #pragma once
 
+#include <array>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -38,11 +39,14 @@ public:
     void Shutdown();
 
     [[nodiscard]] bool Available() const;
+    [[nodiscard]] bool FgAvailable() const;
+    [[nodiscard]] u32 FgMaxMultiFrame() const;
     /// Non-blocking boot check: true when NVIDIA RTX + NGX bridge/extensions are present
     /// (background `bb:DlssInit` may still be finalizing NGX initialization).
     [[nodiscard]] bool EligibleForBoot() const noexcept;
     /// Why DLSS cannot run on this system (empty when it can, or before device creation).
     [[nodiscard]] std::string Problem() const;
+    [[nodiscard]] std::string FgProblem() const;
 
     struct Resource {
         vk::Image image;
@@ -65,6 +69,31 @@ public:
         float frame_ms;
         float sharpness;
     };
+    struct FgFeatureDesc {
+        u32 input_width, input_height, backbuffer_width, backbuffer_height;
+        vk::Format backbuffer_format{vk::Format::eUndefined};
+        bool dynamic_resolution{};
+        bool depth_inverted{};
+        bool hdr{};
+        bool operator==(const FgFeatureDesc&) const = default;
+    };
+    struct FgFrame {
+        Resource backbuffer, depth, motion, hudless{}, output;
+        u64 frame_id{};
+        u32 multi_frame_count{1};
+        u32 multi_frame_index{1};
+        bool reset{};
+        bool depth_inverted{};
+        bool hdr{};
+        bool camera_motion_included{true};
+        u32 render_subrect_width{}, render_subrect_height{};
+        float jitter_x{}, jitter_y{};
+        float mv_scale_x{1.0f}, mv_scale_y{1.0f};
+        std::array<float, 3> camera_pos{}, camera_up{}, camera_right{}, camera_fwd{};
+        float camera_near{}, camera_far{}, camera_fov{}, camera_aspect{1.0f};
+        std::array<float, 16> camera_view_to_clip{}, clip_to_camera_view{}, clip_to_prev_clip{},
+            prev_clip_to_clip{}, clip_to_lens_clip{};
+    };
 
     /// DLSS quality mode for an output/render size ratio (0 DLAA .. 4 Ultra Performance).
     static int QualityForScale(float scale);
@@ -73,6 +102,12 @@ public:
     bool CreateFeature(vk::CommandBuffer command, const FeatureDesc& desc);
     bool Evaluate(vk::CommandBuffer command, const Frame& frame);
     void ReleaseFeature();
+
+    [[nodiscard]] bool HasFgFeature(const FgFeatureDesc& desc) const;
+    /// Records the DLSS-G feature creation. The GPU must be done with the previous one.
+    bool CreateFgFeature(vk::CommandBuffer command, const FgFeatureDesc& desc);
+    bool EvaluateFg(vk::CommandBuffer command, const FgFrame& frame);
+    void ReleaseFgFeature();
 
 private:
     Dlss();

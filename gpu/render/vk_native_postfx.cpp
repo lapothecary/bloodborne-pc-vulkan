@@ -1826,13 +1826,19 @@ bool NativePostFx::Execute(const BbCp::DirectVk::NativePostProcessArgs& args,
         }
     }
 
+    const bool wants_prepost_hdr =
+        upscaler && upscaler->WantsPrePostHdr() &&
+        (hdr_image.info.pixel_format == vk::Format::eR16G16B16A16Sfloat);
+    const bool fg_wanted_now = upscaler && upscaler->FrameGenWanted();
+    const bool obj_moved = (args.flags & BbCp::DirectVk::kNativePostFlagObjMoved) != 0u;
     bool has_vel = false;
     VideoCore::ImageId vel_id{};
     vk::ImageView vel_view = *dummy_black_2d_view;
     u32 vel_fmt_dbg = 0u;
     u32 vel_w_dbg = 0u;
     u32 vel_h_dbg = 0u;
-    if (mb_wanted && (args.flags & BbCp::DirectVk::kNativePostFlagHasVel) != 0u) {
+    if ((mb_wanted || wants_prepost_hdr || fg_wanted_now) &&
+        (args.flags & BbCp::DirectVk::kNativePostFlagHasVel) != 0u) {
         Gcn::Image vel_sharp{};
         std::memcpy(&vel_sharp, args.vel_tsharp, sizeof(vel_sharp));
         u8 vel_gen8 = 0u;
@@ -1860,9 +1866,6 @@ bool NativePostFx::Execute(const BbCp::DirectVk::NativePostProcessArgs& args,
     //   MotionBlur, DoF, Bloom, Fire Heat Haze, Tonemap & CA -> zero conflict between AA & PostFX.
     // - Case B (render < output, e.g. DLSS/FSR Quality): MotionBlur & DoF run at render-res with
     //   pixel-exact depth/vel, then upscaler reconstructs output-res Linear HDR before Bloom/Tonemap/CA.
-    const bool wants_prepost_hdr =
-        upscaler && upscaler->WantsPrePostHdr() &&
-        (hdr_image.info.pixel_format == vk::Format::eR16G16B16A16Sfloat);
     vk::Image src_hdr_img = hdr_image.GetImage();
     vk::ImageView src_hdr_view = *hdr_view_obj.image_view;
     vk::ImageLayout src_hdr_layout = vk::ImageLayout::eShaderReadOnlyOptimal;
@@ -1897,6 +1900,22 @@ bool NativePostFx::Execute(const BbCp::DirectVk::NativePostProcessArgs& args,
     // jittered Linear HDR BEFORE MotionBlur, DoF, Bloom, Heat Haze, Tonemap & CA.
     // Running DoF before DLSS feeds stochastic IGN bokeh noise into the upscaler and ruins
     // fine foliage reconstruction at low input resolutions (e.g. DLSS 4.5 Ultra Performance).
+    const float frames30_now = std::clamp(BbFrameRate::CurrentFramesPer30(), 0.05f, 1.5f);
+    const float fps_scale_now = std::clamp(1.0f / frames30_now, 1.0f, 12.0f);
+    const int fps_q4_int_now =
+        std::clamp(static_cast<int>(std::lround(fps_scale_now * 16.0f)), 16, 255);
+    bool vel_transited_early = false;
+    if (upscaler && has_vel && vel_id && obj_moved && (wants_prepost_hdr || fg_wanted_now)) {
+        auto& vel_image = texture_cache.GetImage(vel_id);
+        runtime.Transit(&vel_image, vk::ImageLayout::eShaderReadOnlyOptimal,
+                        vk::PipelineStageFlagBits2::eComputeShader,
+                        vk::AccessFlagBits2::eShaderRead);
+        runtime.FlushBarriers();
+        vel_transited_early = true;
+        upscaler->SetNativeObjectVelocity(vel_view, vk::ImageLayout::eShaderReadOnlyOptimal,
+                                          u32(fps_q4_int_now));
+    }
+
     const std::array<float, 2> frame_depth_jitter =
         (upscaler && wants_prepost_hdr) ? upscaler->Jitter() : std::array<float, 2>{0.0f, 0.0f};
     TemporalUpscaler::PrePostHdrResult aa_res{};
@@ -1918,7 +1937,6 @@ bool NativePostFx::Execute(const BbCp::DirectVk::NativePostProcessArgs& args,
     }
 
     const bool cam_moved = (args.flags & BbCp::DirectVk::kNativePostFlagCamMoved) != 0u;
-    const bool obj_moved = (args.flags & BbCp::DirectVk::kNativePostFlagObjMoved) != 0u;
     const bool mb_cam_active = mb_wanted && (mb_cam_lvl > 0) && has_depth && cam_moved;
     const bool mb_obj_active = mb_wanted && (mb_obj_lvl > 0) && has_vel && obj_moved;
     const bool mb_active = (mb_cam_active || mb_obj_active || mb_debug_vis) &&
@@ -1953,7 +1971,7 @@ bool NativePostFx::Execute(const BbCp::DirectVk::NativePostProcessArgs& args,
                         vk::PipelineStageFlagBits2::eComputeShader,
                         vk::AccessFlagBits2::eShaderRead);
     }
-    if (mb_active && has_vel && vel_id) {
+    if (mb_active && has_vel && vel_id && !vel_transited_early) {
         auto& vel_image = texture_cache.GetImage(vel_id);
         runtime.Transit(&vel_image, vk::ImageLayout::eShaderReadOnlyOptimal,
                         vk::PipelineStageFlagBits2::eComputeShader,
@@ -2063,12 +2081,21 @@ bool NativePostFx::Execute(const BbCp::DirectVk::NativePostProcessArgs& args,
         // Hunter's Dream, matching PS4 original rather than over-amplifying by raw MotionBlurScale=4.0).
         const float obj_time_scale = std::clamp(time_ratio * 1.45f, 0.10f, 0.28f);
 
+        // When Frame Generation is active, attenuate pre-interpolation stochastic IGN Motion Blur
+        // shutter so Optical Flow and Frame Interpolation track crisp limb/weapon silhouettes
+        // instead of warping pre-blurred streaks into double contours.
+        const int fg_mult = fg_wanted_now
+                                ? BbSettings::FrameGenMultiplier(BbSettings::EffectiveFrameGen())
+                                : 1;
+        const float fg_scale = (fg_mult >= 2) ? (2.0f / float(fg_mult)) : 1.0f;
+        const float fg_cam_damp = (fg_mult >= 2) ? (0.45f * fg_scale) : 1.0f;
+        const float fg_obj_damp = (fg_mult >= 2) ? (0.25f * fg_scale) : 1.0f;
         MbVelUbo mb_ubo{};
         std::memcpy(mb_ubo.clip_to_prev, args.clip_to_prev_clip, sizeof(mb_ubo.clip_to_prev));
-        mb_ubo.params0[0] = time_ratio * fps_q4 * kMbMult[mb_cam_lvl];
-        mb_ubo.params0[1] = obj_time_scale * kMbMult[mb_obj_lvl] * obj_boost;
-        mb_ubo.params0[2] = std::clamp(max_len_uv * kLenMult[mb_cam_lvl], 0.005f, 0.09f);
-        mb_ubo.params0[3] = std::clamp(max_len_uv * 1.25f * kLenMult[mb_obj_lvl], 0.008f, 0.11f);
+        mb_ubo.params0[0] = time_ratio * fps_q4 * kMbMult[mb_cam_lvl] * fg_cam_damp;
+        mb_ubo.params0[1] = obj_time_scale * kMbMult[mb_obj_lvl] * obj_boost * fg_obj_damp;
+        mb_ubo.params0[2] = std::clamp(max_len_uv * kLenMult[mb_cam_lvl] * fg_cam_damp, 0.004f, 0.09f);
+        mb_ubo.params0[3] = std::clamp(max_len_uv * 1.25f * kLenMult[mb_obj_lvl] * fg_obj_damp, 0.004f, 0.11f);
         mb_ubo.params1[0] = fps_q4;
         mb_ubo.params1[1] = 0.25f;   // Exact inverse of Pass 0x2e Native PostFX enc_scale = 4.0
         mb_ubo.params1[2] = 0.0065f; // NDC deadzone (~3.3 LSB) crushes 8-bit static NPC residual noise

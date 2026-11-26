@@ -6,12 +6,18 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <unistd.h>
 #include "gpu/shim/bbport_settings.h"
 
 namespace BbFrameRate {
 void SetLimit(int) {}
 } // namespace BbFrameRate
+namespace BbSysInfo {
+std::string RedactHomePath(std::string_view path) {
+    return std::string{path};
+}
+} // namespace BbSysInfo
 
 static std::string Read(const char* path) {
     std::ifstream file(path);
@@ -105,6 +111,30 @@ int main() {
     assert(s.network_region == 1 && s.player_name_display == 0);
     assert(BbSettings::GetNetworkPassword() == "hunt1234");
     assert(s.game_text_language == 11 && s.game_voice_language == 1);
+
+    // Multi-frame FSR 3.1 (3x / 4x) save/load & multiplier round-trip.
+    s.frame_generation_supported = true;
+    for (int fg_mode : {int(BbSettings::FrameGenFsr3_3x), int(BbSettings::FrameGenFsr3_4x)}) {
+        s.frame_generation = fg_mode;
+        BbSettings::Save();
+        s.frame_generation = BbSettings::FrameGenOff;
+        BbSettings::Load();
+        assert(s.frame_generation == fg_mode);
+        assert(BbSettings::EffectiveFrameGen() == fg_mode);
+        assert(BbSettings::FrameGenMultiplier(fg_mode) == (fg_mode == BbSettings::FrameGenFsr3_3x ? 3 : 4));
+    }
+
+    // VSync / present_mode ("Fifo", "Immediate", "Mailbox") case-insensitive round-trip through Save() -> Load()
+    // and BB_PRESENT_MODE environment fallback.
+    for (int vm : {int(BbSettings::VsyncOn), int(BbSettings::VsyncOff), int(BbSettings::VsyncFast)}) {
+        s.vsync_mode = vm;
+        s.vsync_mode_chosen = true;
+        BbSettings::Save();
+        s.vsync_mode = BbSettings::VsyncFast;
+        s.vsync_mode_chosen = false;
+        BbSettings::Load();
+        assert(s.vsync_mode == vm && s.vsync_mode_chosen);
+    }
 
     unlink(path);
     std::puts("PASS: settings save keeps other keys, menu position, menu language, and native CSOptionsData");

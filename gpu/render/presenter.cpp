@@ -30,6 +30,7 @@
 #include "render/rasterizer.h"
 #include "render/shader_hle.h"
 #include "render/vk_gpu_profiler.h"
+#include "vulkan/low_latency.h"
 #include "vulkan/platform.h"
 
 namespace Vulkan {
@@ -131,6 +132,18 @@ Presenter::~Presenter() {
         if (frame.image) {
             vmaDestroyImage(instance.GetAllocator(), frame.image, frame.allocation);
         }
+        for (u32 slot = 0; slot < Frame::MaxInterpSlots; ++slot) {
+            device.destroyImageView(frame.interp_views[slot]);
+            if (frame.interp_images[slot]) {
+                vmaDestroyImage(instance.GetAllocator(), frame.interp_images[slot],
+                                frame.interp_allocations[slot]);
+            }
+            frame.interp_images[slot] = vk::Image{};
+            frame.interp_views[slot] = vk::ImageView{};
+            frame.interp_allocations[slot] = VmaAllocation{};
+        }
+        frame.interp_count = 0;
+        frame.interp_backend = 0;
         device.destroyFence(frame.present_done);
     }
 }
@@ -196,14 +209,19 @@ void Presenter::RecreateFrame(Frame& frame, u32 width, u32 height) {
         .subresourceRange = ColorRange,
     }));
     SetObjectName(device, frame.image, "frame {}", frame.id);
-    // Frame generation's frame (made with the first one generated: most sessions never need it).
-    device.destroyImageView(frame.interp_view);
-    if (frame.interp_image) {
-        vmaDestroyImage(instance.GetAllocator(), frame.interp_image, frame.interp_allocation);
+    // Frame generation's frames (made on demand: most sessions never need all slots).
+    for (u32 slot = 0; slot < Frame::MaxInterpSlots; ++slot) {
+        device.destroyImageView(frame.interp_views[slot]);
+        if (frame.interp_images[slot]) {
+            vmaDestroyImage(instance.GetAllocator(), frame.interp_images[slot],
+                            frame.interp_allocations[slot]);
+        }
+        frame.interp_images[slot] = vk::Image{};
+        frame.interp_views[slot] = vk::ImageView{};
+        frame.interp_allocations[slot] = VmaAllocation{};
     }
-    frame.interp_image = vk::Image{};
-    frame.interp_view = vk::ImageView{};
-    frame.has_interp = false;
+    frame.interp_count = 0;
+    frame.interp_backend = 0;
     frame.width = width;
     frame.height = height;
     frame.is_hdr = is_hdr;
@@ -420,14 +438,29 @@ Frame* Presenter::PrepareFrame(const BbVideoOut::BufferAttributeGroup& attribute
         }
     });
 
-    // Frame generation: the frame interpolated before this one, encoded the same way.
-    frame->has_interp = false;
-    FrameGeneration::Output interp{};
-    if (upscaled && upscaler.GetFrameGeneration() &&
-        upscaler.GetFrameGeneration()->TakeOutput(cpu_address, interp) &&
-        interp.width == display.width && interp.height == display.height) {
-        EncodeInterpolated(frame, interp.image, interp.format, interp.width, interp.height,
-                           view_info.format, encode);
+    // Frame generation: up to 3 interpolated frames before this real frame, encoded identically
+    // (including PassFusion's fused 1D Display Gamma LUT, RCAS sharpening, and SDR/HDR10 PQ curve).
+    frame->interp_count = 0;
+    frame->interp_backend = 0;
+    std::array<FrameGeneration::Output, FrameGeneration::MaxInterpOutputs> interps{};
+    int fg_backend = 0;
+    const u32 interp_n =
+        ((fused_gamma || upscaled) && upscaler.GetFrameGeneration())
+            ? upscaler.GetFrameGeneration()->TakeOutputs(cpu_address, interps, &fg_backend)
+            : 0u;
+    for (u32 slot = 0; slot < std::min<u32>(interp_n, Frame::MaxInterpSlots); ++slot) {
+        const auto& interp = interps[slot];
+        if (interp.width == source_size.width && interp.height == source_size.height) {
+            EncodeInterpolated(
+                frame, slot, interp.image, interp.format, interp.width, interp.height,
+                view_info.format, encode, fused_gamma,
+                fused.has_src_view_params ? fused.src_format : vk::Format::eUndefined,
+                fused.has_src_view_params ? fused.src_mapping : vk::ComponentMapping{},
+                lut1d_view, lut1d_layout);
+        }
+    }
+    if (frame->interp_count > 0) {
+        frame->interp_backend = fg_backend;
     }
 
     BbStats::frame_number.fetch_add(1, std::memory_order_relaxed);
@@ -451,9 +484,13 @@ Frame* Presenter::PrepareFrame(const BbVideoOut::BufferAttributeGroup& attribute
     }
     frame->ready_semaphore = draw_scheduler.GetWorkSemaphore()->Handle();
     frame->ready_tick = draw_scheduler.CurrentTick();
+    frame->present_id = LowLatency::AssignRenderPresentId();
     SubmitInfo info{};
+    info.present_id = frame->present_id;
+    LowLatency::MarkRenderSubmitStart(frame->present_id);
     draw_scheduler.NoteFrameEndSubmission();
     draw_scheduler.Flush(info);
+    LowLatency::MarkRenderSubmitEnd(frame->present_id);
     BbTimeline::Note(BbTimeline::PipeTask, 5, frame->ready_tick);
 
     // The command processor thread runs at most FramesAhead() guest frames ahead of the GPU: it
@@ -477,6 +514,9 @@ Frame* Presenter::PrepareBlankFrame(bool present_thread) {
     // ends its submission, as any flip does: the guest may wait for work recorded before it.
     if (!present_thread) {
         g_last_completed_frame_draws.store(0, std::memory_order_relaxed);
+        if (rasterizer && rasterizer->GetUpscaler().GetFrameGeneration()) {
+            rasterizer->GetUpscaler().GetFrameGeneration()->ResetHistory();
+        }
         draw_scheduler.EndRendering();
         SubmitInfo info{};
         draw_scheduler.Flush(info);
@@ -512,11 +552,19 @@ void Presenter::SetExpectedSize(u32 width, u32 height) {
     expected_height.store(height, std::memory_order_relaxed);
 }
 
-void Presenter::EncodeInterpolated(Frame* frame, vk::Image image, vk::Format format, u32 width,
-                                   u32 height, vk::Format display_view_format,
-                                   const EncodePass::Settings& encode) {
+void Presenter::EncodeInterpolated(Frame* frame, u32 slot, vk::Image image, vk::Format format,
+                                   u32 width, u32 height, vk::Format display_view_format,
+                                   const EncodePass::Settings& encode, bool fused_gamma,
+                                   vk::Format fused_src_format,
+                                   vk::ComponentMapping fused_src_mapping, vk::ImageView lut1d_view,
+                                   vk::ImageLayout lut1d_layout) {
+    (void)width;
+    (void)height;
+    if (!frame || slot >= Frame::MaxInterpSlots) {
+        return;
+    }
     const vk::Device device = instance.GetDevice();
-    if (!frame->interp_image) {
+    if (!frame->interp_images[slot]) {
         const vk::Format interp_fmt =
             frame->is_hdr ? vk::Format::eA2B10G10R10UnormPack32 : swapchain.GetSurfaceFormat().format;
         const VkImageCreateInfo image_info = vk::ImageCreateInfo{
@@ -534,26 +582,33 @@ void Presenter::EncodeInterpolated(Frame* frame, vk::Image image, vk::Format for
         };
         VkImage created{};
         if (vmaCreateImage(instance.GetAllocator(), &image_info, &alloc_info, &created,
-                           &frame->interp_allocation, nullptr) != VK_SUCCESS) {
+                           &frame->interp_allocations[slot], nullptr) != VK_SUCCESS) {
             return;
         }
-        frame->interp_image = created;
-        frame->interp_view = Check<"create a frame view">(device.createImageView({
-            .image = frame->interp_image,
+        frame->interp_images[slot] = created;
+        frame->interp_views[slot] = Check<"create a frame view">(device.createImageView({
+            .image = frame->interp_images[slot],
             .viewType = vk::ImageViewType::e2D,
             .format = interp_fmt,
             .subresourceRange = ColorRange,
         }));
     }
-    // Read as the display buffer is, with its view format: the game's display pass copies the
-    // scene image's bytes as they are into a BGRA buffer, so the scene image (R8G8B8A8 by its
-    // format) holds them in that order too; its own format swapped red and blue. 8-bit images are
-    // made mutable (vk_frame_generation), 32-bit formats view each other.
-    const bool rgba8 = format == vk::Format::eR8G8B8A8Unorm || format == vk::Format::eB8G8R8A8Unorm;
-    const bool display8 = display_view_format == vk::Format::eB8G8R8A8Srgb ||
-                          display_view_format == vk::Format::eR8G8B8A8Srgb;
-    const vk::Format view_format = rgba8 && display8 ? display_view_format : format;
+    // Match the real frame's exact view format and channel swizzle:
+    // - When PassFusion (`fused_gamma`) is active, replicate `ps_38d65b32`'s sampled UNORM view
+    //   format + BGRA/RGBA swizzle and apply the exact same 1D Display Gamma LUT inside EncodePass.
+    // - Otherwise, view as `display_view_format` (sRGB + BGRA swizzle) just like the display buffer.
+    vk::Format view_format = format;
     vk::ComponentMapping mapping{};
+    if (fused_gamma) {
+        view_format = (fused_src_format != vk::Format::eUndefined) ? fused_src_format : format;
+        mapping = fused_src_mapping;
+    } else {
+        const bool rgba8 =
+            format == vk::Format::eR8G8B8A8Unorm || format == vk::Format::eB8G8R8A8Unorm;
+        const bool display8 = display_view_format == vk::Format::eB8G8R8A8Srgb ||
+                              display_view_format == vk::Format::eR8G8B8A8Srgb;
+        view_format = rgba8 && display8 ? display_view_format : format;
+    }
     mapping.a = vk::ComponentSwizzle::eOne;
     const vk::ImageView source = Check(device.createImageView({
         .image = image,
@@ -563,11 +618,17 @@ void Presenter::EncodeInterpolated(Frame* frame, vk::Image image, vk::Format for
         .subresourceRange = ColorRange,
     }));
     draw_scheduler.DeferOperation([device, source] { device.destroyImageView(source); });
-    draw_scheduler.Record([this, frame, image, source, encode](vk::CommandBuffer cmdbuf) {
+    const vk::Image dst_image = frame->interp_images[slot];
+    const vk::ImageView dst_view = frame->interp_views[slot];
+    draw_scheduler.Record([this, frame, dst_image, dst_view, image, source, encode, lut1d_view,
+                           lut1d_layout](vk::CommandBuffer cmdbuf) {
         const std::array<vk::ImageMemoryBarrier2, 2> before{{
             {
-                .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-                .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+                .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader |
+                                vk::PipelineStageFlagBits2::eCopy |
+                                vk::PipelineStageFlagBits2::eTransfer,
+                .srcAccessMask = vk::AccessFlagBits2::eShaderStorageWrite |
+                                 vk::AccessFlagBits2::eTransferWrite,
                 .dstStageMask = vk::PipelineStageFlagBits2::eFragmentShader,
                 .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
                 .oldLayout = vk::ImageLayout::eGeneral,
@@ -576,22 +637,27 @@ void Presenter::EncodeInterpolated(Frame* frame, vk::Image image, vk::Format for
                 .subresourceRange = ColorRange,
             },
             {
-                .srcStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+                .srcStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput |
+                                vk::PipelineStageFlagBits2::eTransfer,
+                .srcAccessMask = vk::AccessFlagBits2::eNone,
                 .dstStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
                 .dstAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
                 .oldLayout = vk::ImageLayout::eUndefined,
                 .newLayout = vk::ImageLayout::eColorAttachmentOptimal,
-                .image = frame->interp_image,
+                .image = dst_image,
                 .subresourceRange = ColorRange,
             },
         }};
         cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = 2, .pImageMemoryBarriers = before.data()});
-        encode_pass.Render(cmdbuf, source, frame->interp_view, {frame->width, frame->height}, encode);
+        encode_pass.Render(cmdbuf, source, dst_view, {frame->width, frame->height}, encode,
+                           vk::ImageLayout::eShaderReadOnlyOptimal, lut1d_view, lut1d_layout);
         const std::array<vk::ImageMemoryBarrier2, 2> after{{
             {
                 .srcStageMask = vk::PipelineStageFlagBits2::eFragmentShader,
                 .srcAccessMask = vk::AccessFlagBits2::eShaderRead,
-                .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader |
+                                vk::PipelineStageFlagBits2::eTransfer,
+                .dstAccessMask = vk::AccessFlagBits2::eNone,
                 .oldLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
                 .newLayout = vk::ImageLayout::eGeneral,
                 .image = image,
@@ -600,15 +666,17 @@ void Presenter::EncodeInterpolated(Frame* frame, vk::Image image, vk::Format for
             {
                 .srcStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
                 .srcAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
+                .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+                .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
                 .oldLayout = vk::ImageLayout::eColorAttachmentOptimal,
                 .newLayout = vk::ImageLayout::eGeneral,
-                .image = frame->interp_image,
+                .image = dst_image,
                 .subresourceRange = ColorRange,
             },
         }};
         cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = 2, .pImageMemoryBarriers = after.data()});
     });
-    frame->has_interp = true;
+    frame->interp_count = std::max(frame->interp_count, slot + 1u);
 }
 
 void Presenter::RecordPresent(vk::CommandBuffer cmdbuf, const Frame* frame, vk::Image target,
@@ -701,44 +769,96 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool) {
         }
     };
     const bool blank = frame == &blank_frame;
-    // Frame generation: the interpolated frame first, the real one half a frame later (the
-    // interval between real frames, smoothed).
-    using Clock = std::chrono::steady_clock;
-    static Clock::time_point last_real{};
-    static double interval_ms = 16.667;
-    const auto now = Clock::now();
-    if (last_real.time_since_epoch().count() != 0) {
-        const double ms = std::chrono::duration<double, std::milli>(now - last_real).count();
-        if (ms > 2.0 && ms < 100.0) {
-            interval_ms = interval_ms * 0.9 + ms * 0.1;
+    // Track smoothed real-frame arrival interval (ns) for unified half-frame FG pacing.
+    static u64 last_real_ns = 0;
+    static double real_interval_ns = 16'666'667.0;
+    static u32 no_interp_streak = 0;
+    const u64 now_ns = BbFrameRate::NowMonotonicNs();
+    if (last_real_ns != 0 && now_ns > last_real_ns) {
+        const double dt_ns = double(now_ns - last_real_ns);
+        if (dt_ns > 2'000'000.0 && dt_ns < 100'000'000.0) {
+            real_interval_ns = real_interval_ns * 0.9 + dt_ns * 0.1;
         }
     }
-    last_real = now;
+    last_real_ns = now_ns;
+
+    const u32 fg_n = (!blank) ? std::min<u32>(frame->interp_count, Frame::MaxInterpSlots) : 0u;
+    const bool has_fg = fg_n > 0u && frame->interp_images[0];
+    const int mult = has_fg ? int(fg_n + 1u) : 1;
+    if (has_fg) {
+        no_interp_streak = 0;
+        BbStats::fg_active.store(true, std::memory_order_relaxed);
+        BbStats::fg_multiplier.store(mult, std::memory_order_relaxed);
+        BbStats::fg_backend.store(frame->interp_backend, std::memory_order_relaxed);
+    } else if (BbSettings::EffectiveFrameGen() == BbSettings::FrameGenOff ||
+               BbFastLoad::IsLoadingBurstActive() || ++no_interp_streak >= 4u) {
+        BbStats::fg_active.store(false, std::memory_order_relaxed);
+        BbStats::fg_multiplier.store(1, std::memory_order_relaxed);
+        BbStats::fg_backend.store(0, std::memory_order_relaxed);
+    }
+
     // BB_FRAME_GEN_ONLY=1 (diagnostics): only the interpolated frames are shown.
     static const bool only_interp = std::getenv("BB_FRAME_GEN_ONLY") != nullptr;
-    if (only_interp && !blank && frame->has_interp && frame->interp_image) {
-        frame->has_interp = false;
-        PresentImage(frame, frame->interp_image, true);
+    if (only_interp && has_fg) {
+        frame->interp_count = 0;
+        PresentImage(frame, frame->interp_images[0], true, 0, true);
         release();
         return;
     }
-    if (!blank && frame->has_interp && frame->interp_image) {
-        frame->has_interp = false;
+    if (has_fg) {
+        frame->interp_count = 0;
         static std::atomic<u64> shown{0};
-        if (const u64 n = ++shown; n == 1 || n % 1000 == 0) {
-            std::printf("Frame generation: %llu interpolated frames shown\n", (unsigned long long)n);
+        if (const u64 n = shown.fetch_add(fg_n, std::memory_order_relaxed) + 1u;
+            n == 1 || (n / 1000) != ((n + fg_n - 1u) / 1000)) {
+            std::printf("Frame generation: %llu interpolated frames shown (%dx)\n",
+                        (unsigned long long)(n + fg_n - 1u), mult);
+            std::fflush(stdout);
         }
-        if (PresentImage(frame, frame->interp_image, false)) {
-            std::this_thread::sleep_until(now + std::chrono::duration_cast<Clock::duration>(
-                                                    std::chrono::duration<double, std::milli>(
-                                                        std::clamp(interval_ms * 0.5, 1.0, 50.0))));
+        const u64 cap_period_ns =
+            (BbFrameRate::PresentPacingEnabled() && !BbFastLoad::IsLoadingBurstActive())
+                ? BbFrameRate::TargetPeriodNs()
+                : 0ull;
+        u64 slot_ns = std::clamp<u64>(static_cast<u64>(real_interval_ns / double(mult)),
+                                      1'000'000ull, 50'000'000ull);
+        if (cap_period_ns > 0) {
+            // When hitting cap/mult base (within ~6%), lock strictly to the display cap period so
+            // all interpolated and real frames hit the exact monotonic display grid.
+            const u64 cap_group_hi = cap_period_ns * u64(mult) + (cap_period_ns / 8ull);
+            slot_ns = (static_cast<u64>(real_interval_ns) <= cap_group_hi)
+                          ? cap_period_ns
+                          : std::max<u64>(cap_period_ns, slot_ns);
         }
+        const auto pmode = swapchain.GetPresentMode();
+        const bool is_fifo =
+            pmode == vk::PresentModeKHR::eFifo || pmode == vk::PresentModeKHR::eFifoRelaxed;
+        bool any_interp_shown = false;
+        for (u32 slot = 0; slot < fg_n; ++slot) {
+            const vk::Image interp_img = frame->interp_images[slot];
+            if (!interp_img) {
+                continue;
+            }
+            const bool wait_gpu = !any_interp_shown;
+            const bool shown_slot =
+                PresentImage(frame, interp_img, false, slot_ns, /*wait_gpu_done=*/wait_gpu);
+            if (shown_slot) {
+                any_interp_shown = true;
+                BbStats::fg_interpolated_frames.fetch_add(1, std::memory_order_relaxed);
+                if (is_fifo) {
+                    const u64 after_interp_ns = BbFrameRate::NowMonotonicNs();
+                    BbFrameRate::SleepUntilMonotonicNs(after_interp_ns + slot_ns, 1);
+                }
+            }
+        }
+        PresentImage(frame, {}, true, slot_ns, /*wait_gpu_done=*/!any_interp_shown);
+        release();
+        return;
     }
-    PresentImage(frame, {}, true);
+    PresentImage(frame, {}, true, 0, true);
     release();
 }
 
-bool Presenter::PresentImage(Frame* frame, vk::Image source, bool last) {
+bool Presenter::PresentImage(Frame* frame, vk::Image source, bool last, u64 fg_slot_period_ns,
+                             bool wait_gpu_done) {
     const u32 width = u32(window.GetWidth());
     const u32 height = u32(window.GetHeight());
     // Nothing to present to while the window is minimised (a 0x0 surface, issue #31).
@@ -789,7 +909,8 @@ bool Presenter::PresentImage(Frame* frame, vk::Image source, bool last) {
     u64 active_period_ns = 0;
     u64 wsub_ns = 0, wren_ns = 0, pace_ns = 0, pace_over_ns = 0, cushion_before_ns = 0;
     u32 queued_before = 0;
-    if (!blank && last && !source) {
+    const bool pace_slot = !blank && (fg_slot_period_ns > 0 || (last && !source));
+    if (pace_slot) {
 #ifdef __linux__
         static bool pres_timerslack_set = false;
         if (!pres_timerslack_set) {
@@ -798,33 +919,54 @@ bool Presenter::PresentImage(Frame* frame, vk::Image source, bool last) {
         }
 #endif
         const u64 period_ns =
-            (BbFrameRate::PresentPacingEnabled() && !BbFastLoad::IsLoadingBurstActive())
-                ? BbFrameRate::TargetPeriodNs()
-                : 0ull;
+            (fg_slot_period_ns > 0)
+                ? fg_slot_period_ns
+                : ((BbFrameRate::PresentPacingEnabled() && !BbFastLoad::IsLoadingBurstActive())
+                       ? BbFrameRate::TargetPeriodNs()
+                       : 0ull);
         const auto pmode = swapchain.GetPresentMode();
-        if (period_ns > 0 && pmode != vk::PresentModeKHR::eFifo &&
-            pmode != vk::PresentModeKHR::eFifoRelaxed) {
-            active_period_ns = period_ns;
-            pres_paced = true;
-            const u64 ws_t0 = BbFrameRate::NowMonotonicNs();
+        const bool is_fifo =
+            pmode == vk::PresentModeKHR::eFifo || pmode == vk::PresentModeKHR::eFifoRelaxed;
+        if (is_fifo && fg_slot_period_ns > 0 && wait_gpu_done) {
+            // Under VSync FIFO with Frame Generation, wait for the GPU pair to finish before
+            // presenting the interpolated frame so the half-frame sleep starts at true completion.
             if (frame->ready_semaphore == draw_scheduler.GetWorkSemaphore()->Handle()) {
                 draw_scheduler.WaitSubmitted(frame->ready_tick);
             }
-            const u64 wr_t0 = BbFrameRate::NowMonotonicNs();
-            wsub_ns = wr_t0 > ws_t0 ? (wr_t0 - ws_t0) : 0ull;
             WaitRendered(frame);
+        }
+        if (period_ns > 0 && !is_fifo) {
+            active_period_ns = period_ns;
+            pres_paced = true;
+            const u64 ws_t0 = BbFrameRate::NowMonotonicNs();
+            if (wait_gpu_done) {
+                if (frame->ready_semaphore == draw_scheduler.GetWorkSemaphore()->Handle()) {
+                    draw_scheduler.WaitSubmitted(frame->ready_tick);
+                }
+                const u64 wr_t0 = BbFrameRate::NowMonotonicNs();
+                wsub_ns = wr_t0 > ws_t0 ? (wr_t0 - ws_t0) : 0ull;
+                WaitRendered(frame);
+                const u64 ready_done_ns = BbFrameRate::NowMonotonicNs();
+                wren_ns = ready_done_ns > wr_t0 ? (ready_done_ns - wr_t0) : 0ull;
+            }
             const u64 ready_ns = BbFrameRate::NowMonotonicNs();
-            wren_ns = ready_ns > wr_t0 ? (ready_ns - wr_t0) : 0ull;
             const u64 epoch = BbFrameRate::PacerEpoch();
             const u64 target_cushion_ns = std::min<u64>(period_ns / 2ull, 2'400'000ull);
             queued_before = BbVideoOut::QueuedPresentCount();
-            if (pres_deadline_ns == 0 || epoch != pres_seen_epoch ||
-                period_ns != pres_last_period_ns) {
+            const bool period_changed =
+                pres_last_period_ns == 0 ||
+                (fg_slot_period_ns == 0
+                     ? (period_ns != pres_last_period_ns)
+                     : (std::max(period_ns, pres_last_period_ns) -
+                            std::min(period_ns, pres_last_period_ns) >
+                        period_ns / 5ull));
+            if (pres_deadline_ns == 0 || epoch != pres_seen_epoch || period_changed) {
                 pres_seen_epoch = epoch;
                 pres_last_period_ns = period_ns;
                 // Prime with half target cushion so normal camera-turn GPU swings do not break lock.
                 pres_deadline_ns = ready_ns + (target_cushion_ns / 2ull);
             } else {
+                pres_last_period_ns = period_ns;
                 // Smooth queue drain: having 1 frame queued in present_work is normal under
                 // FramesAhead=1, so trim ~3% normally (0.969x) or ~5% (0.95x) when the present
                 // cushion has grown past target_cushion_ns after an external compositor stall,
@@ -833,7 +975,7 @@ bool Presenter::PresentImage(Frame* frame, vk::Image source, bool last) {
                 const u64 step_ns =
                     (queued_before >= 2u)
                         ? (period_ns - (period_ns / 10ull))
-                        : ((queued_before == 1u)
+                        : ((queued_before == 1u && fg_slot_period_ns == 0)
                                ? (period_ns - (period_ns / (high_cush ? 20ull : 32ull)))
                                : period_ns);
                 pres_deadline_ns += step_ns;
@@ -845,7 +987,7 @@ bool Presenter::PresentImage(Frame* frame, vk::Image source, bool last) {
                     }
                     const u64 cushion_ns = pres_deadline_ns - ready_ns;
                     cushion_before_ns = cushion_ns;
-                    if (cushion_ns > target_cushion_ns) {
+                    if (cushion_ns > target_cushion_ns && fg_slot_period_ns == 0) {
                         const u64 pull =
                             std::min<u64>((cushion_ns - target_cushion_ns) / 64ull, 15'000ull);
                         pres_deadline_ns -= pull;
@@ -984,16 +1126,24 @@ bool Presenter::PresentImage(Frame* frame, vk::Image source, bool last) {
         info.AddWait(frame->ready_semaphore, frame->ready_tick);
         if (last) {
             info.AddSignal(frame->present_done);
+            info.present_id = frame->present_id;
         }
     }
     info.AddSignal(swapchain.GetPresentReadySemaphore());
     present_scheduler.Flush(info);
     const u64 fl_t1 = BbFrameRate::NowMonotonicNs();
     prev_flush_ns = fl_t1 > fl_t0 ? (fl_t1 - fl_t0) : 0ull;
+    const u64 ll_present_id = (!blank && last) ? frame->present_id : 0ull;
     {
         const u64 pres_t0 = fl_t1;
         std::scoped_lock lock{Scheduler::submit_mutex};
+        if (ll_present_id != 0) {
+            LowLatency::MarkPresentStart(ll_present_id);
+        }
         const bool ok = swapchain.Present();
+        if (ll_present_id != 0) {
+            LowLatency::MarkPresentEnd(ll_present_id);
+        }
         const u64 pres_t1 = BbFrameRate::NowMonotonicNs();
         const u64 pres_ns = pres_t1 > pres_t0 ? (pres_t1 - pres_t0) : 0ull;
         prev_pres_call_ns = pres_ns;
@@ -1005,6 +1155,9 @@ bool Presenter::PresentImage(Frame* frame, vk::Image source, bool last) {
             swapchain.Recreate(width, height);
             return false;
         }
+    }
+    if (ll_present_id != 0) {
+        LowLatency::PollTimingsIfDue();
     }
     return true;
 }

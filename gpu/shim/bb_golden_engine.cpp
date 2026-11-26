@@ -236,7 +236,14 @@ std::uint32_t GX_SYSV_ABI bb_direct_vk_motion_blur_scales(float* out_time_scale,
     const int obj_lvl = std::clamp(s.motion_blur_object.load(std::memory_order_relaxed), 0, 3);
     const std::uint32_t flags = (cam_lvl > 0 ? 1u : 0u) | (obj_lvl > 0 ? 2u : 0u);
     if (!out_time_scale && !out_obj_vel_scale && !out_max_len_scale && !out_cam_thresh_scale) {
-        return flags;
+        // Called exclusively by GXDeferredLightingAndAmbientOcclusionPass to gate Pass 0x2e
+        // (`viewBytes[0x2969]` & `velWrap` binding). Keep Pass 0x2e active whenever temporal
+        // upscaling or Frame Generation is active so skinned characters, cloth, and weapons retain
+        // exact per-pixel motion vectors even when visual Motion Blur is turned Off.
+        const bool need_vel_for_temporal =
+            (BbSettings::EffectiveUpscaler() != BbSettings::UpscalerOff) ||
+            (BbSettings::EffectiveFrameGen() != BbSettings::FrameGenOff);
+        return flags | (need_vel_for_temporal ? 4u : 0u);
     }
 
     static constexpr float kTimeMult[4] = {0.0f, 0.45f, 1.00f, 1.75f};

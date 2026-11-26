@@ -36,6 +36,25 @@ public:
     }
     SceneResolution::Size Size() const { return size; }
     SceneResolution::Size BaseSize() const { return base_size; }
+    /// True when `(img_w, img_h)` equals `ref` or PS4 Gnm's 4/8-pixel tile-padded allocation for
+    /// `ref` (e.g. `1680x1050 -> 1680x1052`, `1366x768 -> 1368x768`, `840x525 -> 840x528`).
+    [[nodiscard]] static constexpr bool MatchesGnmSceneDim(u32 img_w, u32 img_h, u32 ref_w,
+                                                           u32 ref_h) noexcept {
+        if (ref_w == 0u || ref_h == 0u) {
+            return false;
+        }
+        if (img_w == ref_w && img_h == ref_h) {
+            return true;
+        }
+        const u32 pad4_w = (ref_w + 3u) & ~3u;
+        const u32 pad4_h = (ref_h + 3u) & ~3u;
+        if (img_w == pad4_w && img_h == pad4_h) {
+            return true;
+        }
+        const u32 pad8_w = (ref_w + 7u) & ~7u;
+        const u32 pad8_h = (ref_h + 7u) & ~7u;
+        return img_w == pad8_w && img_h == pad8_h;
+    }
     bool Reduced() const { return size != SceneResolution::Size{} && size != base_size; }
     [[nodiscard]] SceneResolution::Size SizeMt() const noexcept {
         return UnpackMtSize(atomic_size_packed.load(std::memory_order_acquire));

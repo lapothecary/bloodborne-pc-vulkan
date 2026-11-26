@@ -538,6 +538,22 @@ FfxVkPortableResult ffxVkPortableFrameGenerationContextRecordDispatch(
     return FFX_VK_PORTABLE_ERROR_UNSUPPORTED;
 }
 
+FfxVkPortableResult ffxVkPortableFrameGenerationContextRecordMultiDispatch(
+    FfxVkPortableFrameGenerationContext* context,
+    const FfxVkPortableFrameGenerationDispatchInfo* dispatchInfo,
+    uint32_t outputCount,
+    const FfxVkPortableImage* outputs,
+    const float* interpolationTimes)
+{
+    (void)outputCount;
+    (void)interpolationTimes;
+    if (context == NULL || dispatchInfo == NULL || outputs == NULL)
+        return FFX_VK_PORTABLE_ERROR_INVALID_POINTER;
+    if (dispatchInfo->structSize < sizeof(*dispatchInfo))
+        return FFX_VK_PORTABLE_ERROR_INVALID_STRUCT_SIZE;
+    return FFX_VK_PORTABLE_ERROR_UNSUPPORTED;
+}
+
 FfxVkPortableResult ffxVkPortableFrameGenerationContextDestroy(
     FfxVkPortableFrameGenerationContext* context)
 {

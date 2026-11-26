@@ -365,6 +365,9 @@ public:
 
     /// Once per guest submission: evicts unused images and samplers when memory runs short.
     void RunGarbageCollector();
+    /// Cold-path emergency trim before large external allocations (e.g. FSR 3 context creation on
+    /// 2-4 GB GPUs): evicts idle cached textures + orphaned render targets and flushes deferred frees.
+    u64 PurgeIdleForAllocation(u64 desired_bytes);
     /// Live Texture Quality reallocation: shrinks or restores qualifying world 2D BC textures
     /// in-place on the frame boundary when the user changes Texture Quality in the menu.
     /// Returns true if any textures were rebuilt (caller should clear Stage-B view memos).

@@ -3631,14 +3631,17 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
                                  fuse_ps->images.size() == 2u && fuse_ps->images[1].is_array &&
                                  image_infos.size() >= 2u && image_infos[0].imageView &&
                                  image_infos[1].imageView;
-            const bool env_ok = !FrameCapture::Active() && !upscaler->PresentDumpDue() &&
-                                !upscaler->FrameGenWanted();
+            const bool env_ok = !FrameCapture::Active() && !upscaler->PresentDumpDue();
             if (is_disp && cb_descs[0].first && fmt_ok && imgs_ok && env_ok) {
                 scheduler.EndRendering();
                 runtime.FlushBarriers();
                 vk::Extent2D src_ext{};
+                vk::Format src_fmt{};
+                vk::ComponentMapping src_map{};
+                bool has_src_params = false;
                 if (upscaler->Enabled() && upscaler->IsDisplayRedirected()) {
                     src_ext = upscaler->UiExtent();
+                    has_src_params = upscaler->LastSampledViewParams(src_fmt, src_map);
                 } else {
                     const auto& cb_img = texture_cache.GetImage(cb_descs[0].first);
                     src_ext = vk::Extent2D{cb_img.info.size.width, cb_img.info.size.height};
@@ -3650,6 +3653,9 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
                         .src_view = image_infos[0].imageView,
                         .src_layout = image_infos[0].imageLayout,
                         .src_size = src_ext,
+                        .src_format = src_fmt,
+                        .src_mapping = src_map,
+                        .has_src_view_params = has_src_params,
                         .lut1d_view = image_infos[1].imageView,
                         .lut1d_layout = image_infos[1].imageLayout,
                         // When cb0 is Unorm, ps_38d65b32 stored sRGB-encoded LUT bytes directly and
@@ -4274,8 +4280,8 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
         const auto base_sz = scene_targets ? scene_targets->BaseSize() : SceneResolution::Size{};
         const bool is_main_scene_hdr =
             (base_sz.width == 0u || base_sz.height == 0u) ||
-            (cb0_img.info.size.width == base_sz.width &&
-             cb0_img.info.size.height == base_sz.height);
+            SceneTargets::MatchesGnmSceneDim(cb0_img.info.size.width, cb0_img.info.size.height,
+                                             base_sz.width, base_sz.height);
         if (is_main_scene_hdr) {
             vk::Image proxy_img = VK_NULL_HANDLE;
             u32 proxy_w = 0u;
@@ -4362,12 +4368,14 @@ void Rasterizer::NoteUpscalerDraw(const GraphicsPipeline* pipeline) {
     // Single-target passes: the upscaler looks for the scene's and the UI's (UiComposition).
     if (std::popcount(pipeline->GetGraphicsKey().mrt_mask) == 1) {
         const u64 vs_hash = pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash;
+        const auto* ps_stage = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+        const u64 ps_hash = ps_stage ? ps_stage->pgm_hash : 0ull;
         if (UiComposition::MovieShader(vs_hash)) {
             ui_pass_started = true;
         }
         if (upscaler->Enabled()) {
             const auto& viewport = Regs().viewports[0];
-            upscaler->OnDraw(vs_hash, cb_descs[0].first, db_desc.first,
+            upscaler->OnDraw(vs_hash, ps_hash, cb_descs[0].first, db_desc.first,
                              UiComposition::NativeViewport(viewport.xscale * 2, viewport.yscale * 2));
             if (upscaler->InUiPhase()) {
                 ui_pass_started = true;

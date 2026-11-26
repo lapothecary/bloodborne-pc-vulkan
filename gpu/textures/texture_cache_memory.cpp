@@ -39,13 +39,57 @@ u64 EnvU64(const char* name, u64 fallback) {
     return env ? std::strtoull(env, nullptr, 10) : fallback;
 }
 
+void ComputeLowVramMarks(u64 budget, u64& trigger_out, u64& pressure_out, u64& critical_out) {
+    u64 press_pct = 80;
+    u64 crit_pct = 90;
+    if (const char* marks = std::getenv("BB_GC_SMALL_MARKS")) {
+        unsigned p = 0, c = 0;
+        if (std::sscanf(marks, "%u,%u", &p, &c) == 2 && p >= 30 && c > p && c <= 98) {
+            press_pct = p;
+            crit_pct = c;
+        }
+    }
+    const u64 trig_pct = press_pct > 12 ? (press_pct - 12) : (press_pct * 3 / 4);
+    trigger_out = budget / 100 * trig_pct;
+    pressure_out = budget / 100 * press_pct;
+    critical_out = budget / 100 * crit_pct;
+}
+
+bool IsOrphanableTransientTarget(const Image& image) noexcept {
+    return !image.usage.vo_surface && !image.usage.storage && !image.binding.is_bound &&
+           !image.binding.is_target && !image.info.props.is_block &&
+           image.info.resources.levels == 1u && image.info.resources.layers == 1u &&
+           image.backing &&
+           (image.info.props.is_depth ||
+            (image.usage.render_target && image.GetHostImageSize() >= (1ull << 20)));
+}
+
 } // namespace
 
 void TextureCache::UpdateMemoryBudget() {
     if (!instance.CanReportMemoryUsage()) {
+        if (instance.IsLowVramDevice()) {
+            ComputeLowVramMarks(instance.GetPhysicalVramBytes(), trigger_gc_memory,
+                                pressure_gc_memory, critical_gc_memory);
+            return;
+        }
         trigger_gc_memory = 0;
         pressure_gc_memory = DefaultPressureMemory;
         critical_gc_memory = DefaultCriticalMemory;
+        return;
+    }
+    if (instance.IsLowVramDevice()) {
+        const u64 raw_budget = instance.GetDeviceMemoryBudgetNow();
+        const u64 eff_budget =
+            raw_budget != 0 ? std::min(raw_budget, instance.GetPhysicalVramBytes())
+                            : instance.GetPhysicalVramBytes();
+        ComputeLowVramMarks(eff_budget, trigger_gc_memory, pressure_gc_memory, critical_gc_memory);
+        std::printf("Texture cache: low-VRAM collector marks trigger=%llu MiB, pressure=%llu MiB, "
+                    "critical=%llu MiB (VRAM=%llu MiB)\n",
+                    (unsigned long long)(trigger_gc_memory >> 20),
+                    (unsigned long long)(pressure_gc_memory >> 20),
+                    (unsigned long long)(critical_gc_memory >> 20),
+                    (unsigned long long)(instance.GetPhysicalVramBytes() >> 20));
         return;
     }
     const s64 local = s64(instance.GetTotalMemoryBudget());
@@ -55,10 +99,12 @@ void TextureCache::UpdateMemoryBudget() {
     // 5 s at 3 GB used (#204). Critical: 20 % of the threshold (at least 512 MB).
     const s64 pressure_free = std::min(threshold * 6 / 10, std::max(local * 3 / 10, s64(2 * GiB)));
     pressure_gc_memory = std::max<u64>(
-        std::min(local - pressure_free, local - s64(GiB)), DefaultPressureMemory);
+        u64(std::max<s64>(0, std::min(local - pressure_free, local - s64(GiB)))),
+        DefaultPressureMemory);
     critical_gc_memory = std::max<u64>(
-        std::min(local - threshold * 2 / 10, local - s64(512 * MiB)), DefaultCriticalMemory);
-    trigger_gc_memory = u64((local - threshold) / 2);
+        u64(std::max<s64>(0, std::min(local - threshold * 2 / 10, local - s64(512 * MiB)))),
+        DefaultCriticalMemory);
+    trigger_gc_memory = u64(std::max<s64>(0, (local - threshold) / 2));
 }
 
 void TextureCache::ProcessDownloadImages() {
@@ -180,6 +226,12 @@ void TextureCache::GarbageCollectImages() {
         new_second = true;
         if (instance.CanReportMemoryUsage() && !instance.IsIntegrated()) {
             const u64 budget = instance.GetDeviceMemoryBudgetNow();
+            static const u64 forced_budget_chk = EnvU64("BB_GC_BUDGET_MB", 0) << 20;
+            if (instance.IsLowVramDevice() && !forced_budget_chk && budget != 0) {
+                const u64 eff_budget = std::min(budget, instance.GetPhysicalVramBytes());
+                ComputeLowVramMarks(eff_budget, trigger_gc_memory, pressure_gc_memory,
+                                    critical_gc_memory);
+            }
             if (budget != 0 && total_used_memory >= budget / 100 * 92 &&
                 vram_short_until.load(std::memory_order_relaxed) < second + 2) {
                 vram_short_until.store(second + 2, std::memory_order_relaxed);
@@ -201,6 +253,7 @@ void TextureCache::GarbageCollectImages() {
         return gc_tick_at_second[(second - seconds) % gc_tick_at_second.size()];
     };
     const u64 idle_tick = tick_seconds_ago(idle_seconds);
+    const u64 orphan_idle_tick = tick_seconds_ago(45);
 
     if (!BbToggle::Disabled(BbToggle::TextureCollector) && new_second &&
         total_used_memory < trigger_gc_memory && idle_tick != 0 && gc_tick > idle_tick) {
@@ -213,13 +266,21 @@ void TextureCache::GarbageCollectImages() {
                 return true;
             }
             Image& image = slot_images[image_id];
-            if (True(image.flags & (ImageFlagBits::DirectImmutable | ImageFlagBits::GpuModified)) ||
-                image.SafeToDownload() || image.MtLastGcTick() >= idle_tick ||
-                cur_sched_tick - image.LastAccessTick() <= 64u) {
+            const bool orphan_rt =
+                IsOrphanableTransientTarget(image) && orphan_idle_tick != 0 &&
+                gc_tick > orphan_idle_tick && image.MtLastGcTick() < orphan_idle_tick &&
+                cur_sched_tick - image.LastAccessTick() > 256u;
+            if (!orphan_rt &&
+                (True(image.flags & (ImageFlagBits::DirectImmutable | ImageFlagBits::GpuModified)) ||
+                 image.SafeToDownload() || image.MtLastGcTick() >= idle_tick ||
+                 cur_sched_tick - image.LastAccessTick() <= 64u)) {
                 TouchImage(image);
                 return false;
             }
             --idle_deletions;
+            const u64 freed_bytes = image.backing ? u64(image.GetHostImageSize()) : 0ull;
+            total_used_memory =
+                total_used_memory > freed_bytes ? (total_used_memory - freed_bytes) : 0ull;
             BbStats::gc_freed_images.fetch_add(1, std::memory_order_relaxed);
             FreeImage(image_id);
             return false;
@@ -252,14 +313,27 @@ void TextureCache::GarbageCollectImages() {
         deletions = aggressive ? 40 : pressured ? 20 : 10;
         visited = 0;
     };
+    const u64 orphan_pressured_tick = tick_seconds_ago(15);
     const auto evict = [&](ImageId image_id) {
         if (deletions == 0 || ++visited > 256) {
             return true;
         }
         Image& image = slot_images[image_id];
-        if (!is_emergency &&
-            (image.MtLastGcTick() >= below_tick ||
-             cur_sched_tick - image.LastAccessTick() <= 32u)) {
+        if (image.binding.is_bound || image.binding.is_target) {
+            TouchImage(image);
+            BbStats::gc_kept_images.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        if (is_emergency) {
+            // Even in emergency mode, protect textures bound in the current in-flight frame so
+            // low-VRAM scenes never thrash active G-Buffer / character / world textures every tick.
+            if (cur_sched_tick - image.LastAccessTick() <= 8u) {
+                TouchImage(image);
+                BbStats::gc_kept_images.fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
+        } else if (image.MtLastGcTick() >= below_tick ||
+                   cur_sched_tick - image.LastAccessTick() <= 32u) {
             TouchImage(image);
             BbStats::gc_kept_images.fetch_add(1, std::memory_order_relaxed);
             return false;
@@ -271,21 +345,30 @@ void TextureCache::GarbageCollectImages() {
             return false;
         }
         const bool write_back = image.SafeToDownload();
+        const u64 orphan_thresh = pressured ? orphan_pressured_tick : orphan_idle_tick;
+        const bool orphan_rt =
+            IsOrphanableTransientTarget(image) && orphan_thresh != 0 &&
+            gc_tick > orphan_thresh && image.MtLastGcTick() < orphan_thresh &&
+            cur_sched_tick - image.LastAccessTick() > 256u;
         // Images that cannot go now (tiled GPU-written ones cannot be written back; GPU-written
         // ones only under pressure) neither use up the deletions nor stay first in line: the
-        // oldest ten being such targets stopped the collector for good.
-        if ((write_back && image.info.IsTiled()) || (write_back && !pressured)) {
+        // oldest ten being such targets stopped the collector for good. Orphaned transient
+        // single-mip 2D render/depth targets left behind by NowLoading/deaths can be dropped cleanly.
+        if (!orphan_rt && ((write_back && image.info.IsTiled()) || (write_back && !pressured))) {
             TouchImage(image);
             BbStats::gc_kept_images.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
         --deletions;
-        if (write_back) {
+        if (write_back && !orphan_rt) {
             // Synchronously, while the image still watches its pages: a deferred write-back
             // landed after they were given up, over whatever the game stored there meanwhile.
             DownloadImageMemory(image_id, true);
             ++gc_downloads;
         }
+        const u64 freed_bytes = image.backing ? u64(image.GetHostImageSize()) : 0ull;
+        total_used_memory =
+            total_used_memory > freed_bytes ? (total_used_memory - freed_bytes) : 0ull;
         ++gc_evictions;
         BbStats::gc_freed_images.fetch_add(1, std::memory_order_relaxed);
         FreeImage(image_id);
@@ -379,6 +462,49 @@ void TextureCache::GarbageCollectSamplers() {
         // Defer vkDestroySampler until all in-flight GPU work referencing these samplers finishes.
         scheduler.DeferOperation([retired = std::move(retired)]() mutable { retired.clear(); });
     }
+}
+
+u64 TextureCache::PurgeIdleForAllocation(u64 desired_bytes) {
+    u64 reclaimed = 0;
+    u32 count = 0;
+    {
+        std::scoped_lock lock{mutex};
+        const u64 cur_sched_tick = CurrentTick();
+        const u64 second = SteadySeconds();
+        const u64 orphan_thresh = gc_tick_at_second[(second - 5) % gc_tick_at_second.size()];
+        const u64 min_below = gc_tick > 8u ? (gc_tick - 8u) : 0ull;
+        lru_cache.ForEachItemBelow(min_below, [&](ImageId image_id) {
+            if (reclaimed >= desired_bytes) {
+                return true;
+            }
+            Image& image = slot_images[image_id];
+            if (image.binding.is_bound || image.binding.is_target ||
+                cur_sched_tick - image.LastAccessTick() <= 16u) {
+                return false;
+            }
+            const bool orphan_rt =
+                IsOrphanableTransientTarget(image) && orphan_thresh != 0 &&
+                gc_tick > orphan_thresh && image.MtLastGcTick() < orphan_thresh &&
+                cur_sched_tick - image.LastAccessTick() > 128u;
+            if (!orphan_rt &&
+                (True(image.flags & ImageFlagBits::GpuModified) || image.SafeToDownload())) {
+                return false;
+            }
+            const u64 bytes = image.backing ? u64(image.GetHostImageSize()) : 0ull;
+            reclaimed += bytes;
+            ++count;
+            BbStats::gc_freed_images.fetch_add(1, std::memory_order_relaxed);
+            FreeImage(image_id);
+            return false;
+        });
+    }
+    if (count > 0) {
+        // Execute deferred vmaDestroyImage callbacks immediately so VMA returns empty blocks to WDDM.
+        scheduler.Finish();
+        std::printf("Texture cache: purged %u idle images (%llu MiB) to make room for upscaler\n",
+                    count, (unsigned long long)(reclaimed >> 20));
+    }
+    return reclaimed;
 }
 
 } // namespace VideoCore

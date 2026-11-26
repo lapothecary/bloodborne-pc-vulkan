@@ -76,7 +76,7 @@ typedef struct FrameInterpolationConstants
 
     float    minMaxLuminance[2];
     float    fTanHalfFOV;
-    float   _pad1;
+    float    fInterpolationTime;
 
     float   jitter[2];
     float   motionVectorScale[2];

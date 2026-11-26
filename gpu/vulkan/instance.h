@@ -234,6 +234,12 @@ public:
     bool IsHdrMetadataSupported() const {
         return ext.hdr_metadata;
     }
+    bool IsLowLatency2Supported() const {
+        return ext.nv_low_latency2;
+    }
+    bool IsAmdAntiLagSupported() const {
+        return ext.amd_anti_lag;
+    }
     bool IsAttachmentFeedbackLoopLayoutSupported() const {
         return ext.feedback_loop;
     }
@@ -364,6 +370,15 @@ public:
     [[nodiscard]] u64 GetTotalMemoryBudget() const {
         return total_memory_budget;
     }
+    /// Effective device-local VRAM bytes (capped by BB_VRAM_LIMIT_MB when set).
+    [[nodiscard]] u64 GetPhysicalVramBytes() const noexcept {
+        return physical_vram_bytes;
+    }
+    /// Discrete GPUs with <= 4.5 GiB effective VRAM (2 GB / 3 GB / 4 GB cards).
+    [[nodiscard]] bool IsLowVramDevice() const noexcept {
+        constexpr u64 LowVramLimit = (4ULL << 30) + (512ULL << 20);
+        return !IsIntegrated() && physical_vram_bytes > 0 && physical_vram_bytes <= LowVramLimit;
+    }
 
     // Formats.
     [[nodiscard]] bool IsFormatSupported(vk::Format format, vk::FormatFeatureFlags2 flags) const;
@@ -391,7 +406,7 @@ private:
             trinary_minmax, nv_mixed_samples, amd_mixed_samples, atomic_float, atomic_float2,
             workgroup_layout, view_2d_of_3d, image_view_min_lod, memory_budget, memory_fd,
             dma_buf, memory_host, compute_derivatives, mixed_float_dot, cooperative_matrix,
-            float8, shader_clock, guest_uncached, hdr_metadata;
+            float8, shader_clock, guest_uncached, hdr_metadata, nv_low_latency2, amd_anti_lag;
     };
 
     vk::UniqueInstance instance;
@@ -434,6 +449,7 @@ private:
     std::unordered_map<vk::Format, vk::FormatFeatureFlags2> format_features;
     std::vector<u32> counted_heaps; ///< the heaps of the usage and budget figures
     u64 total_memory_budget = 0;
+    u64 physical_vram_bytes = 0;
 };
 
 /// Memory statistics: device-local VMA blocks and the allocations in them (the difference is

@@ -15,7 +15,7 @@
 extern "C" {
 #endif
 
-#define BBPORT_DLSS_BRIDGE_ABI 1
+#define BBPORT_DLSS_BRIDGE_ABI 2
 
 typedef void (*BbDlssLogFn)(int warning, const char* message);
 
@@ -51,6 +51,51 @@ typedef struct BbDlssEvaluate {
     float sharpness; // 0..1; 0 leaves the output unsharpened
 } BbDlssEvaluate;
 
+typedef struct BbDlssFgFeature {
+    uint32_t input_width;
+    uint32_t input_height;
+    uint32_t backbuffer_width;
+    uint32_t backbuffer_height;
+    VkFormat backbuffer_format;
+    int32_t dynamic_resolution;
+    int32_t depth_inverted;
+    int32_t hdr;
+} BbDlssFgFeature;
+
+typedef struct BbDlssFgEvaluate {
+    BbDlssImage backbuffer; // sampled (rendered backbuffer or HUDless base)
+    BbDlssImage depth;      // sampled, hardware depth
+    BbDlssImage motion;     // sampled, render-resolution pixels
+    BbDlssImage hudless;    // optional HUDless color (if unused, pass empty image)
+    BbDlssImage output;     // storage, interpolated frame output
+    uint64_t frame_id;      // monotonically increasing per real frame
+    uint32_t multi_frame_count; // 1 = 2x, 2 = 3x, 3 = 4x
+    uint32_t multi_frame_index; // 1..multi_frame_count
+    int32_t reset;
+    int32_t depth_inverted;
+    int32_t hdr;
+    int32_t camera_motion_included;
+    uint32_t render_subrect_width;
+    uint32_t render_subrect_height;
+    float jitter_x;
+    float jitter_y;
+    float mv_scale_x;
+    float mv_scale_y;
+    float camera_pos[3];
+    float camera_up[3];
+    float camera_right[3];
+    float camera_fwd[3];
+    float camera_near;
+    float camera_far;
+    float camera_fov;
+    float camera_aspect;
+    float camera_view_to_clip[16];
+    float clip_to_camera_view[16];
+    float clip_to_prev_clip[16];
+    float prev_clip_to_clip[16];
+    float clip_to_lens_clip[16];
+} BbDlssFgEvaluate;
+
 typedef struct BbDlssApi {
     uint32_t abi;
     // wchar_t paths (NGX's type): the directory with NVIDIA's DLSS library, and a writable data
@@ -69,6 +114,13 @@ typedef struct BbDlssApi {
     // The caller must have waited for the GPU work that used the feature.
     void (*ReleaseFeature)(void);
     void (*Shutdown)(void);
+    // ABI 2 additions: multi-directory DLL discovery and DLSS-G Frame Generation.
+    int32_t (*ConfigureEx)(const wchar_t* const* dll_directories, uint32_t dll_directory_count,
+                           const wchar_t* data_directory, BbDlssLogFn log);
+    int32_t (*FgAvailable)(uint32_t* out_max_multi_frame);
+    int32_t (*FgCreate)(VkCommandBuffer command, const BbDlssFgFeature* feature);
+    int32_t (*FgEvaluate)(VkCommandBuffer command, const BbDlssFgEvaluate* evaluate);
+    void (*FgRelease)(void);
 } BbDlssApi;
 
 typedef const BbDlssApi* (*BbDlssGetApiFn)(void);

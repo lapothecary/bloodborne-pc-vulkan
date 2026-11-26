@@ -241,7 +241,24 @@ void Set(Values& v, const std::string& key, const std::string& value) {
     } else if (key == "model_lod") {
         v.model_lod = std::clamp(i, -2, 2);
     } else if (key == "frame_generation") {
-        v.frame_generation = i != 0;
+        if (value == "0" || value == "off" || value == "false") {
+            v.frame_generation = FrameGenOff;
+        } else if (value == "1" || value == "on" || value == "true" || value == "fsr3" ||
+                   value == "fsr3_2x") {
+            v.frame_generation = FrameGenFsr3;
+        } else if (value == "fsr3_3x" || value == "fsr33x") {
+            v.frame_generation = FrameGenFsr3_3x;
+        } else if (value == "fsr3_4x" || value == "fsr34x") {
+            v.frame_generation = FrameGenFsr3_4x;
+        } else if (value == "2" || value == "dlss" || value == "dlss_2x" || value == "dlss2x") {
+            v.frame_generation = FrameGenDlss2x;
+        } else if (value == "3" || value == "dlss_3x" || value == "dlss3x") {
+            v.frame_generation = FrameGenDlss3x;
+        } else if (value == "4" || value == "dlss_4x" || value == "dlss4x") {
+            v.frame_generation = FrameGenDlss4x;
+        } else {
+            v.frame_generation = FrameGenOff;
+        }
     } else if (key == "live_resolution") {
         v.live_resolution = value == "auto" ? -1 : std::clamp(i, 0, 1);
     } else if (key == "output_res") {
@@ -337,15 +354,29 @@ void Set(Values& v, const std::string& key, const std::string& value) {
             v.fps_limit = (i <= 0) ? 0 : std::clamp(i, 30, 5000);
         }
     } else if (key == "present_mode" || key == "vsync") {
-        if (value == "fifo" || value == "on" || value == "1") {
+        std::string lower = value;
+        for (char& ch : lower) {
+            if (ch >= 'A' && ch <= 'Z') {
+                ch = static_cast<char>(ch - 'A' + 'a');
+            }
+        }
+        if (lower == "fifo" || lower == "on" || lower == "1") {
             v.vsync_mode = VsyncOn;
             v.vsync_mode_chosen = true;
-        } else if (value == "immediate" || value == "off" || value == "2") {
+        } else if (lower == "immediate" || lower == "off" || lower == "2") {
             v.vsync_mode = VsyncOff;
             v.vsync_mode_chosen = true;
-        } else if (value == "mailbox" || value == "fast" || value == "auto" || value == "0") {
+        } else if (lower == "mailbox" || lower == "fast" || lower == "auto" || lower == "0") {
             v.vsync_mode = VsyncFast;
             v.vsync_mode_chosen = true;
+        }
+    } else if (key == "low_latency") {
+        if (value == "off" || value == "0" || value == "false") {
+            v.low_latency = LowLatencyOff;
+        } else if (value == "boost" || value == "on+boost" || value == "on_boost" || value == "2") {
+            v.low_latency = LowLatencyBoost;
+        } else if (value == "on" || value == "1" || value == "true") {
+            v.low_latency = LowLatencyOn;
         }
     } else if (key == "ui_upscale") {
         v.ui_upscale = (value != "0" && value != "false" && value != "off");
@@ -664,6 +695,17 @@ const char* PresentModeKey(int vsync_mode) {
     }
 }
 
+const char* LowLatencyModeKey(int mode) {
+    switch (mode) {
+    case LowLatencyOff:
+        return "off";
+    case LowLatencyBoost:
+        return "boost";
+    default:
+        return "on";
+    }
+}
+
 OutputSize Monitor() {
     return UnpackSize(monitor.load(std::memory_order_relaxed));
 }
@@ -814,10 +856,8 @@ void Load() {
         {"BB_MOTION_BLUR_CAMERA", "motion_blur_camera"},
         {"BB_MOTION_BLUR_OBJECT", "motion_blur_object"}, {"BB_CAMERA_FOLLOW", "camera_follow_mode"},
         {"BB_TEXTURE_QUALITY", "texture_quality"},       {"BB_SHADOW_QUALITY", "shadow_quality"},
+        {"BB_LOW_LATENCY", "low_latency"},
     };
-    // Frame generation is hidden in the menu until its artifacts are fixed: only BB_FRAME_GEN turns
-    // it on, a saved setting does not.
-    v.frame_generation = false;
     // Native Vulkan 1.3 PostFX is the default base renderer across all profiles (1:1 visual parity
     // with Yebis2, faster & cleaner on GPU). Legacy Yebis2 remains available via BB_NATIVE_POSTFX=0
     // or the hidden Developer A/B Debug section in the overlay.
@@ -933,6 +973,112 @@ void ConfigureDlssSupport(bool available, const char* problem) {
     }
 }
 
+void ConfigureDlssgSupport(bool available, int max_multi_frame, const char* problem) {
+    static std::mutex dlssg_cfg_mutex;
+    std::scoped_lock lk{dlssg_cfg_mutex};
+    auto& v = Get();
+    v.dlssg_supported = available;
+    v.dlssg_max_multi_frame = available ? std::clamp(max_multi_frame, 1, 3) : 0;
+    static std::string kept_fg;
+    kept_fg = problem ? problem : "";
+    v.dlssg_problem = available || kept_fg.empty() ? nullptr : kept_fg.c_str();
+
+    const int cur = v.frame_generation.load(std::memory_order_relaxed);
+    if (IsDlssFrameGen(cur)) {
+        if (!available) {
+            const int fallback =
+                v.frame_generation_supported.load(std::memory_order_relaxed) ? FrameGenFsr3
+                                                                             : FrameGenOff;
+            std::printf("FrameGen: DLSS-G unavailable (%s); falling back to %s\n",
+                        kept_fg.empty() ? "unsupported GPU/driver" : kept_fg.c_str(),
+                        FrameGenLabel(fallback));
+            v.frame_generation = fallback;
+        } else {
+            const int max_mode =
+                std::min(int(FrameGenDlss4x), FrameGenDlss2x + v.dlssg_max_multi_frame.load() - 1);
+            if (cur > max_mode) {
+                std::printf("FrameGen: %s exceeds GPU max %ux; clamping to %s\n",
+                            FrameGenLabel(cur), v.dlssg_max_multi_frame.load() + 1,
+                            FrameGenLabel(max_mode));
+                v.frame_generation = max_mode;
+            }
+        }
+    }
+}
+
+int EffectiveFrameGen() {
+    const auto& v = Get();
+    const int mode = std::clamp(v.frame_generation.load(std::memory_order_relaxed), 0,
+                                int(FrameGenCount) - 1);
+    if (mode == FrameGenOff) {
+        return FrameGenOff;
+    }
+    if (IsDlssFrameGen(mode)) {
+        if (!v.dlssg_supported.load(std::memory_order_relaxed)) {
+            return v.frame_generation_supported.load(std::memory_order_relaxed) ? FrameGenFsr3
+                                                                                : FrameGenOff;
+        }
+        const int max_multi = std::clamp(v.dlssg_max_multi_frame.load(std::memory_order_relaxed), 1, 3);
+        const int max_mode = std::min(int(FrameGenDlss4x), FrameGenDlss2x + max_multi - 1);
+        return std::min(mode, max_mode);
+    }
+    return v.frame_generation_supported.load(std::memory_order_relaxed) ? mode : FrameGenOff;
+}
+
+int FrameGenMultiplier(int mode) {
+    switch (mode) {
+    case FrameGenFsr3:
+    case FrameGenDlss2x:
+        return 2;
+    case FrameGenFsr3_3x:
+    case FrameGenDlss3x:
+        return 3;
+    case FrameGenFsr3_4x:
+    case FrameGenDlss4x:
+        return 4;
+    default:
+        return 1;
+    }
+}
+
+bool IsDlssFrameGen(int mode) {
+    return mode >= FrameGenDlss2x && mode <= FrameGenDlss4x;
+}
+
+const char* FrameGenName(int mode) {
+    static constexpr const char* names[FrameGenCount] = {"off",     "fsr3",    "fsr3_3x", "fsr3_4x",
+                                                         "dlss_2x", "dlss_3x", "dlss_4x"};
+    return names[std::clamp(mode, 0, FrameGenCount - 1)];
+}
+
+const char* FrameGenLabel(int mode, bool russian) {
+    switch (std::clamp(mode, 0, FrameGenCount - 1)) {
+    case FrameGenFsr3:
+        return "FSR 3.1 (2x)";
+    case FrameGenFsr3_3x:
+        return "FSR 3.1 (3x)";
+    case FrameGenFsr3_4x:
+        return "FSR 3.1 (4x)";
+    case FrameGenDlss2x:
+        return "DLSS (2x)";
+    case FrameGenDlss3x:
+        return "DLSS (3x)";
+    case FrameGenDlss4x:
+        return "DLSS (4x)";
+    default:
+        return russian ? "Выкл" : "Off";
+    }
+}
+
+void ConfigureLowLatencySupport(int backend) {
+    auto& v = Get();
+    v.low_latency_backend.store(backend, std::memory_order_release);
+    if (backend == LowLatencyBackendAmdAntiLag &&
+        v.low_latency.load(std::memory_order_relaxed) == LowLatencyBoost) {
+        v.low_latency.store(LowLatencyOn, std::memory_order_relaxed);
+    }
+}
+
 void ConfigureVramDefaults(std::uint64_t vram_bytes) {
     constexpr std::uint64_t LowVramThreshold = (4ULL << 30) + (512ULL << 20);
     if (vram_bytes == 0 || vram_bytes > LowVramThreshold) {
@@ -1035,7 +1181,7 @@ void Save() {
     put("fullscreen", v.window_mode.load() == WindowModeWindowed ? "0" : "1");
     // Read by run.sh at start.
     put("live_resolution", v.live_resolution < 0 ? "auto" : flag(v.live_resolution != 0));
-    put("frame_generation", flag(v.frame_generation));
+    put("frame_generation", FrameGenName(v.frame_generation.load()));
     if (v.menu_x >= 0.0f && v.menu_y >= 0.0f) {
         put("menu_pos", fixed(v.menu_x, 4) + "," + fixed(v.menu_y, 4));
     }
@@ -1050,6 +1196,7 @@ void Save() {
     put("anisotropic", std::to_string(v.anisotropic.load()));
     put("fps_limit", v.fps_limit_auto.load() ? std::string("auto") : std::to_string(v.fps_limit.load()));
     put("present_mode", PresentModeKey(v.vsync_mode.load()));
+    put("low_latency", LowLatencyModeKey(v.low_latency.load()));
     put("ui_upscale", flag(v.ui_upscale.load()));
     put("ssao_quality", flag(v.ssao_quality.load()));
     put("contact_shadows", flag(v.contact_shadows.load()));

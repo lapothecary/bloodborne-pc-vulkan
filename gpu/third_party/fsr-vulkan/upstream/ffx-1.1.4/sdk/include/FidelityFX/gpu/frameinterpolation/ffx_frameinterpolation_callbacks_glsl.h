@@ -65,7 +65,7 @@
 
         FfxFloat32x2    minMaxLuminance;
         FfxFloat32      fTanHalfFOV;
-        FfxInt32        _pad1;
+        FfxFloat32      fInterpolationTime;
 
         FfxFloat32x2    fJitter;
         FfxFloat32x2    fMotionVectorScale;
@@ -104,6 +104,11 @@
     FfxBoolean Reset()
     {
         return cbFI.reset == 1;
+    }
+
+    FfxFloat32 InterpolationTime()
+    {
+        return (cbFI.fInterpolationTime > 0.0f && cbFI.fInterpolationTime < 1.0f) ? cbFI.fInterpolationTime : 0.5f;
     }
 
     FfxFloat32x4 DeviceToViewSpaceTransformFactors()

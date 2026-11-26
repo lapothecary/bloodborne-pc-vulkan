@@ -33,6 +33,13 @@ public:
     void SetObjectMotion(ObjectMotion* motion) noexcept {
         object_motion = motion;
     }
+    /// Native Bloodborne Pass 0x2e (`velWrap`) half-res object velocity texture for this frame,
+    /// used whenever full-res G-Buffer `ObjectMotion` is off (`BB_OBJECT_MOTION=0`).
+    void SetNativeVelocity(vk::ImageView view, vk::ImageLayout layout, u32 fps_q4_int) noexcept {
+        native_vel_view = view;
+        native_vel_layout = layout;
+        native_vel_fps_q4 = fps_q4_int;
+    }
     /// This frame's object motion image (after RecordMotion), for the debug view; or null.
     vk::ImageView ObjectMotionView() const noexcept;
     vk::Image ObjectMotionImage(u32 width, u32 height) const noexcept;
@@ -74,6 +81,21 @@ public:
     void CameraVectors(float position[3], float up[3], float right[3], float forward[3]) const noexcept;
     // Current projection, previous projection, and row Z of previous-view * inverse-view.
     [[nodiscard]] std::array<std::array<float, 4>, 3> TaaDepthParameters() const noexcept;
+
+    /// Row-major post-multiply (+Y up clip space) matrices for NVIDIA DLSS-G Frame Generation.
+    struct DlssgMatrices {
+        std::array<float, 16> camera_view_to_clip{};
+        std::array<float, 16> clip_to_camera_view{};
+        std::array<float, 16> clip_to_prev_clip{};
+        std::array<float, 16> prev_clip_to_clip{};
+        bool valid = false;
+    };
+    static DlssgMatrices ComputeDlssgMatricesFromCameras(
+        const std::array<float, 12>& cur_view, const std::array<float, 12>& cur_inv_view,
+        const std::array<float, 4>& cur_proj, const std::array<float, 12>& prev_view,
+        const std::array<float, 12>& prev_inv_view,
+        const std::array<float, 4>& prev_proj) noexcept;
+    bool ComputeDlssgMatrices(DlssgMatrices& out) const noexcept;
     /// bbport: the matrices and jitter of the motion of this frame, printed with an upscaler dump
     /// (BB_DUMP_TRIGGER) for offline checks of the vectors.
     void PrintState(int frame) const;
@@ -120,6 +142,9 @@ private:
     vk::UniquePipeline motion_pipeline;
 
     ObjectMotion* object_motion = nullptr;
+    vk::ImageView native_vel_view{};
+    vk::ImageLayout native_vel_layout = vk::ImageLayout::eShaderReadOnlyOptimal;
+    u32 native_vel_fps_q4 = 0;
     Camera current, previous;
     bool frame_has_camera = false;
     /// bbport: the camera of the G-buffer pass in progress (OnConstants), committed as the frame's

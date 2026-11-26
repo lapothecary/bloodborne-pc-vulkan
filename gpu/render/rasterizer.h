@@ -224,6 +224,9 @@ public:
         vk::ImageView src_view{};
         vk::ImageLayout src_layout = vk::ImageLayout::eShaderReadOnlyOptimal;
         vk::Extent2D src_size{};
+        vk::Format src_format{};
+        vk::ComponentMapping src_mapping{};
+        bool has_src_view_params = false;
         vk::ImageView lut1d_view{};
         vk::ImageLayout lut1d_layout = vk::ImageLayout::eShaderReadOnlyOptimal;
         bool needs_srgb_decode = false;

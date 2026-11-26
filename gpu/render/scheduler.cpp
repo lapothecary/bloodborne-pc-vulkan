@@ -1148,8 +1148,20 @@ void Scheduler::QueueSubmit(std::span<const vk::CommandBuffer> cmdbufs, SubmitIn
         .signalSemaphoreValueCount = info.num_signal_semas,
         .pSignalSemaphoreValues = info.signal_ticks.data(),
     };
-    const vk::SubmitInfo submit{
+#ifdef VK_NV_LOW_LATENCY_2_EXTENSION_NAME
+    const vk::LatencySubmissionPresentIdNV latency_present_id{
         .pNext = &timeline,
+        .presentID = info.present_id,
+    };
+#endif
+    const void* submit_pnext = &timeline;
+#ifdef VK_NV_LOW_LATENCY_2_EXTENSION_NAME
+    if (instance.IsLowLatency2Supported() && info.present_id != 0) {
+        submit_pnext = &latency_present_id;
+    }
+#endif
+    const vk::SubmitInfo submit{
+        .pNext = submit_pnext,
         .waitSemaphoreCount = info.num_wait_semas,
         .pWaitSemaphores = info.wait_semas.data(),
         .pWaitDstStageMask = wait_stages.data(),

@@ -404,6 +404,16 @@ void ApplyHotEffectsLocked(bool force, u64 fresh = 0) {
         ++live_objects;
         for (const auto& flag : hot_flags) {
             int want = settings.effects[flag.effect].load(std::memory_order_relaxed) ? 1 : 0;
+            if (flag.effect == 2 && want == 0) {
+                // Keep Bloodborne's lightweight Pass 0x2e object-velocity pass (+0x2969) active
+                // whenever temporal upscaling or Frame Generation is active so skinned characters,
+                // cloth, and weapons have exact per-pixel motion vectors even when visual Motion
+                // Blur (`settings.effects[2]`) is turned Off in Effects.
+                if (BbSettings::EffectiveUpscaler() != BbSettings::UpscalerOff ||
+                    BbSettings::EffectiveFrameGen() != BbSettings::FrameGenOff) {
+                    want = 1;
+                }
+            }
             if (flag.effect == 3 && !is_fresh) {
                 // Menus and auxiliary contexts can deliberately have no SSAO target.
                 // Preserve that restriction instead of overriding the game's safety flag.

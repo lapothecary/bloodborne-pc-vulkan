@@ -4,8 +4,19 @@
 #include <cstdio>
 #include <cstdlib>
 #include <initializer_list>
+#include <string>
+#include <string_view>
 #include <unistd.h>
 #include "bbport_settings.h"
+
+namespace BbFrameRate {
+void SetLimit(int) {}
+} // namespace BbFrameRate
+namespace BbSysInfo {
+std::string RedactHomePath(std::string_view path) {
+    return std::string{path};
+}
+} // namespace BbSysInfo
 
 int main() {
     using namespace BbSettings;
@@ -18,13 +29,16 @@ int main() {
     unsetenv("BB_UPSCALE_PRESET");
     unsetenv("BB_RENDER_RES");
     auto& s = Get();
-    s.upscaler = UpscalerTaa;
-    s.preset = Performance;
-    assert(RenderPreset() == NativeAA && s.preset == Performance);
-    Save();
+    s.aa_mode = AaTaa;
     s.upscaler = UpscalerOff;
+    s.preset = Performance;
+    assert(EffectiveUpscaler() == UpscalerTaa && RenderPreset() == NativeAA && s.preset == Performance);
+    Save();
+    s.aa_mode = AaOff;
+    s.upscaler = UpscalerFsr3;
     Load();
-    assert(s.upscaler == UpscalerTaa && s.preset == Performance);
+    assert(s.aa_mode == AaTaa && s.upscaler == UpscalerOff && EffectiveUpscaler() == UpscalerTaa &&
+           s.preset == Performance);
     assert(RenderPreset() == NativeAA && !ResolutionNeedsRestart());
     s.upscaler = UpscalerFsr3;
     assert(RenderPreset() == Performance);
@@ -36,21 +50,26 @@ int main() {
                 std::fprintf(config, "upscaler=%s\npreset=3\noutput_res=2560x1440\n",
                              UpscalerName(requested));
                 std::fclose(config);
+                s.aa_mode_chosen = false;
                 s.fsr4_problem = nullptr;
                 Load();
-                assert(s.upscaler == requested);
+                const int expected_loaded = (requested == UpscalerTaa) ? UpscalerOff : requested;
+                assert(s.upscaler == expected_loaded);
+                if (requested == UpscalerTaa) {
+                    assert(s.aa_mode == AaTaa && EffectiveUpscaler() == UpscalerTaa);
+                }
                 ConfigureUpscalerSupport(fsr4, fsr411);
-                const bool unsupported = (requested == UpscalerFsr4 && !fsr4) ||
-                    (requested == UpscalerFsr411 && !(fsr4 && fsr411));
-                assert(s.upscaler == (unsupported ? UpscalerFsr3 : requested));
+                const bool unsupported = (expected_loaded == UpscalerFsr4 && !fsr4) ||
+                    (expected_loaded == UpscalerFsr411 && !(fsr4 && fsr411));
+                assert(s.upscaler == (unsupported ? UpscalerFsr3 : expected_loaded));
                 assert(s.fsr4_supported == fsr4);
                 assert(s.fsr411_supported == (fsr4 && fsr411));
                 assert(bool(s.fsr4_problem.load()) == unsupported);
                 assert(s.preset == Performance && CurrentOutput() == (OutputSize{2560, 1440}));
                 // Startup patch settings still describe the already applied guest patches.
-                assert(s.startup_upscaler == requested);
+                assert(s.startup_upscaler == expected_loaded);
                 ConfigureUpscalerSupport(fsr4, fsr411);
-                assert(s.upscaler == (unsupported ? UpscalerFsr3 : requested));
+                assert(s.upscaler == (unsupported ? UpscalerFsr3 : expected_loaded));
             }
         }
     }
@@ -60,17 +79,18 @@ int main() {
     s.preset = Performance;
     assert(RenderPreset() == Performance && !ResolutionNeedsRestart());
     setenv("BB_RENDER_RES", "1706x960", 1);
+    s.output_res_auto = false;
+    s.output_res = PackSize({2560, 1440});
     s.startup_output = CurrentOutput(); // Load with BB_OUTPUT_RES
-    assert(RenderPreset() == Quality && ResolutionNeedsRestart());
+    // Preset and provider changes are live via SceneTargets; only output_res changes under
+    // FixedRenderSession() require a restart.
+    assert(RenderPreset() == Performance && !ResolutionNeedsRestart());
     s.preset = Quality;
-    assert(!ResolutionNeedsRestart());
+    assert(RenderPreset() == Quality && !ResolutionNeedsRestart());
     s.upscaler = UpscalerOff;
-    assert(ResolutionNeedsRestart());
+    assert(RenderPreset() == NativeAA && !ResolutionNeedsRestart());
     s.upscaler = UpscalerFsr4;
-    assert(!ResolutionNeedsRestart()); // provider change at the same patched size is live
-    s.upscaler = UpscalerTaa;          // TAA needs native guest targets
-    assert(ResolutionNeedsRestart());
-    s.upscaler = UpscalerFsr4;
+    assert(!ResolutionNeedsRestart());
     s.output_res = PackSize({3840, 2160});
     assert(ResolutionNeedsRestart());
     s.output_res = PackSize(s.startup_output);

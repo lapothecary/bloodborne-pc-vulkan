@@ -369,6 +369,22 @@ std::string BuildActiveSettingsLine() {
                                                                          : "Windowed";
     const char* vsync_str =
         BbSettings::PresentModeKey(s.vsync_mode.load(std::memory_order_relaxed));
+    const int fg_mode = BbSettings::EffectiveFrameGen();
+    const int ll_backend = s.low_latency_backend.load(std::memory_order_relaxed);
+    const int raw_ll_mode = s.low_latency.load(std::memory_order_relaxed);
+    const int ll_mode =
+        (ll_backend == BbSettings::LowLatencyBackendNvReflex &&
+         raw_ll_mode == BbSettings::LowLatencyOff && BbSettings::IsDlssFrameGen(fg_mode))
+            ? BbSettings::LowLatencyOn
+            : raw_ll_mode;
+    const char* ll_str =
+        ll_backend == BbSettings::LowLatencyBackendNone
+            ? "N/A"
+            : (ll_backend == BbSettings::LowLatencyBackendNvReflex
+                   ? (ll_mode == BbSettings::LowLatencyBoost
+                          ? "Reflex(Boost)"
+                          : (ll_mode == BbSettings::LowLatencyOn ? "Reflex(On)" : "Reflex(Off)"))
+                   : (ll_mode != BbSettings::LowLatencyOff ? "AntiLag2(On)" : "AntiLag2(Off)"));
     const int cap = BbFrameRate::Limit();
     const std::string up_label = FormatActiveUpscalerLabel();
     const char* preset_str = BbSettings::PresetName(BbSettings::RenderPreset());
@@ -392,17 +408,17 @@ std::string BuildActiveSettingsLine() {
     const int ssgi_on = s.ssgi_enabled.load(std::memory_order_relaxed) ? 1 : 0;
     const int pcss_on = s.pcss_shadows.load(std::memory_order_relaxed) ? 1 : 0;
     const int hdr_on = s.hdr_output.load(std::memory_order_relaxed) ? 1 : 0;
-    const int fg_on = s.frame_generation.load(std::memory_order_relaxed) ? 1 : 0;
+    const char* fg_str = BbSettings::FrameGenName(fg_mode);
     const int jitter_on = s.jitter.load(std::memory_order_relaxed) ? 1 : 0;
 
     char buf[512];
     std::snprintf(
         buf, sizeof(buf),
-        "Active Settings: %dx%d -> %dx%d (%s, %s, Cap %d) | Up: %s (%s, P=%d, Jit=%d, FG=%d) | "
+        "Active Settings: %dx%d -> %dx%d (%s, %s, Cap %d, LL %s) | Up: %s (%s, P=%d, Jit=%d, FG=%s) | "
         "PostFX: %s (DoF=%d MB=%d/%d Bloom=%d Haze=%d CA=%d) | "
         "SSAO=%d SSR=%d SSGI=%d PCSS=%d HDR=%d TQ=%d SQ=%d AF=%dx",
-        rw, rh, out.width, out.height, win_str, vsync_str, cap, up_label.c_str(), preset_str,
-        dlss_p, jitter_on, fg_on, nat_pfx ? "Native" : "Yebis2", dof_on, mb_cam, mb_obj, bloom_on,
+        rw, rh, out.width, out.height, win_str, vsync_str, cap, ll_str, up_label.c_str(), preset_str,
+        dlss_p, jitter_on, fg_str, nat_pfx ? "Native" : "Yebis2", dof_on, mb_cam, mb_obj, bloom_on,
         haze_on, ca_on, ssao_on, ssr_on, ssgi_on, pcss_on, hdr_on, tq, sq, af);
     return std::string(buf);
 }

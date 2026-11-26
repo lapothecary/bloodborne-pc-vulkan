@@ -353,9 +353,14 @@ inline void LogHitch(const char* fmt, ...) {
         std::fflush(hitch_fp);
     }
 }
+/// Startup PSO/shader prewarm telemetry (`WarmUp` on `bb:PsoPrewarm`).
+inline std::atomic<bool> shader_prewarm_active{false};
+inline std::atomic<std::uint32_t> shader_prewarm_done{0}, shader_prewarm_total{0};
 /// Polite invisible background shader auto-baker telemetry (Title Screen / gameplay).
 inline std::atomic<bool> shader_autobake_active{false};
 inline std::atomic<std::uint32_t> shader_autobake_done{0}, shader_autobake_total{0};
+/// Runtime async pipeline compiler counters (monotonic submitted vs completed jobs).
+inline std::atomic<std::uint32_t> shader_async_submitted{0}, shader_async_completed{0};
 /// Device memory allocated (VMA blocks, arena residency) and freed, bytes.
 inline std::atomic<std::uint64_t> device_alloc_bytes{0}, device_free_bytes{0};
 /// Memory statistics: registered images (their guest size) and how many; the buffer cache's VRAM
@@ -403,4 +408,14 @@ inline std::atomic<std::uint64_t> protect_calls{0}, protect_pages{0}, protect_re
 /// Pack #1: True when NativePostFX observed >=2 consecutive static frames (no camera/object motion),
 /// allowing Rasterizer to safely skip redundant 2-pass ps_abf92450 velocity dilation.
 inline std::atomic<bool> mb_idle_skip_dilate{false};
+/// Native Vulkan Low Latency (NVIDIA Reflex / AMD Anti-Lag 2) telemetry.
+inline std::atomic<std::uint64_t> low_latency_sleep_ns{0};
+inline std::atomic<std::uint32_t> reflex_pc_latency_us{0};
+/// Frame Generation (FSR 3.1 / DLSS-G) live telemetry & pacer coordination.
+inline std::atomic<bool> fg_active{false};
+inline std::atomic<int> fg_multiplier{1};
+inline std::atomic<int> fg_backend{0}; ///< 0 = Off, 1 = FSR 3.1, 2 = DLSS-G
+inline std::atomic<std::uint64_t> fg_interpolated_frames{0};
+inline std::atomic<std::uint64_t> fg_hudless_frames{0};
+inline std::atomic<std::uint64_t> fg_total_dispatches{0};
 } // namespace BbStats

@@ -2236,6 +2236,7 @@ const GraphicsPipeline* PipelineCache::CompileInBackground(const PipelineSelecti
     ++async_started;
     ++g_bb_compiles;
     BbStats::hitch_pso_async_count.fetch_add(1, std::memory_order_relaxed);
+    BbStats::shader_async_submitted.fetch_add(1u, std::memory_order_relaxed);
     compiler->Submit([this, job, key = selection.graphics_key, infos = selection.infos,
                       runtime_infos = selection.runtime_infos, fetch = selection.fetch_shader,
                       modules = selection.modules]() mutable {
@@ -2243,11 +2244,14 @@ const GraphicsPipeline* PipelineCache::CompileInBackground(const PipelineSelecti
         auto pipeline = std::make_unique<GraphicsPipeline>(
             instance, scheduler, desc_heap, profile, key, *pipeline_cache, infos, runtime_infos,
             fetch, modules, sdata, false);
-        std::scoped_lock lk{job->mutex};
-        job->pipeline = std::move(pipeline);
-        job->sdata = std::move(sdata);
-        job->done = true;
-        job->cv.notify_all();
+        {
+            std::scoped_lock lk{job->mutex};
+            job->pipeline = std::move(pipeline);
+            job->sdata = std::move(sdata);
+            job->done = true;
+            job->cv.notify_all();
+        }
+        BbStats::shader_async_completed.fetch_add(1u, std::memory_order_relaxed);
     });
     sel.fetch_shader.reset();
     return nullptr;
@@ -4146,6 +4150,7 @@ bool PipelineCache::QueueAsyncSpvJob(DrawIndirectParams params, bool indirect) {
     ++async_skipped;
     ++g_bb_compiles;
     BbStats::hitch_pso_async_count.fetch_add(1, std::memory_order_relaxed);
+    BbStats::shader_async_submitted.fetch_add(1u, std::memory_order_relaxed);
 
     compiler->Submit([this, job]() mutable {
         PipelineSelection wsel{};
@@ -4178,6 +4183,7 @@ bool PipelineCache::QueueAsyncSpvJob(DrawIndirectParams params, bool indirect) {
             completed_spv_jobs.push_back(std::move(job));
             has_completed_spv.store(true, std::memory_order_release);
         }
+        BbStats::shader_async_completed.fetch_add(1u, std::memory_order_relaxed);
     });
     return true;
 }

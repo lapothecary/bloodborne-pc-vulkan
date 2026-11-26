@@ -17,6 +17,7 @@
 #include <FidelityFX/host/ffx_fsr3upscaler.h>
 #include <FidelityFX/host/ffx_opticalflow.h>
 
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cwchar>
@@ -918,17 +919,34 @@ extern "C" FfxVkPortableResult ffxVkPortableFrameGenerationContextPrepare(
     return FFX_VK_PORTABLE_OK;
 }
 
-extern "C" FfxVkPortableResult ffxVkPortableFrameGenerationContextRecordDispatch(
+extern "C" FfxVkPortableResult ffxVkPortableFrameGenerationContextRecordMultiDispatch(
     FfxVkPortableFrameGenerationContext* context,
-    const FfxVkPortableFrameGenerationDispatchInfo* dispatchInfo)
+    const FfxVkPortableFrameGenerationDispatchInfo* dispatchInfo,
+    uint32_t outputCount,
+    const FfxVkPortableImage* outputs,
+    const float* interpolationTimes)
 {
-    if (context == nullptr || dispatchInfo == nullptr)
+    if (context == nullptr || dispatchInfo == nullptr || outputs == nullptr)
         return FFX_VK_PORTABLE_ERROR_INVALID_POINTER;
-    if (context->magic != kFrameGenerationContextMagic || !context->interpolationCreated)
+    if (context->magic != kFrameGenerationContextMagic || !context->interpolationCreated ||
+        outputCount == 0 || outputCount > FFX_VK_PORTABLE_MAX_MULTI_FRAME_OUTPUTS)
         return FFX_VK_PORTABLE_ERROR_INVALID_ARGUMENT;
-    if (ffxVkPortableValidateFrameGenerationDispatchInfo(&context->createInfo, dispatchInfo) !=
+
+    FfxVkPortableFrameGenerationDispatchInfo validatedInfo = *dispatchInfo;
+    validatedInfo.output = outputs[0];
+    if (ffxVkPortableValidateFrameGenerationDispatchInfo(&context->createInfo, &validatedInfo) !=
         FFX_VK_PORTABLE_VALIDATION_NONE)
         return FFX_VK_PORTABLE_ERROR_INVALID_ARGUMENT;
+
+    for (uint32_t i = 0; i < outputCount; ++i) {
+        if (!validFrameGenerationOutput(&outputs[i], context->createInfo.displaySize,
+                                        context->createInfo.outputFormat))
+            return FFX_VK_PORTABLE_ERROR_INVALID_ARGUMENT;
+        if (interpolationTimes != nullptr &&
+            (!std::isfinite(interpolationTimes[i]) || interpolationTimes[i] <= 0.0f ||
+             interpolationTimes[i] >= 1.0f))
+            return FFX_VK_PORTABLE_ERROR_INVALID_ARGUMENT;
+    }
 
     std::lock_guard<std::mutex> lock(context->mutex);
     if (!context->prepared || context->dispatched || context->preparedFrameId != dispatchInfo->frameId)
@@ -941,9 +959,7 @@ extern "C" FfxVkPortableResult ffxVkPortableFrameGenerationContextRecordDispatch
                                     context->createInfo.interpolationSourceFormat) ||
         interpolationSource->image != context->preparedInterpolationSource ||
         !validFrameGenerationSource(&dispatchInfo->currentColor, context->createInfo.displaySize,
-                                    context->createInfo.interpolationSourceFormat) ||
-        !validFrameGenerationOutput(&dispatchInfo->output, context->createInfo.displaySize,
-                                    context->createInfo.outputFormat))
+                                    context->createInfo.interpolationSourceFormat))
         return FFX_VK_PORTABLE_ERROR_INVALID_ARGUMENT;
 
     FfxFrameInterpolationDispatchDescription dispatch{};
@@ -953,7 +969,12 @@ extern "C" FfxVkPortableResult ffxVkPortableFrameGenerationContextRecordDispatch
     dispatch.currentBackBuffer = externalResource(dispatchInfo->currentColor, L"portable FSR3 FI present color");
     dispatch.currentBackBuffer_HUDLess = externalResource(
         dispatchInfo->hudlessColor, L"portable FSR3 FI HUDless color");
-    dispatch.output = externalResource(dispatchInfo->output, L"portable FSR3 FI output");
+    dispatch.output = externalResource(outputs[0], L"portable FSR3 FI output");
+    dispatch.multiOutputCount = outputCount;
+    for (uint32_t i = 0; i < outputCount; ++i) {
+        dispatch.multiOutputs[i] = externalResource(outputs[i], L"portable FSR3 FI output");
+        dispatch.multiInterpolationTimes[i] = interpolationTimes != nullptr ? interpolationTimes[i] : 0.5f;
+    }
     dispatch.interpolationRect.left = dispatchInfo->interpolationRect.x;
     dispatch.interpolationRect.top = dispatchInfo->interpolationRect.y;
     dispatch.interpolationRect.width = static_cast<int32_t>(dispatchInfo->interpolationRect.width);
@@ -986,6 +1007,16 @@ extern "C" FfxVkPortableResult ffxVkPortableFrameGenerationContextRecordDispatch
     if (ffxResult == FFX_OK)
         context->dispatched = true;
     return fromFfxResult(ffxResult);
+}
+
+extern "C" FfxVkPortableResult ffxVkPortableFrameGenerationContextRecordDispatch(
+    FfxVkPortableFrameGenerationContext* context,
+    const FfxVkPortableFrameGenerationDispatchInfo* dispatchInfo)
+{
+    if (context == nullptr || dispatchInfo == nullptr)
+        return FFX_VK_PORTABLE_ERROR_INVALID_POINTER;
+    return ffxVkPortableFrameGenerationContextRecordMultiDispatch(
+        context, dispatchInfo, 1u, &dispatchInfo->output, nullptr);
 }
 
 extern "C" FfxVkPortableResult ffxVkPortableFrameGenerationContextDestroy(

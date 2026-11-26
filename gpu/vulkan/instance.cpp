@@ -14,6 +14,7 @@
 #include "render/gcn_to_vk.h"
 #include "sdl_window.h"
 #include "upscale/vk_dlss.h"
+#include "vulkan/low_latency.h"
 
 namespace Vulkan {
 
@@ -104,6 +105,7 @@ Instance::Instance(const Frontend::WindowSystemInfo& window_info, s32 device_ind
                VK_VERSION_MAJOR(properties.apiVersion), VK_VERSION_MINOR(properties.apiVersion),
                VK_VERSION_MAJOR(TargetVulkanApiVersion), VK_VERSION_MINOR(TargetVulkanApiVersion));
     CreateDevice();
+    LowLatency::Init(*this);
     CreateAllocator();
     ComputeMemoryBudget();
     ReadFormats();
@@ -116,6 +118,7 @@ Instance::~Instance() {
     if (device) {
         (void)device->waitIdle();
     }
+    LowLatency::Shutdown();
     // Shut down NVIDIA NGX/DLSS while VkDevice is still valid and idle (prevents
     // nvngx_dlss.dll!NVSDK_NGX_CUDA_Shutdown1 crashing in std::atexit after vkDestroyDevice).
     if (auto* dlss = Dlss::Get()) {
@@ -168,6 +171,15 @@ void Instance::ReadProperties() {
     const auto& driver = chain.get<vk::PhysicalDeviceDriverProperties>();
     driver_id = driver.driverID;
     memory_properties = physical_device.getMemoryProperties();
+    {
+        u64 local_bytes = 0;
+        for (u32 i = 0; i < memory_properties.memoryHeapCount; ++i) {
+            if (memory_properties.memoryHeaps[i].flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
+                local_bytes += memory_properties.memoryHeaps[i].size;
+            }
+        }
+        physical_vram_bytes = VramLimit() != 0 ? std::min(local_bytes, VramLimit()) : local_bytes;
+    }
 
     const auto [result, extensions] = physical_device.enumerateDeviceExtensionProperties();
     Check<"list the GPU's extensions">(result);
@@ -200,7 +212,12 @@ void Instance::CreateDevice() {
         vk::PhysicalDeviceImage2DViewOf3DFeaturesEXT, vk::PhysicalDeviceShaderClockFeaturesKHR,
         vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR,
         vk::PhysicalDeviceShaderMixedFloatDotProductFeaturesVALVE,
-        vk::PhysicalDeviceCooperativeMatrixFeaturesKHR, vk::PhysicalDeviceShaderFloat8FeaturesEXT>();
+        vk::PhysicalDeviceCooperativeMatrixFeaturesKHR, vk::PhysicalDeviceShaderFloat8FeaturesEXT
+#ifdef VK_AMD_ANTI_LAG_EXTENSION_NAME
+        ,
+        vk::PhysicalDeviceAntiLagFeaturesAMD
+#endif
+        >();
     features = query.get().features;
     const auto& vk11 = query.get<vk::PhysicalDeviceVulkan11Features>();
     vk12_features = query.get<vk::PhysicalDeviceVulkan12Features>();
@@ -232,6 +249,13 @@ void Instance::CreateDevice() {
     ext.maintenance_5 = enable(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
     ext.maintenance_8 = enable(VK_KHR_MAINTENANCE_8_EXTENSION_NAME);
     ext.hdr_metadata = enable(VK_EXT_HDR_METADATA_EXTENSION_NAME);
+#ifdef VK_NV_LOW_LATENCY_2_EXTENSION_NAME
+    ext.nv_low_latency2 = enable(VK_NV_LOW_LATENCY_2_EXTENSION_NAME);
+#endif
+#ifdef VK_AMD_ANTI_LAG_EXTENSION_NAME
+    ext.amd_anti_lag = query.get<vk::PhysicalDeviceAntiLagFeaturesAMD>().antiLag &&
+                       enable(VK_AMD_ANTI_LAG_EXTENSION_NAME);
+#endif
     ext.buffer_marker = enable(VK_AMD_BUFFER_MARKER_EXTENSION_NAME); // GPU breadcrumbs
     // The feedback loop layout only with its dynamic state.
     ext.feedback_loop = has(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME) &&
@@ -450,6 +474,9 @@ void Instance::CreateDevice() {
     vk::PhysicalDeviceShaderFloat8FeaturesEXT float8{.shaderFloat8 = true,
                                                       .shaderFloat8CooperativeMatrix = true};
     vk::PhysicalDeviceCoherentMemoryFeaturesAMD coherent{.deviceCoherentMemory = true};
+#ifdef VK_AMD_ANTI_LAG_EXTENSION_NAME
+    vk::PhysicalDeviceAntiLagFeaturesAMD anti_lag{.antiLag = true};
+#endif
 
     vk::DeviceCreateInfo create_info{
         .queueCreateInfoCount = u32(queues.size()),
@@ -490,18 +517,30 @@ void Instance::CreateDevice() {
     link_if(ext.cooperative_matrix, matrix);
     link_if(ext.float8, float8);
     link_if(ext.guest_uncached, coherent);
+#ifdef VK_AMD_ANTI_LAG_EXTENSION_NAME
+    link_if(ext.amd_anti_lag, anti_lag);
+#endif
 
     // DLSS (optional bridge library) needs its own device extensions on NVIDIA GPUs.
     const size_t own_extensions = enabled.size();
+    void** const before_dlss_tail = tail;
+    vk::PhysicalDeviceOpticalFlowFeaturesNV optical_flow{.opticalFlow = true};
     Dlss* dlss = Dlss::Get();
     if (dlss) {
         std::vector<const char*> dlss_extensions;
         dlss->AppendDeviceExtensions(*instance, physical_device, dlss_extensions);
+        bool has_optical_flow = false;
         for (const char* name : dlss_extensions) {
+            if (std::string_view{name} == VK_NV_OPTICAL_FLOW_EXTENSION_NAME) {
+                has_optical_flow = true;
+            }
             if (std::ranges::none_of(enabled,
                                      [&](const char* e) { return std::string_view{e} == name; })) {
                 enabled.push_back(name);
             }
+        }
+        if (has_optical_flow) {
+            Link(tail, optical_flow);
         }
     }
     const auto create = [&] {
@@ -520,6 +559,8 @@ void Instance::CreateDevice() {
             dlss->Disable("the Vulkan device does not start with NGX's extensions: NVIDIA's "
                           "libcuda.so.1 or the nvidia-uvm module is missing");
         }
+        *before_dlss_tail = nullptr;
+        tail = before_dlss_tail;
         enabled.resize(own_extensions);
         created = create();
     }
@@ -549,6 +590,22 @@ void Instance::CreateDevice() {
     require(ext.memory_host,
             reinterpret_cast<const void*>(dispatch.vkGetMemoryHostPointerPropertiesEXT),
             VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+#ifdef VK_NV_LOW_LATENCY_2_EXTENSION_NAME
+    require(ext.nv_low_latency2,
+            reinterpret_cast<const void*>(dispatch.vkSetLatencySleepModeNV),
+            VK_NV_LOW_LATENCY_2_EXTENSION_NAME);
+    require(ext.nv_low_latency2,
+            reinterpret_cast<const void*>(dispatch.vkLatencySleepNV),
+            VK_NV_LOW_LATENCY_2_EXTENSION_NAME);
+    require(ext.nv_low_latency2,
+            reinterpret_cast<const void*>(dispatch.vkSetLatencyMarkerNV),
+            VK_NV_LOW_LATENCY_2_EXTENSION_NAME);
+#endif
+#ifdef VK_AMD_ANTI_LAG_EXTENSION_NAME
+    require(ext.amd_anti_lag,
+            reinterpret_cast<const void*>(dispatch.vkAntiLagUpdateAMD),
+            VK_AMD_ANTI_LAG_EXTENSION_NAME);
+#endif
     ASSERT_MSG(dispatch.vkCmdPushDescriptorSetKHR,
                "the driver does not resolve vkCmdPushDescriptorSetKHR (VK_KHR_push_descriptor)");
     if (dlss) {
@@ -577,10 +634,14 @@ void Instance::CreateAllocator() {
     };
     // 64 MiB blocks (VMA's default is 256): a block goes back to the driver only once empty,
     // and images freed here and there (the texture collector) left big blocks mostly empty
-    // and held. BB_VMA_BLOCK_MB=N.
-    static const VkDeviceSize block_size = [] {
+    // and held. BB_VMA_BLOCK_MB=N. On <= 4.5 GiB discrete GPUs use 16 MiB blocks so freed
+    // textures/targets return whole blocks to WDDM without ~200-400 MiB of empty holes.
+    const VkDeviceSize block_size = [this] {
         const char* env = std::getenv("BB_VMA_BLOCK_MB");
-        return VkDeviceSize(env ? std::max(1ul, std::strtoul(env, nullptr, 10)) : 64ul) << 20;
+        if (env && *env) {
+            return VkDeviceSize(std::max(1ul, std::strtoul(env, nullptr, 10))) << 20;
+        }
+        return VkDeviceSize(IsLowVramDevice() ? 16ul : 64ul) << 20;
     }();
     const VmaAllocatorCreateInfo info{
         .flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT,

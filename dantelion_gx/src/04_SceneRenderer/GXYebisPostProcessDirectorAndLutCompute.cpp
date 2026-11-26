@@ -2111,11 +2111,11 @@ void sub_21d5f80(void* self, void* renderCmdCtx, void* filterParam) {
                 mbDummy0, mbDummy1, mbDummy2, mbCamThreshScale);
             gx_direct_vk::UpdateObjectVelocityThresholdScale(mbCamThreshScale);
             const bool objMoved = gx_direct_vk::ConsumeActiveObjectVelocity();
+            if (objMoved) {
+                flags |= gx_direct_vk::kNativePostFlag_ObjMoved;
+            }
             if (mbUserFlags != 0u && *reinterpret_cast<const int32_t*>(param + 0x1dc) != 0) {
                 flags |= gx_direct_vk::kNativePostFlag_MotionBlur;
-                if (objMoved) {
-                    flags |= gx_direct_vk::kNativePostFlag_ObjMoved;
-                }
             }
             const bool dofEnabled = gx_direct_vk::IsEffectEnabled(gx_direct_vk::kEffectDof) &&
                                     (*reinterpret_cast<const int32_t*>(param + 0x1ac) != 0);

@@ -355,10 +355,24 @@ FfxVkPortableResult ffxVkPortableFrameGenerationContextPrepare(
     const FfxVkPortableFrameGenerationPrepareInfo* prepareInfo,
     const FfxVkPortableImage* interpolationSource);
 
+#define FFX_VK_PORTABLE_MAX_MULTI_FRAME_OUTPUTS 3
+
 /* Record the interpolated frame after Prepare.  This never presents or submits. */
 FfxVkPortableResult ffxVkPortableFrameGenerationContextRecordDispatch(
     FfxVkPortableFrameGenerationContext* context,
     const FfxVkPortableFrameGenerationDispatchInfo* dispatchInfo);
+
+/*
+ * Record one or more interpolated frames from the same prepared real-frame pair at normalized
+ * timestamps interpolationTimes[0..outputCount-1] in (0, 1). Reuses Optical Flow + Prepare and
+ * updates PREVIOUS_INTERPOLATION_SOURCE strictly on the final output.
+ */
+FfxVkPortableResult ffxVkPortableFrameGenerationContextRecordMultiDispatch(
+    FfxVkPortableFrameGenerationContext* context,
+    const FfxVkPortableFrameGenerationDispatchInfo* dispatchInfo,
+    uint32_t outputCount,
+    const FfxVkPortableImage* outputs,
+    const float* interpolationTimes);
 
 /* The application must wait for all work referencing the context before destroying it. */
 FfxVkPortableResult ffxVkPortableFrameGenerationContextDestroy(

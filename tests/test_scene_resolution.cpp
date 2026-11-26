@@ -195,6 +195,52 @@ int main() {
         assert(result == 0xff00ff00);
     }
     std::puts("Scene targets: half-resolution mip level proxy roundtrip PASS");
+
+    // Non-multiple-of-4/8 startup scene sizes (e.g. 16:10 1680x1050 -> Gnm 1680x1052 + half 840x528,
+    // 1366x768 -> Gnm 1368x768 + half 684x384, 1440x900 -> half 720x452) must match EligibleScene /
+    // Eligible while rejecting unrelated sizes.
+    {
+        targets.SetBaseSize({1680, 1050});
+        targets.SetSize(SceneResolution::ForPreset(1, {1680, 1050})); // 1120x700 Quality
+        auto ci_1052 = ci;
+        ci_1052.size = {1680, 1052, 1};
+        const auto c1052_id = images.insert(instance, runtime, views, ci_1052);
+        auto di_1052 = di;
+        di_1052.size = {1680, 1052, 1};
+        const auto d1052_id = images.insert(instance, runtime, views, di_1052);
+        auto hi_528 = ci;
+        hi_528.size = {840, 528, 1};
+        const auto h528_id = images.insert(instance, runtime, views, hi_528);
+        auto unrelated = ci;
+        unrelated.size = {1680, 1064, 1};
+        const auto unrel_id = images.insert(instance, runtime, views, unrelated);
+
+        assert(targets.EligibleScene(images[c1052_id]));
+        assert(targets.EligibleScene(images[d1052_id]));
+        assert(targets.Eligible(images[h528_id]) && !targets.EligibleScene(images[h528_id]));
+        assert(!targets.Eligible(images[unrel_id]));
+        assert((targets.ProxySize(images[c1052_id], 0) == SceneResolution::Size{1120, 700}));
+        assert((targets.ProxySize(images[h528_id], 0) == SceneResolution::Size{560, 350}));
+
+        assert(SceneTargets::MatchesGnmSceneDim(1368, 768, 1366, 768));
+        assert(SceneTargets::MatchesGnmSceneDim(684, 384, 1366 / 2, 768 / 2));
+        assert(SceneTargets::MatchesGnmSceneDim(720, 452, 1440 / 2, 900 / 2));
+        assert(!SceneTargets::MatchesGnmSceneDim(1920, 1088, 1920, 1080));
+        if (const char* vram_env = std::getenv("BB_VRAM_LIMIT_MB")) {
+            const int lim_mb = std::atoi(vram_env);
+            if (lim_mb > 0 && !instance.IsIntegrated()) {
+                assert(instance.GetPhysicalVramBytes() <= u64(lim_mb) * (1ULL << 20));
+                assert(instance.IsLowVramDevice() == (lim_mb <= 4608));
+                std::printf("Low-VRAM gate check (%d MiB -> low_vram=%d) PASS\n",
+                            lim_mb, int(instance.IsLowVramDevice()));
+            }
+        } else if (!instance.IsIntegrated() &&
+                   instance.GetPhysicalVramBytes() > (4ULL << 30) + (512ULL << 20)) {
+            assert(!instance.IsLowVramDevice());
+        }
+        std::puts("Scene targets: 16:10 1680x1050 (Gnm 1680x1052 / 840x528) & 1366x768 alignment PASS");
+    }
+
     scheduler.Finish();
     vmaDestroyBuffer(instance.GetAllocator(),readback,allocation);
 }

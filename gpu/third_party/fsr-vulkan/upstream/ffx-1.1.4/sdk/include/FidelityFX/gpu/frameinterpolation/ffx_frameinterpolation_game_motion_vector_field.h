@@ -45,8 +45,10 @@ void computeGameFieldMvs(FfxInt32x2 iPxPos)
 
     const FfxFloat32 fDepthSample = LoadDilatedDepth(iPxPos + iDistortionPixelOffset);
     const FfxFloat32x2 fGameMotionVector = LoadDilatedMotionVector(iPxPos + iDistortionPixelOffset);
-    const FfxFloat32x2 fMotionVectorHalf = fGameMotionVector * 0.5f;
-    const FfxFloat32x2 fInterpolatedLocationUv = fUvInScreenSpace + fMotionVectorHalf;
+    const FfxFloat32   fInterpT              = InterpolationTime();
+    const FfxFloat32x2 fMotionVectorHalf     = fGameMotionVector * 0.5f;
+    const FfxFloat32x2 fMotionVectorToInterp = fGameMotionVector * (1.0f - fInterpT);
+    const FfxFloat32x2 fInterpolatedLocationUv = fUvInScreenSpace + fMotionVectorToInterp;
 
     const FfxFloat32 fViewSpaceDepth = ConvertFromDeviceDepthToViewSpace(fDepthSample);
     const FfxUInt32 uHighPriorityFactorPrimary = getPriorityFactorFromViewSpaceDepth(fViewSpaceDepth);
@@ -79,14 +81,14 @@ void computeGameFieldMvs(FfxInt32x2 iPxPos)
 
     // Update secondary vectors
     // Main purpose of secondary vectors is to improve quality of inpainted vectors
-    const FfxBoolean bWriteSecondaryVectors = length(fMotionVectorHalf * RenderSize()) > FFX_FRAMEINTERPOLATION_EPSILON;
+    const FfxBoolean bWriteSecondaryVectors = length(fMotionVectorToInterp * RenderSize()) > FFX_FRAMEINTERPOLATION_EPSILON;
     if (bWriteSecondaryVectors)
     {
         FfxBoolean bWriteSecondary = true;
         FfxUInt32 uNumPrimaryHits = 0;
         const FfxFloat32 fSecondaryStepScale = length(1.0f / RenderSize());
         const FfxFloat32x2 fStepMv = normalize(fGameMotionVector);
-        const FfxFloat32 fBreakDist = ffxMin(length(fMotionVectorHalf), length(FfxFloat32x2(0.5f, 0.5f)));
+        const FfxFloat32 fBreakDist = ffxMin(length(fMotionVectorToInterp), length(FfxFloat32x2(0.5f, 0.5f)));
 
         for (FfxFloat32 fMvScale = fSecondaryStepScale; fMvScale <= fBreakDist && bWriteSecondary; fMvScale += fSecondaryStepScale)
         {

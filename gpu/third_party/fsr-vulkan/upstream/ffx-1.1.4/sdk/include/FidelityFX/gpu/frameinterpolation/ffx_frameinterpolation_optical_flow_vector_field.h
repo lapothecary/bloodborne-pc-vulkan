@@ -28,7 +28,9 @@ void computeOpticalFlowFieldMvs(FfxUInt32x2 dtID, FfxFloat32x2 fOpticalFlowVecto
     FfxFloat32x2 fUv = FfxFloat32x2(FfxFloat32x2(dtID)+0.5f) / GetOpticalFlowSize2();
 
     const FfxFloat32 scaleFactor = 1.0f;
+    const FfxFloat32 fInterpT = InterpolationTime();
     FfxFloat32x2 fMotionVectorHalf = fOpticalFlowVector * 0.5f;
+    FfxFloat32x2 fMotionVectorToInterp = fOpticalFlowVector * (1.0f - fInterpT);
 
     // pixel position in current frame + fOpticalFlowVector-> pixel position in previous frame
     FfxFloat32x3 prevBackbufferCol = SamplePreviousBackbuffer(fUv + fOpticalFlowVector).xyz; // returns previous backbuffer color of current frame pixel position in previous frame
@@ -49,7 +51,7 @@ void computeOpticalFlowFieldMvs(FfxUInt32x2 dtID, FfxFloat32x2 fOpticalFlowVecto
 
         const FfxUInt32x2 packedVectorPrimary = PackVectorFieldEntries(true, uHighPriorityFactor, uLowPriorityFactor, fMotionVectorHalf);
 
-        BilinearSamplingData bilinearInfo = GetBilinearSamplingData(fUv + fMotionVectorHalf, GetOpticalFlowSize2());
+        BilinearSamplingData bilinearInfo = GetBilinearSamplingData(fUv + fMotionVectorToInterp, GetOpticalFlowSize2());
         for (FfxInt32 iSampleIndex = 0; iSampleIndex < 4; iSampleIndex++)
         {
             const FfxInt32x2 iOffset = bilinearInfo.iOffsets[iSampleIndex];

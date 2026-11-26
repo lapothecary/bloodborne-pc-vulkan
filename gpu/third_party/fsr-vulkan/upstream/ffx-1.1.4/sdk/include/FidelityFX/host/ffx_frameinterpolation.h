@@ -244,6 +244,8 @@ typedef enum FfxFrameInterpolationDispatchFlags
     FFX_FRAMEINTERPOLATION_DISPATCH_RESERVED_2 = (1 << 5), 
 } FfxFrameInterpolationDispatchFlags;
 
+#define FFX_FRAMEINTERPOLATION_MAX_MULTI_OUTPUTS (3)
+
 typedef struct FfxFrameInterpolationDispatchDescription {
 
     uint32_t                            flags;                              ///< combination of FfxFrameInterpolationDispatchFlags
@@ -279,6 +281,10 @@ typedef struct FfxFrameInterpolationDispatchDescription {
     FfxResource                         reconstructedPrevDepth;             ///< The reconstructed depth buffer data
 
     FfxResource                         distortionField;                    ///< A resource containing distortion offset data used when distortion post effects are enabled.
+
+    uint32_t                            multiOutputCount;                   ///< 0 or 1 = single output (`output` at t=0.5); 2..3 = multi-frame outputs in `multiOutputs[]`.
+    FfxResource                         multiOutputs[FFX_FRAMEINTERPOLATION_MAX_MULTI_OUTPUTS];            ///< Output targets when multiOutputCount >= 2.
+    float                               multiInterpolationTimes[FFX_FRAMEINTERPOLATION_MAX_MULTI_OUTPUTS]; ///< Normalized timestamps in (0, 1).
 } FfxFrameInterpolationDispatchDescription;
 
 FFX_API FfxErrorCode ffxFrameInterpolationDispatch(FfxFrameInterpolationContext* context, const FfxFrameInterpolationDispatchDescription* params);

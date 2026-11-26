@@ -22,6 +22,7 @@
 
 #include <algorithm>    // for max used inside SPD CPU code.
 #include <cmath>        // for fabs, abs, sinf, sqrt, etc.
+#include <cstddef>      // for offsetof
 #include <string>       // for memset
 #include <cfloat>       // for FLT_EPSILON
 #include <FidelityFX/host/ffx_frameinterpolation.h>
@@ -38,6 +39,9 @@
 #include <ffx_object_management.h>
 
 #include "ffx_frameinterpolation_private.h"
+
+static_assert(offsetof(FrameInterpolationConstants, fInterpolationTime) == 156,
+              "cbFI fInterpolationTime offset mismatch");
 
 // lists to map shader resource bindpoint name to resource identifier
 typedef struct ResourceBinding
@@ -999,12 +1003,6 @@ FFX_API FfxErrorCode ffxFrameInterpolationDispatch(FfxFrameInterpolationContext*
     contextPrivate->renderDescription.upscaleSize               = params->displaySize;
     setupDeviceDepthToViewSpaceDepthParams(contextPrivate, renderDesc, &contextPrivate->constants);
 
-    contextPrivate->contextDescription.backendInterface.fpStageConstantBufferDataFunc(
-        &contextPrivate->contextDescription.backendInterface,
-        &contextPrivate->constants,
-        sizeof(contextPrivate->constants),
-        &contextPrivate->constantBuffers[FFX_FRAMEINTERPOLATION_CONSTANTBUFFER_IDENTIFIER]);
-
     if (contextPrivate->constants.HUDLessAttachedFactor == 1) {
 
         FFX_ASSERT_MESSAGE(contextPrivate->contextDescription.previousInterpolationSourceFormat == params->currentBackBuffer_HUDLess.description.format,
@@ -1045,9 +1043,21 @@ FFX_API FfxErrorCode ffxFrameInterpolationDispatch(FfxFrameInterpolationContext*
             &contextPrivate->srvResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_RECONSTRUCTED_DEPTH_PREVIOUS_FRAME]);
     }
 
-    // Register output as SRV and UAV
-    contextPrivate->contextDescription.backendInterface.fpRegisterResource(&contextPrivate->contextDescription.backendInterface, &params->output, contextPrivate->effectContextId, &contextPrivate->uavResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_OUTPUT]);
-    contextPrivate->srvResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_OUTPUT] = contextPrivate->uavResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_OUTPUT];
+    const uint32_t subFrameCount =
+        (params->multiOutputCount >= 2 && params->multiOutputCount <= FFX_FRAMEINTERPOLATION_MAX_MULTI_OUTPUTS)
+            ? params->multiOutputCount
+            : 1u;
+
+    FfxResourceInternal subOutputResources[FFX_FRAMEINTERPOLATION_MAX_MULTI_OUTPUTS] = {};
+    for (uint32_t subIdx = 0; subIdx < subFrameCount; ++subIdx)
+    {
+        const FfxResource* subOutput = (params->multiOutputCount >= 2) ? &params->multiOutputs[subIdx] : &params->output;
+        contextPrivate->contextDescription.backendInterface.fpRegisterResource(
+            &contextPrivate->contextDescription.backendInterface,
+            subOutput,
+            contextPrivate->effectContextId,
+            &subOutputResources[subIdx]);
+    }
 
     // set optical flow buffers
     if (params->opticalFlowScale.x > 0)
@@ -1087,8 +1097,24 @@ FFX_API FfxErrorCode ffxFrameInterpolationDispatch(FfxFrameInterpolationContext*
 
     const bool bExecutePreparationPasses = (false == contextPrivate->constants.Reset);
 
-    // Schedule work for the interpolation command list
+    // Schedule work for each interpolated sub-frame between Previous and Current real frames
+    for (uint32_t subIdx = 0; subIdx < subFrameCount; ++subIdx)
     {
+        const float rawT =
+            (params->multiOutputCount >= 1 && params->multiOutputCount <= FFX_FRAMEINTERPOLATION_MAX_MULTI_OUTPUTS)
+                ? params->multiInterpolationTimes[subIdx]
+                : 0.5f;
+        contextPrivate->constants.fInterpolationTime = (rawT > 0.0f && rawT < 1.0f) ? rawT : 0.5f;
+
+        contextPrivate->contextDescription.backendInterface.fpStageConstantBufferDataFunc(
+            &contextPrivate->contextDescription.backendInterface,
+            &contextPrivate->constants,
+            sizeof(contextPrivate->constants),
+            &contextPrivate->constantBuffers[FFX_FRAMEINTERPOLATION_CONSTANTBUFFER_IDENTIFIER]);
+
+        contextPrivate->uavResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_OUTPUT] = subOutputResources[subIdx];
+        contextPrivate->srvResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_OUTPUT] = subOutputResources[subIdx];
+
         FfxResourceInternal aliasableResources[] = {
             contextPrivate->uavResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_RECONSTRUCTED_DEPTH_INTERPOLATED_FRAME],
             contextPrivate->uavResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_GAME_MOTION_VECTOR_FIELD_X],
@@ -1195,7 +1221,8 @@ FFX_API FfxErrorCode ffxFrameInterpolationDispatch(FfxFrameInterpolationContext*
             scheduleDispatch(contextPrivate, &contextPrivate->pipelineDebugView, displayDispatchSizeX, displayDispatchSizeY);
         }
 
-        // store current buffer
+        // Commit Current -> Previous interpolation source strictly after the final sub-frame.
+        if (subIdx + 1u == subFrameCount)
         {
             FfxGpuJobDescription copyJobs[] = { {FFX_GPU_JOB_COPY} };
             FfxResourceInternal  copySources[_countof(copyJobs)] = { contextPrivate->srvResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_CURRENT_INTERPOLATION_SOURCE] };

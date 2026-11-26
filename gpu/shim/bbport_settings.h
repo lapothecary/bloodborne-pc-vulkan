@@ -14,6 +14,16 @@ namespace BbSettings {
 enum Upscaler : int { UpscalerOff = 0, UpscalerFsr3 = 1, UpscalerFsr4 = 2, UpscalerFsr411 = 3,
                       UpscalerTaa = 4, UpscalerDlss = 5, UpscalerCount };
 enum AaMode : int { AaOff = 0, AaFxaa = 1, AaTaa = 2, AaDlaa = 3, AaDlaaCnn = 4, AaSmaa = 5, AaSmaaT2x = 6, AaCount };
+enum FrameGenMode : int {
+    FrameGenOff = 0,
+    FrameGenFsr3 = 1,
+    FrameGenFsr3_3x = 2,
+    FrameGenFsr3_4x = 3,
+    FrameGenDlss2x = 4,
+    FrameGenDlss3x = 5,
+    FrameGenDlss4x = 6,
+    FrameGenCount
+};
 /// FSR 4 v07 or FSR 4.1.1: the same inputs, settings and placement in the frame.
 inline bool IsFsr4(int upscaler) {
     return upscaler == UpscalerFsr4 || upscaler == UpscalerFsr411;
@@ -119,6 +129,19 @@ enum VsyncMode : int {
     VsyncModeCount = 3
 };
 const char* PresentModeKey(int vsync_mode);
+/// Native Vulkan Low Latency mode (NVIDIA Reflex VK_NV_low_latency2 / AMD Anti-Lag 2 VK_AMD_anti_lag).
+enum LowLatencyMode : int {
+    LowLatencyOff = 0,
+    LowLatencyOn = 1,
+    LowLatencyBoost = 2, ///< NVIDIA Reflex On + Boost (AMD Anti-Lag 2 maps to On)
+    LowLatencyCount = 3
+};
+enum LowLatencyBackend : int {
+    LowLatencyBackendNone = 0,
+    LowLatencyBackendNvReflex = 1,
+    LowLatencyBackendAmdAntiLag = 2
+};
+const char* LowLatencyModeKey(int mode);
 struct OutputSize {
     int width = 1920, height = 1080;
     bool operator==(const OutputSize&) const = default;
@@ -194,12 +217,15 @@ struct Values {
     /// Live resolution and preset changes (run.sh): 0 off by default (startup patch, fastest
     /// on the Steam Deck and older GPUs), -1 auto (strong discrete GPUs), 1 on. On restart.
     std::atomic<int> live_resolution{0};
-    /// FSR 3 frame generation (upscale/vk_frame_generation): a frame interpolated between each
-    /// two of the game's, shown between them (needs the upscaler's scaled path). Live.
-    std::atomic<bool> frame_generation{false};
-    /// Whether the GPU can (set by the renderer), or why not.
+    /// Frame generation (Off / FSR 3.1 2x..4x / DLSS-G 2x..4x). Live.
+    std::atomic<int> frame_generation{FrameGenOff};
+    /// Whether the GPU can run FSR 3.1 FG (set by the renderer), or why not.
     std::atomic<bool> frame_generation_supported{false};
     std::atomic<const char*> frame_generation_problem{nullptr};
+    /// Whether the GPU + runtime can run NVIDIA DLSS-G (set by Dlss::Initialize), and max multi-frame count.
+    std::atomic<bool> dlssg_supported{false};
+    std::atomic<int> dlssg_max_multi_frame{0};
+    std::atomic<const char*> dlssg_problem{nullptr};
     /// Why FSR 4 cannot run (assets, device features), or null. Set by the renderer.
     std::atomic<const char*> fsr4_problem{nullptr};
     std::atomic<bool> fsr4_supported{false}, fsr411_supported{false};
@@ -232,6 +258,10 @@ struct Values {
     std::atomic<bool> vsync_mode_chosen{false};
     /// Incremented whenever vsync_mode changes so Presenter recreates the swapchain live.
     std::atomic<std::uint32_t> swapchain_generation{0};
+    /// Native Vulkan Low Latency mode: 0 = Off, 1 = On (default), 2 = On + Boost (NVIDIA Reflex).
+    std::atomic<int> low_latency{LowLatencyOn};
+    /// Detected runtime low-latency backend (LowLatencyBackendNone / NvReflex / AmdAntiLag).
+    std::atomic<int> low_latency_backend{LowLatencyBackendNone};
     /// AI / SDF UI & Icon Super-Resolution (2x/4x + disk cache) for 1-mip 2D UI textures.
     /// GPU Super-Resolution (xBRZ + SDF 2x-4x) for HUD, icons, runes, and logos (0 ms runtime cost).
     std::atomic<bool> ui_upscale{true};
@@ -333,11 +363,20 @@ void Load();
 void ConfigureUpscalerSupport(bool fsr4, bool fsr411);
 /// After device creation: DLSS availability; a DLSS/DLAA setting falls back cleanly without it.
 void ConfigureDlssSupport(bool available, const char* problem);
+/// After NGX init: DLSS-G availability & max generated frames (1=2x, 3=4x).
+void ConfigureDlssgSupport(bool available, int max_multi_frame, const char* problem);
+/// After device creation: active native Vulkan low-latency backend (Reflex / Anti-Lag 2 / None).
+void ConfigureLowLatencySupport(int backend);
 /// Caps unchosen Texture/Shadow defaults gently on <= 4.5 GiB VRAM GPUs to prevent paging stalls.
 void ConfigureVramDefaults(std::uint64_t vram_bytes);
 /// Startup-patched scene dimensions cannot change until run.sh prepares a new image.
 bool FixedRenderSession();
 int EffectiveUpscaler();
+int EffectiveFrameGen();
+int FrameGenMultiplier(int mode);
+bool IsDlssFrameGen(int mode);
+const char* FrameGenName(int mode);
+const char* FrameGenLabel(int mode, bool russian = false);
 int RenderPreset();
 bool ResolutionNeedsRestart();
 /// Writes the file (menu changes).

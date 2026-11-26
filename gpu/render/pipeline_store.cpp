@@ -26,6 +26,7 @@
 #include "shader/backend/spirv/spirv_opt.h"
 #include "shader/info.h"
 #include "shader/specialization.h"
+#include "shim/bbport_toggles.h"
 #include "vulkan/instance.h"
 
 namespace Vulkan {
@@ -696,6 +697,12 @@ void PipelineCache::DropPreloaded() {
 }
 
 void PipelineCache::WarmUp() {
+    struct PrewarmOverlayGuard {
+        ~PrewarmOverlayGuard() {
+            BbStats::shader_prewarm_active.store(false, std::memory_order_release);
+        }
+    } prewarm_overlay_guard{};
+
     const auto t0 = std::chrono::steady_clock::now();
     prewarm_start_ns.store(
         static_cast<u64>(
@@ -887,10 +894,22 @@ void PipelineCache::WarmUp() {
     // Phase 1B: Parallel `.meta` + `.spv` load, SPIR-V upgrade, and vkCreateShaderModule for
     // every unique referenced stage across `io_workers` threads.
     const auto t_stg0 = std::chrono::steady_clock::now();
+    const u32 stg_count = static_cast<u32>(unique_stage_hashes.size());
+    const u32 initial_pso_count =
+        static_cast<u32>(raw_compute_items.size() + raw_graphics_items.size());
+    const u32 est_standalone_count =
+        meta_files.size() > unique_stage_hashes.size()
+            ? static_cast<u32>(meta_files.size() - unique_stage_hashes.size())
+            : 0u;
+    const u32 prewarm_initial_total = stg_count + initial_pso_count + est_standalone_count;
+    BbStats::shader_prewarm_done.store(0u, std::memory_order_relaxed);
+    BbStats::shader_prewarm_total.store(prewarm_initial_total, std::memory_order_relaxed);
+    if (prewarm_initial_total > 0u) {
+        BbStats::shader_prewarm_active.store(true, std::memory_order_release);
+    }
     prewarm_phase.store(3u, std::memory_order_release);
     prewarm_done_items.store(0u, std::memory_order_relaxed);
-    prewarm_total_items.store(static_cast<u32>(unique_stage_hashes.size()),
-                              std::memory_order_relaxed);
+    prewarm_total_items.store(stg_count, std::memory_order_relaxed);
 
     struct LoadedStageEntry {
         u64 perm_hash = 0;
@@ -913,6 +932,13 @@ void PipelineCache::WarmUp() {
                 if (idx >= unique_stage_hashes.size()) {
                     return;
                 }
+                struct StageTickGuard {
+                    std::atomic<u32>& local;
+                    ~StageTickGuard() {
+                        local.fetch_add(1, std::memory_order_relaxed);
+                        BbStats::shader_prewarm_done.fetch_add(1, std::memory_order_relaxed);
+                    }
+                } tick_guard{prewarm_done_items};
                 const u64 perm_hash = unique_stage_hashes[idx];
                 auto& item = loaded_stages[idx];
                 item.perm_hash = perm_hash;
@@ -920,7 +946,6 @@ void PipelineCache::WarmUp() {
                     std::vector<u8> meta;
                     Store().Load(BbCache::BlobType::ShaderMeta, MetaName(perm_hash), meta);
                     if (meta.empty()) {
-                        prewarm_done_items.fetch_add(1, std::memory_order_relaxed);
                         continue;
                     }
                     Serialization::Archive ar{std::move(meta)};
@@ -928,7 +953,6 @@ void PipelineCache::WarmUp() {
                     item.spec.info = &item.program->info;
                     if (!LoadShaderMeta(ar, item.program->info, item.spec, item.perm_idx,
                                         profile)) {
-                        prewarm_done_items.fetch_add(1, std::memory_order_relaxed);
                         continue;
                     }
                     if (profile.paged_buffers &&
@@ -936,7 +960,6 @@ void PipelineCache::WarmUp() {
                         (!item.program->info.uses_paged_buffers || item.perm_idx != 0 ||
                          item.spec.buffers.size() < 3 || !item.spec.buffers[1].paged ||
                          !item.spec.buffers[2].paged)) {
-                        prewarm_done_items.fetch_add(1, std::memory_order_relaxed);
                         continue;
                     }
                     item.runtime_info = item.spec.runtime_info;
@@ -965,7 +988,6 @@ void PipelineCache::WarmUp() {
                                     throw Serialization::CorruptData{
                                         "damaged SPIR-V in the shader cache"};
                                 }
-                                prewarm_done_items.fetch_add(1, std::memory_order_relaxed);
                                 continue;
                             }
                             OptimizeSpirvInWarmUp(spv, pgm_hash);
@@ -979,7 +1001,6 @@ void PipelineCache::WarmUp() {
                                 throw Serialization::CorruptData{
                                     "damaged SPIR-V in the shader cache"};
                             }
-                            prewarm_done_items.fetch_add(1, std::memory_order_relaxed);
                             continue;
                         }
                     }
@@ -1002,7 +1023,6 @@ void PipelineCache::WarmUp() {
                         LOG_WARNING(Render, "Pipeline cache: damaged entry ({})", e.what());
                     }
                 }
-                prewarm_done_items.fetch_add(1, std::memory_order_relaxed);
             }
         };
         const u32 stg_threads = unique_stage_hashes.size() < 8
@@ -1163,6 +1183,10 @@ void PipelineCache::WarmUp() {
     const size_t num_compute = compute_items.size();
     const size_t num_graphics = graphics_items.size();
     const size_t total_items = num_compute + num_graphics;
+    BbStats::shader_prewarm_done.store(stg_count, std::memory_order_relaxed);
+    BbStats::shader_prewarm_total.store(
+        stg_count + static_cast<u32>(total_items) + est_standalone_count,
+        std::memory_order_relaxed);
     prewarm_phase.store(4u, std::memory_order_release);
     prewarm_done_items.store(0u, std::memory_order_relaxed);
     prewarm_total_items.store(static_cast<u32>(total_items), std::memory_order_relaxed);
@@ -1204,6 +1228,7 @@ void PipelineCache::WarmUp() {
                 return;
             }
             prewarm_done_items.fetch_add(1, std::memory_order_relaxed);
+            BbStats::shader_prewarm_done.fetch_add(1, std::memory_order_relaxed);
         }
     };
 
@@ -1288,6 +1313,13 @@ void PipelineCache::WarmUp() {
     prewarm_total_items.store(static_cast<u32>(standalone_metas.size()),
                               std::memory_order_relaxed);
     if (!standalone_metas.empty()) {
+        const u32 prewarm_base = stg_count + static_cast<u32>(total_items);
+        BbStats::shader_prewarm_done.store(prewarm_base, std::memory_order_relaxed);
+        BbStats::shader_prewarm_total.store(
+            prewarm_base + static_cast<u32>(standalone_metas.size()),
+            std::memory_order_relaxed);
+        BbStats::shader_prewarm_active.store(true, std::memory_order_release);
+
         std::atomic<size_t> next_meta{0};
         auto meta_worker = [&] {
             for (;;) {
@@ -1295,18 +1327,23 @@ void PipelineCache::WarmUp() {
                 if (idx >= standalone_metas.size()) {
                     return;
                 }
+                struct MetaTickGuard {
+                    std::atomic<u32>& local;
+                    ~MetaTickGuard() {
+                        local.fetch_add(1, std::memory_order_relaxed);
+                        BbStats::shader_prewarm_done.fetch_add(1, std::memory_order_relaxed);
+                    }
+                } tick_guard{prewarm_done_items};
                 auto& item = standalone_metas[idx];
                 try {
                     std::vector<u8> raw_meta;
                     if (!BbCache::BlobStore::LoadFile(item.meta_path, raw_meta)) {
-                        prewarm_done_items.fetch_add(1, std::memory_order_relaxed);
                         continue;
                     }
                     if (raw_meta.size() >= 24) {
                         u64 ph_comb = 0;
                         std::memcpy(&ph_comb, raw_meta.data() + 8, sizeof(u64));
                         if (resident_perm_hashes.contains(ph_comb)) {
-                            prewarm_done_items.fetch_add(1, std::memory_order_relaxed);
                             continue;
                         }
                     }
@@ -1315,7 +1352,6 @@ void PipelineCache::WarmUp() {
                     item.spec.info = &item.program->info;
                     if (!LoadShaderMeta(ar, item.program->info, item.spec, item.perm_idx,
                                         profile)) {
-                        prewarm_done_items.fetch_add(1, std::memory_order_relaxed);
                         continue;
                     }
                     const u64 pgm_hash = item.program->info.pgm_hash;
@@ -1335,7 +1371,6 @@ void PipelineCache::WarmUp() {
                             Store().Load(BbCache::BlobType::ShaderBinary,
                                          BinaryName(pgm_hash, item.perm_idx), spv);
                             if (spv.size() < 5 || spv[0] != 0x07230203u) {
-                                prewarm_done_items.fetch_add(1, std::memory_order_relaxed);
                                 continue;
                             }
                             OptimizeSpirvInWarmUp(spv, pgm_hash);
@@ -1345,7 +1380,6 @@ void PipelineCache::WarmUp() {
                         Store().Load(BbCache::BlobType::ShaderBinary,
                                      BinaryName(pgm_hash, item.perm_idx), spv);
                         if (spv.size() < 5 || spv[0] != 0x07230203u) {
-                            prewarm_done_items.fetch_add(1, std::memory_order_relaxed);
                             continue;
                         }
                     }
@@ -1355,7 +1389,6 @@ void PipelineCache::WarmUp() {
                     auto [res, created] = instance.GetDevice().createShaderModule(
                         {.codeSize = spv.size() * sizeof(u32), .pCode = spv.data()});
                     if (res != vk::Result::eSuccess) {
-                        prewarm_done_items.fetch_add(1, std::memory_order_relaxed);
                         continue;
                     }
                     if (upgraded) {
@@ -1366,7 +1399,6 @@ void PipelineCache::WarmUp() {
                     item.ok = true;
                 } catch (const std::exception&) {
                 }
-                prewarm_done_items.fetch_add(1, std::memory_order_relaxed);
             }
         };
         const u32 meta_threads = standalone_metas.size() < 8

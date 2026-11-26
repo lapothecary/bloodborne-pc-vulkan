@@ -156,6 +156,20 @@ bool CollectExtensions(const VkExtensionProperties* required, u32 count,
     }
     return true;
 }
+
+BbDlssImage ToDlssImage(const Dlss::Resource& r) {
+    if (!r.image) {
+        return {};
+    }
+    const vk::ImageSubresourceRange range{r.aspect, 0, 1, 0, 1};
+    return BbDlssImage{r.image,
+                       r.view,
+                       static_cast<VkImageSubresourceRange>(range),
+                       static_cast<VkFormat>(r.format),
+                       r.width,
+                       r.height};
+}
+
 } // namespace
 
 struct Dlss::Impl {
@@ -163,8 +177,11 @@ struct Dlss::Impl {
     const BbDlssApi* api{};
     std::vector<std::string> instance_extensions, device_extensions;
     std::optional<FeatureDesc> feature;
-    std::string problem;
+    std::optional<FgFeatureDesc> fg_feature;
+    std::string problem, fg_problem;
     bool eligible{true}, instance_ready{}, device_ready{}, initialized{}, available{};
+    bool fg_available{};
+    u32 fg_max_multi_frame{};
     mutable std::mutex init_mutex;
     std::atomic<bool> init_done{false};
     std::jthread init_thread;
@@ -180,8 +197,10 @@ struct Dlss::Impl {
     }
 
     void Disable(std::string_view reason) {
-        eligible = available = false;
+        eligible = available = fg_available = false;
+        fg_max_multi_frame = 0;
         problem = reason;
+        fg_problem = reason;
         std::printf("DLSS: unavailable (%.*s)\n", int(reason.size()), reason.data());
     }
 };
@@ -213,7 +232,7 @@ Dlss::Dlss() : impl{std::make_unique<Impl>()} {
         impl->module ? reinterpret_cast<BbDlssGetApiFn>(FindSymbol(impl->module, "BbDlssGetApi"))
                      : nullptr;
     impl->api = get_api ? get_api() : nullptr;
-    if (!impl->api || impl->api->abi != BBPORT_DLSS_BRIDGE_ABI) {
+    if (!impl->api || impl->api->abi < 1 || impl->api->abi > BBPORT_DLSS_BRIDGE_ABI) {
         impl->Disable("the DLSS bridge library is missing or from another version");
         return;
     }
@@ -227,7 +246,29 @@ Dlss::Dlss() : impl{std::make_unique<Impl>()} {
     std::error_code error;
     std::filesystem::create_directories(data, error);
     std::printf("DLSS: NVIDIA's library from %s\n", BbSysInfo::RedactHomePath(ngx.string()).c_str());
-    if (!impl->api->Configure(ngx.wstring().c_str(), data.wstring().c_str(), BridgeLog)) {
+    int32_t configured = 0;
+    if (impl->api->abi >= 2 && impl->api->ConfigureEx) {
+        std::vector<std::wstring> search_dirs;
+        for (const auto& candidate : {UserDlssDirectory(), ExecutableDirectory()}) {
+            std::error_code ec;
+            if (std::filesystem::is_directory(candidate, ec)) {
+                const auto w = candidate.wstring();
+                if (std::ranges::find(search_dirs, w) == search_dirs.end()) {
+                    search_dirs.push_back(w);
+                }
+            }
+        }
+        std::vector<const wchar_t*> ptrs;
+        ptrs.reserve(search_dirs.size());
+        for (const auto& d : search_dirs) {
+            ptrs.push_back(d.c_str());
+        }
+        configured = impl->api->ConfigureEx(ptrs.data(), static_cast<uint32_t>(ptrs.size()),
+                                            data.wstring().c_str(), BridgeLog);
+    } else {
+        configured = impl->api->Configure(ngx.wstring().c_str(), data.wstring().c_str(), BridgeLog);
+    }
+    if (!configured) {
         impl->Disable("bridge configuration failed");
     }
 }
@@ -283,6 +324,11 @@ void Dlss::Disable(std::string_view reason) {
 void Dlss::Initialize(vk::Instance instance, vk::PhysicalDevice physical, vk::Device device) {
     if (!impl->eligible || !impl->device_ready || impl->initialized) {
         impl->init_done.store(true, std::memory_order_release);
+        if (!impl->eligible || !impl->device_ready) {
+            BbSettings::ConfigureDlssgSupport(
+                false, 0,
+                impl->problem.empty() ? "DLSS-G requires NVIDIA RTX 40+ GPU" : impl->problem.c_str());
+        }
         return;
     }
     impl->initialized = true;
@@ -293,10 +339,29 @@ void Dlss::Initialize(vk::Instance instance, vk::PhysicalDevice physical, vk::De
                                 VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr)) {
             p->Disable("NVIDIA NGX initialization failed (update the GPU driver)");
             BbSettings::ConfigureDlssSupport(false, p->problem.c_str());
+            BbSettings::ConfigureDlssgSupport(false, 0, p->problem.c_str());
         } else {
             p->available = true;
             std::printf("DLSS: ready\n");
             BbSettings::ConfigureDlssSupport(true, "");
+            if (p->api->abi >= 2 && p->api->FgAvailable) {
+                uint32_t max_multi = 0;
+                if (p->api->FgAvailable(&max_multi)) {
+                    p->fg_available = true;
+                    p->fg_max_multi_frame = std::max(1u, max_multi);
+                    p->fg_problem.clear();
+                    std::printf("DLSS-G: ready (max %ux)\n", p->fg_max_multi_frame + 1u);
+                    BbSettings::ConfigureDlssgSupport(true, static_cast<int>(p->fg_max_multi_frame),
+                                                      "");
+                } else {
+                    p->fg_problem =
+                        "DLSS-G requires NVIDIA RTX 40+ GPU, driver support, and DLSS-G runtime";
+                    BbSettings::ConfigureDlssgSupport(false, 0, p->fg_problem.c_str());
+                }
+            } else {
+                p->fg_problem = "DLSS bridge ABI 1 does not support DLSS-G";
+                BbSettings::ConfigureDlssgSupport(false, 0, p->fg_problem.c_str());
+            }
         }
         p->init_done.store(true, std::memory_order_release);
     };
@@ -317,9 +382,24 @@ bool Dlss::Available() const {
     return impl->available;
 }
 
+bool Dlss::FgAvailable() const {
+    impl->WaitInit();
+    return impl->fg_available;
+}
+
+u32 Dlss::FgMaxMultiFrame() const {
+    impl->WaitInit();
+    return impl->fg_available ? impl->fg_max_multi_frame : 0u;
+}
+
 std::string Dlss::Problem() const {
     impl->WaitInit();
     return impl->problem;
+}
+
+std::string Dlss::FgProblem() const {
+    impl->WaitInit();
+    return impl->fg_problem;
 }
 
 bool Dlss::HasFeature(const FeatureDesc& desc) const {
@@ -362,18 +442,10 @@ bool Dlss::Evaluate(vk::CommandBuffer command, const Frame& frame) {
     if (!impl->available || !impl->feature) {
         return false;
     }
-    const auto image = [](const Resource& r) {
-        const vk::ImageSubresourceRange range{r.aspect, 0, 1, 0, 1};
-        return BbDlssImage{r.image,
-                           r.view,
-                           static_cast<VkImageSubresourceRange>(range),
-                           static_cast<VkFormat>(r.format),
-                           r.width,
-                           r.height};
-    };
-    const BbDlssEvaluate parameters{image(frame.color),  image(frame.depth), image(frame.motion),
-                                    image(frame.output), frame.jitter_x,     frame.jitter_y,
-                                    frame.reset ? 1 : 0, frame.frame_ms,     frame.sharpness};
+    const BbDlssEvaluate parameters{
+        ToDlssImage(frame.color),  ToDlssImage(frame.depth), ToDlssImage(frame.motion),
+        ToDlssImage(frame.output), frame.jitter_x,           frame.jitter_y,
+        frame.reset ? 1 : 0,       frame.frame_ms,           frame.sharpness};
     return impl->api->Evaluate(command, &parameters) != 0;
 }
 
@@ -381,6 +453,90 @@ void Dlss::ReleaseFeature() {
     impl->feature.reset();
     if (impl->api) {
         impl->api->ReleaseFeature();
+    }
+}
+
+bool Dlss::HasFgFeature(const FgFeatureDesc& desc) const {
+    return impl->fg_feature && *impl->fg_feature == desc;
+}
+
+bool Dlss::CreateFgFeature(vk::CommandBuffer command, const FgFeatureDesc& desc) {
+    impl->WaitInit();
+    if (!impl->fg_available || !impl->api || impl->api->abi < 2 || !impl->api->FgCreate) {
+        return false;
+    }
+    impl->fg_feature.reset();
+    const BbDlssFgFeature feature{desc.input_width,
+                                  desc.input_height,
+                                  desc.backbuffer_width,
+                                  desc.backbuffer_height,
+                                  static_cast<VkFormat>(desc.backbuffer_format),
+                                  desc.dynamic_resolution ? 1 : 0,
+                                  desc.depth_inverted ? 1 : 0,
+                                  desc.hdr ? 1 : 0};
+    if (!impl->api->FgCreate(command, &feature)) {
+        return false;
+    }
+    impl->fg_feature = desc;
+    std::printf("FrameGen: DLSS-G feature %ux%u (internal %ux%u, max %ux)\n", desc.backbuffer_width,
+                desc.backbuffer_height, desc.input_width, desc.input_height,
+                impl->fg_max_multi_frame + 1u);
+    return true;
+}
+
+bool Dlss::EvaluateFg(vk::CommandBuffer command, const FgFrame& frame) {
+    if (!impl->fg_available || !impl->fg_feature || !impl->api || impl->api->abi < 2 ||
+        !impl->api->FgEvaluate) {
+        return false;
+    }
+    BbDlssFgEvaluate parameters{};
+    parameters.backbuffer = ToDlssImage(frame.backbuffer);
+    parameters.depth = ToDlssImage(frame.depth);
+    parameters.motion = ToDlssImage(frame.motion);
+    if (frame.hudless.image) {
+        parameters.hudless = ToDlssImage(frame.hudless);
+    }
+    parameters.output = ToDlssImage(frame.output);
+    parameters.frame_id = frame.frame_id;
+    parameters.multi_frame_count = frame.multi_frame_count;
+    parameters.multi_frame_index = frame.multi_frame_index;
+    parameters.reset = frame.reset ? 1 : 0;
+    parameters.depth_inverted = frame.depth_inverted ? 1 : 0;
+    parameters.hdr = frame.hdr ? 1 : 0;
+    parameters.camera_motion_included = frame.camera_motion_included ? 1 : 0;
+    parameters.render_subrect_width = frame.render_subrect_width;
+    parameters.render_subrect_height = frame.render_subrect_height;
+    parameters.jitter_x = frame.jitter_x;
+    parameters.jitter_y = frame.jitter_y;
+    parameters.mv_scale_x = frame.mv_scale_x;
+    parameters.mv_scale_y = frame.mv_scale_y;
+    for (int i = 0; i < 3; ++i) {
+        parameters.camera_pos[i] = frame.camera_pos[i];
+        parameters.camera_up[i] = frame.camera_up[i];
+        parameters.camera_right[i] = frame.camera_right[i];
+        parameters.camera_fwd[i] = frame.camera_fwd[i];
+    }
+    parameters.camera_near = frame.camera_near;
+    parameters.camera_far = frame.camera_far;
+    parameters.camera_fov = frame.camera_fov;
+    parameters.camera_aspect = frame.camera_aspect;
+    std::memcpy(parameters.camera_view_to_clip, frame.camera_view_to_clip.data(),
+                sizeof(parameters.camera_view_to_clip));
+    std::memcpy(parameters.clip_to_camera_view, frame.clip_to_camera_view.data(),
+                sizeof(parameters.clip_to_camera_view));
+    std::memcpy(parameters.clip_to_prev_clip, frame.clip_to_prev_clip.data(),
+                sizeof(parameters.clip_to_prev_clip));
+    std::memcpy(parameters.prev_clip_to_clip, frame.prev_clip_to_clip.data(),
+                sizeof(parameters.prev_clip_to_clip));
+    std::memcpy(parameters.clip_to_lens_clip, frame.clip_to_lens_clip.data(),
+                sizeof(parameters.clip_to_lens_clip));
+    return impl->api->FgEvaluate(command, &parameters) != 0;
+}
+
+void Dlss::ReleaseFgFeature() {
+    impl->fg_feature.reset();
+    if (impl->api && impl->api->abi >= 2 && impl->api->FgRelease) {
+        impl->api->FgRelease();
     }
 }
 
@@ -392,7 +548,10 @@ void Dlss::Shutdown() {
         }
     }
     impl->available = false;
+    impl->fg_available = false;
+    impl->fg_max_multi_frame = 0;
     impl->feature.reset();
+    impl->fg_feature.reset();
     if (impl->api && impl->initialized) {
         impl->api->Shutdown();
         impl->initialized = false;
@@ -418,7 +577,16 @@ bool Dlss::EligibleForBoot() const noexcept {
 bool Dlss::Available() const {
     return false;
 }
+bool Dlss::FgAvailable() const {
+    return false;
+}
+u32 Dlss::FgMaxMultiFrame() const {
+    return 0;
+}
 std::string Dlss::Problem() const {
+    return {};
+}
+std::string Dlss::FgProblem() const {
     return {};
 }
 bool Dlss::HasFeature(const FeatureDesc&) const {
@@ -431,6 +599,16 @@ bool Dlss::Evaluate(vk::CommandBuffer, const Frame&) {
     return false;
 }
 void Dlss::ReleaseFeature() {}
+bool Dlss::HasFgFeature(const FgFeatureDesc&) const {
+    return false;
+}
+bool Dlss::CreateFgFeature(vk::CommandBuffer, const FgFeatureDesc&) {
+    return false;
+}
+bool Dlss::EvaluateFg(vk::CommandBuffer, const FgFrame&) {
+    return false;
+}
+void Dlss::ReleaseFgFeature() {}
 
 #endif
 

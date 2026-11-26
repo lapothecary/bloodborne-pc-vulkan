@@ -305,15 +305,20 @@ def main() -> None:
     if not built_bridge.is_file():
         built_bridge = dlss_build_dir / "bbport_dlss.dll"
     ngx_dll = dlss_sdk_dir / "lib" / "Windows_x86_64" / "rel" / "nvngx_dlss.dll"
-    if not built_bridge.is_file() or not ngx_dll.is_file():
-        emit_error(f"Missing DLSS files: bridge={built_bridge.is_file()}, nvngx_dlss={ngx_dll.is_file()}")
+    ngx_dlssg_dll = dlss_sdk_dir / "lib" / "Windows_x86_64" / "rel" / "nvngx_dlssg.dll"
+    if not built_bridge.is_file() or not ngx_dll.is_file() or not ngx_dlssg_dll.is_file():
+        emit_error(
+            f"Missing DLSS files: bridge={built_bridge.is_file()}, "
+            f"nvngx_dlss={ngx_dll.is_file()}, nvngx_dlssg={ngx_dlssg_dll.is_file()}"
+        )
         sys.exit(1)
     shutil.copy2(built_bridge, stage / "bin" / "bbport_dlss.dll")
     shutil.copy2(ngx_dll, stage / "bin" / "nvngx_dlss.dll")
+    shutil.copy2(ngx_dlssg_dll, stage / "bin" / "nvngx_dlssg.dll")
     dlss_lic = dlss_sdk_dir / "LICENSE.txt"
     if dlss_lic.is_file():
         shutil.copy2(dlss_lic, stage / "NVIDIA-DLSS-LICENSE.txt")
-    print("=== Bundled NVIDIA DLSS 4.5 / DLAA 4 Bridge: bin/bbport_dlss.dll + bin/nvngx_dlss.dll ===", flush=True)
+    print("=== Bundled NVIDIA DLSS 4.5 / DLSS-G Bridge: bin/bbport_dlss.dll + bin/nvngx_dlss.dll + bin/nvngx_dlssg.dll ===", flush=True)
 
     # 5. Write .bbport-version.json, create zip archive + sha256 + windows-manifest.json
     sys.path.insert(0, str(root / "launcher"))

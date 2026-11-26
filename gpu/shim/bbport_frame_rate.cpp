@@ -16,11 +16,15 @@
 // in 30 FPS frames. Durations the game converts from 30 FPS frames into seconds stay as they are:
 // what counts them down uses the real time.
 #include "common/types.h"
+#include "bbport_cloth_interp.h"
 #include "bbport_fast_load.h"
 #include "bbport_frame_rate.h"
 #include "bbport_guest_code.h"
 #include "bbport_sections.h"
+#include "bbport_settings.h"
 #include "bbport_toggles.h"
+#include "cloth_exp/cloth_exp_registry.h"
+#include "vulkan/low_latency.h"
 
 #include <array>
 #include <cerrno>
@@ -92,18 +96,25 @@ struct alignas(64) Live {
     float model_turn = 0.0f;          ///< the model preview's turn per 30 FPS frame (radians per stick unit)
     float dt_half = Frame30 * 0.5f;   ///< 1/60 s at 30 FPS (0.5 * dt), used by foliage wave timers (0x2313870)
     alignas(16) float cloth_friction_scale[4] = {1.0f, 1.0f, 1.0f, 1.0f}; ///< dt-adapted cloth collision friction scale
-    std::uint32_t cloth_wind_seed30 = 0; ///< 30 Hz quantized XorShift seed for DirWind/PointWind turbulence
+    std::uint32_t cloth_wind_seed30 = 0; ///< 30 Hz quantized XorShift seed (t0) for smooth wind turbulence
+    std::uint32_t cloth_wind_seed1 = 10000; ///< next 30 Hz quantized XorShift seed (t1)
+    float cloth_wind_smooth = 0.0f; ///< cubic smoothstep blend [0..1] for output wind vectors & turbulence
+    float cloth_pbd_neg_rate = 0.0f; ///< high-FPS PBD micro-jitter damping rate (-s^-1; 0 at 30 FPS)
+    float cloth_frames = 1.0f; ///< clamped cdt * 30.0f synchronized with hclWorld::step
 };
 static_assert(offsetof(Live, cloth_friction_scale) % 16 == 0,
               "cloth_friction_scale must be 16-byte aligned for vmulps");
 Live* live = nullptr;
 bool cloth_world_synced = false;
 bool cloth_fixed30_hooked = false;
+bool cloth_dir_wind_hooked = false;
 double cloth_sim_time_s = 0.0;
 double cloth_fixed_accum = 0.0;
+std::uint32_t cloth_steady_30_streak = 0;
 std::uint64_t cloth_fixed_step_seq = 0;
 std::atomic<bool> cloth_step_this_frame{true};
 std::atomic<float> cloth_interp_alpha{1.0f};
+std::atomic<float> cloth_step_beta{1.0f};
 std::atomic<float> cloth_step_dt{Frame30};
 std::atomic<std::uint64_t> cloth_world_frame_seq{0};
 std::atomic<float> current_frames_per_30{1.0f};
@@ -111,6 +122,66 @@ std::atomic<u64> sim_frame_seq{0};
 float model_turn_base = 0.0f;         ///< the game's own model_turn (its constant, read at start)
 /// The game's exponent of Havok's stiffness adaptation (0x48d7bbc: -1.725), read at start.
 float cloth_exponent = -1.725f;
+
+bool ClothFixEnabled() noexcept {
+    static const bool enabled = [] {
+        const char* env = std::getenv("BB_CLOTH_FIX");
+        return !(env && env[0] == '0' && env[1] == '\0');
+    }();
+    return enabled;
+}
+
+bool ClothWindSeedEnabled() noexcept {
+    static const bool enabled = [] {
+        const char* env = std::getenv("BB_CLOTH_SEED");
+        return !(env && env[0] == '0' && env[1] == '\0');
+    }();
+    return enabled;
+}
+
+float ClothExpOverride() noexcept {
+    static const float v = [] {
+        const char* env = std::getenv("BB_CLOTH_STIFF_EXP");
+        if (!env || !*env) {
+            env = std::getenv("BB_CLOTH_EXP");
+            // Ignore boolean "0" / "1" used by BbClothExp::PatchImage startup toggle.
+            if (env && (env[0] == '0' || env[0] == '1') && env[1] == '\0') {
+                return -1.0f;
+            }
+        }
+        const float parsed = (env && *env) ? std::strtof(env, nullptr) : -1.0f;
+        return (parsed > 0.0f && parsed <= 3.0f) ? parsed : -1.0f;
+    }();
+    return v;
+}
+
+float ClothDampRetention30() noexcept {
+    static const float v = [] {
+        const char* env = std::getenv("BB_CLOTH_DAMP");
+        const float parsed = (env && *env) ? std::strtof(env, nullptr) : 0.94f;
+        return (parsed >= 0.5f && parsed <= 1.0f) ? parsed : 0.94f;
+    }();
+    return v;
+}
+
+bool ClothWindOffEnabled() noexcept {
+    static const bool enabled = [] {
+        const char* env = std::getenv("BB_CLOTH_WIND_OFF");
+        return env && env[0] == '1' && env[1] == '\0';
+    }();
+    return enabled;
+}
+
+std::uint32_t ClothSkipMask() noexcept {
+    static const std::uint32_t mask = [] {
+        const char* env = std::getenv("BB_CLOTH_SKIP_T");
+        if (!env || !*env) return 0u;
+        return static_cast<std::uint32_t>(std::strtoul(env, nullptr, 0));
+    }();
+    return mask;
+}
+
+void UpdateClothNativeTiming(float cdt, bool update_t5_pulse) noexcept;
 int base_rate = 0;               /// the launched mode's rate (0 = truly uncapped)
 std::atomic<int> live_limit{0};
 std::atomic<u64> pacer_epoch{1};
@@ -219,6 +290,29 @@ void SleepUntilDeadlineImpl(u64 entry_ns, u64 deadline_ns, int timer_slot) noexc
     }
 }
 
+u64 ComputeFgSimPeriodNs(u64 raw_period_ns) noexcept {
+    if (raw_period_ns == 0ull) {
+        return 0ull;
+    }
+    const auto& s = BbSettings::Get();
+    const bool is_auto = s.fps_limit_auto.load(std::memory_order_relaxed);
+    const int mon_hz = BbSettings::MonitorRefreshHz();
+    const int cur_limit = s.fps_limit.load(std::memory_order_relaxed);
+    // When FPS Limit is Auto (e.g. Auto 170 Hz) or set at/above monitor Hz, halve base simulation
+    // so 2x FG outputs exact monitor Hz (85 -> 170 FPS) with zero wasted GPU frames.
+    // When the user explicitly selects a lower limit (e.g. 60 or 85 on a 170 Hz monitor), treat
+    // it as base FPS so 60 -> 120 FPS FG instead of unexpectedly dropping simulation to 30 FPS.
+    if (is_auto || (mon_hz >= 60 && cur_limit >= mon_hz)) {
+        constexpr u64 kMinSimRatePeriodNs = 33'333'333ull;
+        const u64 mult = static_cast<u64>(
+            std::clamp(BbStats::fg_multiplier.load(std::memory_order_relaxed), 1, 4));
+        if (raw_period_ns < kMinSimRatePeriodNs) {
+            return std::min<u64>(raw_period_ns * mult, kMinSimRatePeriodNs);
+        }
+    }
+    return raw_period_ns;
+}
+
 u64 PS4_SYSV_ABI PacerWait(u64 pacer, std::uint32_t reset_flag) {
 #ifdef __linux__
     static bool timerslack_set = false;
@@ -285,10 +379,14 @@ u64 PS4_SYSV_ABI PacerWait(u64 pacer, std::uint32_t reset_flag) {
         const u64 cur_pres_w = BbStats::swapchain_present_wait_ns.load(std::memory_order_relaxed);
 
         const float cap_s = live ? live->shortest : 0.0f;
-        const u64 cap_period_ns =
+        const u64 raw_cap_period_ns =
             (cap_s > 0.0f && std::isfinite(cap_s))
                 ? static_cast<u64>(std::llround(double(cap_s) * 1'000'000'000.0))
                 : 0ull;
+        const u64 cap_period_ns =
+            (raw_cap_period_ns > 0ull && BbStats::fg_active.load(std::memory_order_relaxed))
+                ? ComputeFgSimPeriodNs(raw_cap_period_ns)
+                : raw_cap_period_ns;
         const u64 min_hitch_ns =
             (cap_period_ns > 0 && cap_period_ns <= 8'500'000ull)
                 ? std::max<u64>(9'000'000ull, (cap_period_ns * 3ull) / 2ull)
@@ -444,15 +542,26 @@ u64 PS4_SYSV_ABI PacerWait(u64 pacer, std::uint32_t reset_flag) {
         // during active .dcx loading screens instead of sleeping 11.7..16.6 ms per step.
         constexpr u64 kFastLoadPeriodNs = 2'000'000ull;
         period_ns = (period_ns == 0ull) ? kFastLoadPeriodNs : std::min<u64>(period_ns, kFastLoadPeriodNs);
+    } else if (period_ns > 0ull && BbStats::fg_active.load(std::memory_order_relaxed)) {
+        period_ns = ComputeFgSimPeriodNs(period_ns);
     }
     const u8 reset_273 = *reinterpret_cast<const u8*>(pacer + 0x273);
     const u64 epoch = pacer_epoch.load(std::memory_order_relaxed);
     bool did_wait = false;
 
+    // Close the previous simulation frame and perform driver-paced Low Latency sleep (NVIDIA
+    // Reflex / AMD Anti-Lag 2) before our monotonic FPS-cap pacer. When GPU-bound or VSync-bound,
+    // the driver sleeps just-in-time before GPU completion (cutting 1-2 queued frames); when
+    // under-loaded at a cap, Reflex returns immediately (~10 us) and SleepUntilDeadlineImpl keeps
+    // sub-0.15 ms jitter untouched. Skipped during 500 Hz Fast Load bursts.
+    Vulkan::LowLatency::EndSimulationFrame();
+    const bool ll_slept = Vulkan::LowLatency::Sleep(loading_burst);
+    const u64 pace_now_ns = ll_slept ? MonotonicNs() : entry_ns;
+
     if (period_ns == 0 || reset_flag != 0 || reset_273 != 0 || pacer_prev_exit_ns == 0) {
         pacer_seen_epoch = epoch;
         pacer_last_period_ns = period_ns;
-        pacer_next_deadline_ns = entry_ns;
+        pacer_next_deadline_ns = pace_now_ns;
         pacer_miss_streak = 0;
     } else {
         if (epoch != pacer_seen_epoch || period_ns != pacer_last_period_ns) {
@@ -466,32 +575,32 @@ u64 PS4_SYSV_ABI PacerWait(u64 pacer, std::uint32_t reset_flag) {
         // timer jitter recovers smoothly without creating 2.2 ms rubberband micro-frames after a
         // 9..10 ms hitch.
         const u64 max_debt_ns = std::min<u64>(period_ns / 8ull, 500'000ull);
-        if (entry_ns > pacer_next_deadline_ns + max_debt_ns) {
-            pacer_next_deadline_ns = entry_ns;
+        if (pace_now_ns > pacer_next_deadline_ns + max_debt_ns) {
+            pacer_next_deadline_ns = pace_now_ns;
         }
-        if (entry_ns < pacer_next_deadline_ns) {
+        if (pace_now_ns < pacer_next_deadline_ns) {
             did_wait = true;
             pacer_miss_streak = 0;
-            SleepUntilDeadlineImpl(entry_ns, pacer_next_deadline_ns, 0);
+            SleepUntilDeadlineImpl(pace_now_ns, pacer_next_deadline_ns, 0);
         } else if (pacer_miss_streak < 100u) {
             ++pacer_miss_streak;
         }
     }
 
-    const u64 exit_ns = did_wait ? MonotonicNs() : entry_ns;
+    const u64 exit_ns = did_wait ? MonotonicNs() : pace_now_ns;
     if (pacer_prev_exit_ns != 0 && exit_ns >= pacer_prev_exit_ns) {
         BbStats::last_main_frame_dt_ns.store(exit_ns - pacer_prev_exit_ns,
                                              std::memory_order_relaxed);
     }
-    const u64 exit_tsc = did_wait ? __rdtsc() : entry_tsc;
+    const u64 exit_tsc = (did_wait || ll_slept) ? __rdtsc() : entry_tsc;
     bool have_exit_cpu = have_entry_cpu;
-    const u64 exit_cpu_ns = did_wait ? ThreadCpuNs(have_exit_cpu) : entry_cpu_ns;
+    const u64 exit_cpu_ns = (did_wait || ll_slept) ? ThreadCpuNs(have_exit_cpu) : entry_cpu_ns;
     const u64 sleep_ns = exit_ns > entry_ns ? (exit_ns - entry_ns) : 0ull;
     if (did_wait && exit_ns > pacer_next_deadline_ns + 500'000ull) {
         const u64 over_ns = exit_ns - pacer_next_deadline_ns;
         if (!loading_burst && frame_draws >= 100 && over_ns >= 2'500'000ull) [[unlikely]] {
             const u64 target_sleep_ns =
-                pacer_next_deadline_ns > entry_ns ? (pacer_next_deadline_ns - entry_ns) : 0ull;
+                pacer_next_deadline_ns > pace_now_ns ? (pacer_next_deadline_ns - pace_now_ns) : 0ull;
             BbStats::LogHitch(
                 "[BB-HITCH][PACER_SLEEP] frame=%u target=%.2f ms actual=%.2f ms over=+%.2f ms "
                 "(draws=%llu)\n",
@@ -514,6 +623,7 @@ u64 PS4_SYSV_ABI PacerWait(u64 pacer, std::uint32_t reset_flag) {
     pacer_prev_exit_ns = exit_ns;
     pacer_prev_exit_cpu_ns = have_exit_cpu ? exit_cpu_ns : 0ull;
     pacer_prev_exit_tsc = exit_tsc;
+    Vulkan::LowLatency::BeginSimulationFrame();
     return cur_us;
 }
 
@@ -534,6 +644,9 @@ void PS4_SYSV_ABI FrameStep(u64 pacer) {
     const float min_dt = pacer_wait_hooked ? MinSimDt : std::max(live->shortest, MinSimDt);
     float dt = std::clamp(std::isfinite(measured) ? measured : Frame30, min_dt, Frame30);
     if (!pacer_wait_hooked) {
+        Vulkan::LowLatency::EndSimulationFrame();
+        Vulkan::LowLatency::Sleep(false);
+        Vulkan::LowLatency::BeginSimulationFrame();
         bool have_cpu_ns = false;
         const u64 cur_cpu_ns = ThreadCpuNs(have_cpu_ns);
         if (have_cpu_ns) {
@@ -575,7 +688,14 @@ void PS4_SYSV_ABI FrameStep(u64 pacer) {
             static u64 dt_stab_epoch = 0;
             static float dt_stab_target = 0.0f;
             const u64 cur_ep = pacer_epoch.load(std::memory_order_relaxed);
-            const float target_f = live->shortest;
+            const u64 raw_ns = static_cast<u64>(
+                std::llround(double(live->shortest) * 1'000'000'000.0));
+            const u64 sim_ns =
+                (raw_ns > 0ull && BbStats::fg_active.load(std::memory_order_relaxed))
+                    ? ComputeFgSimPeriodNs(raw_ns)
+                    : raw_ns;
+            const float target_f =
+                sim_ns > 0ull ? static_cast<float>(double(sim_ns) * 1e-9) : live->shortest;
             const double target_d = double(target_f);
             if (cur_ep == dt_stab_epoch && target_f == dt_stab_target &&
                 pacer_miss_streak < 2u &&
@@ -644,26 +764,7 @@ void PS4_SYSV_ABI FrameStep(u64 pacer) {
     // dt right after waitForStepComplete() (0x76a030), preventing worker-thread races and up to
     // 9x out-of-phase stiffness pumping on variable high-FPS frames.
     if (!cloth_world_synced) {
-        static const bool fix_on = [] {
-            const char* env = std::getenv("BB_CLOTH_FIX");
-            return !(env && env[0] == '0' && env[1] == '\0');
-        }();
-        static const float cloth_exp_override = [] {
-            const char* env = std::getenv("BB_CLOTH_EXP");
-            const float v = env && *env ? std::strtof(env, nullptr) : -1.0f;
-            return (v > 0.0f && v <= 3.0f) ? v : -1.0f;
-        }();
-        const double cloth_exp =
-            cloth_exp_override > 0.0f ? double(cloth_exp_override)
-                                      : (fix_on ? 2.0 : double(-cloth_exponent));
-        live->cloth_stiffness_scale = static_cast<float>(std::pow(frames_d, cloth_exp));
-        constexpr double kClothFrictionRef = 0.35;
-        const float friction_scale = static_cast<float>(
-            (-std::expm1(frames_d * std::log(1.0 - kClothFrictionRef))) / kClothFrictionRef);
-        for (float& s : live->cloth_friction_scale) s = friction_scale;
-        cloth_sim_time_s += double(dt);
-        const std::uint64_t tick30 = static_cast<std::uint64_t>(cloth_sim_time_s * 30.0);
-        live->cloth_wind_seed30 = static_cast<std::uint32_t>((tick30 * 10000ull) % 1000000ull);
+        UpdateClothNativeTiming(dt, false);
     }
     MaybePrintClothTrace(dt);
 }
@@ -677,7 +778,19 @@ bool ClothTraceEnabled() noexcept {
     return enabled;
 }
 
+struct ClothLayerTrace {
+    std::atomic<const u8*> sim{nullptr};
+    std::atomic<int> n{0};
+    std::atomic<int> sub{0};
+    std::atomic<float> gdamp{0.0f};
+    std::atomic<float> edamp{0.0f};
+    std::atomic<float> fvel{0.0f};
+    std::atomic<int> ovr{0};
+};
+
 struct ClothTraceState {
+    static constexpr int kMaxLayers = 6;
+    static constexpr int kNumStages = 8; // 0=Int, 1..5=T1..T5, 6=Col, 7=Frc(pure ext force)
     std::atomic<u64> last_print_ns{0};
     std::atomic<std::uint32_t> sim_frames{0};
     std::atomic<std::uint32_t> world_step_calls{0};
@@ -708,10 +821,16 @@ struct ClothTraceState {
     std::atomic<float> dir_wind_max{0.0f};
     std::atomic<float> dir_wind_phase{0.0f};
     std::atomic<float> dir_wind_sfreq{0.0f};
+    std::atomic<float> dir_wind_drag{0.0f};
+    std::atomic<std::uint64_t> wind_spd_sum_mm_s{0};
+    std::atomic<std::uint64_t> wind_spd_samples{0};
+    std::atomic<std::uint64_t> wind_acc_sum_mm_s2{0};
+    std::atomic<std::uint64_t> wind_dv01_sum_mm_s{0};
+    std::atomic<std::uint64_t> wind_dv01_samples{0};
     std::atomic<std::uint32_t> simple_wind_calls{0};
     std::atomic<std::uint32_t> stiff_calls{0};
     std::atomic<std::uint32_t> stiff_type_mask{0};
-    std::atomic<std::uint32_t> stiff_type_counts[16]{};
+    std::atomic<std::uint32_t> stiff_type_counts[24]{};
     std::atomic<int> stiff_last_mode{0};
     std::atomic<int> stiff_last_substeps{0};
     std::atomic<float> t5_stiff_min{999.0f};
@@ -720,9 +839,27 @@ struct ClothTraceState {
     std::atomic<std::uint32_t> t5_sphere_calls{0};
     std::atomic<std::uint64_t> vel_samples{0};
     std::atomic<std::uint64_t> vel_sum_mm_s{0};
+    std::atomic<std::uint32_t> vel_max_mm_s{0};
+    std::atomic<std::uint64_t> pin_vel_samples{0};
+    std::atomic<std::uint64_t> pin_vel_sum_mm_s{0};
+    std::atomic<std::uint32_t> pin_step_max_um{0};
+    std::atomic<std::uint32_t> pin_reversals{0};
+    std::atomic<std::uint32_t> pin_rev_frames{0};
+    std::atomic<std::uint32_t> xfer_calls{0};
+    std::atomic<std::uint64_t> xfer_um_sum{0};
+    std::atomic<std::uint32_t> xfer_max_um{0};
     std::atomic<std::uint32_t> vel_max_particles{0};
     std::atomic<std::uint32_t> vel_reversals{0};
     std::atomic<std::uint32_t> vel_rev_frames{0};
+    std::atomic<std::uint32_t> prestep_override_calls{0};
+    std::atomic<std::uint32_t> prestep_rescale_calls{0};
+    std::atomic<float> prestep_ratio_min{999.0f};
+    std::atomic<float> prestep_ratio_max{0.0f};
+    std::atomic<std::uint32_t> stage_calls[kNumStages]{};
+    std::atomic<std::uint64_t> stage_um_sum[kNumStages]{};
+    std::atomic<std::uint64_t> stage_vel_mm_s_sum[kNumStages]{};
+    std::atomic<std::uint32_t> stage_max_um[kNumStages]{};
+    ClothLayerTrace layers[kMaxLayers]{};
     std::atomic<std::uint32_t> f30_steps{0};
     std::atomic<std::uint32_t> f30_skips{0};
     std::atomic<std::uint32_t> f30_resets{0};
@@ -733,6 +870,62 @@ ClothTraceState cloth_trace;
 std::atomic<std::uint32_t> cloth_tick30_seq{0};
 std::atomic<std::uint32_t> cloth_t5_last_tick30{0};
 std::atomic<bool> cloth_t5_pulse_active{true};
+
+void TraceUpdateAtomicMaxU32(std::atomic<std::uint32_t>& dst, std::uint32_t val) noexcept {
+    std::uint32_t cur = dst.load(std::memory_order_relaxed);
+    while (val > cur && !dst.compare_exchange_weak(cur, val, std::memory_order_relaxed)) {
+    }
+}
+
+int TraceSnapshotFreeParticles(const u8* sim, float* pre_xyz, int max_n) noexcept {
+    if (!sim || !pre_xyz || max_n <= 0) return 0;
+    const float* cur = *reinterpret_cast<const float* const*>(sim + 0x18);
+    const std::int32_t n = *reinterpret_cast<const std::int32_t*>(sim + 0x20);
+    if (!cur || n <= 0 || n > 4096) return 0;
+    const int m = std::min<int>(n, max_n);
+    for (int i = 0; i < m; ++i) {
+        pre_xyz[i * 3 + 0] = cur[i * 4 + 0];
+        pre_xyz[i * 3 + 1] = cur[i * 4 + 1];
+        pre_xyz[i * 3 + 2] = cur[i * 4 + 2];
+    }
+    return m;
+}
+
+void TraceRecordStageDelta(int stage, const u8* sim, const float* pre_xyz, int snap_n, float sdt) noexcept {
+    if (stage < 0 || stage >= ClothTraceState::kNumStages || !sim || !pre_xyz || snap_n <= 0) return;
+    const u8* sim_data = *reinterpret_cast<const u8* const*>(sim + 0x10);
+    const float* cur = *reinterpret_cast<const float* const*>(sim + 0x18);
+    if (!sim_data || !cur) return;
+    const float* pdatas = *reinterpret_cast<const float* const*>(sim_data + 0x38);
+    const std::int32_t n_pdatas = *reinterpret_cast<const std::int32_t*>(sim_data + 0x40);
+    if (!pdatas || n_pdatas < snap_n) return;
+    const float safe_sdt = (sdt > 1e-5f && sdt < 0.2f && std::isfinite(sdt)) ? sdt : (1.0f / 30.0f);
+    double sum_m = 0.0;
+    double max_m = 0.0;
+    int free_cnt = 0;
+    for (int i = 0; i < snap_n; ++i) {
+        if (!(pdatas[i * 4 + 1] > 0.0f)) continue;
+        const float dx = cur[i * 4 + 0] - pre_xyz[i * 3 + 0];
+        const float dy = cur[i * 4 + 1] - pre_xyz[i * 3 + 1];
+        const float dz = cur[i * 4 + 2] - pre_xyz[i * 3 + 2];
+        const double d = std::sqrt(double(dx) * double(dx) + double(dy) * double(dy) + double(dz) * double(dz));
+        if (std::isfinite(d) && d < 2.0) {
+            sum_m += d;
+            if (d > max_m) max_m = d;
+            ++free_cnt;
+        }
+    }
+    if (free_cnt > 0) {
+        const double avg_m = sum_m / double(free_cnt);
+        cloth_trace.stage_calls[stage].fetch_add(1u, std::memory_order_relaxed);
+        cloth_trace.stage_um_sum[stage].fetch_add(
+            static_cast<std::uint64_t>(avg_m * 1'000'000.0), std::memory_order_relaxed);
+        cloth_trace.stage_vel_mm_s_sum[stage].fetch_add(
+            static_cast<std::uint64_t>((avg_m / double(safe_sdt)) * 1000.0), std::memory_order_relaxed);
+        TraceUpdateAtomicMaxU32(cloth_trace.stage_max_um[stage],
+                                static_cast<std::uint32_t>(std::min(max_m * 1'000'000.0, 999999.0)));
+    }
+}
 
 void PS4_SYSV_ABI ProbeWorldStep(const void* /*self*/, float dt) noexcept {
     cloth_trace.world_step_calls.fetch_add(1u, std::memory_order_relaxed);
@@ -748,66 +941,180 @@ void PS4_SYSV_ABI ProbeSimOp(const u8* op, const u8* ctx, float dt) noexcept {
         if (arr && idx >= 0 && idx < 64) {
             const u8* sim = arr[idx];
             if (sim) {
+                const float eff_damp = *reinterpret_cast<const float*>(sim + 0x10c);
+                using GetSimCfgFn = const u8*(PS4_SYSV_ABI*)(const u8*);
+                const auto get_sim_cfg = reinterpret_cast<GetSimCfgFn>(image_base + 0x748c50);
+                const u8* sim_cfg = get_sim_cfg(sim);
+                std::int32_t substeps = sim_cfg ? *reinterpret_cast<const std::int32_t*>(sim_cfg + 0x18) : 0;
+                if (substeps <= 0) {
+                    substeps = *reinterpret_cast<const std::int32_t*>(op + 0x20);
+                }
+                const float gdamp = sim_cfg ? *reinterpret_cast<const float*>(sim_cfg + 0x10) : 0.0f;
+                const int has_ovr = (*reinterpret_cast<const void* const*>(sim + 0x1d8) != nullptr) ? 1 : 0;
+
                 cloth_trace.sim_op_slowmo.store(
                     *reinterpret_cast<const float*>(sim + 0x1d0), std::memory_order_relaxed);
                 cloth_trace.sim_op_actions.store(
                     *reinterpret_cast<const std::int32_t*>(sim + 0x170), std::memory_order_relaxed);
-                cloth_trace.sim_op_eff_damp.store(
-                    *reinterpret_cast<const float*>(sim + 0x10c), std::memory_order_relaxed);
-                cloth_trace.sim_op_substeps.store(
-                    *reinterpret_cast<const std::int32_t*>(op + 0x20), std::memory_order_relaxed);
+                cloth_trace.sim_op_eff_damp.store(eff_damp, std::memory_order_relaxed);
+                cloth_trace.sim_op_substeps.store(substeps, std::memory_order_relaxed);
 
-                // Measure real particle speed (mm/s) and velocity sign reversals on cloth meshes
+                // Measure FREE-particle-only (invMass > 0) vs PINNED velocity (mm/s) and reversals
+                const u8* sim_data = *reinterpret_cast<const u8* const*>(sim + 0x10);
+                const float* pdatas =
+                    sim_data ? *reinterpret_cast<const float* const*>(sim_data + 0x38) : nullptr;
+                const std::int32_t n_pdatas =
+                    sim_data ? *reinterpret_cast<const std::int32_t*>(sim_data + 0x40) : 0;
                 const float* cur = *reinterpret_cast<const float* const*>(sim + 0x18);
                 const float* prv = *reinterpret_cast<const float* const*>(sim + 0x28);
                 const std::int32_t n = *reinterpret_cast<const std::int32_t*>(sim + 0x20);
                 const float prev_sdt = *reinterpret_cast<const float*>(sim + 0x108);
-                if (cur && prv && n >= 16 && n <= 4096 && prev_sdt > 1e-5f && prev_sdt < 0.1f) {
+                if (cur && prv && pdatas && n_pdatas >= n && n >= 8 && n <= 4096 && prev_sdt > 1e-5f &&
+                    prev_sdt < 0.1f) {
                     const float inv_dt = 1.0f / prev_sdt;
-                    double speed_sum = 0.0;
-                    int active_n = 0;
+                    double free_speed_sum = 0.0;
+                    double free_speed_max = 0.0;
+                    int free_n = 0;
+                    int probe_free_idx = -1;
                     for (int i = 0; i < n; ++i) {
                         const float dx = cur[i * 4 + 0] - prv[i * 4 + 0];
                         const float dy = cur[i * 4 + 1] - prv[i * 4 + 1];
                         const float dz = cur[i * 4 + 2] - prv[i * 4 + 2];
                         const float d2 = dx * dx + dy * dy + dz * dz;
-                        if (d2 > 1e-12f && d2 < 4.0f) {
-                            speed_sum += std::sqrt(double(d2)) * double(inv_dt);
-                            ++active_n;
+                        if (pdatas[i * 4 + 1] > 0.0f) {
+                            probe_free_idx = i;
+                            if (d2 >= 0.0f && d2 < 4.0f) {
+                                const double spd = std::sqrt(double(d2)) * double(inv_dt);
+                                free_speed_sum += spd;
+                                if (spd > free_speed_max) free_speed_max = spd;
+                                ++free_n;
+                            }
                         }
                     }
-                    if (active_n > 0) {
-                        const double avg_mm_s = (speed_sum / double(active_n)) * 1000.0;
+                    if (free_n > 0) {
+                        const double avg_m_s = free_speed_sum / double(free_n);
                         cloth_trace.vel_sum_mm_s.fetch_add(
-                            static_cast<std::uint64_t>(avg_mm_s), std::memory_order_relaxed);
+                            static_cast<std::uint64_t>(avg_m_s * 1000.0), std::memory_order_relaxed);
                         cloth_trace.vel_samples.fetch_add(1u, std::memory_order_relaxed);
-                        std::uint32_t prev_max = cloth_trace.vel_max_particles.load(std::memory_order_relaxed);
-                        if (static_cast<std::uint32_t>(n) > prev_max) {
-                            cloth_trace.vel_max_particles.store(static_cast<std::uint32_t>(n),
-                                                                std::memory_order_relaxed);
+                        TraceUpdateAtomicMaxU32(
+                            cloth_trace.vel_max_mm_s,
+                            static_cast<std::uint32_t>(std::min(free_speed_max * 1000.0, 999999.0)));
+                        TraceUpdateAtomicMaxU32(cloth_trace.vel_max_particles,
+                                                static_cast<std::uint32_t>(n));
+
+                        // Per-layer lock-free table (up to 6 active cloths)
+                        for (int li = 0; li < ClothTraceState::kMaxLayers; ++li) {
+                            const u8* slot = cloth_trace.layers[li].sim.load(std::memory_order_relaxed);
+                            if (slot == sim) {
+                                cloth_trace.layers[li].n.store(n, std::memory_order_relaxed);
+                                cloth_trace.layers[li].sub.store(substeps, std::memory_order_relaxed);
+                                cloth_trace.layers[li].gdamp.store(gdamp, std::memory_order_relaxed);
+                                cloth_trace.layers[li].edamp.store(eff_damp, std::memory_order_relaxed);
+                                cloth_trace.layers[li].fvel.store(static_cast<float>(avg_m_s),
+                                                                  std::memory_order_relaxed);
+                                cloth_trace.layers[li].ovr.store(has_ovr, std::memory_order_relaxed);
+                                break;
+                            }
+                            if (slot == nullptr) {
+                                const u8* expected = nullptr;
+                                if (cloth_trace.layers[li].sim.compare_exchange_strong(
+                                        expected, sim, std::memory_order_relaxed)) {
+                                    cloth_trace.layers[li].n.store(n, std::memory_order_relaxed);
+                                    cloth_trace.layers[li].sub.store(substeps, std::memory_order_relaxed);
+                                    cloth_trace.layers[li].gdamp.store(gdamp, std::memory_order_relaxed);
+                                    cloth_trace.layers[li].edamp.store(eff_damp, std::memory_order_relaxed);
+                                    cloth_trace.layers[li].fvel.store(static_cast<float>(avg_m_s),
+                                                                      std::memory_order_relaxed);
+                                    cloth_trace.layers[li].ovr.store(has_ovr, std::memory_order_relaxed);
+                                    break;
+                                }
+                            }
                         }
-                        // Track velocity-direction reversals on the largest cloth (Hunter coat/cape)
+
+                        // Track velocity reversals on the highest-index FREE particle AND real frame-to-frame
+                        // motion of PINNED (skeleton-driven!) particles on the largest cloth (Hunter coat/cape)
                         static std::atomic<const u8*> tracked_sim{nullptr};
                         static std::atomic<int> tracked_n{0};
                         static std::atomic<float> prev_vx{0.0f}, prev_vy{0.0f}, prev_vz{0.0f};
+                        static std::mutex pin_trace_mtx;
+                        static const u8* pin_prev_sim = nullptr;
+                        static int pin_prev_n = 0;
+                        static float pin_prev_xyz[512 * 3]{};
+                        static float pin_prev_v[3] = {0.0f, 0.0f, 0.0f};
                         const int cur_tn = tracked_n.load(std::memory_order_relaxed);
                         if (n > cur_tn) {
                             tracked_n.store(n, std::memory_order_relaxed);
                             tracked_sim.store(sim, std::memory_order_relaxed);
                         }
                         if (sim == tracked_sim.load(std::memory_order_relaxed)) {
-                            const int probe_i = n - 1;
-                            const float vx = (cur[probe_i * 4 + 0] - prv[probe_i * 4 + 0]) * inv_dt;
-                            const float vy = (cur[probe_i * 4 + 1] - prv[probe_i * 4 + 1]) * inv_dt;
-                            const float vz = (cur[probe_i * 4 + 2] - prv[probe_i * 4 + 2]) * inv_dt;
-                            const float pvx = prev_vx.exchange(vx, std::memory_order_relaxed);
-                            const float pvy = prev_vy.exchange(vy, std::memory_order_relaxed);
-                            const float pvz = prev_vz.exchange(vz, std::memory_order_relaxed);
-                            const float dot = vx * pvx + vy * pvy + vz * pvz;
-                            if (dot < -1e-4f) {
-                                cloth_trace.vel_reversals.fetch_add(1u, std::memory_order_relaxed);
+                            if (probe_free_idx >= 0) {
+                                const int pi = probe_free_idx;
+                                const float vx = (cur[pi * 4 + 0] - prv[pi * 4 + 0]) * inv_dt;
+                                const float vy = (cur[pi * 4 + 1] - prv[pi * 4 + 1]) * inv_dt;
+                                const float vz = (cur[pi * 4 + 2] - prv[pi * 4 + 2]) * inv_dt;
+                                const float pvx = prev_vx.exchange(vx, std::memory_order_relaxed);
+                                const float pvy = prev_vy.exchange(vy, std::memory_order_relaxed);
+                                const float pvz = prev_vz.exchange(vz, std::memory_order_relaxed);
+                                const float dot = vx * pvx + vy * pvy + vz * pvz;
+                                if (dot < -1e-4f) {
+                                    cloth_trace.vel_reversals.fetch_add(1u, std::memory_order_relaxed);
+                                }
+                                cloth_trace.vel_rev_frames.fetch_add(1u, std::memory_order_relaxed);
                             }
-                            cloth_trace.vel_rev_frames.fetch_add(1u, std::memory_order_relaxed);
+                            const int m = std::min<int>(n, 512);
+                            const float fdt = (dt > 1e-5f && dt < 0.2f && std::isfinite(dt)) ? dt : prev_sdt;
+                            std::lock_guard<std::mutex> lk(pin_trace_mtx);
+                            if (pin_prev_sim == sim && pin_prev_n == m) {
+                                double p_spd_sum = 0.0;
+                                double p_max_d = 0.0;
+                                double sum_dx = 0.0, sum_dy = 0.0, sum_dz = 0.0;
+                                int p_cnt = 0;
+                                for (int i = 0; i < m; ++i) {
+                                    if (pdatas[i * 4 + 1] > 0.0f) continue;
+                                    const float dx = cur[i * 4 + 0] - pin_prev_xyz[i * 3 + 0];
+                                    const float dy = cur[i * 4 + 1] - pin_prev_xyz[i * 3 + 1];
+                                    const float dz = cur[i * 4 + 2] - pin_prev_xyz[i * 3 + 2];
+                                    const double d = std::sqrt(double(dx) * double(dx) +
+                                                               double(dy) * double(dy) +
+                                                               double(dz) * double(dz));
+                                    if (std::isfinite(d) && d < 2.0) {
+                                        p_spd_sum += d / double(fdt);
+                                        if (d > p_max_d) p_max_d = d;
+                                        sum_dx += dx;
+                                        sum_dy += dy;
+                                        sum_dz += dz;
+                                        ++p_cnt;
+                                    }
+                                }
+                                if (p_cnt > 0) {
+                                    cloth_trace.pin_vel_sum_mm_s.fetch_add(
+                                        static_cast<std::uint64_t>((p_spd_sum / double(p_cnt)) * 1000.0),
+                                        std::memory_order_relaxed);
+                                    cloth_trace.pin_vel_samples.fetch_add(1u, std::memory_order_relaxed);
+                                    TraceUpdateAtomicMaxU32(
+                                        cloth_trace.pin_step_max_um,
+                                        static_cast<std::uint32_t>(std::min(p_max_d * 1'000'000.0, 999999.0)));
+                                    const float pvx = static_cast<float>((sum_dx / double(p_cnt)) / double(fdt));
+                                    const float pvy = static_cast<float>((sum_dy / double(p_cnt)) / double(fdt));
+                                    const float pvz = static_cast<float>((sum_dz / double(p_cnt)) / double(fdt));
+                                    const float dot =
+                                        pvx * pin_prev_v[0] + pvy * pin_prev_v[1] + pvz * pin_prev_v[2];
+                                    if (dot < -1e-6f) {
+                                        cloth_trace.pin_reversals.fetch_add(1u, std::memory_order_relaxed);
+                                    }
+                                    cloth_trace.pin_rev_frames.fetch_add(1u, std::memory_order_relaxed);
+                                    pin_prev_v[0] = pvx;
+                                    pin_prev_v[1] = pvy;
+                                    pin_prev_v[2] = pvz;
+                                }
+                            }
+                            pin_prev_sim = sim;
+                            pin_prev_n = m;
+                            for (int i = 0; i < m; ++i) {
+                                pin_prev_xyz[i * 3 + 0] = cur[i * 4 + 0];
+                                pin_prev_xyz[i * 3 + 1] = cur[i * 4 + 1];
+                                pin_prev_xyz[i * 3 + 2] = cur[i * 4 + 2];
+                            }
                         }
                     }
                 }
@@ -859,10 +1166,25 @@ void PS4_SYSV_ABI ProbePointWindApply() noexcept {
     cloth_trace.point_wind_calls.fetch_add(1u, std::memory_order_relaxed);
 }
 
-void PS4_SYSV_ABI ProbeDirWindApply(const u8* /*self*/, const u8* /*sim*/, const u8* /*forces*/,
-                                    const u8* /*dir*/, const float* params, float dt) noexcept {
+void PS4_SYSV_ABI ProbeDirWindApply(const u8* self, const u8* /*sim*/, const u8* /*forces*/,
+                                    const u8* dir, const float* params, float dt) noexcept {
     cloth_trace.dir_wind_calls.fetch_add(1u, std::memory_order_relaxed);
     cloth_trace.dir_wind_dt.store(dt, std::memory_order_relaxed);
+    if (self) {
+        cloth_trace.dir_wind_drag.store(
+            *reinterpret_cast<const float*>(self + BbClothInterp::SprjWindActionOffsets::kDragCoeff),
+            std::memory_order_relaxed);
+    }
+    if (dir) {
+        const float* dv = reinterpret_cast<const float*>(dir);
+        const float w2 = dv[0] * dv[0] + dv[1] * dv[1] + dv[2] * dv[2];
+        if (w2 >= 0.0f && std::isfinite(w2)) {
+            cloth_trace.wind_spd_sum_mm_s.fetch_add(
+                static_cast<std::uint64_t>(std::sqrt(double(w2)) * 1000.0),
+                std::memory_order_relaxed);
+            cloth_trace.wind_spd_samples.fetch_add(1u, std::memory_order_relaxed);
+        }
+    }
     if (params) {
         cloth_trace.dir_wind_min.store(params[0], std::memory_order_relaxed);
         cloth_trace.dir_wind_max.store(params[1], std::memory_order_relaxed);
@@ -906,20 +1228,42 @@ void MaybePrintClothTrace(float frame_dt) noexcept {
     const std::uint32_t t5_sph = cloth_trace.t5_sphere_calls.exchange(0u, std::memory_order_relaxed);
     const std::uint64_t vsamp = cloth_trace.vel_samples.exchange(0u, std::memory_order_relaxed);
     const std::uint64_t vsum = cloth_trace.vel_sum_mm_s.exchange(0u, std::memory_order_relaxed);
+    const std::uint32_t vmax_mm = cloth_trace.vel_max_mm_s.exchange(0u, std::memory_order_relaxed);
+    const std::uint64_t psamp = cloth_trace.pin_vel_samples.exchange(0u, std::memory_order_relaxed);
+    const std::uint64_t psum = cloth_trace.pin_vel_sum_mm_s.exchange(0u, std::memory_order_relaxed);
+    const std::uint32_t pmax_um = cloth_trace.pin_step_max_um.exchange(0u, std::memory_order_relaxed);
+    const std::uint32_t prev_cnt = cloth_trace.pin_reversals.exchange(0u, std::memory_order_relaxed);
+    const std::uint32_t prev_f = cloth_trace.pin_rev_frames.exchange(0u, std::memory_order_relaxed);
+    const std::uint32_t xfer_c = cloth_trace.xfer_calls.exchange(0u, std::memory_order_relaxed);
+    const std::uint64_t xfer_um = cloth_trace.xfer_um_sum.exchange(0u, std::memory_order_relaxed);
+    const std::uint32_t xfer_mx = cloth_trace.xfer_max_um.exchange(0u, std::memory_order_relaxed);
     const std::uint32_t vmaxn = cloth_trace.vel_max_particles.exchange(0u, std::memory_order_relaxed);
     const std::uint32_t vrev = cloth_trace.vel_reversals.exchange(0u, std::memory_order_relaxed);
     const std::uint32_t vrf = cloth_trace.vel_rev_frames.exchange(0u, std::memory_order_relaxed);
+    const std::uint64_t wspd_n = cloth_trace.wind_spd_samples.exchange(0u, std::memory_order_relaxed);
+    const std::uint64_t wspd_sum = cloth_trace.wind_spd_sum_mm_s.exchange(0u, std::memory_order_relaxed);
+    const std::uint64_t wacc_sum = cloth_trace.wind_acc_sum_mm_s2.exchange(0u, std::memory_order_relaxed);
+    const std::uint64_t wdv_n = cloth_trace.wind_dv01_samples.exchange(0u, std::memory_order_relaxed);
+    const std::uint64_t wdv_sum = cloth_trace.wind_dv01_sum_mm_s.exchange(0u, std::memory_order_relaxed);
+    const std::uint32_t pre_ovr = cloth_trace.prestep_override_calls.exchange(0u, std::memory_order_relaxed);
+    const std::uint32_t pre_rsc = cloth_trace.prestep_rescale_calls.exchange(0u, std::memory_order_relaxed);
+    const float pre_rmin = cloth_trace.prestep_ratio_min.exchange(999.0f, std::memory_order_relaxed);
+    const float pre_rmax = cloth_trace.prestep_ratio_max.exchange(0.0f, std::memory_order_relaxed);
     const std::uint32_t f30_st = cloth_trace.f30_steps.exchange(0u, std::memory_order_relaxed);
     const std::uint32_t f30_sk = cloth_trace.f30_skips.exchange(0u, std::memory_order_relaxed);
     const std::uint32_t f30_rs = cloth_trace.f30_resets.exchange(0u, std::memory_order_relaxed);
     const std::uint32_t f30_rg = cloth_trace.f30_rigid_ok.exchange(0u, std::memory_order_relaxed);
     const std::uint32_t f30_pr = cloth_trace.f30_prestep_calls.exchange(0u, std::memory_order_relaxed);
     const double avg_vel_m_s = vsamp > 0 ? (double(vsum) / double(vsamp)) * 0.001 : 0.0;
+    const double avg_pin_m_s = psamp > 0 ? (double(psum) / double(psamp)) * 0.001 : 0.0;
+    const double avg_wspd = wspd_n > 0 ? (double(wspd_sum) / double(wspd_n)) * 0.001 : 0.0;
+    const double avg_wacc = wspd_n > 0 ? (double(wacc_sum) / double(wspd_n)) * 0.001 : 0.0;
+    const double avg_wdv = wdv_n > 0 ? (double(wdv_sum) / double(wdv_n)) * 0.001 : 0.0;
     const double rev_hz = double(vrev) / elapsed;
     char tbuf[192];
     int tpos = 0;
     tbuf[0] = '\0';
-    for (int t = 0; t < 16; ++t) {
+    for (int t = 0; t < 24; ++t) {
         const std::uint32_t c = cloth_trace.stiff_type_counts[t].exchange(0u, std::memory_order_relaxed);
         if (c > 0 && tpos < int(sizeof(tbuf)) - 24) {
             tpos += std::snprintf(tbuf + tpos, sizeof(tbuf) - std::size_t(tpos), "%s%d:%u",
@@ -932,9 +1276,9 @@ void MaybePrintClothTrace(float frame_dt) noexcept {
         "F30(pre=%u step=%u skip=%u rst=%u rigid=%u) | "
         "FD4Wind=%u(dt=%.2fms t=%.2f ph=%.2f spd=%.2f) | "
         "AreaW=%u/%u(dt=%.2fms per=%.2f tmr=%.2f p=%.2f y=%.2f) | "
-        "SprjW=%u PtW=%u DirW=%u(dt=%.2fms min=%.2f max=%.2f ph=%.2f sf=%.2f) SimpW=%u | "
+        "SprjW=%u PtW=%u DirW=%u(dt=%.2fms |v|=%.2f dv01=%.2f drag=%.2f acc=%.2f ph=%.1f) SimpW=%u | "
         "Stiff=%u(mode=%d sub=%d mask=0x%x [%s]) | "
-        "T5(k=%.2f..%.2f shp=%u sph=%u) Vel=%.3fm/s Rev=%.1fHz(%u/%u n=%u)\n",
+        "T5(k=%.2f..%.2f shp=%u sph=%u) FreeVel=%.3f(max=%.3f) PinVel=%.3f Rev=%.1fHz(%u/%u n=%u)\n",
         double(nf) / elapsed, frame_dt * 1000.0f, live ? live->cloth_stiffness_scale : 1.0f,
         nw, cloth_trace.world_step_dt.load(std::memory_order_relaxed) * 1000.0f,
         ns, cloth_trace.sim_op_dt.load(std::memory_order_relaxed) * 1000.0f,
@@ -953,46 +1297,92 @@ void MaybePrintClothTrace(float frame_dt) noexcept {
         cloth_trace.area_wind_pitch.load(std::memory_order_relaxed),
         cloth_trace.area_wind_yaw.load(std::memory_order_relaxed),
         nsw, npw, ndw, cloth_trace.dir_wind_dt.load(std::memory_order_relaxed) * 1000.0f,
-        cloth_trace.dir_wind_min.load(std::memory_order_relaxed),
-        cloth_trace.dir_wind_max.load(std::memory_order_relaxed),
+        avg_wspd, avg_wdv, cloth_trace.dir_wind_drag.load(std::memory_order_relaxed), avg_wacc,
         cloth_trace.dir_wind_phase.load(std::memory_order_relaxed),
-        cloth_trace.dir_wind_sfreq.load(std::memory_order_relaxed),
         nsm, nst, cloth_trace.stiff_last_mode.load(std::memory_order_relaxed),
         cloth_trace.stiff_last_substeps.load(std::memory_order_relaxed), mask, tbuf,
         t5_max >= 0.0f ? t5_min : 0.0f, t5_max >= 0.0f ? t5_max : 0.0f, t5_shp, t5_sph,
-        avg_vel_m_s, rev_hz, vrev, vrf, vmaxn);
+        avg_vel_m_s, double(vmax_mm) * 0.001, avg_pin_m_s, rev_hz, vrev, vrf, vmaxn);
+
+    if (ns > 0) {
+        static constexpr const char* kStageNames[ClothTraceState::kNumStages] = {
+            "Int", "T1", "T2", "T3", "T4", "T5", "Col", "Frc"};
+        char sbuf[512];
+        int spos = 0;
+        sbuf[0] = '\0';
+        for (int s = 0; s < ClothTraceState::kNumStages; ++s) {
+            const std::uint32_t c = cloth_trace.stage_calls[s].exchange(0u, std::memory_order_relaxed);
+            const std::uint64_t um = cloth_trace.stage_um_sum[s].exchange(0u, std::memory_order_relaxed);
+            const std::uint64_t vm =
+                cloth_trace.stage_vel_mm_s_sum[s].exchange(0u, std::memory_order_relaxed);
+            const std::uint32_t mx = cloth_trace.stage_max_um[s].exchange(0u, std::memory_order_relaxed);
+            if (c > 0 && spos < int(sizeof(sbuf)) - 64) {
+                const double avg_mm = (double(um) / double(c)) * 0.001;
+                const double avg_v = (double(vm) / double(c)) * 0.001;
+                const double max_mm = double(mx) * 0.001;
+                spos += std::snprintf(sbuf + spos, sizeof(sbuf) - std::size_t(spos),
+                                      "%s%s:%.3fmm(mx=%.2f,v=%.3f)", spos ? " " : "", kStageNames[s],
+                                      avg_mm, max_mm, avg_v);
+            }
+        }
+        char lbuf[320];
+        int lpos = 0;
+        lbuf[0] = '\0';
+        for (int li = 0; li < ClothTraceState::kMaxLayers; ++li) {
+            if (cloth_trace.layers[li].sim.load(std::memory_order_relaxed) != nullptr &&
+                lpos < int(sizeof(lbuf)) - 56) {
+                lpos += std::snprintf(
+                    lbuf + lpos, sizeof(lbuf) - std::size_t(lpos), "%s[n=%d s=%d gd=%.2f ed=%.4f fv=%.3f%s]",
+                    lpos ? " " : "", cloth_trace.layers[li].n.load(std::memory_order_relaxed),
+                    cloth_trace.layers[li].sub.load(std::memory_order_relaxed),
+                    cloth_trace.layers[li].gdamp.load(std::memory_order_relaxed),
+                    cloth_trace.layers[li].edamp.load(std::memory_order_relaxed),
+                    cloth_trace.layers[li].fvel.load(std::memory_order_relaxed),
+                    cloth_trace.layers[li].ovr.load(std::memory_order_relaxed) ? " OVR" : "");
+            }
+        }
+        const double xfer_avg_mm = xfer_c > 0 ? (double(xfer_um) / double(xfer_c)) * 0.001 : 0.0;
+        std::printf(
+            "[CLOTH-STAGES] pre(ovr=%u rsc=%u r=%.2f..%.2f) Pin(v=%.3f mx=%.2fmm rev=%.1fHz %u/%u) "
+            "Xfer(c=%u %.3fmm mx=%.2f) | %s | %s\n",
+            pre_ovr, pre_rsc, pre_rmax > 0.0f ? pre_rmin : 1.0f, pre_rmax > 0.0f ? pre_rmax : 1.0f,
+            avg_pin_m_s, double(pmax_um) * 0.001, double(prev_cnt) / elapsed, prev_cnt, prev_f, xfer_c,
+            xfer_avg_mm, double(xfer_mx) * 0.001, sbuf, lbuf);
+    }
     std::fflush(stdout);
 }
 
 // ---- Cloth: the constraints' stiffness factor per substep ----
 /// Havok's stiffness factor of a constraint set for one substep (0x1167a80, replaced): `mode` 2
-/// adapts the constraints' stiffness to how often they are solved, (substeps x a x b)^-1.725
-/// (a, b the instance's scales at +0x1d0/+0x1d4), for a set of type 8 the iteration's share
-/// instead and for types 5 (hclLocalRangeConstraintSet, 0x6fb220) and 10 only the last substep.
-/// In Verlet PBD, spring restoring acceleration is a = (k_pbd / dt^2) * dx, so scaling per-substep
-/// stiffness of link/bend constraints (types 1..4) by frames^2.0 preserves invariant cloth speed
-/// and frequency across 30..360+ FPS. For type 5 (hclLocalRangeConstraintSet, 0x6fb220 / 0x2553210),
-/// Bloodborne armor assets (verified directly from BD_M_1300_c.hkx Hunter Garb and all 42 chest
-/// partsbnd.dcx files) use two distinct regimes:
-///   - m_stiffness >= 0.999f (209/215 sets, e.g. Hunter Garb coat skirt front/back/mantle): hard
-///     containment cage (maxDist + minNormalDist) — MUST stay unscaled (1.0f) or skirts collapse
-///     inside leg geometry and vanish.
-///   - m_stiffness < 0.999f (soft local-range spring tether, e.g. Hunter Garb outer shoulder cape
-///     BD_M_1300_c.hkx 'Local Range outer' stiff=0.500, substeps=2): solving unscaled at 720 Hz
-///     makes it 144x stiffer (6x nervous flutter) — MUST scale by frames^2.0 just like types 1..4.
+/// adapts stiffness to solves per step `(substeps x a x b)^-1.725`, type 8 uses iteration share,
+/// and types 5 (`hclLocalRangeConstraintSet`, `0x6fb220`) / 10 only run on the last substep.
+/// Verified `HclConstraintSetType` `[set + 0x18]` classes in `eboot.bin` + `bd_*.partsbnd.dcx`:
+///   - `type = 2` (`hclStretchLinkConstraintSet`): SIGGRAPH 2012 LRA `1.0f` max-length tether — MUST
+///     stay unscaled (`game`) across all FPS or coats stretch excessively at high FPS.
+///   - `type = 5` (`hclLocalRangeConstraintSet`, solver `0x2553210`): `m_minNormalDistance` /
+///     `m_maxNormalDistance` pushout is unscaled on every solve (zero torso/back clipping when
+///     stepped natively every frame), while `m_stiffness` (`[set + 0x34]`) governs `m_maximumDistance`:
+///     hard `1.0f` cages stay unscaled (`1.0f`) and soft `< 0.999f` ranges (`Local Range outer` `0.5f`)
+///     use exact continuous-time exponential relaxation `(-expm1(frames * log(1 - s))) / s`.
+///   - `types = 1, 16, 20` (`StandardLink`, `BendStiffnessMx`, `CompressibleLink`): elastic springs
+///     scale by `frames^(-cloth_exponent) = frames^1.725` (`0x48d7bbc`).
 float PS4_SYSV_ABI ClothStiffnessFactor(const u8* set, int mode, int iteration, int substeps, float a,
                                         float b) {
     const std::uint32_t type = *reinterpret_cast<const std::uint32_t*>(set + 0x18);
+    const float set_stiff =
+        (type == static_cast<std::uint32_t>(BbClothInterp::HclConstraintSetType::kLocalRange))
+            ? *reinterpret_cast<const float*>(set + 0x34)
+            : 1.0f;
     if (ClothTraceEnabled()) {
         cloth_trace.stiff_calls.fetch_add(1u, std::memory_order_relaxed);
         cloth_trace.stiff_last_mode.store(mode, std::memory_order_relaxed);
         cloth_trace.stiff_last_substeps.store(substeps, std::memory_order_relaxed);
-        if (type < 16u) {
+        if (type < 24u) {
             cloth_trace.stiff_type_mask.fetch_or(1u << type, std::memory_order_relaxed);
             cloth_trace.stiff_type_counts[type].fetch_add(1u, std::memory_order_relaxed);
         }
         if (type == 5u) {
-            const float st = *reinterpret_cast<const float*>(set + 0x34);
+            const float st = set_stiff;
             float cur_min = cloth_trace.t5_stiff_min.load(std::memory_order_relaxed);
             while (st < cur_min && !cloth_trace.t5_stiff_min.compare_exchange_weak(
                                        cur_min, st, std::memory_order_relaxed)) {
@@ -1008,47 +1398,21 @@ float PS4_SYSV_ABI ClothStiffnessFactor(const u8* set, int mode, int iteration, 
             }
         }
     }
-    const bool adapts = mode == 2 && !(substeps == 1 && a == 1.0f && b == 1.0f);
-    if (adapts && type == 8) {
-        return float(iteration + 1) / float(substeps);
-    }
-    if (adapts && (type == 5 || type == 10)) {
-        return substeps - 1 == iteration ? 1.0f : 0.0f;
-    }
-    float game = 1.0f;
-    if (adapts) {
-        const float x = float(substeps) * a * b;
-        if (x != 1.0f && x > 0.0f) {
-            game = std::exp2f(cloth_exponent * std::log2f(x));
-        }
-    }
-    if (cloth_fixed30_hooked) {
-        return game;
-    }
-    if (type == 5u) {
-        static const int t5_mode = [] {
-            const char* fix = std::getenv("BB_CLOTH_FIX");
-            if (fix && fix[0] == '0' && fix[1] == '\0') return 0;
-            const char* env = std::getenv("BB_CLOTH_TYPE5");
-            if (!env || !*env) return 3; // auto-soft: scale m_stiffness < 0.999f, keep hard 1.0 cages unscaled
-            return std::atoi(env);
-        }();
-        if (t5_mode == 0) {
-            return game;
-        }
-        if (t5_mode == 3) {
-            const float set_stiff = *reinterpret_cast<const float*>(set + 0x34);
-            return (set_stiff < 0.999f) ? (game * live->cloth_stiffness_scale) : game;
-        }
-        if (t5_mode == 2) {
-            return cloth_t5_pulse_active.load(std::memory_order_relaxed) ? game : 0.0f;
-        }
-        return game * live->cloth_stiffness_scale;
-    }
-    if (type == 8 || type == 10) {
-        return game;
-    }
-    return game * live->cloth_stiffness_scale;
+    static const bool fix_on = [] {
+        const char* env = std::getenv("BB_CLOTH_FIX");
+        return !(env && env[0] == '0' && env[1] == '\0');
+    }();
+    static const int t5_mode = [] {
+        const char* env = std::getenv("BB_CLOTH_TYPE5");
+        if (!env || !*env) return 3;
+        return std::atoi(env);
+    }();
+    const float frames = live ? live->cloth_frames : 1.0f;
+    const float elastic_scale = live ? live->cloth_stiffness_scale : 1.0f;
+    return BbClothInterp::ComputeNativeClothConstraintFactor(
+        type, set_stiff, mode, iteration, substeps, a, b, cloth_exponent, frames, elastic_scale,
+        t5_mode, cloth_t5_pulse_active.load(std::memory_order_relaxed),
+        fix_on && !cloth_fixed30_hooked);
 }
 
 // ---- Redirected constants: instruction (its RIP-relative operand), the constant, the value ----
@@ -1412,24 +1776,49 @@ bool ClothFixed30Enabled() noexcept {
     return enabled;
 }
 
+int ClothPostCollideMode() noexcept {
+    static const int mode = [] {
+        const char* env = std::getenv("BB_CLOTH_POST_COLLIDE");
+        return (env && *env) ? std::clamp(std::atoi(env), 0, 2) : 0;
+    }();
+    return mode;
+}
+
 struct ClothFixedState {
     const u8* sim_data = nullptr;
     int n = 0;
     std::int32_t move_buf_idx = -1; ///< hclMoveParticlesOperator (+0x34) buffer index for rigid L2W/W2L
     std::uint64_t last_frame_seq = 0;
+    std::uint64_t prev_pose_fseq = 0;
     bool initialized = false;
     bool has_origin = false;
     bool use_rigid_frame = false;
+    bool has_prev_pose = false;
+    bool prev_use_rigid = false;
     float origin_curr[3] = {0.0f, 0.0f, 0.0f};
-    std::vector<float> raw_curr;   ///< un-interpolated m_currentPositions (n * 4)
-    std::vector<float> raw_prev;   ///< un-interpolated m_previousPositions (n * 4)
-    std::vector<float> local_prev; ///< previous 30 Hz step local-frame positions (n * 4)
-    std::vector<float> local_curr; ///< current 30 Hz step local-frame positions (n * 4)
+    float prev_l2w[16]{};
+    float prev_anchor[3]{};
+    std::vector<float> raw_curr;          ///< un-interpolated m_currentPositions (n * 4)
+    std::vector<float> raw_prev;          ///< un-interpolated m_previousPositions (n * 4)
+    std::vector<float> local_prev;        ///< previous 30 Hz step local-frame positions (n * 4)
+    std::vector<float> local_curr;        ///< current 30 Hz step local-frame positions (n * 4)
+    std::vector<float> curr_pinned_saved; ///< live t_f pinned positions preserved across do_step (n * 4)
+    std::vector<float> prev_pinned;       ///< previous base frame t_{f-1} pinned positions (n * 4)
     /// Per-particle pin mask:
     ///   0 = free particle (invMass > 0, not in m_fixedParticles)
     ///   bit 0 (1) = invMass == 0 (hclMoveParticlesOperator sets prev = cur when m_fixedParticles empty)
     ///   bit 1 (2) = listed in sim_data->m_fixedParticles (+0x48/+0x50; simulate lerps prev -> cur)
     std::vector<u8> fixed_mask;
+    struct TSetSnap {
+        const u8* orig_tset = nullptr;
+        std::int32_t n_mats = 0;
+        std::size_t mat_offset = 0;
+    };
+    std::vector<TSetSnap> prev_tset_meta;
+    std::vector<BbClothInterp::ClothMat4> prev_tset_mats;
+    std::vector<BbClothInterp::ClothMat4> interp_tset_mats;
+    std::vector<BbClothInterp::ClonedHclTransformSet> cloned_tsets;
+    std::vector<const u8*> cloned_tset_ptrs;
 };
 std::mutex cloth_fixed_mutex;
 std::unordered_map<const u8*, std::unique_ptr<ClothFixedState>> cloth_fixed_states;
@@ -1471,16 +1860,89 @@ inline bool IsValidRigidFrame4x4(const float* l2w, const float* w2l,
     return (dx * dx + dy * dy + dz * dz) < 1e-3f;
 }
 
-/// Wrapper around `hclSimulateOperator::preStep` (`0x76fb90`, vtable `0x55f2a48`).
-/// Ensures Havok computes `sim->prevSubstepDt` (+0x108) and `sim->effectiveDamping` (+0x10c) using
-/// the exact fixed 30 Hz `step_dt` (`1/30 s`) instead of the live 360 Hz frame dt, and prevents
-/// frame-to-frame high-FPS dt jitter from rescaling `sim->m_previousPositions` (+0x28).
+/// Wrapper around `hclSimulateOperator::preStep` (`0x76fb90`, vtable `0x55f2a48`):
+///   - In default native per-frame mode (`!cloth_fixed30_hooked`), runs Havok's `preStep` and then
+///     deterministically computes `[sim + 0x10c] = ComputeNativeClothEffectiveDamping(...)` on every
+///     frame across all branches (`prev_sdt == 0`, `prev_sdt == new_sdt`, `global_damp == 0`).
+///   - In optional `BB_CLOTH_FIXED30=1` mode (`cloth_fixed30_hooked`), feeds fixed `1/30 s` `step_dt`.
 void PS4_SYSV_ABI WrappedClothPreStep(u8* op, u8* step_info) noexcept {
     if (!orig_cloth_prestep) {
         return;
     }
-    if (!cloth_fixed30_hooked || !op || !step_info) {
-        orig_cloth_prestep(op, step_info);
+    const auto call_prestep = [](u8* p_op, u8* p_si) noexcept {
+        if (!BbClothExp::TryDispatchPreStep(p_op, p_si)) {
+            orig_cloth_prestep(p_op, p_si);
+        }
+    };
+    if (!op || !step_info) {
+        call_prestep(op, step_info);
+        return;
+    }
+    if (!cloth_fixed30_hooked) {
+        u8* sim_for_trace = nullptr;
+        float old_sdt_for_trace = 0.0f;
+        if (ClothTraceEnabled()) {
+            u8* ctx0 = *reinterpret_cast<u8**>(step_info + 0x10);
+            if (ctx0) {
+                const std::int32_t idx0 = *reinterpret_cast<const std::int32_t*>(op + 0x1c);
+                u8* const* arr0 = *reinterpret_cast<u8* const* const*>(ctx0 + 0x20);
+                const std::int32_t cnt0 = *reinterpret_cast<const std::int32_t*>(ctx0 + 0x28);
+                if (arr0 && idx0 >= 0 && idx0 < cnt0 && idx0 < 64) {
+                    sim_for_trace = arr0[idx0];
+                    if (sim_for_trace) {
+                        old_sdt_for_trace = *reinterpret_cast<const float*>(
+                            sim_for_trace + BbClothInterp::HclSimClothInstanceOffsets::kPrevSubstepDt);
+                    }
+                }
+            }
+        }
+        call_prestep(op, step_info);
+        if (!ClothFixEnabled() || !live) {
+            return;
+        }
+        u8* ctx = *reinterpret_cast<u8**>(step_info + 0x10);
+        if (!ctx) {
+            return;
+        }
+        const std::int32_t idx = *reinterpret_cast<const std::int32_t*>(op + 0x1c);
+        u8* const* sim_arr = *reinterpret_cast<u8* const* const*>(ctx + 0x20);
+        const std::int32_t sim_cnt = *reinterpret_cast<const std::int32_t*>(ctx + 0x28);
+        if (!sim_arr || idx < 0 || idx >= sim_cnt || idx >= 64) {
+            return;
+        }
+        u8* sim = sim_arr[idx];
+        if (!sim) {
+            return;
+        }
+        using GetSimCfgFn = const u8*(PS4_SYSV_ABI*)(const u8*);
+        const auto get_sim_cfg = reinterpret_cast<GetSimCfgFn>(image_base + 0x748c50);
+        const u8* sim_cfg = get_sim_cfg(sim);
+        if (!sim_cfg) {
+            return;
+        }
+        const float new_sdt =
+            *reinterpret_cast<const float*>(sim + BbClothInterp::HclSimClothInstanceOffsets::kPrevSubstepDt);
+        if (ClothTraceEnabled()) {
+            if (*reinterpret_cast<const void* const*>(sim + 0x1d8) != nullptr) {
+                cloth_trace.prestep_override_calls.fetch_add(1u, std::memory_order_relaxed);
+            }
+            if (sim == sim_for_trace && old_sdt_for_trace > 0.0f && old_sdt_for_trace != new_sdt) {
+                cloth_trace.prestep_rescale_calls.fetch_add(1u, std::memory_order_relaxed);
+                const float ratio = new_sdt / old_sdt_for_trace;
+                float rmin = cloth_trace.prestep_ratio_min.load(std::memory_order_relaxed);
+                while (ratio < rmin && !cloth_trace.prestep_ratio_min.compare_exchange_weak(
+                                           rmin, ratio, std::memory_order_relaxed)) {
+                }
+                float rmax = cloth_trace.prestep_ratio_max.load(std::memory_order_relaxed);
+                while (ratio > rmax && !cloth_trace.prestep_ratio_max.compare_exchange_weak(
+                                           rmax, ratio, std::memory_order_relaxed)) {
+                }
+            }
+        }
+        const float global_damp = *reinterpret_cast<const float*>(sim_cfg + 0x10);
+        *reinterpret_cast<float*>(sim + BbClothInterp::HclSimClothInstanceOffsets::kEffectiveDamping) =
+            BbClothInterp::ComputeNativeClothEffectiveDamping(
+                global_damp, new_sdt, live->cloth_pbd_neg_rate);
         return;
     }
     if (ClothTraceEnabled()) {
@@ -1488,19 +1950,19 @@ void PS4_SYSV_ABI WrappedClothPreStep(u8* op, u8* step_info) noexcept {
     }
     u8* ctx = *reinterpret_cast<u8**>(step_info + 0x10);
     if (!ctx) {
-        orig_cloth_prestep(op, step_info);
+        call_prestep(op, step_info);
         return;
     }
     const std::int32_t idx = *reinterpret_cast<const std::int32_t*>(op + 0x1c);
     u8* const* sim_arr = *reinterpret_cast<u8* const* const*>(ctx + 0x20);
     const std::int32_t sim_cnt = *reinterpret_cast<const std::int32_t*>(ctx + 0x28);
     if (!sim_arr || idx < 0 || idx >= sim_cnt || idx >= 64) {
-        orig_cloth_prestep(op, step_info);
+        call_prestep(op, step_info);
         return;
     }
     u8* sim = sim_arr[idx];
     if (!sim) {
-        orig_cloth_prestep(op, step_info);
+        call_prestep(op, step_info);
         return;
     }
 
@@ -1527,7 +1989,7 @@ void PS4_SYSV_ABI WrappedClothPreStep(u8* op, u8* step_info) noexcept {
     // When prev_sdt == 0 (first frame) or prev_sdt == new_sdt (constant 1/30 s), 0x76fb90 never
     // enters the m_previousPositions rescaling loop (0x76fdf0) and keeps exact PS4 effectiveDamping.
     if (prev_sdt == 0.0f || prev_sdt == new_sdt) {
-        orig_cloth_prestep(op, step_copy);
+        call_prestep(op, step_copy);
         return;
     }
 
@@ -1557,7 +2019,7 @@ void PS4_SYSV_ABI WrappedClothPreStep(u8* op, u8* step_info) noexcept {
             }
         }
     }
-    orig_cloth_prestep(op, step_copy);
+    call_prestep(op, step_copy);
     if (have_raw) {
         for (int i = 0; i < n; ++i) {
             if (st->fixed_mask[std::size_t(i)] == 0u) {
@@ -1620,12 +2082,17 @@ int PS4_SYSV_ABI WrappedClothSimulate(u8* op, u8* ctx, float dt) noexcept {
         st->initialized = false;
         st->has_origin = false;
         st->use_rigid_frame = false;
+        st->has_prev_pose = false;
+        st->prev_use_rigid = false;
+        st->prev_pose_fseq = 0;
         st->move_buf_idx = -1;
         const std::size_t n4 = std::size_t(n) * 4u;
         st->raw_curr.resize(n4);
         st->raw_prev.resize(n4);
         st->local_prev.resize(n4);
         st->local_curr.resize(n4);
+        st->curr_pinned_saved.resize(n4);
+        st->prev_pinned.resize(n4);
         st->fixed_mask.assign(std::size_t(n), 0u);
         // Mark pinned particles separately for invMass == 0 (bit 0) vs m_fixedParticles (bit 1):
         // When m_fixedParticles is empty (all Bloodborne Hunter Garb meshes), hclMoveParticlesOperator
@@ -1706,7 +2173,13 @@ int PS4_SYSV_ABI WrappedClothSimulate(u8* op, u8* ctx, float dt) noexcept {
     };
 
     // Resolve live rigid 4x4 character frame (rotation + translation) from hclMoveParticlesOperator's
-    // active hclBuffer (+0x80 m_bufferToWorldTransform, +0xc0 m_worldToBufferTransform).
+    // active hclBuffer (+0x80 m_bufferToWorldTransform, +0xc0 m_worldToBufferTransform), falling back
+    // to ctx->m_transformSets root bone when Skin_outer/MoveParticles keep hclBuffer at Identity.
+    const float probe[3] = {
+        has_anchor ? anchor_now[0] : cur[0],
+        has_anchor ? anchor_now[1] : cur[1],
+        has_anchor ? anchor_now[2] : cur[2],
+    };
     bool use_rigid = false;
     float l2w[16];
     float w2l[16];
@@ -1720,12 +2193,37 @@ int PS4_SYSV_ABI WrappedClothSimulate(u8* op, u8* ctx, float dt) noexcept {
                 const u8* active_buf = (sh_idx >= 0 && sh_idx < n_bufs && bufs[sh_idx]) ? bufs[sh_idx] : raw_buf;
                 std::memcpy(l2w, active_buf + 0x80, sizeof(l2w));
                 std::memcpy(w2l, active_buf + 0xc0, sizeof(w2l));
-                const float probe[3] = {
-                    has_anchor ? anchor_now[0] : cur[0],
-                    has_anchor ? anchor_now[1] : cur[1],
-                    has_anchor ? anchor_now[2] : cur[2],
-                };
                 use_rigid = IsValidRigidFrame4x4(l2w, w2l, probe, has_anchor);
+            }
+        }
+    }
+    if (!use_rigid) {
+        const auto* tsets = *reinterpret_cast<const u8* const* const*>(
+            ctx + BbClothInterp::HclClothInstanceOffsets::kTransformSetsData);
+        const std::int32_t n_tsets = *reinterpret_cast<const std::int32_t*>(
+            ctx + BbClothInterp::HclClothInstanceOffsets::kTransformSetsSize);
+        if (tsets && n_tsets > 0) {
+            const std::int32_t xfer_ts = *reinterpret_cast<const std::int32_t*>(
+                sim_data + BbClothInterp::HclSimClothDataOffsets::kTransferTransformSetIndex);
+            const std::int32_t xfer_bi = *reinterpret_cast<const std::int32_t*>(
+                sim_data + BbClothInterp::HclSimClothDataOffsets::kTransferTransformIndex);
+            const std::int32_t col_ts = *reinterpret_cast<const std::int32_t*>(
+                sim_data + BbClothInterp::HclSimClothDataOffsets::kCollidableTransformSetIndex);
+            const std::int32_t try_ts = (xfer_ts >= 0 && xfer_ts < n_tsets) ? xfer_ts : col_ts;
+            const std::int32_t try_bi = (xfer_ts >= 0 && xfer_ts < n_tsets && xfer_bi >= 0) ? xfer_bi : 0;
+            if (try_ts >= 0 && try_ts < n_tsets && tsets[try_ts]) {
+                const u8* tset = tsets[try_ts];
+                const auto* mats = *reinterpret_cast<const BbClothInterp::ClothMat4* const*>(
+                    tset + BbClothInterp::HclTransformSetOffsets::kMatricesData);
+                const std::int32_t n_mats = *reinterpret_cast<const std::int32_t*>(
+                    tset + BbClothInterp::HclTransformSetOffsets::kMatricesSize);
+                if (mats && try_bi >= 0 && try_bi < n_mats &&
+                    (reinterpret_cast<std::uintptr_t>(mats) & 0xFu) == 0u) {
+                    std::memcpy(l2w, mats[try_bi].m, sizeof(l2w));
+                    if (BbClothInterp::InvertRigidMatrix4x4(l2w, w2l)) {
+                        use_rigid = IsValidRigidFrame4x4(l2w, w2l, probe, has_anchor);
+                    }
+                }
             }
         }
     }
@@ -1750,9 +2248,35 @@ int PS4_SYSV_ABI WrappedClothSimulate(u8* op, u8* ctx, float dt) noexcept {
         }
     }
 
+    using GetSimCfgFn = const u8*(PS4_SYSV_ABI*)(const u8*);
+    const auto get_sim_cfg = reinterpret_cast<GetSimCfgFn>(image_base + 0x748c50);
+    const u8* sim_cfg = get_sim_cfg(sim);
+    const bool xfer_enabled = sim_cfg && (sim_cfg[0x1e] != 0u);
+    bool has_local_range = false;
+    u8* const* static_csets = *reinterpret_cast<u8* const* const*>(
+        sim_data + BbClothInterp::HclSimClothDataOffsets::kStaticConstraintSetsData);
+    const std::int32_t n_static_csets = *reinterpret_cast<const std::int32_t*>(
+        sim_data + BbClothInterp::HclSimClothDataOffsets::kStaticConstraintSetsSize);
+    if (static_csets && n_static_csets > 0 && n_static_csets <= 64) {
+        for (std::int32_t ci = 0; ci < n_static_csets; ++ci) {
+            const u8* cs = static_csets[ci];
+            if (cs && *reinterpret_cast<const std::uint32_t*>(cs + 0x18) == 5u) {
+                has_local_range = true;
+                break;
+            }
+        }
+    }
+
     const bool do_step = reset || cloth_step_this_frame.load(std::memory_order_relaxed);
     const float alpha = cloth_interp_alpha.load(std::memory_order_relaxed);
+    const float step_beta = cloth_step_beta.load(std::memory_order_relaxed);
     const float step_dt = cloth_step_dt.load(std::memory_order_relaxed);
+    // Keep cur[pinned] and m_transformSets locked to live t_f whenever Skin_outer has already
+    // deformed a LocalRange reference mesh (SimBuffer_2) to live t_f or transferMotion is off,
+    // preventing step_beta rewind from pulling collar pins inside the live t_f back mesh.
+    const bool can_interp_pose = xfer_enabled && !has_local_range && !reset && st->initialized &&
+                                 st->has_prev_pose && (fseq == st->prev_pose_fseq + 1u) &&
+                                 (step_beta < 0.9999f);
     const auto recalc_normals = reinterpret_cast<NormalsFn>(image_base + 0x76f040);
     const auto compute_aabb_full = reinterpret_cast<AabbFn>(image_base + 0x748ab0);
     const auto compute_aabb_basic = reinterpret_cast<AabbFn>(image_base + 0x748a00);
@@ -1765,6 +2289,100 @@ int PS4_SYSV_ABI WrappedClothSimulate(u8* op, u8* ctx, float dt) noexcept {
             cloth_trace.f30_resets.fetch_add(1u, std::memory_order_relaxed);
         }
     }
+
+    auto project_against_live_body = [&]() noexcept {
+        const int post_mode = ClothPostCollideMode();
+        if (post_mode <= 0) {
+            return;
+        }
+        using CollideFn = void(PS4_SYSV_ABI*)(u8*, u8*, u8*, float);
+        using ApplyFn = void(PS4_SYSV_ABI*)(u8*, u8*, u8*, int, int, float);
+        const auto collide_particles = reinterpret_cast<CollideFn>(image_base + 0x774260);
+
+        // 1. Update sim->m_activeCollidables (+0x1c0) in-place to live t_f bone transforms without
+        //    mutating sim->m_colliders (+0xd0), keeping 30 Hz collider velocities untouched.
+        const std::int32_t n_char_cols = *reinterpret_cast<const std::int32_t*>(
+            sim + BbClothInterp::HclSimClothInstanceOffsets::kCollidablesSize);
+        const std::int32_t n_active_cols = *reinterpret_cast<const std::int32_t*>(
+            sim + BbClothInterp::HclSimClothInstanceOffsets::kActiveCollidablesSize);
+        u8* active_cols = *reinterpret_cast<u8* const*>(
+            sim + BbClothInterp::HclSimClothInstanceOffsets::kActiveCollidablesData);
+        const std::int32_t col_tset_idx = *reinterpret_cast<const std::int32_t*>(
+            sim_data + BbClothInterp::HclSimClothDataOffsets::kCollidableTransformSetIndex);
+        const auto* tsets = *reinterpret_cast<const u8* const* const*>(
+            ctx + BbClothInterp::HclClothInstanceOffsets::kTransformSetsData);
+        const std::int32_t n_tsets = *reinterpret_cast<const std::int32_t*>(
+            ctx + BbClothInterp::HclClothInstanceOffsets::kTransformSetsSize);
+        if (active_cols && n_char_cols > 0 && n_active_cols >= n_char_cols &&
+            tsets && col_tset_idx >= 0 && col_tset_idx < n_tsets && tsets[col_tset_idx]) {
+            const u8* tset = tsets[col_tset_idx];
+            const auto* bone_mats = *reinterpret_cast<const BbClothInterp::ClothMat4* const*>(
+                tset + BbClothInterp::HclTransformSetOffsets::kMatricesData);
+            const std::int32_t n_bones = *reinterpret_cast<const std::int32_t*>(
+                tset + BbClothInterp::HclTransformSetOffsets::kMatricesSize);
+            const std::int32_t* bone_map = *reinterpret_cast<const std::int32_t* const*>(
+                sim_data + BbClothInterp::HclSimClothDataOffsets::kCollidableTransformMapData);
+            const std::int32_t n_map = *reinterpret_cast<const std::int32_t*>(
+                sim_data + BbClothInterp::HclSimClothDataOffsets::kCollidableTransformMapSize);
+            const auto* local_offs = *reinterpret_cast<const BbClothInterp::ClothMat4* const*>(
+                sim_data + BbClothInterp::HclSimClothDataOffsets::kCollidableTransformOffsetsData);
+            if (bone_mats && n_bones > 0 && bone_map && n_map >= n_char_cols && local_offs &&
+                (reinterpret_cast<std::uintptr_t>(bone_mats) & 0xFu) == 0u &&
+                (reinterpret_cast<std::uintptr_t>(local_offs) & 0xFu) == 0u) {
+                for (std::int32_t c = 0; c < n_char_cols; ++c) {
+                    const std::int32_t bi = bone_map[c];
+                    if (bi < 0 || bi >= n_bones) continue;
+                    u8* col_dst = active_cols + std::size_t(c) * BbClothInterp::HclCollidableOffsets::kStride;
+                    float world_mat[16];
+                    BbClothInterp::MulAffineTransform4x4(bone_mats[bi].m, local_offs[c].m, world_mat);
+                    std::memcpy(col_dst + BbClothInterp::HclCollidableOffsets::kTransform, world_mat,
+                                sizeof(world_mat));
+                    std::memset(col_dst + BbClothInterp::HclCollidableOffsets::kLinearVelocity, 0, 32);
+                }
+            }
+        }
+
+        // 2. Project interpolated display positions `cur` outside live t_f capsules/shapes and
+        //    live t_f-skinned LocalRange back/shoulder surfaces in exact .hkx execution order.
+        //    `st->raw_curr` and `st->raw_prev` stay untouched so zero fake Verlet velocity is injected.
+        auto run_cset_if_needed = [&](std::int32_t ci) noexcept {
+            if (!static_csets || ci < 0 || ci >= n_static_csets) return;
+            u8* cs = static_csets[ci];
+            if (!cs) return;
+            const std::uint32_t type = *reinterpret_cast<const std::uint32_t*>(cs + 0x18);
+            if (type == 5u || (post_mode >= 2 && type == 2u)) {
+                const auto* vtbl = *reinterpret_cast<void* const* const*>(cs);
+                if (vtbl && vtbl[0x50 / sizeof(void*)]) {
+                    const auto apply_fn = reinterpret_cast<ApplyFn>(vtbl[0x50 / sizeof(void*)]);
+                    apply_fn(cs, sim, ctx, static_cast<int>(ci), 0, 1.0f);
+                }
+            }
+        };
+
+        const std::int32_t n_exec = *reinterpret_cast<const std::int32_t*>(
+            op + BbClothInterp::HclSimulateOperatorOffsets::kConstraintExecutionsSize);
+        const std::int32_t* exec_ids = *reinterpret_cast<const std::int32_t* const*>(
+            op + BbClothInterp::HclSimulateOperatorOffsets::kConstraintExecutionsData);
+        if (exec_ids && n_exec > 0 && n_exec <= 128) {
+            for (std::int32_t ei = 0; ei < n_exec; ++ei) {
+                const std::int32_t id = exec_ids[ei];
+                if (id == -1) {
+                    if (active_cols && n_active_cols > 0) {
+                        collide_particles(op, ctx, sim, Frame30);
+                    }
+                } else {
+                    run_cset_if_needed(id);
+                }
+            }
+        } else {
+            for (std::int32_t ci = 0; ci < n_static_csets; ++ci) {
+                run_cset_if_needed(ci);
+            }
+            if (active_cols && n_active_cols > 0) {
+                collide_particles(op, ctx, sim, Frame30);
+            }
+        }
+    };
 
     auto write_interp_free = [&]() noexcept {
         for (int i = 0; i < n; ++i) {
@@ -1786,6 +2404,7 @@ int PS4_SYSV_ABI WrappedClothSimulate(u8* op, u8* ctx, float dt) noexcept {
             }
             cur[i * 4 + 3] = st->raw_curr[k + 3];
         }
+        project_against_live_body();
         if (sim_data[0x14c] != 0) {
             recalc_normals(nullptr, sim);
         }
@@ -1796,14 +2415,65 @@ int PS4_SYSV_ABI WrappedClothSimulate(u8* op, u8* ctx, float dt) noexcept {
         }
     };
 
+    auto save_curr_pose_as_prev = [&]() noexcept {
+        for (int i = 0; i < n; ++i) {
+            if (st->fixed_mask[std::size_t(i)] == 0u) continue;
+            std::memcpy(&st->prev_pinned[std::size_t(i) * 4u], &cur[i * 4], 16);
+        }
+        if (use_rigid) {
+            std::memcpy(st->prev_l2w, l2w, sizeof(st->prev_l2w));
+        }
+        std::memcpy(st->prev_anchor, anchor_now, sizeof(st->prev_anchor));
+        st->prev_use_rigid = use_rigid;
+        st->prev_tset_meta.clear();
+        st->prev_tset_mats.clear();
+        const auto* orig_tsets = *reinterpret_cast<const u8* const* const*>(
+            ctx + BbClothInterp::HclClothInstanceOffsets::kTransformSetsData);
+        const std::int32_t n_tsets = *reinterpret_cast<const std::int32_t*>(
+            ctx + BbClothInterp::HclClothInstanceOffsets::kTransformSetsSize);
+        if (orig_tsets && n_tsets > 0 && n_tsets <= 8) {
+            for (std::int32_t ts_i = 0; ts_i < n_tsets; ++ts_i) {
+                const u8* tset = orig_tsets[ts_i];
+                const BbClothInterp::ClothMat4* mats = nullptr;
+                std::int32_t n_mats = 0;
+                if (tset) {
+                    mats = *reinterpret_cast<const BbClothInterp::ClothMat4* const*>(
+                        tset + BbClothInterp::HclTransformSetOffsets::kMatricesData);
+                    n_mats = *reinterpret_cast<const std::int32_t*>(
+                        tset + BbClothInterp::HclTransformSetOffsets::kMatricesSize);
+                    if (!mats || n_mats <= 0 || n_mats > 512 ||
+                        (reinterpret_cast<std::uintptr_t>(mats) & 0xFu) != 0u) {
+                        mats = nullptr;
+                        n_mats = 0;
+                    }
+                }
+                const std::size_t off = st->prev_tset_mats.size();
+                st->prev_tset_meta.push_back({tset, n_mats, off});
+                if (mats && n_mats > 0) {
+                    st->prev_tset_mats.insert(st->prev_tset_mats.end(), mats, mats + n_mats);
+                }
+            }
+        }
+        st->prev_pose_fseq = fseq;
+        st->has_prev_pose = true;
+    };
+
     if (do_step) {
         if (ClothTraceEnabled()) {
             cloth_trace.f30_steps.fetch_add(1u, std::memory_order_relaxed);
         }
+        if (can_interp_pose) {
+            for (int i = 0; i < n; ++i) {
+                if (st->fixed_mask[std::size_t(i)] == 0u) continue;
+                std::memcpy(&st->curr_pinned_saved[std::size_t(i) * 4u], &cur[i * 4], 16);
+            }
+        }
         if (!reset && st->initialized) {
-            // Restore un-interpolated physics positions ONLY for free particles.
+            // Restore un-interpolated physics positions ONLY for free particles, and feed exact
+            // 30 Hz sub-frame interpolated pinned anchors + collider transforms so Havok
+            // transferMotion (`0x771290`) and Verlet constraints never see 2:1 beat aliasing.
             // CRITICAL: For invMass==0 particles not in m_fixedParticles (100% of Hunter Garb),
-            // Verlet (0x7740bf) computes cur + damp*(cur - prev) WITHOUT multiplying by invMass,
+            // Verlet (`0x7740bf`) computes cur + damp*(cur - prev) WITHOUT multiplying by invMass,
             // so prev[pinned] MUST stay equal to cur[pinned] (matching hclMoveParticlesOperator).
             for (int i = 0; i < n; ++i) {
                 const u8 fm = st->fixed_mask[std::size_t(i)];
@@ -1811,33 +2481,167 @@ int PS4_SYSV_ABI WrappedClothSimulate(u8* op, u8* ctx, float dt) noexcept {
                 if (fm == 0u) {
                     std::memcpy(&cur[i * 4], &st->raw_curr[k], 16);
                     std::memcpy(&prev[i * 4], &st->raw_prev[k], 16);
-                } else if ((fm & 2u) != 0u) {
-                    std::memcpy(&prev[i * 4], &st->raw_curr[k], 16);
                 } else {
-                    std::memcpy(&prev[i * 4], &cur[i * 4], 16);
+                    if (can_interp_pose) {
+                        const float* p0 = &st->prev_pinned[k];
+                        const float* p1 = &st->curr_pinned_saved[k];
+                        if (std::isfinite(p0[0]) && std::isfinite(p0[1]) && std::isfinite(p0[2]) &&
+                            std::isfinite(p1[0]) && std::isfinite(p1[1]) && std::isfinite(p1[2])) {
+                            const float pdx = p1[0] - p0[0];
+                            const float pdy = p1[1] - p0[1];
+                            const float pdz = p1[2] - p0[2];
+                            if (pdx * pdx + pdy * pdy + pdz * pdz <= 2.25f) {
+                                cur[i * 4 + 0] = p0[0] + pdx * step_beta;
+                                cur[i * 4 + 1] = p0[1] + pdy * step_beta;
+                                cur[i * 4 + 2] = p0[2] + pdz * step_beta;
+                                cur[i * 4 + 3] = p1[3];
+                            }
+                        }
+                    }
+                    if ((fm & 2u) != 0u) {
+                        std::memcpy(&prev[i * 4], &st->raw_curr[k], 16);
+                    } else {
+                        std::memcpy(&prev[i * 4], &cur[i * 4], 16);
+                    }
                 }
             }
             st->local_prev.swap(st->local_curr);
         }
 
-        const int ret = orig_sim(op, ctx, step_dt);
+        struct TransformSetSwapGuard {
+            const u8* const** slot = nullptr;
+            const u8* const* orig = nullptr;
+            ~TransformSetSwapGuard() noexcept {
+                if (slot) {
+                    *slot = orig;
+                }
+            }
+        };
+        int ret = 0;
+        {
+            TransformSetSwapGuard tset_guard;
+            if (can_interp_pose && !st->prev_tset_meta.empty()) {
+                auto* tset_slot = reinterpret_cast<const u8* const**>(
+                    ctx + BbClothInterp::HclClothInstanceOffsets::kTransformSetsData);
+                const u8* const* orig_tsets = *tset_slot;
+                const std::int32_t n_tsets = *reinterpret_cast<const std::int32_t*>(
+                    ctx + BbClothInterp::HclClothInstanceOffsets::kTransformSetsSize);
+                if (orig_tsets && n_tsets == static_cast<std::int32_t>(st->prev_tset_meta.size())) {
+                    bool match = true;
+                    for (std::int32_t ts_i = 0; ts_i < n_tsets; ++ts_i) {
+                        const auto& pm = st->prev_tset_meta[std::size_t(ts_i)];
+                        const u8* tset = orig_tsets[ts_i];
+                        if (pm.n_mats == 0) {
+                            if (pm.orig_tset != tset) {
+                                match = false;
+                                break;
+                            }
+                            continue;
+                        }
+                        if (!tset || tset != pm.orig_tset) {
+                            match = false;
+                            break;
+                        }
+                        const auto* mats = *reinterpret_cast<const BbClothInterp::ClothMat4* const*>(
+                            tset + BbClothInterp::HclTransformSetOffsets::kMatricesData);
+                        const std::int32_t n_mats = *reinterpret_cast<const std::int32_t*>(
+                            tset + BbClothInterp::HclTransformSetOffsets::kMatricesSize);
+                        if (!mats || n_mats != pm.n_mats ||
+                            (reinterpret_cast<std::uintptr_t>(mats) & 0xFu) != 0u) {
+                            match = false;
+                            break;
+                        }
+                    }
+                    if (match) {
+                        st->interp_tset_mats.resize(st->prev_tset_mats.size());
+                        st->cloned_tsets.resize(std::size_t(n_tsets));
+                        st->cloned_tset_ptrs.resize(std::size_t(n_tsets));
+                        for (std::int32_t ts_i = 0; ts_i < n_tsets; ++ts_i) {
+                            const auto& pm = st->prev_tset_meta[std::size_t(ts_i)];
+                            const u8* tset = orig_tsets[ts_i];
+                            if (pm.n_mats <= 0) {
+                                st->cloned_tset_ptrs[std::size_t(ts_i)] = tset;
+                                continue;
+                            }
+                            const auto* mats = *reinterpret_cast<const BbClothInterp::ClothMat4* const*>(
+                                tset + BbClothInterp::HclTransformSetOffsets::kMatricesData);
+                            BbClothInterp::ClothMat4* dst_mats =
+                                st->interp_tset_mats.data() + pm.mat_offset;
+                            const BbClothInterp::ClothMat4* src0_mats =
+                                st->prev_tset_mats.data() + pm.mat_offset;
+                            for (std::int32_t m = 0; m < pm.n_mats; ++m) {
+                                BbClothInterp::LerpTransformMatrix4x4(
+                                    src0_mats[m].m, mats[m].m, step_beta, dst_mats[m].m);
+                            }
+                            BbClothInterp::InitClonedHclTransformSet(
+                                st->cloned_tsets[std::size_t(ts_i)], tset, dst_mats);
+                            st->cloned_tset_ptrs[std::size_t(ts_i)] =
+                                st->cloned_tsets[std::size_t(ts_i)].bytes;
+                        }
+                        tset_guard.slot = tset_slot;
+                        tset_guard.orig = orig_tsets;
+                        *tset_slot = st->cloned_tset_ptrs.data();
+                    }
+                }
+            }
+            ret = orig_sim(op, ctx, step_dt);
+        }
 
         std::memcpy(st->raw_curr.data(), cur, std::size_t(n) * 16u);
         std::memcpy(st->raw_prev.data(), prev, std::size_t(n) * 16u);
+
+        float w2l_sim[16]{};
+        bool use_sim_w2l = false;
+        if (can_interp_pose && use_rigid && st->prev_use_rigid) {
+            float l2w_sim[16]{};
+            BbClothInterp::LerpTransformMatrix4x4(st->prev_l2w, l2w, step_beta, l2w_sim);
+            const float sim_probe[3] = {
+                has_anchor ? (st->prev_anchor[0] + (anchor_now[0] - st->prev_anchor[0]) * step_beta)
+                           : l2w_sim[12],
+                has_anchor ? (st->prev_anchor[1] + (anchor_now[1] - st->prev_anchor[1]) * step_beta)
+                           : l2w_sim[13],
+                has_anchor ? (st->prev_anchor[2] + (anchor_now[2] - st->prev_anchor[2]) * step_beta)
+                           : l2w_sim[14],
+            };
+            if (BbClothInterp::InvertRigidMatrix4x4(l2w_sim, w2l_sim) &&
+                IsValidRigidFrame4x4(l2w_sim, w2l_sim, sim_probe, has_anchor)) {
+                use_sim_w2l = true;
+            }
+        }
+        const float* w2l_for_step = use_sim_w2l ? w2l_sim : w2l;
+        const float anchor_for_step[3] = {
+            can_interp_pose
+                ? (st->prev_anchor[0] + (anchor_now[0] - st->prev_anchor[0]) * step_beta)
+                : anchor_now[0],
+            can_interp_pose
+                ? (st->prev_anchor[1] + (anchor_now[1] - st->prev_anchor[1]) * step_beta)
+                : anchor_now[1],
+            can_interp_pose
+                ? (st->prev_anchor[2] + (anchor_now[2] - st->prev_anchor[2]) * step_beta)
+                : anchor_now[2],
+        };
+
         for (int i = 0; i < n; ++i) {
             const std::size_t k = std::size_t(i) * 4u;
             if (use_rigid) {
                 float lp[3];
-                TransformPoint4x4(w2l, cur[i * 4 + 0], cur[i * 4 + 1], cur[i * 4 + 2], lp);
+                TransformPoint4x4(w2l_for_step, cur[i * 4 + 0], cur[i * 4 + 1], cur[i * 4 + 2], lp);
                 st->local_curr[k + 0u] = lp[0];
                 st->local_curr[k + 1u] = lp[1];
                 st->local_curr[k + 2u] = lp[2];
             } else {
-                st->local_curr[k + 0u] = cur[i * 4 + 0] - anchor_now[0];
-                st->local_curr[k + 1u] = cur[i * 4 + 1] - anchor_now[1];
-                st->local_curr[k + 2u] = cur[i * 4 + 2] - anchor_now[2];
+                st->local_curr[k + 0u] = cur[i * 4 + 0] - anchor_for_step[0];
+                st->local_curr[k + 1u] = cur[i * 4 + 1] - anchor_for_step[1];
+                st->local_curr[k + 2u] = cur[i * 4 + 2] - anchor_for_step[2];
             }
             st->local_curr[k + 3u] = cur[i * 4 + 3];
+        }
+        if (can_interp_pose) {
+            // Restore live t_f pinned seam vertices so rendered shoulder/collar stitches never lag.
+            for (int i = 0; i < n; ++i) {
+                if (st->fixed_mask[std::size_t(i)] == 0u) continue;
+                std::memcpy(&cur[i * 4], &st->curr_pinned_saved[std::size_t(i) * 4u], 16);
+            }
         }
         st->has_origin = has_origin;
         st->use_rigid_frame = use_rigid;
@@ -1864,9 +2668,13 @@ int PS4_SYSV_ABI WrappedClothSimulate(u8* op, u8* ctx, float dt) noexcept {
         if (snap_prev) {
             st->local_prev = st->local_curr;
             st->initialized = true;
-        } else if (alpha < 0.999f) {
+            if (can_interp_pose) {
+                write_interp_free();
+            }
+        } else if (alpha < 0.999f || can_interp_pose) {
             write_interp_free();
         }
+        save_curr_pose_as_prev();
         return ret;
     }
 
@@ -1876,15 +2684,14 @@ int PS4_SYSV_ABI WrappedClothSimulate(u8* op, u8* ctx, float dt) noexcept {
     // Non-step high-FPS frame: smoothly interpolate local-frame free particles onto this frame's
     // live rigid character transform without stepping Havok Verlet (-92% cloth CPU at 360 FPS).
     write_interp_free();
+    save_curr_pose_as_prev();
     return 0;
 }
 
-bool HookClothFixed30() {
-    if (!ClothFixed30Enabled()) {
+bool HookClothPreStep() {
+    if (!ClothFixEnabled()) {
         return false;
     }
-    // 1. Hook hclSimulateOperator::preStep (0x76fb90) with a 6-byte prologue trampoline so Havok
-    //    always computes prevSubstepDt (+0x108) and effectiveDamping (+0x10c) for exact 1/30 s.
     constexpr u64 pre_site = 0x76fb90;
     constexpr u8 pre_expected[6] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57}; // push rbp; mov rbp,rsp; push r15
     if (std::memcmp(reinterpret_cast<const u8*>(image_base + pre_site), pre_expected, sizeof(pre_expected)) != 0) {
@@ -1907,8 +2714,14 @@ bool HookClothFixed30() {
         orig_cloth_prestep = nullptr;
         return false;
     }
+    return true;
+}
 
-    // 2. Patch the sole call site of hclSimulateOperator::simulate (0x76ab3c: call 0x76e370).
+bool HookClothFixed30() {
+    if (!ClothFixed30Enabled() || !orig_cloth_prestep) {
+        return false;
+    }
+    // Patch the sole call site of hclSimulateOperator::simulate (0x76ab3c: call 0x76e370).
     constexpr u64 site = 0x76ab3c;
     constexpr u8 expected[5] = {0xe8, 0x2f, 0x38, 0x00, 0x00}; // call 0x76e370
     u8* code = reinterpret_cast<u8*>(image_base + site);
@@ -1932,6 +2745,123 @@ bool HookClothFixed30() {
     code[0] = 0xe8; // call stub -> tail-jmp WrappedClothSimulate -> returns to 0x76ab41
     std::memcpy(code + 1, &rel32, 4);
     return true;
+}
+
+void PS4_SYSV_ABI TraceConstraintApply(u8* set, u8* sim, u8* ctx, int idx, int use_factor,
+                                       float factor) noexcept {
+    if (!set) {
+        return;
+    }
+    const std::uint32_t type = *reinterpret_cast<const std::uint32_t*>(set + 0x18);
+    if (type < 24u && (ClothSkipMask() & (1u << type)) != 0u) {
+        return;
+    }
+    using ApplyFn = void(PS4_SYSV_ABI*)(u8*, u8*, u8*, int, int, float);
+    const auto* vtbl = *reinterpret_cast<void* const* const*>(set);
+    const auto apply_fn = reinterpret_cast<ApplyFn>(vtbl[0x50 / sizeof(void*)]);
+    if (!ClothTraceEnabled() || !sim) {
+        apply_fn(set, sim, ctx, idx, use_factor, factor);
+        return;
+    }
+    float pre_xyz[512 * 3];
+    const int snap_n = TraceSnapshotFreeParticles(sim, pre_xyz, 512);
+    apply_fn(set, sim, ctx, idx, use_factor, factor);
+    if (snap_n > 0 && type >= 1u && type <= 5u) {
+        const float sdt = *reinterpret_cast<const float*>(sim + 0x108);
+        TraceRecordStageDelta(static_cast<int>(type), sim, pre_xyz, snap_n, sdt);
+    }
+}
+
+/// Forces `r8d = 1` (`useStiffnessFactor = true`) across both `solveConstraints` paths (`0x771f60`
+/// at `0x7720f9` and `0x772180` at `0x77230b`) in native mode so `hclLocalRangeConstraintSet::apply`
+/// (`0x6fb220`) always applies `ComputeClothExponentialRelaxationFactor` even on garments authored
+/// with `m_adaptConstraintStiffness == 0` or `m_subSteps == 1` (e.g. all 5 layers of Hunter Garb).
+/// When `BB_CLOTH_TRACE=1` or `BB_CLOTH_SKIP_T != 0`, wraps the virtual `apply` call with
+/// `TraceConstraintApply` (zero overhead in normal runs).
+int HookClothSolveConstraintsUseFactor() {
+    if (!ClothFixEnabled() || cloth_fixed30_hooked) {
+        return 0;
+    }
+    const bool wrap_apply = ClothTraceEnabled() || (ClothSkipMask() != 0u);
+    int hooked = 0;
+    if (wrap_apply) {
+        constexpr u64 site1 = 0x7720f9;
+        constexpr u8 expected1[10] = {0x44, 0x89, 0xf9, 0x44, 0x8b, 0x45, 0xc0, 0xff, 0x50, 0x50};
+        Emitter e1;
+        e1.Bytes({0x44, 0x89, 0xf9});                   // mov ecx, r15d
+        e1.Bytes({0x41, 0xb8, 0x01, 0x00, 0x00, 0x00}); // mov r8d, 1
+        e1.CallAbs(reinterpret_cast<const void*>(&TraceConstraintApply));
+        e1.JmpAbs(image_base + 0x772103);
+        if (Detour(site1, expected1, sizeof(expected1), e1)) {
+            ++hooked;
+        }
+        constexpr u64 site2 = 0x77230b;
+        constexpr u8 expected2[10] = {0x4c, 0x89, 0xe2, 0x44, 0x8b, 0x45, 0xb4, 0xff, 0x50, 0x50};
+        Emitter e2;
+        e2.Bytes({0x4c, 0x89, 0xe2});                   // mov rdx, r12
+        e2.Bytes({0x41, 0xb8, 0x01, 0x00, 0x00, 0x00}); // mov r8d, 1
+        e2.CallAbs(reinterpret_cast<const void*>(&TraceConstraintApply));
+        e2.JmpAbs(image_base + 0x772315);
+        if (Detour(site2, expected2, sizeof(expected2), e2)) {
+            ++hooked;
+        }
+        return hooked;
+    }
+    {
+        constexpr u64 site1 = 0x7720f9;
+        constexpr u8 expected1[7] = {0x44, 0x89, 0xf9, 0x44, 0x8b, 0x45, 0xc0}; // mov ecx,r15d; mov r8d,[rbp-0x40]
+        Emitter e1;
+        e1.Bytes({0x44, 0x89, 0xf9});                   // mov ecx, r15d
+        e1.Bytes({0x41, 0xb8, 0x01, 0x00, 0x00, 0x00}); // mov r8d, 1
+        e1.JmpAbs(image_base + 0x772100);
+        if (Detour(site1, expected1, sizeof(expected1), e1)) {
+            ++hooked;
+        }
+    }
+    {
+        constexpr u64 site2 = 0x77230b;
+        constexpr u8 expected2[7] = {0x4c, 0x89, 0xe2, 0x44, 0x8b, 0x45, 0xb4}; // mov rdx,r12; mov r8d,[rbp-0x4c]
+        Emitter e2;
+        e2.Bytes({0x4c, 0x89, 0xe2});                   // mov rdx, r12
+        e2.Bytes({0x41, 0xb8, 0x01, 0x00, 0x00, 0x00}); // mov r8d, 1
+        e2.JmpAbs(image_base + 0x772312);
+        if (Detour(site2, expected2, sizeof(expected2), e2)) {
+            ++hooked;
+        }
+    }
+    return hooked;
+}
+
+void UpdateClothNativeTiming(float cdt, bool update_t5_pulse) noexcept {
+    const double frames_d = std::clamp(double(cdt) * 30.0, 1.0 / 300.0, 1.0);
+    const float clamped_frames = static_cast<float>(frames_d);
+    live->cloth_frames = clamped_frames;
+    const float exp_ov = ClothExpOverride();
+    const float cloth_exp = exp_ov > 0.0f ? exp_ov : -cloth_exponent;
+    const bool fix_on = ClothFixEnabled();
+    live->cloth_stiffness_scale =
+        fix_on ? BbClothInterp::ComputeClothElasticStiffnessScale(clamped_frames, cloth_exp) : 1.0f;
+    constexpr double kClothFrictionRef = 0.35;
+    const float friction_scale = static_cast<float>(
+        (-std::expm1(frames_d * std::log(1.0 - kClothFrictionRef))) / kClothFrictionRef);
+    for (float& s : live->cloth_friction_scale) s = friction_scale;
+
+    cloth_sim_time_s += double(cdt);
+    const auto ws = BbClothInterp::ComputeClothWindSmoothState(cloth_sim_time_s);
+    live->cloth_wind_seed30 = ws.seed0;
+    live->cloth_wind_seed1 = ws.seed1;
+    live->cloth_wind_smooth = ClothWindSeedEnabled() ? ws.smooth : 0.0f;
+    live->cloth_pbd_neg_rate =
+        fix_on ? BbClothInterp::ComputeHighFpsClothDampingNegRate(clamped_frames, ClothDampRetention30())
+               : 0.0f;
+
+    if (update_t5_pulse) {
+        const std::uint64_t tick30 = static_cast<std::uint64_t>(std::floor(cloth_sim_time_s * 30.0));
+        const std::uint32_t t30 = static_cast<std::uint32_t>(tick30);
+        const std::uint32_t prev_t30 = cloth_t5_last_tick30.exchange(t30, std::memory_order_relaxed);
+        cloth_t5_pulse_active.store(t30 != prev_t30, std::memory_order_relaxed);
+        cloth_tick30_seq.store(t30, std::memory_order_relaxed);
+    }
 }
 
 void PS4_SYSV_ABI OnClothWorldStep(float* dt_ptr) noexcept {
@@ -1958,60 +2888,33 @@ void PS4_SYSV_ABI OnClothWorldStep(float* dt_ptr) noexcept {
             }
         }
         live->cloth_stiffness_scale = 1.0f;
+        live->cloth_frames = 1.0f;
         for (float& s : live->cloth_friction_scale) s = 1.0f;
-        if (cdt >= Frame30 * 0.96f) {
-            // Native ~30 FPS: step every frame with exact dt and alpha = 1.0 (zero latency).
-            cloth_fixed_accum = 0.0;
-            cloth_step_this_frame.store(true, std::memory_order_relaxed);
-            cloth_interp_alpha.store(1.0f, std::memory_order_relaxed);
-            cloth_step_dt.store(cdt, std::memory_order_relaxed);
+        const auto tick = BbClothInterp::ComputeClothFixed30Tick(
+            cloth_fixed_accum, cloth_steady_30_streak, cdt, Frame30);
+        cloth_step_this_frame.store(tick.do_step, std::memory_order_relaxed);
+        cloth_interp_alpha.store(tick.alpha, std::memory_order_relaxed);
+        cloth_step_beta.store(tick.step_beta, std::memory_order_relaxed);
+        cloth_step_dt.store(tick.step_dt, std::memory_order_relaxed);
+        if (tick.do_step) {
             ++cloth_fixed_step_seq;
-        } else {
-            cloth_fixed_accum += double(cdt);
-            if (cloth_fixed_accum >= double(Frame30)) {
-                cloth_fixed_accum = std::min(cloth_fixed_accum - double(Frame30), double(Frame30) * 0.999);
-                cloth_step_this_frame.store(true, std::memory_order_relaxed);
-                ++cloth_fixed_step_seq;
-            } else {
-                cloth_step_this_frame.store(false, std::memory_order_relaxed);
-            }
-            cloth_interp_alpha.store(
-                std::clamp(static_cast<float>(cloth_fixed_accum / double(Frame30)), 0.0f, 1.0f),
-                std::memory_order_relaxed);
-            cloth_step_dt.store(Frame30, std::memory_order_relaxed);
         }
-        live->cloth_wind_seed30 = static_cast<std::uint32_t>((cloth_fixed_step_seq * 10000ull) % 1000000ull);
+        const auto ws = BbClothInterp::ComputeClothWindSmoothState(double(cloth_fixed_step_seq) / 30.0);
+        live->cloth_wind_seed30 = ws.seed0;
+        live->cloth_wind_seed1 = ws.seed1;
+        live->cloth_wind_smooth = 0.0f;
+        live->cloth_pbd_neg_rate = 0.0f;
         return;
     }
 
-    const double frames_d = double(cdt) * 30.0;
-    static const float cloth_exp_override = [] {
-        const char* env = std::getenv("BB_CLOTH_EXP");
-        const float v = env && *env ? std::strtof(env, nullptr) : -1.0f;
-        return (v > 0.0f && v <= 3.0f) ? v : -1.0f;
-    }();
-    const double cloth_exp = cloth_exp_override > 0.0f ? double(cloth_exp_override) : 2.0;
-    live->cloth_stiffness_scale = static_cast<float>(std::pow(frames_d, cloth_exp));
-    constexpr double kClothFrictionRef = 0.35;
-    const float friction_scale = static_cast<float>(
-        (-std::expm1(frames_d * std::log(1.0 - kClothFrictionRef))) / kClothFrictionRef);
-    for (float& s : live->cloth_friction_scale) s = friction_scale;
-
-    cloth_sim_time_s += double(cdt);
-    const std::uint64_t tick30 = static_cast<std::uint64_t>(cloth_sim_time_s * 30.0);
-    live->cloth_wind_seed30 = static_cast<std::uint32_t>((tick30 * 10000ull) % 1000000ull);
-    const std::uint32_t t30 = static_cast<std::uint32_t>(tick30);
-    const std::uint32_t prev_t30 = cloth_t5_last_tick30.exchange(t30, std::memory_order_relaxed);
-    cloth_t5_pulse_active.store(t30 != prev_t30, std::memory_order_relaxed);
-    cloth_tick30_seq.store(t30, std::memory_order_relaxed);
+    UpdateClothNativeTiming(cdt, true);
 }
 
 /// Synchronizes Havok Cloth fixed-30 Hz cadence (or fallback dt-adapted scales) and 30 Hz wind
 /// turbulence PRNG directly to `hclWorld`'s own `dt` at `0xfd54a2` — immediately after
 /// `waitForStepComplete()` (`0x76a030`) and before worker jobs dispatch (`0x769450`/`0x769190`).
 bool HookClothWorldSync() {
-    const char* env = std::getenv("BB_CLOTH_FIX");
-    if (env && env[0] == '0' && env[1] == '\0') {
+    if (!ClothFixEnabled()) {
         return false;
     }
     const char* sync_env = std::getenv("BB_CLOTH_SYNC");
@@ -2037,38 +2940,422 @@ bool HookClothWorldSync() {
     return Detour(site, code, sizeof(code), e);
 }
 
-/// Quantizes the XorShift turbulence seed in Bloodborne's Directional Cloth Wind (`sub_1053b90`
-/// @ `0x1053dc6`) and Point Cloth Wind (`sub_1052af0` @ `0x1052b84`) to a steady 30 Hz cadence
-/// (`live->cloth_wind_seed30`) instead of re-seeding every substep at 180..680 Hz.
-int HookClothWindSeed() {
-    const char* env = std::getenv("BB_CLOTH_FIX");
-    if (env && env[0] == '0' && env[1] == '\0') {
-        return 0;
+bool PS4_SYSV_ABI SprjDirWindHook(const u8* self, const u8* sim, float* forces, const float* dir_vec,
+                                  const float* params, float sdt) noexcept {
+    if (ClothTraceEnabled()) {
+        ProbeDirWindApply(self, sim, reinterpret_cast<const u8*>(forces),
+                          reinterpret_cast<const u8*>(dir_vec), params, sdt);
     }
-    const char* seed_env = std::getenv("BB_CLOTH_SEED");
-    if (seed_env && seed_env[0] == '0' && seed_env[1] == '\0') {
-        return 0;
+    if (!live || ClothWindOffEnabled()) {
+        return true;
     }
-    constexpr u8 code[5] = {0xc4, 0xe1, 0xfa, 0x2c, 0xf0}; // vcvttss2si rsi, xmm0
-    const u64 seed_addr = reinterpret_cast<u64>(&live->cloth_wind_seed30);
-    int hooked = 0;
-    for (const u64 site : {u64(0x1053dc6), u64(0x1052b84)}) {
-        const u64 stub_addr = reinterpret_cast<u64>(stub_page + stub_used);
-        const std::int64_t disp = std::int64_t(seed_addr) - std::int64_t(stub_addr + 6);
-        if (disp != std::int32_t(disp)) continue;
-        Emitter e;
-        e.Bytes({0x8b, 0x35}); // mov esi, dword ptr [rip + disp32] (zero-extends to rsi)
-        e.U32(static_cast<std::uint32_t>(std::int32_t(disp)));
-        e.JmpAbs(image_base + site + sizeof(code));
-        if (Detour(site, code, sizeof(code), e)) {
-            ++hooked;
+    const bool ok = BbClothInterp::SprjDirWindApplyNative(
+        self, sim, forces, dir_vec, params, sdt, live->cloth_wind_seed30, live->cloth_wind_seed1,
+        live->cloth_wind_smooth, live->cloth_frames, ClothWindSeedEnabled());
+    if (ClothTraceEnabled() && sim && forces) {
+        const u8* sim_data = *reinterpret_cast<const u8* const*>(sim + 0x10);
+        const std::int32_t n = *reinterpret_cast<const std::int32_t*>(sim + 0x20);
+        if (sim_data && n > 0 && n <= 4096) {
+            const float* pdatas = *reinterpret_cast<const float* const*>(sim_data + 0x38);
+            const std::int32_t np = *reinterpret_cast<const std::int32_t*>(sim_data + 0x40);
+            if (pdatas && np >= n) {
+                double acc_sum = 0.0;
+                int free_cnt = 0;
+                for (int i = 0; i < n; ++i) {
+                    const float inv_m = pdatas[i * 4 + 1];
+                    if (!(inv_m > 0.0f)) continue;
+                    const float fx = forces[i * 4 + 0];
+                    const float fy = forces[i * 4 + 1];
+                    const float fz = forces[i * 4 + 2];
+                    const double f = std::sqrt(double(fx) * double(fx) + double(fy) * double(fy) +
+                                               double(fz) * double(fz));
+                    if (std::isfinite(f)) {
+                        acc_sum += f * double(inv_m);
+                        ++free_cnt;
+                    }
+                }
+                if (free_cnt > 0) {
+                    cloth_trace.wind_acc_sum_mm_s2.fetch_add(
+                        static_cast<std::uint64_t>((acc_sum / double(free_cnt)) * 1000.0),
+                        std::memory_order_relaxed);
+                }
+            }
         }
+    }
+    return ok;
+}
+
+/// Replaces FromSoftware's `SprjDirWind` (`0x1053b90`) with `SprjDirWindHook` (`BbClothInterp::SprjDirWindApplyNative`):
+/// $C^1$-smooth dual-seed 30 Hz turbulence, true `prev_sdt` (`[sim + 0x108]`) relative drag velocity,
+/// and 30-FPS substep displacement parity inside turbulence.
+bool HookClothDirWind() {
+    if (!ClothFixEnabled() && !ClothWindOffEnabled()) {
+        return false;
+    }
+    constexpr u8 pro6[6] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57};
+    Emitter e;
+    e.JmpAbs(reinterpret_cast<u64>(&SprjDirWindHook));
+    return Detour(0x1053b90, pro6, sizeof(pro6), e);
+}
+
+constexpr u64 kWindSeedOverrideTag = 0x5eed000100000000ULL;
+
+/// Evaluates `sub_10522f0` (`0x10522f0`) at discrete 30 Hz seeds `(seed0, seed1)` (thread-safely
+/// passing the tagged seed via `rdx -> r13` with +0 B TLS) and smoothstep-blends the OUTPUT 3D
+/// wind vector (`BlendClothWindVectors3D`), keeping exact 30-FPS wind frequency at any frame rate.
+__m128 PS4_SYSV_ABI SprjWindEvalWorldDirHook(const u8* self, const u8* wind_handle) noexcept {
+    using EvalFn = __m128(PS4_SYSV_ABI*)(const u8*, const u8*, u64);
+    const auto orig_eval = reinterpret_cast<EvalFn>(image_base + 0x10522f0);
+    if (!live || !ClothWindSeedEnabled()) {
+        return orig_eval(self, wind_handle, 0ULL);
+    }
+    const std::uint32_t seed0 = live->cloth_wind_seed30;
+    const std::uint32_t seed1 = live->cloth_wind_seed1;
+    const float smooth = live->cloth_wind_smooth;
+    const __m128 m0 = orig_eval(self, wind_handle, kWindSeedOverrideTag | u64(seed0));
+    if (!(smooth > 1e-6f && smooth < 1.0f)) {
+        return m0;
+    }
+    const __m128 m1 = orig_eval(self, wind_handle, kWindSeedOverrideTag | u64(seed1));
+    alignas(16) float v0[4]{};
+    alignas(16) float v1[4]{};
+    alignas(16) float out[4]{};
+    _mm_store_ps(v0, m0);
+    _mm_store_ps(v1, m1);
+    if (ClothTraceEnabled()) {
+        const float dx = v1[0] - v0[0];
+        const float dy = v1[1] - v0[1];
+        const float dz = v1[2] - v0[2];
+        const double dv = std::sqrt(double(dx) * double(dx) + double(dy) * double(dy) + double(dz) * double(dz));
+        if (std::isfinite(dv)) {
+            cloth_trace.wind_dv01_sum_mm_s.fetch_add(
+                static_cast<std::uint64_t>(dv * 1000.0), std::memory_order_relaxed);
+            cloth_trace.wind_dv01_samples.fetch_add(1u, std::memory_order_relaxed);
+        }
+    }
+    BbClothInterp::BlendClothWindVectors3D(v0, v1, smooth, out);
+    return _mm_load_ps(out);
+}
+
+void PS4_SYSV_ABI OnPointWindPrepareSeed(u8* frame, float raw_seed_f) noexcept {
+    const std::int32_t pass = *reinterpret_cast<const std::int32_t*>(frame - 0x1dc);
+    if (!live || !ClothWindSeedEnabled()) {
+        *reinterpret_cast<std::int32_t*>(frame - 0xd8) = static_cast<std::int32_t>(raw_seed_f);
+        *reinterpret_cast<float*>(frame - 0x1d8) = 0.0f;
+        return;
+    }
+    if (pass == 0) {
+        *reinterpret_cast<std::int32_t*>(frame - 0xd8) =
+            static_cast<std::int32_t>(live->cloth_wind_seed30);
+        *reinterpret_cast<std::int32_t*>(frame - 0x1d4) =
+            static_cast<std::int32_t>(live->cloth_wind_seed1);
+        *reinterpret_cast<float*>(frame - 0x1d8) = live->cloth_wind_smooth;
+    } else {
+        *reinterpret_cast<std::int32_t*>(frame - 0xd8) =
+            *reinterpret_cast<const std::int32_t*>(frame - 0x1d4);
+    }
+}
+
+void PS4_SYSV_ABI OnPointWindAfterEval(u8* frame) noexcept {
+    auto* pass = reinterpret_cast<std::int32_t*>(frame - 0x1dc);
+    const float smooth = *reinterpret_cast<const float*>(frame - 0x1d8);
+    float* dir_cur = reinterpret_cast<float*>(frame - 0x120);
+    float* spd_cur = reinterpret_cast<float*>(frame - 0x150);
+    if (*pass == 0) {
+        if (!(smooth > 1e-6f && smooth < 1.0f)) {
+            *pass = 0;
+            return;
+        }
+        std::memcpy(frame - 0x1d0, dir_cur, 16);
+        *reinterpret_cast<float*>(frame - 0x1e0) = *spd_cur;
+        *pass = 1;
+        return;
+    }
+    const float* dir0 = reinterpret_cast<const float*>(frame - 0x1d0);
+    const float spd0 = *reinterpret_cast<const float*>(frame - 0x1e0);
+    float out_spd = *spd_cur;
+    alignas(16) float out_dir[4]{};
+    BbClothInterp::BlendClothPointWindSpeedAndDir(
+        spd0, dir0, *spd_cur, dir_cur, smooth, &out_spd, out_dir);
+    *spd_cur = out_spd;
+    std::memcpy(dir_cur, out_dir, 16);
+    *pass = 0;
+}
+
+/// Replaces both 1000 Hz wind evaluators (`sub_10522f0` called at `0x1052200` and `SprjPointWind`
+/// `0x1052af0`) with discrete 30 Hz `(seed0, seed1)` OUTPUT vector/speed smoothstep blending, plus
+/// `prev_sdt = [sim + 0x108]` particle velocity guard in `SprjPointWind` (`0x10532f2`).
+int HookClothWindEval() {
+    if (!ClothFixEnabled()) {
+        return 0;
+    }
+    int hooked = 0;
+
+    if (ClothWindSeedEnabled()) {
+        // 1. sub_10522f0: save tagged 3rd arg rdx -> r13 (0x1052304), apply at seed site (0x1052363),
+        //    and redirect sole caller (0x1052200: call 0x10522f0) to SprjWindEvalWorldDirHook.
+        constexpr u8 exp_save6[6] = {0x49, 0x89, 0xf7, 0x48, 0x89, 0xfb}; // mov r15,rsi; mov rbx,rdi
+        constexpr u8 exp_seed11[11] = {
+            0xc4, 0xe1, 0xfa, 0x2c, 0xf0,             // vcvttss2si rsi, xmm0
+            0x89, 0xb5, 0x28, 0xff, 0xff, 0xff,       // mov [rbp - 0xd8], esi
+        };
+        constexpr u8 exp_call5[5] = {0xe8, 0xeb, 0x00, 0x00, 0x00}; // call 0x10522f0
+        u8* call_code = reinterpret_cast<u8*>(image_base + 0x1052200);
+        if (std::memcmp(reinterpret_cast<const u8*>(image_base + 0x1052304), exp_save6, 6) == 0 &&
+            std::memcmp(reinterpret_cast<const u8*>(image_base + 0x1052363), exp_seed11, 11) == 0 &&
+            std::memcmp(call_code, exp_call5, 5) == 0) {
+            Emitter e_save;
+            e_save.Bytes({0x49, 0x89, 0xf7, 0x48, 0x89, 0xfb}); // mov r15, rsi; mov rbx, rdi
+            e_save.Bytes({0x49, 0x89, 0xd5});                   // mov r13, rdx
+            e_save.JmpAbs(image_base + 0x105230a);
+
+            Emitter e_seed;
+            e_seed.Bytes({0x4c, 0x89, 0xe8});                   // mov rax, r13
+            e_seed.Bytes({0x48, 0xc1, 0xe8, 0x20});             // shr rax, 32
+            e_seed.Bytes({0x3d, 0x01, 0x00, 0xed, 0x5e});       // cmp eax, 0x5eed0001
+            e_seed.Bytes({0x75, 0x05});                         // jne fallback (+5)
+            e_seed.Bytes({0x49, 0x63, 0xf5});                   // movsxd rsi, r13d
+            e_seed.Bytes({0xeb, 0x05});                         // jmp store (+5)
+            e_seed.Bytes({0xc4, 0xe1, 0xfa, 0x2c, 0xf0});       // fallback: vcvttss2si rsi, xmm0
+            e_seed.Bytes({0x89, 0xb5, 0x28, 0xff, 0xff, 0xff}); // store: mov [rbp - 0xd8], esi
+            e_seed.JmpAbs(image_base + 0x105236e);
+
+            Emitter e_call;
+            e_call.JmpAbs(reinterpret_cast<u64>(&SprjWindEvalWorldDirHook));
+            if (Detour(0x1052304, exp_save6, 6, e_save) &&
+                Detour(0x1052363, exp_seed11, 11, e_seed) &&
+                !e_call.overflow && stub_used + e_call.size <= StubPageSize) {
+                u8* stub = stub_page + stub_used;
+                const std::int64_t rel =
+                    std::int64_t(reinterpret_cast<u64>(stub)) - std::int64_t(image_base + 0x1052205);
+                if (rel == std::int32_t(rel)) {
+                    std::memcpy(stub, e_call.code.data(), e_call.size);
+                    stub_used += (e_call.size + 15) & ~std::size_t(15);
+                    const std::int32_t rel32 = std::int32_t(rel);
+                    Writable(reinterpret_cast<u64>(call_code), 5);
+                    call_code[0] = 0xe8;
+                    std::memcpy(call_code + 1, &rel32, 4);
+                    ++hooked;
+                }
+            }
+        }
+
+        // 2. SprjPointWind (0x1052af0): 2-pass discrete (seed0, seed1) output speed+dir blend
+        //    using untouched stack slots [rbp - 0x1d0 .. rbp - 0x1e0] prior to 0x10533d2.
+        constexpr u8 exp_pw_init10[10] = {
+            0xc7, 0x85, 0x28, 0xff, 0xff, 0xff, 0x15, 0xcd, 0x5b, 0x07, // mov dword [rbp-0xd8], 0x75bcd15
+        };
+        constexpr u8 exp_pw_seed11[11] = {
+            0xc4, 0xe1, 0xfa, 0x2c, 0xf0,             // vcvttss2si rsi, xmm0
+            0x89, 0xb5, 0x28, 0xff, 0xff, 0xff,       // mov [rbp - 0xd8], esi
+        };
+        constexpr u8 exp_pw_post11[11] = {
+            0xc5, 0xf8, 0x29, 0x85, 0xe0, 0xfe, 0xff, 0xff, // vmovaps [rbp - 0x120], xmm0
+            0x4c, 0x89, 0xf7,                               // mov rdi, r14
+        };
+        if (std::memcmp(reinterpret_cast<const u8*>(image_base + 0x1052b49), exp_pw_init10, 10) == 0 &&
+            std::memcmp(reinterpret_cast<const u8*>(image_base + 0x1052b84), exp_pw_seed11, 11) == 0 &&
+            std::memcmp(reinterpret_cast<const u8*>(image_base + 0x1053200), exp_pw_post11, 11) == 0) {
+            Emitter e_init;
+            e_init.Bytes({0xc7, 0x85, 0x24, 0xfe, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00}); // mov dword [rbp-0x1dc], 0
+            for (const u8 b : exp_pw_init10) e_init.Bytes({b});
+            e_init.JmpAbs(image_base + 0x1052b53);
+
+            Emitter e_pw_seed;
+            e_pw_seed.SaveVolatile();
+            e_pw_seed.SaveXmm();
+            e_pw_seed.Bytes({0x48, 0x89, 0xef}); // mov rdi, rbp (xmm0 holds raw_seed_f)
+            e_pw_seed.CallAbs(reinterpret_cast<const void*>(&OnPointWindPrepareSeed));
+            e_pw_seed.RestoreXmm();
+            e_pw_seed.RestoreVolatile();
+            e_pw_seed.Bytes({0x48, 0x63, 0xb5, 0x28, 0xff, 0xff, 0xff}); // movsxd rsi, [rbp - 0xd8]
+            e_pw_seed.JmpAbs(image_base + 0x1052b8f);
+
+            Emitter e_pw_post;
+            e_pw_post.Bytes({0xc5, 0xf8, 0x29, 0x85, 0xe0, 0xfe, 0xff, 0xff}); // vmovaps [rbp-0x120], xmm0
+            e_pw_post.SaveVolatile();
+            e_pw_post.SaveXmm();
+            e_pw_post.Bytes({0x48, 0x89, 0xef}); // mov rdi, rbp
+            e_pw_post.CallAbs(reinterpret_cast<const void*>(&OnPointWindAfterEval));
+            e_pw_post.RestoreXmm();
+            e_pw_post.RestoreVolatile();
+            e_pw_post.Bytes({0x83, 0xbd, 0x24, 0xfe, 0xff, 0xff, 0x01}); // cmp dword [rbp-0x1dc], 1
+            e_pw_post.Bytes({0x74, 0x11});                               // je loop_pass1 (+17 B)
+            e_pw_post.Bytes({0x4c, 0x89, 0xf7});                         // mov rdi, r14 (3 B)
+            e_pw_post.JmpAbs(image_base + 0x105320b);                    // 14 B
+            e_pw_post.JmpAbs(image_base + 0x1052b53);                    // loop_pass1
+            if (Detour(0x1052b49, exp_pw_init10, 10, e_init) &&
+                Detour(0x1052b84, exp_pw_seed11, 11, e_pw_seed) &&
+                Detour(0x1053200, exp_pw_post11, 11, e_pw_post)) {
+                ++hooked;
+            }
+        }
+    }
+
+    // 3. Fix SprjPointWind's particle velocity interval (0x10532f2: vdivss xmm10, xmm1, [rbp - 0x160])
+    //    to use `[sim + 0x108]` (prev_sdt) when valid.
+    constexpr u8 expected8[8] = {0xc5, 0x72, 0x5e, 0x95, 0xa0, 0xfe, 0xff, 0xff};
+    Emitter e_vel;
+    e_vel.Bytes({0x8b, 0x81, 0x08, 0x01, 0x00, 0x00}); // mov eax, dword ptr [rcx + 0x108]
+    e_vel.Bytes({0x3d, 0xac, 0xc5, 0x27, 0x37});       // cmp eax, 0x3727c5ac (1e-5f)
+    const std::size_t jbe_disp = e_vel.size + 1;
+    e_vel.Bytes({0x76, 0x00});                         // jbe fallback
+    e_vel.Bytes({0x3d, 0xcd, 0xcc, 0x4c, 0x3e});       // cmp eax, 0x3e4ccccd (0.2f)
+    const std::size_t jae_disp = e_vel.size + 1;
+    e_vel.Bytes({0x73, 0x00});                         // jae fallback
+    e_vel.Bytes({0xc5, 0x79, 0x6e, 0xd0});             // vmovd xmm10, eax
+    const std::size_t jmp_disp = e_vel.size + 1;
+    e_vel.Bytes({0xeb, 0x00});                         // jmp divide
+    const std::size_t fallback_off = e_vel.size;
+    e_vel.code[jbe_disp] = static_cast<u8>(fallback_off - (jbe_disp + 1));
+    e_vel.code[jae_disp] = static_cast<u8>(fallback_off - (jae_disp + 1));
+    e_vel.Bytes({0xc5, 0x7a, 0x10, 0x95, 0xa0, 0xfe, 0xff, 0xff}); // vmovss xmm10, dword ptr [rbp - 0x160]
+    const std::size_t divide_off = e_vel.size;
+    e_vel.code[jmp_disp] = static_cast<u8>(divide_off - (jmp_disp + 1));
+    e_vel.Bytes({0xc4, 0x41, 0x72, 0x5e, 0xd2});       // vdivss xmm10, xmm1, xmm10
+    e_vel.JmpAbs(image_base + 0x10532fa);
+    if (Detour(0x10532f2, expected8, sizeof(expected8), e_vel)) {
+        ++hooked;
     }
     return hooked;
 }
 
+using ClothStageFn = void(PS4_SYSV_ABI*)(u8*, u8*, u8*, float);
+using ClothXferFn = void(PS4_SYSV_ABI*)(u8*, u8*, const void*, const void*, float);
+ClothStageFn orig_cloth_integrate = nullptr;
+ClothStageFn orig_cloth_collide = nullptr;
+ClothXferFn orig_cloth_xfer = nullptr;
+
+void PS4_SYSV_ABI TraceTransferMotion(u8* op, u8* sim, const void* prev_m, const void* cur_m,
+                                      float dt) noexcept {
+    if (!orig_cloth_xfer) {
+        return;
+    }
+    if (!ClothTraceEnabled() || !sim) {
+        orig_cloth_xfer(op, sim, prev_m, cur_m, dt);
+        return;
+    }
+    float pre_xyz[512 * 3];
+    const int snap_n = TraceSnapshotFreeParticles(sim, pre_xyz, 512);
+    orig_cloth_xfer(op, sim, prev_m, cur_m, dt);
+    cloth_trace.xfer_calls.fetch_add(1u, std::memory_order_relaxed);
+    if (snap_n > 0) {
+        const u8* sim_data = *reinterpret_cast<const u8* const*>(sim + 0x10);
+        const float* cur = *reinterpret_cast<const float* const*>(sim + 0x18);
+        if (sim_data && cur) {
+            const float* pdatas = *reinterpret_cast<const float* const*>(sim_data + 0x38);
+            const std::int32_t np = *reinterpret_cast<const std::int32_t*>(sim_data + 0x40);
+            if (pdatas && np >= snap_n) {
+                double sum_m = 0.0, max_m = 0.0;
+                int free_cnt = 0;
+                for (int i = 0; i < snap_n; ++i) {
+                    if (!(pdatas[i * 4 + 1] > 0.0f)) continue;
+                    const float dx = cur[i * 4 + 0] - pre_xyz[i * 3 + 0];
+                    const float dy = cur[i * 4 + 1] - pre_xyz[i * 3 + 1];
+                    const float dz = cur[i * 4 + 2] - pre_xyz[i * 3 + 2];
+                    const double d = std::sqrt(double(dx) * double(dx) + double(dy) * double(dy) +
+                                               double(dz) * double(dz));
+                    if (std::isfinite(d) && d < 2.0) {
+                        sum_m += d;
+                        if (d > max_m) max_m = d;
+                        ++free_cnt;
+                    }
+                }
+                if (free_cnt > 0) {
+                    cloth_trace.xfer_um_sum.fetch_add(
+                        static_cast<std::uint64_t>((sum_m / double(free_cnt)) * 1'000'000.0),
+                        std::memory_order_relaxed);
+                    TraceUpdateAtomicMaxU32(
+                        cloth_trace.xfer_max_um,
+                        static_cast<std::uint32_t>(std::min(max_m * 1'000'000.0, 999999.0)));
+                }
+            }
+        }
+    }
+}
+
+void PS4_SYSV_ABI TraceIntegrate(u8* op, u8* ctx, u8* sim, float sdt) noexcept {
+    if (!orig_cloth_integrate) {
+        return;
+    }
+    if (!ClothTraceEnabled() || !sim) {
+        orig_cloth_integrate(op, ctx, sim, sdt);
+        return;
+    }
+    float pre_xyz[512 * 3];
+    float inertial_xyz[512 * 3];
+    const int snap_n = TraceSnapshotFreeParticles(sim, pre_xyz, 512);
+    if (snap_n > 0) {
+        const float* prv = *reinterpret_cast<const float* const*>(sim + 0x28);
+        const float eff_damp = *reinterpret_cast<const float*>(sim + 0x10c);
+        if (prv) {
+            for (int i = 0; i < snap_n; ++i) {
+                inertial_xyz[i * 3 + 0] = pre_xyz[i * 3 + 0] + eff_damp * (pre_xyz[i * 3 + 0] - prv[i * 4 + 0]);
+                inertial_xyz[i * 3 + 1] = pre_xyz[i * 3 + 1] + eff_damp * (pre_xyz[i * 3 + 1] - prv[i * 4 + 1]);
+                inertial_xyz[i * 3 + 2] = pre_xyz[i * 3 + 2] + eff_damp * (pre_xyz[i * 3 + 2] - prv[i * 4 + 2]);
+            }
+        }
+    }
+    orig_cloth_integrate(op, ctx, sim, sdt);
+    if (snap_n > 0) {
+        TraceRecordStageDelta(0, sim, pre_xyz, snap_n, sdt);
+        TraceRecordStageDelta(7, sim, inertial_xyz, snap_n, sdt);
+    }
+}
+
+void PS4_SYSV_ABI TraceCollide(u8* op, u8* ctx, u8* sim, float sdt) noexcept {
+    if (!orig_cloth_collide) {
+        return;
+    }
+    if ((ClothSkipMask() & (1u << 6)) != 0u) {
+        return;
+    }
+    if (!ClothTraceEnabled() || !sim) {
+        orig_cloth_collide(op, ctx, sim, sdt);
+        return;
+    }
+    float pre_xyz[512 * 3];
+    const int snap_n = TraceSnapshotFreeParticles(sim, pre_xyz, 512);
+    orig_cloth_collide(op, ctx, sim, sdt);
+    if (snap_n > 0) {
+        TraceRecordStageDelta(6, sim, pre_xyz, snap_n, sdt);
+    }
+}
+
+bool HookClothStageTrampoline(u64 site, const u8* expected6, const void* wrapper,
+                              ClothStageFn* orig_out) {
+    if (std::memcmp(reinterpret_cast<const u8*>(image_base + site), expected6, 6) != 0) {
+        return false;
+    }
+    Emitter tramp;
+    for (int i = 0; i < 6; ++i) tramp.Bytes({expected6[i]});
+    tramp.JmpAbs(image_base + site + 6);
+    if (tramp.overflow || stub_used + tramp.size + 64 > StubPageSize) {
+        return false;
+    }
+    u8* tramp_addr = stub_page + stub_used;
+    std::memcpy(tramp_addr, tramp.code.data(), tramp.size);
+    stub_used += (tramp.size + 15) & ~std::size_t(15);
+    *orig_out = reinterpret_cast<ClothStageFn>(tramp_addr);
+    Emitter e;
+    e.JmpAbs(reinterpret_cast<u64>(wrapper));
+    if (!Detour(site, expected6, 6, e)) {
+        *orig_out = nullptr;
+        return false;
+    }
+    return true;
+}
+
 int InstallClothTraceHooks() {
-    if (!ClothTraceEnabled()) return 0;
+    constexpr u8 std_pro6[6] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57};
+    const bool skip_col = (ClothSkipMask() & (1u << 6)) != 0u;
+    if (!ClothTraceEnabled()) {
+        if (skip_col) {
+            (void)HookClothStageTrampoline(0x774260, std_pro6, reinterpret_cast<const void*>(&TraceCollide),
+                                           &orig_cloth_collide);
+        }
+        return 0;
+    }
     auto hook_entry = [](u64 site, const u8* expected, std::size_t len, const void* fn) -> bool {
         Emitter e;
         e.SaveVolatile();
@@ -2080,7 +3367,6 @@ int InstallClothTraceHooks() {
         e.JmpAbs(image_base + site + len);
         return Detour(site, expected, len, e);
     };
-    constexpr u8 std_pro6[6] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57};
     constexpr u8 fd4_wind5[5] = {0xc5, 0xfa, 0x11, 0x47, 0x38};
     constexpr u8 simp_wind9[9] = {0x48, 0x8b, 0x46, 0x10, 0xc5, 0xfa, 0x10, 0x48, 0x78};
     int n = 0;
@@ -2091,9 +3377,25 @@ int InstallClothTraceHooks() {
     if (hook_entry(0xfd8350, std_pro6, 6, reinterpret_cast<const void*>(&ProbeAreaWindApply))) ++n;
     if (hook_entry(0x1051fa0, std_pro6, 6, reinterpret_cast<const void*>(&ProbeSprjWindApply))) ++n;
     if (hook_entry(0x1052af0, std_pro6, 6, reinterpret_cast<const void*>(&ProbePointWindApply))) ++n;
-    if (hook_entry(0x1053b90, std_pro6, 6, reinterpret_cast<const void*>(&ProbeDirWindApply))) ++n;
+    if (cloth_dir_wind_hooked ||
+        hook_entry(0x1053b90, std_pro6, 6, reinterpret_cast<const void*>(&ProbeDirWindApply))) {
+        ++n;
+    }
     if (hook_entry(0x71fb60, simp_wind9, 9, reinterpret_cast<const void*>(&ProbeSimpleWindApply))) ++n;
-    std::printf("Frame rate: BB_CLOTH_TRACE=1 armed (%d/9 cloth+wind probes)\n", n);
+    if (HookClothStageTrampoline(0x773df0, std_pro6, reinterpret_cast<const void*>(&TraceIntegrate),
+                                 &orig_cloth_integrate)) {
+        ++n;
+    }
+    if (HookClothStageTrampoline(0x774260, std_pro6, reinterpret_cast<const void*>(&TraceCollide),
+                                 &orig_cloth_collide)) {
+        ++n;
+    }
+    if (HookClothStageTrampoline(0x771290, std_pro6, reinterpret_cast<const void*>(&TraceTransferMotion),
+                                 reinterpret_cast<ClothStageFn*>(&orig_cloth_xfer))) {
+        ++n;
+    }
+    std::printf("Frame rate: BB_CLOTH_TRACE=1 armed (%d/12 cloth+wind+stage probes, wind_off=%d, skip_mask=0x%x)\n",
+                n, ClothWindOffEnabled() ? 1 : 0, ClothSkipMask());
     return n;
 }
 
@@ -2158,8 +3460,11 @@ void PatchImage(unsigned char* image, std::uint64_t image_size) {
     const bool cloth = HookClothStiffness();
     const int cloth_friction = HookClothFriction();
     cloth_world_synced = HookClothWorldSync();
-    cloth_fixed30_hooked = cloth_world_synced && HookClothFixed30();
-    const int cloth_wind_seed = HookClothWindSeed();
+    const bool cloth_prestep_hooked = HookClothPreStep();
+    cloth_fixed30_hooked = cloth_world_synced && cloth_prestep_hooked && HookClothFixed30();
+    const int cloth_r8_sites = HookClothSolveConstraintsUseFactor();
+    cloth_dir_wind_hooked = HookClothDirWind();
+    const int cloth_wind_eval = HookClothWindEval();
     (void)InstallClothTraceHooks();
     int redirected = 0;
     for (const Redirect& r : Redirects) {
@@ -2186,16 +3491,9 @@ void PatchImage(unsigned char* image, std::uint64_t image_size) {
     mprotect(stub_page, StubPageSize, PROT_READ | PROT_EXEC);
     std::printf("Frame rate: the model preview turns %.5f rad per stick unit per 30 FPS frame\n",
                 model_turn_base);
-    const bool cloth_fix_on = [] {
-        const char* env = std::getenv("BB_CLOTH_FIX");
-        return !(env && env[0] == '0' && env[1] == '\0');
-    }();
-    const float logged_cloth_exp = [&] {
-        const char* env = std::getenv("BB_CLOTH_EXP");
-        const float v = env && *env ? std::strtof(env, nullptr) : -1.0f;
-        if (v > 0.0f && v <= 3.0f) return v;
-        return cloth_fix_on ? 2.0f : -cloth_exponent;
-    }();
+    const bool cloth_fix_on = ClothFixEnabled();
+    const float logged_cloth_exp =
+        ClothExpOverride() > 0.0f ? ClothExpOverride() : -cloth_exponent;
     const int logged_t5_mode = [&] {
         if (!cloth_fix_on) return 0;
         const char* env = std::getenv("BB_CLOTH_TYPE5");
@@ -2204,7 +3502,8 @@ void PatchImage(unsigned char* image, std::uint64_t image_size) {
     std::printf("Frame rate: free (hooks, no patches): the game steps by each frame's time "
                 "(pacer=%s%s, sim=1/%d..1/30 s); %d fixed steps, %d of %zu per-frame values follow the frame's "
                 "time, foliage sway=%s, pacer usleep spin=%d/3, the run's wall check %s, "
-                "cloth=%s (stiffness %s, exp=%.3f, type5=%d, friction=%d/17, world_dt_sync=%s, wind_seed30=%d/2)\n",
+                "cloth=%s (stiffness %s, exp=%.3f, type5=%d [r8=%d/2], friction=%d/17, world_dt_sync=%s, "
+                "dir_wind=%s, wind_eval=%d/3, pbd_damp=%.2f, post_col=%d)\n",
                 live->shortest > 0.0f ? "capped" : "truly uncapped (0.0 ms)",
                 pacer_wait_hooked ? " + monotonic-abstime" : "", MaxRate,
                 steps, redirected, std::size(Redirects),
@@ -2213,8 +3512,10 @@ void PatchImage(unsigned char* image, std::uint64_t image_size) {
                                                  : "unchanged (not found)",
                 cloth_fixed30_hooked ? "fixed30+interp" : "native",
                 cloth ? "by solves per second" : "per frame (not found)",
-                logged_cloth_exp, logged_t5_mode, cloth_friction,
-                cloth_world_synced ? "on" : "off", cloth_wind_seed);
+                logged_cloth_exp, logged_t5_mode, cloth_r8_sites, cloth_friction,
+                cloth_world_synced ? "on" : "off", cloth_dir_wind_hooked ? "native" : "orig",
+                cloth_wind_eval, (!cloth_fixed30_hooked && cloth_prestep_hooked) ? ClothDampRetention30() : 1.0f,
+                cloth_fixed30_hooked ? ClothPostCollideMode() : 0);
 }
 
 bool CleanPacerEnabled() noexcept {
@@ -2270,9 +3571,15 @@ std::uint64_t TargetPeriodNs() noexcept {
         return 0ull;
     }
     const float t = live->shortest;
-    return (t > 0.0f && std::isfinite(t))
-               ? static_cast<u64>(std::llround(double(t) * 1'000'000'000.0))
-               : 0ull;
+    const u64 raw_ns = (t > 0.0f && std::isfinite(t))
+                           ? static_cast<u64>(std::llround(double(t) * 1'000'000'000.0))
+                           : 0ull;
+    if (raw_ns > 0ull && BbStats::fg_active.load(std::memory_order_relaxed)) {
+        const u64 mult = static_cast<u64>(
+            std::clamp(BbStats::fg_multiplier.load(std::memory_order_relaxed), 1, 4));
+        return ComputeFgSimPeriodNs(raw_ns) / mult;
+    }
+    return raw_ns;
 }
 
 std::uint64_t PacerEpoch() noexcept {

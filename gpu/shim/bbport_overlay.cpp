@@ -30,6 +30,7 @@ extern "C" void runtime_wait_report(double frames);
 #include "bbport_game_menu.h"
 #include "bbport_guest_hooks.h"
 #include "bbport_frame_rate.h"
+#include "cloth_exp/cloth_exp_registry.h"
 
 namespace Vulkan {
 void StartSfxFireDump(u32 duration_ms = 5000u) noexcept;
@@ -43,6 +44,7 @@ void StartSfxFireDump(u32 duration_ms = 5000u) noexcept;
 #include "imgui.h"
 #include "imgui_impl_vulkan.h"
 #include "vulkan/instance.h"
+#include "vulkan/low_latency.h"
 #include "render/direct_shaders.h"
 #include "render/scheduler.h"
 #include "render/vk_gpu_profiler.h"
@@ -111,6 +113,120 @@ bool ToastActiveNow() {
                               std::chrono::steady_clock::now().time_since_epoch())
                               .count();
     return now < until;
+}
+
+// Bottom-left shader compilation indicator (startup WarmUp, background Auto-Bake,
+// and runtime async pipeline compilation bursts). Driven lock-free from BbStats atomics
+// and updated strictly on the present thread.
+struct ShaderCompilePillState {
+    bool showing = false;
+    std::uint32_t last_done = 0;
+    std::uint32_t last_total = 0;
+    std::uint32_t async_batch_base = 0;
+    long long async_burst_start_ns = 0;
+    long long fade_until_ns = 0;
+};
+ShaderCompilePillState compile_pill{};
+
+bool PollShaderCompilePill(long long now_ns, std::uint32_t& out_done, std::uint32_t& out_total,
+                           float& out_alpha) {
+    bool active_now = false;
+    std::uint32_t cur_done = 0;
+    std::uint32_t cur_total = 0;
+
+    // 1. Startup PSO/shader prewarm (WarmUp on bb:PsoPrewarm)
+    if (BbStats::shader_prewarm_active.load(std::memory_order_acquire)) {
+        const std::uint32_t t = BbStats::shader_prewarm_total.load(std::memory_order_relaxed);
+        const std::uint32_t d =
+            std::min(BbStats::shader_prewarm_done.load(std::memory_order_relaxed), t);
+        if (t > 0u) {
+            active_now = true;
+            cur_done = d;
+            cur_total = t;
+        }
+    }
+    // 2. Background Auto-Baker (compiling remaining game shaders / recipe perms)
+    if (!active_now && BbStats::shader_autobake_active.load(std::memory_order_acquire)) {
+        const std::uint32_t t = BbStats::shader_autobake_total.load(std::memory_order_relaxed);
+        const std::uint32_t d =
+            std::min(BbStats::shader_autobake_done.load(std::memory_order_relaxed), t);
+        if (t > 0u) {
+            active_now = true;
+            cur_done = d;
+            cur_total = t;
+        }
+    }
+    // 3. Runtime async PipelineCompiler bursts (only surface if >= 3 in-flight or active >= 120 ms)
+    {
+        const std::uint32_t sub = BbStats::shader_async_submitted.load(std::memory_order_relaxed);
+        const std::uint32_t cmp = BbStats::shader_async_completed.load(std::memory_order_relaxed);
+        const std::uint32_t pending = sub - cmp;
+        if (pending == 0u) {
+            if (compile_pill.async_burst_start_ns != 0) {
+                if (!active_now && compile_pill.showing) {
+                    const std::uint32_t bt = sub - compile_pill.async_batch_base;
+                    if (bt > 0u) {
+                        compile_pill.last_done = bt;
+                        compile_pill.last_total = bt;
+                    }
+                }
+                compile_pill.async_burst_start_ns = 0;
+            }
+            compile_pill.async_batch_base = cmp;
+        } else {
+            if (compile_pill.async_burst_start_ns == 0) {
+                compile_pill.async_burst_start_ns = now_ns;
+            }
+            if (!active_now) {
+                const std::uint32_t batch_total = sub - compile_pill.async_batch_base;
+                const std::uint32_t batch_done =
+                    std::min(cmp - compile_pill.async_batch_base, batch_total);
+                const bool long_enough =
+                    (now_ns - compile_pill.async_burst_start_ns) >= 120'000'000LL;
+                if (batch_total > 0u && (pending >= 3u || long_enough || compile_pill.showing)) {
+                    active_now = true;
+                    cur_done = batch_done;
+                    cur_total = batch_total;
+                }
+            }
+        }
+    }
+
+    constexpr long long kFadeNs = 450'000'000LL;
+    if (active_now) {
+        compile_pill.showing = true;
+        compile_pill.last_done = cur_done;
+        compile_pill.last_total = cur_total;
+        compile_pill.fade_until_ns = 0;
+        out_done = cur_done;
+        out_total = cur_total;
+        out_alpha = 1.0f;
+        return true;
+    }
+    if (compile_pill.showing) {
+        compile_pill.showing = false;
+        compile_pill.last_done = compile_pill.last_total;
+        compile_pill.fade_until_ns = now_ns + kFadeNs;
+    }
+    if (compile_pill.fade_until_ns > now_ns && compile_pill.last_total > 0u) {
+        const float rem =
+            float(double(compile_pill.fade_until_ns - now_ns) / double(kFadeNs));
+        out_done = compile_pill.last_done;
+        out_total = compile_pill.last_total;
+        out_alpha = std::clamp(rem, 0.0f, 1.0f);
+        return true;
+    }
+    compile_pill.fade_until_ns = 0;
+    return false;
+}
+
+bool ShaderCompilePillActiveNow() {
+    const long long now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                 std::chrono::steady_clock::now().time_since_epoch())
+                                 .count();
+    std::uint32_t done = 0, total = 0;
+    float alpha = 0.0f;
+    return PollShaderCompilePill(now_ns, done, total, alpha);
 }
 
 // Present rate for the FPS counter.
@@ -642,21 +758,64 @@ void Menu() {
         "До 1 — резкость самого апскейлера (RCAS). Выше 1 добавляется ещё один проход RCAS. "
         "Ctrl+клик по ползунку — ввести точное значение."));
     ImGui::EndDisabled();
-    // Frame generation: hidden until its artifacts are fixed (BB_FRAME_GEN=1 for tests).
-    if (std::getenv("BB_FRAME_GEN")) {
-        ImGui::BeginDisabled(!s.frame_generation_supported.load(std::memory_order_relaxed));
-        Checkbox(BbSettings::MenuText("Frame generation (FSR 3)", "Генерация кадров (FSR 3)"),
-                 s.frame_generation);
+    // Frame Generation (FSR 3.1 2x/3x/4x on any GPU; NVIDIA DLSS-G 2x on RTX 40+, 3x/4x on RTX 50+).
+    {
+        const bool is_ru = s.menu_language.load(std::memory_order_relaxed) ==
+                           BbSettings::MenuLanguage::Russian;
+        const bool fsr_sup = s.frame_generation_supported.load(std::memory_order_relaxed);
+        const bool dlssg_sup = s.dlssg_supported.load(std::memory_order_relaxed);
+        const int max_multi = std::max(0, s.dlssg_max_multi_frame.load(std::memory_order_relaxed));
+        std::vector<int> modes = {BbSettings::FrameGenOff};
+        if (fsr_sup) {
+            modes.push_back(BbSettings::FrameGenFsr3);
+            modes.push_back(BbSettings::FrameGenFsr3_3x);
+            modes.push_back(BbSettings::FrameGenFsr3_4x);
+        }
+        if (dlssg_sup) {
+            modes.push_back(BbSettings::FrameGenDlss2x);
+            if (max_multi >= 2) modes.push_back(BbSettings::FrameGenDlss3x);
+            if (max_multi >= 3) modes.push_back(BbSettings::FrameGenDlss4x);
+        }
+        std::vector<const char*> fg_labels;
+        fg_labels.reserve(modes.size());
+        const int eff = BbSettings::EffectiveFrameGen();
+        int fg_idx = 0;
+        for (int i = 0; i < int(modes.size()); ++i) {
+            fg_labels.push_back(BbSettings::FrameGenLabel(modes[i], is_ru));
+            if (modes[i] == eff) fg_idx = i;
+        }
+        const bool any_fg_sup = modes.size() > 1;
+        ImGui::BeginDisabled(!any_fg_sup);
+        if (ImGui::Combo(BbSettings::MenuText("Frame Generation", "Генерация кадров"), &fg_idx,
+                         fg_labels.data(), int(fg_labels.size()))) {
+            const int chosen = modes[std::clamp(fg_idx, 0, int(modes.size()) - 1)];
+            Store(s.frame_generation, chosen, true);
+            if (BbSettings::IsDlssFrameGen(chosen) &&
+                s.low_latency_backend.load(std::memory_order_relaxed) ==
+                    BbSettings::LowLatencyBackendNvReflex &&
+                s.low_latency.load(std::memory_order_relaxed) == BbSettings::LowLatencyOff) {
+                Store(s.low_latency, int(BbSettings::LowLatencyOn), true);
+            }
+            BbGuestHooks::ApplyGameEffects();
+            BbSettings::Save();
+            Vulkan::LowLatency::SyncModeIfChanged();
+            BbSysInfo::LogSettingsIfChanged();
+        }
         ImGui::EndDisabled();
-        if (const char* problem = s.frame_generation_problem.load(std::memory_order_relaxed)) {
-            Hint(problem);
+        if (!any_fg_sup) {
+            if (const char* problem = s.frame_generation_problem.load(std::memory_order_relaxed)) {
+                Hint(problem);
+            } else if (const char* dproblem = s.dlssg_problem.load(std::memory_order_relaxed)) {
+                Hint(dproblem);
+            }
         } else {
             Hint(BbSettings::MenuText(
-                "Shows a frame interpolated by FSR 3 between each two of the game's: twice the frames "
-                "on screen, a little more input lag. Works with every upscaler preset except Off.",
-                "Между каждыми двумя кадрами игры показывается кадр, интерполированный FSR 3: на "
-                "экране вдвое больше кадров, задержка ввода чуть выше. Работает со всеми пресетами "
-                "апскейлера, кроме «Выкл»."));
+                "Generates smooth intermediate frames (FSR 3.1 2x/3x/4x on any GPU; NVIDIA DLSS "
+                "2x/3x/4x on RTX 40/50+, automatically enables Reflex) with clean HUD separation. "
+                "With an FPS limit, base FPS automatically targets Limit / Multiplier.",
+                "Создаёт промежуточные кадры (FSR 3.1 2x/3x/4x на любой GPU; NVIDIA DLSS 2x/3x/4x "
+                "на RTX 40/50+, автоматически включает Reflex) с чистым HUD. При лимите FPS база "
+                "автоматически подбирается как Лимит / Множитель."));
         }
     }
     Checkbox(BbSettings::MenuText("Subpixel jitter", "Субпиксельный сдвиг (jitter)"), s.jitter);
@@ -775,6 +934,68 @@ void Menu() {
             s.vsync_mode_chosen = true;
             Store(s.vsync_mode, vs, true);
             s.swapchain_generation.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    {
+        const int ll_backend = s.low_latency_backend.load(std::memory_order_relaxed);
+        if (ll_backend == BbSettings::LowLatencyBackendNvReflex) {
+            const bool fg_forces_reflex =
+                BbSettings::IsDlssFrameGen(BbSettings::EffectiveFrameGen());
+            int eff_ll = Vulkan::LowLatency::EffectiveMode(
+                ll_backend, s.low_latency.load(std::memory_order_relaxed));
+            if (fg_forces_reflex) {
+                const char* ll_fg_labels[] = {
+                    BbSettings::MenuText("On (Required by DLSS FG)", "Вкл (нужно для DLSS FG)"),
+                    BbSettings::MenuText("On + Boost", "Вкл + Boost")};
+                int ll_idx = (eff_ll == BbSettings::LowLatencyBoost) ? 1 : 0;
+                if (ImGui::Combo(BbSettings::MenuText("NVIDIA Reflex", "NVIDIA Reflex"), &ll_idx,
+                                 ll_fg_labels, 2)) {
+                    const int next_ll =
+                        (ll_idx == 1) ? BbSettings::LowLatencyBoost : BbSettings::LowLatencyOn;
+                    Store(s.low_latency, next_ll, true);
+                    BbSettings::Save();
+                    Vulkan::LowLatency::SyncModeIfChanged();
+                    BbSysInfo::LogSettingsIfChanged();
+                }
+            } else {
+                const char* ll_labels[] = {
+                    BbSettings::MenuText("Off", "Выкл"),
+                    BbSettings::MenuText("On", "Вкл"),
+                    BbSettings::MenuText("On + Boost", "Вкл + Boost")};
+                int ll = std::clamp(s.low_latency.load(std::memory_order_relaxed), 0,
+                                    BbSettings::LowLatencyCount - 1);
+                if (ImGui::Combo(BbSettings::MenuText("NVIDIA Reflex", "NVIDIA Reflex"), &ll,
+                                 ll_labels, 3)) {
+                    Store(s.low_latency, ll, true);
+                    BbSettings::Save();
+                    Vulkan::LowLatency::SyncModeIfChanged();
+                    BbSysInfo::LogSettingsIfChanged();
+                }
+            }
+            const std::uint32_t pc_us =
+                BbStats::reflex_pc_latency_us.load(std::memory_order_relaxed);
+            if (eff_ll != BbSettings::LowLatencyOff && pc_us > 0) {
+                ImGui::SameLine();
+                ImGui::TextDisabled("(%.1f ms PC)", double(pc_us) / 1000.0);
+            }
+        } else if (ll_backend == BbSettings::LowLatencyBackendAmdAntiLag) {
+            const char* ll_labels[] = {
+                BbSettings::MenuText("Off", "Выкл"),
+                BbSettings::MenuText("On", "Вкл")};
+            int ll = s.low_latency.load(std::memory_order_relaxed) != BbSettings::LowLatencyOff ? 1 : 0;
+            if (ImGui::Combo(BbSettings::MenuText("AMD Anti-Lag 2", "AMD Anti-Lag 2"), &ll,
+                             ll_labels, 2)) {
+                Store(s.low_latency, ll, true);
+                BbSettings::Save();
+                Vulkan::LowLatency::SyncModeIfChanged();
+                BbSysInfo::LogSettingsIfChanged();
+            }
+        } else {
+            ImGui::BeginDisabled(true);
+            const char* unavail = BbSettings::MenuText("Unavailable", "Недоступно");
+            int zero = 0;
+            ImGui::Combo(BbSettings::MenuText("Low Latency", "Низкая задержка"), &zero, &unavail, 1);
+            ImGui::EndDisabled();
         }
     }
     Hint(BbSettings::MenuText(
@@ -1024,17 +1245,36 @@ void Menu() {
                 }
             }
         }
+        const int fg_mult = BbSettings::FrameGenMultiplier(BbSettings::EffectiveFrameGen());
+        const bool fg_ui = fg_mult > 1;
         auto format_fps_step = [&](int val) -> std::string {
             if (val < 0) {
                 if (mon_hz >= 30) {
-                    char buf[48];
-                    std::snprintf(buf, sizeof(buf), BbSettings::MenuText("Auto (%d Hz)", "Авто (%d Гц)"), mon_hz);
+                    char buf[64];
+                    if (fg_ui && mon_hz >= 60) {
+                        const int base_hz = std::max(30, mon_hz / fg_mult);
+                        std::snprintf(buf, sizeof(buf),
+                                      BbSettings::MenuText("Auto (%d -> %d Hz FG)", "Авто (%d -> %d Гц FG)"),
+                                      base_hz, base_hz * fg_mult);
+                    } else {
+                        std::snprintf(buf, sizeof(buf), BbSettings::MenuText("Auto (%d Hz)", "Авто (%d Гц)"), mon_hz);
+                    }
                     return buf;
                 }
                 return BbSettings::MenuText("Auto", "Авто");
             }
             if (val == 0) {
                 return BbSettings::MenuText("Uncapped (Unlimited)", "Без лимита (Анлимит)");
+            }
+            if (fg_ui) {
+                char buf[64];
+                if (mon_hz >= 60 && val >= mon_hz) {
+                    const int base_hz = std::max(30, val / fg_mult);
+                    std::snprintf(buf, sizeof(buf), "%d -> %d FPS (FG)", base_hz, base_hz * fg_mult);
+                } else {
+                    std::snprintf(buf, sizeof(buf), "%d -> %d FPS (FG)", val, val * fg_mult);
+                }
+                return buf;
             }
             return std::to_string(val);
         };
@@ -1292,6 +1532,53 @@ void Menu() {
     if (ImGui::CollapsingHeader(BbSettings::MenuText("Developer / Legacy A/B Debug",
                                                      "Отладка разработчика / Legacy A/B"))) {
         ImGui::Indent(12.0f);
+        {
+            bool cloth_exp_on = BbClothExp::Enabled();
+            if (ImGui::Checkbox(
+                    BbSettings::MenuText("Experimental Cloth Engine C++20 (Live A/B)",
+                                         "Экспериментальный движок ткани C++20 (на лету)"),
+                    &cloth_exp_on)) {
+                BbClothExp::SetEnabled(cloth_exp_on);
+            }
+            const int total_fn = static_cast<int>(BbClothExp::EntryCount());
+            const int hooked_fn = static_cast<int>(BbClothExp::InstalledHookCount());
+            int r_min = 0, r_max = std::max(0, total_fn - 1);
+            BbClothExp::GetActiveRange(r_min, r_max);
+            ImGui::SameLine();
+            ImGui::TextDisabled("(%d/%d hooked | calls: %llu)",
+                                hooked_fn, total_fn,
+                                static_cast<unsigned long long>(BbClothExp::TotalDispatchCount()));
+            if (cloth_exp_on && total_fn > 0) {
+                const auto* entries = BbClothExp::GetEntries();
+                bool range_changed = false;
+                if (ImGui::SliderInt(BbSettings::MenuText("Cloth C++ Min Index",
+                                                          "Мин. индекс функции ткани"),
+                                     &r_min, 0, total_fn - 1)) {
+                    r_max = std::max(r_max, r_min);
+                    range_changed = true;
+                }
+                if (ImGui::SliderInt(BbSettings::MenuText("Cloth C++ Max Index",
+                                                          "Макс. индекс функции ткани"),
+                                     &r_max, 0, total_fn - 1)) {
+                    r_min = std::min(r_min, r_max);
+                    range_changed = true;
+                }
+                if (range_changed) {
+                    BbClothExp::SetActiveRange(r_min, r_max);
+                }
+                ImGui::TextDisabled("[%d] 0x%07llx %s  ..  [%d] 0x%07llx %s",
+                                    r_min, static_cast<unsigned long long>(entries[r_min].vma),
+                                    entries[r_min].name,
+                                    r_max, static_cast<unsigned long long>(entries[r_max].vma),
+                                    entries[r_max].name);
+            }
+            Hint(BbSettings::MenuText(
+                "Isolated 1:1 decompiled C++20 Havok Cloth + Wind module (gpu/cloth_exp/). "
+                "Switches live on the next frame with zero restart; use Min/Max sliders for binary bisection.",
+                "Изолированный C++20 модуль ткани и ветра (gpu/cloth_exp/). "
+                "Переключается мгновенно на следующем кадре без перезапуска; ползунки Min/Max — для бинарного поиска."));
+            ImGui::Spacing();
+        }
         Checkbox(BbSettings::MenuText("Native Vulkan PostFX (uncheck for Legacy Yebis2 A/B)",
                                       "Нативный Vulkan PostFX (снять для Legacy Yebis2 A/B)"),
                  s.native_postfx);
@@ -1392,6 +1679,7 @@ void Menu() {
 struct HudSampleSlot {
     std::chrono::steady_clock::time_point end_time{};
     std::uint64_t frames = 0;
+    std::uint64_t fg_frames = 0;
     double time_s = 0.0;
     double present_ms_sum = 0.0;
     double present_ms_sq_sum = 0.0;
@@ -1468,6 +1756,7 @@ struct HudSlidingWindow {
         for (std::size_t i = 0; i < count; ++i) {
             const HudSampleSlot& s = slots[(start + i) % kSlots];
             sum.frames += s.frames;
+            sum.fg_frames += s.fg_frames;
             sum.time_s += s.time_s;
             sum.present_ms_sum += s.present_ms_sum;
             sum.present_ms_sq_sum += s.present_ms_sq_sum;
@@ -1534,8 +1823,14 @@ struct HudSlidingWindow {
 struct HudBreakdown {
     float fps = 0.0f;
     float frame_ms = 0.0f;
+    float base_fps = 0.0f;
     float avg_fps = 0.0f;
     float avg_frame_ms = 0.0f;
+    float avg_base_fps = 0.0f;
+    bool fg_active = false;
+    int fg_mult = 1;
+    int fg_backend = 0;
+    float fg_hudless_pct = 0.0f;
     float jitter_ms = 0.0f;
     float avg_jitter_ms = 0.0f;
     float window_s = 0.0f;
@@ -2060,7 +2355,9 @@ private:
             const auto now = Clock::now();
             if (now >= next_sensor_poll) {
                 do_sensors = true;
-                const int poll_ms = Visible() ? 2000 : 5000;
+                const bool hud_or_menu =
+                    Visible() || BbSettings::Get().show_fps.load(std::memory_order_relaxed);
+                const int poll_ms = hud_or_menu ? 1500 : 5000;
                 next_sensor_poll = now + std::chrono::milliseconds(poll_ms);
             }
 
@@ -2280,6 +2577,8 @@ void UpdateHudBreakdown(HudBreakdown& h) {
     static Clock::time_point last_file_dump{};
     static std::uint64_t last_tsc = 0;
     static std::uint64_t last_frames = 0;
+    static std::uint64_t last_fg_frames = 0;
+    static std::uint64_t last_fg_hudless = 0, last_fg_dispatches = 0;
     static std::uint64_t last_draws = 0, last_dispatches = 0, last_submits = 0;
     static std::uint64_t last_idle_ns = 0, last_gnm_wait_ns = 0;
     static std::uint64_t last_main_cpu_ns = 0, last_main_cpu_frames = 0;
@@ -2309,6 +2608,9 @@ void UpdateHudBreakdown(HudBreakdown& h) {
         last_file_dump = now;
         last_tsc = tsc;
         last_frames = cur_frames;
+        last_fg_frames = BbStats::fg_interpolated_frames.load(std::memory_order_relaxed);
+        last_fg_hudless = BbStats::fg_hudless_frames.load(std::memory_order_relaxed);
+        last_fg_dispatches = BbStats::fg_total_dispatches.load(std::memory_order_relaxed);
         last_draws = BbStats::draws.load(std::memory_order_relaxed);
         last_dispatches = BbStats::dispatches.load(std::memory_order_relaxed);
         last_submits = Vulkan::Scheduler::recorded_submissions.load(std::memory_order_relaxed);
@@ -2477,8 +2779,32 @@ void UpdateHudBreakdown(HudBreakdown& h) {
     const std::uint64_t dds = safe_delta(cur_desc_saved, last_desc_saved);
     const std::uint64_t ddt = safe_delta(cur_desc_total, last_desc_total);
 
-    h.fps = float(double(df) / dt);
-    h.frame_ms = float((dt * 1000.0) * inv_f);
+    const std::uint64_t cur_fg_frames =
+        BbStats::fg_interpolated_frames.load(std::memory_order_relaxed);
+    const std::uint64_t cur_fg_hudless =
+        BbStats::fg_hudless_frames.load(std::memory_order_relaxed);
+    const std::uint64_t cur_fg_dispatches =
+        BbStats::fg_total_dispatches.load(std::memory_order_relaxed);
+    const std::uint64_t d_fg = safe_delta(cur_fg_frames, last_fg_frames);
+    const std::uint64_t d_fg_hudless = safe_delta(cur_fg_hudless, last_fg_hudless);
+    const std::uint64_t d_fg_disp = safe_delta(cur_fg_dispatches, last_fg_dispatches);
+    last_fg_frames = cur_fg_frames;
+    last_fg_hudless = cur_fg_hudless;
+    last_fg_dispatches = cur_fg_dispatches;
+
+    const std::uint64_t disp_frames = df + d_fg;
+    h.base_fps = float(double(df) / dt);
+    h.fps = float(double(disp_frames) / dt);
+    h.frame_ms = float((dt * 1000.0) / double(disp_frames));
+    h.fg_active = d_fg > 0;
+    h.fg_mult =
+        h.fg_active ? std::clamp(BbStats::fg_multiplier.load(std::memory_order_relaxed), 2, 4) : 1;
+    h.fg_backend = h.fg_active ? BbStats::fg_backend.load(std::memory_order_relaxed) : 0;
+    if (d_fg_disp > 0) {
+        h.fg_hudless_pct = float(100.0 * double(d_fg_hudless) / double(d_fg_disp));
+    } else if (!h.fg_active) {
+        h.fg_hudless_pct = 0.0f;
+    }
     if (present_ms_count_accum > 1) {
         const double mean_p = present_ms_sum_accum / double(present_ms_count_accum);
         const double var_p =
@@ -2772,6 +3098,7 @@ void UpdateHudBreakdown(HudBreakdown& h) {
         HudSampleSlot s{};
         s.end_time = now;
         s.frames = df;
+        s.fg_frames = d_fg;
         s.time_s = dt;
         s.present_ms_sum = present_ms_sum_accum;
         s.present_ms_sq_sum = present_ms_sq_sum_accum;
@@ -2835,10 +3162,12 @@ void UpdateHudBreakdown(HudBreakdown& h) {
 
     if (win.sum.frames > 0 && win.sum.time_s > 0.0) {
         const double inv_af = 1.0 / double(win.sum.frames);
+        const std::uint64_t sum_disp = win.sum.frames + win.sum.fg_frames;
         h.has_avg = true;
         h.window_s = float(win.sum.time_s);
-        h.avg_fps = float(double(win.sum.frames) / win.sum.time_s);
-        h.avg_frame_ms = float((win.sum.time_s * 1000.0) * inv_af);
+        h.avg_base_fps = float(double(win.sum.frames) / win.sum.time_s);
+        h.avg_fps = float(double(sum_disp) / win.sum.time_s);
+        h.avg_frame_ms = float((win.sum.time_s * 1000.0) / double(sum_disp));
         if (win.sum.present_ms_count > 1) {
             const double mean_p = win.sum.present_ms_sum / double(win.sum.present_ms_count);
             const double var_p = std::max(
@@ -2914,6 +3243,7 @@ void UpdateHudBreakdown(HudBreakdown& h) {
     } else {
         h.has_avg = false;
         h.window_s = 0.0f;
+        h.avg_base_fps = h.base_fps;
         h.avg_fps = h.fps;
         h.avg_frame_ms = h.frame_ms;
         h.avg_jitter_ms = h.jitter_ms;
@@ -2980,19 +3310,19 @@ void UpdateHudBreakdown(HudBreakdown& h) {
             h.hw_gpu_busy_ms >= stage_a_work_ms) {
             h.bottleneck_ms = h.hw_gpu_busy_ms;
             h.avg_bottleneck_ms = h.avg_hw_gpu_busy_ms;
-            h.bottleneck_en = "FPS Cap Active (Max: GPU Shaders)";
+            h.bottleneck_en = "FPS Cap (Max: GPU)";
         } else if (game_cpu_bound_ms >= stage_b_work_ms && game_cpu_bound_ms >= stage_a_work_ms) {
             h.bottleneck_ms = game_cpu_bound_ms;
             h.avg_bottleneck_ms = h.avg_game_cpu_work_ms;
-            h.bottleneck_en = "FPS Cap Active (Max: Game CPU)";
+            h.bottleneck_en = "FPS Cap (Max: Game CPU)";
         } else if (stage_b_work_ms >= stage_a_work_ms) {
             h.bottleneck_ms = stage_b_work_ms;
             h.avg_bottleneck_ms = h.avg_b_total_ms;
-            h.bottleneck_en = "FPS Cap Active (Max: Stage B)";
+            h.bottleneck_en = "FPS Cap (Max: Stage B)";
         } else {
             h.bottleneck_ms = stage_a_work_ms;
             h.avg_bottleneck_ms = avg_stage_a_work_ms;
-            h.bottleneck_en = "FPS Cap Active (Max: Stage A)";
+            h.bottleneck_en = "FPS Cap (Max: Stage A)";
         }
         h.bottleneck_ru = h.bottleneck_en;
     } else {
@@ -3008,20 +3338,20 @@ void UpdateHudBreakdown(HudBreakdown& h) {
                 h.hw_gpu_busy_ms >= stage_a_work_ms) {
                 h.bottleneck_ms = h.hw_gpu_busy_ms;
                 h.avg_bottleneck_ms = h.avg_hw_gpu_busy_ms;
-                h.bottleneck_en = "External VSync / Present Cap (Max: GPU)";
+                h.bottleneck_en = "VSync Cap (Max: GPU)";
             } else if (game_cpu_bound_ms >= stage_b_work_ms &&
                        game_cpu_bound_ms >= stage_a_work_ms) {
                 h.bottleneck_ms = game_cpu_bound_ms;
                 h.avg_bottleneck_ms = h.avg_game_cpu_work_ms;
-                h.bottleneck_en = "External VSync / Present Cap (Max: Game CPU)";
+                h.bottleneck_en = "VSync Cap (Max: Game CPU)";
             } else if (stage_b_work_ms >= stage_a_work_ms) {
                 h.bottleneck_ms = stage_b_work_ms;
                 h.avg_bottleneck_ms = h.avg_b_total_ms;
-                h.bottleneck_en = "External VSync / Present Cap (Max: Stage B)";
+                h.bottleneck_en = "VSync Cap (Max: Stage B)";
             } else {
                 h.bottleneck_ms = stage_a_work_ms;
                 h.avg_bottleneck_ms = avg_stage_a_work_ms;
-                h.bottleneck_en = "External VSync / Present Cap (Max: Stage A)";
+                h.bottleneck_en = "VSync Cap (Max: Stage A)";
             }
         } else if (h.gnm_wait_ms >= 1.50f && stage_a_work_ms < h.frame_ms * 0.78f &&
                    h.b_busy_pct < 78.0f && h.gpu_present_ms < 0.50f) {
@@ -3148,10 +3478,42 @@ void UpdateHudBreakdown(HudBreakdown& h) {
                 sys_hw_line[pos] = '\0';
             }
         }
+        char ll_hud_str[48]{};
+        {
+            const int ll_b = s.low_latency_backend.load(std::memory_order_relaxed);
+            const int ll_m = Vulkan::LowLatency::EffectiveMode(
+                ll_b, s.low_latency.load(std::memory_order_relaxed));
+            const std::uint32_t pc_us =
+                BbStats::reflex_pc_latency_us.load(std::memory_order_relaxed);
+            if (ll_b == BbSettings::LowLatencyBackendNvReflex) {
+                const char* m_str = ll_m == BbSettings::LowLatencyBoost ? "On+Boost"
+                                    : (ll_m == BbSettings::LowLatencyOn ? "On" : "Off");
+                if (ll_m != BbSettings::LowLatencyOff && pc_us > 0) {
+                    std::snprintf(ll_hud_str, sizeof(ll_hud_str), " | Reflex: %s (%.1f ms PC)",
+                                  m_str, double(pc_us) / 1000.0);
+                } else {
+                    std::snprintf(ll_hud_str, sizeof(ll_hud_str), " | Reflex: %s", m_str);
+                }
+            } else if (ll_b == BbSettings::LowLatencyBackendAmdAntiLag) {
+                std::snprintf(ll_hud_str, sizeof(ll_hud_str), " | Anti-Lag 2: %s",
+                              ll_m != BbSettings::LowLatencyOff ? "On" : "Off");
+            }
+        }
+        char fg_hud_str[64]{};
+        if (h.fg_active) {
+            std::snprintf(fg_hud_str, sizeof(fg_hud_str),
+                          " | FG: %s %dx (%.1f base, hudless %.0f%%)",
+                          h.fg_backend == 2 ? "DLSS" : "FSR3", std::max(2, h.fg_mult),
+                          h.base_fps, h.fg_hudless_pct);
+        } else if (const int fg_eff = BbSettings::EffectiveFrameGen();
+                   fg_eff != BbSettings::FrameGenOff) {
+            std::snprintf(fg_hud_str, sizeof(fg_hud_str), " | FG: %s (paused)",
+                          BbSettings::IsDlssFrameGen(fg_eff) ? "DLSS" : "FSR3");
+        }
         char hud_buf[4096];
         std::snprintf(
             hud_buf, sizeof(hud_buf),
-            "FPS: %.1f (%.2f ms/f) | Avg15s: %.1f FPS (%.2f ms/f, Jit %.2f ms) | Scene: %dx%d -> %dx%d | Cap %d | Up: %s (%s)%s\n"
+            "FPS: %.1f (%.2f ms/f) | Avg15s: %.1f FPS (%.2f ms/f, Jit %.2f ms) | Scene: %dx%d -> %dx%d | Cap %d | Up: %s (%s)%s%s%s\n"
             "GPU HW: %.1f W | %d MHz | %d C | DrvBusy %d%% | VRAM Proc %.2f GB (Sys %.2f/%.2f GB)\n"
             "%s"
             "Counts/f: Draws %.0f (Avg %.0f) | Disp %.0f (Avg %.0f) | Subm %.1f (Avg %.1f) | PipeDrains %.1f | Faults/s %.1f | NativeVkBuf %.1f%% | NativeVkTex %.1f%% | DescSaved %.1f%% | DontCare %llu/%llu\n"
@@ -3172,6 +3534,8 @@ void UpdateHudBreakdown(HudBreakdown& h) {
             out.width, out.height, cap_limit,
             up_label.c_str(),
             BbSettings::PresetName(BbSettings::RenderPreset()),
+            fg_hud_str,
+            ll_hud_str,
             BbSettings::ResolutionNeedsRestart() ? " [NEEDS RESTART]" : "",
             h.gpu_power_w, h.gpu_clock_mhz, h.gpu_temp_c, h.gpu_drv_util_pct,
             h.vram_proc_gb > 0.01f ? h.vram_proc_gb : h.vram_used_gb, h.vram_used_gb, h.vram_total_gb,
@@ -3643,15 +4007,40 @@ void UpdateHudBreakdown(HudBreakdown& h) {
                 const double ev_per_poll =
                     d_m_polls > 0 ? (double(d_m_ev) / double(d_m_polls)) : 0.0;
 
+                static std::uint64_t prev_ll_sleep_ns = 0;
+                const std::uint64_t cur_ll_sleep_ns =
+                    BbStats::low_latency_sleep_ns.load(std::memory_order_relaxed);
+                const double ll_sleep_ms =
+                    (cnt > 0 && cur_ll_sleep_ns >= prev_ll_sleep_ns)
+                        ? (double(cur_ll_sleep_ns - prev_ll_sleep_ns) / 1e6 / double(cnt))
+                        : 0.0;
+                prev_ll_sleep_ns = cur_ll_sleep_ns;
+                const double pc_lat_ms =
+                    double(BbStats::reflex_pc_latency_us.load(std::memory_order_relaxed)) / 1000.0;
+                const auto& ll_s = BbSettings::Get();
+                const int ll_b = ll_s.low_latency_backend.load(std::memory_order_relaxed);
+                const int ll_m = Vulkan::LowLatency::EffectiveMode(
+                    ll_b, ll_s.low_latency.load(std::memory_order_relaxed));
+                const char* ll_tag =
+                    ll_b == BbSettings::LowLatencyBackendNvReflex
+                        ? (ll_m == BbSettings::LowLatencyBoost
+                               ? "Reflex+Boost"
+                               : (ll_m == BbSettings::LowLatencyOn ? "Reflex" : "Reflex(Off)"))
+                        : (ll_b == BbSettings::LowLatencyBackendAmdAntiLag
+                               ? (ll_m != BbSettings::LowLatencyOff ? "AntiLag2" : "AntiLag2(Off)")
+                               : "None");
+
                 AppendLogFmt(
                     log_out,
                     "Pacing (%uf): min %.2f | p50 %.2f | p95 %.2f | p99 %.2f | max %.2f ms"
-                    " | >1.25x:%u >1.5x:%u | PresPace %.2f Acq %.2f Pres %.2f ms | SimDt %.2f..%.2f ms\n"
+                    " | >1.25x:%u >1.5x:%u | PresPace %.2f Acq %.2f Pres %.2f ms | SimDt %.2f..%.2f ms"
+                    " | LL:%s(slp=%.2f pc=%.1fms)\n"
                     "Input (%.0fs): Mouse %llu ev / %llu active-f (%.1f ev/f, batch %u..%u, 0-ev-gaps %llu)"
                     " | WinWake %llu\n",
                     cnt, min_ms, p50_ms, p95_ms, p99_ms, max_ms, over_125, over_150, pres_pace_ms,
                     swap_acq_ms, swap_pres_ms,
-                    sim_min_ms, sim_max_ms, log_dt, static_cast<unsigned long long>(d_m_ev),
+                    sim_min_ms, sim_max_ms, ll_tag, ll_sleep_ms, pc_lat_ms,
+                    log_dt, static_cast<unsigned long long>(d_m_ev),
                     static_cast<unsigned long long>(d_m_polls), ev_per_poll,
                     m_min != 0xFFFFFFFFu ? m_min : 0u, m_max,
                     static_cast<unsigned long long>(d_m_zero),
@@ -3715,82 +4104,211 @@ void FpsCounter() {
     const bool rcas_on = s.sharpen.load(std::memory_order_relaxed) &&
                          s.sharpness.load(std::memory_order_relaxed) > 0.01f;
     if (rcas_on) {
-        std::snprintf(upscaler_str, sizeof(upscaler_str), "%s + RCAS", base_aa_str);
+        std::snprintf(upscaler_str, sizeof(upscaler_str), "%s+RCAS", base_aa_str);
     } else {
         std::snprintf(upscaler_str, sizeof(upscaler_str), "%s", base_aa_str);
     }
 
     const bool xray = s.show_additional_debug.load(std::memory_order_relaxed);
-    if (xray) {
-        ImGui::SetWindowFontScale(0.82f);
-    }
+    ImGui::SetWindowFontScale(0.82f);
 
+    // Keep every header line <= ~58-60 chars so the auto-resized window tracks the breakdown
+    // table width cleanly without trailing blank padding.
     const float now_fps = frame_ms_avg > 0.0f ? 1000.0f / frame_ms_avg : h.fps;
     const float now_ms = frame_ms_avg > 0.0f ? frame_ms_avg : h.frame_ms;
-    if (h.has_avg) {
-        ImGui::TextColored(
-            ImVec4(0.95f, 0.92f, 0.78f, 1.0f),
-            "%.0f FPS (Avg %.0f)  %.2f ms (Avg %.2f)  [%s]",
-            now_fps, h.avg_fps, now_ms, h.avg_frame_ms, upscaler_str);
-    } else {
-        ImGui::TextColored(ImVec4(0.95f, 0.92f, 0.78f, 1.0f),
-                           "%.0f FPS  %.2f ms  [%s]",
-                           now_fps, now_ms, upscaler_str);
-    }
-    const float gpu_busy_pct =
-        now_ms > 0.05f ? std::clamp(100.0f * h.hw_gpu_busy_ms / now_ms, 0.0f, 100.0f) : 0.0f;
-    if (h.has_gpu_sensors) {
-        const ImVec4 gpu_col = h.gpu_power_w >= 220.0f ? ImVec4(1.0f, 0.68f, 0.42f, 1.0f)
-                             : h.gpu_power_w >= 140.0f ? ImVec4(0.95f, 0.90f, 0.65f, 1.0f)
-                                                       : ImVec4(0.62f, 0.92f, 0.75f, 1.0f);
-        if (h.vram_proc_gb > 0.01f && h.vram_used_gb > h.vram_proc_gb + 0.05f) {
-            ImGui::TextColored(
-                gpu_col,
-                "GPU: %.0f W | %.0f%% Busy (Drv %d%%) | %d MHz | %d C | VRAM: %.2f GB (Sys %.1f)",
-                h.gpu_power_w, gpu_busy_pct, h.gpu_drv_util_pct, h.gpu_clock_mhz, h.gpu_temp_c,
-                h.vram_proc_gb, h.vram_used_gb);
-        } else {
-            ImGui::TextColored(
-                gpu_col,
-                "GPU: %.0f W | %.0f%% Busy (Drv %d%%) | %d MHz | %d C | VRAM: %.2f GB",
-                h.gpu_power_w, gpu_busy_pct, h.gpu_drv_util_pct, h.gpu_clock_mhz, h.gpu_temp_c,
-                h.vram_proc_gb > 0.01f ? h.vram_proc_gb : h.vram_used_gb);
-        }
-    } else if (h.vram_proc_gb > 0.01f || h.vram_used_gb > 0.01f) {
-        ImGui::TextColored(ImVec4(0.62f, 0.92f, 0.75f, 1.0f),
-                           "GPU: %.0f%% Busy | VRAM: %.2f GB", gpu_busy_pct,
-                           h.vram_proc_gb > 0.01f ? h.vram_proc_gb : h.vram_used_gb);
-    }
     const int fps_cap = h.fps_cap_active;
-    char cap_buf[32];
+    char cap_buf[24];
     if (fps_cap > 0) {
         std::snprintf(cap_buf, sizeof(cap_buf), "Cap %d", fps_cap);
     } else {
-        std::snprintf(cap_buf, sizeof(cap_buf), "Uncapped");
+        std::snprintf(cap_buf, sizeof(cap_buf), "Uncap");
     }
-    ImGui::TextDisabled(
-        "Scene: %dx%d -> %dx%d | %s | Jit: %.2f ms (Avg %.2f)%s",
-        rw, rh, out.width, out.height, cap_buf, h.jitter_ms, h.avg_jitter_ms,
-        BbSettings::ResolutionNeedsRestart() ? " (restart!)" : "");
-    ImGui::TextDisabled(
-        "Draws: %.0f (%.0f) | Disp: %.0f (%.0f) | Subm: %.1f | B busy: %.0f%% (%.0f%%)",
-        h.draws_pf, h.avg_draws_pf, h.dispatches_pf, h.avg_dispatches_pf, h.submits_pf,
-        h.b_busy_pct, h.avg_b_busy_pct);
-    const ImVec4 health_col = (h.faults_ps < 10.0f && h.eop_pf < 5.0f)
-                                  ? ImVec4(0.55f, 0.88f, 0.62f, 1.0f)
-                                  : ImVec4(1.0f, 0.72f, 0.38f, 1.0f);
-    ImGui::TextColored(
-        health_col,
-        "Faults: %.0f/s (%.0f) | NatBuf: %.0f%% (%.0f%%) | NatTex: %.0f%% | DscSav: %.0f%% (%.0f%%)",
-        h.faults_ps, h.avg_faults_ps, h.native_buf_pct, h.avg_native_buf_pct, h.native_tex_pct,
-        h.desc_saved_pct, h.avg_desc_saved_pct);
+
+    // Row 1: FPS / Frame Time / Jitter / Cap
+    const ImVec4 row1_col(0.95f, 0.92f, 0.78f, 1.0f);
+    if (h.fg_active) {
+        const int disp_mult = std::max(2, h.fg_mult);
+        if (h.has_avg) {
+            ImGui::TextColored(row1_col,
+                               "%.0f FPS (%.0fx%d, Avg %.0f) | %.2f ms | Jit %.2f | %s",
+                               now_fps, h.base_fps, disp_mult, h.avg_fps, now_ms, h.jitter_ms,
+                               cap_buf);
+        } else {
+            ImGui::TextColored(row1_col, "%.0f FPS (%.0fx%d) | %.2f ms | Jit %.2f | %s",
+                               now_fps, h.base_fps, disp_mult, now_ms, h.jitter_ms, cap_buf);
+        }
+    } else if (h.has_avg) {
+        ImGui::TextColored(row1_col, "%.0f FPS (Avg %.0f) | %.2f ms (%.2f) | Jit %.2f | %s",
+                           now_fps, h.avg_fps, now_ms, h.avg_frame_ms, h.jitter_ms, cap_buf);
+    } else {
+        ImGui::TextColored(row1_col, "%.0f FPS | %.2f ms | Jit %.2f | %s", now_fps, now_ms,
+                           h.jitter_ms, cap_buf);
+    }
+
+    // Row 2: Resolution | AA / Upscaler | FG | Low Latency
+    {
+        char pipe_buf[128];
+        int ppos = 0;
+        const auto append_pipe = [&](const char* fmt, ...) {
+            if (ppos < 0 || std::size_t(ppos) >= sizeof(pipe_buf)) {
+                return;
+            }
+            va_list ap;
+            va_start(ap, fmt);
+            const int n = std::vsnprintf(pipe_buf + ppos, sizeof(pipe_buf) - std::size_t(ppos), fmt, ap);
+            va_end(ap);
+            if (n > 0) {
+                ppos = std::min(ppos + n, int(sizeof(pipe_buf) - 1));
+            }
+        };
+        if (rw == int(out.width) && rh == int(out.height)) {
+            append_pipe("%dx%d", int(out.width), int(out.height));
+        } else {
+            append_pipe("%dx%d->%dp", rw, rh, int(out.height));
+        }
+        if (BbSettings::ResolutionNeedsRestart()) {
+            append_pipe("*");
+        }
+        append_pipe(" | %s", upscaler_str);
+        if (h.fg_active) {
+            append_pipe(" | %s %dx", h.fg_backend == 2 ? "DLSS" : "FSR3",
+                        std::max(2, h.fg_mult));
+        } else if (const int fg_eff = BbSettings::EffectiveFrameGen();
+                   fg_eff != BbSettings::FrameGenOff) {
+            append_pipe(" | %s(idle)", BbSettings::IsDlssFrameGen(fg_eff) ? "DLSS" : "FSR3");
+        }
+        const int ll_b = s.low_latency_backend.load(std::memory_order_relaxed);
+        const int ll_m = Vulkan::LowLatency::EffectiveMode(
+            ll_b, s.low_latency.load(std::memory_order_relaxed));
+        const std::uint32_t pc_us = BbStats::reflex_pc_latency_us.load(std::memory_order_relaxed);
+        if (ll_b == BbSettings::LowLatencyBackendNvReflex) {
+            const char* m_str = ll_m == BbSettings::LowLatencyBoost ? "+B"
+                                : (ll_m == BbSettings::LowLatencyOn ? "" : " Off");
+            if (ll_m != BbSettings::LowLatencyOff && pc_us > 0) {
+                append_pipe(" | Reflex%s %.1fms", m_str, double(pc_us) / 1000.0);
+            } else {
+                append_pipe(" | Reflex%s", m_str[0] ? m_str : " On");
+            }
+        } else if (ll_b == BbSettings::LowLatencyBackendAmdAntiLag) {
+            append_pipe(" | AntiLag2 %s", ll_m != BbSettings::LowLatencyOff ? "On" : "Off");
+        }
+        ImGui::TextColored(ImVec4(0.76f, 0.84f, 0.92f, 1.0f), "%s", pipe_buf);
+    }
+
+    // Row 3: Live CPU | GPU usage, temps, power & clocks (independently thermal-colored)
+    const float real_frame_ms =
+        (h.fg_active && h.base_fps > 0.5f) ? (1000.0f / h.base_fps) : now_ms;
+    const float gpu_busy_pct =
+        real_frame_ms > 0.05f ? std::clamp(100.0f * h.hw_gpu_busy_ms / real_frame_ms, 0.0f, 100.0f)
+                              : 0.0f;
+    {
+        char cpu_buf[64];
+        int cpos = 0;
+        if (h.proc_cpu_pct >= 0 && h.sys_cpu_pct >= 0) {
+            cpos = std::snprintf(cpu_buf, sizeof(cpu_buf), "CPU %d%%/%d%%", h.proc_cpu_pct,
+                                 h.sys_cpu_pct);
+        } else if (h.sys_cpu_pct >= 0) {
+            cpos = std::snprintf(cpu_buf, sizeof(cpu_buf), "CPU %d%%", h.sys_cpu_pct);
+        } else {
+            cpos = std::snprintf(cpu_buf, sizeof(cpu_buf), "CPU --");
+        }
+        if (cpos > 0 && std::size_t(cpos) < sizeof(cpu_buf) && h.cpu_temp_c > 0) {
+            cpos += std::snprintf(cpu_buf + cpos, sizeof(cpu_buf) - std::size_t(cpos), " %dC",
+                                  h.cpu_temp_c);
+        }
+        if (cpos > 0 && std::size_t(cpos) < sizeof(cpu_buf) && h.cpu_clock_mhz > 0) {
+            std::snprintf(cpu_buf + cpos, sizeof(cpu_buf) - std::size_t(cpos), " %.2fGHz",
+                          double(h.cpu_clock_mhz) / 1000.0);
+        }
+        const ImVec4 cpu_col = (h.cpu_temp_c >= 85 || h.sys_cpu_pct >= 85)
+                                   ? ImVec4(1.0f, 0.65f, 0.42f, 1.0f)
+                             : (h.cpu_temp_c >= 74 || h.sys_cpu_pct >= 60)
+                                   ? ImVec4(0.95f, 0.90f, 0.65f, 1.0f)
+                                   : ImVec4(0.66f, 0.88f, 0.96f, 1.0f);
+
+        char gpu_buf[64];
+        ImVec4 gpu_col(0.62f, 0.92f, 0.75f, 1.0f);
+        if (h.has_gpu_sensors) {
+            std::snprintf(gpu_buf, sizeof(gpu_buf), "GPU %.0f%%(%d%%) %dC %.0fW %dMHz",
+                          gpu_busy_pct, h.gpu_drv_util_pct, h.gpu_temp_c, h.gpu_power_w,
+                          h.gpu_clock_mhz);
+            gpu_col = (h.gpu_power_w >= 220.0f || h.gpu_temp_c >= 80)
+                          ? ImVec4(1.0f, 0.68f, 0.42f, 1.0f)
+                    : (h.gpu_power_w >= 140.0f || h.gpu_temp_c >= 70)
+                          ? ImVec4(0.95f, 0.90f, 0.65f, 1.0f)
+                          : ImVec4(0.62f, 0.92f, 0.75f, 1.0f);
+        } else {
+            std::snprintf(gpu_buf, sizeof(gpu_buf), "GPU %.0f%% Busy", gpu_busy_pct);
+        }
+
+        ImGui::TextColored(cpu_col, "%s", cpu_buf);
+        ImGui::SameLine(0.0f, 0.0f);
+        ImGui::TextDisabled(" | ");
+        ImGui::SameLine(0.0f, 0.0f);
+        ImGui::TextColored(gpu_col, "%s", gpu_buf);
+    }
+
+    // Row 4: Memory (VRAM | RAM) & Draw/Submit Counts
+    {
+        char mem_draw_buf[128];
+        int mpos = 0;
+        const auto append_mem = [&](const char* fmt, ...) {
+            if (mpos < 0 || std::size_t(mpos) >= sizeof(mem_draw_buf)) {
+                return;
+            }
+            if (mpos > 0) {
+                const int sep = std::snprintf(mem_draw_buf + mpos,
+                                              sizeof(mem_draw_buf) - std::size_t(mpos), " | ");
+                if (sep > 0) {
+                    mpos = std::min(mpos + sep, int(sizeof(mem_draw_buf) - 1));
+                }
+            }
+            va_list ap;
+            va_start(ap, fmt);
+            const int n =
+                std::vsnprintf(mem_draw_buf + mpos, sizeof(mem_draw_buf) - std::size_t(mpos), fmt, ap);
+            va_end(ap);
+            if (n > 0) {
+                mpos = std::min(mpos + n, int(sizeof(mem_draw_buf) - 1));
+            }
+        };
+        if (h.vram_proc_gb > 0.01f || h.vram_used_gb > 0.01f) {
+            if (h.vram_proc_gb > 0.01f && h.vram_used_gb > h.vram_proc_gb + 0.05f) {
+                append_mem("VRAM %.2f/%.1fG", h.vram_proc_gb, h.vram_used_gb);
+            } else {
+                append_mem("VRAM %.2fG",
+                           h.vram_proc_gb > 0.01f ? h.vram_proc_gb : h.vram_used_gb);
+            }
+        }
+        if (h.has_sys_ram && h.ram_proc_gb > 0.01f) {
+            append_mem("RAM %.1f/%.1fG", h.ram_proc_gb, h.ram_sys_used_gb);
+        }
+        append_mem("Draws %.0f(%.0f) | Sub %.1f", h.draws_pf, h.avg_draws_pf, h.submits_pf);
+        ImGui::TextDisabled("%s", mem_draw_buf);
+    }
+
+    // Row 5: Compact RHI Health Line (always in X-Ray F9, or in F8 on faults/EoP)
+    const bool show_rhi_health = xray || h.faults_ps >= 1.0f || h.eop_pf >= 5.0f;
+    if (show_rhi_health) {
+        const ImVec4 health_col = (h.faults_ps < 10.0f && h.eop_pf < 5.0f)
+                                      ? ImVec4(0.55f, 0.88f, 0.62f, 1.0f)
+                                      : ImVec4(1.0f, 0.72f, 0.38f, 1.0f);
+        ImGui::TextColored(health_col,
+                           "RHI: Flt %.0f/s | Disp %.0f | B-Busy %.0f%% | Nat %.0f%% | Dsc %.0f%%",
+                           h.faults_ps, h.dispatches_pf, h.b_busy_pct,
+                           std::min(h.native_buf_pct, h.native_tex_pct), h.desc_saved_pct);
+    }
 
     ImGui::Separator();
-    if (xray) {
-        ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(4.0f * base_scale, 1.0f * base_scale));
-    }
+    ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(4.0f * base_scale, 1.0f * base_scale));
     if (ImGui::BeginTable("##hud_breakdown", 5,
                           ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_NoPadOuterX)) {
+        const float col0_min_w = ImGui::CalcTextSize("  10b. RCAS Sharpen, Overlay & Flip").x;
+        ImGui::TableSetupColumn("##c0", ImGuiTableColumnFlags_WidthFixed, col0_min_w);
+        ImGui::TableSetupColumn("##c1", ImGuiTableColumnFlags_WidthFixed);
+        ImGui::TableSetupColumn("##c2", ImGuiTableColumnFlags_WidthFixed);
+        ImGui::TableSetupColumn("##c3", ImGuiTableColumnFlags_WidthFixed);
+        ImGui::TableSetupColumn("##c4", ImGuiTableColumnFlags_WidthFixed);
         ImGui::TableNextRow();
         ImGui::TableSetColumnIndex(0);
         ImGui::TextDisabled("CPU & GPU Breakdown");
@@ -4082,9 +4600,7 @@ void FpsCounter() {
 
         ImGui::EndTable();
     }
-    if (xray) {
-        ImGui::PopStyleVar();
-    }
+    ImGui::PopStyleVar();
     ImGui::Separator();
     const ImVec4 limit_col = (h.bottleneck_kind == 5 || h.bottleneck_kind == 6)
                                  ? ImVec4(0.55f, 0.90f, 0.68f, 1.0f)
@@ -4094,9 +4610,7 @@ void FpsCounter() {
         "LIMIT: %s (%.2f ms | Avg %.2f)",
         h.bottleneck_en, h.bottleneck_ms,
         h.avg_bottleneck_ms);
-    if (xray) {
-        ImGui::SetWindowFontScale(1.0f);
-    }
+    ImGui::SetWindowFontScale(1.0f);
     ImGui::End();
 }
 
@@ -4599,7 +5113,8 @@ void ShowToast(const char* text, float duration_sec) {
 
 bool Visible() {
     return initialized && (menu_open || prompt_active || banner_active ||
-                           ToastActiveNow() || BbSettings::Get().show_fps);
+                           ToastActiveNow() || ShaderCompilePillActiveNow() ||
+                           BbSettings::Get().show_fps);
 }
 
 bool MenuOpen() {
@@ -4716,6 +5231,44 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
             draw->AddText(at, IM_COL32(238, 228, 206, int(255.0f * alpha)), text.c_str());
         } else {
             toast_until_ns.store(0, std::memory_order_relaxed);
+        }
+    }
+    {
+        const long long now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                     now.time_since_epoch())
+                                     .count();
+        std::uint32_t pill_done = 0, pill_total = 0;
+        float pill_alpha = 0.0f;
+        if (PollShaderCompilePill(now_ns, pill_done, pill_total, pill_alpha) &&
+            pill_alpha > 0.01f && pill_total > 0u) {
+            const char* label =
+                BbSettings::MenuText("Compiling shaders", "Компиляция шейдеров");
+            char text_buf[128];
+            std::snprintf(text_buf, sizeof(text_buf), "%s %u / %u", label, pill_done, pill_total);
+            char stable_buf[128];
+            std::snprintf(stable_buf, sizeof(stable_buf), "%s %u / %u", label, pill_total,
+                          pill_total);
+            for (char* p = stable_buf; *p; ++p) {
+                if (*p >= '0' && *p <= '9') {
+                    *p = '0';
+                }
+            }
+            const ImVec2 text_size = ImGui::CalcTextSize(text_buf);
+            const ImVec2 stable_size = ImGui::CalcTextSize(stable_buf);
+            const float pad_x = 13.0f * base_scale;
+            const float pad_y = 8.0f * base_scale;
+            const float margin = 16.0f * base_scale;
+            const float box_w = std::max(text_size.x, stable_size.x) + pad_x * 2.0f;
+            const float box_h = text_size.y + pad_y * 2.0f;
+            const ImVec2 p0{margin, io.DisplaySize.y - margin - box_h};
+            const ImVec2 p1{p0.x + box_w, p0.y + box_h};
+            const ImVec2 text_pos{p0.x + pad_x, p0.y + pad_y};
+            const float rounding = 6.0f * base_scale;
+            auto* draw = ImGui::GetForegroundDrawList();
+            draw->AddRectFilled(p0, p1, IM_COL32(12, 12, 14, int(204.0f * pill_alpha)), rounding);
+            draw->AddRect(p0, p1, IM_COL32(142, 142, 148, int(118.0f * pill_alpha)), rounding, 0,
+                          1.0f * base_scale);
+            draw->AddText(text_pos, IM_COL32(236, 236, 238, int(255.0f * pill_alpha)), text_buf);
         }
     }
     ImGui::Render();
