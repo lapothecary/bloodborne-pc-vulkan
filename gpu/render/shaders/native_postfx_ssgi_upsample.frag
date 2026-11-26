@@ -21,8 +21,9 @@ layout(push_constant) uniform SsgiUpsamplePush {
 } pc;
 
 void main() {
-    const ivec2 depth_max = max(textureSize(depth_tex, 0) - ivec2(1), ivec2(0));
-    const float d_c = texelFetch(depth_tex, min(ivec2(gl_FragCoord.xy), depth_max), 0).r;
+    const ivec2 depth_sz = max(textureSize(depth_tex, 0), ivec2(1));
+    const ivec2 depth_max = depth_sz - ivec2(1);
+    const float d_c = texelFetch(depth_tex, clamp(ivec2(uv * vec2(depth_sz)), ivec2(0), depth_max), 0).r;
     if (d_c >= 0.99995) {
         discard;
     }

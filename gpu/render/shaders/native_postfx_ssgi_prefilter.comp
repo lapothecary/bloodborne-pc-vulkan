@@ -33,34 +33,54 @@ void main() {
 
     if (pc.is_mip1 == 0u) {
         // Mip 0 (Half-Res): pack (diff + amb, depth) from full-res G-Buffer/lighting targets.
-        const float d00 = texelFetch(depth_or_mip0_tex, p00, 0).r;
-        const float d10 = texelFetch(depth_or_mip0_tex, p10, 0).r;
-        const float d01 = texelFetch(depth_or_mip0_tex, p01, 0).r;
-        const float d11 = texelFetch(depth_or_mip0_tex, p11, 0).r;
+        // Map each logical 2x2 sub-pixel center into each input texture's own texel grid so
+        // upscaled SceneTargets proxies (e.g. 1707x960 HDR/diff vs 2560x1440 non-blittable D32S8
+        // depth on NVIDIA) stay 100% aligned instead of sampling only the top-left sub-rectangle.
+        const ivec2 d_sz = max(textureSize(depth_or_mip0_tex, 0), ivec2(1));
+        const ivec2 diff_sz = max(textureSize(diff_tex, 0), ivec2(1));
+        const ivec2 amb_sz = max(textureSize(amb_tex, 0), ivec2(1));
+        const ivec2 d_max = d_sz - ivec2(1);
+        const ivec2 diff_max = diff_sz - ivec2(1);
+        const ivec2 amb_max = amb_sz - ivec2(1);
+        const vec2 inv_src = 1.0 / max(vec2(pc.src_w, pc.src_h), vec2(1.0));
+        const vec2 d_scale = vec2(d_sz) * inv_src;
+        const vec2 diff_scale = vec2(diff_sz) * inv_src;
+        const vec2 amb_scale = vec2(amb_sz) * inv_src;
+
+        const ivec2 pts[4] = ivec2[4](p00, p10, p01, p11);
+        ivec2 d_pts[4];
+        ivec2 diff_pts[4];
+        ivec2 amb_pts[4];
+        float ds[4];
+        for (int i = 0; i < 4; ++i) {
+            const vec2 src_c = vec2(pts[i]) + 0.5;
+            d_pts[i] = clamp(ivec2(src_c * d_scale), ivec2(0), d_max);
+            diff_pts[i] = clamp(ivec2(src_c * diff_scale), ivec2(0), diff_max);
+            amb_pts[i] = clamp(ivec2(src_c * amb_scale), ivec2(0), amb_max);
+            ds[i] = texelFetch(depth_or_mip0_tex, d_pts[i], 0).r;
+        }
 
         // Pick closest depth (Forward-Z: smaller = closer) so thin pillars/limbs never vanish.
-        const float d_min = min(min(d00, d10), min(d01, d11));
+        const float d_min = min(min(ds[0], ds[1]), min(ds[2], ds[3]));
         vec3 rad_sum = vec3(0.0);
         float w_sum = 0.0;
 
         if (d_min >= 0.99995) {
             // Sky quad: store sky dome radiance from amb_tex (fs_img5) with inv_depth = 0.0.
-            rad_sum = max(texelFetch(amb_tex, p00, 0).rgb, vec3(0.0))
-                    + max(texelFetch(amb_tex, p10, 0).rgb, vec3(0.0))
-                    + max(texelFetch(amb_tex, p01, 0).rgb, vec3(0.0))
-                    + max(texelFetch(amb_tex, p11, 0).rgb, vec3(0.0));
+            rad_sum = max(texelFetch(amb_tex, amb_pts[0], 0).rgb, vec3(0.0))
+                    + max(texelFetch(amb_tex, amb_pts[1], 0).rgb, vec3(0.0))
+                    + max(texelFetch(amb_tex, amb_pts[2], 0).rgb, vec3(0.0))
+                    + max(texelFetch(amb_tex, amb_pts[3], 0).rgb, vec3(0.0));
             imageStore(dst_img, ivec2(px), vec4(rad_sum * 0.25, 0.0));
             return;
         }
 
         const float d_tol = max((1.0 - d_min) * 0.12, 2e-4);
-        const ivec2 pts[4] = ivec2[4](p00, p10, p01, p11);
-        const float ds[4]  = float[4](d00, d10, d01, d11);
         float d_avg = 0.0;
         for (int i = 0; i < 4; ++i) {
             if (ds[i] < 0.99995 && abs(ds[i] - d_min) <= d_tol) {
-                const vec3 c = max(texelFetch(diff_tex, pts[i], 0).rgb, vec3(0.0)) +
-                               max(texelFetch(amb_tex, pts[i], 0).rgb, vec3(0.0));
+                const vec3 c = max(texelFetch(diff_tex, diff_pts[i], 0).rgb, vec3(0.0)) +
+                               max(texelFetch(amb_tex, amb_pts[i], 0).rgb, vec3(0.0));
                 rad_sum += c;
                 d_avg += ds[i];
                 w_sum += 1.0;

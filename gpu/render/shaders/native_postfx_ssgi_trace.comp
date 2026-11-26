@@ -46,10 +46,14 @@ void main() {
 
     // Read center depth and 4 neighbors from full-precision FP32 D32 depth buffer:
     // avoids FP16 Forward-Z contour staircase artifacts on angled stone walls and cobblestones!
+    // Always derive normalized UV from dst_ssgi_img dimensions (pc.dst_w, pc.dst_h) and map into
+    // full_depth_tex via textureSize so reduced upscaler proxies (e.g. DLSS/FSR Quality/Balanced/
+    // Performance/Ultra Perf) never sample only the top-left sub-rectangle of native D32S8 depth.
+    const vec2 uv_dst = (vec2(px) + 0.5) / max(vec2(pc.dst_w, pc.dst_h), vec2(1.0));
     const ivec2 full_sz = max(textureSize(full_depth_tex, 0), ivec2(1));
     const ivec2 full_max = full_sz - ivec2(1);
     const vec2 inv_full = 1.0 / vec2(full_sz);
-    const ivec2 fp = min(ivec2(px) * 2, full_max);
+    const ivec2 fp = clamp(ivec2(uv_dst * vec2(full_sz)), ivec2(0), full_max);
     const vec2 uv = (vec2(fp) + 0.5) * inv_full;
     const float depth = texelFetch(full_depth_tex, fp, 0).r;
     if (depth >= 0.99995) {
