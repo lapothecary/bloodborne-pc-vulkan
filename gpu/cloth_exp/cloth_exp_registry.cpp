@@ -236,7 +236,7 @@ void PatchImage(unsigned char* image, std::uint64_t size) noexcept {
 
         while (stolen < 5u) {
             ZydisDecodedInstruction insn{};
-            ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT_VISIBLE]{};
+            ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT]{};
             if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(&decoder, guest_fn + stolen,
                                                      32u - std::min<std::size_t>(stolen, 16u),
                                                      &insn, ops))) {
