@@ -17,7 +17,12 @@
 #include <cstring>
 #include <immintrin.h>
 
+#include "cloth_exp/cloth_exp_local_fp64.h"
+#include "cloth_exp/cloth_exp_registry.h"
 #include "cloth_exp/cloth_exp_runtime.h"
+#include "cloth_exp/cloth_exp_xpbd.h"
+#include "shim/bbport_cloth_interp.h"
+#include "shim/bbport_frame_rate.h"
 
 namespace BbClothExp {
 
@@ -343,7 +348,7 @@ bool PS4_SYSV_ABI ClothExp_SprjWindAction_apply(
 // ============================================================================
 // [37] ClothExp_SprjWindEvalWorldDir @ 0x10522f0 (2,037 B)
 // ============================================================================
-__m128 PS4_SYSV_ABI ClothExp_SprjWindEvalWorldDir(
+static __m128 EvalWorldDirSingleSeed(
     const u8* action, u8* wind_entry, std::uint64_t opt_seed_tag) noexcept {
 
     using GetPhaseFn = float(PS4_SYSV_ABI*)(u8*);
@@ -422,6 +427,31 @@ __m128 PS4_SYSV_ABI ClothExp_SprjWindEvalWorldDir(
     return _mm_mul_ps(_mm_set1_ps(final_spd), rot_dir);
 }
 
+__m128 PS4_SYSV_ABI ClothExp_SprjWindEvalWorldDir(
+    const u8* action, u8* wind_entry, std::uint64_t opt_seed_tag) noexcept {
+    if (!IsNativeFpsMode() || (opt_seed_tag >> 32) == 0x5eed0001ULL) {
+        return EvalWorldDirSingleSeed(action, wind_entry, opt_seed_tag);
+    }
+
+    constexpr std::uint64_t kSeedTag = 0x5eed000100000000ULL;
+    std::uint32_t seed0 = 0;
+    std::uint32_t seed1 = 0;
+    float smooth = 0.0f;
+    float frames = 1.0f;
+    BbFrameRate::GetClothWindSmoothParams(seed0, seed1, smooth, frames);
+
+    const __m128 m0 = EvalWorldDirSingleSeed(action, wind_entry, kSeedTag | seed0);
+    if (!(smooth > 1e-6f && smooth < 1.0f)) {
+        return m0;
+    }
+    const __m128 m1 = EvalWorldDirSingleSeed(action, wind_entry, kSeedTag | seed1);
+    alignas(16) float v0[4]{}, v1[4]{}, out[4]{};
+    _mm_store_ps(v0, m0);
+    _mm_store_ps(v1, m1);
+    BbClothInterp::BlendClothWindVectors3D(v0, v1, smooth, out);
+    return _mm_load_ps(out);
+}
+
 // ============================================================================
 // [38] ClothExp_SprjPointWind_apply @ 0x1052af0 (4,244 B)
 // ============================================================================
@@ -448,58 +478,99 @@ bool PS4_SYSV_ABI ClothExp_SprjPointWind_apply(
     const float phase = ResolveFn<GetPhaseFn>(0x2318840ULL)(wind_entry);
     const u8 sub_mode = ResolveFn<GetSubTypeFn>(0x23188a0ULL)(wind_entry);
 
-    alignas(16) std::uint32_t rng_buf[8]{};
-    rng_buf[0] = 0x075bcd15u;
-    std::uint32_t* rng_state = &rng_buf[1];
-    ResolveFn<RngInitFn>(0x20f8110ULL)(rng_state, 0x075bcd15u);
-
-    const float rem = ResolveFn<FmodfFn>(0x20b54f0ULL)(phase, 1000.0f);
-    const std::int64_t seed64 = static_cast<std::int64_t>(rem * 1000.0f);
-    rng_buf[0] = static_cast<std::uint32_t>(seed64);
-    ResolveFn<RngSeedFn>(0x20f81c0ULL)(rng_state, seed64);
-
-    alignas(16) u8 perlin[32]{};
-    ResolveFn<PerlinCtorFn>(0x2685930ULL)(perlin);
+    const bool native_fps = IsNativeFpsMode();
+    std::uint32_t seed0 = 0, seed1 = 0;
+    float smooth_t = 0.0f, cloth_frames = 1.0f;
+    if (native_fps) {
+        BbFrameRate::GetClothWindSmoothParams(seed0, seed1, smooth_t, cloth_frames);
+    }
 
     float gust_min = 0.0f;
     float gust_max = 0.0f;
     ResolveFn<GetFloatRangeFn>(0x2318760ULL)(wind_entry, &gust_min, &gust_max);
-    const float u_gust = XorShift128NextUnitFloat(rng_state);
-    const float gust_p = gust_min + (gust_max - gust_min) * u_gust;
 
     float spd_min = 0.0f;
     float spd_max = 0.0f;
     ResolveFn<GetFloatRangeFn>(0x2318690ULL)(wind_entry, &spd_min, &spd_max);
     const float spd_span = spd_max - spd_min;
+    const float spd_mul = ResolveFn<GetMulFn>(0x2318a40ULL)(wind_entry);
+
+    alignas(16) __m128 mtx[4]{};
+    alignas(16) __m128 ang_min = _mm_setzero_ps();
+    alignas(16) __m128 ang_max = _mm_setzero_ps();
+    if (sub_mode != 0) {
+        ResolveFn<GetMtxFn>(0x2318520ULL)(mtx, wind_entry);
+        mtx[3] = _mm_setr_ps(0.0f, 0.0f, 0.0f, 1.0f);
+        ResolveFn<GetVecRangeFn>(0x23185c0ULL)(wind_entry, &ang_min, &ang_max);
+    }
+    const __m128 ang_span = _mm_sub_ps(ang_max, ang_min);
 
     constexpr float kPointFreq = 0.1f;      // 0x48cdf4c
     constexpr float kPointPers = 0.3f;      // 0x48cdf50
     constexpr float kPointAmpScale = 5.0f;  // 0x48cdf54
-    const float py = gust_p * 6.0f + 400.0f;
-    const float pz = gust_p + 150.0f;
 
-    const float n_spd_raw =
-        ResolveFn<PerlinFbmFn>(0x2685e30ULL)(perlin, 4, gust_p, py, pz, kPointFreq, kPointPers);
-    const float spd_mul = ResolveFn<GetMulFn>(0x2318a40ULL)(wind_entry);
-    const float n_spd = std::bit_cast<float>(std::bit_cast<std::uint32_t>(n_spd_raw * kPointAmpScale) & 0x7fffffffu);
-    const float final_spd = (spd_span * n_spd + spd_min) * spd_mul;
+    auto eval_point_gust = [&](std::int64_t seed_val, float& out_spd, __m128& out_dir) noexcept {
+        alignas(16) std::uint32_t local_rng_buf[8]{};
+        local_rng_buf[0] = 0x075bcd15u;
+        std::uint32_t* local_rng = &local_rng_buf[1];
+        ResolveFn<RngInitFn>(0x20f8110ULL)(local_rng, 0x075bcd15u);
+        local_rng_buf[0] = static_cast<std::uint32_t>(seed_val);
+        ResolveFn<RngSeedFn>(0x20f81c0ULL)(local_rng, seed_val);
 
+        alignas(16) u8 local_perlin[32]{};
+        ResolveFn<PerlinCtorFn>(0x2685930ULL)(local_perlin);
+
+        const float u_gust = XorShift128NextUnitFloat(local_rng);
+        const float gust_p = gust_min + (gust_max - gust_min) * u_gust;
+        const float py = gust_p * 6.0f + 400.0f;
+        const float pz = gust_p + 150.0f;
+
+        const float n_spd_raw =
+            ResolveFn<PerlinFbmFn>(0x2685e30ULL)(local_perlin, 4, gust_p, py, pz, kPointFreq, kPointPers);
+        const float n_spd =
+            std::bit_cast<float>(std::bit_cast<std::uint32_t>(n_spd_raw * kPointAmpScale) & 0x7fffffffu);
+        out_spd = (spd_span * n_spd + spd_min) * spd_mul;
+
+        out_dir = _mm_setr_ps(0.0f, 0.0f, 0.0f, 1.0f);
+        if (sub_mode != 0) {
+            const float n_ang_raw =
+                ResolveFn<PerlinFbmFn>(0x2685e30ULL)(local_perlin, 4, gust_p, py, pz, kPointFreq, kPointPers);
+            const float n_ang =
+                std::bit_cast<float>(std::bit_cast<std::uint32_t>(n_ang_raw * kPointAmpScale) & 0x7fffffffu);
+            const __m128 euler = _mm_add_ps(_mm_mul_ps(ang_span, _mm_set1_ps(n_ang)), ang_min);
+            out_dir = RotateVecByEulerXYZ_ExactPS4(euler, mtx[2]);
+        }
+
+        ResolveFn<PerlinDtorFn>(0x2685940ULL)(local_perlin);
+        ResolveFn<RngDtorFn>(0x20f8290ULL)(local_rng);
+    };
+
+    float final_spd = 0.0f;
     __m128 world_dir = _mm_setr_ps(0.0f, 0.0f, 0.0f, 1.0f);
-    if (sub_mode != 0) {
-        alignas(16) __m128 mtx[4];
-        ResolveFn<GetMtxFn>(0x2318520ULL)(mtx, wind_entry);
-        mtx[3] = _mm_setr_ps(0.0f, 0.0f, 0.0f, 1.0f);
-
-        alignas(16) __m128 ang_min = _mm_setzero_ps();
-        alignas(16) __m128 ang_max = _mm_setzero_ps();
-        ResolveFn<GetVecRangeFn>(0x23185c0ULL)(wind_entry, &ang_min, &ang_max);
-        const __m128 ang_span = _mm_sub_ps(ang_max, ang_min);
-
-        const float n_ang_raw =
-            ResolveFn<PerlinFbmFn>(0x2685e30ULL)(perlin, 4, gust_p, py, pz, kPointFreq, kPointPers);
-        const float n_ang = std::bit_cast<float>(std::bit_cast<std::uint32_t>(n_ang_raw * kPointAmpScale) & 0x7fffffffu);
-        const __m128 euler = _mm_add_ps(_mm_mul_ps(ang_span, _mm_set1_ps(n_ang)), ang_min);
-        world_dir = RotateVecByEulerXYZ_ExactPS4(euler, mtx[2]);
+    if (!native_fps) {
+        const float rem = ResolveFn<FmodfFn>(0x20b54f0ULL)(phase, 1000.0f);
+        eval_point_gust(static_cast<std::int64_t>(rem * 1000.0f), final_spd, world_dir);
+    } else {
+        float spd0 = 0.0f;
+        __m128 dir0 = _mm_setr_ps(0.0f, 0.0f, 0.0f, 1.0f);
+        eval_point_gust(static_cast<std::int64_t>(static_cast<std::int32_t>(seed0)), spd0, dir0);
+        if (!(smooth_t > 1e-6f) || seed0 == seed1) {
+            final_spd = spd0;
+            world_dir = dir0;
+        } else {
+            float spd1 = 0.0f;
+            __m128 dir1 = _mm_setr_ps(0.0f, 0.0f, 0.0f, 1.0f);
+            eval_point_gust(static_cast<std::int64_t>(static_cast<std::int32_t>(seed1)), spd1, dir1);
+            final_spd = spd0 + smooth_t * (spd1 - spd0);
+            if (sub_mode != 0) {
+                alignas(16) float d0_arr[4], d1_arr[4], dout_arr[4]{0.0f, 0.0f, 0.0f, 1.0f};
+                _mm_store_ps(d0_arr, dir0);
+                _mm_store_ps(d1_arr, dir1);
+                BbClothInterp::BlendClothWindVectors3D(d0_arr, d1_arr, smooth_t, dout_arr);
+                dout_arr[3] = 1.0f;
+                world_dir = _mm_load_ps(dout_arr);
+            }
+        }
     }
 
     const __m128 wind_pos = ResolveFn<GetPosFn>(0x23182b0ULL)(wind_entry);
@@ -543,6 +614,20 @@ bool PS4_SYSV_ABI ClothExp_SprjPointWind_apply(
     }
     const float cone_fac_s = _mm_cvtss_f32(cone_fac);
 
+    const std::int32_t vel_bytes = native_fps ? (((num_p << 4) + 0x7f) & ~0x7f) : 0;
+    __m128* fp64_vel =
+        (native_fps && num_p > 0) ? reinterpret_cast<__m128*>(HkLifoAlloc(vel_bytes)) : nullptr;
+    const bool have_fp64_vel =
+        (fp64_vel != nullptr) &&
+        (IsXpbdMode() ? Xpbd_CopyParticleVelocities(sim, fp64_vel, num_p)
+                      : LocalFp64_CopyParticleVelocities(sim, fp64_vel, num_p));
+    const __m128 zero_ps = _mm_setzero_ps();
+
+    auto neg_particle_vel = [&](std::int32_t idx, __m128 pos_v) noexcept -> __m128 {
+        return have_fp64_vel ? _mm_sub_ps(zero_ps, fp64_vel[idx])
+                             : _mm_mul_ps(neg_inv_dt_vec, _mm_sub_ps(pos_v, prev_pos[idx]));
+    };
+
     const std::int32_t num_normals = *reinterpret_cast<const std::int32_t*>(sim + 0x40);
     if (num_normals == num_p) {
         const __m128* normals = *reinterpret_cast<const __m128* const*>(sim + 0x38);
@@ -570,7 +655,7 @@ bool PS4_SYSV_ABI ClothExp_SprjPointWind_apply(
                             const float ndot_raw = _mm_cvtss_f32(_mm_dp_ps(diff, normals[i], 0x7f));
                             const float ndot = std::bit_cast<float>(std::bit_cast<std::uint32_t>(ndot_raw) & 0x7fffffffu);
                             const float mass_i = _mm_cvtss_f32(pdatas[i]);
-                            const __m128 rel_v = _mm_add_ps(wind_v, _mm_mul_ps(neg_inv_dt_vec, _mm_sub_ps(pos, prev_pos[i])));
+                            const __m128 rel_v = _mm_add_ps(wind_v, neg_particle_vel(i, pos));
                             const float f_scale = (inv_density * mass_i) * (drag_coeff * ndot);
                             prev_force = _mm_mul_ps(rel_v, _mm_set1_ps(f_scale));
                         }
@@ -592,7 +677,7 @@ bool PS4_SYSV_ABI ClothExp_SprjPointWind_apply(
                         const float ndot_raw = _mm_cvtss_f32(_mm_dp_ps(diff, normals[i], 0x7f));
                         const float ndot = std::bit_cast<float>(std::bit_cast<std::uint32_t>(ndot_raw) & 0x7fffffffu);
                         const float mass_i = _mm_cvtss_f32(pdatas[i]);
-                        const __m128 rel_v = _mm_add_ps(wind_v, _mm_mul_ps(neg_inv_dt_vec, _mm_sub_ps(pos, prev_pos[i])));
+                        const __m128 rel_v = _mm_add_ps(wind_v, neg_particle_vel(i, pos));
                         const float f_scale = (inv_density * mass_i) * (drag_coeff * ndot);
                         prev_force = _mm_mul_ps(rel_v, _mm_set1_ps(f_scale));
                     }
@@ -623,7 +708,7 @@ bool PS4_SYSV_ABI ClothExp_SprjPointWind_apply(
                         } else {
                             const __m128 wind_v = _mm_mul_ps(_mm_set1_ps(final_spd * atten), diff);
                             const float mass_i = _mm_cvtss_f32(pdatas[i]);
-                            const __m128 rel_v = _mm_add_ps(wind_v, _mm_mul_ps(neg_inv_dt_vec, _mm_sub_ps(pos, prev_pos[i])));
+                            const __m128 rel_v = _mm_add_ps(wind_v, neg_particle_vel(i, pos));
                             const float f_scale = eff_drag * (inv_density * mass_i);
                             prev_force = _mm_mul_ps(rel_v, _mm_set1_ps(f_scale));
                         }
@@ -640,8 +725,7 @@ bool PS4_SYSV_ABI ClothExp_SprjPointWind_apply(
                         // Exact `0x1053af0..0x1053b16` instruction sequence
                         const float dm = inv_density * _mm_cvtss_f32(pdatas[i]);
                         const __m128 dm_ss = _mm_set_ss(dm);
-                        const __m128 disp = _mm_sub_ps(cur_pos[i], prev_pos[i]);
-                        __m128 v = _mm_add_ps(_mm_mul_ps(neg_inv_dt_vec, disp), dm_ss);
+                        __m128 v = _mm_add_ps(neg_particle_vel(i, cur_pos[i]), dm_ss);
                         v = _mm_mul_ps(cone_fac, v);
                         prev_force = _mm_mul_ps(_mm_set1_ps(eff_drag * dm), v);
                     }
@@ -651,8 +735,9 @@ bool PS4_SYSV_ABI ClothExp_SprjPointWind_apply(
         }
     }
 
-    ResolveFn<PerlinDtorFn>(0x2685940ULL)(perlin);
-    ResolveFn<RngDtorFn>(0x20f8290ULL)(rng_state);
+    if (fp64_vel != nullptr) {
+        HkLifoFree(fp64_vel, vel_bytes);
+    }
     return true;
 }
 
@@ -720,15 +805,43 @@ bool PS4_SYSV_ABI ClothExp_SprjDirWind_apply(
     const __m128* prev_pos = *reinterpret_cast<const __m128* const*>(sim + 0x28);
     const float drag_coeff = *reinterpret_cast<const float*>(action + 0x94);
 
+    const bool native_fps = IsNativeFpsMode();
+    std::uint32_t seed0 = 0, seed1 = 0;
+    float smooth_t = 0.0f, cloth_frames = 1.0f;
+    if (native_fps) {
+        BbFrameRate::GetClothWindSmoothParams(seed0, seed1, smooth_t, cloth_frames);
+    }
+
+    std::uint32_t rng_state0[4]{};
+    std::uint32_t rng_state1[4]{};
     alignas(16) std::uint32_t rng_buf[8]{};
     rng_buf[0] = 0x075bcd15u;
     std::uint32_t* rng_state = &rng_buf[1];
     ResolveFn<RngInitFn>(0x20f8110ULL)(rng_state, 0x075bcd15u);
 
     const float rem = ResolveFn<FmodfFn>(0x20b54f0ULL)(p2_phase, 1000.0f);
-    const std::int64_t seed64 = static_cast<std::int64_t>(rem * 1000.0f);
+    const std::int64_t seed64 = native_fps ? static_cast<std::int64_t>(static_cast<std::int32_t>(seed0))
+                                           : static_cast<std::int64_t>(rem * 1000.0f);
     rng_buf[0] = static_cast<std::uint32_t>(seed64);
     ResolveFn<RngSeedFn>(0x20f81c0ULL)(rng_state, seed64);
+    if (native_fps) {
+        std::memcpy(rng_state0, rng_state, sizeof(rng_state0));
+        alignas(16) std::uint32_t tmp_rng[8]{};
+        tmp_rng[0] = 0x075bcd15u;
+        ResolveFn<RngInitFn>(0x20f8110ULL)(&tmp_rng[1], 0x075bcd15u);
+        ResolveFn<RngSeedFn>(0x20f81c0ULL)(
+            &tmp_rng[1], static_cast<std::int64_t>(static_cast<std::int32_t>(seed1)));
+        std::memcpy(rng_state1, &tmp_rng[1], sizeof(rng_state1));
+        ResolveFn<RngDtorFn>(0x20f8290ULL)(&tmp_rng[1]);
+    }
+
+    const std::int32_t vel_bytes = native_fps ? (((num_p << 4) + 0x7f) & ~0x7f) : 0;
+    __m128* fp64_vel =
+        (native_fps && num_p > 0) ? reinterpret_cast<__m128*>(HkLifoAlloc(vel_bytes)) : nullptr;
+    const bool have_fp64_vel =
+        (fp64_vel != nullptr) &&
+        (IsXpbdMode() ? Xpbd_CopyParticleVelocities(sim, fp64_vel, num_p)
+                      : LocalFp64_CopyParticleVelocities(sim, fp64_vel, num_p));
 
     constexpr float kTurbAddScale = 0.20000000298023224f;  // 0x48cdf7c (0.2f)
     constexpr float kTurbAddBias = 0.05000000074505806f;   // 0x48cdf80 (0.05f)
@@ -746,6 +859,7 @@ bool PS4_SYSV_ABI ClothExp_SprjDirWind_apply(
     if (num_p > 0) {
         __m128 prev_force = _mm_setzero_ps();
         float idx_f = 0.0f;
+        const __m128 dt30_vec = _mm_set1_ps(1.0f / 30.0f);
         for (std::int32_t i = 0; i < num_p; ++i, idx_f += 1.0f) {
             if (i == 0 || i == num_p - 1 || !ShouldReusePrevParticleWindForce(sub_rate, idx_f)) {
                 float eff_drag = const_drag;
@@ -757,18 +871,34 @@ bool PS4_SYSV_ABI ClothExp_SprjDirWind_apply(
 
                 const float dm = inv_density * _mm_cvtss_f32(pdatas[i]);
                 const __m128 pos = cur_pos[i];
-                const __m128 disp = _mm_sub_ps(pos, prev_pos[i]);
+                const __m128 raw_disp = _mm_sub_ps(pos, prev_pos[i]);
+                // In Native-FPS Mode 1.1, use exact FP64 velocity for both 30-FPS turbulence
+                // displacement (`v * 1/30 s`) and aerodynamic drag (`-v`), avoiding FP32 noise!
+                const __m128 disp =
+                    have_fp64_vel ? _mm_mul_ps(fp64_vel[i], dt30_vec) : raw_disp;
 
-                const float u0 = XorShift128NextUnitFloat(rng_state);
+                auto next_turb_u = [&]() noexcept -> float {
+                    if (!native_fps) {
+                        return XorShift128NextUnitFloat(rng_state);
+                    }
+                    const float a = XorShift128NextUnitFloat(rng_state0);
+                    if (!(smooth_t > 1e-6f)) {
+                        return a;
+                    }
+                    const float b = XorShift128NextUnitFloat(rng_state1);
+                    return a + smooth_t * (b - a);
+                };
+
+                const float u0 = next_turb_u();
                 const float tx = _mm_cvtss_f32(disp) + (u0 * kTurbAddScale + kTurbAddBias);
-                const float u1 = XorShift128NextUnitFloat(rng_state);
+                const float u1 = next_turb_u();
                 const float turb_x = tx * (u1 * kTurbMulScale + kTurbMulBias);
 
                 const float disp_y = _mm_cvtss_f32(
                     _mm_castsi128_ps(_mm_shuffle_epi32(_mm_castps_si128(disp), 0x01)));
-                const float u2 = XorShift128NextUnitFloat(rng_state);
+                const float u2 = next_turb_u();
                 const float ty = disp_y + (u2 * kTurbAddScale + kTurbAddBias);
-                const float u3 = XorShift128NextUnitFloat(rng_state);
+                const float u3 = next_turb_u();
                 const float turb_y = ty * (u3 * kTurbMulScale + kTurbMulBias);
 
                 // Exact XZ distance `sqrt(pos.x^2 + pos.z^2)` (`0x10540b4..0x1054127`)
@@ -780,9 +910,9 @@ bool PS4_SYSV_ABI ClothExp_SprjDirWind_apply(
                 const float xz_dist = _mm_cvtss_f32(FastSqrt_TwoStep(xz));
 
                 const float disp_z = _mm_cvtss_f32(_mm_movehl_ps(disp, disp));
-                const float u4 = XorShift128NextUnitFloat(rng_state);
+                const float u4 = next_turb_u();
                 const float tz = disp_z + (u4 * kTurbAddScale + kTurbAddBias);
-                const float u5 = XorShift128NextUnitFloat(rng_state);
+                const float u5 = next_turb_u();
                 const float turb_z = tz * (u5 * kTurbMulScale + kTurbMulBias);
 
                 const __m128 turb_vec = _mm_movelh_ps(
@@ -800,13 +930,18 @@ bool PS4_SYSV_ABI ClothExp_SprjDirWind_apply(
 
                 const __m128 wind_v = _mm_add_ps(
                     turb_vec, _mm_mul_ps(unit_dir, _mm_set1_ps(wind_spd * spd_factor)));
-                const __m128 rel_v = _mm_add_ps(_mm_mul_ps(neg_inv_dt_vec, disp), wind_v);
+                const __m128 neg_part_v = have_fp64_vel ? _mm_sub_ps(zero, fp64_vel[i])
+                                                        : _mm_mul_ps(neg_inv_dt_vec, raw_disp);
+                const __m128 rel_v = _mm_add_ps(neg_part_v, wind_v);
                 prev_force = _mm_mul_ps(_mm_set1_ps(eff_drag * dm), rel_v);
             }
             forces[i] = _mm_add_ps(prev_force, forces[i]);
         }
     }
 
+    if (fp64_vel != nullptr) {
+        HkLifoFree(fp64_vel, vel_bytes);
+    }
     ResolveFn<RngDtorFn>(0x20f8290ULL)(rng_state);
     return true;
 }

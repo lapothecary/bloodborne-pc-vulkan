@@ -570,13 +570,39 @@ bool TemporalUpscaler::OnFrameStart() {
         (display_redirect && !display_in_place) ? ui_color.index : 0u,
         std::memory_order_relaxed);
     mt_ui_color_id.store(0u, std::memory_order_relaxed);
+    if (display_in_place) {
+        if (ui_in_place_streak < 120u) {
+            ++ui_in_place_streak;
+        }
+    } else if (ui_phase) {
+        ui_in_place_streak = 0u;
+    }
     ui_phase = false;
     ui_in_place = false;
     ui_hud_started = false;
     ui_read_barrier = false;
     has_last_sampled_view = false;
+    const bool fg_wanted_now = frame_generation && frame_generation->Wanted();
+    if (!active && (context || resources_ready || motion_image || output_image || opaque_image ||
+                    reactive_image || fsr4_linear_image || taa_history[0])) {
+        // Reclaim ~70-95 MiB of FSR 3 / DLSS / TAA context & intermediate VRAM immediately when
+        // upscaling is switched Off instead of holding it for the rest of the session.
+        ReleaseUpscalerResources();
+    }
+    if (!fg_wanted_now && fg_motion_image) {
+        scheduler.Finish();
+        fg_motion_view.reset();
+        fg_motion_image = VideoCore::HostImage{};
+        fg_motion_w = fg_motion_h = 0;
+    }
+    if (!active && !fg_wanted_now && !display_redirect && ui_in_place_streak >= 60u &&
+        (ui_image || ui_depth_image) && instance.IsLowVramDevice()) {
+        // Reclaim Title-Screen off-screen UI targets (~16-20 MiB on 16:10/non-16:9 displays) once
+        // gameplay has settled into zero-copy in-place UI composition on <= 4.5 GiB GPUs.
+        ReleaseUiResources();
+    }
     if (frame_generation) {
-        if (!frame_generation->Wanted()) {
+        if (!fg_wanted_now) {
             frame_generation->ResetHistory();
         } else {
             const u32 out_w = Scaled() ? target_width : 1920u;
@@ -1108,6 +1134,47 @@ TemporalUpscaler::PrePostHdrResult TemporalUpscaler::RunPrePostHdr(
     return result;
 }
 
+void TemporalUpscaler::ReleaseUpscalerResources() {
+    scheduler.Finish();
+    resources_ready = false;
+    resources_fsr4 = false;
+    resources_taa = false;
+    if (context) {
+        ffxVkPortableUpscaleContextDestroy(context);
+        context = nullptr;
+    }
+    motion_view.reset();
+    output_view.reset();
+    opaque_view.reset();
+    reactive_view.reset();
+    fsr4_linear_view.reset();
+    motion_image = VideoCore::HostImage{};
+    output_image = VideoCore::HostImage{};
+    opaque_image = VideoCore::HostImage{};
+    reactive_image = VideoCore::HostImage{};
+    fsr4_linear_image = VideoCore::HostImage{};
+    for (u32 i = 0; i < taa_history.size(); ++i) {
+        taa_history_views[i].reset();
+        taa_history[i] = VideoCore::HostImage{};
+    }
+    width = height = out_width = out_height = 0;
+    opaque_valid = false;
+    reset = true;
+}
+
+void TemporalUpscaler::ReleaseUiResources() {
+    scheduler.Finish();
+    ui_views.clear();
+    ui_view.reset();
+    ui_storage_view.reset();
+    ui_depth_view.reset();
+    ui_image = VideoCore::HostImage{};
+    ui_depth_image = VideoCore::HostImage{};
+    ui_width = ui_height = 0;
+    ui_format = vk::Format::eUndefined;
+    ui_depth_format = vk::Format::eUndefined;
+}
+
 bool TemporalUpscaler::EnsureResources(u32 w, u32 h, u32 ow, u32 oh, bool hdr) {
     // DLSS, like FSR 4, has its own context: no portable FSR 3 context is made.
     const bool use_fsr4 = UseFsr4() || UseDlss();
@@ -1121,13 +1188,9 @@ bool TemporalUpscaler::EnsureResources(u32 w, u32 h, u32 ow, u32 oh, bool hdr) {
         return true;
     }
     const auto device = instance.GetDevice();
-    // FSR 4 owns no portable FSR 3 context, but its images can still be in flight.
-    scheduler.Finish();
-    resources_ready = false;
-    if (context) {
-        ffxVkPortableUpscaleContextDestroy(context);
-        context = nullptr;
-    }
+    // Destroy the previous FSR 3 context AND all shared upscaler images (motion/output/opaque/
+    // reactive, ~35+ MiB) BEFORE creating the new context so 2 GB GPUs do not OOM on preset switch.
+    ReleaseUpscalerResources();
     width = w;
     height = h;
     out_width = ow;

@@ -16,7 +16,11 @@
 #include <cstdint>
 #include <cstring>
 
+#include "cloth_exp/cloth_exp_local_fp64.h"
+#include "cloth_exp/cloth_exp_registry.h"
 #include "cloth_exp/cloth_exp_runtime.h"
+#include "cloth_exp/cloth_exp_xpbd.h"
+#include "shim/bbport_frame_rate.h"
 
 namespace BbClothExp {
 
@@ -248,6 +252,11 @@ void PS4_SYSV_ABI ClothExp_hclMoveParticlesOperator_moveSomeSIMD(const u8* op, u
                 cur[part_idx] = wp;
             }
         }
+        if (IsLocalFp64Mode()) {
+            LocalFp64_RecordMoveParticles(op, sim, ref_buf);
+        } else if (IsXpbdMode()) {
+            Xpbd_RecordMoveParticles(op, sim, ref_buf);
+        }
     }
     MonitorPushTimer(0x47ad014ULL);
 }
@@ -307,6 +316,11 @@ void PS4_SYSV_ABI ClothExp_hclMoveParticlesOperator_moveSomeScalar(const u8* op,
                 cur[part_idx] = wp;
                 prev[part_idx] = wp;
             }
+        }
+        if (IsLocalFp64Mode()) {
+            LocalFp64_RecordMoveParticles(op, sim, ref_buf);
+        } else if (IsXpbdMode()) {
+            Xpbd_RecordMoveParticles(op, sim, ref_buf);
         }
     }
     MonitorPushTimer(0x47ad014ULL);
@@ -742,6 +756,9 @@ void PS4_SYSV_ABI ClothExp_FD4HavokCloth_step(u8* self, float dt) noexcept {
     if (!ok) {
         ResolveFn<PreSyncFn>(0x076a030ULL)(*reinterpret_cast<u8* const*>(self + 0x10));
     }
+
+    // Keep BbFrameRate's cloth world timing & wind seeds synchronized (`0xfd54a2` equivalent).
+    BbFrameRate::NotifyClothWorldStep(dt);
 
     if (self[0x30] != 0u) {
         self[0x141] = 1u;

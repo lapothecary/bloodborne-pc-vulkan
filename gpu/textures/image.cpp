@@ -154,9 +154,16 @@ void HostImage::Create(const vk::ImageCreateInfo& create_info, VmaPool pool) {
                 dedicated = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
             }
         }
+        const bool high_residency =
+            bool(image_ci.usage & (vk::ImageUsageFlagBits::eColorAttachment |
+                                   vk::ImageUsageFlagBits::eDepthStencilAttachment |
+                                   vk::ImageUsageFlagBits::eStorage));
         const VmaAllocationCreateInfo alloc_ci = {
             .flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | dedicated,
             .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+            // Pin dedicated render/depth/storage targets at max priority (1.0) so WDDM never
+            // demotes active HDR/G-Buffer/shadow targets to PCIe System RAM ahead of world textures.
+            .priority = high_residency ? 1.0f : 0.25f,
         };
         result = vmaCreateImage(allocator, &vk_create_info, &alloc_ci, &handle, &allocation,
                                 &alloc_info);

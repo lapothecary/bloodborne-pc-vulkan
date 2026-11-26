@@ -136,6 +136,53 @@ int main() {
         assert(s.vsync_mode == vm && s.vsync_mode_chosen);
     }
 
+    // Default hidden XPBD tuning values (2.50x compliance, 0.25x aero lift, 1.50x damping) before user edits.
+    assert(std::abs(s.xpbd_compliance.load() - 2.50f) < 1e-3f &&
+           std::abs(s.xpbd_aero.load() - 0.25f) < 1e-3f &&
+           std::abs(s.xpbd_damping.load() - 1.50f) < 1e-3f);
+
+    // Insert menu geometry, scroll, collapsible sections, cloth engine mode & XPBD/PostFX sliders round-trip.
+    s.menu_x = 0.685f;
+    s.menu_y = 0.045f;
+    s.menu_w = 0.340f;
+    s.menu_h = 0.860f;
+    s.menu_scroll_y = 642.5f;
+    s.menu_sec_controls = false;
+    s.menu_sec_developer = true;
+    s.cloth_exp_mode = 3; // Mode 1.2 XPBD
+    s.cloth_exp_chosen = true;
+    s.cloth_exp_min = 4;
+    s.cloth_exp_max = 35;
+    s.xpbd_compliance = 0.85f;
+    s.xpbd_aero = 1.45f;
+    s.xpbd_damping = 1.15f;
+    s.xpbd_tuning_chosen = true;
+    s.native_bloom_intensity = 0.215f;
+    s.native_dof_strength = 1.35f;
+    s.native_postfx_tuning_chosen = true;
+    BbSettings::Save();
+
+    s.menu_x = -1.0f;
+    s.menu_w = -1.0f;
+    s.menu_scroll_y = 0.0f;
+    s.menu_sec_controls = true;
+    s.menu_sec_developer = false;
+    s.cloth_exp_mode = 0;
+    s.xpbd_aero = 1.0f;
+    s.native_dof_strength = 1.0f;
+    BbSettings::Load();
+
+    assert(std::abs(s.menu_x.load() - 0.685f) < 1e-3f && std::abs(s.menu_y.load() - 0.045f) < 1e-3f);
+    assert(std::abs(s.menu_w.load() - 0.340f) < 1e-3f && std::abs(s.menu_h.load() - 0.860f) < 1e-3f);
+    assert(std::abs(s.menu_scroll_y.load() - 642.5f) < 0.2f);
+    assert(!s.menu_sec_controls.load() && s.menu_sec_developer.load());
+    assert(s.cloth_exp_mode.load() == 3 && s.cloth_exp_min.load() == 4 && s.cloth_exp_max.load() == 35);
+    assert(std::abs(s.xpbd_compliance.load() - 0.85f) < 1e-3f &&
+           std::abs(s.xpbd_aero.load() - 1.45f) < 1e-3f &&
+           std::abs(s.xpbd_damping.load() - 1.15f) < 1e-3f);
+    assert(std::abs(s.native_bloom_intensity.load() - 0.215f) < 1e-3f &&
+           std::abs(s.native_dof_strength.load() - 1.35f) < 1e-2f);
+
     unlink(path);
     std::puts("PASS: settings save keeps other keys, menu position, menu language, and native CSOptionsData");
 }

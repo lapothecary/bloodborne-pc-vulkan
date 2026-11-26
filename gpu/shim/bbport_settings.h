@@ -198,8 +198,24 @@ struct Values {
     std::atomic<int> debug_view{DebugNone};
     std::atomic<bool> show_fps{false};
     std::atomic<bool> show_additional_debug{false};
-    /// The settings menu's position (fraction of the screen), -1 until it is moved.
+    /// The settings menu's position & size (fraction of viewport work area, -1 until moved/resized),
+    /// vertical scroll offset (unscaled px), and collapsible section states.
     std::atomic<float> menu_x{-1.0f}, menu_y{-1.0f};
+    std::atomic<float> menu_w{-1.0f}, menu_h{-1.0f};
+    std::atomic<float> menu_scroll_y{0.0f};
+    std::atomic<bool> menu_sec_controls{true};
+    std::atomic<bool> menu_sec_developer{false};
+    std::atomic<bool> menu_sec_toypad{true};
+    /// Experimental Cloth Engine mode & XPBD sliders persisted from Insert -> Developer Debug.
+    std::atomic<int> cloth_exp_mode{0};
+    std::atomic<bool> cloth_exp_chosen{false};
+    std::atomic<int> cloth_exp_min{0};
+    std::atomic<int> cloth_exp_max{39};
+    std::atomic<float> xpbd_compliance{2.50f};
+    std::atomic<float> xpbd_aero{0.25f};
+    std::atomic<float> xpbd_damping{1.50f};
+    std::atomic<bool> xpbd_tuning_chosen{false};
+    std::atomic<bool> native_postfx_tuning_chosen{false};
     // FSR 4 checks (menu): the provider's auto exposure, the jitter sign it is given.
     std::atomic<bool> fsr4_auto_exposure{true};
     std::atomic<bool> fsr4_invert_jitter{false};

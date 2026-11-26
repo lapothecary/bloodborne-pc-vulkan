@@ -422,6 +422,7 @@ static void StartProfileWriter() {
 
 extern "C" int bbgpu_init(const BbGpuConfig* config) {
     BbSettings::Load();
+    BbClothExp::SyncFromSettings();
     // What the translator knows about this game (games/), before anything asks for it.
     Game::Select(config->serial);
 #ifdef BB_PGO_GENERATE
@@ -656,6 +657,7 @@ extern "C" int bbgpu_bake_shaders(const char* game_dir_cstr, const char* user_di
 #endif
     }
     BbSettings::Load();
+    BbClothExp::SyncFromSettings();
     const std::string serial = ReadSerialFromSfo(game_dir);
     Game::Select(serial.c_str());
     Common::ElfInfo::Instance().Set(serial, "Bloodborne", 0x04508001u, 0);

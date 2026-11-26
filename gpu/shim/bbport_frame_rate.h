@@ -39,4 +39,9 @@ bool PresentPacingEnabled() noexcept;
 float CurrentFramesPer30() noexcept;
 /// Monotonic simulation frame sequence counter (increments once per FrameStep).
 std::uint64_t FrameSeq() noexcept;
+/// Synchronizes cloth world timing & 30 Hz smooth wind seeds when `ClothExp_FD4HavokCloth_step` runs.
+void NotifyClothWorldStep(float dt) noexcept;
+/// Queries current 30 Hz smooth wind seeds, cubic blend `[0..1]`, and `cloth_frames` for `ClothExp`.
+void GetClothWindSmoothParams(std::uint32_t& out_seed0, std::uint32_t& out_seed1,
+                              float& out_smooth, float& out_frames) noexcept;
 } // namespace BbFrameRate

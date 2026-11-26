@@ -26,6 +26,8 @@
 #include "cloth_exp/cloth_exp_sim_and_integrate.h"
 #include "cloth_exp/cloth_exp_sprj_wind.h"
 #include "cloth_exp/cloth_exp_world_and_ops.h"
+#include "cloth_exp/cloth_exp_xpbd.h"
+#include "shim/bbport_settings.h"
 
 #if defined(_WIN32)
 extern "C" int bb_guest_tls_slot(void) noexcept;
@@ -101,10 +103,43 @@ static_assert(kEntryCount <= 256u, "Live flag page holds up to 256 1-byte atomic
 std::mutex g_state_mutex;
 volatile u8* g_live_flag_page = nullptr; // 4 KiB RW page adjacent to RX trampoline pages
 bool g_entry_installed[kEntryCount]{};
-std::atomic<bool> g_master_enabled{false};
+std::atomic<ClothExpMode> g_mode{ClothExpMode::Off};
 std::atomic<int> g_range_min{0};
 std::atomic<int> g_range_max{static_cast<int>(kEntryCount) - 1};
 std::atomic<std::size_t> g_installed_count{0};
+
+ClothExpMode ParseEnvMode(const char* env_exp) noexcept {
+    if (!env_exp || !env_exp[0] || std::strcmp(env_exp, "0") == 0 ||
+        std::strcmp(env_exp, "off") == 0) {
+        return ClothExpMode::Off;
+    }
+    if (std::strcmp(env_exp, "1.1") == 0 || std::strcmp(env_exp, "2") == 0 ||
+        std::strcmp(env_exp, "fp64") == 0) {
+        return ClothExpMode::LocalFp64;
+    }
+    if (std::strcmp(env_exp, "1.2") == 0 || std::strcmp(env_exp, "3") == 0 ||
+        std::strcmp(env_exp, "xpbd") == 0) {
+        return ClothExpMode::XpbdEnhanced;
+    }
+    if (std::strcmp(env_exp, "1") == 0) {
+        return ClothExpMode::Havok1to1;
+    }
+    return ClothExpMode::Off;
+}
+
+const char* ModeDisplayName(ClothExpMode m) noexcept {
+    switch (m) {
+    case ClothExpMode::Havok1to1:
+        return "Mode 1 (Havok C++20 1:1)";
+    case ClothExpMode::LocalFp64:
+        return "Mode 1.1 (Havok Local-Space FP64, Native FPS)";
+    case ClothExpMode::XpbdEnhanced:
+        return "Mode 1.2 (XPBD Enhanced, Native FPS)";
+    case ClothExpMode::Off:
+    default:
+        return "OFF (Default Fixed-30 Interp)";
+    }
+}
 
 bool MatchesModuleFilter(const char* mod_name, const char* env_mods) noexcept {
     if (!env_mods || !env_mods[0] || std::strcmp(env_mods, "all") == 0) {
@@ -127,12 +162,17 @@ void RefreshLiveFlagsLocked(const char* env_mods) noexcept {
     if (!g_live_flag_page) {
         return;
     }
-    const bool master = g_master_enabled.load(std::memory_order_relaxed);
-    const int lo = g_range_min.load(std::memory_order_relaxed);
-    const int hi = g_range_max.load(std::memory_order_relaxed);
+    const ClothExpMode mode = g_mode.load(std::memory_order_relaxed);
+    const bool master = (mode != ClothExpMode::Off);
+    // In Mode 1.1 / 1.2 (Native-FPS solver), keep all 40 hooks active coherently.
+    const bool full_range = (mode == ClothExpMode::LocalFp64 || mode == ClothExpMode::XpbdEnhanced);
+    const int lo = full_range ? 0 : g_range_min.load(std::memory_order_relaxed);
+    const int hi = full_range ? (static_cast<int>(kEntryCount) - 1)
+                              : g_range_max.load(std::memory_order_relaxed);
     for (std::size_t i = 0; i < kEntryCount; ++i) {
         const bool in_range = (static_cast<int>(i) >= lo && static_cast<int>(i) <= hi);
-        const bool mod_ok = env_mods ? MatchesModuleFilter(kEntries[i].module_name, env_mods) : true;
+        const bool mod_ok =
+            (!full_range && env_mods) ? MatchesModuleFilter(kEntries[i].module_name, env_mods) : true;
         const u8 val = (master && g_entry_installed[i] && in_range && mod_ok) ? 1u : 0u;
         __atomic_store_n(&g_live_flag_page[i], val, __ATOMIC_RELEASE);
     }
@@ -342,14 +382,26 @@ void PatchImage(unsigned char* image, std::uint64_t size) noexcept {
     ::mprotect(arena, flag_bytes, PROT_READ | PROT_WRITE);
     ::mprotect(code_base, code_bytes, PROT_READ | PROT_EXEC);
     g_installed_count.store(hooked, std::memory_order_release);
+    SyncFromSettings();
 
+    int min_idx = 0, max_idx = static_cast<int>(kEntryCount) - 1;
+    GetActiveRange(min_idx, max_idx);
+    std::printf("[ClothExp] Experimental C++20 Cloth Engine ready: %zu / %zu functions hooked "
+                "(state=%s, range=[%d..%d], toggle live in Insert -> Developer Debug)\n",
+                hooked, kEntryCount, ModeDisplayName(GetMode()), min_idx, max_idx);
+}
+
+void SyncFromSettings() noexcept {
+    const auto& s = BbSettings::Get();
     const char* env_exp = std::getenv("BB_CLOTH_EXP");
     const char* env_min = std::getenv("BB_CLOTH_EXP_MIN");
     const char* env_max = std::getenv("BB_CLOTH_EXP_MAX");
     const char* env_mods = std::getenv("BB_CLOTH_EXP_MODULES");
 
-    int min_idx = 0;
-    int max_idx = static_cast<int>(kEntryCount) - 1;
+    int min_idx = std::clamp(s.cloth_exp_min.load(std::memory_order_relaxed), 0,
+                             static_cast<int>(kEntryCount) - 1);
+    int max_idx = std::clamp(s.cloth_exp_max.load(std::memory_order_relaxed), min_idx,
+                             static_cast<int>(kEntryCount) - 1);
     if (env_min && *env_min) {
         min_idx = std::clamp(std::atoi(env_min), 0, static_cast<int>(kEntryCount) - 1);
     }
@@ -359,26 +411,54 @@ void PatchImage(unsigned char* image, std::uint64_t size) noexcept {
     g_range_min.store(min_idx, std::memory_order_relaxed);
     g_range_max.store(max_idx, std::memory_order_relaxed);
 
-    const bool start_on = (env_exp && env_exp[0] == '1' && env_exp[1] == '\0');
-    g_master_enabled.store(start_on, std::memory_order_relaxed);
-    {
-        std::lock_guard<std::mutex> lk(g_state_mutex);
-        RefreshLiveFlagsLocked(env_mods);
+    ClothExpMode target_mode = ClothExpMode::Off;
+    if (env_exp && *env_exp) {
+        target_mode = ParseEnvMode(env_exp);
+    } else {
+        target_mode = static_cast<ClothExpMode>(
+            std::clamp(s.cloth_exp_mode.load(std::memory_order_relaxed), 0, 3));
     }
 
-    std::printf("[ClothExp] Experimental C++20 Cloth Engine ready: %zu / %zu functions hooked "
-                "(state=%s, range=[%d..%d], toggle live in Insert -> Developer Debug)\n",
-                hooked, kEntryCount, start_on ? "ON" : "OFF (default)", min_idx, max_idx);
+    Xpbd_SetTuning(XpbdTuningParams{
+        .compliance_scale = s.xpbd_compliance.load(std::memory_order_relaxed),
+        .aero_lift_scale = s.xpbd_aero.load(std::memory_order_relaxed),
+        .damping_scale = s.xpbd_damping.load(std::memory_order_relaxed),
+    });
+
+    std::lock_guard<std::mutex> lk(g_state_mutex);
+    g_mode.store(target_mode, std::memory_order_release);
+    RefreshLiveFlagsLocked(env_mods);
 }
 
-void SetEnabled(bool enabled) noexcept {
+void SetMode(ClothExpMode mode) noexcept {
     std::lock_guard<std::mutex> lk(g_state_mutex);
-    g_master_enabled.store(enabled, std::memory_order_relaxed);
+    g_mode.store(mode, std::memory_order_release);
     RefreshLiveFlagsLocked(std::getenv("BB_CLOTH_EXP_MODULES"));
 }
 
+ClothExpMode GetMode() noexcept {
+    return g_mode.load(std::memory_order_acquire);
+}
+
+bool IsLocalFp64Mode() noexcept {
+    return g_mode.load(std::memory_order_relaxed) == ClothExpMode::LocalFp64;
+}
+
+bool IsXpbdMode() noexcept {
+    return g_mode.load(std::memory_order_relaxed) == ClothExpMode::XpbdEnhanced;
+}
+
+bool IsNativeFpsMode() noexcept {
+    const ClothExpMode m = g_mode.load(std::memory_order_relaxed);
+    return m == ClothExpMode::LocalFp64 || m == ClothExpMode::XpbdEnhanced;
+}
+
+void SetEnabled(bool enabled) noexcept {
+    SetMode(enabled ? ClothExpMode::Havok1to1 : ClothExpMode::Off);
+}
+
 bool Enabled() noexcept {
-    return g_master_enabled.load(std::memory_order_relaxed);
+    return g_mode.load(std::memory_order_relaxed) != ClothExpMode::Off;
 }
 
 void SetActiveRange(int min_idx, int max_idx) noexcept {

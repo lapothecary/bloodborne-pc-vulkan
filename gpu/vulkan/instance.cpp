@@ -213,6 +213,10 @@ void Instance::CreateDevice() {
         vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR,
         vk::PhysicalDeviceShaderMixedFloatDotProductFeaturesVALVE,
         vk::PhysicalDeviceCooperativeMatrixFeaturesKHR, vk::PhysicalDeviceShaderFloat8FeaturesEXT
+#ifdef VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME
+        ,
+        vk::PhysicalDeviceMemoryPriorityFeaturesEXT
+#endif
 #ifdef VK_AMD_ANTI_LAG_EXTENSION_NAME
         ,
         vk::PhysicalDeviceAntiLagFeaturesAMD
@@ -305,6 +309,11 @@ void Instance::CreateDevice() {
     view_2d_of_3d = views.image2DViewOf3D && views.sampler2DViewOf3D;
     ext.image_view_min_lod = enable(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
     ext.memory_budget = enable(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+#ifdef VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME
+    ext.memory_priority =
+        query.get<vk::PhysicalDeviceMemoryPriorityFeaturesEXT>().memoryPriority &&
+        enable(VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME);
+#endif
     // Guest direct memory allocated here and mapped by the runtime (BbGuestMemory), or host
     // memory imported where dma-bufs do not fit (NVIDIA).
     ext.memory_fd = enable(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME);
@@ -474,6 +483,9 @@ void Instance::CreateDevice() {
     vk::PhysicalDeviceShaderFloat8FeaturesEXT float8{.shaderFloat8 = true,
                                                       .shaderFloat8CooperativeMatrix = true};
     vk::PhysicalDeviceCoherentMemoryFeaturesAMD coherent{.deviceCoherentMemory = true};
+#ifdef VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME
+    vk::PhysicalDeviceMemoryPriorityFeaturesEXT memory_priority_features{.memoryPriority = true};
+#endif
 #ifdef VK_AMD_ANTI_LAG_EXTENSION_NAME
     vk::PhysicalDeviceAntiLagFeaturesAMD anti_lag{.antiLag = true};
 #endif
@@ -517,6 +529,9 @@ void Instance::CreateDevice() {
     link_if(ext.cooperative_matrix, matrix);
     link_if(ext.float8, float8);
     link_if(ext.guest_uncached, coherent);
+#ifdef VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME
+    link_if(ext.memory_priority, memory_priority_features);
+#endif
 #ifdef VK_AMD_ANTI_LAG_EXTENSION_NAME
     link_if(ext.amd_anti_lag, anti_lag);
 #endif
@@ -643,8 +658,12 @@ void Instance::CreateAllocator() {
         }
         return VkDeviceSize(IsLowVramDevice() ? 16ul : 64ul) << 20;
     }();
+    VmaAllocatorCreateFlags vma_flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
+    if (ext.memory_priority) {
+        vma_flags |= VMA_ALLOCATOR_CREATE_EXT_MEMORY_PRIORITY_BIT;
+    }
     const VmaAllocatorCreateInfo info{
-        .flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT,
+        .flags = vma_flags,
         .physicalDevice = physical_device,
         .device = *device,
         .preferredLargeHeapBlockSize = block_size,
@@ -683,6 +702,8 @@ void Instance::CreateAllocator() {
         pool_ci.blockSize = 16ull << 20;
         pool_ci.minBlockCount = 0;
         pool_ci.maxBlockCount = 0;
+        // Streamed 2D world BC textures yield VRAM before active render/depth targets on WDDM.
+        pool_ci.priority = 0.25f;
         for (VmaPool& pool : world_bc_pools) {
             if (vmaCreatePool(allocator, &pool_ci, &pool) != VK_SUCCESS) {
                 pool = VK_NULL_HANDLE;

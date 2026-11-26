@@ -429,7 +429,7 @@ Logs, dumps, traces, probes and experiments, for finding bugs. Most cost frame t
 | `BB_CE_STATS` | =1: what the constant engine's dumps feed |
 | `BB_CE_WAIT_LOG` | set: constant engine waits that were not satisfied |
 | `BB_CE_WATCH` | =hex address: constant RAM dumps and WRITE_DATA packets over that address |
-| `BB_CLOTH_EXP` | =1: enable isolated Experimental C++20 Cloth & Wind Engine (gpu/cloth_exp/) at boot (default 0; also live-toggleable in Insert overlay) |
+| `BB_CLOTH_EXP` | =0/1/1.1/1.2: Experimental C++20 Cloth & Wind Engine mode at boot (0=off [default], 1=Havok 1:1, 1.1=Local-Space FP64 Native FPS, 1.2=XPBD; also live-switchable in Insert) |
 | `BB_CLOTH_EXP_MAX` | =idx: last active function index for gpu/cloth_exp/ bisection (default N-1) |
 | `BB_CLOTH_EXP_MIN` | =idx: first active function index for gpu/cloth_exp/ bisection (default 0) |
 | `BB_CLOTH_EXP_MODULES` | =mod,...: module prefix filter for gpu/cloth_exp/ bisection (default all) |

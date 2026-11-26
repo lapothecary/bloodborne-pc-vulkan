@@ -56,12 +56,14 @@ void ComputeLowVramMarks(u64 budget, u64& trigger_out, u64& pressure_out, u64& c
 }
 
 bool IsOrphanableTransientTarget(const Image& image) noexcept {
+    // Strictly transient depth/stencil targets only: NEVER drop GpuModified color render targets
+    // without writeback, because Bloodborne keeps persistent tiled character/weapon/enemy
+    // blood-splatter accumulation maps (>= 1 MiB, single-mip, cleared once on spawn) untouched
+    // for minutes until a hit occurs.
     return !image.usage.vo_surface && !image.usage.storage && !image.binding.is_bound &&
            !image.binding.is_target && !image.info.props.is_block &&
            image.info.resources.levels == 1u && image.info.resources.layers == 1u &&
-           image.backing &&
-           (image.info.props.is_depth ||
-            (image.usage.render_target && image.GetHostImageSize() >= (1ull << 20)));
+           image.backing && image.info.props.is_depth;
 }
 
 } // namespace
@@ -253,7 +255,6 @@ void TextureCache::GarbageCollectImages() {
         return gc_tick_at_second[(second - seconds) % gc_tick_at_second.size()];
     };
     const u64 idle_tick = tick_seconds_ago(idle_seconds);
-    const u64 orphan_idle_tick = tick_seconds_ago(45);
 
     if (!BbToggle::Disabled(BbToggle::TextureCollector) && new_second &&
         total_used_memory < trigger_gc_memory && idle_tick != 0 && gc_tick > idle_tick) {
@@ -266,14 +267,9 @@ void TextureCache::GarbageCollectImages() {
                 return true;
             }
             Image& image = slot_images[image_id];
-            const bool orphan_rt =
-                IsOrphanableTransientTarget(image) && orphan_idle_tick != 0 &&
-                gc_tick > orphan_idle_tick && image.MtLastGcTick() < orphan_idle_tick &&
-                cur_sched_tick - image.LastAccessTick() > 256u;
-            if (!orphan_rt &&
-                (True(image.flags & (ImageFlagBits::DirectImmutable | ImageFlagBits::GpuModified)) ||
-                 image.SafeToDownload() || image.MtLastGcTick() >= idle_tick ||
-                 cur_sched_tick - image.LastAccessTick() <= 64u)) {
+            if (True(image.flags & (ImageFlagBits::DirectImmutable | ImageFlagBits::GpuModified)) ||
+                image.SafeToDownload() || image.MtLastGcTick() >= idle_tick ||
+                cur_sched_tick - image.LastAccessTick() <= 64u) {
                 TouchImage(image);
                 return false;
             }
@@ -345,10 +341,10 @@ void TextureCache::GarbageCollectImages() {
             return false;
         }
         const bool write_back = image.SafeToDownload();
-        const u64 orphan_thresh = pressured ? orphan_pressured_tick : orphan_idle_tick;
         const bool orphan_rt =
-            IsOrphanableTransientTarget(image) && orphan_thresh != 0 &&
-            gc_tick > orphan_thresh && image.MtLastGcTick() < orphan_thresh &&
+            instance.IsLowVramDevice() && pressured && IsOrphanableTransientTarget(image) &&
+            orphan_pressured_tick != 0 && gc_tick > orphan_pressured_tick &&
+            image.MtLastGcTick() < orphan_pressured_tick &&
             cur_sched_tick - image.LastAccessTick() > 256u;
         // Images that cannot go now (tiled GPU-written ones cannot be written back; GPU-written
         // ones only under pressure) neither use up the deletions nor stay first in line: the
@@ -472,31 +468,39 @@ u64 TextureCache::PurgeIdleForAllocation(u64 desired_bytes) {
         const u64 cur_sched_tick = CurrentTick();
         const u64 second = SteadySeconds();
         const u64 orphan_thresh = gc_tick_at_second[(second - 5) % gc_tick_at_second.size()];
-        const u64 min_below = gc_tick > 8u ? (gc_tick - 8u) : 0ull;
-        lru_cache.ForEachItemBelow(min_below, [&](ImageId image_id) {
-            if (reclaimed >= desired_bytes) {
-                return true;
-            }
-            Image& image = slot_images[image_id];
-            if (image.binding.is_bound || image.binding.is_target ||
-                cur_sched_tick - image.LastAccessTick() <= 16u) {
+        const auto run_purge_pass = [&](u64 min_gc_age, u64 min_sched_age) {
+            const u64 min_below = gc_tick > min_gc_age ? (gc_tick - min_gc_age) : 0ull;
+            lru_cache.ForEachItemBelow(min_below, [&](ImageId image_id) {
+                if (reclaimed >= desired_bytes) {
+                    return true;
+                }
+                Image& image = slot_images[image_id];
+                if (image.binding.is_bound || image.binding.is_target ||
+                    cur_sched_tick - image.LastAccessTick() <= min_sched_age) {
+                    return false;
+                }
+                const bool orphan_rt =
+                    IsOrphanableTransientTarget(image) && orphan_thresh != 0 &&
+                    gc_tick > orphan_thresh && image.MtLastGcTick() < orphan_thresh &&
+                    cur_sched_tick - image.LastAccessTick() > 128u;
+                if (!orphan_rt &&
+                    (True(image.flags & ImageFlagBits::GpuModified) || image.SafeToDownload())) {
+                    return false;
+                }
+                const u64 bytes = image.backing ? u64(image.GetHostImageSize()) : 0ull;
+                reclaimed += bytes;
+                ++count;
+                BbStats::gc_freed_images.fetch_add(1, std::memory_order_relaxed);
+                FreeImage(image_id);
                 return false;
-            }
-            const bool orphan_rt =
-                IsOrphanableTransientTarget(image) && orphan_thresh != 0 &&
-                gc_tick > orphan_thresh && image.MtLastGcTick() < orphan_thresh &&
-                cur_sched_tick - image.LastAccessTick() > 128u;
-            if (!orphan_rt &&
-                (True(image.flags & ImageFlagBits::GpuModified) || image.SafeToDownload())) {
-                return false;
-            }
-            const u64 bytes = image.backing ? u64(image.GetHostImageSize()) : 0ull;
-            reclaimed += bytes;
-            ++count;
-            BbStats::gc_freed_images.fetch_add(1, std::memory_order_relaxed);
-            FreeImage(image_id);
-            return false;
-        });
+            });
+        };
+        run_purge_pass(8u, 16u);
+        if (reclaimed < desired_bytes) {
+            // Second pass for 30 FPS low-VRAM sessions where active BC world textures can be
+            // re-uploaded cleanly from guest RAM to give FSR 3 / upscaler contexts headroom.
+            run_purge_pass(2u, 4u);
+        }
     }
     if (count > 0) {
         // Execute deferred vmaDestroyImage callbacks immediately so VMA returns empty blocks to WDDM.

@@ -23,7 +23,9 @@
 #include "bbport_sections.h"
 #include "bbport_settings.h"
 #include "bbport_toggles.h"
+#include "cloth_exp/cloth_exp_local_fp64.h"
 #include "cloth_exp/cloth_exp_registry.h"
+#include "cloth_exp/cloth_exp_xpbd.h"
 #include "vulkan/low_latency.h"
 
 #include <array>
@@ -142,13 +144,6 @@ bool ClothWindSeedEnabled() noexcept {
 float ClothExpOverride() noexcept {
     static const float v = [] {
         const char* env = std::getenv("BB_CLOTH_STIFF_EXP");
-        if (!env || !*env) {
-            env = std::getenv("BB_CLOTH_EXP");
-            // Ignore boolean "0" / "1" used by BbClothExp::PatchImage startup toggle.
-            if (env && (env[0] == '0' || env[0] == '1') && env[1] == '\0') {
-                return -1.0f;
-            }
-        }
         const float parsed = (env && *env) ? std::strtof(env, nullptr) : -1.0f;
         return (parsed > 0.0f && parsed <= 3.0f) ? parsed : -1.0f;
     }();
@@ -1878,7 +1873,7 @@ void PS4_SYSV_ABI WrappedClothPreStep(u8* op, u8* step_info) noexcept {
         call_prestep(op, step_info);
         return;
     }
-    if (!cloth_fixed30_hooked) {
+    if (!cloth_fixed30_hooked || BbClothExp::IsNativeFpsMode()) {
         u8* sim_for_trace = nullptr;
         float old_sdt_for_trace = 0.0f;
         if (ClothTraceEnabled()) {
@@ -2041,7 +2036,7 @@ int PS4_SYSV_ABI WrappedClothSimulate(u8* op, u8* ctx, float dt) noexcept {
     using NormalsFn = void(PS4_SYSV_ABI*)(void*, u8*);
     using AabbFn = void(PS4_SYSV_ABI*)(u8*);
     const auto orig_sim = reinterpret_cast<SimFn>(image_base + 0x76e370);
-    if (!cloth_fixed30_hooked || !op || !ctx) {
+    if (!cloth_fixed30_hooked || BbClothExp::IsNativeFpsMode() || !op || !ctx) {
         return orig_sim(op, ctx, dt);
     }
     const std::int32_t idx = *reinterpret_cast<const std::int32_t*>(op + 0x1c);
@@ -2073,9 +2068,10 @@ int PS4_SYSV_ABI WrappedClothSimulate(u8* op, u8* ctx, float dt) noexcept {
     }
 
     const std::uint64_t fseq = cloth_world_frame_seq.load(std::memory_order_relaxed);
+    const bool mode_resumed = (st->initialized && fseq > st->last_frame_seq + 1u);
     st->last_frame_seq = fseq;
 
-    bool reset = (!st->initialized || st->sim_data != sim_data || st->n != n);
+    bool reset = (!st->initialized || mode_resumed || st->sim_data != sim_data || st->n != n);
     if (reset) {
         st->sim_data = sim_data;
         st->n = n;
@@ -2874,8 +2870,10 @@ void PS4_SYSV_ABI OnClothWorldStep(float* dt_ptr) noexcept {
     }
     const std::uint64_t fseq = cloth_world_frame_seq.fetch_add(1u, std::memory_order_relaxed) + 1u;
     const float cdt = std::clamp(dt, MinSimDt, Frame30);
+    BbClothExp::LocalFp64_OnWorldStepBegin(fseq);
+    BbClothExp::Xpbd_OnWorldStepBegin(fseq);
 
-    if (cloth_fixed30_hooked) {
+    if (cloth_fixed30_hooked && !BbClothExp::IsNativeFpsMode()) {
         // Periodically prune stale cloth entries while all Havok Cloth workers are idle (right
         // after waitForStepComplete() 0x76a030).
         if ((fseq & 63u) == 0u && !cloth_fixed_states.empty()) {
@@ -3601,5 +3599,27 @@ float CurrentFramesPer30() noexcept {
 
 std::uint64_t FrameSeq() noexcept {
     return sim_frame_seq.load(std::memory_order_relaxed);
+}
+
+void NotifyClothWorldStep(float dt) noexcept {
+    if (!live || !ClothFixEnabled()) {
+        return;
+    }
+    OnClothWorldStep(&dt);
+}
+
+void GetClothWindSmoothParams(std::uint32_t& out_seed0, std::uint32_t& out_seed1,
+                              float& out_smooth, float& out_frames) noexcept {
+    if (!live) {
+        out_seed0 = 0u;
+        out_seed1 = 0u;
+        out_smooth = 0.0f;
+        out_frames = 1.0f;
+        return;
+    }
+    out_seed0 = live->cloth_wind_seed30;
+    out_seed1 = live->cloth_wind_seed1;
+    out_smooth = ClothWindSeedEnabled() ? live->cloth_wind_smooth : 0.0f;
+    out_frames = live->cloth_frames;
 }
 } // namespace BbFrameRate

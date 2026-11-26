@@ -19,7 +19,10 @@
 #include <cstdint>
 #include <cstring>
 
+#include "cloth_exp/cloth_exp_local_fp64.h"
+#include "cloth_exp/cloth_exp_registry.h"
 #include "cloth_exp/cloth_exp_runtime.h"
+#include "cloth_exp/cloth_exp_xpbd.h"
 
 namespace BbClothExp {
 
@@ -122,6 +125,14 @@ extern "C" {
 // 31. hclSimulateOperator::preStep @ 0x076fb90 (1717 B)
 // ============================================================================
 void PS4_SYSV_ABI ClothExp_hclSimulateOperator_preStep(u8* op, u8* step_info) noexcept {
+    if (IsLocalFp64Mode()) {
+        LocalFp64_PreStep(op, step_info);
+        return;
+    }
+    if (IsXpbdMode()) {
+        Xpbd_PreStep(op, step_info);
+        return;
+    }
     u8* ctx0 = *reinterpret_cast<u8* const*>(step_info + 0x10);
     const std::int32_t sim_idx = *reinterpret_cast<const std::int32_t*>(op + 0x1c);
     u8* sim = (*reinterpret_cast<u8* const* const*>(ctx0 + 0x20))[sim_idx];
@@ -228,6 +239,12 @@ void PS4_SYSV_ABI ClothExp_hclSimulateOperator_preStep(u8* op, u8* step_info) no
 // 32. hclSimulateOperator::simulate @ 0x076e370 (3276 B)
 // ============================================================================
 int PS4_SYSV_ABI ClothExp_hclSimulateOperator_simulate(u8* op, u8* ctx, float dt) noexcept {
+    if (IsLocalFp64Mode()) {
+        return LocalFp64_Simulate(op, ctx, dt);
+    }
+    if (IsXpbdMode()) {
+        return Xpbd_Simulate(op, ctx, dt);
+    }
     MonitorPushTimer(0x47b31afULL);
 
     const std::int32_t sim_idx = *reinterpret_cast<const std::int32_t*>(op + 0x1c);

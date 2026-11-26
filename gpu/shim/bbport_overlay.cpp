@@ -31,6 +31,7 @@ extern "C" void runtime_wait_report(double frames);
 #include "bbport_guest_hooks.h"
 #include "bbport_frame_rate.h"
 #include "cloth_exp/cloth_exp_registry.h"
+#include "cloth_exp/cloth_exp_xpbd.h"
 
 namespace Vulkan {
 void StartSfxFireDump(u32 duration_ms = 5000u) noexcept;
@@ -84,7 +85,20 @@ bool initialized = false;
 std::atomic<bool> menu_open{false};
 std::atomic<bool> reset_hud_avg{false};
 bool l3_down = false, r3_down = false;
-bool dirty = false; // settings changed while open: saved on close
+bool dirty = false; // settings changed while open: auto-saved on idle & saved on close
+long long last_dirty_ns = 0;
+int restore_scroll_frames = 0;
+
+long long SteadyNowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+void MarkDirty() {
+    dirty = true;
+    last_dirty_ns = SteadyNowNs();
+}
 int rebinding_action = -1; // >= 0 while waiting for a key/mouse press to rebind KeyAction
 bool rebind_wait_initial_release = false;
 int rebind_wheel_dir = 0; // +1 Wheel Up, -1 Wheel Down
@@ -248,6 +262,7 @@ void SetOpen(bool value) {
     // The system cursor shows over the menu (window.cpp); ImGui learns where it is now, not at
     // the next motion: mouse motion is not passed on while the menu is closed.
     if (value) {
+        restore_scroll_frames = 2;
         if (SDL_Window* window = SDL_GetMouseFocus()) {
             float x = 0.0f, y = 0.0f;
             SDL_GetMouseState(&x, &y);
@@ -320,7 +335,7 @@ template <typename T>
 void Store(std::atomic<T>& target, T value, bool changed) {
     if (changed) {
         target = value;
-        dirty = true;
+        MarkDirty();
     }
 }
 
@@ -448,7 +463,17 @@ void ToyPadSection() {
     bool changed = false;
     u32 lights[3] = {};
     static unsigned pick_id = 1; // the figure to put on
-    ImGui::SeparatorText(BbSettings::MenuText("Toy Pad", "Toy Pad (фигурки)"));
+    auto& s = BbSettings::Get();
+    const bool toypad_prev_open = s.menu_sec_toypad.load(std::memory_order_relaxed);
+    ImGui::SetNextItemOpen(toypad_prev_open, ImGuiCond_Always);
+    const bool toypad_open = ImGui::CollapsingHeader(
+        BbSettings::MenuText("Toy Pad###sec_toypad", "Toy Pad (фигурки)###sec_toypad"));
+    if (toypad_open != toypad_prev_open) {
+        Store(s.menu_sec_toypad, toypad_open, true);
+    }
+    if (!toypad_open) {
+        return;
+    }
     // Choosing a figure: characters, then vehicles and gadgets (ids from 1000).
     const std::string current = ToyPadLabel(names, pick_id);
     if (ImGui::BeginCombo(BbSettings::MenuText("Figure", "Фигурка"), current.c_str(),
@@ -529,17 +554,32 @@ void ToyPadSection() {
 void Menu() {
     auto& s = BbSettings::Get();
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
-    // Where it was moved last (bbport.ini menu_pos, a fraction of the screen), kept on screen.
+    // Where it was moved & sized last (bbport.ini menu_pos / menu_size / menu_scroll), kept on screen.
     ImVec2 pos(viewport->WorkPos.x + 40.0f * base_scale, viewport->WorkPos.y + 40.0f * base_scale);
-    if (s.menu_x >= 0.0f && s.menu_y >= 0.0f) {
+    if (s.menu_x >= -0.45f && s.menu_y >= -0.45f) {
         const float margin = 80.0f * base_scale;
         pos.x = viewport->WorkPos.x +
-                std::clamp(s.menu_x * viewport->WorkSize.x, 0.0f, std::max(viewport->WorkSize.x - margin, 0.0f));
+                std::clamp(s.menu_x * viewport->WorkSize.x, -margin * 2.0f,
+                           std::max(viewport->WorkSize.x - margin, 0.0f));
         pos.y = viewport->WorkPos.y +
-                std::clamp(s.menu_y * viewport->WorkSize.y, 0.0f, std::max(viewport->WorkSize.y - margin, 0.0f));
+                std::clamp(s.menu_y * viewport->WorkSize.y, 0.0f,
+                           std::max(viewport->WorkSize.y - margin, 0.0f));
+    }
+    ImVec2 target_size(620.0f * base_scale,
+                       std::min(780.0f * base_scale, std::max(320.0f, viewport->WorkSize.y * 0.88f)));
+    if (s.menu_w > 0.0f && s.menu_h > 0.0f && viewport->WorkSize.x > 0.0f &&
+        viewport->WorkSize.y > 0.0f) {
+        target_size.x = std::clamp(s.menu_w * viewport->WorkSize.x, 360.0f * base_scale,
+                                   viewport->WorkSize.x);
+        target_size.y = std::clamp(s.menu_h * viewport->WorkSize.y, 220.0f * base_scale,
+                                   viewport->WorkSize.y);
     }
     ImGui::SetNextWindowPos(pos, ImGuiCond_Appearing);
-    ImGui::SetNextWindowSize(ImVec2(620.0f * base_scale, 0.0f), ImGuiCond_Appearing);
+    ImGui::SetNextWindowSize(target_size, ImGuiCond_Appearing);
+    if (restore_scroll_frames > 0) {
+        ImGui::SetNextWindowScroll(
+            ImVec2(0.0f, std::max(0.0f, s.menu_scroll_y.load(std::memory_order_relaxed)) * base_scale));
+    }
     bool keep_open = true;
     if (!ImGui::Begin(
             BbSettings::MenuText("Bloodborne - Graphics  (Insert / L3+R3)###bbport_settings",
@@ -548,15 +588,32 @@ void Menu() {
         ImGui::End();
         return;
     }
-    // Moved: remembered (saved with the settings when the menu closes).
+    // Moved or resized: remembered immediately (auto-flushed to bbport.ini once mouse releases).
     if (!ImGui::IsWindowAppearing() && viewport->WorkSize.x > 0.0f && viewport->WorkSize.y > 0.0f) {
         const ImVec2 at = ImGui::GetWindowPos();
         const float fx = (at.x - viewport->WorkPos.x) / viewport->WorkSize.x;
         const float fy = (at.y - viewport->WorkPos.y) / viewport->WorkSize.y;
-        if (std::abs(at.x - pos.x) >= 1.0f || std::abs(at.y - pos.y) >= 1.0f) {
+        const float prev_x = s.menu_x.load(std::memory_order_relaxed);
+        const float prev_y = s.menu_y.load(std::memory_order_relaxed);
+        if ((prev_x < -0.45f && (std::abs(at.x - pos.x) >= 1.0f || std::abs(at.y - pos.y) >= 1.0f)) ||
+            (prev_x >= -0.45f && (std::abs(fx - prev_x) * viewport->WorkSize.x >= 1.0f ||
+                                  std::abs(fy - prev_y) * viewport->WorkSize.y >= 1.0f))) {
             s.menu_x = fx;
             s.menu_y = fy;
-            dirty = true;
+            MarkDirty();
+        }
+        const ImVec2 cur_sz = ImGui::GetWindowSize();
+        const float fw = cur_sz.x / viewport->WorkSize.x;
+        const float fh = cur_sz.y / viewport->WorkSize.y;
+        const float prev_w = s.menu_w.load(std::memory_order_relaxed);
+        const float prev_h = s.menu_h.load(std::memory_order_relaxed);
+        if ((prev_w <= 0.0f && (std::abs(cur_sz.x - target_size.x) >= 2.0f ||
+                                std::abs(cur_sz.y - target_size.y) >= 2.0f)) ||
+            (prev_w > 0.0f && (std::abs(fw - prev_w) * viewport->WorkSize.x >= 2.0f ||
+                               std::abs(fh - prev_h) * viewport->WorkSize.y >= 2.0f))) {
+            s.menu_w = fw;
+            s.menu_h = fh;
+            MarkDirty();
         }
     }
     // Always readable, even when the rest of the menu is in Russian.
@@ -1321,9 +1378,15 @@ void Menu() {
             "для ввода точного числа. На 30 FPS кинематика Лоуренса не зависает."));
     }
     ImGui::SeparatorText(BbSettings::MenuText("Controls (Keyboard & Mouse)", "Управление (Клавиатура и мышь)"));
-    if (ImGui::CollapsingHeader(
-            BbSettings::MenuText("Keybindings & Mouse Camera (Live)", "Горячие клавиши и мышь (на лету)"),
-            ImGuiTreeNodeFlags_DefaultOpen)) {
+    const bool controls_prev_open = s.menu_sec_controls.load(std::memory_order_relaxed);
+    ImGui::SetNextItemOpen(controls_prev_open, ImGuiCond_Always);
+    const bool controls_open = ImGui::CollapsingHeader(
+        BbSettings::MenuText("Keybindings & Mouse Camera (Live)###sec_controls",
+                             "Горячие клавиши и мышь (на лету)###sec_controls"));
+    if (controls_open != controls_prev_open) {
+        Store(s.menu_sec_controls, controls_open, true);
+    }
+    if (controls_open) {
         ImGui::TextWrapped("%s", BbSettings::MenuText(
             "Movement: WASD  |  Walk: Left Ctrl + WASD  |  Jump: hold Sprint + press Dodge\n"
             "Switch weapons: 1 (Left hand), 2 (Right hand)  |  Switch items/magic: Mouse Wheel or 3 / 4\n"
@@ -1529,16 +1592,41 @@ void Menu() {
         }
     }
 
-    if (ImGui::CollapsingHeader(BbSettings::MenuText("Developer / Legacy A/B Debug",
-                                                     "Отладка разработчика / Legacy A/B"))) {
+    const bool dev_prev_open = s.menu_sec_developer.load(std::memory_order_relaxed);
+    ImGui::SetNextItemOpen(dev_prev_open, ImGuiCond_Always);
+    const bool dev_open = ImGui::CollapsingHeader(
+        BbSettings::MenuText("Developer / Legacy A/B Debug###sec_developer",
+                             "Отладка разработчика / Legacy A/B###sec_developer"));
+    if (dev_open != dev_prev_open) {
+        Store(s.menu_sec_developer, dev_open, true);
+    }
+    if (dev_open) {
         ImGui::Indent(12.0f);
         {
-            bool cloth_exp_on = BbClothExp::Enabled();
-            if (ImGui::Checkbox(
-                    BbSettings::MenuText("Experimental Cloth Engine C++20 (Live A/B)",
-                                         "Экспериментальный движок ткани C++20 (на лету)"),
-                    &cloth_exp_on)) {
-                BbClothExp::SetEnabled(cloth_exp_on);
+            const char* mode_labels_en[4] = {
+                "Off (Default Fixed-30 Interp)",
+                "Mode 1: Havok C++20 1:1 (Fixed-30)",
+                "Mode 1.1: Havok Local-Space FP64 (Native Any-FPS)",
+                "Mode 1.2: XPBD Enhanced Solver (Native Any-FPS)",
+            };
+            const char* mode_labels_ru[4] = {
+                "Выкл (Эталон Fixed-30 с интерполяцией)",
+                "Режим 1: Havok C++20 1:1 (Fixed-30)",
+                "Режим 1.1: Havok Local-Space FP64 (Нативный FPS)",
+                "Режим 1.2: Новый солвер XPBD (Нативный FPS)",
+            };
+            const bool is_ru = (std::strcmp(BbSettings::MenuText("en", "ru"), "ru") == 0);
+            const char* const* mode_labels = is_ru ? mode_labels_ru : mode_labels_en;
+            int cur_mode = std::clamp(static_cast<int>(BbClothExp::GetMode()), 0, 3);
+            ImGui::SetNextItemWidth(360.0f);
+            if (ImGui::Combo(
+                    BbSettings::MenuText("Cloth Engine Mode (Live A/B)",
+                                         "Режим движка ткани (живой A/B)"),
+                    &cur_mode, mode_labels, 4)) {
+                BbClothExp::SetMode(static_cast<BbClothExp::ClothExpMode>(cur_mode));
+                s.cloth_exp_mode = cur_mode;
+                s.cloth_exp_chosen = true;
+                MarkDirty();
             }
             const int total_fn = static_cast<int>(BbClothExp::EntryCount());
             const int hooked_fn = static_cast<int>(BbClothExp::InstalledHookCount());
@@ -1548,7 +1636,7 @@ void Menu() {
             ImGui::TextDisabled("(%d/%d hooked | calls: %llu)",
                                 hooked_fn, total_fn,
                                 static_cast<unsigned long long>(BbClothExp::TotalDispatchCount()));
-            if (cloth_exp_on && total_fn > 0) {
+            if (cur_mode == 1 && total_fn > 0) {
                 const auto* entries = BbClothExp::GetEntries();
                 bool range_changed = false;
                 if (ImGui::SliderInt(BbSettings::MenuText("Cloth C++ Min Index",
@@ -1565,23 +1653,73 @@ void Menu() {
                 }
                 if (range_changed) {
                     BbClothExp::SetActiveRange(r_min, r_max);
+                    s.cloth_exp_min = r_min;
+                    s.cloth_exp_max = r_max;
+                    s.cloth_exp_chosen = true;
+                    MarkDirty();
                 }
                 ImGui::TextDisabled("[%d] 0x%07llx %s  ..  [%d] 0x%07llx %s",
                                     r_min, static_cast<unsigned long long>(entries[r_min].vma),
                                     entries[r_min].name,
                                     r_max, static_cast<unsigned long long>(entries[r_max].vma),
                                     entries[r_max].name);
+            } else if (cur_mode == 3) {
+                BbClothExp::XpbdTuningParams xpbd_t = BbClothExp::Xpbd_GetTuning();
+                bool xpbd_changed = false;
+                ImGui::SetNextItemWidth(240.0f);
+                xpbd_changed |= ImGui::SliderFloat(
+                    BbSettings::MenuText("XPBD Fabric Softness (Compliance)",
+                                         "XPBD Мягкость ткани (податливость)"),
+                    &xpbd_t.compliance_scale, 0.10f, 3.00f, "%.2fx");
+                ImGui::SetNextItemWidth(240.0f);
+                xpbd_changed |= ImGui::SliderFloat(
+                    BbSettings::MenuText("XPBD Aerodynamic Lift & Air Cushion",
+                                         "XPBD Аэродинамика и парусность"),
+                    &xpbd_t.aero_lift_scale, 0.00f, 3.00f, "%.2fx");
+                ImGui::SetNextItemWidth(240.0f);
+                xpbd_changed |= ImGui::SliderFloat(
+                    BbSettings::MenuText("XPBD Weight / Damping",
+                                         "XPBD Вес и затухание инерции"),
+                    &xpbd_t.damping_scale, 0.15f, 3.00f, "%.2fx");
+                if (xpbd_changed) {
+                    BbClothExp::Xpbd_SetTuning(xpbd_t);
+                    const auto applied = BbClothExp::Xpbd_GetTuning();
+                    s.xpbd_compliance = applied.compliance_scale;
+                    s.xpbd_aero = applied.aero_lift_scale;
+                    s.xpbd_damping = applied.damping_scale;
+                    s.xpbd_tuning_chosen = true;
+                    MarkDirty();
+                }
+                ImGui::SameLine();
+                if (ImGui::SmallButton(BbSettings::MenuText("Reset XPBD", "Сброс XPBD"))) {
+                    BbClothExp::Xpbd_ResetTuningDefaults();
+                    const auto defaults = BbClothExp::Xpbd_GetTuning();
+                    s.xpbd_compliance = defaults.compliance_scale;
+                    s.xpbd_aero = defaults.aero_lift_scale;
+                    s.xpbd_damping = defaults.damping_scale;
+                    s.xpbd_tuning_chosen = true;
+                    MarkDirty();
+                }
             }
             Hint(BbSettings::MenuText(
-                "Isolated 1:1 decompiled C++20 Havok Cloth + Wind module (gpu/cloth_exp/). "
-                "Switches live on the next frame with zero restart; use Min/Max sliders for binary bisection.",
-                "Изолированный C++20 модуль ткани и ветра (gpu/cloth_exp/). "
-                "Переключается мгновенно на следующем кадре без перезапуска; ползунки Min/Max — для бинарного поиска."));
+                "Live cloth physics switcher (zero restart): Off = default Fixed-30 + rigid pose interpolation; "
+                "Mode 1 = 1:1 C++20 Havok + Wind; Mode 1.1 = Character-Local FP64 Havok (Native Any-FPS); "
+                "Mode 1.2 = Next-Gen Small-Steps FP64 XPBD with 3D triangle aerodynamics & swept capsule CCD.",
+                "Живое переключение физики ткани без перезапуска: Выкл = эталонный Fixed-30; "
+                "Режим 1 = чистый C++20 Havok 1:1; Режим 1.1 = локальный FP64 Havok на нативном FPS; "
+                "Режим 1.2 = новый Small-Steps FP64 XPBD с 3D-аэродинамикой треугольников и swept-коллизиями капсул."));
             ImGui::Spacing();
         }
-        Checkbox(BbSettings::MenuText("Native Vulkan PostFX (uncheck for Legacy Yebis2 A/B)",
-                                      "Нативный Vulkan PostFX (снять для Legacy Yebis2 A/B)"),
-                 s.native_postfx);
+        {
+            bool npfx = s.native_postfx.load(std::memory_order_relaxed);
+            if (ImGui::Checkbox(
+                    BbSettings::MenuText("Native Vulkan PostFX (uncheck for Legacy Yebis2 A/B)",
+                                         "Нативный Vulkan PostFX (снять для Legacy Yebis2 A/B)"),
+                    &npfx)) {
+                s.native_postfx_tuning_chosen = true;
+                Store(s.native_postfx, npfx, true);
+            }
+        }
         Hint(BbSettings::MenuText(
             "Default base post-process renderer (1:1 visual parity with PS4 Yebis2, faster & cleaner on GPU). "
             "Uncheck only for live A/B comparison against legacy Yebis2 (or launch with BB_NATIVE_POSTFX=0).",
@@ -1595,6 +1733,8 @@ void Menu() {
                     &bloom_int, 0.00f, 0.40f, "%.3f")) {
                 s.native_bloom_intensity.store(std::clamp(bloom_int, 0.0f, 0.40f),
                                                std::memory_order_relaxed);
+                s.native_postfx_tuning_chosen = true;
+                MarkDirty();
             }
             float bloom_thr = s.native_bloom_threshold.load(std::memory_order_relaxed);
             if (ImGui::SliderFloat(
@@ -1603,6 +1743,8 @@ void Menu() {
                     &bloom_thr, 0.50f, 5.00f, "%.2f")) {
                 s.native_bloom_threshold.store(std::clamp(bloom_thr, 0.50f, 5.00f),
                                                std::memory_order_relaxed);
+                s.native_postfx_tuning_chosen = true;
+                MarkDirty();
             }
             float obj_boost = s.native_mb_obj_boost.load(std::memory_order_relaxed);
             if (ImGui::SliderFloat(
@@ -1611,6 +1753,8 @@ void Menu() {
                     &obj_boost, 0.25f, 4.00f, "%.2fx")) {
                 s.native_mb_obj_boost.store(std::clamp(obj_boost, 0.25f, 4.00f),
                                             std::memory_order_relaxed);
+                s.native_postfx_tuning_chosen = true;
+                MarkDirty();
             }
             float dof_str = s.native_dof_strength.load(std::memory_order_relaxed);
             if (ImGui::SliderFloat(
@@ -1619,10 +1763,17 @@ void Menu() {
                     &dof_str, 0.25f, 3.00f, "%.2fx")) {
                 s.native_dof_strength.store(std::clamp(dof_str, 0.25f, 3.00f),
                                             std::memory_order_relaxed);
+                s.native_postfx_tuning_chosen = true;
+                MarkDirty();
             }
-            Checkbox(BbSettings::MenuText("Debug: Show Velocity Map (Cam=R/G, ObjMask=B, ObjVel=Y)",
-                                          "Отладка: Карта скоростей (Мир=R/G, Маска=Синий, Герой=Жёлтый)"),
-                     s.native_mb_debug_vis);
+            bool dbg_vis = s.native_mb_debug_vis.load(std::memory_order_relaxed);
+            if (ImGui::Checkbox(
+                    BbSettings::MenuText("Debug: Show Velocity Map (Cam=R/G, ObjMask=B, ObjVel=Y)",
+                                         "Отладка: Карта скоростей (Мир=R/G, Маска=Синий, Герой=Жёлтый)"),
+                    &dbg_vis)) {
+                s.native_postfx_tuning_chosen = true;
+                Store(s.native_mb_debug_vis, dbg_vis, true);
+            }
         }
         ImGui::Spacing();
         {
@@ -1659,6 +1810,10 @@ void Menu() {
     if (ImGui::Button(quit_armed ? BbSettings::MenuText("Press again to quit", "Нажмите ещё раз для выхода")
                                  : BbSettings::MenuText("Quit game", "Выйти из игры"))) {
         if (quit_armed) {
+            if (dirty) {
+                dirty = false;
+                BbSettings::Save();
+            }
             SDL_Event quit{};
             quit.type = SDL_EVENT_QUIT;
             SDL_PushEvent(&quit);
@@ -1670,6 +1825,28 @@ void Menu() {
     }
     ImGui::TextDisabled("%s", BbSettings::MenuText("Settings are saved to bbport.ini",
                                              "Настройки сохраняются в bbport.ini"));
+
+    // Restore saved scroll on open (2 frames so collapsed/expanded sections finish laying out),
+    // then track live scroll offset & debounced auto-save (`350 ms` after mouse/scroll settles):
+    if (restore_scroll_frames > 0) {
+        const float target_sy =
+            std::max(0.0f, s.menu_scroll_y.load(std::memory_order_relaxed)) * base_scale;
+        const float clamped_sy =
+            (restore_scroll_frames == 1) ? std::min(target_sy, ImGui::GetScrollMaxY()) : target_sy;
+        ImGui::SetScrollY(clamped_sy);
+        --restore_scroll_frames;
+    } else {
+        const float cur_sy = ImGui::GetScrollY() / std::max(base_scale, 0.1f);
+        if (std::abs(cur_sy - s.menu_scroll_y.load(std::memory_order_relaxed)) >= 1.0f) {
+            s.menu_scroll_y.store(cur_sy, std::memory_order_relaxed);
+            MarkDirty();
+        }
+    }
+    if (dirty && !ImGui::IsAnyMouseDown() && (SteadyNowNs() - last_dirty_ns) >= 350'000'000LL) {
+        dirty = false;
+        BbSettings::Save();
+    }
+
     ImGui::End();
     if (!keep_open) {
         SetOpen(false);

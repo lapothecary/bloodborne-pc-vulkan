@@ -285,6 +285,10 @@ private:
     /// GENERAL layout (null if it could not run).
     vk::Image RunSmaa(VideoCore::ImageId color, bool proxy = false);
     bool EnsureResources(u32 width, u32 height, u32 out_width, u32 out_height, bool hdr);
+    /// Releases the FSR 3 context and shared upscaler intermediate images back to VMA/WDDM.
+    void ReleaseUpscalerResources();
+    /// Releases off-screen UI composition targets when gameplay runs zero-copy in-place.
+    void ReleaseUiResources();
     void CreatePipelines();
     /// Records the reactive mask pass; false when there is no snapshot this frame.
     bool RecordReactive(vk::ImageView color_view);
@@ -346,6 +350,7 @@ private:
     VideoCore::ImageId ui_color{}, ui_depth{};
     bool ui_phase = false;         ///< from the upscale to the next display pass
     bool ui_in_place = false;      ///< native-size guest target: scale UI viewport in-place without ui_image blit
+    u32 ui_in_place_streak = 0;    ///< consecutive zero-copy in-place UI frames (for low-VRAM cleanup)
     bool ui_hud_started = false;   ///< true once the first actual Scaleform HUD draw begins (after post-Yebis Glow/AA)
     const bool ui_trace_on = std::getenv("BB_UI_TRACE") != nullptr; ///< diagnostics
     std::string ui_trace;

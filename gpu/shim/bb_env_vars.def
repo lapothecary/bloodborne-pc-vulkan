@@ -131,7 +131,7 @@ BB_ENV(BB_CLOTH_STIFF_EXP, TUNING, "=value: override Havok Cloth high-FPS elasti
 BB_ENV(BB_CLOTH_FIX, TUNING, "=0: disable continuous-time Havok Cloth constraint adaptation, hclWorld-dt sync, native SprjDirWind, and smooth 30 Hz wind turbulence (default 1)")
 BB_ENV(BB_CLOTH_FIXED30, TUNING, "=0: opt into experimental per-frame native Havok Cloth instead of default fixed-30 Hz simulation + arbitrary-FPS rigid-pose interpolation (default 1)")
 BB_ENV(BB_CLOTH_POST_COLLIDE, TUNING, "=0/1/2: optional per-render-frame live body/capsule/LocalRange pushout in BB_CLOTH_FIXED30=1 mode (0=off [default], 1=LocalRange+colliders, 2=StretchLink+LocalRange+colliders)")
-BB_ENV(BB_CLOTH_EXP, DEBUG, "=1: enable isolated Experimental C++20 Cloth & Wind Engine (gpu/cloth_exp/) at boot (default 0; also live-toggleable in Insert overlay)")
+BB_ENV(BB_CLOTH_EXP, DEBUG, "=0/1/1.1/1.2: Experimental C++20 Cloth & Wind Engine mode at boot (0=off [default], 1=Havok 1:1, 1.1=Local-Space FP64 Native FPS, 1.2=XPBD; also live-switchable in Insert)")
 BB_ENV(BB_CLOTH_EXP_MIN, DEBUG, "=idx: first active function index for gpu/cloth_exp/ bisection (default 0)")
 BB_ENV(BB_CLOTH_EXP_MAX, DEBUG, "=idx: last active function index for gpu/cloth_exp/ bisection (default N-1)")
 BB_ENV(BB_CLOTH_EXP_MODULES, DEBUG, "=mod,...: module prefix filter for gpu/cloth_exp/ bisection (default all)")

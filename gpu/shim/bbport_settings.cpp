@@ -229,11 +229,71 @@ void Set(Values& v, const std::string& key, const std::string& value) {
         v.show_additional_debug = i != 0;
     } else if (key == "menu_pos") {
         float x = -1.0f, y = -1.0f;
-        if (std::sscanf(value.c_str(), "%f,%f", &x, &y) == 2 && x >= 0.0f && x <= 1.0f && y >= 0.0f &&
+        if (std::sscanf(value.c_str(), "%f,%f", &x, &y) == 2 && x >= -0.45f && x <= 1.0f && y >= -0.45f &&
             y <= 1.0f) {
             v.menu_x = x;
             v.menu_y = y;
         }
+    } else if (key == "menu_size") {
+        float w = -1.0f, h = -1.0f;
+        if (std::sscanf(value.c_str(), "%f,%f", &w, &h) == 2 && w >= 0.10f && w <= 1.0f && h >= 0.10f &&
+            h <= 1.0f) {
+            v.menu_w = w;
+            v.menu_h = h;
+        }
+    } else if (key == "menu_scroll") {
+        v.menu_scroll_y = Clamp(f, 0.0f, 50000.0f);
+    } else if (key == "menu_sec_controls") {
+        v.menu_sec_controls = i != 0;
+    } else if (key == "menu_sec_developer") {
+        v.menu_sec_developer = i != 0;
+    } else if (key == "menu_sec_toypad") {
+        v.menu_sec_toypad = i != 0;
+    } else if (key == "cloth_exp_mode") {
+        if (value == "0" || value == "off" || value == "false") {
+            v.cloth_exp_mode = 0;
+        } else if (value == "1" || value == "havok") {
+            v.cloth_exp_mode = 1;
+        } else if (value == "1.1" || value == "2" || value == "fp64") {
+            v.cloth_exp_mode = 2;
+        } else if (value == "1.2" || value == "3" || value == "xpbd") {
+            v.cloth_exp_mode = 3;
+        } else {
+            v.cloth_exp_mode = std::clamp(i, 0, 3);
+        }
+        v.cloth_exp_chosen = true;
+    } else if (key == "cloth_exp_range") {
+        int r0 = 0, r1 = 39;
+        if (std::sscanf(value.c_str(), "%d,%d", &r0, &r1) == 2) {
+            r0 = std::clamp(r0, 0, 255);
+            r1 = std::clamp(r1, r0, 255);
+            v.cloth_exp_min = r0;
+            v.cloth_exp_max = r1;
+            v.cloth_exp_chosen = true;
+        }
+    } else if (key == "xpbd_tuning") {
+        float c = 1.0f, a = 1.0f, d = 1.0f;
+        if (std::sscanf(value.c_str(), "%f,%f,%f", &c, &a, &d) == 3) {
+            v.xpbd_compliance = Clamp(c, 0.10f, 4.0f);
+            v.xpbd_aero = Clamp(a, 0.0f, 3.0f);
+            v.xpbd_damping = Clamp(d, 0.15f, 3.0f);
+            v.xpbd_tuning_chosen = true;
+        }
+    } else if (key == "native_postfx") {
+        v.native_postfx = i != 0;
+        v.native_postfx_tuning_chosen = true;
+    } else if (key == "native_postfx_tuning") {
+        float bi = 0.25f, bt = 2.50f, mb = 1.00f, df = 1.00f;
+        if (std::sscanf(value.c_str(), "%f,%f,%f,%f", &bi, &bt, &mb, &df) == 4) {
+            v.native_bloom_intensity = Clamp(bi, 0.0f, 0.40f);
+            v.native_bloom_threshold = Clamp(bt, 0.50f, 5.00f);
+            v.native_mb_obj_boost = Clamp(mb, 0.25f, 4.00f);
+            v.native_dof_strength = Clamp(df, 0.25f, 3.00f);
+            v.native_postfx_tuning_chosen = true;
+        }
+    } else if (key == "native_mb_debug_vis") {
+        v.native_mb_debug_vis = i != 0;
+        v.native_postfx_tuning_chosen = true;
     } else if (key == "fsr4_auto_exposure") {
         v.fsr4_auto_exposure = i != 0;
     } else if (key == "fsr4_invert_jitter") {
@@ -1182,8 +1242,48 @@ void Save() {
     // Read by run.sh at start.
     put("live_resolution", v.live_resolution < 0 ? "auto" : flag(v.live_resolution != 0));
     put("frame_generation", FrameGenName(v.frame_generation.load()));
-    if (v.menu_x >= 0.0f && v.menu_y >= 0.0f) {
+    if (v.menu_x >= -0.45f && v.menu_y >= -0.45f) {
         put("menu_pos", fixed(v.menu_x, 4) + "," + fixed(v.menu_y, 4));
+    }
+    if (v.menu_w > 0.0f && v.menu_h > 0.0f) {
+        put("menu_size", fixed(v.menu_w, 4) + "," + fixed(v.menu_h, 4));
+    }
+    if (v.menu_scroll_y.load() > 0.5f) {
+        put("menu_scroll", fixed(v.menu_scroll_y.load(), 1));
+    } else {
+        put("menu_scroll", "0.0");
+    }
+    put("menu_sec_controls", flag(v.menu_sec_controls.load()));
+    put("menu_sec_developer", flag(v.menu_sec_developer.load()));
+    if (!v.menu_sec_toypad.load()) {
+        put("menu_sec_toypad", flag(v.menu_sec_toypad.load()));
+    }
+    if (v.cloth_exp_chosen.load() || v.cloth_exp_mode.load() != 0) {
+        const char* cm_str = "off";
+        switch (std::clamp(v.cloth_exp_mode.load(), 0, 3)) {
+        case 1: cm_str = "1"; break;
+        case 2: cm_str = "1.1"; break;
+        case 3: cm_str = "1.2"; break;
+        default: cm_str = "off"; break;
+        }
+        put("cloth_exp_mode", cm_str);
+        put("cloth_exp_range",
+            std::to_string(v.cloth_exp_min.load()) + "," + std::to_string(v.cloth_exp_max.load()));
+    }
+    if (v.xpbd_tuning_chosen.load()) {
+        put("xpbd_tuning", fixed(v.xpbd_compliance.load(), 3) + "," +
+                               fixed(v.xpbd_aero.load(), 3) + "," +
+                               fixed(v.xpbd_damping.load(), 3));
+    }
+    if (v.native_postfx_tuning_chosen.load() || !v.native_postfx.load() ||
+        v.native_mb_debug_vis.load()) {
+        put("native_postfx", flag(v.native_postfx.load()));
+        put("native_postfx_tuning",
+            fixed(v.native_bloom_intensity.load(), 3) + "," +
+                fixed(v.native_bloom_threshold.load(), 2) + "," +
+                fixed(v.native_mb_obj_boost.load(), 2) + "," +
+                fixed(v.native_dof_strength.load(), 2));
+        put("native_mb_debug_vis", flag(v.native_mb_debug_vis.load()));
     }
     put("mouse_look", flag(v.mouse_look));
     put("mouse_invert_y", flag(v.mouse_invert_y));

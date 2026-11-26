@@ -362,6 +362,9 @@ public:
     bool CanReportMemoryUsage() const {
         return ext.memory_budget;
     }
+    bool IsMemoryPrioritySupported() const {
+        return ext.memory_priority;
+    }
     /// Bytes in use in the heaps the port counts (device local; all on integrated GPUs).
     [[nodiscard]] u64 GetDeviceMemoryUsage() const;
     /// The driver's current budget of those heaps (other processes' use taken out).
@@ -404,8 +407,8 @@ private:
             depth_clip_enable, vertex_input_dynamic_state, list_restart, explicit_vertex_parameter,
             barycentric, provoking_vertex, stencil_export, image_load_store_lod, amd_gcn_shader,
             trinary_minmax, nv_mixed_samples, amd_mixed_samples, atomic_float, atomic_float2,
-            workgroup_layout, view_2d_of_3d, image_view_min_lod, memory_budget, memory_fd,
-            dma_buf, memory_host, compute_derivatives, mixed_float_dot, cooperative_matrix,
+            workgroup_layout, view_2d_of_3d, image_view_min_lod, memory_budget, memory_priority,
+            memory_fd, dma_buf, memory_host, compute_derivatives, mixed_float_dot, cooperative_matrix,
             float8, shader_clock, guest_uncached, hdr_metadata, nv_low_latency2, amd_anti_lag;
     };
 

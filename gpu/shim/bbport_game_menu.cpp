@@ -25,6 +25,7 @@
 #include "bbport_menu_engine.h"
 #include "bbport_settings.h"
 #include "bbport_system_info.h"
+#include "cloth_exp/cloth_exp_registry.h"
 #include "vulkan/low_latency.h"
 #include "games/bloodborne_menu_pointer.h"
 #include <SDL3/SDL.h>
@@ -336,6 +337,7 @@ enum DisplayItem : int {
     DispItemAnisotropic,
     DispItemModelLod,
     DispItemUiUpscale,
+    DispItemClothPhysics,
     TotalDisplayItems
 };
 constexpr int MaxDisplayScroll = TotalDisplayItems - DisplaySlotCount;
@@ -2124,6 +2126,17 @@ void BuildDisplaySlotChoices(int slot, std::vector<u32>& out_choices, int& out_s
         add_choice("Off", "Выкл");
         add_choice("On (AI / SDF 2x-4x)", "Вкл (AI / SDF 2x-4x)");
         out_selected_idx = s.ui_upscale.load() ? 1 : 0;
+        return;
+    }
+
+    if (item_idx == DispItemClothPhysics) {
+        add_choice("Default", "Стандарт");
+        add_choice("Native Smooth", "Плавная (любой FPS)");
+        add_choice("Enhanced (XPBD)", "Улучшенная (XPBD)");
+        const auto cur_mode = BbClothExp::GetMode();
+        out_selected_idx = (cur_mode == BbClothExp::ClothExpMode::XpbdEnhanced) ? 2
+                         : (cur_mode == BbClothExp::ClothExpMode::LocalFp64)    ? 1
+                                                                                : 0;
     }
 }
 
@@ -2420,6 +2433,22 @@ void RefreshDisplaySlotTexts(int slot) {
             SetDynamic(val_id, "On (AI / SDF 2x-4x)", "Вкл (AI / SDF 2x-4x)");
         } else {
             SetDynamic(val_id, "Off", "Выкл");
+        }
+        return;
+    }
+
+    if (item_idx == DispItemClothPhysics) {
+        SetDynamic(name_id, "Cloth Physics", "Физика ткани");
+        SetDynamic(help_id,
+                   "Cloth simulation engine: Default, Native Smooth (any-FPS), or Enhanced XPBD (softer natural drape, applies live)",
+                   "Движок физики ткани: Стандарт, Плавная (любой FPS) или Улучшенная XPBD (мягче складки и драпировка, мгновенно)");
+        const auto cur_mode = BbClothExp::GetMode();
+        if (cur_mode == BbClothExp::ClothExpMode::XpbdEnhanced) {
+            SetDynamic(val_id, "Enhanced (XPBD)", "Улучшенная (XPBD)");
+        } else if (cur_mode == BbClothExp::ClothExpMode::LocalFp64) {
+            SetDynamic(val_id, "Native Smooth", "Плавная (любой FPS)");
+        } else {
+            SetDynamic(val_id, "Default", "Стандарт");
         }
     }
 }
@@ -2720,6 +2749,24 @@ void ApplyDisplaySlotChoiceIndex(u8* row, int slot, int choice_idx) {
         if (new_ui_up != s.ui_upscale.load()) {
             s.ui_upscale = new_ui_up;
             BbSettings::Save();
+        }
+        RefreshDisplaySlotTexts(slot);
+        UpdateDisplaySlotRowDisplay(row, slot);
+        return;
+    }
+
+    if (item_idx == DispItemClothPhysics) {
+        const auto new_mode =
+            (choice_idx == 2) ? BbClothExp::ClothExpMode::XpbdEnhanced
+                              : (choice_idx == 1) ? BbClothExp::ClothExpMode::LocalFp64
+                                                  : BbClothExp::ClothExpMode::Off;
+        if (new_mode != BbClothExp::GetMode() ||
+            s.cloth_exp_mode.load() != static_cast<int>(new_mode)) {
+            BbClothExp::SetMode(new_mode);
+            s.cloth_exp_mode = static_cast<int>(new_mode);
+            s.cloth_exp_chosen = true;
+            BbSettings::Save();
+            BbSysInfo::LogSettingsIfChanged();
         }
         RefreshDisplaySlotTexts(slot);
         UpdateDisplaySlotRowDisplay(row, slot);
@@ -3437,6 +3484,9 @@ void ResetDisplayPageToDefaults() {
     applied[ModelLod] = 0;
     BbGuestHooks::ApplyGameEffects();
     s.ui_upscale = true;
+    BbClothExp::SetMode(BbClothExp::ClothExpMode::Off);
+    s.cloth_exp_mode = static_cast<int>(BbClothExp::ClothExpMode::Off);
+    s.cloth_exp_chosen = true;
     s.low_latency = BbSettings::LowLatencyOn;
     s.frame_generation = BbSettings::FrameGenOff;
     if (s.vsync_mode.load() != BbSettings::VsyncFast) {
