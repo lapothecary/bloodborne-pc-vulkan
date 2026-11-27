@@ -234,6 +234,81 @@ NativePostFx::~NativePostFx() {
     }
 }
 
+void NativePostFx::ReleaseDisabledTargets() {
+    const auto& settings = BbSettings::Get();
+    const bool native_on = settings.native_postfx.load(std::memory_order_relaxed);
+    const bool bloom_enabled = native_on && settings.effects[7].load(std::memory_order_relaxed);
+    const bool haze_enabled =
+        bloom_enabled && settings.fire_heat_haze.load(std::memory_order_relaxed);
+    const bool ssgi_enabled = settings.ssgi_enabled.load(std::memory_order_relaxed);
+    const bool mb_debug = settings.native_mb_debug_vis.load(std::memory_order_relaxed);
+    const bool mb_enabled =
+        native_on &&
+        ((settings.effects[2].load(std::memory_order_relaxed) &&
+          (settings.motion_blur_camera.load(std::memory_order_relaxed) > 0 ||
+           settings.motion_blur_object.load(std::memory_order_relaxed) > 0)) ||
+         mb_debug);
+    const bool dof_enabled =
+        native_on && settings.effects[1].load(std::memory_order_relaxed) && !mb_debug;
+
+    const bool drop_bloom = !bloom_enabled && bool(bloom_pyramid);
+    const bool drop_haze = !haze_enabled && bool(opaque_hdr_half);
+    const bool drop_ssgi = !ssgi_enabled && (bool(ssgi_rad_mip0) || bool(ssgi_rad_mip1) || bool(ssgi_raw_img));
+    const bool drop_mb = !mb_enabled && (bool(mb_vel_img) || bool(mb_tile_max_img) || bool(mb_color_img));
+    const bool drop_dof = !dof_enabled && (bool(dof_coc_img) || bool(dof_bokeh_img) || bool(dof_color_img));
+    if (!drop_bloom && !drop_haze && !drop_ssgi && !drop_mb && !drop_dof) {
+        return;
+    }
+
+    scheduler.Finish();
+    if (drop_bloom) {
+        for (auto& view : bloom_mip_views) {
+            view.reset();
+        }
+        bloom_pyramid = VideoCore::HostImage{};
+        bloom_mip_extents = {};
+        bloom_base_w = bloom_base_h = 0u;
+    }
+    if (drop_haze) {
+        opaque_hdr_view.reset();
+        opaque_hdr_half = VideoCore::HostImage{};
+        opaque_hdr_extent = vk::Extent2D{0u, 0u};
+        opaque_hdr_src_vk = VK_NULL_HANDLE;
+        opaque_hdr_valid = false;
+    }
+    if (drop_ssgi) {
+        ssgi_rad_mip0_view.reset();
+        ssgi_rad_mip1_view.reset();
+        ssgi_raw_view.reset();
+        ssgi_rad_mip0 = VideoCore::HostImage{};
+        ssgi_rad_mip1 = VideoCore::HostImage{};
+        ssgi_raw_img = VideoCore::HostImage{};
+        ssgi_half_extent = vk::Extent2D{0u, 0u};
+        ssgi_quarter_extent = vk::Extent2D{0u, 0u};
+    }
+    if (drop_mb) {
+        mb_vel_view.reset();
+        mb_tile_max_view.reset();
+        mb_color_view.reset();
+        mb_vel_img = VideoCore::HostImage{};
+        mb_tile_max_img = VideoCore::HostImage{};
+        mb_color_img = VideoCore::HostImage{};
+        mb_vel_extent = vk::Extent2D{0u, 0u};
+        mb_tile_extent = vk::Extent2D{0u, 0u};
+        mb_color_extent = vk::Extent2D{0u, 0u};
+    }
+    if (drop_dof) {
+        dof_coc_view.reset();
+        dof_bokeh_view.reset();
+        dof_color_view.reset();
+        dof_coc_img = VideoCore::HostImage{};
+        dof_bokeh_img = VideoCore::HostImage{};
+        dof_color_img = VideoCore::HostImage{};
+        dof_half_extent = vk::Extent2D{0u, 0u};
+        dof_full_extent = vk::Extent2D{0u, 0u};
+    }
+}
+
 bool NativePostFx::EnsureInit() {
     if (initialized) {
         return true;

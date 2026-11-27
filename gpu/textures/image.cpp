@@ -154,16 +154,22 @@ void HostImage::Create(const vk::ImageCreateInfo& create_info, VmaPool pool) {
                 dedicated = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
             }
         }
-        const bool high_residency =
+        const bool is_render_target =
             bool(image_ci.usage & (vk::ImageUsageFlagBits::eColorAttachment |
-                                   vk::ImageUsageFlagBits::eDepthStencilAttachment |
-                                   vk::ImageUsageFlagBits::eStorage));
+                                   vk::ImageUsageFlagBits::eDepthStencilAttachment));
+        const bool is_storage = bool(image_ci.usage & vk::ImageUsageFlagBits::eStorage);
+        const bool is_block_fmt =
+            image_ci.format >= vk::Format::eBc1RgbUnormBlock &&
+            image_ci.format <= vk::Format::eBc7SrgbBlock;
+        const float priority =
+            is_render_target ? 1.0f : ((is_storage && !is_block_fmt) ? 0.5f : 0.25f);
         const VmaAllocationCreateInfo alloc_ci = {
             .flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | dedicated,
             .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
-            // Pin dedicated render/depth/storage targets at max priority (1.0) so WDDM never
-            // demotes active HDR/G-Buffer/shadow targets to PCIe System RAM ahead of world textures.
-            .priority = high_residency ? 1.0f : 0.25f,
+            // Pin active render/depth targets at max priority (1.0), non-BC compute targets at
+            // 0.5, and streamed world/BC textures at 0.25 so WDDM never demotes active HDR/G-Buffer
+            // targets to System RAM ahead of world textures or UI copies.
+            .priority = priority,
         };
         result = vmaCreateImage(allocator, &vk_create_info, &alloc_ci, &handle, &allocation,
                                 &alloc_info);

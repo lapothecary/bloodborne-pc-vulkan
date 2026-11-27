@@ -5,9 +5,12 @@
 #include <cstdio>
 #include <cstring>
 #include "common/slot_vector.h"
+#include "bbport_settings.h"
+#include "bbport_toggles.h"
 #include "vulkan/instance.h"
 #include "render/runtime.h"
 #include "render/scheduler.h"
+#include "render/vk_button_prompts.h"
 #include "upscale/vk_scene_resolution.h"
 #include <vk_mem_alloc.h>
 
@@ -239,6 +242,106 @@ int main() {
             assert(!instance.IsLowVramDevice());
         }
         std::puts("Scene targets: 16:10 1680x1050 (Gnm 1680x1052 / 840x528) & 1366x768 alignment PASS");
+    }
+
+    // ButtonPrompts UI Super-Resolution VRAM cap, deletion sync, and toggle-off reclamation tests.
+    {
+        assert(ButtonPrompts::ComputeUiUpscaleFactor(2048, 2048, true) == 0u);
+        assert(ButtonPrompts::ComputeUiUpscaleFactor(2048, 2048, false) == 2u);
+        assert(ButtonPrompts::ComputeUiUpscaleFactor(1024, 512, true) == 2u);
+        assert(ButtonPrompts::ComputeUiUpscaleFactor(1024, 512, false) == 4u);
+        assert(ButtonPrompts::ComputeUiUpscaleFactor(1024, 1024, true) == 2u);
+        assert(ButtonPrompts::ComputeUiUpscaleFactor(256, 256, true) == 4u);
+        assert(ButtonPrompts::ComputeAtlasUpscaleFactor(2048, 2048, true, true) == 1u);
+        assert(ButtonPrompts::ComputeAtlasUpscaleFactor(2048, 2048, true, false) == 2u);
+        assert(ButtonPrompts::ComputeAtlasUpscaleFactor(1024, 1024, true, true) == 2u);
+        assert(ButtonPrompts::ComputeAtlasUpscaleFactor(1024, 1024, false, false) == 1u);
+        assert(ButtonPrompts::ComputeUiCacheBudgetBytes(true) == (64ull << 20));
+        assert(ButtonPrompts::ComputeUiCacheBudgetBytes(false) == (256ull << 20));
+        assert(ButtonPrompts::ComputeUiCacheMaxEntries(true) == 32u);
+        assert(ButtonPrompts::ComputeUiCacheMaxEntries(false) == 128u);
+
+        ButtonPrompts prompts(instance, scheduler);
+        VideoCore::ImageInfo ui_info{};
+        ui_info.size = {1024, 1024, 1};
+        ui_info.resources = {1, 1};
+        ui_info.type = Gcn::ImageType::Color2D;
+        ui_info.pixel_format = vk::Format::eBc7UnormBlock;
+        ui_info.num_bits = 8;
+        ui_info.props.is_block = true;
+        VideoCore::ImageViewInfo ui_view_info{};
+        ui_view_info.type = Gcn::ImageType::Color2D;
+        ui_view_info.format = vk::Format::eBc7UnormBlock;
+        ui_view_info.range = {{0, 0}, {1, 1}};
+
+        const auto ui_id0 = images.insert(instance, runtime, views, ui_info);
+        auto& ui_img0 = images[ui_id0];
+        assert(prompts.IsUiTexture(ui_img0));
+
+        u64 vma_blocks_before = 0, vma_used_before = 0;
+        Vulkan::VmaDeviceUsage(vma_blocks_before, vma_used_before);
+        const vk::ImageView upscaled0 = prompts.UiView(runtime, ui_img0, ui_view_info);
+        assert(upscaled0);
+        scheduler.Finish();
+        u64 vma_blocks_after = 0, vma_used_after = 0;
+        Vulkan::VmaDeviceUsage(vma_blocks_after, vma_used_after);
+        assert(prompts.UiCacheCount() == 1u);
+        assert(prompts.UiCacheBytes() >= (16ull << 20));
+        assert(vma_used_after >= vma_used_before + (16ull << 20));
+
+        // Deletion hook must immediately reclaim the upscaled HostImage (0 bytes leaked).
+        prompts.OnImageDeleted(ui_img0.image_uid);
+        prompts.Maintenance();
+        u64 vma_blocks_del = 0, vma_used_del = 0;
+        Vulkan::VmaDeviceUsage(vma_blocks_del, vma_used_del);
+        assert(prompts.UiCacheCount() == 0u);
+        assert(prompts.UiCacheBytes() == 0u);
+        assert(prompts.RetiredCount() == 0u);
+        assert(vma_used_del == vma_used_before);
+
+        // Repeatedly upscaling >64 MiB of distinct 1024x1024 UI textures (6 x 16 MiB = 96 MiB)
+        // must stay strictly within the low-VRAM byte cap when BB_VRAM_LIMIT_MB<=4608, and
+        // toggling ui_upscale Off must reclaim 100% of cached UI VRAM on Maintenance().
+        std::vector<VideoCore::ImageId> ui_ids;
+        const u64 cap_bytes = ButtonPrompts::ComputeUiCacheBudgetBytes(instance.IsLowVramDevice());
+        for (int k = 0; k < 6; ++k) {
+            ui_ids.push_back(images.insert(instance, runtime, views, ui_info));
+        }
+        u64 vma_blocks_src = 0, vma_used_src = 0;
+        Vulkan::VmaDeviceUsage(vma_blocks_src, vma_used_src);
+        for (const auto id : ui_ids) {
+            const vk::ImageView v = prompts.UiView(runtime, images[id], ui_view_info);
+            assert(v);
+            // Advance enough submissions (>4 ticks) so older finished entries become LRU-evictable.
+            for (int f = 0; f < 6; ++f) {
+                scheduler.Finish();
+            }
+            assert(prompts.UiCacheBytes() <= cap_bytes);
+            u64 b_now = 0, u_now = 0;
+            Vulkan::VmaDeviceUsage(b_now, u_now);
+            assert(u_now - vma_used_src <= cap_bytes);
+        }
+        BbSettings::Get().ui_upscale.store(false, std::memory_order_relaxed);
+        prompts.Maintenance();
+        u64 b_off = 0, u_off = 0;
+        Vulkan::VmaDeviceUsage(b_off, u_off);
+        assert(prompts.UiCacheCount() == 0u);
+        assert(prompts.UiCacheBytes() == 0u);
+        assert(prompts.RetiredCount() == 0u);
+        assert(u_off == vma_used_src);
+        BbSettings::Get().ui_upscale.store(true, std::memory_order_relaxed);
+
+        // Low-VRAM GPUs must skip 2048x2048 UI sheets (64 MiB uncompressed bloat).
+        if (instance.IsLowVramDevice()) {
+            auto big_ui = ui_info;
+            big_ui.size = {2048, 2048, 1};
+            const auto big_id = images.insert(instance, runtime, views, big_ui);
+            assert(!prompts.UiView(runtime, images[big_id], ui_view_info));
+        }
+        std::printf("ButtonPrompts UI upscale cache (low_vram=%d, cap=%llu MiB): deletion sync, "
+                    "byte budget & toggle-off PASS\n",
+                    int(instance.IsLowVramDevice()),
+                    static_cast<unsigned long long>(cap_bytes >> 20));
     }
 
     scheduler.Finish();

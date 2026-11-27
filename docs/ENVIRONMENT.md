@@ -373,6 +373,7 @@ Defaults to change on a machine where they misbehave, workarounds, and switches 
 | `BB_TILE_BIND_VRAM` | =0: tiled data read in place over the bus instead of from a VRAM copy |
 | `BB_TIMELINE_POLL_US` | =N (default 50): timeline semaphore poll interval |
 | `BB_UFFD` | =0 / 1: Linux userfaultfd write tracking |
+| `BB_UI_UPSCALE_CACHE_MB` | =N (16-1024): VRAM cap in MiB for the UI & Icons Super-Resolution texture cache (default 64 on `<= 4.5 GiB` GPUs, 256 otherwise) |
 | `BB_UNIFIED_MEMORY` | =1 / 0: treat the GPU as unified memory or not (over the device type) |
 | `BB_VBAO_BLUR` | =N (default 2, 0: raw): VBAO denoise taps per side |
 | `BB_VBAO_BLUR_DEPTH` | =f (default 0.05): relative depth difference that stops the VBAO blur |

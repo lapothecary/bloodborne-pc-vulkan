@@ -1219,6 +1219,11 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     upscaler = std::make_unique<TemporalUpscaler>(instance, scheduler, texture_cache, runtime,
                                                   *camera_motion, *scene_targets);
     prompts = std::make_unique<ButtonPrompts>(instance, scheduler, buffer_cache);
+    texture_cache.SetImageDeletedCallback([this](u64 uid) {
+        if (prompts) {
+            prompts->OnImageDeleted(uid);
+        }
+    });
     native_postfx = std::make_unique<NativePostFx>(instance, scheduler, texture_cache,
                                                    buffer_cache, runtime);
     vsm_blur_batcher = std::make_unique<VsmBlurBatcher>(instance, scheduler, runtime,
@@ -1272,6 +1277,7 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
 }
 
 Rasterizer::~Rasterizer() {
+    texture_cache.SetImageDeletedCallback({});
     bilateral_blur.reset();
     vsm_blur_batcher.reset();
     mt_direct_recorder.reset();
@@ -2834,6 +2840,10 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
         }();
         buffer_cache.Preupload(budget);
         prompts->Update();
+        prompts->Maintenance();
+        if (native_postfx) {
+            native_postfx->ReleaseDisabledTargets();
+        }
     }
     const auto& regs = Regs();
     // bbport: the pass copying a finished frame to a display buffer; the previous draw's

@@ -584,7 +584,8 @@ bool TemporalUpscaler::OnFrameStart() {
     has_last_sampled_view = false;
     const bool fg_wanted_now = frame_generation && frame_generation->Wanted();
     if (!active && (context || resources_ready || motion_image || output_image || opaque_image ||
-                    reactive_image || fsr4_linear_image || taa_history[0])) {
+                    reactive_image || fsr4_linear_image || taa_history[0] || live_color_image ||
+                    live_depth_image || extra_sharpen_image)) {
         // Reclaim ~70-95 MiB of FSR 3 / DLSS / TAA context & intermediate VRAM immediately when
         // upscaling is switched Off instead of holding it for the rest of the session.
         ReleaseUpscalerResources();
@@ -1157,6 +1158,15 @@ void TemporalUpscaler::ReleaseUpscalerResources() {
         taa_history_views[i].reset();
         taa_history[i] = VideoCore::HostImage{};
     }
+    live_color_view.reset();
+    live_depth_view.reset();
+    live_color_image = VideoCore::HostImage{};
+    live_depth_image = VideoCore::HostImage{};
+    live_input_w = live_input_h = 0;
+    live_color_fmt = live_depth_fmt = vk::Format::eUndefined;
+    extra_sharpen_view.reset();
+    extra_sharpen_image = VideoCore::HostImage{};
+    extra_sharpen_width = extra_sharpen_height = 0;
     width = height = out_width = out_height = 0;
     opaque_valid = false;
     reset = true;
@@ -1173,6 +1183,10 @@ void TemporalUpscaler::ReleaseUiResources() {
     ui_width = ui_height = 0;
     ui_format = vk::Format::eUndefined;
     ui_depth_format = vk::Format::eUndefined;
+    {
+        std::scoped_lock lock{display_mutex};
+        displays.clear();
+    }
 }
 
 bool TemporalUpscaler::EnsureResources(u32 w, u32 h, u32 ow, u32 oh, bool hdr) {

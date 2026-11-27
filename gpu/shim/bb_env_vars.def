@@ -390,6 +390,7 @@ BB_ENV(BB_THD_STUN, TUNING, "=host[:port] / off: STUN server (default: the serve
 BB_ENV(BB_THD_VERIFY_TLS, TUNING, "=0: The Hunter's Dream TLS certificates not checked")
 BB_ENV(BB_TILE_BIND_VRAM, TUNING, "=0: tiled data read in place over the bus instead of from a VRAM copy")
 BB_ENV(BB_TIMELINE_POLL_US, TUNING, "=N (default 50): timeline semaphore poll interval")
+BB_ENV(BB_UI_UPSCALE_CACHE_MB, TUNING, "=N (16-1024): byte cap for GPU-upscaled UI texture cache (default 64 low-VRAM / 256 normal)")
 BB_ENV(BB_UNIFIED_MEMORY, TUNING, "=1 / 0: treat the GPU as unified memory or not (over the device type)")
 BB_ENV(BB_VBAO_BLUR, TUNING, "=N (default 2, 0: raw): VBAO denoise taps per side")
 BB_ENV(BB_VBAO_BLUR_DEPTH, TUNING, "=f (default 0.05): relative depth difference that stops the VBAO blur")

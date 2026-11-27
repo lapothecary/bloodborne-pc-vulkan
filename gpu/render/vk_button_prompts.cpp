@@ -3,7 +3,9 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
 
 #include "bbgpu/shaders/ui_upscale_comp.h"
 #include "bbport_button_prompts.h"
@@ -111,14 +113,73 @@ void DownsampleIcons(const std::vector<u32>& src, u32 layers, u32 dst_dim, std::
     }
 }
 
+u64 CurrentSteadySeconds() noexcept {
+    return static_cast<u64>(std::chrono::duration_cast<std::chrono::seconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count());
+}
+
+constexpr u64 MiB = 1ull << 20;
+constexpr std::size_t MaxCachedAtlases = 8;
+
 } // namespace
+
+u32 ButtonPrompts::ComputeUiUpscaleFactor(u32 width, u32 height, bool low_vram) noexcept {
+    if (width < 32u || height < 32u || width > 2048u || height > 2048u) {
+        return 0u;
+    }
+    if (low_vram) {
+        // On <= 4.5 GiB GPUs, 2048x2048 sheets are already native 2K crisp; upscaling them to
+        // uncompressed 4096x4096 RGBA8 would consume 64 MiB for a single UI sheet.
+        if (width > 1024u || height > 1024u) {
+            return 0u;
+        }
+        // Keep 4x for small icons/badges (<= 256x256 -> <= 4 MiB); use 2x for 512..1024 sheets
+        // (4..16 MiB instead of 16..32 MiB) which already exceeds 1080p/1680x1050 output density.
+        return (width <= 256u && height <= 256u) ? 4u : 2u;
+    }
+    // 4x Super-Resolution for logos (1024x256, 1024x512) and individual icons/widgets (<= 512K px);
+    // 2x Super-Resolution for large 1024x1024 / 2048x2048 multi-icon sheets (up to 4096x4096).
+    return (width * height <= 1024u * 512u && width <= 1024u && height <= 1024u) ? 4u : 2u;
+}
+
+u32 ButtonPrompts::ComputeAtlasUpscaleFactor(u32 width, u32 height, bool upscale_on,
+                                             bool low_vram) noexcept {
+    if (!upscale_on) {
+        return 1u;
+    }
+    const u32 max_dim = low_vram ? 1024u : 2048u;
+    return (width <= max_dim && height <= max_dim) ? 2u : 1u;
+}
+
+u64 ButtonPrompts::ComputeUiCacheBudgetBytes(bool low_vram) noexcept {
+    static const u64 env_mb = []() -> u64 {
+        const char* env = std::getenv("BB_UI_UPSCALE_CACHE_MB");
+        if (!env || !*env) {
+            return 0ull;
+        }
+        return std::clamp<u64>(std::strtoull(env, nullptr, 10), 16ull, 1024ull);
+    }();
+    if (env_mb != 0ull) {
+        return env_mb * MiB;
+    }
+    return (low_vram ? 64ull : 256ull) * MiB;
+}
+
+std::size_t ButtonPrompts::ComputeUiCacheMaxEntries(bool low_vram) noexcept {
+    return low_vram ? 32u : 128u;
+}
 
 ButtonPrompts::ButtonPrompts(const Instance& instance_, Scheduler& scheduler_,
                              VideoCore::BufferCache& buffer_cache_)
-    : instance{instance_}, scheduler{scheduler_}, buffer_cache{buffer_cache_},
-      image{instance_.GetDevice(), instance_.GetAllocator()} {
+    : ButtonPrompts(instance_, scheduler_) {
+    buffer_cache = &buffer_cache_;
     BbPrompts::Start();
+}
 
+ButtonPrompts::ButtonPrompts(const Instance& instance_, Scheduler& scheduler_)
+    : instance{instance_}, scheduler{scheduler_},
+      image{instance_.GetDevice(), instance_.GetAllocator()} {
     const auto device = instance.GetDevice();
     const std::array<vk::DescriptorSetLayoutBinding, 2> bindings{{
         {.binding = 0,
@@ -195,7 +256,10 @@ void ButtonPrompts::Update() {
     DownsampleIcons(set.pixels, layers, BbPrompts::GameIconSize * 2, medium);
 
     const u64 bytes = u64(set.pixels.size()) * sizeof(u32);
-    auto& stream = buffer_cache.GetStreamBuffer();
+    if (!buffer_cache) {
+        return;
+    }
+    auto& stream = buffer_cache->GetStreamBuffer();
     const u64 offset = stream.Copy(set.pixels.data(), bytes, 16);
     // In stream order, ahead of the draws that sample it; the draws before it are done reading it
     // (the barrier's source stages).
@@ -318,9 +382,120 @@ bool ButtonPrompts::EnsureUpscaleViews(Atlas& entry, VideoCore::Image& src_image
     return true;
 }
 
+u64 ButtonPrompts::UiCacheBytes() const noexcept {
+    std::scoped_lock lk{cache_mutex};
+    return ui_textures_bytes;
+}
+
+std::size_t ButtonPrompts::UiCacheCount() const noexcept {
+    std::scoped_lock lk{cache_mutex};
+    return ui_textures.size();
+}
+
+std::size_t ButtonPrompts::RetiredCount() const noexcept {
+    std::scoped_lock lk{cache_mutex};
+    return retired_entries.size();
+}
+
+void ButtonPrompts::RetireOrDestroyLocked(Atlas&& entry, std::vector<Atlas>& destroy_now) {
+    // Source VkImage may be about to be destroyed by TextureCache; drop src_view immediately.
+    entry.src_view.reset();
+    entry.src_image = VK_NULL_HANDLE;
+    if (entry.last_used_tick == 0 || scheduler.IsFree(entry.last_used_tick)) {
+        destroy_now.push_back(std::move(entry));
+    } else {
+        retired_entries.push_back(std::move(entry));
+    }
+}
+
+void ButtonPrompts::OnImageDeleted(u64 image_uid) {
+    if (image_uid == 0) {
+        return;
+    }
+    std::vector<Atlas> destroy_now;
+    {
+        std::scoped_lock lk{cache_mutex};
+        if (auto it = ui_textures.find(image_uid); it != ui_textures.end()) {
+            const u64 bytes = it->second.image.size_bytes;
+            ui_textures_bytes = ui_textures_bytes > bytes ? (ui_textures_bytes - bytes) : 0ull;
+            RetireOrDestroyLocked(std::move(it->second), destroy_now);
+            ui_textures.erase(it);
+        }
+        if (auto it = atlases.find(image_uid); it != atlases.end()) {
+            RetireOrDestroyLocked(std::move(it->second), destroy_now);
+            atlases.erase(it);
+        }
+    }
+    // Destroy retired HostImages outside cache_mutex.
+    destroy_now.clear();
+}
+
+void ButtonPrompts::Maintenance() {
+    const bool upscale_on = BbSettings::Get().ui_upscale.load(std::memory_order_relaxed);
+    const u64 now_sec = CurrentSteadySeconds();
+    const bool low_vram = instance.IsLowVramDevice();
+    const u64 ui_idle_secs = low_vram ? 5ull : 20ull;
+    const u64 atlas_idle_secs = low_vram ? 15ull : 30ull;
+
+    std::vector<Atlas> destroy_now;
+    {
+        std::scoped_lock lk{cache_mutex};
+        // Always drain deferred GPU-retired entries as soon as the GPU finishes their tick.
+        for (std::size_t i = 0; i < retired_entries.size();) {
+            if (retired_entries[i].last_used_tick == 0 ||
+                scheduler.IsFree(retired_entries[i].last_used_tick)) {
+                destroy_now.push_back(std::move(retired_entries[i]));
+                retired_entries[i] = std::move(retired_entries.back());
+                retired_entries.pop_back();
+            } else {
+                ++i;
+            }
+        }
+        // Release all upscaled UI textures immediately when UI & Icons Upscale is toggled Off.
+        if (!upscale_on && !ui_textures.empty()) {
+            for (auto& [uid, entry] : ui_textures) {
+                RetireOrDestroyLocked(std::move(entry), destroy_now);
+            }
+            ui_textures.clear();
+            ui_textures_bytes = 0;
+        }
+        // Once per second: evict idle upscaled UI sheets and prompt atlases (e.g. closed menus,
+        // title screen, loading screens, or area transitions) so VRAM stays bounded and flat.
+        if (now_sec != last_maintenance_second) {
+            last_maintenance_second = now_sec;
+            for (auto it = ui_textures.begin(); it != ui_textures.end();) {
+                const Atlas& entry = it->second;
+                if (entry.last_used_second != 0 && now_sec >= entry.last_used_second + ui_idle_secs &&
+                    (entry.last_used_tick == 0 || scheduler.IsFree(entry.last_used_tick))) {
+                    const u64 bytes = entry.image.size_bytes;
+                    ui_textures_bytes =
+                        ui_textures_bytes > bytes ? (ui_textures_bytes - bytes) : 0ull;
+                    destroy_now.push_back(std::move(it->second));
+                    it = ui_textures.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            for (auto it = atlases.begin(); it != atlases.end();) {
+                const Atlas& entry = it->second;
+                if (entry.last_used_second != 0 &&
+                    now_sec >= entry.last_used_second + atlas_idle_secs &&
+                    (entry.last_used_tick == 0 || scheduler.IsFree(entry.last_used_tick))) {
+                    destroy_now.push_back(std::move(it->second));
+                    it = atlases.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+    }
+    destroy_now.clear();
+}
+
 vk::ImageView ButtonPrompts::AtlasView(Runtime& runtime, VideoCore::Image& image,
                                        const VideoCore::ImageViewInfo& info) {
-    if (!active || image.prompt_atlas == 0 || info.type != Gcn::ImageType::Color2D || !image.backing) {
+    if (!active || !buffer_cache || image.prompt_atlas == 0 || info.type != Gcn::ImageType::Color2D ||
+        !image.backing) {
         return {};
     }
     const auto cells = BbPrompts::AtlasCells(image.prompt_atlas);
@@ -336,27 +511,94 @@ vk::ImageView ButtonPrompts::AtlasView(Runtime& runtime, VideoCore::Image& image
     }
     const u32 width = image.info.size.width, height = image.info.size.height;
     const bool upscale_on = BbSettings::Get().ui_upscale.load(std::memory_order_relaxed);
-    const u32 desired_scale = (upscale_on && width <= 2048 && height <= 2048) ? 2u : 1u;
+    const u32 desired_scale =
+        ComputeAtlasUpscaleFactor(width, height, upscale_on, instance.IsLowVramDevice());
     const u32 dst_w = width * desired_scale, dst_h = height * desired_scale;
+    const u64 uid = image.image_uid;
+    const bool srgb = IsSrgb(info.format);
+    const u32 mapping = u32(info.mapping.r) | u32(info.mapping.g) << 8 | u32(info.mapping.b) << 16 |
+                        u32(info.mapping.a) << 24;
 
-    Atlas& atlas = atlases[image.image_uid];
-    if (atlas.scale != desired_scale) {
-        if (atlas.image && atlas.last_used_tick != 0 && !scheduler.IsFree(atlas.last_used_tick)) {
-            scheduler.Wait(atlas.last_used_tick);
+    bool need_dispatch = false;
+    vk::ImageView src_view_h{};
+    vk::ImageView dst_view_h{};
+    vk::Image target_h{};
+    vk::ImageView out_view{};
+    std::vector<Atlas> destroy_now;
+    {
+        std::scoped_lock lk{cache_mutex};
+        auto it = atlases.find(uid);
+        if (it == atlases.end() && atlases.size() >= MaxCachedAtlases) {
+            const u64 cur_tick = scheduler.CurrentTick();
+            auto victim = atlases.end();
+            for (auto cand = atlases.begin(); cand != atlases.end(); ++cand) {
+                if (cur_tick > cand->second.last_used_tick + 4u &&
+                    scheduler.IsFree(cand->second.last_used_tick)) {
+                    if (victim == atlases.end() ||
+                        cand->second.last_used_tick < victim->second.last_used_tick) {
+                        victim = cand;
+                    }
+                }
+            }
+            if (victim != atlases.end()) {
+                destroy_now.push_back(std::move(victim->second));
+                atlases.erase(victim);
+            }
         }
-        atlas.views.clear();
-        atlas.storage_view.reset();
-        atlas.image.Destroy();
-        atlas.scale = desired_scale;
-        atlas.upload = 0;
-        atlas.generation = 0;
+        const bool inserted = (it == atlases.end());
+        Atlas& atlas = inserted ? atlases[uid] : it->second;
+        if (atlas.scale != desired_scale) {
+            if (atlas.image) {
+                Atlas old_copy;
+                old_copy.image = std::move(atlas.image);
+                old_copy.storage_view = std::move(atlas.storage_view);
+                old_copy.views = std::move(atlas.views);
+                old_copy.last_used_tick = atlas.last_used_tick;
+                RetireOrDestroyLocked(std::move(old_copy), destroy_now);
+            } else {
+                atlas.views.clear();
+                atlas.storage_view.reset();
+            }
+            atlas.scale = desired_scale;
+            atlas.upload = 0;
+            atlas.generation = 0;
+        }
+        if (!EnsureUpscaleViews(atlas, image, dst_w, dst_h)) {
+            if (inserted) {
+                atlases.erase(uid);
+            }
+            return {};
+        }
+        if (atlas.upload != image.prompt_upload || atlas.generation != generation) {
+            atlas.upload = image.prompt_upload;
+            atlas.generation = generation;
+            need_dispatch = true;
+            src_view_h = *atlas.src_view;
+            dst_view_h = *atlas.storage_view;
+            target_h = vk::Image{atlas.image.image};
+        }
+        atlas.last_used_tick = scheduler.CurrentTick();
+        atlas.last_used_second = CurrentSteadySeconds();
+        auto& view = atlas.views[{srgb, false, mapping}];
+        if (!view) {
+            auto [result, created] = instance.GetDevice().createImageViewUnique(vk::ImageViewCreateInfo{
+                .image = atlas.image.image,
+                .viewType = vk::ImageViewType::e2D,
+                .format = srgb ? vk::Format::eR8G8B8A8Srgb : vk::Format::eR8G8B8A8Unorm,
+                .components = info.mapping,
+                .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+            });
+            if (result != vk::Result::eSuccess) {
+                std::printf("Button prompts: no atlas view (%s)\n", vk::to_string(result).c_str());
+                return {};
+            }
+            view = std::move(created);
+        }
+        out_view = *view;
     }
-    if (!EnsureUpscaleViews(atlas, image, dst_w, dst_h)) {
-        return {};
-    }
-    if (atlas.upload != image.prompt_upload || atlas.generation != generation) {
-        atlas.upload = image.prompt_upload;
-        atlas.generation = generation;
+    destroy_now.clear();
+
+    if (need_dispatch) {
         const u32 cell_dim = BbPrompts::GameIconSize * desired_scale;
         const auto& icon_pool = (desired_scale == 2u) ? medium : small;
         std::vector<vk::BufferImageCopy> copies;
@@ -375,7 +617,7 @@ vk::ImageView ButtonPrompts::AtlasView(Runtime& runtime, VideoCore::Image& image
             const u32* icon = icon_pool.data() + std::size_t(cell.icon - 1) * cell_dim * cell_dim;
             pixels.insert(pixels.end(), icon, icon + cell_dim * cell_dim);
         }
-        auto& stream = buffer_cache.GetStreamBuffer();
+        auto& stream = buffer_cache->GetStreamBuffer();
         const u64 offset = stream.Copy(pixels.data(), pixels.size() * sizeof(u32), 16);
         for (auto& copy : copies) {
             copy.bufferOffset += offset;
@@ -397,9 +639,9 @@ vk::ImageView ButtonPrompts::AtlasView(Runtime& runtime, VideoCore::Image& image
             .is_block = 1,
         };
         scheduler.Record([pipeline = *upscale_pipeline, layout = *upscale_pipeline_layout,
-                          src_view = *atlas.src_view, dst_view = *atlas.storage_view,
-                          target = vk::Image{atlas.image.image}, buffer = stream.Handle(),
-                          copies = std::move(copies), push](vk::CommandBuffer cmdbuf) {
+                          src_view = src_view_h, dst_view = dst_view_h, target = target_h,
+                          buffer = stream.Handle(), copies = std::move(copies),
+                          push](vk::CommandBuffer cmdbuf) {
             const vk::ImageSubresourceRange range{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
             const vk::ImageMemoryBarrier2 to_storage{
                 .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
@@ -465,27 +707,12 @@ vk::ImageView ButtonPrompts::AtlasView(Runtime& runtime, VideoCore::Image& image
             cmdbuf.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = 1,
                                                        .pImageMemoryBarriers = &to_sample});
         });
-    }
-    atlas.last_used_tick = scheduler.CurrentTick();
-    const bool srgb = IsSrgb(info.format);
-    const u32 mapping = u32(info.mapping.r) | u32(info.mapping.g) << 8 | u32(info.mapping.b) << 16 |
-                        u32(info.mapping.a) << 24;
-    auto& view = atlas.views[{srgb, false, mapping}];
-    if (!view) {
-        auto [result, created] = instance.GetDevice().createImageViewUnique(vk::ImageViewCreateInfo{
-            .image = atlas.image.image,
-            .viewType = vk::ImageViewType::e2D,
-            .format = srgb ? vk::Format::eR8G8B8A8Srgb : vk::Format::eR8G8B8A8Unorm,
-            .components = info.mapping,
-            .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
-        });
-        if (result != vk::Result::eSuccess) {
-            std::printf("Button prompts: no atlas view (%s)\n", vk::to_string(result).c_str());
-            return {};
+        std::scoped_lock lk{cache_mutex};
+        if (auto it = atlases.find(uid); it != atlases.end()) {
+            it->second.last_used_tick = scheduler.CurrentTick();
         }
-        view = std::move(created);
     }
-    return *view;
+    return out_view;
 }
 
 bool ButtonPrompts::IsUiTexture(const VideoCore::Image& image) const noexcept {
@@ -511,41 +738,104 @@ vk::ImageView ButtonPrompts::UiView(Runtime& runtime, VideoCore::Image& image,
     }
     const u32 width = image.info.size.width;
     const u32 height = image.info.size.height;
-    // 4x Super-Resolution for logos (1024x256, 1024x512) and individual icons/widgets (<= 512K px);
-    // 2x Super-Resolution for large 1024x1024 / 2048x2048 multi-icon sheets (up to 4096x4096).
-    const u32 scale = (width * height <= 1024u * 512u && width <= 1024u && height <= 1024u) ? 4u : 2u;
+    const bool low_vram = instance.IsLowVramDevice();
+    const u32 scale = ComputeUiUpscaleFactor(width, height, low_vram);
+    if (scale == 0u) {
+        return {};
+    }
     const u32 dst_w = width * scale;
     const u32 dst_h = height * scale;
-
-    auto it = ui_textures.find(image.image_uid);
-    if (it == ui_textures.end() && ui_textures.size() >= 256) {
-        // Evict the oldest GPU-retired UI texture that has been idle for >60 ticks so VRAM stays
-        // bounded and active UI sheets never thrash within a frame.
-        const u64 cur_tick = scheduler.CurrentTick();
-        auto victim = ui_textures.end();
-        for (auto cand = ui_textures.begin(); cand != ui_textures.end(); ++cand) {
-            if (cand->second.last_used_tick + 60 < cur_tick &&
-                scheduler.IsFree(cand->second.last_used_tick)) {
-                if (victim == ui_textures.end() ||
-                    cand->second.last_used_tick < victim->second.last_used_tick) {
-                    victim = cand;
-                }
-            }
-        }
-        if (victim != ui_textures.end()) {
-            ui_textures.erase(victim);
-        }
-    }
-
-    Atlas& entry = ui_textures[image.image_uid];
-    entry.scale = scale;
-    if (!EnsureUpscaleViews(entry, image, dst_w, dst_h)) {
+    const u64 est_bytes = u64(dst_w) * u64(dst_h) * 4ull;
+    const u64 max_bytes = ComputeUiCacheBudgetBytes(low_vram);
+    const std::size_t max_entries = ComputeUiCacheMaxEntries(low_vram);
+    if (est_bytes > max_bytes) {
         return {};
     }
 
+    const u64 uid = image.image_uid;
     const u32 cur_upload = image.prompt_upload ? image.prompt_upload : 1u;
-    if (entry.upload != cur_upload) {
-        entry.upload = cur_upload;
+    const bool srgb = IsSrgb(info.format);
+    const u32 mapping = u32(info.mapping.r) | u32(info.mapping.g) << 8 | u32(info.mapping.b) << 16 |
+                        u32(info.mapping.a) << 24;
+
+    bool need_dispatch = false;
+    vk::ImageView src_view_h{};
+    vk::ImageView dst_view_h{};
+    vk::Image target_h{};
+    vk::ImageView out_view{};
+    std::vector<Atlas> destroy_now;
+    {
+        std::scoped_lock lk{cache_mutex};
+        auto it = ui_textures.find(uid);
+        if (it == ui_textures.end()) {
+            const u64 cur_tick = scheduler.CurrentTick();
+            // Evict LRU GPU-free entries until both entry count and byte budget have headroom.
+            while (ui_textures.size() >= max_entries ||
+                   ui_textures_bytes + est_bytes > max_bytes) {
+                auto victim = ui_textures.end();
+                for (auto cand = ui_textures.begin(); cand != ui_textures.end(); ++cand) {
+                    if (cur_tick > cand->second.last_used_tick + 4u &&
+                        scheduler.IsFree(cand->second.last_used_tick)) {
+                        if (victim == ui_textures.end() ||
+                            cand->second.last_used_tick < victim->second.last_used_tick) {
+                            victim = cand;
+                        }
+                    }
+                }
+                if (victim == ui_textures.end()) {
+                    // All cached entries are actively in-flight this frame: fall back to native
+                    // BC sampling instead of exceeding the VRAM budget.
+                    return {};
+                }
+                const u64 freed = victim->second.image.size_bytes;
+                ui_textures_bytes = ui_textures_bytes > freed ? (ui_textures_bytes - freed) : 0ull;
+                destroy_now.push_back(std::move(victim->second));
+                ui_textures.erase(victim);
+            }
+        }
+
+        const bool inserted = (it == ui_textures.end());
+        Atlas& entry = inserted ? ui_textures[uid] : it->second;
+        entry.scale = scale;
+        const bool had_image = bool(entry.image);
+        if (!EnsureUpscaleViews(entry, image, dst_w, dst_h)) {
+            if (inserted) {
+                ui_textures.erase(uid);
+            }
+            return {};
+        }
+        if (!had_image && entry.image) {
+            ui_textures_bytes += entry.image.size_bytes;
+        }
+        if (entry.upload != cur_upload) {
+            entry.upload = cur_upload;
+            need_dispatch = true;
+            src_view_h = *entry.src_view;
+            dst_view_h = *entry.storage_view;
+            target_h = vk::Image{entry.image.image};
+        }
+        entry.last_used_tick = scheduler.CurrentTick();
+        entry.last_used_second = CurrentSteadySeconds();
+        auto& view = entry.views[{srgb, false, mapping}];
+        if (!view) {
+            auto [result, created] = instance.GetDevice().createImageViewUnique(vk::ImageViewCreateInfo{
+                .image = entry.image.image,
+                .viewType = vk::ImageViewType::e2D,
+                .format = srgb ? vk::Format::eR8G8B8A8Srgb : vk::Format::eR8G8B8A8Unorm,
+                .components = info.mapping,
+                .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+            });
+            if (result != vk::Result::eSuccess) {
+                std::printf("UI upscale: no image view (%s)\n", vk::to_string(result).c_str());
+                return {};
+            }
+            view = std::move(created);
+        }
+        out_view = *view;
+    }
+    destroy_now.clear();
+
+    if (need_dispatch) {
         scheduler.EndRendering();
         runtime.Transit(&image, vk::ImageLayout::eShaderReadOnlyOptimal,
                         vk::PipelineStageFlagBits2::eComputeShader |
@@ -563,8 +853,8 @@ vk::ImageView ButtonPrompts::UiView(Runtime& runtime, VideoCore::Image& image,
             .is_block = 1,
         };
         scheduler.Record([pipeline = *upscale_pipeline, layout = *upscale_pipeline_layout,
-                          src_view = *entry.src_view, dst_view = *entry.storage_view,
-                          target = vk::Image{entry.image.image}, push](vk::CommandBuffer cmdbuf) {
+                          src_view = src_view_h, dst_view = dst_view_h, target = target_h,
+                          push](vk::CommandBuffer cmdbuf) {
             const vk::ImageSubresourceRange range{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
             const vk::ImageMemoryBarrier2 to_storage{
                 .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
@@ -617,28 +907,12 @@ vk::ImageView ButtonPrompts::UiView(Runtime& runtime, VideoCore::Image& image,
             cmdbuf.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = 1,
                                                        .pImageMemoryBarriers = &to_sample});
         });
-    }
-
-    entry.last_used_tick = scheduler.CurrentTick();
-    const bool srgb = IsSrgb(info.format);
-    const u32 mapping = u32(info.mapping.r) | u32(info.mapping.g) << 8 | u32(info.mapping.b) << 16 |
-                        u32(info.mapping.a) << 24;
-    auto& view = entry.views[{srgb, false, mapping}];
-    if (!view) {
-        auto [result, created] = instance.GetDevice().createImageViewUnique(vk::ImageViewCreateInfo{
-            .image = entry.image.image,
-            .viewType = vk::ImageViewType::e2D,
-            .format = srgb ? vk::Format::eR8G8B8A8Srgb : vk::Format::eR8G8B8A8Unorm,
-            .components = info.mapping,
-            .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
-        });
-        if (result != vk::Result::eSuccess) {
-            std::printf("UI upscale: no image view (%s)\n", vk::to_string(result).c_str());
-            return {};
+        std::scoped_lock lk{cache_mutex};
+        if (auto it = ui_textures.find(uid); it != ui_textures.end()) {
+            it->second.last_used_tick = scheduler.CurrentTick();
         }
-        view = std::move(created);
     }
-    return *view;
+    return out_view;
 }
 
 } // namespace Vulkan

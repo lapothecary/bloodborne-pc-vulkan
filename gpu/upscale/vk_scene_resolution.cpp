@@ -189,7 +189,21 @@ void SceneTargets::CleanupStaleEntries() {
     if (!to_remove.empty()) {
         scheduler.Finish(); // no command buffer can reference these views
         for (u64 key : to_remove) {
-            entries.erase(key);
+            if (const auto it = entries.find(key); it != entries.end()) {
+                const u64 uid = it->second->uid;
+                entries.erase(it);
+                // Keep `tracked` clean once no mip levels of `uid` remain in `entries`.
+                bool any_left = false;
+                for (const auto& [k, e] : entries) {
+                    if (e->uid == uid) {
+                        any_left = true;
+                        break;
+                    }
+                }
+                if (!any_left) {
+                    tracked.erase(uid);
+                }
+            }
         }
         // Clear recent cache since some entries may be deleted
         recent = {};

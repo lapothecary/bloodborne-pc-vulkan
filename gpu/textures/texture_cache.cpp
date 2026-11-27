@@ -1384,6 +1384,9 @@ bool TextureCache::SyncTextureQualityLive(Core::MemoryManager* memory) {
         auto batch = std::make_unique<RetiredTqBatch>(std::move(retired_tq_batches.front()));
         retired_tq_batches.pop_front();
         scheduler.DeferOperation([this, batch = std::move(batch)]() mutable {
+            for (const u64 old_uid : batch->uids) {
+                NotifyImageDeleted(old_uid);
+            }
             for (const ImageViewId vid : batch->view_ids) {
                 if (slot_image_views.is_allocated(vid)) {
                     slot_image_views.erase(vid);
@@ -1460,6 +1463,7 @@ bool TextureCache::SyncTextureQualityLive(Core::MemoryManager* memory) {
                 img.backing->subresource_states.clear();
                 img.backing->settled = false;
 
+                csm_retired.uids.push_back(img.image_uid);
                 img.image_uid = Image::NextUid();
                 img.backing->image = HostImage{instance.GetDevice(), instance.GetAllocator()};
                 img.backing->image.Create(new_ci);
@@ -1592,6 +1596,7 @@ bool TextureCache::SyncTextureQualityLive(Core::MemoryManager* memory) {
             img.backing->settled = false;
 
             img.host_mip_offset = desired;
+            retired.uids.push_back(img.image_uid);
             img.image_uid = Image::NextUid();
             img.backing->image = HostImage{instance.GetDevice(), instance.GetAllocator()};
             img.backing->image.Create(new_ci, target_pool);

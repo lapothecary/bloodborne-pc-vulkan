@@ -290,6 +290,8 @@ void TextureCache::DeleteImage(ImageId image_id) {
     // The image and its views go once the GPU is done with them.
     scheduler.DeferOperation([this, image_id] {
         Image& dead = slot_images[image_id];
+        const u64 dead_uid = dead.image_uid;
+        NotifyImageDeleted(dead_uid);
         for (const auto& backing : dead.backing_images) {
             for (const ImageViewId view_id : backing.image_view_ids) {
                 slot_image_views.erase(view_id);

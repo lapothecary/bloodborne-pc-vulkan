@@ -53,6 +53,10 @@ public:
                             u32 d1_dword_offset, vk::Image proxy_img = VK_NULL_HANDLE,
                             u32 proxy_w = 0u, u32 proxy_h = 0u);
 
+    /// Releases intermediate VRAM targets for any NativePostFX effects currently disabled in
+    /// settings so toggling Bloom / Heat Haze / SSGI / Motion Blur / DoF Off reclaims VRAM.
+    void ReleaseDisabledTargets();
+
 private:
     bool EnsureInit();
     bool EnsureBloomPyramid(u32 hdr_w, u32 hdr_h);

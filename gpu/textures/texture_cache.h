@@ -13,6 +13,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <functional>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -228,6 +229,13 @@ public:
         if (const Image* img = slot_images.try_at_mt(image_id)) [[likely]] {
             img->NoteMtAccess(CurrentTick(), atomic_gc_tick.load(std::memory_order_relaxed));
         }
+    }
+
+    /// Registers a callback fired with the retired `Image::image_uid` right before a deleted or
+    /// rebuilt image's VkImage is destroyed on the GPU-finished deferred path.
+    void SetImageDeletedCallback(std::function<void(u64)> cb) {
+        std::scoped_lock lk{delete_cb_mutex};
+        on_image_deleted = std::move(cb);
     }
 
     // Keeping images up to date.
@@ -548,11 +556,28 @@ private:
         u64 retire_after_submit = 0;
         std::vector<HostImage> images;
         std::vector<ImageViewId> view_ids;
+        std::vector<u64> uids;
     };
     std::deque<RetiredTqBatch> retired_tq_batches;
     u64 tq_submit_counter = 0;
     int last_applied_tq = 0;
     int last_applied_sq = 2;
+
+    std::mutex delete_cb_mutex;
+    std::function<void(u64)> on_image_deleted;
+    void NotifyImageDeleted(u64 uid) {
+        if (uid == 0) {
+            return;
+        }
+        std::function<void(u64)> cb;
+        {
+            std::scoped_lock lk{delete_cb_mutex};
+            cb = on_image_deleted;
+        }
+        if (cb) {
+            cb(uid);
+        }
+    }
 };
 
 } // namespace VideoCore
