@@ -639,19 +639,25 @@ void Runtime::CopyImageThroughBuffer(VideoCore::Image* src, VideoCore::Image* ds
 }
 
 void Runtime::CopyMip(VideoCore::Image* src, VideoCore::Image* dst, u32 mip, u32 slice) {
+    if (mip < dst->host_mip_offset) {
+        return;
+    }
     const u32 dst_shift = dst->info.props.is_block ? 2 : 0;
     const u32 src_shift = src->info.props.is_block ? 2 : 0;
     ASSERT(std::max(dst->info.size.width >> (mip + dst_shift), 1u) ==
-           (src->info.size.width >> src_shift));
+           std::max(src->info.size.width >> src_shift, 1u));
     ASSERT(std::max(dst->info.size.height >> (mip + dst_shift), 1u) ==
-           (src->info.size.height >> src_shift));
+           std::max(src->info.size.height >> src_shift, 1u));
     ASSERT(std::max(dst->info.mips_layout[mip].pitch >> dst_shift, 1u) ==
-           (src->info.pitch >> src_shift));
+           std::max(src->info.pitch >> src_shift, 1u));
     const auto [src_layers, dst_layers] = CopyLayers(src->info, dst->info, src->info.size.depth);
+    const u32 dst_w = std::max(dst->info.size.width >> mip, 1u);
+    const u32 dst_h = std::max(dst->info.size.height >> mip, 1u);
     const vk::ImageCopy region{
         .srcSubresource = {src->aspect_mask, 0, 0, src_layers},
-        .dstSubresource = {src->aspect_mask, mip, slice, dst_layers},
-        .extent = {src->info.size.width, src->info.size.height, src->info.size.depth},
+        .dstSubresource = {dst->aspect_mask, mip - dst->host_mip_offset, slice, dst_layers},
+        .extent = {std::min(src->info.size.width, dst_w), std::min(src->info.size.height, dst_h),
+                   src->info.size.depth},
     };
     SetBackingSamples(dst, dst->info.num_samples);
     SetBackingSamples(src, src->info.num_samples);

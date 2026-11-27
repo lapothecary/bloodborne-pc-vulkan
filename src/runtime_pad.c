@@ -8,13 +8,13 @@
  *   WASD left stick, IJKL right stick (the camera), Space the dodge (a short Circle press: never a
  *   run), Left Shift the run (Circle held), Shift + Space the jump (Circle let go and pressed again
  *   while running), F and Enter Cross
- *   (interact, confirm), Q Triangle (blood vial), E L1 (transform the weapon), Tab and R Square
- *   (the quick item), C R3 (lock-on), Left Ctrl L3, Left Alt walk (held), Escape Options (the menu; Circle, the way back, while a game menu is open), G left touchpad
+ *   (interact, confirm), V Triangle (blood vial), E L1 (transform the weapon), R Square
+ *   (the quick item), Q R3 (lock-on), Left Ctrl L3, Left Alt walk (held), Escape Options (the menu; Circle, the way back, while a game menu is open), G left touchpad
  *   (gestures), Backspace right touchpad; the d-pad on 1 (left: the left hand's weapon), 2 (right:
  *   the right hand's), 3 (up), 4 (down) and the arrow keys.
  *   Mouse (once the game window is clicked; F1 or leaving the window releases it): look (the
- *   right stick), Left R1 (attack), Shift+Left R2, Right L2 (the gun), Middle R3, side buttons R2
- *   (X1) and L1 (X2), wheel the d-pad's up/down (quick items).
+ *   right stick), Left R1 (attack), Shift+Left R2, Right L2 (the gun), side buttons R2
+ *   (X1) and L1 (X2), wheel down the d-pad's down (quick items).
  *   A binding may be a chord, "Left Shift+Mouse Left": while it is held, the second key's plain
  *   bindings do not count (Shift+Left is R2, not R2 and R1).
  *

@@ -344,6 +344,83 @@ int main() {
                     static_cast<unsigned long long>(cap_bytes >> 20));
     }
 
+    // ImageInfo::MipOf / SliceOf micro-tiled sub-mip tests (PS4 GCN 2D_THIN1 -> 1D_THIN1 mip tail,
+    // e.g. character face/head Blood Paint g_DecalDiffuseTexture mipgen targets).
+    {
+        auto make_parent = [](u32 w, u32 h, u32 levels, vk::Format fmt, u32 bpp) {
+            VideoCore::ImageInfo p{};
+            p.props.is_tiled = true;
+            p.tile_mode = Gcn::TileMode::Thin2DThin;
+            p.array_mode = Gcn::ArrayMode::Array2DTiledThin1;
+            p.pixel_format = fmt;
+            p.type = Gcn::ImageType::Color2D;
+            p.size = {w, h, 1};
+            p.pitch = w;
+            p.resources = {levels, 1};
+            p.num_samples = 1;
+            p.num_bits = bpp;
+            p.guest_address = 0x100000000ULL;
+            p.UpdateSize();
+            return p;
+        };
+        auto make_submip = [](const VideoCore::ImageInfo& p, u32 m, Gcn::TileMode tm,
+                              Gcn::ArrayMode am) {
+            VideoCore::ImageInfo sub{};
+            sub.props.is_tiled = (am != Gcn::ArrayMode::ArrayLinearAligned);
+            sub.tile_mode = tm;
+            sub.array_mode = am;
+            sub.pixel_format = p.pixel_format;
+            sub.type = Gcn::ImageType::Color2D;
+            sub.size = {std::max(p.size.width >> m, 1u), std::max(p.size.height >> m, 1u), 1};
+            sub.pitch = p.mips_layout[m].pitch;
+            sub.resources = {1, 1};
+            sub.num_samples = 1;
+            sub.num_bits = p.num_bits;
+            sub.guest_address = p.guest_address + p.mips_layout[m].offset;
+            sub.guest_size = p.mips_layout[m].size;
+            sub.mips_layout[0] = {sub.guest_size, sub.pitch, p.mips_layout[m].height, 0};
+            return sub;
+        };
+
+        // 256x256 R8Unorm (macro-tile 256x128): mip 1 (128x128) is already micro-tiled (1D_THIN1).
+        const auto p_r8 = make_parent(256, 256, 9, vk::Format::eR8Unorm, 8);
+        assert((p_r8.micro_tiled_mips & (1u << 0)) == 0u);
+        assert((p_r8.micro_tiled_mips & (1u << 1)) != 0u);
+        const auto sub_r8_m1 =
+            make_submip(p_r8, 1, Gcn::TileMode::Thin1DThin, Gcn::ArrayMode::Array1DTiledThin1);
+        assert(sub_r8_m1.MipOf(p_r8) == 1);
+        assert(sub_r8_m1.SliceOf(p_r8, 1) == 0);
+        // Macro-tiled mip 0 must NOT match a 1D micro-tiled view, and linear must never match.
+        const auto bad_r8_m0 =
+            make_submip(p_r8, 0, Gcn::TileMode::Thin1DThin, Gcn::ArrayMode::Array1DTiledThin1);
+        assert(bad_r8_m0.MipOf(p_r8) == -1);
+        const auto bad_r8_lin = make_submip(p_r8, 1, Gcn::TileMode::DisplayLinearAligned,
+                                            Gcn::ArrayMode::ArrayLinearAligned);
+        assert(bad_r8_lin.MipOf(p_r8) == -1);
+
+        // 256x256 RGBA8 (macro-tile 128x64): mip 1 stays 2D_THIN1; mips 2..6 drop to 1D_THIN1.
+        const auto p_rgba = make_parent(256, 256, 9, vk::Format::eR8G8B8A8Unorm, 32);
+        assert((p_rgba.micro_tiled_mips & (1u << 1)) == 0u);
+        assert((p_rgba.micro_tiled_mips & (1u << 2)) != 0u);
+        for (u32 m = 1; m <= 6; ++m) {
+            const bool is_micro = (p_rgba.micro_tiled_mips & (1u << m)) != 0u;
+            const auto sub = make_submip(
+                p_rgba, m, is_micro ? Gcn::TileMode::Thin1DThin : Gcn::TileMode::Thin2DThin,
+                is_micro ? Gcn::ArrayMode::Array1DTiledThin1 : Gcn::ArrayMode::Array2DTiledThin1);
+            assert(sub.MipOf(p_rgba) == s32(m));
+            assert(sub.SliceOf(p_rgba, s32(m)) == 0);
+        }
+
+        // 128x128 RGBA8: mip 1 (64x64) drops straight into 1D_THIN1.
+        const auto p_128 = make_parent(128, 128, 8, vk::Format::eR8G8B8A8Unorm, 32);
+        assert((p_128.micro_tiled_mips & (1u << 1)) != 0u);
+        const auto sub_128_m1 =
+            make_submip(p_128, 1, Gcn::TileMode::Thin1DThin, Gcn::ArrayMode::Array1DTiledThin1);
+        assert(sub_128_m1.MipOf(p_128) == 1);
+        assert(sub_128_m1.SliceOf(p_128, 1) == 0);
+        std::puts("ImageInfo::MipOf/SliceOf micro-tiled sub-mip resolution PASS");
+    }
+
     scheduler.Finish();
     vmaDestroyBuffer(instance.GetAllocator(),readback,allocation);
 }

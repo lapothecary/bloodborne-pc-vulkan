@@ -50,9 +50,9 @@ static void bind_defaults(void) {
     static const struct { int input; int key; int mod; } keys[]={
         {IN_DODGE,SDL_SCANCODE_SPACE,NONE}, {IN_SPRINT,SHIFT,NONE}, {IN_CROSS,SDL_SCANCODE_F,NONE},
         {IN_WALK,SDL_SCANCODE_LALT,NONE},
-        {IN_CROSS,SDL_SCANCODE_RETURN,NONE}, {IN_TRIANGLE,SDL_SCANCODE_Q,NONE},
-        {IN_L1,SDL_SCANCODE_E,NONE}, {IN_SQUARE,SDL_SCANCODE_TAB,NONE}, {IN_SQUARE,SDL_SCANCODE_R,NONE},
-        {IN_R3,SDL_SCANCODE_C,NONE}, {IN_L3,SDL_SCANCODE_LCTRL,NONE},
+        {IN_CROSS,SDL_SCANCODE_RETURN,NONE}, {IN_TRIANGLE,SDL_SCANCODE_V,NONE},
+        {IN_L1,SDL_SCANCODE_E,NONE}, {IN_SQUARE,SDL_SCANCODE_R,NONE},
+        {IN_R3,SDL_SCANCODE_Q,NONE}, {IN_L3,SDL_SCANCODE_LCTRL,NONE},
         {IN_OPTIONS,SDL_SCANCODE_ESCAPE,NONE}, {IN_TOUCHPAD,SDL_SCANCODE_G,NONE},
         {IN_TOUCHPAD_RIGHT,SDL_SCANCODE_BACKSPACE,NONE},
         {IN_LEFT,SDL_SCANCODE_1,NONE}, {IN_RIGHT,SDL_SCANCODE_2,NONE}, {IN_UP,SDL_SCANCODE_3,NONE},
@@ -65,9 +65,9 @@ static void bind_defaults(void) {
         {IN_LOOK_LEFT,SDL_SCANCODE_J,NONE}, {IN_LOOK_RIGHT,SDL_SCANCODE_L,NONE},
         {IN_R1,MOUSE_KEY+SDL_BUTTON_LEFT,NONE}, {IN_R2,MOUSE_KEY+SDL_BUTTON_LEFT,SHIFT},
         {IN_L2,MOUSE_KEY+SDL_BUTTON_RIGHT,NONE},
-        {IN_R3,MOUSE_KEY+SDL_BUTTON_MIDDLE,NONE}, {IN_R2,MOUSE_KEY+SDL_BUTTON_X1,NONE},
+        {IN_R2,MOUSE_KEY+SDL_BUTTON_X1,NONE},
         {IN_L1,MOUSE_KEY+SDL_BUTTON_X2,NONE},
-        {IN_UP,MOUSE_WHEEL_UP,NONE}, {IN_DOWN,MOUSE_WHEEL_DOWN,NONE},
+        {IN_DOWN,MOUSE_WHEEL_DOWN,NONE},
     };
     static const struct { int input, button; } pads[]={
         {IN_CROSS,SDL_GAMEPAD_BUTTON_SOUTH}, {IN_CIRCLE,SDL_GAMEPAD_BUTTON_EAST},
@@ -199,8 +199,8 @@ static void load_bindings(void) {
     }
     fclose(f);
     /* Keep Enter and the arrow keys active as fallback navigation/confirm keys when bbport.ini
-     * only lists gameplay keys (e.g. key.cross=F, key.left=1, key.right=2, key.up=Wheel Up, 3,
-     * key.down=Wheel Down, 4) and those keys were not bound to another action. Appended after the
+     * only lists gameplay keys (e.g. key.cross=F, key.left=1, key.right=2, key.up=3,
+     * key.down=4, Wheel Down) and those keys were not bound to another action. Appended after the
      * primary gameplay keys so HUD button prompts still show F / 1 / 2 / 3 / 4. */
     ensure_nav_key(IN_CROSS,SDL_SCANCODE_RETURN);
     ensure_nav_key(IN_CROSS,SDL_SCANCODE_KP_ENTER);

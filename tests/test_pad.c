@@ -44,7 +44,7 @@ int main(void) {
     assert(config_fd>=0);
     const char controls[]="upscaler=fsr3\npad.cross=b\npad.circle=a\npad.r2=rightshoulder\n"
                           "pad.r1=righttrigger\nkey.cross=X, Space\npad.bogus=a\n"
-                          "key.l3=Left Ctrl+C, Keypad +\n";
+                          "key.l3=Left Ctrl+Q, Keypad +\n";
     assert(write(config_fd,controls,sizeof(controls)-1)==(ssize_t)(sizeof(controls)-1));
     close(config_fd);
     setenv("BB_CONFIG",config,1);
@@ -57,14 +57,21 @@ int main(void) {
     assert(bindings[IN_OPTIONS].keys[0]==SDL_SCANCODE_ESCAPE && bindings[IN_OPTIONS].mods[0]<0);
     assert(bindings[IN_R2].keys[0]==MOUSE_KEY+SDL_BUTTON_LEFT && bindings[IN_R2].mods[0]==SDL_SCANCODE_LSHIFT);
     assert(bindings[IN_R1].keys[0]==MOUSE_KEY+SDL_BUTTON_LEFT && bindings[IN_R1].mods[0]<0);
-    /* A chord on the keyboard: C alone is R3, Ctrl+C is L3 and not R3 too. */
+    assert(bindings[IN_TRIANGLE].key_count==1 && bindings[IN_TRIANGLE].keys[0]==SDL_SCANCODE_V);
+    assert(bindings[IN_SQUARE].key_count==1 && bindings[IN_SQUARE].keys[0]==SDL_SCANCODE_R);
+    assert(bindings[IN_R3].key_count==1 && bindings[IN_R3].keys[0]==SDL_SCANCODE_Q);
+    assert(bindings[IN_UP].key_count==2 && bindings[IN_UP].keys[0]==SDL_SCANCODE_3 &&
+           bindings[IN_UP].keys[1]==SDL_SCANCODE_UP);
+    assert(bindings[IN_DOWN].key_count==3 && bindings[IN_DOWN].keys[0]==SDL_SCANCODE_4 &&
+           bindings[IN_DOWN].keys[2]==MOUSE_WHEEL_DOWN);
+    /* A chord on the keyboard: Q alone is R3, Ctrl+Q is L3 and not R3 too. */
     load_bindings();
-    assert(bindings[IN_L3].key_count==2 && bindings[IN_L3].keys[0]==SDL_SCANCODE_C &&
+    assert(bindings[IN_L3].key_count==2 && bindings[IN_L3].keys[0]==SDL_SCANCODE_Q &&
            bindings[IN_L3].mods[0]==SDL_SCANCODE_LCTRL && bindings[IN_L3].keys[1]==SDL_SCANCODE_KP_PLUS &&
            bindings[IN_L3].mods[1]<0);
     {
         bool keys[SDL_SCANCODE_COUNT]={0};
-        keys[SDL_SCANCODE_C]=true;
+        keys[SDL_SCANCODE_Q]=true;
         assert(key_down(keys,IN_R3) && !key_down(keys,IN_L3));
         keys[SDL_SCANCODE_LCTRL]=true;
         assert(key_down(keys,IN_L3) && !key_down(keys,IN_R3));

@@ -71,8 +71,30 @@ void ImageInfo::UpdateSize() {
     }
 }
 
+namespace {
+
+/// Whether a single-level sub-mip with `sub_mode` matches mip `mip` of `parent`.
+/// On PS4 GCN, macro-tiled mipmapped surfaces (`Array2DTiledThin1` / `Array2DTiledThick`) store
+/// mip levels smaller than a macro-tile (`parent.micro_tiled_mips`) in 1D micro-tiled layout
+/// (`Array1DTiledThin1` / `Array1DTiledThick`), so ColorBuffer sub-mip draws bind them with that
+/// 1D tile mode rather than the parent's 2D macro-tiled mode.
+bool MipArrayModeMatches(const ImageInfo& parent, u32 mip, Gcn::ArrayMode sub_mode) noexcept {
+    if (sub_mode == parent.array_mode) {
+        return true;
+    }
+    if (!Gcn::IsMacroTiled(parent.array_mode) || mip >= 32u ||
+        (parent.micro_tiled_mips & (1u << mip)) == 0u) {
+        return false;
+    }
+    const u32 thickness = Gcn::GetMicroTileThickness(parent.array_mode);
+    return thickness == 1u ? (sub_mode == Gcn::ArrayMode::Array1DTiledThin1)
+                           : (sub_mode == Gcn::ArrayMode::Array1DTiledThick);
+}
+
+} // namespace
+
 s32 ImageInfo::MipOf(const ImageInfo& info) const {
-    if (!IsCompatible(info) || info.array_mode != array_mode || resources.levels != 1) {
+    if (!IsCompatible(info) || resources.levels != 1) {
         return -1;
     }
     const u32 info_shift = info.props.is_block ? 2 : 0;
@@ -81,9 +103,15 @@ s32 ImageInfo::MipOf(const ImageInfo& info) const {
     // The level of `info` this image starts a slice of, with the same pitch in blocks.
     s32 mip = -1;
     for (u32 m = 0; m < info.resources.levels; ++m) {
+        if (!MipArrayModeMatches(info, m, array_mode)) {
+            continue;
+        }
         const auto& level = info.mips_layout[m];
         const VAddr begin = info.guest_address + level.offset;
         const u32 slice_size = level.size / info.resources.layers;
+        if (slice_size == 0) {
+            continue;
+        }
         if (guest_address >= begin && guest_address < begin + level.size &&
             (guest_address - begin) % slice_size == 0 &&
             (pitch >> this_shift) == (level.pitch >> info_shift)) {

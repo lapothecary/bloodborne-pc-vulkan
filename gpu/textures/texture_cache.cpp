@@ -203,18 +203,32 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     }
 
     // Else resolve the overlaps one by one, carrying the merged result.
+    // Partition overlapping entries so containing parents and same-address mip 0 images are
+    // processed before strictly-greater sub-mip images; otherwise a sub-mip encountered first
+    // would be skipped while `merged_id` is still empty.
     int view_mip = -1;
     int view_slice = -1;
+    ImageIds deferred_submips;
     if (!image_id) {
+        if (overlapping.size() > 1) {
+            std::stable_partition(overlapping.begin(), overlapping.end(), [&](ImageId id) {
+                return slot_images[id].info.guest_address <= info.guest_address;
+            });
+        }
         for (const ImageId id : overlapping) {
-            view_mip = -1;
-            view_slice = -1;
             const ImageInfo& merged = image_id ? slot_images[image_id].info : info;
             const auto [resolved, mip, slice] = ResolveOverlap(merged, desc.type, id, image_id);
             if (resolved) {
+                if (resolved != image_id || mip >= 0) {
+                    view_mip = mip;
+                    view_slice = slice;
+                }
                 image_id = resolved;
-                view_mip = mip;
-                view_slice = slice;
+            } else if (!image_id && slot_images.is_allocated(id) &&
+                       True(slot_images[id].flags & ImageFlagBits::Registered) &&
+                       slot_images[id].info.guest_address > info.guest_address &&
+                       slot_images[id].info.MipOf(info) >= 0) {
+                deferred_submips.push_back(id);
             }
         }
     }
@@ -230,6 +244,17 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     }
     if (!image_id) {
         image_id = InsertImage(info);
+        if (!deferred_submips.empty()) {
+            RefreshImage(slot_images[image_id]);
+            for (const ImageId sub_id : deferred_submips) {
+                if (!slot_images.is_allocated(sub_id) ||
+                    False(slot_images[sub_id].flags & ImageFlagBits::Registered)) {
+                    continue;
+                }
+                (void)ResolveOverlap(slot_images[image_id].info, desc.type, sub_id, image_id);
+            }
+            TrackImage(image_id);
+        }
     }
 
     Image& image = slot_images[image_id];
@@ -954,9 +979,11 @@ ImageId TextureCache::TryFindExistingImageLocked(ImageDesc& desc) const {
                                                   merged.pixel_format)) {
                         return {};
                     }
+                    if (!image_id) {
+                        view_mip = -1;
+                        view_slice = -1;
+                    }
                     image_id = res_id;
-                    view_mip = -1;
-                    view_slice = -1;
                     continue;
                 }
                 return {};
