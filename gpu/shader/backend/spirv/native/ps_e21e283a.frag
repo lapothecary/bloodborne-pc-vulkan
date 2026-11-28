@@ -62,7 +62,7 @@ vec3 cube_uv(vec3 r) {
     bool iz = (abs(r.z) >= abs(r.x)) && (abs(r.z) >= abs(r.y));
     bool iy = (abs(r.y) >= abs(r.x));
     float ma = iz ? (r.z * 2.0) : (iy ? (r.y * 2.0) : (r.x * 2.0));
-    float inv_ma = 1.0 / abs(ma);
+    float inv_ma = 1.0 / max(abs(ma), 1e-30);
     float face = iz ? ((r.z < 0.0) ? 5.0 : 4.0)
                     : (iy ? ((r.y < 0.0) ? 3.0 : 2.0) : ((r.x < 0.0) ? 1.0 : 0.0));
     float sc = iz ? ((r.z < 0.0) ? -r.x : r.x)
@@ -160,7 +160,7 @@ void main() {
 
     frag_color5 = vec4((spec_fres * env_blend) * env_tint, alpha_pass ? alpha_val : ssbo_4.data[sh_base + 3u]);
     frag_color4 = vec4(-spec * sh_rgb + sh_rgb, alpha_pass ? alpha_val : 1.0);
-    frag_color3 = vec4(sqrt(spec), alpha_pass ? alpha_val : mat_id);
+    frag_color3 = vec4(sqrt(max(spec, vec3(0.0))), alpha_pass ? alpha_val : mat_id);
     frag_color2 = vec4(vec3(s3f(d2), s3f(d2 + 1u), s3f(d2 + 2u)) * alb_base, alpha_val);
     frag_color1 = vec4(gloss_scale * gloss, is_front ? 0.0 : 0.08, ssbo_4.data[sh_base + 16u], alpha_zero);
     frag_color0 = vec4(fma(vec3(0.5), N, vec3(0.500488758)), alpha_zero);

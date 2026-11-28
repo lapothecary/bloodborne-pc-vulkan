@@ -174,6 +174,7 @@ constexpr u32 kSpirvMagic = 0x07230203u;
 
 // SPIR-V opcodes
 constexpr u32 kOpName = 5u;
+constexpr u32 kOpExtInstImport = 11u;
 constexpr u32 kOpExtInst = 12u;
 constexpr u32 kOpEntryPoint = 15u;
 constexpr u32 kOpTypeInt = 21u;
@@ -183,6 +184,8 @@ constexpr u32 kOpTypeImage = 25u;
 constexpr u32 kOpTypeSampler = 26u;
 constexpr u32 kOpTypeSampledImage = 27u;
 constexpr u32 kOpImageQuerySizeLod = 103u;
+constexpr u32 kOpImageQuerySize = 104u;
+constexpr u32 kGlslStd450Pow = 26u;
 constexpr u32 kOpTypeStruct = 30u;
 constexpr u32 kOpTypePointer = 32u;
 constexpr u32 kOpConstant = 43u;
@@ -234,11 +237,12 @@ struct NativeShaderCandidate {
     u64 pgm_hash;
     std::span<const u32> words;
     const char* label;
+    bool is_cldist = false;
 };
 
 constexpr std::array<NativeShaderCandidate, 152> kNativeRegistry{{
     {0x000000000f61fd27ull, PS_0F61FD27_VSM_BLUR_FRAG, "ps_0f61fd27_vsm_blur"},
-    {0x000000001ae03d75ull, PS_1AE03D75_VSM_MOMENT_CLDIST_FRAG, "ps_1ae03d75_vsm_moment_cldist"},
+    {0x000000001ae03d75ull, PS_1AE03D75_VSM_MOMENT_CLDIST_FRAG, "ps_1ae03d75_vsm_moment_cldist", true},
     {0x000000001ae03d75ull, PS_1AE03D75_VSM_MOMENT_NOCLIP_FRAG, "ps_1ae03d75_vsm_moment_noclip"},
     {0x00000000f7229091ull, PS_F7229091_BGRA_BLIT_FRAG, "ps_f7229091_bgra_blit"},
     {0x00000000ed4c7668ull, PS_ED4C7668_LUT3D_FRAG, "ps_ed4c7668_lut3d"},
@@ -341,7 +345,7 @@ constexpr std::array<NativeShaderCandidate, 152> kNativeRegistry{{
     {0x00000000e820ee9dull, PS_E820EE9D_FRAG, "ps_e820ee9d_ssr_hiz_depth"},
     {0x00000000998b035eull, PS_998B035E_FRAG, "ps_998b035e_gbuf6_alpha"},
     {0x00000000a0e88f56ull, PS_A0E88F56_NOCLIP_FRAG, "ps_a0e88f56_csm_depth_noclip"},
-    {0x00000000a0e88f56ull, PS_A0E88F56_CLDIST_FRAG, "ps_a0e88f56_vsm_depth_cldist"},
+    {0x00000000a0e88f56ull, PS_A0E88F56_CLDIST_FRAG, "ps_a0e88f56_vsm_depth_cldist", true},
     {0x0000000086e96401ull, PS_86E96401_FRAG, "ps_86e96401_yebis_copy"},
     {0x000000004b766f62ull, PS_4B766F62_FRAG, "ps_4b766f62_yebis_tap1"},
     {0x000000003c2b7974ull, PS_3C2B7974_FRAG, "ps_3c2b7974_yebis_tap3"},
@@ -371,7 +375,7 @@ constexpr std::array<NativeShaderCandidate, 152> kNativeRegistry{{
     {0x000000004baeaa00ull, PS_4BAEAA00_FRAG, "ps_4baeaa00_scaleform_cxform_bgra"},
     {0x000000007cde8e5full, PS_7CDE8E5F_PACK_FRAG, "ps_7cde8e5f_shadow_pack"},
     {0x000000007cde8e5full, PS_7CDE8E5F_NOCLIP_FRAG, "ps_7cde8e5f_shadow_noclip"},
-    {0x000000007cde8e5full, PS_7CDE8E5F_CLDIST_FRAG, "ps_7cde8e5f_shadow_cldist"},
+    {0x000000007cde8e5full, PS_7CDE8E5F_CLDIST_FRAG, "ps_7cde8e5f_shadow_cldist", true},
     {0x00000000b25e4faeull, PS_B25E4FAE_LOC2_FRAG, "ps_b25e4fae_motblur_alpha_loc2"},
     {0x00000000b25e4faeull, PS_B25E4FAE_LOC3_FRAG, "ps_b25e4fae_motblur_alpha_loc3"},
     {0x000000002eacb983ull, PS_2EACB983_SSS_X_FRAG, "ps_2eacb983_sss_blur_x"},
@@ -400,9 +404,11 @@ struct DescSlot {
 struct SpvInterfaceSig {
     u32 exec_model = 0xFFFFFFFFu;
     bool has_per_vertex_input = false;
+    bool has_cldist = false;
     bool has_frag0_swizzle = false;
     bool bgra_export = false;
     bool has_image_query_size = false;
+    bool has_pow = false;
     u64 in_loc_mask = 0;
     u64 out_loc_mask = 0;
     std::array<u8, 64> in_interp{};
@@ -434,6 +440,7 @@ bool ExtractInterfaceSig(std::span<const u32> spv, SpvInterfaceSig& sig) {
     std::vector<u8> var_has_builtin(bound, 0u);
     std::vector<u8> var_interp(bound, 0u);
     std::vector<u8> var_per_vertex(bound, 0u);
+    std::vector<u8> var_is_cldist(bound, 0u);
     std::vector<u8> var_has_binding(bound, 0u);
     std::vector<u32> var_binding(bound, 0u);
     std::vector<u32> var_set(bound, 0u);
@@ -444,6 +451,7 @@ bool ExtractInterfaceSig(std::span<const u32> spv, SpvInterfaceSig& sig) {
     std::vector<u32> extract_idx(bound, 0xFFFFFFFFu);
     std::array<u32, 4> frag0_store_val{};
     u32 frag0_var_id = 0xFFFFFFFFu;
+    u32 glsl_std_450_id = 0xFFFFFFFFu;
 
     struct VarRec {
         u32 id;
@@ -510,6 +518,9 @@ bool ExtractInterfaceSig(std::span<const u32> spv, SpvInterfaceSig& sig) {
                 }
                 break;
             case kOpExtInst:
+                if (wc >= 5 && w[3] == glsl_std_450_id && w[4] == kGlslStd450Pow) {
+                    sig.has_pow = true;
+                }
                 if (wc >= 6 && w[5] < bound) {
                     var_used[w[5]] = 1u;
                 }
@@ -522,6 +533,7 @@ bool ExtractInterfaceSig(std::span<const u32> spv, SpvInterfaceSig& sig) {
                 }
                 break;
             case kOpImageQuerySizeLod:
+            case kOpImageQuerySize:
                 sig.has_image_query_size = true;
                 break;
             default:
@@ -532,6 +544,26 @@ bool ExtractInterfaceSig(std::span<const u32> spv, SpvInterfaceSig& sig) {
         }
 
         switch (op) {
+        case kOpName:
+            if (wc >= 3 && w[1] < bound) {
+                const char* s = reinterpret_cast<const char*>(&w[2]);
+                const size_t max_chars = (wc - 2u) * 4u;
+                if (std::memchr(s, '\0', max_chars) != nullptr &&
+                    std::strncmp(s, "cldist_attr", 11u) == 0) {
+                    var_is_cldist[w[1]] = 1u;
+                }
+            }
+            break;
+        case kOpExtInstImport:
+            if (wc >= 3) {
+                const char* s = reinterpret_cast<const char*>(&w[2]);
+                const size_t max_chars = (wc - 2u) * 4u;
+                if (std::memchr(s, '\0', max_chars) != nullptr &&
+                    std::strcmp(s, "GLSL.std.450") == 0) {
+                    glsl_std_450_id = w[1];
+                }
+            }
+            break;
         case kOpEntryPoint:
             if (wc >= 4 && sig.exec_model == 0xFFFFFFFFu) {
                 sig.exec_model = w[1];
@@ -651,6 +683,9 @@ bool ExtractInterfaceSig(std::span<const u32> spv, SpvInterfaceSig& sig) {
             if (var_per_vertex[v.id]) {
                 sig.has_per_vertex_input = true;
             }
+            if (var_is_cldist[v.id]) {
+                sig.has_cldist = true;
+            }
             if (!var_has_loc[v.id] || var_loc[v.id] >= 64u) {
                 return false;
             }
@@ -662,6 +697,9 @@ bool ExtractInterfaceSig(std::span<const u32> spv, SpvInterfaceSig& sig) {
             if (var_has_builtin[v.id] ||
                 (pointee < bound && struct_deco[pointee] != 0 && !var_has_loc[v.id])) {
                 continue;
+            }
+            if (var_is_cldist[v.id]) {
+                sig.has_cldist = true;
             }
             if (!var_has_loc[v.id] || var_loc[v.id] >= 64u) {
                 return false;
@@ -1020,11 +1058,6 @@ bool TryReplaceWithNativeShader(u64 pgm_hash, const std::vector<u32>& ref_spv,
     if (!ExtractInterfaceSig(ref_spv, ref_sig) || ref_sig.has_per_vertex_input) {
         return false;
     }
-    // ps_83da8467 perms _0/_1 are generic unnormalized-UV + sRGB-decode fallbacks; only replace
-    // the live runtime linear normalized-UV perm (_2, has_image_query_size == false).
-    if (pgm_hash == 0x0000000083da8467ull && ref_sig.has_image_query_size) {
-        return false;
-    }
     const BgraMode bgra_mode = ExpectedBgraMode(pgm_hash);
     if (ref_sig.exec_model == kExecModelFragment && ref_sig.out_loc_mask == 1ull &&
         ref_sig.has_frag0_swizzle) {
@@ -1100,11 +1133,17 @@ bool TryReplaceWithNativeShader(u64 pgm_hash, const std::vector<u32>& ref_spv,
             continue;
         }
         const auto& entry = kNativeRegistry[idx];
-        if (entry.pgm_hash != pgm_hash) {
+        if (entry.pgm_hash != pgm_hash || entry.is_cldist != ref_sig.has_cldist) {
             continue;
         }
         SpvInterfaceSig cand_sig{};
         if (!ExtractInterfaceSig(entry.words, cand_sig) || cand_sig.has_per_vertex_input) {
+            continue;
+        }
+        // Reject unnormalized-UV (OpImageQuerySize*) and sRGB force-degamma (GLSL.std.450 Pow)
+        // fallback permutations unless the native candidate explicitly supports them.
+        if ((ref_sig.has_image_query_size && !cand_sig.has_image_query_size) ||
+            (ref_sig.has_pow && !cand_sig.has_pow)) {
             continue;
         }
         if (cand_sig.exec_model != ref_sig.exec_model ||

@@ -1,55 +1,63 @@
-Bloodborne (bbport) for Windows 10/11
+Bloodborne PC Vulkan for Windows 10/11 (x86_64)
 
-You need your own dump of Bloodborne (CUSA03173, version 1.09) and a GPU with Vulkan 1.3 and a
-current driver (AMD Adrenalin, NVIDIA GeForce, Intel Arc).
+Requirements:
+- Your own legal dump of Bloodborne v1.09 (CUSA03173 or CUSA00900; split base + -patch folders are auto-detected).
+- Vulkan 1.3 GPU (2 GB+ VRAM) with a current driver (NVIDIA GeForce, AMD Adrenalin, Intel Arc).
+- x86-64-v3 CPU (Intel Haswell 4th-gen 2013+ / AMD Ryzen).
 
-1. Unpack the zip anywhere (not into Program Files).
-2. Start Bloodborne.exe, choose the game folder (the one with eboot.bin), press Play.
-3. In the game: Insert (or L3+R3) opens the port's settings menu.
+Quick Start:
+1. Extract this archive next to your CUSA03173 folder (avoid Program Files).
+2. Run Bloodborne.exe for direct launch, or Launcher.exe for Mods, Online, Shader Pre-Bake, and 1-click updates.
+3. Adjust Display, Effects, Cloth Physics, Upscalers / Frame Generation, HDR10, and Controls live inside
+   Bloodborne's System menu (or press Insert / L3+R3 for the port overlay).
 
-Everything the port writes stays in this folder: bbport.ini (settings), user\ (saves),
-out\ (prepared game files), logs\ (one log per run). For a report send the newest file from logs\.
+Handy Shortcuts & Default PC Controls:
+- F4: cycle Camera Follow Mode (Original / Balanced / Locked)
+- F3: cycle FPS cap  |  F8 / F9: toggle performance HUD  |  Alt+Enter: Fullscreen / Borderless
+- V: Heal (Blood Vial)  |  R: Use Quick Item  |  Q: Lock-On  |  3: Blood Bullets  |  4 / Wheel Down: Switch Item
+  (all rebindable in System -> Controls).
 
-This build has only the new memory model: the GPU uses the game's memory in place. If the driver
-cannot do that, the game stops at start with a line beginning "STOP: the GPU driver cannot use the
-game's memory in place" — please send that log.
+Portable Folder Layout:
+Everything the port writes stays in this folder: bbport.ini (settings), user\ (saves & shader cache),
+logs\ (per-run logs, crash-*.log reports, and unknown_recipes.bbrc). For bug reports, attach the newest
+files from logs\ (user paths are redacted automatically).
 
-Online play: the launcher's Online section, two pools as on Linux: Seamless Hunt (your shadNet
-account from seamlesshunt.com, BBSC seamless co-op) or The Hunter's Dream (sign-in with Discord);
-UPnP and a connection check. The online module and its libraries are in online\ (bbnet20.dll):
-to try another build of it (a newer BBSC), replace that folder.
-Mods: the launcher's Mods section (unpack each mod into its own folder in mods\, choose the load
-order) and shadPS4 XML patches for 01.09 (patches\).
-FSR 4.1.1: the port ships nothing of AMD's. In the launcher choose the FSR 4.1.1 upscaler, then
-"Build from an AMD DLL..." and pick amd_fidelityfx_upscaler_dx12.dll 4.1.x (OptiScaler and many
-games have it); a minute or two later the set is in fsr4_411\. FSR 4.1.2's models (RDNA2, Lite):
-pick the driver's amdxcffx64.dll (Adrenalin 26.10.1+, under C:\Windows\System32\DriverStore\
-FileRepository\u0*\) together with the upscaler DLL. The recording runs on vkd3d-proton and DXVK
-(tools\fsr4cap\bin, LGPL-2.1 / zlib), so any GPU with Vulkan can build the set.
-DLSS (GeForce RTX): when bin\bbport_dlss.dll and bin\nvngx_dlss.dll are in the package, choose
-DLSS in the in-game menu (Insert) or the launcher; Frame Generation needs RTX 40/50 and
-bin\nvngx_dlssg.dll.
+Features:
+- DLSS 4.5 / DLAA / FSR 3.1 & 4 / XeSS / SMAA T2x + DLSS (RTX 40/50) & FSR 3.1 (2x-4x) Frame Generation
+  (DLSS & DLSS-G DLLs are bundled in bin\).
+- Online play: Launcher -> Online (Seamless Hunt / BBSC co-op or The Hunter's Dream).
+- Mods & XML patches: unpack each mod into its own subfolder in mods\, or drop shadPS4 01.09 XML patches
+  into patches\, and enable them in Launcher -> Mods.
 
 -----------------------------------------------------------------------------------------------
-Bloodborne для Windows 10/11
+Bloodborne PC Vulkan для Windows 10/11 (x86_64)
 
-Нужен свой дамп Bloodborne (CUSA03173, версия 1.09) и видеокарта с Vulkan 1.3 и свежим драйвером.
+Требования:
+- Собственный дамп Bloodborne v1.09 (CUSA03173 или CUSA00900; раздельные папки база + -patch находятся автоматически).
+- Видеокарта с поддержкой Vulkan 1.3 (от 2 ГБ VRAM) и свежим драйвером (NVIDIA, AMD, Intel Arc).
+- Процессор x86-64-v3 (Intel Haswell 4-го поколения 2013+ / AMD Ryzen).
 
-1. Распакуйте архив в любую папку (не в Program Files).
-2. Запустите Bloodborne.exe, выберите папку игры (где лежит eboot.bin), нажмите «Играть».
-3. В игре: Insert (или L3+R3) открывает меню настроек порта.
+Быстрый старт:
+1. Распакуйте архив рядом с папкой игры CUSA03173 (не в Program Files).
+2. Запустите Bloodborne.exe для прямого входа в игру или Launcher.exe для модов, онлайна, пре-бейка шейдеров
+   и обновлений в 1 клик.
+3. Все настройки графики, физики ткани, апскейлеров / генерации кадров, HDR10 и управления меняются на лету
+   в меню игры «Система» (или через Insert / L3+R3 для оверлея порта).
 
-Всё, что пишет порт, остаётся в этой папке: bbport.ini, user\ (сохранения), out\, logs\ (журнал
-каждого запуска). Для отчёта пришлите последний файл из logs\.
+Полезные клавиши и ПК-управление по умолчанию:
+- F4: режим камеры (Original / Balanced / Locked)
+- F3: лимит FPS  |  F8 / F9: оверлей производительности  |  Alt+Enter: полный экран / без рамки
+- V: лечение  |  R: быстрый предмет  |  Q: захват цели  |  3: пули  |  4 / колёсико вниз: смена предмета
+  (всё переназначается в Система -> Управление).
 
-В этой сборке только новая модель памяти. Если драйвер её не поддерживает, игра остановится при
-запуске со строкой "STOP: the GPU driver cannot use the game's memory in place" — пришлите журнал.
+Портативное хранение:
+Всё, что создаёт порт, остаётся в этой папке: bbport.ini (настройки), user\ (сохранения и кэш шейдеров),
+logs\ (логи запусков, отчёты crash-*.log и unknown_recipes.bbrc). Для баг-репортов прикладывайте свежие
+файлы из logs\ (имя пользователя в путях автоматически скрывается).
 
-Игра по сети: раздел лаунчера «Онлайн», два пула, как в Linux: Seamless Hunt (учётная запись
-shadNet с seamlesshunt.com, бесшовный кооператив BBSC) или The Hunter's Dream (вход через Discord);
-UPnP и проверка соединения. Модуль онлайна и его библиотеки — в папке online\ (bbnet20.dll):
-чтобы попробовать другую его сборку (новый BBSC), замените эту папку.
-Моды: раздел лаунчера «Моды и патчи» (каждый мод — в свою папку в mods\, порядок загрузки
-выбирается) и XML-патчи shadPS4 для 01.09 (patches\).
-
-Release version: v1.1.1
+Возможности:
+- DLSS 4.5 / DLAA / FSR 3.1 & 4 / XeSS / SMAA T2x + генерация кадров DLSS (RTX 40/50) и FSR 3.1 (2x-4x)
+  (DLL-библиотеки DLSS уже вложены в bin\).
+- Онлайн: раздел лаунчера «Онлайн» (Seamless Hunt / BBSC кооператив или The Hunter's Dream).
+- Моды и патчи: распакуйте каждый мод в отдельную подпапку в mods\ или добавьте XML-патчи 01.09 в patches\
+  и включите их в разделе лаунчера «Моды».

@@ -36,7 +36,7 @@ BloodBorne/
     └── ...
 ```
 
-**Handy In-Game Shortcuts:** `F4` cycles Camera Follow Mode (`Original` / `Balanced` / `Locked`) • `F3` cycles FPS cap • `F8` / `F9` toggles performance HUD • `Insert` opens the overlay • `Alt+Enter` toggles Fullscreen / Borderless (all rebindable in `System -> Controls`).
+**Handy In-Game Shortcuts:** `F4` cycles Camera Follow Mode (`Original` / `Balanced` / `Locked`) • `F3` cycles FPS cap • `F8` / `F9` toggles performance HUD • `Insert` opens the overlay • `Alt+Enter` toggles Fullscreen / Borderless. Default PC controls (`V` Blood Vial, `R` Quick Item, `Q` Lock-On, `3` Blood Bullets, `4`/Wheel Down switch item, `Left Alt` Slow Walk) are all rebindable in `System -> Controls`.
 
 ---
 
@@ -44,26 +44,27 @@ BloodBorne/
 
 - **Authentic Native Launcher (Zero Bundled Game Assets)** — Fast, frameless C++20 launcher with 1-click SHA-256 updates, unified gothic hover tooltips, Mods, Online (`bbnet20`), and live Shader/Recipe Pre-Bake counter. On first run it decodes Bloodborne's own title art, official Victorian font (with full Cyrillic support), menu SFX, and ambient music (*Hunter's Dream* & *Omen*) straight from your local game files.
 - **Full-Game Shader Pre-Bake (`5,761` Shaders + `3,995` Recipes)** — Pre-compile all game shaders once in the launcher (~4 s on Linux!) or let the quiet background auto-baker finish while you play, with zero-stutter async compile fallback during combat.
-- **Silky-Smooth Frame Pacing & `1000+ Hz` Mouse Camera** — Overhauled multi-core L3/P+E CPU scheduling, dual-stage frame/present pacing (`~0.13–0.49 ms` jitter), and event-driven mouse input remove camera stutter at 60–300+ FPS (with automatic slow-motion protection below FPS caps).
+- **Runs Even on `2–4 GB VRAM` GPUs** — True split PC VRAM (`DEVICE_LOCAL`), Vulkan memory priority pinning, bounded UI-upscale cache, live **`Texture Quality`** (saving up to ~1 GB VRAM on the fly), and `16:10` / `1366×768` support make Bloodborne smooth all the way from `GTX 1050 2 GB` up to `RTX 4090`.
+- **Silky-Smooth Frame Pacing & `1000+ Hz` Mouse Camera** — Overhauled multi-core L3/P+E CPU scheduling, dual-stage frame/present pacing (`~0.13–0.49 ms` jitter), **NVIDIA Reflex** low latency, and event-driven mouse input remove camera stutter at 60–300+ FPS (with automatic slow-motion protection below FPS caps).
 - **Smooth `Balanced` Camera Mode (`F4`)** — Inspired by *Lies of P*'s smooth camera feel and refined for Bloodborne: strafing, sprinting, and climbing stairs flow smoothly without jarring camera jerks. Switch live anytime between `Original (PS4)`, `Balanced`, and `Locked (1:1)`.
-- **Complete Live In-Game PC Menu & Controls** — Rebind any keyboard/mouse key (including mouse wheel and `Left Alt` Slow Walk) and adjust resolution, **`Texture Quality`** (saving up to ~1 GB VRAM live), **`Shadow Quality`** (`Off` to `8K Ultra PCSS`), live `VSync`, upscalers, and effects right inside Bloodborne's `System` menu — complete with gothic scrollbars and `Exit Game` on the Title Screen.
+- **Enhanced High-FPS Cloth Physics & Smooth Ladders** — Choose **`Cloth Physics`** live in `System -> Display`: `Default`, `Native Smooth`, or **`Enhanced (XPBD)`** for fluid, tangle-free coats, capes, and belts at 60–500 FPS, plus smooth rung-by-rung ladder climbing/sliding and proper grass wind.
+- **Complete Live In-Game PC Menu & Controls** — Rebind any keyboard/mouse key (including mouse wheel) and adjust resolution, **`Texture Quality`**, **`Shadow Quality`** (`Off` to `8K Ultra PCSS`), **`Cloth Physics`**, live `VSync`, upscalers, Frame Generation, and effects right inside Bloodborne's `System` menu — complete with gothic scrollbars and `Exit Game` on the Title Screen.
 - **~1.3 s Death Respawns & ~2–3 s Loading** — Accelerated decompression and loading-screen pacing drop death respawns from `~12.6 s` down to **~1.3 s** and warps to ~2–3 s (with optional **`Loading Screen Tips Timer`** toggle in `System -> Controls`).
-- **True High-FPS Physics, Native HDR10 & Remaster Visuals** — Fixed 30 Hz-interpolated Havok cloth draping, smooth rung-by-rung ladder climbing/sliding, and proper grass wind at 60–360+ FPS; live **`DLSS 4.5 / 4 / DLAA / FSR 3.1 & 4 / XeSS / SMAA T2x`**, free `RCAS` sharpening, `2×/4×` GPU UI & icon upscaling, **`152` native Vulkan shaders** (all Post-FX, SSAO, shadows), true 10-bit **`HDR10`**, plus optional remaster toggles (`GTAO/SSAO`, `PCSS`, `SSGI`, `Contact Shadows`, `Adaptive SSR`, `Fire Heat Haze`, and `True Black / OLED`).
-- **Single-Process Native Execution & Privacy-Safe Diagnostics** — Only `Bloodborne.exe` / `bb-vulkan` stays in memory during gameplay with zero Python overhead, automatic user-path-redacted crash reports (`logs/`), and anonymized `logs/recipes/unknown_recipes.bbrc` capture to expand community shader coverage.
+- **Upscaling, Frame Generation, Native HDR10 & Remaster Visuals** — Live **`DLSS 4.5 / 4 / DLAA / FSR 3.1 & 4 / XeSS / SMAA T2x`**, **`DLSS` & `FSR 3.1` Frame Generation (`2×–4×`)**, free `RCAS` sharpening, `2×/4×` GPU UI & icon upscaling, **`152` native Vulkan shaders**, true 10-bit **`HDR10`**, plus optional remaster toggles (`GTAO/SSAO`, `PCSS`, denoised `SSGI`, `Contact Shadows`, `Adaptive SSR`, `Fire Heat Haze`, and `True Black / OLED`).
+- **Single-Process Native Execution & Privacy-Safe Diagnostics** — Only `Bloodborne.exe` / `bb-vulkan` stays in memory during gameplay with zero Python overhead, automatic user-path-redacted Crash Black-Box reports (`logs/crash-*.log`), and anonymized `logs/recipes/unknown_recipes.bbrc` capture to expand community shader coverage.
 
 ---
 
-> **Hardware Requirements:** Because this port executes Bloodborne's original PS4 (`AMD Jaguar x86_64`) code natively on your CPU, it requires a **Vulkan 1.3 GPU** and an **x86-64-v3 CPU** supporting `AVX`, `BMI1`, `MOVBE`, `LZCNT`, and `POPCNT` (**Intel Haswell 4th-gen Core 2013+** or **AMD Ryzen / Steam Deck**; older pre-2013 CPUs such as Ivy Bridge `i7-3770K` or Sandy Bridge are not supported).  
-> **Public Beta & Hardware Testing:** Heavily verified on **NVIDIA GPUs (`RTX 3080`, `RTX 4070 Laptop`, `RTX 4090`)** with **AMD Ryzen** and **Intel Hybrid** CPUs on Windows 10/11 and Linux. **AMD Radeon**, **Intel Arc**, and **Steam Deck** testers are very welcome — if you hit a bug, freeze, or uncached shader, please open a GitHub Issue with your `logs/` folder (`logs/recipes/unknown_recipes.bbrc` helps improve pre-baking for everyone, and 1-click updates ship fixes straight to your launcher!).  
+> **Hardware Requirements:** Because this port executes Bloodborne's original PS4 (`AMD Jaguar x86_64`) code natively on your CPU, it requires a **Vulkan 1.3 GPU (`2 GB+ VRAM`)** and an **x86-64-v3 CPU** supporting `AVX`, `BMI1`, `MOVBE`, `LZCNT`, and `POPCNT` (**Intel Haswell 4th-gen Core 2013+** or **AMD Ryzen / Steam Deck**; older pre-2013 CPUs such as Ivy Bridge `i7-3770K` or Sandy Bridge are not supported).  
+> **Public Beta & Hardware Testing:** Heavily verified on **NVIDIA GPUs (`GTX 1050 2 GB`, `RTX 3080`, `RTX 4070 Laptop`, `RTX 4090`)** with **AMD Ryzen** and **Intel Hybrid** CPUs on Windows 10/11 and Linux. **AMD Radeon**, **Intel Arc**, and **Steam Deck** testers are very welcome — if you hit a bug, freeze, or uncached shader, please open a GitHub Issue with your `logs/` folder (`logs/recipes/unknown_recipes.bbrc` helps improve pre-baking for everyone, and 1-click updates ship fixes straight to your launcher!).  
 > **Linux Launcher Audio Tip (Arch / CachyOS):** Launcher BGM/SFX uses WebKitGTK + GStreamer — if launcher audio is silent on minimal installs, install `gst-plugins-base gst-plugins-good gst-plugin-pipewire`.
 
-## 🆕 Latest Release (`v1.2.3`)
+## 🆕 Recent Highlights
 
-- **True High-FPS Cloth Physics & Smooth Ladders** — Fixed capes, coats, and belts twitching or stiffening at 60–360+ FPS (smoothly interpolated 30 Hz Havok simulation) and eliminated rung-by-rung stuttering when climbing or sliding down ladders.
-- **Multi-Core Frame Pacing Overhaul & Water-Area Crash/FPS Fix** — Reworked AMD multi-CCD & Intel Hybrid `P+E` thread scheduling (`+25–35%` FPS and sub-millisecond jitter) and fixed a reproducible planar-reflection crash & `6 ms` bottleneck near water (`+65%` FPS).
-- **Live `Texture Quality` & `Shadow Quality` + HDR-Space AA (`~130 MB` Less VRAM)** — Scale `Texture Quality` live down to `Very Low` (saving up to `~1 GB` VRAM) and `Shadow Quality` from `Off` up to `8K Ultra PCSS`, while running DLAA/DLSS/FSR/TAA ahead of native Post-FX (`152` native Vulkan shaders).
-- **`3,995` Pre-Bake Recipes, Zero-Stutter Combat & Launcher Polish** — Expanded `data/shader_recipes.bbrc`, eliminated mid-combat `AsyncSkippable` compile hitches and periodic background telemetry stutters, fixed slow-motion below FPS caps (`Issue #1`), unified gothic launcher sidebar tooltips, and fixed Windows 1-click updater bracket paths & UTF-8 text.
-- **Includes everything from `v1.2.2` – `v1.2.0`** — Native Vulkan Post-Processing, Native `HDR10`, `PCSS` Soft Shadows, `SSGI`, Fire Heat Haze, `~1.3 s` death respawns, `~4 s` Linux pre-bake, portable `x86-64-v3` builds, and `2×–4×` UI upscaling.
+- **Live `Cloth Physics` (`Default` / `Native Smooth` / `Enhanced XPBD`)** — Switch cloth simulation live in `System -> Display` for ultra-smooth coats, capes, and belts at any frame rate (60–500 FPS) with zero jitter or stretched waist straps.
+- **DLSS & FSR 3.1 Frame Generation (`2×–4×`) + NVIDIA Reflex** — Hardware DLSS Frame Generation on RTX 40/50 and universal FSR 3.1 `2×/3×/4×` Frame Generation on any Vulkan 1.3 GPU, paired with Reflex low-latency pacing.
+- **Low-VRAM (`2–4 GB`) & Windows Stability Overhaul** — Dedicated VRAM priority & budget management, bounded UI-upscale cache, Windows DXGI flip-queue stall fix, `16:10` / `1366×768` resolution fixes, and instant VRAM release when toggling effects off.
+- **C++20 Engine Audit, Blood & Lighting Polish** — Full static audit across all `2,940` decompiled graphics functions, fixed persistent character/clothing blood mipmaps, refined `SSGI` with a smooth À-Trous denoiser (off by default), updated default PC controls (`V`/`R`/`Q`), and persistent `Insert` overlay layout.
 
 *(See [Releases](https://github.com/lapothecary/bloodborne-pc-vulkan/releases) for clean per-version changelogs.)*
 
@@ -118,11 +119,11 @@ cmake -S launcher_v2 -B launcher_v2/build -G Ninja -DCMAKE_BUILD_TYPE=Release
 ninja -C launcher_v2/build && cp -f launcher_v2/build/bb-launcher out/bb-launcher
 ```
 
-**Useful Runtime Flags (No Rebuild Needed):**
+**Useful Runtime Flags (No Rebuild Needed — full list in [`docs/ENVIRONMENT.md`](docs/ENVIRONMENT.md)):**
 ```bash
 BB_HW_OCCLUSION_CULL=0 ./play.sh        # Disable 3D hardware occlusion culling
 BB_NATIVE_SHADERS=0 ./play.sh           # Fall back from native GLSL to translated SPIR-V
-BB_GX_SKIP_MODS="05,06" ./play.sh       # Skip specific C++20 graphics modules for debugging
+BB_GX_MODULES="01,02,03,04,07" ./play.sh # Enable only selected C++20 graphics modules for debugging
 ```
 
 </details>
@@ -141,12 +142,13 @@ BB_GX_SKIP_MODS="05,06" ./play.sh       # Skip specific C++20 graphics modules f
 
 ### Что делает этот порт удобным для игры
 - **Аутентичный нативный лаунчер** — быстрый C++20 лаунчер с автообновлением в 1 клик, едиными готическими подсказками, модами, онлайном и предкомпиляцией шейдеров. Не хранит защищённых файлов Sony: при первом запуске сам декодирует прямо из вашей папки игры родной арт, официальный шрифт Bloodborne (с кириллицей), звуки меню и музыку *Hunter's Dream* / *Omen*.
+- **Работает даже на картах с `2–4 ГБ VRAM`** — раздельный ПК-VRAM с приоритетами памяти, ограниченный кэш UI-апскейлера, живое переключение **`Texture Quality`** (экономия до ~1 ГБ VRAM на лету) и поддержка `16:10` / `1366×768` (проверено от `GTX 1050 2 GB` до `RTX 4090`).
 - **Полный пре-бейк (`5,761` шейдер + `3,995` рецептов)** — один раз прогоняется в лаунчере (~4 сек на Linux) или тихо в фоне во время игры, убирая статтеры компиляции шейдеров.
-- **Плавная камера, фреймпейсинг и физика на 60–300+ FPS** — событийный опрос мыши `1000+ Гц`, переработанный планировщик под многоядерные AMD и Intel `P+E` (`~0.2–0.5 мс` джиттер), режим плавной камеры **`Balanced`** (`F4`), естественная физика плащей и плавный спуск/подъём по лестницам.
-- **Полноценные ПК-настройки прямо в игре** — живое переключение **`Texture Quality`** (экономия до ~1 ГБ VRAM на лету), **`Shadow Quality`** (`Off` до `8K Ultra PCSS`), разрешение, `VSync`, **`HDR10`**, апскейлеры (`DLSS 4.5 / DLAA / FSR 3.1 & 4 / XeSS / SMAA T2x`), скроллбары и `Exit Game` прямо в меню.
+- **Плавная камера, фреймпейсинг и новая физика ткани на 60–500 FPS** — событийный опрос мыши `1000+ Гц`, **NVIDIA Reflex**, планировщик под многоядерные AMD и Intel `P+E` (`~0.2–0.5 мс` джиттер), режим плавной камеры **`Balanced`** (`F4`), настройка **`Cloth Physics`** (`Default` / `Native Smooth` / **`Enhanced XPBD`**) прямо в `System -> Display` и плавные лестницы.
+- **Полноценные ПК-настройки и удобное управление прямо в игре** — переназначение любых клавиш и колеса мыши (по умолчанию: `V` лечение, `R` предмет, `Q` захват цели, `3` пули, `4`/колёсико вниз — слот, `Left Alt` шаг), живое переключение **`Texture Quality`**, **`Shadow Quality`** (`Off` до `8K Ultra PCSS`), разрешение, `VSync`, **`HDR10`**, апскейлеры (`DLSS 4.5 / DLAA / FSR 3.1 & 4 / XeSS / SMAA T2x`), **генерация кадров (`DLSS` и `FSR 3.1 2×–4×`)**, скроллбары и `Exit Game` прямо в меню.
 - **Возрождение за ~1.3 секунды** — переходы и смерти занимают ~1.3–3 секунды вместо 11–12 (при желании таймер подсказок на загрузках можно вернуть обратно прямо в `System -> Controls`).
-- **Нативный Vulkan Post-FX и опциональные ремастер-эффекты** — `152` нативных Vulkan-шейдера, `GTAO/SSAO`, `PCSS`, `SSGI`, `Fire Heat Haze`, контактные микро-тени, адаптивный `SSR`, `True Black / OLED` и `2×/4×` апскейл интерфейса и иконок.
-- **Open Beta и помощь в тестировании** — порт плотно проверен на видеокартах NVIDIA (`RTX 3080`, `RTX 4070 Laptop`, `RTX 4090`) на Windows 10/11 и Linux. Будем рады тестам на **AMD Radeon**, **Intel Arc** и **Steam Deck**: если поймаете баг, скидывайте папку `logs/` в GitHub Issues (пути с именем пользователя автоматически скрываются).
+- **Нативный Vulkan Post-FX и опциональные ремастер-эффекты** — `152` нативных Vulkan-шейдера, `GTAO/SSAO`, `PCSS`, улучшенный `SSGI` с денойзером, `Fire Heat Haze`, контактные микро-тени, адаптивный `SSR`, `True Black / OLED` и `2×/4×` апскейл интерфейса и иконок.
+- **Помощь в тестировании** — порт плотно проверен на видеокартах NVIDIA (`GTX 1050 2 GB`, `RTX 3080`, `RTX 4070 Laptop`, `RTX 4090`) на Windows 10/11 и Linux. Будем рады тестам на **AMD Radeon**, **Intel Arc** и **Steam Deck**: если поймаете баг или вылет, скидывайте папку `logs/` (включая `logs/crash-*.log`) в GitHub Issues — пути с именем пользователя автоматически скрываются.
 
 </details>
 
