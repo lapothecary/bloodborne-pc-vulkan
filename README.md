@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <code>Open Beta (v1.2.3)</code> · <code>Windows 10/11 &amp; Linux (x86_64)</code> · <code>2,940 Decompiled C++20 Engine Functions</code> · <code>152 Native Vulkan Shaders</code> · <code>3,995 Pre-Bake Recipes</code> · <code>1-Click Auto-Updater</code>
+  <code>Windows 10/11 &amp; Linux (x86_64)</code> · <code>2,940 Decompiled C++20 Engine Functions</code> · <code>152 Native Vulkan Shaders</code> · <code>3,995 Pre-Bake Recipes</code> · <code>1-Click Auto-Updater</code>
 </p>
 
 An optimization-focused **Windows 10/11** and **Linux (`x86_64`)** PC port for **Bloodborne** (`CUSA03173` / `CUSA00900` v1.09), built on top of [`bbport`](https://github.com/deadinside28/bloodborne_pc) and [`shadPS4`](https://github.com/shadps4-emu/shadPS4).
