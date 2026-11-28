@@ -331,6 +331,23 @@ CommandProcessor::Step CommandProcessor::Compute(Work& work, Level& level, const
                 rasterizer->ScopeMarker(
                     "asc[{}]:{}:DirectDispatchIndirect", fmt::make_format_args(vqid, at),
                     [&] { rasterizer->DispatchIndirect(base, args.byte_offset, DispatchDimsBytes); });
+            } else if (vk_op == DirectVk::Op::BindCsShader && body_words == 9u) {
+                auto* state = reinterpret_cast<u32*>(&queues[work.queue].cs_state);
+                state[0x20Cu - ComputeShOffset] = body[2];
+                state[0x20Du - ComputeShOffset] = body[3];
+                state[0x212u - ComputeShOffset] = body[4];
+                state[0x213u - ComputeShOffset] = body[5];
+                state[0x207u - ComputeShOffset] = body[6];
+                state[0x208u - ComputeShOffset] = body[7];
+                state[0x209u - ComputeShOffset] = body[8];
+            } else if (vk_op == DirectVk::Op::InitDefaultHardwareState && body_words == 2u) {
+                const u32 gen = (op_word >> 16) & 0xFFu;
+                if (gen <= 3u || gen == 6u) {
+                    auto* state = reinterpret_cast<u32*>(&queues[work.queue].cs_state);
+                    state[0x216u - ComputeShOffset] = 0xFFFFFFFFu;
+                    state[0x217u - ComputeShOffset] = 0xFFFFFFFFu;
+                    state[0x215u - ComputeShOffset] = (gen == 6u) ? 0x170u : 0u;
+                }
             } else if (vk_op == DirectVk::Op::SetStageUserData && body_words >= 3u) {
                 const u32 sh_offset = body[2] & 0xFFFFu;
                 u32 mask = body[2] >> 16;

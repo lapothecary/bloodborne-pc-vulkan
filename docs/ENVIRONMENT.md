@@ -112,7 +112,7 @@ What players and the launchers set. The menu, bbport.ini and the launcher write 
 | `BB_USER_NAME` | the PS4 user name (default Hunter) |
 | `BB_WINDOW_MODE` | =fullscreen / borderless / windowed: startup window mode |
 
-## Tuning (282)
+## Tuning (286)
 
 Defaults to change on a machine where they misbehave, workarounds, and switches that turn a fix off for comparison.
 
@@ -164,7 +164,10 @@ Defaults to change on a machine where they misbehave, workarounds, and switches 
 | `BB_DETILE_SKIPPED` | =1: texture levels the quality setting leaves out are still detiled and read |
 | `BB_DIRECT_IMPORT_LOCKED` | =1: direct memory imports under the lock |
 | `BB_DIRECT_MEMORY_ACCESS` | =1: shadPS4's direct memory access mode of the shader translator |
+| `BB_DIRECT_RING` | =1 / 0: compact DirectVulkan hardware-init & VGT ring packets (default follows BB_DIRECT_VULKAN) |
 | `BB_DIRECT_SEGMENT` | =0: the presenter waits for the recording threads instead of taking its own command segment |
+| `BB_DIRECT_SHADER_BIND` | =1 / 0: compact DirectVulkan shader bind packets in libSceGnmDriver (default follows BB_DIRECT_VULKAN) |
+| `BB_DIRECT_VULKAN` | =1 / 0: master toggle for Direct Vulkan RHI packets & fast paths (0 = legacy PM4 fallback) |
 | `BB_DISABLE_HTTPS` | =1: the game's HTTPS requests go out as plain HTTP (online) |
 | `BB_DRAW_BUNDLE` | =1 / 0: opt-in fuse per-draw DirectVk state + draw packets into Op::DrawBundle (default 0) |
 | `BB_DRAW_PIPE` | =0 / N: the draw pipeline off, or its depth |
@@ -373,7 +376,7 @@ Defaults to change on a machine where they misbehave, workarounds, and switches 
 | `BB_TILE_BIND_VRAM` | =0: tiled data read in place over the bus instead of from a VRAM copy |
 | `BB_TIMELINE_POLL_US` | =N (default 50): timeline semaphore poll interval |
 | `BB_UFFD` | =0 / 1: Linux userfaultfd write tracking |
-| `BB_UI_UPSCALE_CACHE_MB` | =N (16-1024): VRAM cap in MiB for the UI & Icons Super-Resolution texture cache (default 64 on `<= 4.5 GiB` GPUs, 256 otherwise) |
+| `BB_UI_UPSCALE_CACHE_MB` | =N (16-1024): byte cap for GPU-upscaled UI texture cache (default 64 low-VRAM / 256 normal) |
 | `BB_UNIFIED_MEMORY` | =1 / 0: treat the GPU as unified memory or not (over the device type) |
 | `BB_VBAO_BLUR` | =N (default 2, 0: raw): VBAO denoise taps per side |
 | `BB_VBAO_BLUR_DEPTH` | =f (default 0.05): relative depth difference that stops the VBAO blur |
@@ -402,7 +405,7 @@ Defaults to change on a machine where they misbehave, workarounds, and switches 
 | `BB_WINDOW_POLL_DELAY` | =1: fall back to legacy 2 ms SDL_Delay window polling instead of event-driven SDL_WaitEventTimeout (default 0) |
 | `BB_WORK_RETIRED` | =0: the recording thread and fences do not wait for retired work |
 
-## Diagnostics (301)
+## Diagnostics (313)
 
 Logs, dumps, traces, probes and experiments, for finding bugs. Most cost frame time; none is meant for playing.
 
@@ -418,6 +421,9 @@ Logs, dumps, traces, probes and experiments, for finding bugs. Most cost frame t
 | `BB_BBSC_PROBE` | =address: BBSC probe of that guest address |
 | `BB_BDA_LOG` | set: GPU addresses of buffer sources, to place a GPUVM fault |
 | `BB_BIG_ALLOC_STACKS` | =1: call stacks of device memory allocations of 64 MiB and more |
+| `BB_BLOOD_BOOST` | =N (1..16): replay each character blood splatter N times across sequential frames for rapid testing |
+| `BB_BLOOD_DRENCH` | =N (1..3): 360-degree full-body spherical blood drench test on hit (16*N angles around Hunter) |
+| `BB_BLOOD_TRACE` | =1: log PaintTarget blood splatter commands |
 | `BB_BREADCRUMB_READS` | =1 / 0: breadcrumbs of T# and V# reads everywhere / nowhere (default: NVIDIA only) |
 | `BB_BUFFER_STATS` | =1: how many frames behind the GPU is when a frame starts |
 | `BB_CAMERA_FRAME_LOG` | set: projection of every G-buffer pass's camera with its GPU frame |
@@ -446,6 +452,14 @@ Logs, dumps, traces, probes and experiments, for finding bugs. Most cost frame t
 | `BB_CULL_LOG` | =1: log [BB-CULL] occlusion culling stats every 600 frames instead of once |
 | `BB_DCB_STATS` | =1: structure of the graphics command buffers |
 | `BB_DEBUG_MOTION` | =1: motion vectors blended over the picture |
+| `BB_DIRECT_V1_MASK` | =hex: Direct Vulkan V1 sub-feature bitmask |
+| `BB_DIRECT_V2_MASK` | =hex: Direct Vulkan V2 sub-feature bitmask |
+| `BB_DIRECT_V3_MASK` | =hex: Direct Vulkan V3 sub-feature bitmask |
+| `BB_DIRECT_V4_MASK` | =hex: Direct Vulkan V4 sub-feature bitmask |
+| `BB_DIRECT_V5_MASK` | =hex: Direct Vulkan V5 sub-feature bitmask |
+| `BB_DIRECT_V6_MASK` | =hex: Direct Vulkan V6 sub-feature bitmask |
+| `BB_DIRECT_V7_MASK` | =hex: Direct Vulkan V7 sub-feature bitmask |
+| `BB_DIRECT_VULKAN_MASK` | =hex: module bitmask selecting Direct Vulkan V1..V7 groups |
 | `BB_DISPATCH_LOG` | =1: the shape of each kind of compute dispatch, once |
 | `BB_DISPATCH_START_LOG` | set: dispatches with a nonzero thread group start |
 | `BB_DISPLAY_WATCH` | set: every draw into a display buffer with its sizes and state |
@@ -581,6 +595,7 @@ Logs, dumps, traces, probes and experiments, for finding bugs. Most cost frame t
 | `BB_NATIVE_SHADER_MIN` | =0..118: lower index bound for native SPIR-V shader bisection |
 | `BB_NATIVE_SHADER_SKIP_MAX` | =0..118: upper index bound to skip in native SPIR-V shader registry |
 | `BB_NATIVE_SHADER_SKIP_MIN` | =0..118: lower index bound to skip in native SPIR-V shader registry |
+| `BB_NATIVE_VK_MASK` | =hex: Native Vulkan resource bitmask (bit 0 = N1 buffers, bit 1 = N2 textures) |
 | `BB_NGX_LOG` | =1 / 2: NVIDIA NGX log into the port's (2: verbose) |
 | `BB_NULL_GPU` | =1: no GPU work at all (tests) |
 | `BB_OBJECT_MOTION_ALL` | =1: the old broad object motion selection (A/B) |

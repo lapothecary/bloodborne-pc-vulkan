@@ -253,7 +253,9 @@ void NativePostFx::ReleaseDisabledTargets() {
 
     const bool drop_bloom = !bloom_enabled && bool(bloom_pyramid);
     const bool drop_haze = !haze_enabled && bool(opaque_hdr_half);
-    const bool drop_ssgi = !ssgi_enabled && (bool(ssgi_rad_mip0) || bool(ssgi_rad_mip1) || bool(ssgi_raw_img));
+    const bool drop_ssgi = !ssgi_enabled &&
+                           (bool(ssgi_rad_mip0) || bool(ssgi_rad_mip1) || bool(ssgi_raw_img) ||
+                            bool(ssgi_denoise_img));
     const bool drop_mb = !mb_enabled && (bool(mb_vel_img) || bool(mb_tile_max_img) || bool(mb_color_img));
     const bool drop_dof = !dof_enabled && (bool(dof_coc_img) || bool(dof_bokeh_img) || bool(dof_color_img));
     if (!drop_bloom && !drop_haze && !drop_ssgi && !drop_mb && !drop_dof) {
@@ -280,9 +282,11 @@ void NativePostFx::ReleaseDisabledTargets() {
         ssgi_rad_mip0_view.reset();
         ssgi_rad_mip1_view.reset();
         ssgi_raw_view.reset();
+        ssgi_denoise_view.reset();
         ssgi_rad_mip0 = VideoCore::HostImage{};
         ssgi_rad_mip1 = VideoCore::HostImage{};
         ssgi_raw_img = VideoCore::HostImage{};
+        ssgi_denoise_img = VideoCore::HostImage{};
         ssgi_half_extent = vk::Extent2D{0u, 0u};
         ssgi_quarter_extent = vk::Extent2D{0u, 0u};
     }
@@ -1239,7 +1243,7 @@ bool NativePostFx::EnsureSsgiTargets(u32 hdr_w, u32 hdr_h) {
     const u32 half_h = std::max(hdr_h / 2u, 16u);
     const u32 qtr_w = std::max(half_w / 2u, 8u);
     const u32 qtr_h = std::max(half_h / 2u, 8u);
-    if (ssgi_rad_mip0 && ssgi_rad_mip1 && ssgi_raw_img &&
+    if (ssgi_rad_mip0 && ssgi_rad_mip1 && ssgi_raw_img && ssgi_denoise_img &&
         ssgi_half_extent.width == half_w && ssgi_half_extent.height == half_h &&
         ssgi_quarter_extent.width == qtr_w && ssgi_quarter_extent.height == qtr_h) {
         return true;
@@ -1272,6 +1276,7 @@ bool NativePostFx::EnsureSsgiTargets(u32 hdr_w, u32 hdr_h) {
     make_img(ssgi_rad_mip0, ssgi_rad_mip0_view, half_w, half_h);
     make_img(ssgi_rad_mip1, ssgi_rad_mip1_view, qtr_w, qtr_h);
     make_img(ssgi_raw_img, ssgi_raw_view, half_w, half_h);
+    make_img(ssgi_denoise_img, ssgi_denoise_view, half_w, half_h);
     ssgi_half_extent = vk::Extent2D{half_w, half_h};
     ssgi_quarter_extent = vk::Extent2D{qtr_w, qtr_h};
     return true;
@@ -1390,6 +1395,8 @@ void NativePostFx::ExecuteHalfResSsgi(VideoCore::Image& hdr_image, vk::ImageView
     const vk::ImageView m1_view = *ssgi_rad_mip1_view;
     const vk::Image raw_img = vk::Image(ssgi_raw_img);
     const vk::ImageView raw_view = *ssgi_raw_view;
+    const vk::Image denoise_img = vk::Image(ssgi_denoise_img);
+    const vk::ImageView denoise_view = *ssgi_denoise_view;
     const vk::Extent2D half_ext = ssgi_half_extent;
     const vk::Extent2D qtr_ext = ssgi_quarter_extent;
     const vk::Sampler samp = *linear_sampler;
@@ -1407,7 +1414,7 @@ void NativePostFx::ExecuteHalfResSsgi(VideoCore::Image& hdr_image, vk::ImageView
     }
     scheduler.Record([=](vk::CommandBuffer cmdbuf) {
         const vk::ImageSubresourceRange one_range{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
-        const std::array<vk::ImageMemoryBarrier2, 3> to_gen{{
+        const std::array<vk::ImageMemoryBarrier2, 4> to_gen{{
             {.srcStageMask = vk::PipelineStageFlagBits2::eComputeShader |
                              vk::PipelineStageFlagBits2::eFragmentShader,
              .srcAccessMask = vk::AccessFlagBits2::eNone,
@@ -1425,7 +1432,8 @@ void NativePostFx::ExecuteHalfResSsgi(VideoCore::Image& hdr_image, vk::ImageView
              .newLayout = vk::ImageLayout::eGeneral,
              .image = m1_img,
              .subresourceRange = one_range},
-            {.srcStageMask = vk::PipelineStageFlagBits2::eFragmentShader,
+            {.srcStageMask = vk::PipelineStageFlagBits2::eComputeShader |
+                             vk::PipelineStageFlagBits2::eFragmentShader,
              .srcAccessMask = vk::AccessFlagBits2::eNone,
              .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
              .dstAccessMask = vk::AccessFlagBits2::eShaderWrite,
@@ -1433,11 +1441,20 @@ void NativePostFx::ExecuteHalfResSsgi(VideoCore::Image& hdr_image, vk::ImageView
              .newLayout = vk::ImageLayout::eGeneral,
              .image = raw_img,
              .subresourceRange = one_range},
+            {.srcStageMask = vk::PipelineStageFlagBits2::eComputeShader |
+                             vk::PipelineStageFlagBits2::eFragmentShader,
+             .srcAccessMask = vk::AccessFlagBits2::eNone,
+             .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+             .dstAccessMask = vk::AccessFlagBits2::eShaderWrite,
+             .oldLayout = vk::ImageLayout::eUndefined,
+             .newLayout = vk::ImageLayout::eGeneral,
+             .image = denoise_img,
+             .subresourceRange = one_range},
         }};
         cmdbuf.pipelineBarrier2(
             {.imageMemoryBarrierCount = u32(to_gen.size()), .pImageMemoryBarriers = to_gen.data()});
 
-        // 1. Prefilter Mip 0 (Half-Res packed Radiance+Depth)
+        // 1. Prefilter Mip 0 (Half-Res packed firefly-clamped Radiance+Depth)
         const vk::DescriptorImageInfo d_in{VK_NULL_HANDLE, depth_view,
                                            vk::ImageLayout::eShaderReadOnlyOptimal};
         const vk::DescriptorImageInfo diff_in{VK_NULL_HANDLE, diff_view,
@@ -1470,7 +1487,7 @@ void NativePostFx::ExecuteHalfResSsgi(VideoCore::Image& hdr_image, vk::ImageView
         };
         cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &m0_ready});
 
-        // 2. Prefilter Mip 1 (Quarter-Res packed Radiance+Depth)
+        // 2. Prefilter Mip 1 (Quarter-Res tent-filtered Radiance + clean inner-2x2 Depth)
         const vk::DescriptorImageInfo m0_in{VK_NULL_HANDLE, m0_view,
                                             vk::ImageLayout::eShaderReadOnlyOptimal};
         const vk::DescriptorImageInfo m1_out{VK_NULL_HANDLE, m1_view, vk::ImageLayout::eGeneral};
@@ -1497,7 +1514,7 @@ void NativePostFx::ExecuteHalfResSsgi(VideoCore::Image& hdr_image, vk::ImageView
         };
         cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &m1_ready});
 
-        // 3. Half-Res 16-tap HBIL SSGI Trace (L2-resident!)
+        // 3. Half-Res 32-tap point-sampled HBIL SSGI Trace (L2-resident, zero bilinear depth bleed)
         const vk::DescriptorImageInfo m1_in{VK_NULL_HANDLE, m1_view,
                                             vk::ImageLayout::eShaderReadOnlyOptimal};
         const vk::DescriptorImageInfo samp_in{samp, VK_NULL_HANDLE, vk::ImageLayout::eUndefined};
@@ -1517,14 +1534,123 @@ void NativePostFx::ExecuteHalfResSsgi(VideoCore::Image& hdr_image, vk::ImageView
         cmdbuf.pushConstants(tr_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(tr_pc), &tr_pc);
         cmdbuf.dispatch((half_ext.width + 15u) / 16u, (half_ext.height + 15u) / 16u, 1u);
 
-        const vk::ImageMemoryBarrier2 raw_ready{
+        // 3b. 3-Pass Edge-Preserving A-Trous Wavelet Denoiser (strides 1 -> 2 -> 4 in Half-Res)
+        const vk::ImageMemoryBarrier2 raw_to_read{
+            .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+            .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+            .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+            .oldLayout = vk::ImageLayout::eGeneral,
+            .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+            .image = raw_img,
+            .subresourceRange = one_range,
+        };
+        cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &raw_to_read});
+
+        const vk::DescriptorImageInfo raw_in_ro{VK_NULL_HANDLE, raw_view,
+                                                vk::ImageLayout::eShaderReadOnlyOptimal};
+        const vk::DescriptorImageInfo den_out_rw{VK_NULL_HANDLE, denoise_view,
+                                                 vk::ImageLayout::eGeneral};
+        const vk::DescriptorImageInfo den_in_ro{VK_NULL_HANDLE, denoise_view,
+                                                vk::ImageLayout::eShaderReadOnlyOptimal};
+        const u32 half_gx = (half_ext.width + 15u) / 16u;
+        const u32 half_gy = (half_ext.height + 15u) / 16u;
+        cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pf_pipe);
+
+        // Pass 1 (mode=2, stride=1 + firefly variance clamp): raw -> denoise
+        {
+            const std::array<vk::WriteDescriptorSet, 4> dn1_writes{{
+                {.dstBinding = 0, .descriptorCount = 1, .descriptorType = vk::DescriptorType::eSampledImage, .pImageInfo = &raw_in_ro},
+                {.dstBinding = 1, .descriptorCount = 1, .descriptorType = vk::DescriptorType::eSampledImage, .pImageInfo = &m0_in},
+                {.dstBinding = 2, .descriptorCount = 1, .descriptorType = vk::DescriptorType::eSampledImage, .pImageInfo = &m0_in},
+                {.dstBinding = 3, .descriptorCount = 1, .descriptorType = vk::DescriptorType::eStorageImage, .pImageInfo = &den_out_rw},
+            }};
+            const SsgiPrefilterPush dn1_pc{half_ext.width, half_ext.height, half_ext.width, half_ext.height, 2u};
+            cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, pf_layout, 0, dn1_writes);
+            cmdbuf.pushConstants(pf_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(dn1_pc), &dn1_pc);
+            cmdbuf.dispatch(half_gx, half_gy, 1u);
+        }
+        {
+            const std::array<vk::ImageMemoryBarrier2, 2> swap1{{
+                {.srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+                 .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
+                 .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+                 .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+                 .oldLayout = vk::ImageLayout::eGeneral,
+                 .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+                 .image = denoise_img,
+                 .subresourceRange = one_range},
+                {.srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+                 .srcAccessMask = vk::AccessFlagBits2::eShaderRead,
+                 .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+                 .dstAccessMask = vk::AccessFlagBits2::eShaderWrite,
+                 .oldLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+                 .newLayout = vk::ImageLayout::eGeneral,
+                 .image = raw_img,
+                 .subresourceRange = one_range},
+            }};
+            cmdbuf.pipelineBarrier2(
+                {.imageMemoryBarrierCount = u32(swap1.size()), .pImageMemoryBarriers = swap1.data()});
+        }
+
+        // Pass 2 (mode=3, stride=2): denoise -> raw
+        {
+            const std::array<vk::WriteDescriptorSet, 4> dn2_writes{{
+                {.dstBinding = 0, .descriptorCount = 1, .descriptorType = vk::DescriptorType::eSampledImage, .pImageInfo = &den_in_ro},
+                {.dstBinding = 1, .descriptorCount = 1, .descriptorType = vk::DescriptorType::eSampledImage, .pImageInfo = &m0_in},
+                {.dstBinding = 2, .descriptorCount = 1, .descriptorType = vk::DescriptorType::eSampledImage, .pImageInfo = &m0_in},
+                {.dstBinding = 3, .descriptorCount = 1, .descriptorType = vk::DescriptorType::eStorageImage, .pImageInfo = &raw_out},
+            }};
+            const SsgiPrefilterPush dn2_pc{half_ext.width, half_ext.height, half_ext.width, half_ext.height, 3u};
+            cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, pf_layout, 0, dn2_writes);
+            cmdbuf.pushConstants(pf_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(dn2_pc), &dn2_pc);
+            cmdbuf.dispatch(half_gx, half_gy, 1u);
+        }
+        {
+            const std::array<vk::ImageMemoryBarrier2, 2> swap2{{
+                {.srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+                 .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
+                 .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+                 .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+                 .oldLayout = vk::ImageLayout::eGeneral,
+                 .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+                 .image = raw_img,
+                 .subresourceRange = one_range},
+                {.srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+                 .srcAccessMask = vk::AccessFlagBits2::eShaderRead,
+                 .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+                 .dstAccessMask = vk::AccessFlagBits2::eShaderWrite,
+                 .oldLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+                 .newLayout = vk::ImageLayout::eGeneral,
+                 .image = denoise_img,
+                 .subresourceRange = one_range},
+            }};
+            cmdbuf.pipelineBarrier2(
+                {.imageMemoryBarrierCount = u32(swap2.size()), .pImageMemoryBarriers = swap2.data()});
+        }
+
+        // Pass 3 (mode=4, stride=4): raw -> denoise
+        {
+            const std::array<vk::WriteDescriptorSet, 4> dn3_writes{{
+                {.dstBinding = 0, .descriptorCount = 1, .descriptorType = vk::DescriptorType::eSampledImage, .pImageInfo = &raw_in_ro},
+                {.dstBinding = 1, .descriptorCount = 1, .descriptorType = vk::DescriptorType::eSampledImage, .pImageInfo = &m0_in},
+                {.dstBinding = 2, .descriptorCount = 1, .descriptorType = vk::DescriptorType::eSampledImage, .pImageInfo = &m0_in},
+                {.dstBinding = 3, .descriptorCount = 1, .descriptorType = vk::DescriptorType::eStorageImage, .pImageInfo = &den_out_rw},
+            }};
+            const SsgiPrefilterPush dn3_pc{half_ext.width, half_ext.height, half_ext.width, half_ext.height, 4u};
+            cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, pf_layout, 0, dn3_writes);
+            cmdbuf.pushConstants(pf_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(dn3_pc), &dn3_pc);
+            cmdbuf.dispatch(half_gx, half_gy, 1u);
+        }
+
+        const vk::ImageMemoryBarrier2 den_ready{
             .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
             .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
             .dstStageMask = vk::PipelineStageFlagBits2::eFragmentShader,
             .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
             .oldLayout = vk::ImageLayout::eGeneral,
             .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
-            .image = raw_img,
+            .image = denoise_img,
             .subresourceRange = one_range,
         };
         if (use_proxy) {
@@ -1539,25 +1665,23 @@ void NativePostFx::ExecuteHalfResSsgi(VideoCore::Image& hdr_image, vk::ImageView
                 .image = proxy_img,
                 .subresourceRange = one_range,
             };
-            const std::array<vk::ImageMemoryBarrier2, 2> up_barriers{{raw_ready, hdr_sync}};
+            const std::array<vk::ImageMemoryBarrier2, 2> up_barriers{{den_ready, hdr_sync}};
             cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = u32(up_barriers.size()),
                                      .pImageMemoryBarriers = up_barriers.data()});
         } else {
-            cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &raw_ready});
+            cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &den_ready});
         }
 
-        // 4. Full-Res 5-tap depth-aware bilateral upsample & blend directly onto hdr_image
+        // 4. Full-Res 4-tap exact joint-bilateral upsample & blend directly onto hdr_image
         const vk::DescriptorImageInfo g0_in{VK_NULL_HANDLE, g0_view,
                                             vk::ImageLayout::eShaderReadOnlyOptimal};
         const vk::DescriptorImageInfo g2_in{VK_NULL_HANDLE, g2_view,
                                             vk::ImageLayout::eShaderReadOnlyOptimal};
-        const vk::DescriptorImageInfo raw_in{VK_NULL_HANDLE, raw_view,
-                                             vk::ImageLayout::eShaderReadOnlyOptimal};
         const std::array<vk::WriteDescriptorSet, 6> up_writes{{
             {.dstBinding = 0, .descriptorCount = 1, .descriptorType = vk::DescriptorType::eSampledImage, .pImageInfo = &g0_in},
             {.dstBinding = 1, .descriptorCount = 1, .descriptorType = vk::DescriptorType::eSampledImage, .pImageInfo = &d_in},
             {.dstBinding = 2, .descriptorCount = 1, .descriptorType = vk::DescriptorType::eSampledImage, .pImageInfo = &g2_in},
-            {.dstBinding = 3, .descriptorCount = 1, .descriptorType = vk::DescriptorType::eSampledImage, .pImageInfo = &raw_in},
+            {.dstBinding = 3, .descriptorCount = 1, .descriptorType = vk::DescriptorType::eSampledImage, .pImageInfo = &den_in_ro},
             {.dstBinding = 4, .descriptorCount = 1, .descriptorType = vk::DescriptorType::eSampledImage, .pImageInfo = &m0_in},
             {.dstBinding = 5, .descriptorCount = 1, .descriptorType = vk::DescriptorType::eSampler, .pImageInfo = &samp_in},
         }};

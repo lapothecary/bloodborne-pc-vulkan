@@ -294,7 +294,7 @@ struct Values {
     /// PCSS Contact-Hardening Soft Shadows (blocker-distance penumbra for 4K CSM + VSM point lights).
     std::atomic<bool> pcss_shadows{true};
     /// Horizon-Based Screen-Space Global Illumination (HBIL indirect bounce lighting in GXLightComposite).
-    std::atomic<bool> ssgi_enabled{true};
+    std::atomic<bool> ssgi_enabled{false};
     /// Native Vulkan 1.3 Post-Process pipeline (default base renderer; legacy Yebis2 kept as hidden A/B debug).
     std::atomic<bool> native_postfx{true};
     /// Convective heat-haze air refraction rising above blazing fires & torches (Native PostFX).

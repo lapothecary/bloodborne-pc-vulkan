@@ -3959,20 +3959,18 @@ bool PipelineCache::QueueAsyncSpvJob(DrawIndirectParams params, bool indirect) {
                 sharp_fmt_sig = HashCombine(sharp_fmt_sig, w);
             }
             sig = HashCombine(sig, sharp_fmt_sig);
-        } else if (hw == HwStage::Vertex || hw == HwStage::Export) {
-            const u32* pc = ps.code_ptr;
-            const u32* end = pc + std::min<size_t>(ps.code_dwords, 64);
-            while (pc < end) {
-                const auto inst = GcnIsa::Decode(pc);
-                if (inst.opcode == GcnIsa::Opcode::S_ENDPGM) {
-                    break;
-                }
-                if (inst.opcode == GcnIsa::Opcode::S_SWAPPC_B64) {
-                    ps.has_fetch = true;
-                    ps.fetch_sgpr = inst.src[0].code;
-                    break;
-                }
+            if (live_info.flattened_ud_buf.empty()) {
+                return false;
             }
+        } else {
+            // Uncached shader (cold cache before Background Auto-Baker finishes): without a
+            // decoded `srt_info.walker_func` we cannot freeze `flattened_ud_buf` synchronously on
+            // Stage A, and transient per-frame command-heap pointers (especially when
+            // `cue_base == 0` under BB_DIRECT_VULKAN=0 / BB_GX_MODULES=none) can be overwritten
+            // before the worker runs `TranslateProgram -> ResourcePatchingPass`. Fall back once to
+            // synchronous Stage A compilation for perm 0 while guest memory is guaranteed live;
+            // subsequent permutations and PSO compilation still run asynchronously.
+            return false;
         }
 
         if (ps.has_fetch && ps.fetch_sgpr + 1 < Gcn::NUM_USER_DATA) {
@@ -4068,9 +4066,6 @@ bool PipelineCache::QueueAsyncSpvJob(DrawIndirectParams params, bool indirect) {
         return true;
     }
 
-    VAddr cue_base = 0, cue_end = 0;
-    VideoCore::DirectBuffers::GetTransientCueHeapBounds(cue_base, cue_end);
-
     auto job = std::make_shared<AsyncSpvJob>();
     job->sig = sig;
     job->regs_copy = regs;
@@ -4088,9 +4083,7 @@ bool PipelineCache::QueueAsyncSpvJob(DrawIndirectParams params, bool indirect) {
         snap.hash = ps.hash;
         snap.pgm_base = ps.pgm_base;
         snap.user_data = pgm->user_data;
-        if (ps.cached_prog) {
-            snap.flat_buf = ps.cached_prog->info.flattened_ud_buf;
-        }
+        snap.flat_buf = ps.cached_prog->info.flattened_ud_buf;
         snap.valid = true;
 
         for (u32 i = 0; i + 1 < Gcn::NUM_USER_DATA; i += 2) {
@@ -4114,18 +4107,6 @@ bool PipelineCache::QueueAsyncSpvJob(DrawIndirectParams params, bool indirect) {
                 if (ndw >= 4) {
                     const u32* src = reinterpret_cast<const u32*>(raw_ptr);
                     auto& blob = job->ctx.owned_blobs.emplace_back(src, src + ndw);
-                    const uintptr_t host_ptr = reinterpret_cast<uintptr_t>(blob.data());
-                    snap.user_data[i] = static_cast<u32>(host_ptr);
-                    snap.user_data[i + 1] = static_cast<u32>(host_ptr >> 32);
-                }
-            } else if (!ps.cached_prog && cue_base != 0 && raw_ptr >= cue_base &&
-                       raw_ptr < cue_end && (raw_ptr & 3ULL) == 0) {
-                const size_t copy_bytes =
-                    static_cast<size_t>(std::min<u64>(cue_end - raw_ptr, 1024ULL)) & ~size_t(3);
-                if (copy_bytes >= 16) {
-                    const u32* src = reinterpret_cast<const u32*>(raw_ptr);
-                    auto& blob =
-                        job->ctx.owned_blobs.emplace_back(src, src + (copy_bytes / sizeof(u32)));
                     const uintptr_t host_ptr = reinterpret_cast<uintptr_t>(blob.data());
                     snap.user_data[i] = static_cast<u32>(host_ptr);
                     snap.user_data[i + 1] = static_cast<u32>(host_ptr >> 32);

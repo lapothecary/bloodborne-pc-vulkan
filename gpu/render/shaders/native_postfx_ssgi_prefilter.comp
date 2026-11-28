@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-// Remaster v2 Performance Audit: Half-Res & Quarter-Res packed Radiance+Depth prefilter for L2-resident SSGI.
+// Remaster v2 SSGI Prefilter & Edge-Preserving 3-Pass A-Trous Wavelet Denoiser.
+// mode == 0: Half-Res packed (firefly-clamped Radiance, 1.0 - depth) prefilter
+// mode == 1: Quarter-Res depth-aware smooth Radiance + representative depth downsample
+// mode == 2..4: Half-Res 3x3 A-Trous edge-preserving bilateral denoiser (stride = 1, 2, 4)
 #version 460
 #extension GL_EXT_samplerless_texture_functions : require
 
@@ -15,8 +18,12 @@ layout(push_constant) uniform SsgiPrefilterPush {
     uint dst_h;
     uint src_w;
     uint src_h;
-    uint is_mip1;
+    uint mode; // 0 = mip0 prefilter, 1 = mip1 smooth downsample, 2/3/4 = A-Trous denoise (step 1/2/4)
 } pc;
+
+float Luma(vec3 c) {
+    return dot(c, vec3(0.2126, 0.7152, 0.0722));
+}
 
 void main() {
     const uvec2 px = gl_GlobalInvocationID.xy;
@@ -24,18 +31,19 @@ void main() {
         return;
     }
 
-    const ivec2 base = ivec2(px * 2u);
-    const ivec2 max_p = max(ivec2(int(pc.src_w) - 1, int(pc.src_h) - 1), ivec2(0));
-    const ivec2 p00 = min(base + ivec2(0, 0), max_p);
-    const ivec2 p10 = min(base + ivec2(1, 0), max_p);
-    const ivec2 p01 = min(base + ivec2(0, 1), max_p);
-    const ivec2 p11 = min(base + ivec2(1, 1), max_p);
-
-    if (pc.is_mip1 == 0u) {
-        // Mip 0 (Half-Res): pack (diff + amb, depth) from full-res G-Buffer/lighting targets.
+    if (pc.mode == 0u) {
+        // Mip 0 (Half-Res): pack (firefly-clamped diff + amb, 1.0 - depth) from full-res targets.
         // Map each logical 2x2 sub-pixel center into each input texture's own texel grid so
-        // upscaled SceneTargets proxies (e.g. 1707x960 HDR/diff vs 2560x1440 non-blittable D32S8
-        // depth on NVIDIA) stay 100% aligned instead of sampling only the top-left sub-rectangle.
+        // upscaled SceneTargets proxies stay 100% aligned with native D32S8 depth.
+        const ivec2 base = ivec2(px * 2u);
+        const ivec2 max_p = max(ivec2(int(pc.src_w) - 1, int(pc.src_h) - 1), ivec2(0));
+        const ivec2 pts[4] = ivec2[4](
+            min(base + ivec2(0, 0), max_p),
+            min(base + ivec2(1, 0), max_p),
+            min(base + ivec2(0, 1), max_p),
+            min(base + ivec2(1, 1), max_p)
+        );
+
         const ivec2 d_sz = max(textureSize(depth_or_mip0_tex, 0), ivec2(1));
         const ivec2 diff_sz = max(textureSize(diff_tex, 0), ivec2(1));
         const ivec2 amb_sz = max(textureSize(amb_tex, 0), ivec2(1));
@@ -47,7 +55,6 @@ void main() {
         const vec2 diff_scale = vec2(diff_sz) * inv_src;
         const vec2 amb_scale = vec2(amb_sz) * inv_src;
 
-        const ivec2 pts[4] = ivec2[4](p00, p10, p01, p11);
         ivec2 d_pts[4];
         ivec2 diff_pts[4];
         ivec2 amb_pts[4];
@@ -60,17 +67,17 @@ void main() {
             ds[i] = texelFetch(depth_or_mip0_tex, d_pts[i], 0).r;
         }
 
-        // Pick closest depth (Forward-Z: smaller = closer) so thin pillars/limbs never vanish.
         const float d_min = min(min(ds[0], ds[1]), min(ds[2], ds[3]));
         vec3 rad_sum = vec3(0.0);
         float w_sum = 0.0;
 
         if (d_min >= 0.99995) {
-            // Sky quad: store sky dome radiance from amb_tex (fs_img5) with inv_depth = 0.0.
-            rad_sum = max(texelFetch(amb_tex, amb_pts[0], 0).rgb, vec3(0.0))
-                    + max(texelFetch(amb_tex, amb_pts[1], 0).rgb, vec3(0.0))
-                    + max(texelFetch(amb_tex, amb_pts[2], 0).rgb, vec3(0.0))
-                    + max(texelFetch(amb_tex, amb_pts[3], 0).rgb, vec3(0.0));
+            for (int i = 0; i < 4; ++i) {
+                vec3 c = max(texelFetch(amb_tex, amb_pts[i], 0).rgb, vec3(0.0));
+                const float l = Luma(c);
+                c *= 1.0 / (1.0 + l * 0.55);
+                rad_sum += c;
+            }
             imageStore(dst_img, ivec2(px), vec4(rad_sum * 0.25, 0.0));
             return;
         }
@@ -79,8 +86,12 @@ void main() {
         float d_avg = 0.0;
         for (int i = 0; i < 4; ++i) {
             if (ds[i] < 0.99995 && abs(ds[i] - d_min) <= d_tol) {
-                const vec3 c = max(texelFetch(diff_tex, diff_pts[i], 0).rgb, vec3(0.0)) +
-                               max(texelFetch(amb_tex, amb_pts[i], 0).rgb, vec3(0.0));
+                vec3 c = max(texelFetch(diff_tex, diff_pts[i], 0).rgb, vec3(0.0)) +
+                         max(texelFetch(amb_tex, amb_pts[i], 0).rgb, vec3(0.0));
+                // Soft Reinhard firefly suppression on tiny HDR emitters (candle flames/sparks):
+                // preserves full warm bounce from lit surfaces while preventing single-ray spikes.
+                const float l = Luma(c);
+                c *= 1.0 / (1.0 + l * 0.70);
                 rad_sum += c;
                 d_avg += ds[i];
                 w_sum += 1.0;
@@ -88,32 +99,122 @@ void main() {
         }
         const vec3 rad = (w_sum > 0.0) ? (rad_sum / w_sum) : vec3(0.0);
         const float d_out = (w_sum > 0.0) ? (d_avg / w_sum) : d_min;
-        // Store inverted depth (1.0 - d) in FP16 alpha: shifts exponent down near the far plane,
-        // giving 64-256x higher precision than raw Forward-Z (0.98..0.999) in RGBA16F.
         imageStore(dst_img, ivec2(px), vec4(rad, max(1.0 - d_out, 6e-5)));
-    } else {
-        // Mip 1 (Quarter-Res): smooth 2x2 downsample of (radiance, 1.0 - depth) without inflation.
-        const vec4 s00 = texelFetch(depth_or_mip0_tex, p00, 0);
-        const vec4 s10 = texelFetch(depth_or_mip0_tex, p10, 0);
-        const vec4 s01 = texelFetch(depth_or_mip0_tex, p01, 0);
-        const vec4 s11 = texelFetch(depth_or_mip0_tex, p11, 0);
+        return;
+    }
 
-        const vec4 ss[4] = vec4[4](s00, s10, s01, s11);
-        vec3 rad_sum = vec3(0.0);
+    if (pc.mode == 1u) {
+        // Mip 1 (Quarter-Res): smooth 4x4 tent-filtered radiance with clean inner-2x2 depth.
+        // Smooths thin candle/spark emissives before far ray taps so distant bounces stay velvety.
+        const ivec2 base = ivec2(px * 2u);
+        const ivec2 max_p = max(ivec2(int(pc.src_w) - 1, int(pc.src_h) - 1), ivec2(0));
+
         float inv_d_sum = 0.0;
-        float w_sum = 0.0;
-        for (int i = 0; i < 4; ++i) {
-            if (ss[i].a > 5e-5) {
-                rad_sum += ss[i].rgb;
-                inv_d_sum += ss[i].a;
-                w_sum += 1.0;
+        float inv_d_w = 0.0;
+        vec3 sky_sum = vec3(0.0);
+        for (int dy = 0; dy <= 1; ++dy) {
+            for (int dx = 0; dx <= 1; ++dx) {
+                const vec4 s = texelFetch(depth_or_mip0_tex, clamp(base + ivec2(dx, dy), ivec2(0), max_p), 0);
+                sky_sum += s.rgb;
+                if (s.a > 5e-5) {
+                    inv_d_sum += s.a;
+                    inv_d_w += 1.0;
+                }
             }
         }
-        if (w_sum <= 0.0) {
-            imageStore(dst_img, ivec2(px),
-                       vec4((s00.rgb + s10.rgb + s01.rgb + s11.rgb) * 0.25, 0.0));
+        if (inv_d_w <= 0.0) {
+            imageStore(dst_img, ivec2(px), vec4(sky_sum * 0.25, 0.0));
             return;
         }
-        imageStore(dst_img, ivec2(px), vec4(rad_sum / w_sum, max(inv_d_sum / w_sum, 6e-5)));
+        const float inv_d_ref = max(inv_d_sum / inv_d_w, 6e-5);
+        const float rcp_ref = 1.0 / inv_d_ref;
+
+        // 4x4 tent kernel (-1..+2 around the 2x2 center) weighted by depth similarity.
+        vec3 rad_sum = vec3(0.0);
+        float w_sum = 0.0;
+        for (int dy = -1; dy <= 2; ++dy) {
+            const float wy = (dy == 0 || dy == 1) ? 1.0 : 0.45;
+            for (int dx = -1; dx <= 2; ++dx) {
+                const float wx = (dx == 0 || dx == 1) ? 1.0 : 0.45;
+                const vec4 s = texelFetch(depth_or_mip0_tex, clamp(base + ivec2(dx, dy), ivec2(0), max_p), 0);
+                if (s.a <= 5e-5) {
+                    continue;
+                }
+                const float dz = abs(s.a - inv_d_ref) * rcp_ref;
+                const float w = (wx * wy) * exp(-dz * dz * 16.0);
+                rad_sum += s.rgb * w;
+                w_sum += w;
+            }
+        }
+        const vec3 rad_out = (w_sum > 1e-4) ? (rad_sum / w_sum) : (sky_sum * 0.25);
+        imageStore(dst_img, ivec2(px), vec4(rad_out, inv_d_ref));
+        return;
     }
+
+    // Modes 2, 3, 4: Edge-Preserving 3x3 A-Trous Wavelet Bilateral Denoiser (stride = 1, 2, 4).
+    // Binding 0 = input Half-Res SSGI (rgb = GI, a = occlusion)
+    // Binding 1 = Half-Res rad_mip0 (a = 1.0 - depth)
+    const ivec2 p = ivec2(px);
+    const ivec2 max_p = max(ivec2(int(pc.dst_w) - 1, int(pc.dst_h) - 1), ivec2(0));
+    const float inv_d_c = texelFetch(diff_tex, p, 0).a;
+    if (inv_d_c <= 5e-5) {
+        imageStore(dst_img, p, vec4(0.0));
+        return;
+    }
+
+    const int stride = 1 << int(min(pc.mode - 2u, 3u));
+    const float rcp_inv_d_c = 1.0 / inv_d_c;
+    const vec4 center = texelFetch(depth_or_mip0_tex, p, 0);
+
+    // On Pass 1 (stride == 1), compute depth-matched local neighborhood mean & variance
+    // to suppress single-ray candle fireflies before diffusing across wider strides.
+    vec4 c_filtered = center;
+    if (pc.mode == 2u) {
+        vec3 m1 = vec3(0.0);
+        vec3 m2 = vec3(0.0);
+        float nw = 0.0;
+        for (int dy = -1; dy <= 1; ++dy) {
+            for (int dx = -1; dx <= 1; ++dx) {
+                if (dx == 0 && dy == 0) continue;
+                const ivec2 q = clamp(p + ivec2(dx, dy), ivec2(0), max_p);
+                const float inv_d_q = texelFetch(diff_tex, q, 0).a;
+                if (inv_d_q <= 5e-5) continue;
+                const float dz = abs(inv_d_q - inv_d_c) * rcp_inv_d_c;
+                const float w = exp(-dz * dz * 36.0);
+                if (w > 0.15) {
+                    const vec3 v = texelFetch(depth_or_mip0_tex, q, 0).rgb;
+                    m1 += v * w;
+                    m2 += (v * v) * w;
+                    nw += w;
+                }
+            }
+        }
+        if (nw > 0.5) {
+            const vec3 mu = m1 / nw;
+            const vec3 var = max(m2 / nw - mu * mu, vec3(0.0));
+            const vec3 sigma = sqrt(var);
+            c_filtered.rgb = min(center.rgb, mu + sigma * 1.25 + vec3(0.04));
+        }
+    }
+
+    const float k_w[3] = float[3](0.55, 1.0, 0.55);
+    // Sharper depth stopping on wide strides prevents warm bounce from bleeding past silhouettes.
+    const float depth_sharpness = (stride == 1) ? 38.0 : ((stride == 2) ? 46.0 : 54.0);
+
+    vec4 acc = c_filtered;
+    float w_sum = 1.0;
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            if (dx == 0 && dy == 0) continue;
+            const ivec2 q = clamp(p + ivec2(dx, dy) * stride, ivec2(0), max_p);
+            const float inv_d_q = texelFetch(diff_tex, q, 0).a;
+            if (inv_d_q <= 5e-5) continue;
+            const float dz = abs(inv_d_q - inv_d_c) * rcp_inv_d_c;
+            const float w = (k_w[dx + 1] * k_w[dy + 1]) * exp(-dz * dz * depth_sharpness);
+            acc += texelFetch(depth_or_mip0_tex, q, 0) * w;
+            w_sum += w;
+        }
+    }
+
+    imageStore(dst_img, p, max(acc / max(w_sum, 1e-4), vec4(0.0)));
 }

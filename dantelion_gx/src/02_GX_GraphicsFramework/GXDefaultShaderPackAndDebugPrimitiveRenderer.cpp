@@ -301,10 +301,10 @@ bool GXDefaultShaderPack_BindPresetPipelineToContext(
     // Presets 2, 5, 6 (bitmask 0x64 = 0b01100100) also bind auxiliary CB (+0x1E8) to VS CB slot 1
     if (static_cast<uint32_t>(presetIndex) <= 6u && ((0x64u >> presetIndex) & 1u) != 0) {
         if (pThis->m_bAuxCBsInitialized == 0) {
-            uint32_t valZero = 0;
-            sub_26d73f0(pThis->m_pConstantBuffers[2], pHwState, 0, &valZero);
-            uint32_t valOne = 1;
-            sub_26d73f0(pThis->m_pConstantBuffers[3], pHwState, 0, &valOne);
+            alignas(16) uint32_t valZero[4] = { 0u, 0u, 0u, 0u };
+            sub_26d73f0(pThis->m_pConstantBuffers[2], pHwState, 0, valZero);
+            alignas(16) uint32_t valOne[4] = { 1u, 0u, 0u, 0u };
+            sub_26d73f0(pThis->m_pConstantBuffers[3], pHwState, 0, valOne);
             pThis->m_bAuxCBsInitialized = 1;
         }
 
@@ -520,7 +520,10 @@ bool GXDefaultShaderPack_PopulateShadersAndInputLayoutsFromArchive(
             pThis->m_pPixelShaders[psIdx] != nullptr &&
             pThis->m_pInputLayouts[ilIdx] != nullptr)
         {
-            pThis->m_presets[p].m_pInputLayout  = pThis->m_pInputLayouts[ilIdx];
+            // Match out/boot.bin 0x219192f: null-checks m_pInputLayouts[ilIdx], then binds
+            // m_pInputLayouts[vsIdx] (indexed by VS slot 0..5, where slots 2/3 hold the
+            // 3-element POS+COLOR+TEXCOORD0 layout needed by textured/mipgen presets).
+            pThis->m_presets[p].m_pInputLayout  = pThis->m_pInputLayouts[vsIdx];
             pThis->m_presets[p].m_pVertexShader = pThis->m_pVertexShaders[vsIdx];
             pThis->m_presets[p].m_pPixelShader  = pThis->m_pPixelShaders[psIdx];
         }

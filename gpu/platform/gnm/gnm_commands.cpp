@@ -71,16 +71,26 @@ u32 ApplyModifier(u32 rsrc1, u32 modifier, u32 allowed) {
 
 bool DirectShaderBindEnabled() {
     static const bool enabled = [] {
-        const char* env = std::getenv("BB_DIRECT_SHADER_BIND");
-        return !(env && env[0] == '0');
+        if (const char* env = std::getenv("BB_DIRECT_SHADER_BIND"); env && env[0]) {
+            return env[0] != '0';
+        }
+        if (const char* dv = std::getenv("BB_DIRECT_VULKAN"); dv && dv[0] == '0' && dv[1] == '\0') {
+            return false;
+        }
+        return true;
     }();
     return enabled;
 }
 
 bool DirectRingEnabled() {
     static const bool enabled = [] {
-        const char* env = std::getenv("BB_DIRECT_RING");
-        return !(env && env[0] == '0');
+        if (const char* env = std::getenv("BB_DIRECT_RING"); env && env[0]) {
+            return env[0] != '0';
+        }
+        if (const char* dv = std::getenv("BB_DIRECT_VULKAN"); dv && dv[0] == '0' && dv[1] == '\0') {
+            return false;
+        }
+        return true;
     }();
     return enabled && DirectShaderBindEnabled();
 }

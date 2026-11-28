@@ -445,7 +445,23 @@ void GXDepthStencilResource_ReleaseViewsAndTexture(GXDepthStencilResource* pThis
 void GXDepthStencilResource_BaseDtor(GXDepthStencilResource* pThis) {
     pThis->m_vptr = reinterpret_cast<void**>(GX_VMA(0x53b6860ULL));
     GXDepthStencilResource_ReleaseViewsAndTexture(pThis);
+
+    // Base GXTexture2DResource teardown (matches eboot.bin 0x219eecc..0x219ef16)
     pThis->m_vptr = reinterpret_cast<void**>(GX_VMA(0x53b6a20ULL));
+    GXTexture2DResource_ReleaseGpuTexture(pThis);
+    if (CGTextureGnmHeader* pTex = pThis->m_pGnmTexture) {
+        int32_t oldRef = __atomic_fetch_sub(
+            reinterpret_cast<int32_t*>(reinterpret_cast<uint8_t*>(pTex) + 0x10),
+            1, __ATOMIC_SEQ_CST);
+        if (oldRef == 1) {
+            void* pAlloc = *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(pTex) + 0x08);
+            (*reinterpret_cast<void(**)(void*)>(*reinterpret_cast<uintptr_t*>(pTex)))(pTex);
+            (*reinterpret_cast<void(**)(void*, void*)>(*reinterpret_cast<uintptr_t*>(pAlloc) + 0x70))(pAlloc, pTex);
+        }
+        pThis->m_pGnmTexture = nullptr;
+    }
+
+    // Base GXResourceBase teardown (matches eboot.bin 0x219ef17..0x219ef36)
     pThis->m_vptr = reinterpret_cast<void**>(GX_VMA(0x53b6b00ULL));
     if (pThis->m_pColorScaleCBuf) {
         CGBufferGnm_Release(pThis->m_pColorScaleCBuf);

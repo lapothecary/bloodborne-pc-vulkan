@@ -103,6 +103,8 @@ private:
     vk::UniqueImageView ssgi_rad_mip1_view;
     VideoCore::HostImage ssgi_raw_img;
     vk::UniqueImageView ssgi_raw_view;
+    VideoCore::HostImage ssgi_denoise_img;
+    vk::UniqueImageView ssgi_denoise_view;
     vk::Extent2D ssgi_half_extent{};
     vk::Extent2D ssgi_quarter_extent{};
 

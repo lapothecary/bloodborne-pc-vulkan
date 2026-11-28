@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-// Remaster v2 Performance Audit: Half-Res L2-Resident 16-tap HBIL SSGI Compute Pass.
-// Reads a single packed RGBA16F (radiance, depth) mip pair (< 4.5 MB, 100% L2-cache resident)
-// instead of 3 full-res 1440p textures -> ~4x faster & -35..45W lower GPU power.
+// Remaster v2: Half-Res L2-Resident 32-tap HBIL SSGI Compute Pass.
+// Uses point texelFetch on packed (firefly-clamped radiance, 1.0 - depth) mip0/mip1 so
+// foreground candle/pillar silhouettes never generate phantom bilinearly-interpolated depths,
+// followed by a 3-pass edge-preserving A-Trous wavelet denoiser.
 #version 460
 #extension GL_EXT_samplerless_texture_functions : require
 
@@ -44,11 +45,8 @@ void main() {
         return;
     }
 
-    // Read center depth and 4 neighbors from full-precision FP32 D32 depth buffer:
-    // avoids FP16 Forward-Z contour staircase artifacts on angled stone walls and cobblestones!
-    // Always derive normalized UV from dst_ssgi_img dimensions (pc.dst_w, pc.dst_h) and map into
-    // full_depth_tex via textureSize so reduced upscaler proxies (e.g. DLSS/FSR Quality/Balanced/
-    // Performance/Ultra Perf) never sample only the top-left sub-rectangle of native D32S8 depth.
+    // Derive normalized UV from dst_ssgi_img dimensions and map into full_depth_tex via textureSize
+    // so reduced upscaler proxies stay 100% aligned with native D32S8 depth.
     const vec2 uv_dst = (vec2(px) + 0.5) / max(vec2(pc.dst_w, pc.dst_h), vec2(1.0));
     const ivec2 full_sz = max(textureSize(full_depth_tex, 0), ivec2(1));
     const ivec2 full_max = full_sz - ivec2(1);
@@ -64,7 +62,7 @@ void main() {
     const uint d1 = pc.d1_offset;
     const vec3 P = ReconstructPos(uv, depth, d1);
     const float cam_dist = length(P);
-    const float cam_fade = 1.0 - smoothstep(30.0, 50.0, cam_dist);
+    const float cam_fade = 1.0 - smoothstep(28.0, 48.0, cam_dist);
     if (cam_fade <= 0.001 || cam_dist <= 0.05) {
         imageStore(dst_ssgi_img, ivec2(px), vec4(0.0));
         return;
@@ -99,81 +97,92 @@ void main() {
         N = -N;
     }
 
+    const ivec2 m0_sz = max(textureSize(rad_mip0_tex, 0), ivec2(1));
+    const ivec2 m1_sz = max(textureSize(rad_mip1_tex, 0), ivec2(1));
+    const ivec2 m0_max = m0_sz - ivec2(1);
+    const ivec2 m1_max = m1_sz - ivec2(1);
+
     const float ign1 = fract(52.9829189 * fract(dot(vec2(px) + 0.5, vec2(0.06711056, 0.00583715))));
     const float ign2 = fract(52.9829189 * fract(dot(vec2(px) + vec2(17.3, 31.7), vec2(0.06711056, 0.00583715))));
-    const float max_uv_r = clamp(0.85 / max(cam_dist, 2.0), 0.06, 0.34);
+    const float max_uv_r = clamp(0.75 / max(cam_dist, 2.2), 0.055, 0.28);
 
     vec3 gi_acc = vec3(0.0);
     float occ_acc = 0.0;
 
-    // 4 orthogonal IGN-rotated horizon sectors x 6 seamless continuous-jittered radii (zero dead gaps).
+    // 4 orthogonal IGN-rotated horizon sectors x 8 stratified steps using point texelFetch
+    // (eliminates phantom mid-air depths caused by bilinear filtering across silhouettes).
     for (uint dir_idx = 0u; dir_idx < 4u; ++dir_idx) {
         const float ang = (float(dir_idx) + ign1) * 1.57079633;
         const vec2 ray_uv = vec2(cos(ang) / pc.aspect, sin(ang));
         const float dir_jitter = fract(ign2 + float(dir_idx) * 0.38196601);
-        float max_sin_h = 0.14;
-        for (uint s = 0u; s < 6u; ++s) {
-            // Full [0, 1] stratified jitter per step eliminates discrete concentric banding rings.
+        float max_sin_h = 0.16;
+        for (uint s = 0u; s < 8u; ++s) {
             const float step_j = fract(dir_jitter + float(s) * 0.61803399);
-            const float t_lin = max((float(s) + step_j) * (1.0 / 6.0), 0.035);
-            const float t_rad = t_lin * (0.28 + 0.72 * t_lin);
+            const float t_lin = max((float(s) + step_j) * (1.0 / 8.0), 0.03);
+            const float t_rad = t_lin * (0.22 + 0.78 * t_lin);
             const vec2 uv_s = uv + ray_uv * (max_uv_r * t_rad);
             if (uv_s.x <= 0.002 || uv_s.x >= 0.998 || uv_s.y <= 0.002 || uv_s.y >= 0.998) {
                 break;
             }
-            const float edge_x = smoothstep(0.0, 0.045, min(uv_s.x, 1.0 - uv_s.x));
-            const float edge_y = smoothstep(0.0, 0.045, min(uv_s.y, 1.0 - uv_s.y));
+            const float edge_x = smoothstep(0.0, 0.05, min(uv_s.x, 1.0 - uv_s.x));
+            const float edge_y = smoothstep(0.0, 0.05, min(uv_s.y, 1.0 - uv_s.y));
             const float edge_w = edge_x * edge_y;
 
-            // Near steps read Half-Res mip0, far steps read Quarter-Res mip1 -> 100% L2 cache hit!
-            const vec4 tap = (s < 2u)
-                                 ? textureLod(sampler2D(rad_mip0_tex, linear_samp), uv_s, 0.0)
-                                 : textureLod(sampler2D(rad_mip1_tex, linear_samp), uv_s, 0.0);
-            // Alpha stores inverted depth (1.0 - depth); <= 5e-5 marks sky.
+            vec4 tap;
+            vec2 tap_uv;
+            if (s < 3u) {
+                const ivec2 tp = clamp(ivec2(uv_s * vec2(m0_sz)), ivec2(0), m0_max);
+                tap = texelFetch(rad_mip0_tex, tp, 0);
+                tap_uv = (vec2(tp) + 0.5) / vec2(m0_sz);
+            } else {
+                const ivec2 tp = clamp(ivec2(uv_s * vec2(m1_sz)), ivec2(0), m1_max);
+                tap = texelFetch(rad_mip1_tex, tp, 0);
+                tap_uv = (vec2(tp) + 0.5) / vec2(m1_sz);
+            }
+
             const float inv_d_s = tap.a;
             if (inv_d_s <= 5e-5) {
-                const vec3 P_sky = ReconstructPos(uv_s, 0.9999, d1);
+                const vec3 P_sky = ReconstructPos(tap_uv, 0.9999, d1);
                 const float sky_len2 = dot(P_sky, P_sky);
                 if (sky_len2 > 1e-6) {
                     const float sin_h = dot(N, P_sky * inversesqrt(sky_len2));
                     if (sin_h > max_sin_h) {
-                        // Exact cosine-weighted HBIL solid angle: integral(sin*cos) = 0.5 * sin^2.
                         const float dw = sin_h * sin_h - max_sin_h * max_sin_h;
                         max_sin_h = sin_h;
                         vec3 L_sky = max(tap.rgb, vec3(0.0));
                         const float l_sky = dot(L_sky, vec3(0.2126, 0.7152, 0.0722));
-                        L_sky = max(mix(vec3(l_sky), L_sky, 1.25), vec3(0.0)) / (1.0 + l_sky * 0.35);
-                        gi_acc += L_sky * (dw * 0.56 * edge_w);
+                        L_sky = max(mix(vec3(l_sky), L_sky, 1.12), vec3(0.0)) / (1.0 + l_sky * 0.45);
+                        gi_acc += L_sky * (dw * 0.48 * edge_w);
                     }
                 }
             } else {
                 const float d_s = 1.0 - inv_d_s;
-                const vec3 P_s = ReconstructPos(uv_s, d_s, d1);
+                const vec3 P_s = ReconstructPos(tap_uv, d_s, d1);
                 const vec3 diff = P_s - P;
                 const float dist2 = dot(diff, diff);
-                if (dist2 > 0.002 && dist2 < 90.25) {
+                if (dist2 > 0.004 && dist2 < 64.0) {
                     const float dist = sqrt(dist2);
                     const float sin_h = dot(N, diff / dist);
                     if (sin_h > max_sin_h) {
                         const float dw = sin_h * sin_h - max_sin_h * max_sin_h;
                         max_sin_h = sin_h;
-                        // Smooth near fade eliminates hard inner step rings around bodies/pillars
-                        // while preserving full warm bounce from torches, bonfires, lanterns & walls.
-                        const float near_fade = smoothstep(0.20, 0.65, dist);
-                        const float range_fade = 1.0 - smoothstep(5.5, 9.5, dist);
-                        const float atten = (near_fade * range_fade) / (1.0 + dist2 * 0.14);
+                        // Smooth near/far attenuation keeps bounce physically grounded without
+                        // hard rings or bright halos from thin foreground objects (candles/pillars).
+                        const float near_fade = smoothstep(0.24, 0.80, dist);
+                        const float range_fade = 1.0 - smoothstep(4.5, 8.0, dist);
+                        const float atten = (near_fade * range_fade) / (1.0 + dist2 * 0.24);
                         vec3 L_s = max(tap.rgb, vec3(0.0));
                         const float l_s = dot(L_s, vec3(0.2126, 0.7152, 0.0722));
-                        L_s = max(mix(vec3(l_s), L_s, 1.28), vec3(0.0)) / (1.0 + l_s * 0.18);
+                        L_s = max(mix(vec3(l_s), L_s, 1.12), vec3(0.0)) / (1.0 + l_s * 0.45);
                         gi_acc += L_s * (dw * atten * edge_w);
                     }
                 }
             }
         }
-        occ_acc += clamp((max_sin_h - 0.14) * 1.15, 0.0, 1.0);
+        occ_acc += clamp((max_sin_h - 0.16) * 1.10, 0.0, 1.0);
     }
 
-    const vec3 gi_out = gi_acc * (9.2 / 4.0) * cam_fade;
+    const vec3 gi_out = gi_acc * (4.8 / 4.0) * cam_fade;
     const float occ_out = (occ_acc * 0.25) * cam_fade;
     imageStore(dst_ssgi_img, ivec2(px), vec4(max(gi_out, vec3(0.0)), clamp(occ_out, 0.0, 1.0)));
 }

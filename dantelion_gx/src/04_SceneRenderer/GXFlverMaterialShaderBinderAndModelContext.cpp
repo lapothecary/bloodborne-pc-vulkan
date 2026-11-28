@@ -1407,7 +1407,7 @@ extern "C" bool sub_21c2100(void* self, void* src_tex, void* dst_tex) {
     void* fmt_holder = MemRef<void*>(query_tex, 0x48);
     std::uint32_t format = MemRef<std::uint32_t>(fmt_holder, 0x30);
 
-    MemRef<std::int32_t>(dst_tex, 0x08) += 1;
+    __atomic_fetch_add(&MemRef<std::int32_t>(dst_tex, 0x08), 1, __ATOMIC_RELAXED);
     if (src_tex) {
         void* src_res = VCall<void*(*)(void*)>(src_tex, 0x28)(src_tex);
         void* dst_res = VCall<void*(*)(void*)>(dst_tex, 0x28)(dst_tex);
@@ -1511,13 +1511,14 @@ extern "C" bool sub_21c2100(void* self, void* src_tex, void* dst_tex) {
                 ReleaseRefCounted(temp_rt);
                 temp_rt = nullptr;
                 if (new_rt) {
-                    MemRef<std::int32_t>(new_rt, 0x08) += 1;
+                    __atomic_fetch_add(&MemRef<std::int32_t>(new_rt, 0x08), 1, __ATOMIC_RELAXED);
                     temp_rt = new_rt;
                 }
             }
 
             void* rt_surf = nullptr;
-            if (MemRef<void*>(temp_rt, 0x40) != nullptr && MemRef<void*>(temp_rt, 0x60) != nullptr) {
+            if (temp_rt != nullptr && MemRef<void*>(temp_rt, 0x40) != nullptr &&
+                MemRef<void*>(temp_rt, 0x60) != nullptr) {
                 if (VCall<std::uint32_t(*)(void*)>(temp_rt, 0x40)(temp_rt) != 0) {
                     void** surf_arr = MemRef<void**>(temp_rt, 0x60);
                     rt_surf = surf_arr[0];
@@ -1572,7 +1573,7 @@ extern "C" bool sub_21c2100(void* self, void* src_tex, void* dst_tex) {
                 ReleaseRefCounted(cur_src);
                 cur_src = nullptr;
                 if (temp_rt) {
-                    MemRef<std::int32_t>(temp_rt, 0x08) += 1;
+                    __atomic_fetch_add(&MemRef<std::int32_t>(temp_rt, 0x08), 1, __ATOMIC_RELAXED);
                     cur_src = temp_rt;
                 }
             }

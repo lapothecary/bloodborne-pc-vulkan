@@ -600,39 +600,65 @@ void sub_21d4860(
     if (packet == nullptr) {
         return;
     }
-    packet[0x408] = 0;
-    packet[0x4a8] = 0;
+    // Initialize both embedded GXCameraFrustum slots (+0x3a0 and +0x440) with eboot.bin defaults
+    // (0x21d48c8..0x21d4aa0: identity matrix 0x5128a40, fovY/near/far, swapchain W/H from 0x55406c8).
+    auto initDefaultCameraSlot = [](uint8_t* dst) {
+        const auto* idMtx = reinterpret_cast<const uint8_t*>(GX_VMA(0x5128a40ULL));
+        std::memcpy(dst + 0x00, idMtx, 64);
+        std::memset(dst + 0x40, 0, 16);
+        *reinterpret_cast<uint64_t*>(dst + 0x50) = 0x3dcccccd3f75be0bULL; // fovY=0.959931, nearZ=0.1f
+        *reinterpret_cast<uint32_t*>(dst + 0x58) = 0x459c4000u;           // farZ=5000.0f
+        *reinterpret_cast<uint32_t*>(dst + 0x64) = 0u;
+        const uint8_t* pGxMgr = *reinterpret_cast<const uint8_t* const*>(GX_VMA(0x55406c8ULL));
+        if (pGxMgr != nullptr) {
+            const uint8_t* pSwap = *reinterpret_cast<const uint8_t* const*>(pGxMgr + 0x90);
+            *reinterpret_cast<uint32_t*>(dst + 0x5c) = *reinterpret_cast<const uint32_t*>(pSwap + 0x80);
+            *reinterpret_cast<uint32_t*>(dst + 0x60) = *reinterpret_cast<const uint32_t*>(pSwap + 0x84);
+        } else {
+            *reinterpret_cast<uint64_t*>(dst + 0x5c) = 0ULL;
+        }
+        dst[0x68] = 0;
+        *reinterpret_cast<uint64_t*>(dst + 0x6c) = 0ULL;
+        *reinterpret_cast<uint64_t*>(dst + 0x74) = 0ULL;
+        *reinterpret_cast<uint64_t*>(dst + 0x7c) = 0ULL;
+    };
+    initDefaultCameraSlot(packet + 0x3a0);
+    initDefaultCameraSlot(packet + 0x440);
 
     std::memcpy(packet, g_GlobalYebisFilterParam_55406e0, 0x370);
     *reinterpret_cast<void**>(packet + 0x370) = resA;
     *reinterpret_cast<void**>(packet + 0x390) = resB;
 
     const auto* curCam = *reinterpret_cast<const uint8_t* const*>(rendererBytes + 0x3f8);
-    std::memcpy(packet + 0x3a0, curCam + 0x00, 80);
-    *reinterpret_cast<float*>(packet + 0x3f0) = *reinterpret_cast<const float*>(curCam + 0x50);
-    *reinterpret_cast<float*>(packet + 0x3f4) = *reinterpret_cast<const float*>(curCam + 0x54);
-    *reinterpret_cast<float*>(packet + 0x3f8) = *reinterpret_cast<const float*>(curCam + 0x58);
-    *reinterpret_cast<uint32_t*>(packet + 0x3fc) = *reinterpret_cast<const uint32_t*>(curCam + 0x5c);
-    *reinterpret_cast<uint32_t*>(packet + 0x400) = *reinterpret_cast<const uint32_t*>(curCam + 0x60);
-    *reinterpret_cast<float*>(packet + 0x404) = *reinterpret_cast<const float*>(curCam + 0x64);
-    *reinterpret_cast<float*>(packet + 0x40c) = *reinterpret_cast<const float*>(curCam + 0x6c);
-    std::memcpy(packet + 0x410, curCam + 0x70, 16);
-    *reinterpret_cast<uint32_t*>(packet + 0x420) = *reinterpret_cast<const uint32_t*>(curCam + 0x80);
+    if (curCam != nullptr) {
+        std::memcpy(packet + 0x3a0, curCam + 0x00, 80);
+        *reinterpret_cast<float*>(packet + 0x3f0) = *reinterpret_cast<const float*>(curCam + 0x50);
+        *reinterpret_cast<float*>(packet + 0x3f4) = *reinterpret_cast<const float*>(curCam + 0x54);
+        *reinterpret_cast<float*>(packet + 0x3f8) = *reinterpret_cast<const float*>(curCam + 0x58);
+        *reinterpret_cast<uint32_t*>(packet + 0x3fc) = *reinterpret_cast<const uint32_t*>(curCam + 0x5c);
+        *reinterpret_cast<uint32_t*>(packet + 0x400) = *reinterpret_cast<const uint32_t*>(curCam + 0x60);
+        *reinterpret_cast<float*>(packet + 0x404) = *reinterpret_cast<const float*>(curCam + 0x64);
+        *reinterpret_cast<float*>(packet + 0x40c) = *reinterpret_cast<const float*>(curCam + 0x6c);
+        std::memcpy(packet + 0x410, curCam + 0x70, 16);
+        *reinterpret_cast<uint32_t*>(packet + 0x420) = *reinterpret_cast<const uint32_t*>(curCam + 0x80);
+    }
 
     *reinterpret_cast<void**>(packet + 0x380) = resC;
     *reinterpret_cast<void**>(packet + 0x388) = resD;
     *reinterpret_cast<void**>(packet + 0x430) = resE;
 
-    std::memcpy(packet + 0x440, prevCameraData + 0x00, 80);
-    *reinterpret_cast<float*>(packet + 0x490) = *reinterpret_cast<const float*>(prevCameraData + 0x50);
-    *reinterpret_cast<float*>(packet + 0x494) = *reinterpret_cast<const float*>(prevCameraData + 0x54);
-    *reinterpret_cast<float*>(packet + 0x498) = *reinterpret_cast<const float*>(prevCameraData + 0x58);
-    *reinterpret_cast<uint32_t*>(packet + 0x49c) = *reinterpret_cast<const uint32_t*>(prevCameraData + 0x5c);
-    *reinterpret_cast<uint32_t*>(packet + 0x4a0) = *reinterpret_cast<const uint32_t*>(prevCameraData + 0x60);
-    *reinterpret_cast<float*>(packet + 0x4a4) = *reinterpret_cast<const float*>(prevCameraData + 0x64);
-    *reinterpret_cast<float*>(packet + 0x4ac) = *reinterpret_cast<const float*>(prevCameraData + 0x6c);
-    std::memcpy(packet + 0x4b0, prevCameraData + 0x70, 16);
-    *reinterpret_cast<uint32_t*>(packet + 0x4c0) = *reinterpret_cast<const uint32_t*>(prevCameraData + 0x80);
+    if (prevCameraData != nullptr) {
+        std::memcpy(packet + 0x440, prevCameraData + 0x00, 80);
+        *reinterpret_cast<float*>(packet + 0x490) = *reinterpret_cast<const float*>(prevCameraData + 0x50);
+        *reinterpret_cast<float*>(packet + 0x494) = *reinterpret_cast<const float*>(prevCameraData + 0x54);
+        *reinterpret_cast<float*>(packet + 0x498) = *reinterpret_cast<const float*>(prevCameraData + 0x58);
+        *reinterpret_cast<uint32_t*>(packet + 0x49c) = *reinterpret_cast<const uint32_t*>(prevCameraData + 0x5c);
+        *reinterpret_cast<uint32_t*>(packet + 0x4a0) = *reinterpret_cast<const uint32_t*>(prevCameraData + 0x60);
+        *reinterpret_cast<float*>(packet + 0x4a4) = *reinterpret_cast<const float*>(prevCameraData + 0x64);
+        *reinterpret_cast<float*>(packet + 0x4ac) = *reinterpret_cast<const float*>(prevCameraData + 0x6c);
+        std::memcpy(packet + 0x4b0, prevCameraData + 0x70, 16);
+        *reinterpret_cast<uint32_t*>(packet + 0x4c0) = *reinterpret_cast<const uint32_t*>(prevCameraData + 0x80);
+    }
 
     rendererBytes[0x400] = 1;
     rendererBytes[0x401] = 1;

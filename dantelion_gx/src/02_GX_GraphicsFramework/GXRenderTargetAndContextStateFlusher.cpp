@@ -682,7 +682,23 @@ void GXRenderTargetResource_ReleaseViewsAndTexture(GXRenderTargetResource* pThis
 void GXRenderTargetResource_BaseDtor(GXRenderTargetResource* pThis) {
     pThis->m_vptr = reinterpret_cast<void**>(GX_VMA(0x53b6940ULL));
     GXRenderTargetResource_ReleaseViewsAndTexture(pThis);
+
+    // Base GXTexture2DResource teardown (matches eboot.bin 0x21a30fc..0x21a3146)
     pThis->m_vptr = reinterpret_cast<void**>(GX_VMA(0x53b6a20ULL));
+    GXTexture2DResource_ReleaseGpuTexture(pThis);
+    if (CGTextureGnmHeader* pTex = pThis->m_pGnmTexture) {
+        int32_t oldRef = __atomic_fetch_sub(
+            reinterpret_cast<int32_t*>(reinterpret_cast<uint8_t*>(pTex) + 0x10),
+            1, __ATOMIC_SEQ_CST);
+        if (oldRef == 1) {
+            void* pAlloc = *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(pTex) + 0x08);
+            (*reinterpret_cast<void(**)(void*)>(*reinterpret_cast<uintptr_t*>(pTex)))(pTex);
+            (*reinterpret_cast<void(**)(void*, void*)>(*reinterpret_cast<uintptr_t*>(pAlloc) + 0x70))(pAlloc, pTex);
+        }
+        pThis->m_pGnmTexture = nullptr;
+    }
+
+    // Base GXResourceBase teardown (matches eboot.bin 0x21a3147..0x21a3166)
     pThis->m_vptr = reinterpret_cast<void**>(GX_VMA(0x53b6b00ULL));
     if (pThis->m_pColorScaleCBuf) {
         CGBufferGnm_Release(pThis->m_pColorScaleCBuf);
@@ -1033,15 +1049,13 @@ void GXDeviceContext_CopyShadowStateAndDirtyMasks(
     std::memcpy(pDstCtx + 0x1670, pSrcDirtyMasks, 0xB8);
 }
 
-// Helper for resetting dirty bitmasks after a Draw/Dispatch call
+// Helper for resetting dirty bitmasks after a Draw/Dispatch/Flush call
+// Matches out/boot.bin (0x21a192e, 0x21a23e3, 0x21a2447): unconditionally clears
+// the 0xB8-byte dirty table and resets VB minSlot (+0x1680) to 0x0E and CS UAV
+// minSlot (+0x1688) to 0x08.
 static inline void GXDeviceContext_ResetDirtyMasksAfterDraw(uint8_t* pCtx) {
-    if (*reinterpret_cast<const uint64_t*>(pCtx + 0x1670) == 0ULL &&
-        *reinterpret_cast<const uint64_t*>(pCtx + 0x1680) == 0x20ULL &&
-        *reinterpret_cast<const uint64_t*>(pCtx + 0x1688) == 0x08ULL) {
-        return;
-    }
     std::memset(pCtx + 0x1670, 0, 0xB8);
-    *reinterpret_cast<uint64_t*>(pCtx + 0x1680) = 0x20;
+    *reinterpret_cast<uint64_t*>(pCtx + 0x1680) = 0x0E;
     *reinterpret_cast<uint64_t*>(pCtx + 0x1688) = 0x08;
 }
 

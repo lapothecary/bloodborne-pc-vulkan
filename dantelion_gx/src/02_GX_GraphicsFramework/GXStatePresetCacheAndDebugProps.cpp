@@ -275,17 +275,48 @@ void GXStatePresetCache_UpdateSamplerAnisotropyPresets(
         }
     }
 
-    // Compare each shadow descriptor against the existing sampler state and update in-place if dirty
+    // Compare each shadow descriptor against the live sampler state; if modified, free the old
+    // object via its owning allocator and allocate a fresh 0x40-byte state from g_gx_manager_55406c8
+    // (matches eboot.bin 0x21b28b8..0x21b29be).
     for (size_t i = 0; i < 19; ++i) {
-        if (self->samplerStates[i] == nullptr) {
-            continue;
-        }
         GXSamplerDesc currentDesc{};
         GXSamplerState_ExtractDesc(self->samplerStates[i], &currentDesc);
 
-        if (std::memcmp(&currentDesc, &self->samplerShadowDescs[i], sizeof(GXSamplerDesc)) != 0) {
-            GXSamplerState_InitFromDesc(self->samplerStates[i], nullptr, &self->samplerShadowDescs[i]);
+        if (std::memcmp(&currentDesc, &self->samplerShadowDescs[i], sizeof(GXSamplerDesc)) == 0) {
+            continue;
         }
+
+        if (void* oldState = self->samplerStates[i]) {
+            DLAllocator* oldAlloc = GXStateObject_GetAllocator(oldState);
+            oldAlloc->vptr->Free(oldAlloc, oldState);
+            self->samplerStates[i] = nullptr;
+        }
+
+        uint8_t* pGxMgr = *reinterpret_cast<uint8_t**>(GX_VMA(0x55406c8ULL));
+        uint8_t* pDev   = *reinterpret_cast<uint8_t**>(pGxMgr);
+        if (*reinterpret_cast<void**>(pDev + 0x00) == nullptr ||
+            *reinterpret_cast<void**>(pDev + 0x08) == nullptr) {
+            continue;
+        }
+        DLAllocator* pStateAlloc = *reinterpret_cast<DLAllocator**>(pDev + 0xDC10);
+        if (pStateAlloc == nullptr) {
+            continue;
+        }
+        void* pInnerDev = *reinterpret_cast<void**>(pDev + 0x20);
+        if (pInnerDev == nullptr) {
+            continue;
+        }
+
+        alignas(16) uint8_t builtState[0x40];
+        GXSamplerState_InitFromDesc(builtState, pInnerDev, &self->samplerShadowDescs[i]);
+
+        void* newState = pStateAlloc->vptr->AllocateAligned(pStateAlloc, 0x40u, 0x10u);
+        if (newState == nullptr) {
+            self->samplerStates[i] = nullptr;
+            continue;
+        }
+        std::memcpy(newState, builtState, sizeof(builtState));
+        self->samplerStates[i] = newState;
     }
 }
 

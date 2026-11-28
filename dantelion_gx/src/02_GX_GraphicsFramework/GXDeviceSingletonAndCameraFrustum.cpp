@@ -4249,10 +4249,10 @@ void GXConstantBufferHelper_BindTextureAndUpdatePSConstantSlot1(
 
     if (pHelper[0x1f8] == 0) {
         void* pLowLevelCtx = *(void**)(pDeviceCtx + 0x08);
-        uint32_t zeroVal = 0;
-        sub_26d73f0(*(void**)(pHelper + 0x1e8), pLowLevelCtx, 0, &zeroVal);
-        uint32_t oneVal = 1;
-        sub_26d73f0(*(void**)(pHelper + 0x1f0), pLowLevelCtx, 0, &oneVal);
+        alignas(16) const uint32_t zeroVal[4] = { 0u, 0u, 0u, 0u };
+        sub_26d73f0(*(void**)(pHelper + 0x1e8), pLowLevelCtx, 0, zeroVal);
+        alignas(16) const uint32_t oneVal[4] = { 1u, 0u, 0u, 0u };
+        sub_26d73f0(*(void**)(pHelper + 0x1f0), pLowLevelCtx, 0, oneVal);
         pHelper[0x1f8] = 1;
     }
 

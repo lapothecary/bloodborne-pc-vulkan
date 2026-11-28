@@ -2886,6 +2886,261 @@ void Install(RangeCallback on_gpu_range_allocated) {
         const bool chara_ok = enabled("BB_FIX_CHARA_ID") &&
             Core::InstallGuestCodeHook(reinterpret_cast<void*>(ImageBase + CharaStep),
                                        CharaStepEntry, CharaStep, &EngineFixHooks::CharaHook);
+
+        // Opt-in diagnostic/testing hook on PaintTarget::ScheduleCmd (0x2210920):
+        // BB_BLOOD_BOOST=N replays each blood hit sequentially across N frames (keeping the
+        // engine's 1-PaintTarget-per-frame serialization so rt_pool is never contended);
+        // BB_BLOOD_DRENCH=1..3 splashes from 16*N 360-degree spherical angles (8 horizontal +
+        // 4 top-down + 4 bottom-up) on each hit so 1 hit drenches the entire Hunter head-to-toe;
+        // BB_BLOOD_TRACE=1 logs every PaintTarget command & sub-targets.
+        // Zero overhead & untouched guest code when none of these env vars are set.
+        const int blood_boost = [] {
+            const char* env = std::getenv("BB_BLOOD_BOOST");
+            return (env && *env) ? std::clamp(std::atoi(env), 1, 16) : 1;
+        }();
+        const int blood_drench = [] {
+            const char* env = std::getenv("BB_BLOOD_DRENCH");
+            return (env && *env) ? std::clamp(std::atoi(env), 0, 3) : 0;
+        }();
+        const bool blood_trace = [] {
+            const char* env = std::getenv("BB_BLOOD_TRACE");
+            return env && env[0] == '1';
+        }();
+        if ((blood_boost > 1 || blood_drench > 0 || blood_trace) && stub_page) {
+            using PaintScheduleFn = void (PS4_SYSV_ABI*)(void*, void*, u32, u32, const void*);
+            struct ReplayEntry {
+                u64 key = 0;
+                int step = 0;
+                int total = 0;
+            };
+            struct DecalBaseEntry {
+                u32 handle = 0;
+                float base_pos[3]{};
+            };
+            struct BloodBoostData {
+                PaintScheduleFn orig_fn = nullptr;
+                int boost = 1;
+                int drench = 0;
+                bool trace = false;
+                std::mutex mu;
+                std::array<ReplayEntry, 128> replays{};
+                u32 replay_pos = 0;
+                std::array<DecalBaseEntry, 32> bases{};
+                u32 base_pos_idx = 0;
+            };
+            struct BloodBoostState {
+                static BloodBoostData& Get() noexcept {
+                    static BloodBoostData d;
+                    return d;
+                }
+
+                static void PS4_SYSV_ABI Hook(void* pTarget, void* pRenderCtx, u32 decalHandle,
+                                              u32 cmdType, const void* param0) noexcept {
+                    auto& st = Get();
+                    u8* pDecal = nullptr;
+                    u8* pMgr = nullptr;
+                    auto* tgt = reinterpret_cast<u8*>(pTarget);
+                    if (tgt && cmdType == 0u && decalHandle != 0u && decalHandle != 0xFFFFFFFFu) {
+                        pMgr = *reinterpret_cast<u8**>(tgt + 0x18);
+                        if (pMgr) {
+                            auto** slotTbl = *reinterpret_cast<u8***>(pMgr + 0x850);
+                            auto* genTbl = *reinterpret_cast<const u16**>(pMgr + 0x858);
+                            const u32 idx = decalHandle & 0xFFFFu;
+                            const u16 gen = static_cast<u16>(decalHandle >> 16);
+                            if (slotTbl && genTbl && genTbl[idx] == gen) {
+                                pDecal = slotTbl[idx];
+                            }
+                        }
+                    }
+
+                    const int total_steps =
+                        (st.drench > 0) ? (16 * st.drench) : st.boost;
+                    int cur_step = 0;
+                    bool should_requeue = false;
+                    float base_pos[3]{};
+                    if (total_steps > 1 && cmdType == 0u && pDecal != nullptr && pMgr != nullptr) {
+                        const u64 key = (reinterpret_cast<u64>(pTarget) * 0x9e3779b97f4a7c15ull) ^
+                                        (u64(decalHandle) << 17);
+                        std::lock_guard<std::mutex> lk(st.mu);
+                        // Capture original hit center once per decalHandle before any rotation.
+                        DecalBaseEntry* bslot = nullptr;
+                        for (auto& b : st.bases) {
+                            if (b.handle == decalHandle) {
+                                bslot = &b;
+                                break;
+                            }
+                        }
+                        if (!bslot) {
+                            bslot = &st.bases[st.base_pos_idx++ & 31u];
+                            bslot->handle = decalHandle;
+                            std::memcpy(bslot->base_pos, pDecal + 0x18, sizeof(bslot->base_pos));
+                        }
+                        std::memcpy(base_pos, bslot->base_pos, sizeof(base_pos));
+
+                        ReplayEntry* slot = nullptr;
+                        for (auto& e : st.replays) {
+                            if (e.key == key) {
+                                slot = &e;
+                                break;
+                            }
+                        }
+                        if (!slot) {
+                            slot = &st.replays[st.replay_pos++ & 127u];
+                            slot->key = key;
+                            slot->step = 0;
+                            slot->total = total_steps;
+                        }
+                        cur_step = slot->step;
+                        if (slot->step + 1 < slot->total) {
+                            ++slot->step;
+                            should_requeue = true;
+                        }
+                    }
+
+                    // BB_BLOOD_DRENCH: sweep 16 deterministic spherical directions around the
+                    // hit center (8 horizontal 45-deg steps, 4 top-down 45-deg, 4 bottom-up 35-deg)
+                    // with a 4.0m x 4.0m x 6.5m projector box covering the entire Hunter.
+                    if (st.drench > 0 && cmdType == 0u && pDecal != nullptr) {
+                        static constexpr float kDirs[16][3] = {
+                            // 8 horizontal angles around 360 deg
+                            { 1.000000f,  0.000000f,  0.000000f},
+                            { 0.707107f,  0.000000f,  0.707107f},
+                            { 0.000000f,  0.000000f,  1.000000f},
+                            {-0.707107f,  0.000000f,  0.707107f},
+                            {-1.000000f,  0.000000f,  0.000000f},
+                            {-0.707107f,  0.000000f, -0.707107f},
+                            { 0.000000f,  0.000000f, -1.000000f},
+                            { 0.707107f,  0.000000f, -0.707107f},
+                            // 4 top-down diagonal angles (-45 deg pitch -> hood, shoulders, cape)
+                            { 0.500000f, -0.707107f,  0.500000f},
+                            {-0.500000f, -0.707107f,  0.500000f},
+                            {-0.500000f, -0.707107f, -0.500000f},
+                            { 0.500000f, -0.707107f, -0.500000f},
+                            // 4 bottom-up diagonal angles (+35 deg pitch -> lower coat hem, boots)
+                            { 0.819152f,  0.573576f,  0.000000f},
+                            { 0.000000f,  0.573576f,  0.819152f},
+                            {-0.819152f,  0.573576f,  0.000000f},
+                            { 0.000000f,  0.573576f, -0.819152f},
+                        };
+                        const float* d = kDirs[cur_step & 15];
+                        // right = normalize(cross((0,1,0), d)) = normalize(dz, 0, -dx)
+                        const float hlen = std::sqrt(d[0] * d[0] + d[2] * d[2]);
+                        const float inv_h = (hlen > 1e-4f) ? (1.0f / hlen) : 1.0f;
+                        const float rx = d[2] * inv_h;
+                        const float ry = 0.0f;
+                        const float rz = -d[0] * inv_h;
+                        constexpr float kDist = 2.5f;
+                        const float px = base_pos[0] - d[0] * kDist;
+                        const float py = base_pos[1] - d[1] * kDist;
+                        const float pz = base_pos[2] - d[2] * kDist;
+                        *reinterpret_cast<float*>(pDecal + 0x18) = px;
+                        *reinterpret_cast<float*>(pDecal + 0x1c) = py;
+                        *reinterpret_cast<float*>(pDecal + 0x20) = pz;
+                        *reinterpret_cast<float*>(pDecal + 0x24) = d[0];
+                        *reinterpret_cast<float*>(pDecal + 0x28) = d[1];
+                        *reinterpret_cast<float*>(pDecal + 0x2c) = d[2];
+                        *reinterpret_cast<float*>(pDecal + 0x30) = rx;
+                        *reinterpret_cast<float*>(pDecal + 0x34) = ry;
+                        *reinterpret_cast<float*>(pDecal + 0x38) = rz;
+                        *reinterpret_cast<float*>(pDecal + 0x3c) = 4.0f;
+                        *reinterpret_cast<float*>(pDecal + 0x44) = 6.5f;
+                        *reinterpret_cast<float*>(pDecal + 0x48) = 4.0f;
+                    }
+
+                    if (st.trace) {
+                        void* subs[4]{};
+                        u8 b78 = 0, b79 = 0;
+                        if (tgt) {
+                            std::memcpy(subs, tgt + 0x20, sizeof(subs));
+                            b78 = tgt[0x78];
+                            b79 = tgt[0x79];
+                        }
+                        if (pDecal) {
+                            float pos[3]{}, sz[3]{};
+                            std::memcpy(pos, pDecal + 0x18, sizeof(pos));
+                            sz[0] = *reinterpret_cast<const float*>(pDecal + 0x3c);
+                            sz[1] = *reinterpret_cast<const float*>(pDecal + 0x48);
+                            sz[2] = *reinterpret_cast<const float*>(pDecal + 0x44);
+                            const u32 layer = *reinterpret_cast<const u32*>(pDecal + 0x58);
+                            const u32 flags = *reinterpret_cast<const u32*>(pDecal + 0x54);
+                            const u64 p88 = *reinterpret_cast<const u64*>(pDecal + 0x88);
+                            std::printf("[BLOOD-CMD] tgt=%p cmd=%u step=%d h=0x%08x dec=%p pos=(%.2f,%.2f,%.2f) "
+                                        "sz=(%.2f,%.2f,%.2f) layer=%u flg=%u p88=%d t78=%u t79=%u "
+                                        "subs=[%p,%p,%p,%p]\n",
+                                        pTarget, cmdType, cur_step, decalHandle, static_cast<void*>(pDecal),
+                                        pos[0], pos[1], pos[2], sz[0], sz[1], sz[2], layer, flags,
+                                        p88 != 0 ? 1 : 0, b78, b79, subs[0], subs[1], subs[2],
+                                        subs[3]);
+                        } else {
+                            std::printf("[BLOOD-CMD] tgt=%p cmd=%u h=0x%08x dec=null t78=%u t79=%u "
+                                        "subs=[%p,%p,%p,%p]\n",
+                                        pTarget, cmdType, decalHandle, b78, b79, subs[0], subs[1],
+                                        subs[2], subs[3]);
+                        }
+                    }
+                    // Execute once (strictly 1 PaintTarget/frame parity).
+                    st.orig_fn(pTarget, pRenderCtx, decalHandle, cmdType, param0);
+
+                    // Safe cross-frame replay: re-append this 40-byte GXPaintDecalCommand to the
+                    // back of GXDecalManager::m_paintCommandQueue only when spare capacity exists
+                    // (never reallocates the vector while 0x220afa0 iterates it).
+                    if (should_requeue && pMgr != nullptr) {
+                        auto* q_begin = *reinterpret_cast<u8**>(pMgr + 0x20);
+                        auto* q_end = *reinterpret_cast<u8**>(pMgr + 0x28);
+                        auto* q_cap = *reinterpret_cast<u8**>(pMgr + 0x30);
+                        constexpr size_t kCmdSize = 40u;
+                        if (q_begin && q_end && q_cap && q_begin < q_end &&
+                            q_end + kCmdSize <= q_cap &&
+                            size_t(q_end - q_begin) < 64u * kCmdSize) {
+                            void* q0_tgt = *reinterpret_cast<void**>(q_begin + 0x00);
+                            u32 q0_h = *reinterpret_cast<const u32*>(q_begin + 0x08);
+                            u32 q0_cmd = *reinterpret_cast<const u32*>(q_begin + 0x0c);
+                            if (q0_tgt == pTarget && q0_h == decalHandle && q0_cmd == 0u) {
+                                std::memcpy(q_end, q_begin, kCmdSize);
+                                *reinterpret_cast<u8**>(pMgr + 0x28) = q_end + kCmdSize;
+                            }
+                        }
+                    }
+                }
+            };
+            constexpr u64 PaintSchedVma = 0x2210920ull;
+            constexpr std::array<u8, 6> PaintSchedPrologue = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57};
+            const u64 address = ImageBase + PaintSchedVma;
+            if (std::memcmp(reinterpret_cast<const void*>(address), PaintSchedPrologue.data(),
+                            PaintSchedPrologue.size()) == 0) {
+                Emitter orig_e;
+                for (u8 b : PaintSchedPrologue) orig_e.Bytes({b});
+                orig_e.Bytes({0xff, 0x25, 0x00, 0x00, 0x00, 0x00});
+                orig_e.U64(address + PaintSchedPrologue.size());
+                const u64 orig_stub = PlaceStub(orig_e);
+
+                Emitter entry_e;
+                entry_e.Bytes({0x48, 0xb8});
+                entry_e.U64(reinterpret_cast<u64>(&BloodBoostState::Hook));
+                entry_e.Bytes({0xff, 0xe0});
+                const u64 entry_stub = PlaceStub(entry_e);
+
+                std::uint32_t rel = 0;
+                if (orig_stub && entry_stub && Rel32To(address + 5, entry_stub, rel)) {
+                    auto& st = BloodBoostState::Get();
+                    st.orig_fn = reinterpret_cast<PaintScheduleFn>(orig_stub);
+                    st.boost = blood_boost;
+                    st.drench = blood_drench;
+                    st.trace = blood_trace;
+                    const long page_size = sysconf(_SC_PAGESIZE);
+                    void* page = reinterpret_cast<void*>(address & ~u64(page_size - 1));
+                    mprotect(page, (address + 6) - reinterpret_cast<u64>(page),
+                             PROT_READ | PROT_WRITE | PROT_EXEC);
+                    reinterpret_cast<u8*>(address)[0] = 0xcc;
+                    reinterpret_cast<u8*>(address)[5] = 0x90;
+                    mprotect(page, (address + 6) - reinterpret_cast<u64>(page),
+                             Core::GuestCodeProtection());
+                    WriteJumpOverTrap(address, 0xe9, rel);
+                    std::printf("Blood diagnostic hook active (BB_BLOOD_BOOST=%d, BB_BLOOD_DRENCH=%d, BB_BLOOD_TRACE=%d)\n",
+                                blood_boost, blood_drench, blood_trace ? 1 : 0);
+                }
+            }
+        }
         if (stub_page) {
             mprotect(stub_page, StubPageSize, PROT_READ | PROT_EXEC);
         }

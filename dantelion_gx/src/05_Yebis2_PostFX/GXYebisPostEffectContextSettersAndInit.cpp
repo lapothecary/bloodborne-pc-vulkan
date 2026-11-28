@@ -937,9 +937,10 @@ void sub_bb6310(uint32_t iSample, void* afOutOffset) {
     }
     __m128 jitter = sub_2610c30(iSample);
     _mm_storel_epi64(reinterpret_cast<__m128i*>(afOutOffset), _mm_castps_si128(jitter));
-    if (BbGoldenEngine_OnYebisJitter) {
+    void (*const onJitter)(float, float) = &BbGoldenEngine_OnYebisJitter;
+    if (onJitter != nullptr) {
         const float* j = static_cast<const float*>(afOutOffset);
-        BbGoldenEngine_OnYebisJitter(j[0], j[1]);
+        onJitter(j[0], j[1]);
     }
 }
 
