@@ -623,7 +623,15 @@ bool TemporalUpscaler::OnFrameStart() {
     snapshot_taken = false;
     opaque_valid = false;
     mask_ready = false;
-    mt_scene_mip_bias_bits.store(std::bit_cast<u32>(SceneMipBias()), std::memory_order_relaxed);
+    const float live_mip_bias = SceneMipBias();
+    mt_scene_mip_bias_bits.store(std::bit_cast<u32>(live_mip_bias), std::memory_order_relaxed);
+    {
+        static float reported_mt = 0.0f;
+        if (live_mip_bias != reported_mt) {
+            reported_mt = live_mip_bias;
+            std::printf("Upscaler: scene texture LOD bias %.2f\n", live_mip_bias);
+        }
+    }
     // Halton(2, 3); the menu or toggle 1 << 25 disables it.
     flip_frame_started = true;
     const u32 next_eff_flips = stage_b_flips_retired + 1u;
@@ -2208,10 +2216,27 @@ std::array<u32, 2> TemporalUpscaler::SceneSize(u32 w, u32 h) const {
 }
 
 float TemporalUpscaler::SceneMipBias() const {
-    if (!Active() || BbSettings::EffectiveUpscaler() == BbSettings::UpscalerTaa) return 0.0f;
+    if (!Active() || BbToggle::Disabled(BbToggle::SceneMipBias)) return 0.0f;
+    const int up = BbSettings::EffectiveUpscaler();
+    if (up == BbSettings::UpscalerTaa) return 0.0f;
     const float render = float(BbSettings::Get().active_render_width.load());
     const float output = float(Scaled() ? target_width : 1920u);
-    return render > 0.0f && render < output ? std::log2(render / output) : 0.0f;
+    if (render <= 0.0f) return 0.0f;
+    const bool upscaling = render < output;
+    const float base = upscaling ? std::log2(render / output) : 0.0f;
+    const float raw = BbSettings::Get().upscaler_mip_bias.load(std::memory_order_relaxed);
+    float extra = 0.0f;
+    if (BbSettings::IsUpscalerMipBiasAuto(raw)) {
+        if (!upscaling) return 0.0f;
+        // NVIDIA DLSS (§3.5.3) & AMD FSR 4 programming guides recommend log2(r/o) - 1.0
+        // for ML temporal super-resolution; FSR 3.1 uses -0.5 to avoid thin-fence shimmer.
+        const bool ml_upscaler = UseDlss() || (BbSettings::IsFsr4(up) && !fsr4_failed);
+        extra = ml_upscaler ? -1.0f : -0.5f;
+    } else {
+        extra = BbSettings::QuantizeUpscalerMipBias(raw);
+    }
+    const float total = base + extra;
+    return total == 0.0f ? 0.0f : total;
 }
 
 bool TemporalUpscaler::Scaled() const {

@@ -228,7 +228,10 @@ public:
         const GraphicsPipeline* pipeline,
         boost::container::static_vector<Gcn::Buffer, Shader::NUM_BUFFERS>& out) noexcept;
     const boost::container::static_vector<Gcn::Buffer, Shader::NUM_BUFFERS>* PeekFastVsharps(
-        const GraphicsPipeline* pipeline) noexcept;
+        const GraphicsPipeline* pipeline, u64* out_gen = nullptr) noexcept;
+
+    /// Stage 3B-2: O(1) lookup of a cached graphics pipeline by its dense 12-bit `NativePsoId`.
+    [[nodiscard]] const GraphicsPipeline* LookupPipelineByPsoId(u16 pso_id) const noexcept;
 
     const ComputePipeline* GetComputePipeline();
 

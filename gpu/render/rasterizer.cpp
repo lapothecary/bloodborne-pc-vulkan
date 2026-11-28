@@ -7,6 +7,7 @@
 #include <string>
 #include <filesystem>
 #include "render/raster_internal.h"
+#include "render/native_stream_shadow.h"
 #include "render/shader_hle.h"
 #include "render/vk_light_tile_batch.h"
 #include "render/vk_mt_direct_recorder.h"
@@ -1245,6 +1246,7 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
         light_tile_batcher = std::make_unique<LightTileBatcher>();
         vsm_shadow_memo = std::make_unique<VsmShadowMemo>();
         vfx_ui_batcher = std::make_unique<VfxUiBatcher>();
+        native_consumer = std::make_unique<NativeStreamConsumer>();
         draw_pipe = std::make_unique<DrawPipe>(&RunDrawPacket, this);
         // Keep 1 constant resolve worker by default (`spin_us = 0` in `vk_draw_pipe.h` so it
         // never burns idle spin CPU): offloading `XXH3` + Write-Combined ReBAR `memcpy` from
@@ -2193,6 +2195,20 @@ void Rasterizer::NoteLightBatchCullStats(u64 seen_tiles, u64 saved_draws) noexce
     }
 }
 
+bool Rasterizer::TryAllocateSceneOccQuery(u16 occ_handoff, vk::QueryPool& out_pool,
+                                          u32& out_slot) noexcept {
+    if (!scene_occlusion_culler || occ_handoff >= SceneOcclusionCuller::TotalEntries) {
+        return false;
+    }
+    const s32 q = scene_occlusion_culler->AllocateQuery(occ_handoff);
+    if (q < 0) {
+        return false;
+    }
+    out_pool = *scene_occlusion_culler->pool;
+    out_slot = static_cast<u32>(q);
+    return true;
+}
+
 void Rasterizer::InvalidateOccCullStageACpuShadow(VAddr addr, u64 size) noexcept {
     if (scene_occlusion_culler) {
         scene_occlusion_culler->InvalidateStageACpuShadow(addr, size);
@@ -2700,6 +2716,12 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const PreparedDraw* pre
     }
     if (!pipeline) {
         return;
+    }
+    if (liverpool->native_stream_shadow) [[unlikely]] {
+        liverpool->native_stream_shadow->CompleteDirectDraw(
+            liverpool->regs, liverpool->last_cb_extent.data(), liverpool->last_cb_uid.data(),
+            liverpool->last_db_uid, liverpool->direct_state.rs_id, liverpool->direct_state.bs_id,
+            liverpool->direct_state.ds_id, *pipeline);
     }
     if (pipelined && FilterDrawPasses()) {
         const bool run_stage_a_occ =
@@ -4313,7 +4335,8 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
                 buffer_infos.size() >= 2u) {
                 vk::ImageView ps_imgs[6]{};
                 u32 img_count = 0u;
-                for (const auto& w : set_writes) {
+                for (u32 wi = 0u; wi < set_write_index; ++wi) {
+                    const auto& w = set_writes[wi];
                     if (w.descriptorType == vk::DescriptorType::eSampledImage && w.pImageInfo &&
                         img_count < 6u) {
                         ps_imgs[img_count++] = w.pImageInfo->imageView;
@@ -5175,7 +5198,8 @@ void Rasterizer::BeginDraw(const GraphicsPipeline* pipeline, const RenderState& 
     // screen (docs/Flicker_2026-10-18.ru.md).
     {
         BB_SECTION(PipelineBind);
-        pipeline->BindResources(set_writes, push_data, {image_infos.data(), image_infos.size()},
+        pipeline->BindResources({set_writes.data(), set_write_index}, push_data,
+                                {image_infos.data(), image_infos.size()},
                                 {buffer_infos.data(), buffer_infos.size()}, true);
     }
 }
@@ -5271,6 +5295,12 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     const GraphicsPipeline* pipeline = pipeline_cache.GetGraphicsPipeline(params, nullptr, true);
     if (!pipeline) {
         return;
+    }
+    if (liverpool->native_stream_shadow) [[unlikely]] {
+        liverpool->native_stream_shadow->CompleteDirectDraw(
+            liverpool->regs, liverpool->last_cb_extent.data(), liverpool->last_cb_uid.data(),
+            liverpool->last_db_uid, liverpool->direct_state.rs_id, liverpool->direct_state.bs_id,
+            liverpool->direct_state.ds_id, *pipeline);
     }
     const IndirectDraw indirect = {arg_address + offset, count_address, stride, max_count};
     if (pipelined) {
@@ -5602,7 +5632,8 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
             }
         }
     }
-    pipeline->BindResources(set_writes, push_data, {image_infos.data(), image_infos.size()},
+    pipeline->BindResources({set_writes.data(), set_write_index}, push_data,
+                            {image_infos.data(), image_infos.size()},
                             {buffer_infos.data(), buffer_infos.size()}, true);
 
     const vk::Pipeline handle = pipeline->Handle();
@@ -5717,7 +5748,8 @@ void Rasterizer::DispatchIndirectRecord(const ComputePipeline* pipeline, VAddr a
         }
         std::tie(args, args_offset) = indirect_guard->CheckArgs(*buffer, base);
     }
-    pipeline->BindResources(set_writes, push_data, {image_infos.data(), image_infos.size()},
+    pipeline->BindResources({set_writes.data(), set_write_index}, push_data,
+                            {image_infos.data(), image_infos.size()},
                             {buffer_infos.data(), buffer_infos.size()}, true);
 
     const vk::Pipeline handle = pipeline->Handle();

@@ -2,6 +2,7 @@
 // bbport cp: graphics submissions: the draw command buffer with the indirect buffers it calls,
 // and the constant engine's buffer beside it.
 
+#include <bit>
 #include <chrono>
 #include <thread>
 #include <cstring>
@@ -20,6 +21,7 @@
 #include "cp/command_processor.h"
 #include "cp/cp_diagnostics.h"
 #include "cp/cp_packets.h"
+#include "cp/cp_reg_inline.h"
 #include "cp/cp_tasks.h"
 #include "cp/pm4_selftest.h"
 #include "platform/interrupts.h"
@@ -28,6 +30,8 @@
 #include "render/vk_draw_prep.h"
 #include "buffers/buffer_cache.h"
 #include "render/rasterizer.h"
+#include "render/direct_states.h"
+#include "render/native_stream_shadow.h"
 #include "render/vk_mt_direct_recorder.h"
 
 namespace BbCp {
@@ -125,7 +129,15 @@ void WatchCommandWrite(const char* what, VAddr address, u64 bytes, const void* d
 
 void CommandProcessor::BeginGraphics(Work& work) {
     work.started = true;
+    ++flat_invalidation_epoch;
+    current_draw_is_direct_vk = false;
     const bool top = work.seq != NoSeq;
+    if (top && bb_native_stream::ShadowVerifyEnabled()) [[unlikely]] {
+        if (!native_stream_shadow) {
+            native_stream_shadow = std::make_unique<Vulkan::NativeStreamShadow>();
+        }
+        native_stream_shadow->BeginSubmission();
+    }
     if (top && rasterizer) {
         rasterizer->GetDrawPreparation().BeginSubmission(work.seq, regs, gfx_reg_checksum);
     }
@@ -172,6 +184,9 @@ void CommandProcessor::EndGraphics(Work& work) {
     if (work.seq == NoSeq) {
         return;
     }
+    if (native_stream_shadow) [[unlikely]] {
+        native_stream_shadow->EndSubmission(true);
+    }
     if (rasterizer) {
         rasterizer->RetireSubmission(); // prepared draws live until the recording thread is past
         rasterizer->GetDrawPreparation().EndSubmission();
@@ -193,6 +208,55 @@ void CommandProcessor::EndGraphics(Work& work) {
     }
     if (work.copy && BbFreeCheck::Enabled()) {
         Diagnostics::CheckSubmittedCopy(*work.copy, work.seq);
+    }
+}
+
+namespace {
+
+inline void AuditStageADraw(const Gcn::Regs& regs, const Gcn::CbDbExtent* cb_extents,
+                            const u16* cb_uids, u16 db_uid, bool is_direct_vk, u32 op_code) {
+    if (!Diagnostics::DcbStatsEnabled()) [[likely]] {
+        return;
+    }
+    const u64 vs_addr = regs.vs_program.Address<VAddr>();
+    const u64 ps_addr = regs.ps_program.Address<VAddr>();
+    const u32 target_mask = regs.color_target_mask.raw & regs.color_shader_mask.raw;
+    u32 mrt_mask = 0u;
+    for (u32 i = 0; i < 8u; ++i) {
+        if (((target_mask >> (i * 4u)) & 0xFu) != 0u && bool(regs.color_buffers[i])) {
+            mrt_mask |= (1u << i);
+        }
+    }
+    u32 rt0_w = cb_extents[0].width;
+    u32 rt0_h = cb_extents[0].height;
+    if ((rt0_w == 0u || rt0_h == 0u) && bool(regs.color_buffers[0])) {
+        rt0_w = regs.color_buffers[0].Pitch();
+        rt0_h = regs.color_buffers[0].Height();
+    }
+    u64 state_sig = u64(mrt_mask) | (u64(regs.reg_array[0xA200]) << 8); // DB_DEPTH_CONTROL
+    state_sig ^= (u64(regs.reg_array[0xA201]) * 0x9e3779b97f4a7c15ULL); // CB_COLOR_CONTROL
+    state_sig ^= (u64(regs.reg_array[0xA205]) * 0xbf58476d1ce4e5b9ULL); // PA_SU_SC_MODE_CNTL
+    state_sig ^= (u64(regs.reg_array[0xA1E0]) * 0x94d049bb133111ebULL); // CB_BLEND0_CONTROL
+    state_sig ^= (u64(regs.reg_array[0xA1C5]) * 0x517cc1b727220a95ULL); // SPI_SHADER_COL_FORMAT
+    state_sig ^= (u64(regs.reg_array[0xA31C]) * 0x2545f4914f6cdd1dULL); // CB_COLOR0_INFO
+    Diagnostics::NoteDrawAudit(is_direct_vk, op_code, vs_addr, ps_addr, mrt_mask, rt0_w, rt0_h,
+                               cb_uids[0], db_uid, state_sig);
+}
+
+} // namespace
+
+void CommandProcessor::OnStageADraw(bool is_direct_vk, u32 op_code, u32 start_index,
+                                    const u32* raw_pkt, u32 raw_dwords) noexcept {
+    if (Diagnostics::DcbStatsEnabled()) [[unlikely]] {
+        AuditStageADraw(regs, last_cb_extent.data(), last_cb_uid.data(), last_db_uid, is_direct_vk,
+                        op_code);
+    }
+    if (native_stream_shadow) [[unlikely]] {
+        if (is_direct_vk) {
+            native_stream_shadow->PrepareDirectDraw(op_code, start_index);
+        } else {
+            native_stream_shadow->RecordLegacyPm4Draw(raw_pkt, raw_dwords);
+        }
     }
 }
 
@@ -226,6 +290,8 @@ CommandProcessor::Status CommandProcessor::RunGraphics(Work& work) {
             const bool need_checksum = has_rast && rasterizer->GetDrawPreparation().Enabled();
             RegDirty* const dirty_ptr =
                 (has_rast && rasterizer->UseDrawPipe()) ? &pipe_dirty : nullptr;
+            const bool fast_inline_reg =
+                !need_checksum && (!dirty_ptr || !dirty_ptr->track_all_blocks);
             const bool host_markers = has_rast && rasterizer->HostMarkersEnabled();
             while (level.at < level.end) {
                 const u32 hdr = *level.at;
@@ -243,36 +309,403 @@ CommandProcessor::Status CommandProcessor::RunGraphics(Work& work) {
                     const u32 op_word = level.at[2];
                     const auto vk_op = DirectVk::Op(op_word & 0xFFFFu);
                     switch (vk_op) {
-                    case DirectVk::Op::SetStageUserData:
+                    case DirectVk::Op::SetStageUserData: {
                         if (bw < 3u || (level.at[3] & 0xFFFFu) >= ComputeShOffset) {
                             break;
                         }
-                        [[fallthrough]];
-                    case DirectVk::Op::SetIndexState:
-                    case DirectVk::Op::SetContextRegsPacked:
-                    case DirectVk::Op::BindVsShader:
-                    case DirectVk::Op::BindPsShader:
-                    case DirectVk::Op::BindEsShader:
-                    case DirectVk::Op::BindGsShader:
-                    case DirectVk::Op::BindHsShader:
-                    case DirectVk::Op::BindLsShader:
-                    case DirectVk::Op::SetVgtControl:
+                        if (fast_inline_reg) [[likely]] {
+                            const u32 sh_off = level.at[3] & 0xFFFFu;
+                            u32 mask = level.at[3] >> 16;
+                            const u32 count = bw - 3u;
+                            if (static_cast<u32>(std::popcount(mask)) == count) [[likely]] {
+                                const u32* const src = level.at + 4u;
+                                u32* const base = &regs.reg_array[Bank::Sh + sh_off];
+                                u32 diff = 0u;
+                                if ((mask & (mask + 1u)) == 0u) [[likely]] {
+                                    for (u32 i = 0u; i < count; ++i) {
+                                        const u32 v = src[i];
+                                        diff |= base[i] ^ v;
+                                        base[i] = v;
+                                    }
+                                } else {
+                                    u32 s = 0u;
+                                    while (mask != 0u) {
+                                        const u32 bit = static_cast<u32>(std::countr_zero(mask));
+                                        mask &= (mask - 1u);
+                                        const u32 v = src[s++];
+                                        diff |= base[bit] ^ v;
+                                        base[bit] = v;
+                                    }
+                                }
+                                const bool touches_pgm = (sh_off & 0x3Fu) < 0x0Cu;
+                                if (diff != 0u) {
+                                    const u32 st = sh_off >> 6;
+                                    if (st < 6u) [[likely]] {
+                                        ++stage_ud_epoch[st];
+                                        if ((op_word & DirectVk::kUdFlagSpecInvariant) == 0u ||
+                                            touches_pgm) {
+                                            ++direct_state.stage_spec_epoch[st];
+                                        }
+                                    }
+                                }
+                                if (touches_pgm) [[unlikely]] {
+                                    ++pso_sig_epoch;
+                                    ++pso_non_shader_epoch;
+                                    ++direct_state.pso_misc_state_epoch;
+                                }
+                                level.at += 1u + bw;
+                                continue;
+                            }
+                        }
                         if (ApplyGraphicsRegisterPacket(regs, level.at, gfx_reg_checksum, dirty_ptr,
                                                         need_checksum, &pso_sig_epoch,
-                                                        &dyn_reg_epoch)) [[likely]] {
+                                                        &dyn_reg_epoch, &pso_non_shader_epoch,
+                                                        stage_ud_epoch.data(),
+                                                        &flat_invalidation_epoch,
+                                                        &direct_state)) [[likely]] {
                             level.at += 1u + bw;
                             continue;
                         }
                         break;
-                    case DirectVk::Op::DrawIndexed:
-                        if (bw == 6u) [[likely]] {
+                    }
+                    case DirectVk::Op::SetDirectStateIds: {
+                        if (fast_inline_reg && bw == 2u) [[likely]] {
+                            const u32 kind = (op_word >> 16) & 0xFu;
+                            const u16 id = static_cast<u16>((op_word >> 20) & 0x3FFu);
+                            if (kind == 3u) {
+                                if (id != 0u && direct_state.ps_usage_id == id) [[likely]] {
+                                    level.at += 3u;
+                                    continue;
+                                }
+                                direct_state.ps_usage_id = id;
+                                if (const auto* u = Vulkan::DirectStates::GetPsUsagePtr(id))
+                                    [[likely]] {
+                                    u32* const dst = &regs.reg_array[Bank::Context + 0x191u];
+                                    const u32* const src = u->dwords.data();
+                                    const u32 cnt = u->count;
+                                    u32 diff = 0u;
+                                    for (u32 i = 0u; i < cnt; ++i) {
+                                        const u32 v = src[i];
+                                        diff |= dst[i] ^ v;
+                                        dst[i] = v;
+                                    }
+                                    if (diff != 0u) {
+                                        ++pso_sig_epoch;
+                                    }
+                                }
+                                level.at += 3u;
+                                continue;
+                            }
+                            if (id != 0u && ((kind == 0u && direct_state.rs_id == id) ||
+                                             (kind == 1u && direct_state.bs_id == id) ||
+                                             (kind == 2u && direct_state.ds_id == id))) {
+                                level.at += 3u;
+                                continue;
+                            }
+                            if (kind <= 2u) [[likely]] {
+                                bool pso_chg = false;
+                                bool dyn_chg = false;
+                                bool pso_ns_chg = false;
+                                ApplyDirectStateIdsFastInline(regs, dirty_ptr, false, kind, id,
+                                                              pso_chg, dyn_chg, pso_ns_chg,
+                                                              &direct_state);
+                                if (pso_chg) {
+                                    ++pso_sig_epoch;
+                                }
+                                if (pso_ns_chg) {
+                                    ++pso_non_shader_epoch;
+                                }
+                                if (dyn_chg) {
+                                    ++dyn_reg_epoch;
+                                }
+                                level.at += 3u;
+                                continue;
+                            }
+                        }
+                        if (ApplyGraphicsRegisterPacket(regs, level.at, gfx_reg_checksum, dirty_ptr,
+                                                        need_checksum, &pso_sig_epoch,
+                                                        &dyn_reg_epoch, &pso_non_shader_epoch,
+                                                        stage_ud_epoch.data(),
+                                                        &flat_invalidation_epoch,
+                                                        &direct_state)) [[likely]] {
+                            level.at += 1u + bw;
+                            continue;
+                        }
+                        break;
+                    }
+                    case DirectVk::Op::BindPsShader: {
+                        if (fast_inline_reg && bw == 14u && ((op_word >> 16) & 1u) != 0u &&
+                            ((op_word >> 18) & 1u) == 0u) [[likely]] {
+                            const u32* const pay = level.at + 3u;
+                            u32* const sh = &regs.reg_array[Bank::Sh + 0x08u];
+                            u32 diff = (sh[0] ^ pay[0]) | (sh[1] ^ pay[1]) | (sh[2] ^ pay[2]) |
+                                       (sh[3] ^ pay[3]);
+                            sh[0] = pay[0];
+                            sh[1] = pay[1];
+                            sh[2] = pay[2];
+                            sh[3] = pay[3];
+                            const u32 c17_diff = regs.reg_array[Bank::Context + 0x08Fu] ^ pay[11];
+                            diff |= (regs.reg_array[Bank::Context + 0x1C4u] ^ pay[4]) |
+                                    (regs.reg_array[Bank::Context + 0x1C5u] ^ pay[5]) |
+                                    (regs.reg_array[Bank::Context + 0x1B3u] ^ pay[6]) |
+                                    (regs.reg_array[Bank::Context + 0x1B4u] ^ pay[7]) |
+                                    (regs.reg_array[Bank::Context + 0x1B6u] ^ pay[8]) |
+                                    (regs.reg_array[Bank::Context + 0x1B8u] ^ pay[9]) |
+                                    (regs.reg_array[Bank::Context + 0x203u] ^ pay[10]) | c17_diff;
+                            regs.reg_array[Bank::Context + 0x1C4u] = pay[4];
+                            regs.reg_array[Bank::Context + 0x1C5u] = pay[5];
+                            regs.reg_array[Bank::Context + 0x1B3u] = pay[6];
+                            regs.reg_array[Bank::Context + 0x1B4u] = pay[7];
+                            regs.reg_array[Bank::Context + 0x1B6u] = pay[8];
+                            regs.reg_array[Bank::Context + 0x1B8u] = pay[9];
+                            regs.reg_array[Bank::Context + 0x203u] = pay[10];
+                            regs.reg_array[Bank::Context + 0x08Fu] = pay[11];
+                            if (c17_diff != 0u && dirty_ptr) {
+                                dirty_ptr->stage_b_mask[0] |= (1ULL << 17);
+                                dirty_ptr->batch_stage_b_mask[0] |= (1ULL << 17);
+                            }
+                            if (diff != 0u) {
+                                ++pso_sig_epoch;
+                                ++direct_state.stage_spec_epoch[0];
+                            }
+                            level.at += 15u;
+                            continue;
+                        }
+                        if (ApplyGraphicsRegisterPacket(regs, level.at, gfx_reg_checksum, dirty_ptr,
+                                                        need_checksum, &pso_sig_epoch,
+                                                        &dyn_reg_epoch, &pso_non_shader_epoch,
+                                                        stage_ud_epoch.data(),
+                                                        &flat_invalidation_epoch,
+                                                        &direct_state)) [[likely]] {
+                            level.at += 1u + bw;
+                            continue;
+                        }
+                        break;
+                    }
+                    case DirectVk::Op::BindVsShader: {
+                        if (fast_inline_reg && bw == 9u && ((op_word >> 18) & 1u) == 0u) [[likely]] {
+                            const u32* const pay = level.at + 3u;
+                            u32* const sh = &regs.reg_array[Bank::Sh + 0x48u];
+                            u32 diff = (sh[0] ^ pay[0]) | (sh[1] ^ pay[1]) | (sh[2] ^ pay[2]) |
+                                       (sh[3] ^ pay[3]);
+                            sh[0] = pay[0];
+                            sh[1] = pay[1];
+                            sh[2] = pay[2];
+                            sh[3] = pay[3];
+                            const u32 c64_diff = regs.reg_array[Bank::Context + 0x207u] ^ pay[6];
+                            diff |= (regs.reg_array[Bank::Context + 0x1B1u] ^ pay[4]) |
+                                    (regs.reg_array[Bank::Context + 0x1C3u] ^ pay[5]) | c64_diff;
+                            regs.reg_array[Bank::Context + 0x1B1u] = pay[4];
+                            regs.reg_array[Bank::Context + 0x1C3u] = pay[5];
+                            regs.reg_array[Bank::Context + 0x207u] = pay[6];
+                            if (c64_diff != 0u) {
+                                if (dirty_ptr) {
+                                    dirty_ptr->stage_b_mask[1] |= (1ULL << 0);
+                                    dirty_ptr->batch_stage_b_mask[1] |= (1ULL << 0);
+                                }
+                                ++dyn_reg_epoch;
+                            }
+                            if (diff != 0u) {
+                                ++pso_sig_epoch;
+                                ++direct_state.stage_spec_epoch[1];
+                            }
+                            level.at += 10u;
+                            continue;
+                        }
+                        if (ApplyGraphicsRegisterPacket(regs, level.at, gfx_reg_checksum, dirty_ptr,
+                                                        need_checksum, &pso_sig_epoch,
+                                                        &dyn_reg_epoch, &pso_non_shader_epoch,
+                                                        stage_ud_epoch.data(),
+                                                        &flat_invalidation_epoch,
+                                                        &direct_state)) [[likely]] {
+                            level.at += 1u + bw;
+                            continue;
+                        }
+                        break;
+                    }
+                    case DirectVk::Op::SetContextRegsPacked: {
+                        if (fast_inline_reg && bw >= 4u) [[likely]] {
+                            bool pso_chg = false;
+                            bool dyn_chg = false;
+                            bool pso_ns_chg = false;
+                            bool misc_chg = false;
+                            if (ApplyContextRegsPackedInline(regs, dirty_ptr, false, op_word,
+                                                             level.at + 3u, bw - 2u, pso_chg,
+                                                             dyn_chg, pso_ns_chg, misc_chg,
+                                                             &direct_state)) [[likely]] {
+                                if (pso_chg) {
+                                    ++pso_sig_epoch;
+                                }
+                                if (pso_ns_chg) {
+                                    ++pso_non_shader_epoch;
+                                }
+                                if (misc_chg) {
+                                    ++direct_state.pso_misc_state_epoch;
+                                }
+                                if (dyn_chg) {
+                                    ++dyn_reg_epoch;
+                                }
+                                level.at += 1u + bw;
+                                continue;
+                            }
+                        }
+                        if (ApplyGraphicsRegisterPacket(regs, level.at, gfx_reg_checksum, dirty_ptr,
+                                                        need_checksum, &pso_sig_epoch,
+                                                        &dyn_reg_epoch, &pso_non_shader_epoch,
+                                                        stage_ud_epoch.data(),
+                                                        &flat_invalidation_epoch,
+                                                        &direct_state)) [[likely]] {
+                            level.at += 1u + bw;
+                            continue;
+                        }
+                        break;
+                    }
+                    case DirectVk::Op::SetIndexState: {
+                        if (fast_inline_reg && bw == 6u) [[likely]] {
+                            bool pso_chg = false;
+                            bool dyn_chg = false;
+                            bool pso_ns_chg = false;
+                            ApplyIndexStateInline(regs, dirty_ptr, false, level.at + 3u, 4u,
+                                                  pso_chg, dyn_chg, pso_ns_chg);
+                            if (pso_chg) {
+                                ++pso_sig_epoch;
+                            }
+                            if (pso_ns_chg) {
+                                ++pso_non_shader_epoch;
+                            }
+                            if (dyn_chg) {
+                                ++dyn_reg_epoch;
+                            }
+                            level.at += 7u;
+                            continue;
+                        }
+                        if (ApplyGraphicsRegisterPacket(regs, level.at, gfx_reg_checksum, dirty_ptr,
+                                                        need_checksum, &pso_sig_epoch,
+                                                        &dyn_reg_epoch, &pso_non_shader_epoch,
+                                                        stage_ud_epoch.data(),
+                                                        &flat_invalidation_epoch,
+                                                        &direct_state)) [[likely]] {
+                            level.at += 1u + bw;
+                            continue;
+                        }
+                        break;
+                    }
+                    case DirectVk::Op::SetVgtControl: {
+                        if (fast_inline_reg && bw == 2u) [[likely]] {
+                            const u32 prim_group_sz_minus_1 = (op_word >> 16) & 0xFFu;
+                            const u32 partial_vs_wave_mode = (op_word >> 24) & 1u;
+                            WriteRegInline(regs, dirty_ptr, false, Bank::Context + 0x2AAu,
+                                           (partial_vs_wave_mode << 16) | prim_group_sz_minus_1);
+                            level.at += 3u;
+                            continue;
+                        }
+                        if (ApplyGraphicsRegisterPacket(regs, level.at, gfx_reg_checksum, dirty_ptr,
+                                                        need_checksum, &pso_sig_epoch,
+                                                        &dyn_reg_epoch, &pso_non_shader_epoch,
+                                                        stage_ud_epoch.data(),
+                                                        &flat_invalidation_epoch,
+                                                        &direct_state)) [[likely]] {
+                            level.at += 1u + bw;
+                            continue;
+                        }
+                        break;
+                    }
+                    case DirectVk::Op::BindEsShader:
+                    case DirectVk::Op::BindGsShader:
+                    case DirectVk::Op::BindHsShader:
+                    case DirectVk::Op::BindLsShader:
+                        if (ApplyGraphicsRegisterPacket(regs, level.at, gfx_reg_checksum, dirty_ptr,
+                                                        need_checksum, &pso_sig_epoch,
+                                                        &dyn_reg_epoch, &pso_non_shader_epoch,
+                                                        stage_ud_epoch.data(),
+                                                        &flat_invalidation_epoch,
+                                                        &direct_state)) [[likely]] {
+                            level.at += 1u + bw;
+                            continue;
+                        }
+                        break;
+                    case DirectVk::Op::SetRenderTarget: {
+                        const u32 slot = (op_word >> 16) & 0x7u;
+                        const bool valid = ((op_word >> 19) & 1u) != 0u;
+                        if ((valid && bw == 14u) || (!valid && bw == 2u)) [[likely]] {
                             ApplyGraphicsRegisterPacket(regs, level.at, gfx_reg_checksum, dirty_ptr,
                                                         need_checksum, &pso_sig_epoch,
-                                                        &dyn_reg_epoch);
+                                                        &dyn_reg_epoch, &pso_non_shader_epoch,
+                                                        stage_ud_epoch.data(),
+                                                        &flat_invalidation_epoch,
+                                                        &direct_state);
+                            if (valid) {
+                                last_cb_extent[slot].raw = level.at[14];
+                                last_cb_uid[slot] = static_cast<u16>((op_word >> 20) & 0xFFFu);
+                            } else {
+                                last_cb_uid[slot] = 0u;
+                            }
+                            level.at += 1u + bw;
+                            continue;
+                        }
+                        break;
+                    }
+                    case DirectVk::Op::SetDepthRenderTarget: {
+                        const bool valid = ((op_word >> 16) & 1u) != 0u;
+                        if ((valid && bw == 15u) || (!valid && bw == 2u)) [[likely]] {
+                            ApplyGraphicsRegisterPacket(regs, level.at, gfx_reg_checksum, dirty_ptr,
+                                                        need_checksum, &pso_sig_epoch,
+                                                        &dyn_reg_epoch, &pso_non_shader_epoch,
+                                                        stage_ud_epoch.data(),
+                                                        &flat_invalidation_epoch,
+                                                        &direct_state);
+                            if (valid) {
+                                last_db_extent.raw = level.at[15];
+                                last_db_uid = static_cast<u16>((op_word >> 20) & 0xFFFu);
+                            } else {
+                                last_db_extent.raw = 0u;
+                                last_db_uid = 0u;
+                            }
+                            level.at += 1u + bw;
+                            continue;
+                        }
+                        break;
+                    }
+                    case DirectVk::Op::DrawIndexed:
+                        if (bw == 6u) [[likely]] {
+                            if (fast_inline_reg) [[likely]] {
+                                DirectVk::DrawIndexedArgs a{};
+                                std::memcpy(&a, level.at + 3u, sizeof(a));
+                                const u32 base_vtx = static_cast<u32>(a.base_vertex);
+                                const bool chg_idx_off =
+                                    (regs.reg_array[Reg::VgtIndxOffset] != base_vtx);
+                                const bool chg_inst =
+                                    (regs.reg_array[Reg::VgtNumInstances] != a.instance_count);
+                                const bool chg_max =
+                                    (regs.reg_array[Reg::VgtDmaMaxSize] != a.index_count);
+                                const bool chg_num =
+                                    (regs.reg_array[Reg::VgtNumIndices] != a.index_count);
+                                const bool chg_init = (regs.reg_array[Reg::VgtDrawInitiator] != 0u);
+                                regs.reg_array[Reg::VgtIndxOffset] = base_vtx;
+                                regs.reg_array[Reg::VgtNumInstances] = a.instance_count;
+                                regs.reg_array[Reg::VgtDmaMaxSize] = a.index_count;
+                                regs.reg_array[Reg::VgtNumIndices] = a.index_count;
+                                regs.reg_array[Reg::VgtDrawInitiator] = 0u;
+                                if (dirty_ptr) {
+                                    dirty_ptr->stage_b_mask[0] |=
+                                        (chg_idx_off ? (1ULL << 32) : 0ULL) |
+                                        (chg_init ? (1ULL << 63) : 0ULL);
+                                    dirty_ptr->stage_b_mask[1] |=
+                                        (chg_max ? (1ULL << (83 - 64)) : 0ULL) |
+                                        ((chg_inst || chg_num) ? (1ULL << (116 - 64)) : 0ULL);
+                                }
+                            } else {
+                                ApplyGraphicsRegisterPacket(
+                                    regs, level.at, gfx_reg_checksum, dirty_ptr, need_checksum,
+                                    &pso_sig_epoch, &dyn_reg_epoch, &pso_non_shader_epoch,
+                                    stage_ud_epoch.data(), &flat_invalidation_epoch, &direct_state);
+                            }
                             const auto* prepared = level.prepared
                                                        ? rasterizer->GetDrawPreparation().NextDraw()
                                                        : nullptr;
                             if (!PredicationSkips(hdr)) [[likely]] {
+                                current_draw_is_direct_vk = true;
+                                OnStageADraw(true, u32(DirectVk::Op::DrawIndexed), level.at[5]);
                                 rasterizer->Draw(true, level.at[5], prepared);
                             }
                             level.at += 7u;
@@ -281,13 +714,40 @@ CommandProcessor::Status CommandProcessor::RunGraphics(Work& work) {
                         break;
                     case DirectVk::Op::DrawAuto:
                         if (bw == 5u) [[likely]] {
-                            ApplyGraphicsRegisterPacket(regs, level.at, gfx_reg_checksum, dirty_ptr,
-                                                        need_checksum, &pso_sig_epoch,
-                                                        &dyn_reg_epoch);
+                            if (fast_inline_reg) [[likely]] {
+                                DirectVk::DrawAutoArgs a{};
+                                std::memcpy(&a, level.at + 3u, sizeof(a));
+                                const u32 start_vtx = static_cast<u32>(a.start_vertex);
+                                const bool chg_idx_off =
+                                    (regs.reg_array[Reg::VgtIndxOffset] != start_vtx);
+                                const bool chg_inst =
+                                    (regs.reg_array[Reg::VgtNumInstances] != a.instance_count);
+                                const bool chg_num =
+                                    (regs.reg_array[Reg::VgtNumIndices] != a.vertex_count);
+                                const bool chg_init = (regs.reg_array[Reg::VgtDrawInitiator] != 2u);
+                                regs.reg_array[Reg::VgtIndxOffset] = start_vtx;
+                                regs.reg_array[Reg::VgtNumInstances] = a.instance_count;
+                                regs.reg_array[Reg::VgtNumIndices] = a.vertex_count;
+                                regs.reg_array[Reg::VgtDrawInitiator] = 2u;
+                                if (dirty_ptr) {
+                                    dirty_ptr->stage_b_mask[0] |=
+                                        (chg_idx_off ? (1ULL << 32) : 0ULL) |
+                                        (chg_init ? (1ULL << 63) : 0ULL);
+                                    dirty_ptr->stage_b_mask[1] |=
+                                        ((chg_inst || chg_num) ? (1ULL << (116 - 64)) : 0ULL);
+                                }
+                            } else {
+                                ApplyGraphicsRegisterPacket(
+                                    regs, level.at, gfx_reg_checksum, dirty_ptr, need_checksum,
+                                    &pso_sig_epoch, &dyn_reg_epoch, &pso_non_shader_epoch,
+                                    stage_ud_epoch.data(), &flat_invalidation_epoch, &direct_state);
+                            }
                             const auto* prepared = level.prepared
                                                        ? rasterizer->GetDrawPreparation().NextDraw()
                                                        : nullptr;
                             if (!PredicationSkips(hdr)) [[likely]] {
+                                current_draw_is_direct_vk = true;
+                                OnStageADraw(true, u32(DirectVk::Op::DrawAuto));
                                 rasterizer->Draw(false, 0u, prepared);
                             }
                             level.at += 6u;
@@ -298,11 +758,16 @@ CommandProcessor::Status CommandProcessor::RunGraphics(Work& work) {
                         if (bw == 6u) [[likely]] {
                             ApplyGraphicsRegisterPacket(regs, level.at, gfx_reg_checksum, dirty_ptr,
                                                         need_checksum, &pso_sig_epoch,
-                                                        &dyn_reg_epoch);
+                                                        &dyn_reg_epoch, &pso_non_shader_epoch,
+                                                        stage_ud_epoch.data(),
+                                                        &flat_invalidation_epoch,
+                                                        &direct_state);
                             const auto* prepared = level.prepared
                                                        ? rasterizer->GetDrawPreparation().NextDraw()
                                                        : nullptr;
                             if (!PredicationSkips(hdr)) [[likely]] {
+                                current_draw_is_direct_vk = true;
+                                OnStageADraw(true, u32(DirectVk::Op::DrawIndexAddr));
                                 rasterizer->Draw(true, 0u, prepared);
                             }
                             level.at += 7u;
@@ -313,7 +778,10 @@ CommandProcessor::Status CommandProcessor::RunGraphics(Work& work) {
                         if (bw >= 7u) [[likely]] {
                             ApplyGraphicsRegisterPacket(regs, level.at, gfx_reg_checksum, dirty_ptr,
                                                         need_checksum, &pso_sig_epoch,
-                                                        &dyn_reg_epoch);
+                                                        &dyn_reg_epoch, &pso_non_shader_epoch,
+                                                        stage_ud_epoch.data(),
+                                                        &flat_invalidation_epoch,
+                                                        &direct_state);
                             const auto* prepared = level.prepared
                                                        ? rasterizer->GetDrawPreparation().NextDraw()
                                                        : nullptr;
@@ -321,6 +789,8 @@ CommandProcessor::Status CommandProcessor::RunGraphics(Work& work) {
                                 const u32 draw_kind = (op_word >> 16) & 0xFu;
                                 const bool is_indexed = (draw_kind != 1u);
                                 const u32 start_idx = (draw_kind == 0u) ? level.at[bw - 1u] : 0u;
+                                current_draw_is_direct_vk = true;
+                                OnStageADraw(true, u32(DirectVk::Op::DrawBundle), start_idx);
                                 rasterizer->Draw(is_indexed, start_idx, prepared);
                             }
                             level.at += 1u + bw;
@@ -433,9 +903,13 @@ CommandProcessor::Step CommandProcessor::Graphics(Work& work, Level& level, cons
         const bool need_dirty = rasterizer && rasterizer->UseDrawPipe();
         const bool handled_completely = ApplyGraphicsRegisterPacket(
             regs, packet, gfx_reg_checksum, need_dirty ? &pipe_dirty : nullptr, need_checksum,
-            &pso_sig_epoch, &dyn_reg_epoch);
+            &pso_sig_epoch, &dyn_reg_epoch, &pso_non_shader_epoch, stage_ud_epoch.data(),
+            &flat_invalidation_epoch, &direct_state);
         if (handled_completely) {
             return Step::Next;
+        }
+        if (op != Op::Nop && op != Op::SetContextReg) {
+            ++flat_invalidation_epoch;
         }
         // Not before earlier fences either: these may write guest memory.
         if (op != Op::Nop && rasterizer && !Pipelined(op) &&
@@ -557,6 +1031,7 @@ CommandProcessor::Step CommandProcessor::Graphics(Work& work, Level& level, cons
                 case DirectVk::Op::BindHsShader:
                 case DirectVk::Op::BindLsShader:
                 case DirectVk::Op::SetVgtControl:
+                case DirectVk::Op::SetDirectStateIds:
                     // Applied in ApplyGraphicsRegisterPacket (including DrawPreparation).
                     break;
                 case DirectVk::Op::SetRenderTarget: {
@@ -589,6 +1064,8 @@ CommandProcessor::Step CommandProcessor::Graphics(Work& work, Level& level, cons
                         const auto* prepared =
                             level.prepared ? rasterizer->GetDrawPreparation().NextDraw() : nullptr;
                         if (!PredicationSkips(header)) {
+                            current_draw_is_direct_vk = true;
+                            OnStageADraw(true, u32(DirectVk::Op::DrawBundle), start_idx);
                             if (rasterizer->HostMarkersEnabled()) [[unlikely]] {
                                 const void* at = packet;
                                 rasterizer->ScopeMarker(
@@ -655,6 +1132,8 @@ CommandProcessor::Step CommandProcessor::Graphics(Work& work, Level& level, cons
                         const auto* prepared =
                             level.prepared ? rasterizer->GetDrawPreparation().NextDraw() : nullptr;
                         if (!PredicationSkips(header)) {
+                            current_draw_is_direct_vk = true;
+                            OnStageADraw(true, u32(DirectVk::Op::DrawIndexed), args.start_index);
                             if (rasterizer->HostMarkersEnabled()) [[unlikely]] {
                                 const void* at = packet;
                                 rasterizer->ScopeMarker(
@@ -786,6 +1265,7 @@ CommandProcessor::Step CommandProcessor::Graphics(Work& work, Level& level, cons
                     break;
                 }
                 case DirectVk::Op::CopyBufferBatch: {
+                    ++flat_invalidation_epoch;
                     const u32 count = op_word >> 16;
                     if (rasterizer && count > 0 && count <= 32 && body_words == 2u + count * 6u) {
                         rasterizer->NotifyVsmBeforeCopyBatch(body + 2u, count);
@@ -809,6 +1289,7 @@ CommandProcessor::Step CommandProcessor::Graphics(Work& work, Level& level, cons
                     break;
                 }
                 case DirectVk::Op::FillBuffer: {
+                    ++flat_invalidation_epoch;
                     if (rasterizer && body_words == 6u) {
                         DirectVk::FillArgs args{};
                         std::memcpy(&args, body + 2u, sizeof(args));
@@ -1007,6 +1488,8 @@ CommandProcessor::Step CommandProcessor::Graphics(Work& work, Level& level, cons
                         const auto* prepared =
                             level.prepared ? rasterizer->GetDrawPreparation().NextDraw() : nullptr;
                         if (!PredicationSkips(header)) {
+                            current_draw_is_direct_vk = true;
+                            OnStageADraw(true, u32(DirectVk::Op::DrawIndexAddr));
                             if (rasterizer->HostMarkersEnabled()) [[unlikely]] {
                                 const void* at = packet;
                                 rasterizer->ScopeMarker(
@@ -1024,6 +1507,8 @@ CommandProcessor::Step CommandProcessor::Graphics(Work& work, Level& level, cons
                         const auto* prepared =
                             level.prepared ? rasterizer->GetDrawPreparation().NextDraw() : nullptr;
                         if (!PredicationSkips(header)) {
+                            current_draw_is_direct_vk = true;
+                            OnStageADraw(true, u32(DirectVk::Op::DrawAuto));
                             if (rasterizer->HostMarkersEnabled()) [[unlikely]] {
                                 const void* at = packet;
                                 rasterizer->ScopeMarker(
@@ -1042,6 +1527,8 @@ CommandProcessor::Step CommandProcessor::Graphics(Work& work, Level& level, cons
                         std::memcpy(&args, body + 2u, sizeof(args));
                         indirect_args_addr = (args.args_va & 0xFFFFFFFFFFull) & ~7ull;
                         if (!PredicationSkips(header)) {
+                            current_draw_is_direct_vk = true;
+                            OnStageADraw(true, u32(DirectVk::Op::DrawIndirect));
                             const bool indexed = args.is_indexed != 0u;
                             const u32 stride = indexed ? 20u : 16u;
                             if (rasterizer->HostMarkersEnabled()) [[unlikely]] {
@@ -1469,6 +1956,9 @@ void CommandProcessor::Draw(Level& level, Op op, const u32* packet, u32 body_wor
         if (PredicationSkips(header)) {
             return;
         }
+        current_draw_is_direct_vk = false;
+        ++flat_invalidation_epoch;
+        OnStageADraw(false, u32(op), 0u, packet, body_words + 1u);
         switch (op) {
         case Op::DrawIndex2:
             rasterizer->ScopeMarker("gfx:{}:DrawIndex2", fmt::make_format_args(at),
@@ -1488,6 +1978,9 @@ void CommandProcessor::Draw(Level& level, Op op, const u32* packet, u32 body_wor
     if (PredicationSkips(header) || !rasterizer) {
         return;
     }
+    current_draw_is_direct_vk = false;
+    ++flat_invalidation_epoch;
+    OnStageADraw(false, u32(op), 0u, packet, body_words + 1u);
     const auto draw = DrawIndirect::From(body, body_words);
     const bool indexed = op != Op::DrawIndirect && op != Op::DrawIndirectMulti;
     u32 stride = indexed ? 20 : 16; // the argument records

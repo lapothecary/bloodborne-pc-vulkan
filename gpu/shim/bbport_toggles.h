@@ -135,6 +135,8 @@ inline std::atomic<std::uint64_t> legacy_eop_decoded{0};
 inline std::atomic<std::uint64_t> native_buf_hits{0}, native_buf_misses{0};
 /// N2.1 Native VkImageView/VkSampler direct handle hits vs legacy T#/S# fallback resolutions.
 inline std::atomic<std::uint64_t> native_tex_hits{0}, native_tex_misses{0};
+/// Stage 5 NativeCmdStream direct 3D draws vs legacy DrawPacket bridge draws on Stage B.
+inline std::atomic<std::uint64_t> native_stream_draws{0}, legacy_stream_draws{0};
 /// N2.2 Incremental Push Descriptor slots deduplicated vs total graphics descriptor slots bound.
 inline std::atomic<std::uint64_t> desc_push_saved{0}, desc_push_total{0};
 /// G2.2 Render passes upgraded from AttachmentLoadOp::eLoad to eDontCare vs total color passes.

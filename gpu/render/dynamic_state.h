@@ -53,6 +53,10 @@ public:
         dirty |= ViewportsBit | ScissorsBit;
     }
 
+    [[nodiscard]] bool ViewportsDirty() const noexcept {
+        return (dirty & (ViewportsBit | ScissorsBit)) != 0u;
+    }
+
     /// Whether CommitWith would emit anything.
     [[nodiscard]] bool AnyDirty() const noexcept {
         return (dirty & ~Deferred()) != 0;

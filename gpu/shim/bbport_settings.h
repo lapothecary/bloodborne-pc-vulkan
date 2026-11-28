@@ -6,6 +6,7 @@
 #pragma once
 #include <array>
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <string>
 
@@ -24,9 +25,30 @@ enum FrameGenMode : int {
     FrameGenDlss4x = 6,
     FrameGenCount
 };
+enum AudioMode : int {
+    AudioStereo = 0,
+    AudioHrtf = 1,
+    AudioSurround = 2,
+    AudioModeCount
+};
+inline const char* AudioModeName(int mode) {
+    switch (mode) {
+    case AudioHrtf: return "hrtf";
+    case AudioSurround: return "surround";
+    default: return "stereo";
+    }
+}
 /// FSR 4 v07 or FSR 4.1.1: the same inputs, settings and placement in the frame.
 inline bool IsFsr4(int upscaler) {
     return upscaler == UpscalerFsr4 || upscaler == UpscalerFsr411;
+}
+inline bool IsUpscalerMipBiasAuto(float bias) {
+    return bias > 1.0f;
+}
+inline float QuantizeUpscalerMipBias(float bias) {
+    const float clamped = bias < -2.0f ? -2.0f : (bias > 0.0f ? 0.0f : bias);
+    const float q = std::round(clamped * 4.0f) * 0.25f;
+    return q == 0.0f ? 0.0f : q;
 }
 enum Preset : int { NativeAA = 0, Quality, Balanced, Performance, UltraPerformance, PresetCount };
 enum WindowMode : int { WindowModeFullscreen = 0, WindowModeBorderless = 1, WindowModeWindowed = 2, WindowModeCount };
@@ -258,6 +280,12 @@ struct Values {
     std::atomic<bool> loading_tips_timer{false};
     /// DLSS model preset: 11 = DLSS 4 Transformer (Preset K), 0 = DLSS 3 CNN Default.
     std::atomic<int> dlss_preset{11};
+    /// Extra negative G-buffer texture LOD bias under temporal upscaling (DLSS / FSR).
+    /// UpscalerMipBiasAuto (> 1.0f) applies NVIDIA/AMD recommended defaults (-1.0 for DLSS/FSR 4,
+    /// -0.5 for FSR 3.1 while upscaling; 0.0 at Native AA / DLAA). Manual values in [-2.0, 0.0]
+    /// are quantized to 0.25 steps to keep Vulkan sampler cache size strictly bounded.
+    static constexpr float UpscalerMipBiasAuto = 100.0f;
+    std::atomic<float> upscaler_mip_bias{UpscalerMipBiasAuto};
     /// World BC texture quality mip skip: 0 = Default (Mip 0), 1 = Medium (Mip 1), 2 = Low (Mip 2), 3 = Very Low (Mip 3).
     std::atomic<int> texture_quality{0};
     std::atomic<bool> texture_quality_chosen{false};
@@ -266,6 +294,8 @@ struct Values {
     std::atomic<bool> shadow_quality_chosen{false};
     /// Forced anisotropic filtering on scene textures: 16, 8, 4, or 1/0 (game default).
     std::atomic<int> anisotropic{16};
+    /// Cross-platform audio output mode: 0 = Stereo, 1 = Headphones (7.1 HRTF), 2 = Surround (7.1).
+    std::atomic<int> audio_mode{AudioStereo};
     /// Persistent FPS limit (0 = Uncapped, or 30..5000; auto = monitor refresh Hz).
     std::atomic<int> fps_limit{0};
     std::atomic<bool> fps_limit_auto{true};

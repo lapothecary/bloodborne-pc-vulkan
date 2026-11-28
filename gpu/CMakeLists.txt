@@ -430,7 +430,7 @@ if (WIN32)
     set_target_properties(bb-probe PROPERTIES OUTPUT_NAME "Bloodborne" C_STANDARD 11 C_EXTENSIONS ON)
     target_include_directories(bb-probe PRIVATE .. ../src)
     target_compile_options(bb-probe PRIVATE $<$<COMPILE_LANGUAGE:C>:-Wall -Wextra>)
-    target_link_libraries(bb-probe PRIVATE bbgpu "${BB_GX_ENGINE_ARCHIVE}" bbgpu bbatrac9 pthread ws2_32 bcrypt dbghelp winmm onecore
+    target_link_libraries(bb-probe PRIVATE bbgpu "${BB_GX_ENGINE_ARCHIVE}" bbgpu bbatrac9 pthread ws2_32 bcrypt dbghelp winmm ole32 onecore
         ${Vulkan_LIBRARIES})
     # Plain -l names in the packages' CMake files (Zydis: Zycore) are found in the sysroot.
     foreach(root ${CMAKE_FIND_ROOT_PATH})

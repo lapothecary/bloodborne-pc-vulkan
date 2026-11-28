@@ -133,6 +133,7 @@ inline constexpr u64 UpdatePageHelpBar    = 0x1b1ab20; // (OptionPage* page) -> 
 inline constexpr u64 UpdatePageButtonGuide= 0x1ad6450; // (OptionPage* page) -> updates StatusBar/KeyGuide
 inline constexpr u64 OptionsPageNavigate  = 0x1b1b520; // (OptionPage* page, u8* input, float frame_time)
 inline constexpr u64 ControlsContent      = 0x1b211a0; // (OptionPage* page, u8* game_settings)
+inline constexpr u64 EnvironmentContent   = 0x1b21840; // (OptionPage* page, u8* game_settings) -> Subtitles, HUD, Music, SE, Voice
 
 // Menu pad/mouse input predicates (const u8* input)
 inline constexpr u64 GetHorizontalStep    = 0x1adfdd0; // (const u8* input) -> int32_t (-1, 0, +1)

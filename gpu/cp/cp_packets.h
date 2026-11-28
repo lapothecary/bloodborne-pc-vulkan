@@ -485,7 +485,10 @@ enum class Op : u32 {
     ExecuteSecondaryCmds = 35u,
     NativePostProcess = 36u,
     GenerateMipsSpd = 37u,
+    SetDirectStateIds = 38u,
 };
+inline constexpr u32 kContextRegFromDirectState = 0x80000000u;
+inline constexpr u32 kUdFlagSpecInvariant = 1u << 16;
 struct CopyRegion {
     u64 dst_va;
     u64 src_va;

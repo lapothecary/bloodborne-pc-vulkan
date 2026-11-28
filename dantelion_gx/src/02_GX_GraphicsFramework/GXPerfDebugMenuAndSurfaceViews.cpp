@@ -1663,8 +1663,8 @@ extern "C" int GXGnmSurfaceView_InitDepthRenderTargetView(
         *reinterpret_cast<uint32_t*>(pOutDepthView + 0x3C) = pViewDesc->m_firstSlice10;
         *reinterpret_cast<uint64_t*>(pOutDepthView + 0x34) = *reinterpret_cast<const uint64_t*>(&pViewDesc->m_firstElem08);
         *reinterpret_cast<uint64_t*>(pOutDepthView + 0x2C) = *reinterpret_cast<const uint64_t*>(&pViewDesc->m_format00);
-        gx_direct_vk::RegisterDirectDepthTarget(
-            pOutDepthView, nullptr, pViewDesc->m_firstElem08, pViewDesc->m_numElems0C, pViewDesc->m_firstSlice10);
+        // Note: 0x217a4b0 calls 0x216e1d0 (Color RenderTarget), which already called
+        // RegisterDirectColorTarget with full parentTsharp metadata; do not misregister as Depth.
     }
     return res;
 }
@@ -1719,20 +1719,22 @@ extern "C" int GXGnmSurfaceView_InitRenderTargetViewAndClearCMask(
         *reinterpret_cast<uint32_t*>(pOutRtView + 0x4C) = 0u;
     }
 
+    // Note: 0x217a210 calls 0x216fa60 (DepthRenderTarget) and updates HTILE clear state;
+    // re-register as DepthTarget so DirectTargets holds the final post-HTILE register bits.
     sceGnmRenderTargetSetCmaskClearColor(pOutRtView, ((rtFlags & 0x04u) != 0) ? 0u : 1u);
     if (!sceGnmRenderTargetGetCmaskFastClearEnable(pOutRtView)) {
-        gx_direct_vk::RegisterDirectColorTarget(
+        gx_direct_vk::RegisterDirectDepthTarget(
             pOutRtView, nullptr, pViewDesc->m_numElems0C, pViewDesc->m_firstSlice10, pViewDesc->m_numSlices14);
         return 0;
     }
     if ((rtFlags & 0x08u) == 0) {
-        gx_direct_vk::RegisterDirectColorTarget(
+        gx_direct_vk::RegisterDirectDepthTarget(
             pOutRtView, nullptr, pViewDesc->m_numElems0C, pViewDesc->m_firstSlice10, pViewDesc->m_numSlices14);
         return 0;
     }
 
     sceGnmRenderTargetSetCmaskFastClearEnable(pOutRtView, 1u);
-    gx_direct_vk::RegisterDirectColorTarget(
+    gx_direct_vk::RegisterDirectDepthTarget(
         pOutRtView, nullptr, pViewDesc->m_numElems0C, pViewDesc->m_firstSlice10, pViewDesc->m_numSlices14);
     uintptr_t cmaskBase = static_cast<uintptr_t>(sceGnmRenderTargetGetCmaskAddress256ByteBlocks(pOutRtView)) << 8;
     uint32_t cmaskSliceBytes = sceGnmRenderTargetGetCmaskSliceSizeInBytes(pOutRtView);

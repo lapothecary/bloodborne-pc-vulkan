@@ -336,7 +336,7 @@ int runtime_patch_optionsetting_gfx(const uint8_t *src,size_t size,uint8_t **out
     if (size<16 || memcmp(src,"GFX",3)) return 0;
     const size_t rect=(5+4*(src[8]>>3)+7)/8, first=8+rect+4;
     unsigned code; size_t body,len,next;
-    long top_sp=-1, ctrl_sp=-1, lang_sp=-1, sb_cid=-1, arrow_cid=-1;
+    long top_sp=-1, ctrl_sp=-1, lang_sp=-1, env_sp=-1, sb_cid=-1, arrow_cid=-1;
     for (size_t at=first; opt_swf_tag(src,at,size,&code,&body,&len,&next) && code; at=next) {
         if (code==76 && len>=2) {
             size_t p=body+2;
@@ -347,6 +347,7 @@ int runtime_patch_optionsetting_gfx(const uint8_t *src,size_t size,uint8_t **out
                 if (!strcmp(nm,"OptionSetting_fla.OptionSetting_Top_74")) top_sp=(long)id;
                 else if (!strcmp(nm,"OptionSetting_fla._Option_ItemList_71")) ctrl_sp=(long)id;
                 else if (!strcmp(nm,"OptionSetting_fla._LanguageSetting_54")) lang_sp=(long)id;
+                else if (!strcmp(nm,"OptionSetting_fla._Enviroment_ItemList_1")) env_sp=(long)id;
                 p+=2+strlen(nm)+1;
             }
         } else if (code==39 && len>=4) {
@@ -364,16 +365,17 @@ int runtime_patch_optionsetting_gfx(const uint8_t *src,size_t size,uint8_t **out
             }
         }
     }
-    if (top_sp<0 || ctrl_sp<0 || lang_sp<0 || sb_cid<0 || arrow_cid<0) return 0;
+    if (top_sp<0 || ctrl_sp<0 || lang_sp<0 || env_sp<0 || sb_cid<0 || arrow_cid<0) return 0;
 
-    /* Extract child character IDs from `ctrl_sp` (138), `top_sp` (150), `lang_sp` (115), and their frames. */
+    /* Extract child character IDs from `ctrl_sp` (138), `top_sp` (150), `lang_sp` (115), `env_sp` (107). */
     int bg_dim=-1, ctrl_frame=-1, statusbar=-1, opt_row=-1, def_row=-1, ctrl_title=-1;
     int top_frame=-1, top_row=-1, top_title=-1;
     int lang_frame=-1, lang_notice=-1, lang_title=-1;
+    int env_frame=-1, env_lbl1=-1, env_lbl2=-1, env_title=-1;
     for (size_t at=first; opt_swf_tag(src,at,size,&code,&body,&len,&next) && code; at=next) {
         if (code!=39 || len<4) continue;
         const unsigned sid=(unsigned)src[body] | ((unsigned)src[body+1]<<8);
-        if ((long)sid!=ctrl_sp && (long)sid!=top_sp && (long)sid!=lang_sp) continue;
+        if ((long)sid!=ctrl_sp && (long)sid!=top_sp && (long)sid!=lang_sp && (long)sid!=env_sp) continue;
         size_t inner,ilen,inext; unsigned c;
         for (size_t t=body+4; opt_swf_tag(src,t,next,&c,&inner,&ilen,&inext) && c && c!=1; t=inext) {
             if ((c!=26 && c!=70) || ilen<5 || !(src[inner]&0x02)) continue;
@@ -391,24 +393,31 @@ int runtime_patch_optionsetting_gfx(const uint8_t *src,size_t size,uint8_t **out
                 if (d==3) top_frame=(int)cid;
                 else if (nm && !strcmp(nm,"Item_0_0")) top_row=(int)cid;
                 else if (!nm && d>60) top_title=(int)cid;
-            } else {
+            } else if ((long)sid==lang_sp) {
                 if (d==3) lang_frame=(int)cid;
                 else if (d==56) lang_notice=(int)cid;
                 else if (!nm && d>80) lang_title=(int)cid;
+            } else {
+                if (d==3) env_frame=(int)cid;
+                else if (nm && !strcmp(nm,"StaticText_111010")) env_lbl1=(int)cid;
+                else if (nm && !strcmp(nm,"StaticText_111011")) env_lbl2=(int)cid;
+                else if (!nm && d>110) env_title=(int)cid;
             }
         }
     }
     if (bg_dim<0 || ctrl_frame<0 || statusbar<0 || opt_row<0 || def_row<0 || ctrl_title<0 ||
         top_frame<0 || top_row<0 || top_title<0 ||
-        lang_frame<0 || lang_notice<0 || lang_title<0) return 0;
+        lang_frame<0 || lang_notice<0 || lang_title<0 ||
+        env_frame<0 || env_lbl1<0 || env_lbl2<0 || env_title<0) return 0;
 
     int cf_smoke=-1, cf_grad=-1, cf_top_t=-1, cf_bot_t=-1, cf_pillar=-1, cf_crown=-1;
     int tf_smoke=-1, tf_crown=-1, tf_rule=-1;
     int lf_grad=-1;
+    int ef_smoke=-1, ef_grad=-1, ef_top_t=-1, ef_mid_t=-1, ef_bot_t=-1, ef_pillar=-1, ef_crown=-1;
     for (size_t at=first; opt_swf_tag(src,at,size,&code,&body,&len,&next) && code; at=next) {
         if (code!=39 || len<4) continue;
         const int sid=(int)((unsigned)src[body] | ((unsigned)src[body+1]<<8));
-        if (sid!=ctrl_frame && sid!=top_frame && sid!=lang_frame) continue;
+        if (sid!=ctrl_frame && sid!=top_frame && sid!=lang_frame && sid!=env_frame) continue;
         size_t inner,ilen,inext; unsigned c;
         for (size_t t=body+4; opt_swf_tag(src,t,next,&c,&inner,&ilen,&inext) && c && c!=1; t=inext) {
             if ((c!=26 && c!=70) || ilen<5 || !(src[inner]&0x02)) continue;
@@ -425,13 +434,23 @@ int runtime_patch_optionsetting_gfx(const uint8_t *src,size_t size,uint8_t **out
                 if (d==1) tf_smoke=cid;
                 else if (d==11) tf_crown=cid;
                 else if (d==23) tf_rule=cid;
-            } else {
+            } else if (sid==lang_frame) {
                 if (d==11) lf_grad=cid;
+            } else {
+                if (d==1) ef_smoke=cid;
+                else if (d==11) ef_grad=cid;
+                else if (d==17) ef_top_t=cid;
+                else if (d==25) ef_mid_t=cid;
+                else if (d==31) ef_bot_t=cid;
+                else if (d==47) ef_pillar=cid;
+                else if (d==51) ef_crown=cid;
             }
         }
     }
     if (cf_smoke<0 || cf_grad<0 || cf_top_t<0 || cf_bot_t<0 || cf_pillar<0 || cf_crown<0 ||
-        tf_smoke<0 || tf_crown<0 || tf_rule<0 || lf_grad<0) return 0;
+        tf_smoke<0 || tf_crown<0 || tf_rule<0 || lf_grad<0 ||
+        ef_smoke<0 || ef_grad<0 || ef_top_t<0 || ef_mid_t<0 || ef_bot_t<0 || ef_pillar<0 || ef_crown<0)
+        return 0;
 
     uint8_t *cur=NULL,*nxt=NULL; size_t cur_sz=0,nxt_sz=0;
     if (!style_gothic_scrollbar(src,size,(unsigned)sb_cid,(unsigned)arrow_cid,&cur,&cur_sz))
@@ -598,6 +617,68 @@ int runtime_patch_optionsetting_gfx(const uint8_t *src,size_t size,uint8_t **out
             free(sp.data); free(cur); return 0;
         }
         const int ok=replace_define_sprite(cur,cur_sz,(unsigned)top_sp,19,sp.data,sp.len,&nxt,&nxt_sz);
+        free(sp.data); free(cur);
+        if (!ok) return 0;
+        cur=nxt; cur_sz=nxt_sz;
+    }
+
+    /* 6. Rebuild `env_frame` (34) + `env_sp` (107, `Environment`): expand the Sound sub-panel
+     *    cleanly by +700 twips (+35 px) so all 4 Sound rows (Music, Sound Effects, Voice, Audio
+     *    Output at 51 px uniform spacing) sit strictly inside the dark smoked panel & center
+     *    vertical pillar, above the bottom divider (y=8496), with Defaults centered cleanly at
+     *    y=9800 (65 px below divider, 64 px above bottom rule). */
+    {
+        ByteBuf ft={0};
+        uint8_t m11[11], m5[5];
+        pack_mat_t16(m5,-10622,-1291);
+        emit_place(&ft,1,ef_smoke,m5,5,cx_2cc,6,NULL,0,0);
+        pack_mat_t16(m5,-5384,27);
+        emit_place(&ft,11,ef_grad,m5,5,cx_2cc,6,NULL,8,0);
+        pack_mat_st11(m11,-65536,-65536,5776,7915);          /* bottom backdrop extended +35 px */
+        emit_place(&ft,14,ef_grad,m11,11,cx_2cc,6,NULL,8,0);
+        pack_mat_t16(m5,0,-380);
+        emit_place(&ft,17,ef_top_t,m5,5,cx_134,6,NULL,8,0);
+        pack_mat_t16(m5,0,2617);                             /* Display/Sound divider (y=3597) */
+        emit_place(&ft,25,ef_mid_t,m5,5,cx_0cc,6,NULL,8,0);
+        pack_mat_t16(m5,0,7516);                             /* Sound/Defaults divider (y=8496) */
+        emit_place(&ft,31,ef_bot_t,m5,5,cx_0cc,6,NULL,8,0);
+        pack_mat_st11(m11,65536,-65536,0,10104);             /* lower frame rule (y=11084) */
+        emit_place(&ft,39,ef_bot_t,m11,11,cx_134,6,NULL,8,0);
+        pack_mat_st11(m11,65536,16777,122,300);              /* Display center pillar (sy=0.256) */
+        emit_place(&ft,47,ef_pillar,m11,11,cx_0cc,6,NULL,8,0);
+        pack_mat_st11(m11,65536,32113,122,3000);             /* Sound center pillar (sy=0.490, 4 rows) */
+        emit_place(&ft,49,ef_pillar,m11,11,cx_0cc,6,NULL,8,0);
+        pack_mat_t16(m5,-4466,-2040);
+        emit_place(&ft,51,ef_crown,m5,5,NULL,0,NULL,8,0);
+        pack_mat_st11(m11,65536,-65536,-4466,12759);
+        emit_place(&ft,57,ef_crown,m11,11,NULL,0,NULL,8,0);
+        emit_show_frame(&ft);
+        emit_end_tag(&ft);
+        const int ok=replace_define_sprite(cur,cur_sz,(unsigned)env_frame,1,ft.data,ft.len,&nxt,&nxt_sz);
+        free(ft.data); free(cur);
+        if (!ok) return 0;
+        cur=nxt; cur_sz=nxt_sz;
+    }
+    {
+        const AnimChild kids[12]={
+            {3,   env_frame, 0,0,0,   8937,  980, NULL,                0},
+            {61,  statusbar, 0,0,0,   9568, 6661, "StatusBar",         0},
+            {100, opt_row,   0,0,0,   1840, 1539, "Item_0_0",          0},
+            {95,  opt_row,   0,0,0,   1840, 2591, "Item_1_0",          0},
+            {90,  opt_row,   0,0,0,   1840, 4135, "Item_2_0",          0},
+            {85,  opt_row,   0,0,0,   1840, 5155, "Item_3_0",          0},
+            {80,  opt_row,   0,0,0,   1840, 6175, "Item_4_0",          0},
+            {75,  opt_row,   0,0,0,   1840, 7195, "Item_5_0",          0},
+            {64,  def_row,   0,0,0,  10800, 9800, "Item_6_0",          0},
+            {116, env_lbl1,  0,0,0,    618, 1318, "StaticText_111010", 0},
+            {117, env_lbl2,  0,0,0,    618, 4040, "StaticText_111011", 0},
+            {118, env_title, 0,0,0,   4626,  -21, NULL,                8},
+        };
+        ByteBuf sp={0};
+        if (!build_19frame_menu_sprite((unsigned)bg_dim,-10045,-4094,kids,12,&sp)) {
+            free(sp.data); free(cur); return 0;
+        }
+        const int ok=replace_define_sprite(cur,cur_sz,(unsigned)env_sp,19,sp.data,sp.len,&nxt,&nxt_sz);
         free(sp.data); free(cur);
         if (!ok) return 0;
         cur=nxt; cur_sz=nxt_sz;

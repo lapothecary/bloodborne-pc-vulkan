@@ -275,6 +275,7 @@ struct Info : InfoPersistent {
 
     /// The flat user data for the current draw: the registers, then what the SRT walker copies.
     void RefreshFlatBuf() {
+        last_flat_inv_epoch = 0;
         if (flat_buf_replay) [[unlikely]] {
             flattened_ud_buf = *flat_buf_replay;
             return;
@@ -288,6 +289,38 @@ struct Info : InfoPersistent {
             srt_info.walker_func(user_data.data(), flattened_ud_buf.data());
         }
     }
+
+    /// Stage 2A / 4B: Lossless cached `RefreshFlatBuf()` for DirectVk draws whose SRT/EUD chunks
+    /// are monotonically bump-allocated per submission (`FastSuballocate64K`).
+    /// Returns: 0 = ran walker, 1 = skipped via stage_ud_epoch.
+    /// Stage 4B removed the dead 64-byte `last_flat_ud` memcmp/memcpy (0.000% hit rate across
+    /// 770K stages/s) and inlined the hot no-resize walker path.
+    [[gnu::always_inline]] u32 RefreshFlatBufCached(u64 cur_ud_epoch, u64 cur_inv_epoch) {
+        const u32 flat_dw = srt_info.flattened_bufsize_dw;
+        if (cur_inv_epoch != 0u && !flat_buf_replay) [[likely]] {
+            if (cur_ud_epoch != 0u && last_flat_inv_epoch == cur_inv_epoch &&
+                last_flat_ud_epoch == cur_ud_epoch && flattened_ud_buf.size() == flat_dw) {
+                return 1u;
+            }
+            if (flattened_ud_buf.size() != flat_dw) [[unlikely]] {
+                flattened_ud_buf.resize(flat_dw);
+            }
+            ASSERT(user_data.size() <= NUM_USER_DATA_REGS);
+            std::memcpy(flattened_ud_buf.data(), user_data.data(), user_data.size_bytes());
+            if (srt_info.walker_func) {
+                srt_info.walker_func(user_data.data(), flattened_ud_buf.data());
+            }
+            last_flat_ud_epoch = cur_ud_epoch;
+            last_flat_inv_epoch = cur_inv_epoch;
+            return 0u;
+        }
+        RefreshFlatBuf();
+        return 0u;
+    }
+
+    // Runtime-only Stage 2A/4B RefreshFlatBuf memoization (never serialized).
+    u64 last_flat_ud_epoch = 0;
+    u64 last_flat_inv_epoch = 0;
 
     void ReadTessConstantBuffer(TessellationDataConstantBuffer& tess_constants) const {
         ASSERT(tess_consts_dword_offset >= 0); // (found by the tessellation pass)

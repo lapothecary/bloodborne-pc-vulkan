@@ -80,6 +80,8 @@ constexpr u64 OptionsPageNavigate = 0x1b1b520;
 constexpr u64 OptionsPageResetDefaults = 0x1b1a2d0;
 /// (page, game_settings): Bloodborne's native System -> Controls page content builder.
 constexpr u64 ControlsContent = 0x1b211a0;
+/// (page, game_settings): Bloodborne's native System -> Environment (Screen/Sound) page content builder.
+constexpr u64 EnvironmentContent = 0x1b21840;
 /// Menu input button check helpers (const u8* input -> bool / step).
 constexpr u64 IsConfirmPressed = 0x1adfec0;
 constexpr u64 IsLeftPressed = 0x1ae0890;
@@ -394,7 +396,7 @@ const char16_t* TextOf(u32 id) {
 
 // ---- The port's values the game's rows edit (ints: the list rows bind ints). ----
 enum Field : int {
-    Aspect, OutputRes, Upscaler, Preset, Sharpness, ModelLod,
+    Aspect, OutputRes, Upscaler, Preset, Sharpness, ModelLod, AudioModeField,
     FirstEffect,
     FirstSlot = FirstEffect + BbSettings::EffectCount,
     FirstDisplaySlot = FirstSlot + ControlsSlotCount,
@@ -459,6 +461,8 @@ void Fill(const BbSettings::Values& s, int* values) {
     for (int i = 0; i < 4; ++i) {
         if (LodValues[i] == s.model_lod) values[ModelLod] = i;
     }
+    values[AudioModeField] = std::clamp(s.audio_mode.load(std::memory_order_relaxed), 0,
+                                        BbSettings::AudioModeCount - 1);
     for (int e = 0; e < BbSettings::EffectCount; ++e) {
         values[FirstEffect + e] = s.effects[e];
     }
@@ -506,6 +510,7 @@ struct Page {
 std::vector<Page> pages;
 
 std::vector<Row> controls_rows;
+std::vector<Row> env_audio_rows;
 u32 exit_game_name = 0;
 u32 exit_game_help = 0;
 
@@ -567,6 +572,17 @@ void DefineTexts() {
              {ControlsSlotVal + u32(slot), ControlsSlotVal + u32(slot)},
              Kind::Select});
     }
+
+    // Native System -> Environment -> Sound: Audio Output row inserted right below Voice (`Item_5_0`).
+    env_audio_rows.push_back(
+        {AudioModeField,
+         AddText("Audio Output", "Режим звука"),
+         AddText("Stereo (speakers), Headphones (built-in 7.1 binaural HRTF), or Surround (7.1 / OS Spatial) — applies live",
+                 "Стерео (колонки), Наушники (встроенный 7.1 HRTF 3D-звук) или Объёмный (7.1 / OS Spatial) — применяется сразу"),
+         {AddText("Stereo", "Стерео"),
+          AddText("Headphones (7.1 HRTF)", "Наушники (7.1 HRTF)"),
+          AddText("Surround (7.1)", "Объёмный (7.1)")},
+         Kind::Select});
 }
 
 // ---- The game's structures, as its own code builds them. ----
@@ -3209,6 +3225,21 @@ void StepKeyCapture(u8* row, int slot, int k) {
 // ---- Hooks ----
 using ControlsContentFn = void (PS4_SYSV_ABI*)(void*, u8*);
 ControlsContentFn controls_content_original = nullptr;
+ControlsContentFn environment_content_original = nullptr;
+
+void PS4_SYSV_ABI EnvironmentContentHook(void* page, u8* game_settings) {
+    ClearActiveCustomPages();
+    environment_content_original(page, game_settings);
+    if (!values_valid) {
+        LoadValues();
+    }
+    const int cur_mode = std::clamp(BbSettings::Get().audio_mode.load(std::memory_order_relaxed), 0,
+                                    BbSettings::AudioModeCount - 1);
+    values[AudioModeField] = cur_mode;
+    applied[AudioModeField] = cur_mode;
+    default_values[AudioModeField] = BbSettings::AudioStereo;
+    AddRows(page, env_audio_rows);
+}
 
 void PS4_SYSV_ABI ControlsContentHook(void* page, u8* game_settings) {
     ClearActiveCustomPages();
@@ -4099,6 +4130,9 @@ void PatchImage(unsigned char* image, std::uint64_t size) {
         Detour(image, ControlsContent, AddPageItemPrologue, sizeof(AddPageItemPrologue),
                reinterpret_cast<void*>(&ControlsContentHook),
                reinterpret_cast<void**>(&controls_content_original), cursor) &&
+        Detour(image, EnvironmentContent, AddPageItemPrologue, sizeof(AddPageItemPrologue),
+               reinterpret_cast<void*>(&EnvironmentContentHook),
+               reinterpret_cast<void**>(&environment_content_original), cursor) &&
         Detour(image, OptionsPageNavigate, AddPageItemPrologue, sizeof(AddPageItemPrologue),
                reinterpret_cast<void*>(&OptionsPageNavigateHook),
                reinterpret_cast<void**>(&options_page_navigate_original), cursor) &&
@@ -4272,6 +4306,12 @@ void Poll() {
         if (byte_field[f]) {
             now_values[f] = bytes[f];
         }
+    }
+    if (now_values[AudioModeField] != applied[AudioModeField]) {
+        const int next_mode = std::clamp(now_values[AudioModeField], 0, BbSettings::AudioModeCount - 1);
+        s.audio_mode.store(next_mode, std::memory_order_relaxed);
+        applied[AudioModeField] = next_mode;
+        saved = true;
     }
     bool effects_changed = false;
     for (int e = 0; e < BbSettings::EffectCount; ++e) {

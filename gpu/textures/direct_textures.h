@@ -59,9 +59,12 @@ void DrainEvents(std::vector<Event>& out);
 // N2.1: Lock-free content-deduplicated native S# and T# descriptor tables.
 u16 RegisterNativeSampler(void* ssharp_4dw) noexcept;
 [[nodiscard]] u16 UnpackAndCleanSampler(Gcn::Sampler& ssharp) noexcept;
+[[nodiscard]] bool ReadNativeSamplerByUid(u16 uid, Gcn::Sampler& out_clean_ssharp) noexcept;
 
 u16 RegisterNativeSrv(void* tsharp_8dw, u32 resource_id, bool is_immutable) noexcept;
 [[nodiscard]] u16 UnpackAndCleanSrv(Gcn::Image& tsharp, u8& out_gen8) noexcept;
+[[nodiscard]] bool ReadNativeSrvByUid(u16 uid, u8 expected_gen8,
+                                      Gcn::Image& out_clean_tsharp) noexcept;
 
 // Phase 3.1: Non-zero 16-bit epoch bumped only when a DirectImmutable image is unregistered or
 // transitions out of its settled read-only ShaderReadOnlyOptimal state.

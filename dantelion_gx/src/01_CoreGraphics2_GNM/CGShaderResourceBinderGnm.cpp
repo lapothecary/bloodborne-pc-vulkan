@@ -267,8 +267,11 @@ inline void ExecuteStageBindingBytecode(
     const CGShaderBindingHeaderGnm* hdr,
     uint32_t binder_stage_idx,
     uint32_t gnm_stage,
-    uint32_t gds_range_dword)
+    uint32_t gds_range_dword,
+    bool spec_invariant = false,
+    gx_direct_vk::StageUserDataBatch* ext_ud_batch = nullptr)
 {
+    const bool direct_ud = gx_direct_vk::EnabledV2Sub(gx_direct_vk::kV2Sub_StageUserData);
     CGStageDependencyCacheGnm& st = self->stages[binder_stage_idx];
     uint64_t dirty_cmds = st.dirty_cmd_mask;
     const uint32_t num_cmds = hdr->num_binding_cmds;
@@ -276,14 +279,18 @@ inline void ExecuteStageBindingBytecode(
         dirty_cmds &= (1ULL << num_cmds) - 1ULL;
     }
     if (dirty_cmds == 0ULL) {
+        if (direct_ud && ext_ud_batch != nullptr) {
+            ext_ud_batch->Flush(gnmx_ctx, gnm_stage, /*spec_invariant=*/true);
+        }
         return;
     }
 
     const uint32_t* cmds = hdr->binding_cmds;
     uint32_t* srt_dwords = self->srt_user_data_dwords[gnm_stage];
 
-    const bool direct_ud = gx_direct_vk::EnabledV2Sub(gx_direct_vk::kV2Sub_StageUserData);
-    gx_direct_vk::StageUserDataBatch ud_batch;
+    gx_direct_vk::StageUserDataBatch local_ud_batch;
+    auto& ud_batch = ext_ud_batch ? *ext_ud_batch : local_ud_batch;
+    bool only_spec_invariant_ops = spec_invariant;
 
     auto fn_suballoc  = [&](void* pool, void* fctx, uint64_t sz) noexcept -> void* {
         return FastSuballocate64K(pool, fctx, sz);
@@ -338,6 +345,18 @@ inline void ExecuteStageBindingBytecode(
         const uint8_t  opcode   = static_cast<uint8_t>(cmd & 0xFFu);
         const uint8_t  dst_reg  = static_cast<uint8_t>((cmd >> 8) & 0xFFu);
         const uint8_t  src_slot = static_cast<uint8_t>((cmd >> 16) & 0xFFu);
+
+        // Stage 4C: All SRV (0,1,8,13,14,21), Sampler (4,10,17,23), CB (5,11,18,24), and EUD (26)
+        // opcodes have their specialization invariance verified by `StageAndExecuteGraphicsShaderStage`.
+        // Clear `only_spec_invariant_ops` for any UAV / GDS / Global-table opcode.
+        constexpr uint32_t kSpecInvariantOpMask =
+            (1u << 0) | (1u << 1) | (1u << 4) | (1u << 5) | (1u << 8) | (1u << 10) |
+            (1u << 11) | (1u << 13) | (1u << 14) | (1u << 17) | (1u << 18) | (1u << 21) |
+            (1u << 23) | (1u << 24) | (1u << 26);
+        if (only_spec_invariant_ops &&
+            (opcode >= 32u || ((kSpecInvariantOpMask >> opcode) & 1u) == 0u)) {
+            only_spec_invariant_ops = false;
+        }
 
         switch (opcode) {
         case 0:
@@ -540,7 +559,7 @@ inline void ExecuteStageBindingBytecode(
     }
 
     if (direct_ud) {
-        ud_batch.Flush(gnmx_ctx, gnm_stage);
+        ud_batch.Flush(gnmx_ctx, gnm_stage, only_spec_invariant_ops);
     }
 
     st.dirty_srv_mask_lo &= ~st.active_srv_mask_lo;
@@ -594,12 +613,13 @@ bool CGShaderResourceBinderGnm_BindShaderHeader_StageE(
 // resolving dynamic buffers via `0x26d0ff0`, and binds them either directly into SGPRs
 // (`setVsharpInUserData`), into SRT user data (`+0xa4a0`), or into a suballocated GPU
 // Fetch-Shader vertex table (`StagingPool_Suballocate64K` `0x26addc0` + `setPointerInUserData`).
-void CGShaderResourceBinderGnm_BindVertexBuffersAndFetchShader(
+inline void BindVertexBuffersAndFetchShaderImpl(
     CGShaderResourceBinderGnm* self,
     uint8_t* gnmx_ctx_wrapper,
     const uint8_t* pipeline_state,
     uint32_t binder_stage_idx,
-    uint32_t gnm_shader_stage)
+    uint32_t gnm_shader_stage,
+    gx_direct_vk::StageUserDataBatch* shared_ud_batch)
 {
     const uint32_t dirty_vb     = self->dirty_vb_mask;
     const uint32_t table_dirty  = dirty_vb & self->eud_table_vb_mask;
@@ -612,7 +632,8 @@ void CGShaderResourceBinderGnm_BindVertexBuffersAndFetchShader(
     const bool native_vsharp  = gx_direct_vk::EnabledV2Sub(gx_direct_vk::kV2Sub_NativeVsharp);
     const bool direct_ud      = gx_direct_vk::EnabledV2Sub(gx_direct_vk::kV2Sub_StageUserData);
     const bool n1_native_bufs = gx_direct_vk::EnabledNativeVk(gx_direct_vk::kN1_NativeBuffers);
-    gx_direct_vk::StageUserDataBatch ud_batch;
+    gx_direct_vk::StageUserDataBatch local_ud_batch;
+    auto& ud_batch = shared_ud_batch ? *shared_ud_batch : local_ud_batch;
 
     auto resolve_dyn_vb = [&](const uint8_t* vb_res) noexcept -> uint64_t {
         uint8_t* ring = gnmx_ctx_wrapper + 0xb6f8;
@@ -783,9 +804,20 @@ void CGShaderResourceBinderGnm_BindVertexBuffersAndFetchShader(
         self->dirty_vb_mask &= ~table_dirty;
     }
 
-    if (direct_ud) {
-        ud_batch.Flush(gnmx_ctx, gnm_shader_stage);
+    if (direct_ud && shared_ud_batch == nullptr) {
+        ud_batch.Flush(gnmx_ctx, gnm_shader_stage, /*spec_invariant=*/true);
     }
+}
+
+void CGShaderResourceBinderGnm_BindVertexBuffersAndFetchShader(
+    CGShaderResourceBinderGnm* self,
+    uint8_t* gnmx_ctx_wrapper,
+    const uint8_t* pipeline_state,
+    uint32_t binder_stage_idx,
+    uint32_t gnm_shader_stage)
+{
+    BindVertexBuffersAndFetchShaderImpl(
+        self, gnmx_ctx_wrapper, pipeline_state, binder_stage_idx, gnm_shader_stage, nullptr);
 }
 
 // ============================================================================
@@ -1516,20 +1548,32 @@ inline void StageAndExecuteGraphicsShaderStage(
     const uint8_t* pipeline_state,
     const CGShaderBindingHeaderGnm* hdr,
     uint32_t binder_stage_idx,
-    uint32_t gnm_stage)
+    uint32_t gnm_stage,
+    gx_direct_vk::StageUserDataBatch* shared_ud_batch = nullptr)
 {
     CGStageDependencyCacheGnm& st = self->stages[binder_stage_idx];
     const uint8_t* stage_state = pipeline_state + 0x598 + static_cast<size_t>(binder_stage_idx) * 0x4F8;
+    // Stage 4C: Ignore `fetch_cmd_bitmask` in `pre_dirty` — vertex buffer V# updates are validated
+    // independently by `want_vsharps` before `SpecWordCheck` runs.
+    const bool pre_dirty = ((st.dirty_cmd_mask & ~st.fetch_cmd_bitmask) != 0ULL);
     uint64_t dirty_cmds_accum = 0ULL;
 
     // 1. Dirty SRVs 0..63
+    bool any_srv_spec_changed = false;
     uint64_t srv_lo = st.dirty_srv_mask_lo & st.active_srv_mask_lo;
     while (srv_lo != 0ULL) {
         const uint32_t slot = static_cast<uint32_t>(__builtin_ctzll(srv_lo));
         srv_lo -= (1ULL << slot);
         const uint8_t* srv_view = *reinterpret_cast<const uint8_t* const*>(stage_state + 0x080 + slot * 8);
         if (srv_view != nullptr) {
-            std::memcpy(self->staged_srv_tsharps[binder_stage_idx][slot], srv_view + 0x10, 32);
+            uint8_t* dst = self->staged_srv_tsharps[binder_stage_idx][slot];
+            if (!any_srv_spec_changed &&
+                !gx_direct_vk::SrvSharpSpecEquivalent(
+                    reinterpret_cast<const uint32_t*>(dst),
+                    reinterpret_cast<const uint32_t*>(srv_view + 0x10))) {
+                any_srv_spec_changed = true;
+            }
+            std::memcpy(dst, srv_view + 0x10, 32);
             dirty_cmds_accum |= st.srv_lo_dep_masks[slot];
         }
     }
@@ -1541,7 +1585,14 @@ inline void StageAndExecuteGraphicsShaderStage(
         srv_hi -= (1ULL << slot);
         const uint8_t* srv_view = *reinterpret_cast<const uint8_t* const*>(stage_state + 0x280 + slot * 8);
         if (srv_view != nullptr) {
-            std::memcpy(self->staged_srv_tsharps[binder_stage_idx][64u + slot], srv_view + 0x10, 32);
+            uint8_t* dst = self->staged_srv_tsharps[binder_stage_idx][64u + slot];
+            if (!any_srv_spec_changed &&
+                !gx_direct_vk::SrvSharpSpecEquivalent(
+                    reinterpret_cast<const uint32_t*>(dst),
+                    reinterpret_cast<const uint32_t*>(srv_view + 0x10))) {
+                any_srv_spec_changed = true;
+            }
+            std::memcpy(dst, srv_view + 0x10, 32);
             dirty_cmds_accum |= st.srv_hi_dep_masks[slot];
         }
     }
@@ -1549,18 +1600,27 @@ inline void StageAndExecuteGraphicsShaderStage(
     // 3. Dirty Samplers 0..15
     const uint64_t other_dirty = st.dirty_other_mask & st.active_other_mask;
     uint64_t samp_dirty = other_dirty & 0xFFFFULL;
+    bool any_samp_spec_changed = false;
     if (samp_dirty != 0ULL) {
         const void* default_sampler = reinterpret_cast<const void*>(GX_VMA(0x546c8b0ULL));
         while (samp_dirty != 0ULL) {
             const uint32_t slot = static_cast<uint32_t>(__builtin_ctzll(samp_dirty));
             samp_dirty &= (samp_dirty - 1ULL);
             const void* samp_view = *reinterpret_cast<const void* const*>(stage_state + 0x000 + slot * 8);
-            std::memcpy(self->staged_sampler_ssharps[binder_stage_idx][slot], samp_view ? samp_view : default_sampler, 16);
+            const void* src_samp = samp_view ? samp_view : default_sampler;
+            uint8_t* dst = self->staged_sampler_ssharps[binder_stage_idx][slot];
+            if (!any_samp_spec_changed &&
+                ((*reinterpret_cast<const uint32_t*>(dst) ^
+                  *reinterpret_cast<const uint32_t*>(src_samp)) & 0x00108000u) != 0u) {
+                any_samp_spec_changed = true;
+            }
+            std::memcpy(dst, src_samp, 16);
             dirty_cmds_accum |= st.other_dep_masks[slot];
         }
     }
 
     // 4. Dirty Constant Buffers 0..13 (bits 16..29)
+    bool any_cb_spec_changed = false;
     uint64_t cb_dirty = (other_dirty & 0x3FFF0000ULL) >> 16;
     if (cb_dirty != 0ULL) {
         const bool native_vsharp = gx_direct_vk::EnabledV2Sub(gx_direct_vk::kV2Sub_NativeVsharp);
@@ -1571,6 +1631,10 @@ inline void StageAndExecuteGraphicsShaderStage(
             const uint8_t* cb_res = *reinterpret_cast<const uint8_t* const*>(stage_state + 0x480 + slot * 8);
             if (cb_res != nullptr) {
                 uint8_t* dst_vsharp = self->staged_cb_vsharps[binder_stage_idx][slot];
+                const auto* v_dw = reinterpret_cast<const uint32_t*>(dst_vsharp);
+                const uint32_t old_w1 = v_dw[1];
+                const uint32_t old_w2 = v_dw[2];
+                const uint32_t old_w3 = v_dw[3];
                 void* gpu_addr      = FastFindStagingBuffer(staging_map, cb_res + 0x18);
                 const uint32_t dwords = *reinterpret_cast<const uint32_t*>(cb_res + 0x2c);
                 if (native_vsharp) [[likely]] {
@@ -1580,11 +1644,18 @@ inline void StageAndExecuteGraphicsShaderStage(
                     reinterpret_cast<void(*)(void*, void*, uint32_t)>(GX_VMA(0x1070960ULL))(dst_vsharp, gpu_addr, dwords);
                     reinterpret_cast<void(*)(void*, uint32_t, uint32_t, uint32_t)>(GX_VMA(0x10710c0ULL))(dst_vsharp, 0x6eu, 0u, 0u);
                 }
+                if ((old_w2 != 0u) != (v_dw[2] != 0u) ||
+                    ((old_w1 ^ v_dw[1]) & 0xBFFF0000u) != 0u ||
+                    ((old_w3 ^ v_dw[3]) & 0xC07FFFFFu) != 0u) {
+                    any_cb_spec_changed = true;
+                }
                 dirty_cmds_accum |= st.other_dep_masks[16u + slot];
             }
         }
     }
 
+    const bool spec_invariant =
+        !pre_dirty && !any_srv_spec_changed && !any_samp_spec_changed && !any_cb_spec_changed;
     st.dirty_cmd_mask |= dirty_cmds_accum;
     ExecuteStageBindingBytecode(
         self,
@@ -1593,7 +1664,9 @@ inline void StageAndExecuteGraphicsShaderStage(
         hdr,
         binder_stage_idx,
         gnm_stage,
-        0x20u);
+        0x20u,
+        spec_invariant,
+        shared_ud_batch);
 }
 
 inline bool UnpackVsAndInputLayout(
@@ -2059,8 +2132,11 @@ void CGShaderResourceBinderGnm_BindAndFlushGraphicsPipeline(
             BindPsShaderUsageFromExportShader(gnmx_ctx, vs_hdr->gnm_shader_object, ps_hdr);
         }
 
-        CGShaderResourceBinderGnm_BindVertexBuffersAndFetchShader(self, gnmx_ctx_wrapper, pipeline_state, 0u, 2u);
-        StageAndExecuteGraphicsShaderStage(self, gnmx_ctx_wrapper, gnmx_ctx, pipeline_state, vs_hdr, 0u, 2u);
+        {
+            gx_direct_vk::StageUserDataBatch vs_ud_batch{};
+            BindVertexBuffersAndFetchShaderImpl(self, gnmx_ctx_wrapper, pipeline_state, 0u, 2u, &vs_ud_batch);
+            StageAndExecuteGraphicsShaderStage(self, gnmx_ctx_wrapper, gnmx_ctx, pipeline_state, vs_hdr, 0u, 2u, &vs_ud_batch);
+        }
         if (ps_hdr != nullptr) {
             StageAndExecuteGraphicsShaderStage(self, gnmx_ctx_wrapper, gnmx_ctx, pipeline_state, ps_hdr, 4u, 1u);
         }
@@ -2117,8 +2193,11 @@ void CGShaderResourceBinderGnm_BindAndFlushGraphicsPipeline(
             BindPsShaderUsageFromExportShader(gnmx_ctx, gs_obj + 0x38 + gs_reg_count * 4, ps_hdr);
         }
 
-        CGShaderResourceBinderGnm_BindVertexBuffersAndFetchShader(self, gnmx_ctx_wrapper, pipeline_state, 0u, 4u);
-        StageAndExecuteGraphicsShaderStage(self, gnmx_ctx_wrapper, gnmx_ctx, pipeline_state, vs_hdr, 0u, 4u);
+        {
+            gx_direct_vk::StageUserDataBatch vs_ud_batch{};
+            BindVertexBuffersAndFetchShaderImpl(self, gnmx_ctx_wrapper, pipeline_state, 0u, 4u, &vs_ud_batch);
+            StageAndExecuteGraphicsShaderStage(self, gnmx_ctx_wrapper, gnmx_ctx, pipeline_state, vs_hdr, 0u, 4u, &vs_ud_batch);
+        }
         StageAndExecuteGraphicsShaderStage(self, gnmx_ctx_wrapper, gnmx_ctx, pipeline_state, gs_hdr, 3u, 3u);
         StageAndBindGsStreamOutBuffers(self, gnmx_ctx_wrapper, gnmx_ctx, pipeline_state, gs_hdr);
         if (ps_hdr != nullptr) {
@@ -2223,8 +2302,11 @@ void CGShaderResourceBinderGnm_BindAndFlushGraphicsPipeline(
             BindPsShaderUsageFromExportShader(gnmx_ctx, gs_obj + 0x38 + gs_reg_count * 4, ps_hdr);
         }
 
-        CGShaderResourceBinderGnm_BindVertexBuffersAndFetchShader(self, gnmx_ctx_wrapper, pipeline_state, 0u, 6u);
-        StageAndExecuteGraphicsShaderStage(self, gnmx_ctx_wrapper, gnmx_ctx, pipeline_state, vs_hdr, 0u, 6u);
+        {
+            gx_direct_vk::StageUserDataBatch vs_ud_batch{};
+            BindVertexBuffersAndFetchShaderImpl(self, gnmx_ctx_wrapper, pipeline_state, 0u, 6u, &vs_ud_batch);
+            StageAndExecuteGraphicsShaderStage(self, gnmx_ctx_wrapper, gnmx_ctx, pipeline_state, vs_hdr, 0u, 6u, &vs_ud_batch);
+        }
         StageAndExecuteGraphicsShaderStage(self, gnmx_ctx_wrapper, gnmx_ctx, pipeline_state, hs_hdr, 1u, 5u);
         StageAndExecuteGraphicsShaderStage(self, gnmx_ctx_wrapper, gnmx_ctx, pipeline_state, ds_hdr, 2u, 4u);
         StageAndExecuteGraphicsShaderStage(self, gnmx_ctx_wrapper, gnmx_ctx, pipeline_state, gs_hdr, 3u, 3u);
@@ -2316,8 +2398,11 @@ void CGShaderResourceBinderGnm_BindAndFlushGraphicsPipeline(
                 BindPsShaderUsageFromExportShader(gnmx_ctx, ds_hdr->gnm_shader_object, ps_hdr);
             }
 
-            CGShaderResourceBinderGnm_BindVertexBuffersAndFetchShader(self, gnmx_ctx_wrapper, pipeline_state, 0u, 6u);
-            StageAndExecuteGraphicsShaderStage(self, gnmx_ctx_wrapper, gnmx_ctx, pipeline_state, vs_hdr, 0u, 6u);
+            {
+                gx_direct_vk::StageUserDataBatch vs_ud_batch{};
+                BindVertexBuffersAndFetchShaderImpl(self, gnmx_ctx_wrapper, pipeline_state, 0u, 6u, &vs_ud_batch);
+                StageAndExecuteGraphicsShaderStage(self, gnmx_ctx_wrapper, gnmx_ctx, pipeline_state, vs_hdr, 0u, 6u, &vs_ud_batch);
+            }
             StageAndExecuteGraphicsShaderStage(self, gnmx_ctx_wrapper, gnmx_ctx, pipeline_state, hs_hdr, 1u, 5u);
             StageAndExecuteGraphicsShaderStage(self, gnmx_ctx_wrapper, gnmx_ctx, pipeline_state, ds_hdr, 2u, 2u);
             if (ps_hdr != nullptr) {

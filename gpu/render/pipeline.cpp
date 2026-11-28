@@ -227,7 +227,8 @@ void Pipeline::CreateLayouts(vk::ShaderStageFlags push_stages, const char* kind,
     pipeline_layout = *shared_layout->pipeline_layout;
 }
 
-void Pipeline::BindResources(DescriptorWrites& set_writes, const Shader::PushData& push_data,
+void Pipeline::BindResources(std::span<vk::WriteDescriptorSet> set_writes,
+                             const Shader::PushData& push_data,
                              std::span<const vk::DescriptorImageInfo> image_infos,
                              std::span<const vk::DescriptorBufferInfo> buffer_infos,
                              bool bulk_known) const {
@@ -455,7 +456,10 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, const Shader::PushDat
         for (auto& write : set_writes) {
             write.dstSet = desc_set;
         }
-        instance.GetDevice().updateDescriptorSets(set_writes, {});
+        instance.GetDevice().updateDescriptorSets(
+            vk::ArrayProxy<const vk::WriteDescriptorSet>{
+                static_cast<u32>(set_writes.size()), set_writes.data()},
+            {});
         if (fast_bind) {
             scheduler.Record([bind_point, layout, stage_flags, push_data,
                               desc_set](vk::CommandBuffer cmdbuf) {
@@ -475,7 +479,10 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, const Shader::PushDat
     if (!scheduler.IsRecordingDeferred()) {
         scheduler.Record([&](vk::CommandBuffer cmdbuf) {
             cmdbuf.pushConstants(layout, stage_flags, 0u, sizeof(push_data), &push_data);
-            cmdbuf.pushDescriptorSetKHR(bind_point, layout, 0, set_writes);
+            cmdbuf.pushDescriptorSetKHR(
+                bind_point, layout, 0,
+                vk::ArrayProxy<const vk::WriteDescriptorSet>{
+                    static_cast<u32>(set_writes.size()), set_writes.data()});
         });
         return;
     }

@@ -42,6 +42,7 @@ void StartSfxFireDump(u32 duration_ms = 5000u) noexcept;
 #include "bbport_settings.h"
 #include "bbport_system_info.h"
 #include "bbport_toggles.h"
+#include "render/native_cmd_stream.h"
 #include "imgui.h"
 #include "imgui_impl_vulkan.h"
 #include "vulkan/instance.h"
@@ -815,6 +816,38 @@ void Menu() {
         "До 1 — резкость самого апскейлера (RCAS). Выше 1 добавляется ещё один проход RCAS. "
         "Ctrl+клик по ползунку — ввести точное значение."));
     ImGui::EndDisabled();
+    {
+        const float cur_mb = s.upscaler_mip_bias.load(std::memory_order_relaxed);
+        static constexpr float mb_vals[] = {
+            BbSettings::Values::UpscalerMipBiasAuto, 0.0f, -0.5f, -1.0f, -1.5f, -2.0f,
+        };
+        const char* mb_labels[] = {
+            BbSettings::MenuText("Auto (Recommended)", "Авто (рекомендуется)"),
+            BbSettings::MenuText("0.00 (Soft)", "0.00 (мягко)"),
+            BbSettings::MenuText("-0.50 (Balanced)", "-0.50 (баланс)"),
+            BbSettings::MenuText("-1.00 (Sharp — DLSS/FSR Rec.)", "-1.00 (чётко — рек. DLSS/FSR)"),
+            BbSettings::MenuText("-1.50 (Extra Sharp)", "-1.50 (очень чётко)"),
+            BbSettings::MenuText("-2.00 (Maximum)", "-2.00 (максимум)"),
+        };
+        int mb_idx = 0;
+        if (!BbSettings::IsUpscalerMipBiasAuto(cur_mb)) {
+            const float q = BbSettings::QuantizeUpscalerMipBias(cur_mb);
+            mb_idx = q >= -0.25f   ? 1
+                     : q >= -0.75f ? 2
+                     : q >= -1.25f ? 3
+                     : q >= -1.75f ? 4
+                                   : 5;
+        }
+        if (ImGui::Combo(BbSettings::MenuText("Texture Mip Bias", "Mip Bias текстур"), &mb_idx,
+                         mb_labels, 6)) {
+            Store(s.upscaler_mip_bias, mb_vals[mb_idx], true);
+        }
+        Hint(BbSettings::MenuText(
+            "Extra negative LOD bias on scene textures under DLSS/FSR at zero GPU cost. Auto uses "
+            "-1.0 on DLSS/FSR 4 and -0.5 on FSR 3.1 while upscaling (0.0 at Native AA). Applies live.",
+            "Дополнительный отрицательный LOD bias для текстур сцены при DLSS/FSR без нагрузки на GPU. "
+            "Авто: -1.0 для DLSS/FSR 4 и -0.5 для FSR 3.1 при апскейле (0.0 для Native AA). Применяется сразу."));
+    }
     // Frame Generation (FSR 3.1 2x/3x/4x on any GPU; NVIDIA DLSS-G 2x on RTX 40+, 3x/4x on RTX 50+).
     {
         const bool is_ru = s.menu_language.load(std::memory_order_relaxed) ==
@@ -1377,6 +1410,27 @@ void Menu() {
             "Сохраняется в bbport.ini. Авто подбирает герцовку монитора, 0 — без лимита, либо Ctrl+клик по ползунку "
             "для ввода точного числа. На 30 FPS кинематика Лоуренса не зависает."));
     }
+    ImGui::SeparatorText(BbSettings::MenuText("Audio (3D / 7.1)", "Звук (3D / 7.1)"));
+    {
+        int am = std::clamp(s.audio_mode.load(std::memory_order_relaxed), 0,
+                            BbSettings::AudioModeCount - 1);
+        const char* am_labels[] = {
+            BbSettings::MenuText("Stereo (Speakers)", "Стерео (Колонки)"),
+            BbSettings::MenuText("Headphones (7.1 HRTF)", "Наушники (7.1 HRTF)"),
+            BbSettings::MenuText("Surround (7.1 / OS Spatial)", "Объёмный (7.1 / OS Spatial)"),
+        };
+        if (ImGui::Combo(BbSettings::MenuText("Audio Output", "Режим звука"), &am, am_labels,
+                         BbSettings::AudioModeCount)) {
+            Store(s.audio_mode, am, true);
+        }
+        Hint(BbSettings::MenuText(
+            "Stereo: clean full-loudness 7.1->2.0 fold. Headphones (7.1 HRTF): built-in 48 kHz "
+            "binaural 3D surround for any headphones/IEMs on Linux & Windows (switches live, zero "
+            "reverb coloration). Surround (7.1): discrete 5.1/7.1 receivers or Windows Dolby Atmos/DTS.",
+            "Стерео: чистый полногромкий даунмикс 7.1->2.0. Наушники (7.1 HRTF): встроенный 48 кГц "
+            "бинауральный 3D-звук для любых наушников/IEM на Linux и Windows (переключается на лету, "
+            "нейтральный тональный баланс). Объёмный (7.1): ресиверы 5.1/7.1 или Windows Dolby Atmos/DTS."));
+    }
     ImGui::SeparatorText(BbSettings::MenuText("Controls (Keyboard & Mouse)", "Управление (Клавиатура и мышь)"));
     const bool controls_prev_open = s.menu_sec_controls.load(std::memory_order_relaxed);
     ImGui::SetNextItemOpen(controls_prev_open, ImGuiCond_Always);
@@ -1869,6 +1923,8 @@ struct HudSampleSlot {
     std::uint64_t native_buf_total = 0;
     std::uint64_t native_tex_hits = 0;
     std::uint64_t native_tex_total = 0;
+    std::uint64_t native_stream_hits = 0;
+    std::uint64_t native_stream_total = 0;
     std::uint64_t desc_saved = 0;
     std::uint64_t desc_total = 0;
     double idle_a_ms = 0.0;
@@ -1946,6 +2002,8 @@ struct HudSlidingWindow {
             sum.native_buf_total += s.native_buf_total;
             sum.native_tex_hits += s.native_tex_hits;
             sum.native_tex_total += s.native_tex_total;
+            sum.native_stream_hits += s.native_stream_hits;
+            sum.native_stream_total += s.native_stream_total;
             sum.desc_saved += s.desc_saved;
             sum.desc_total += s.desc_total;
             sum.idle_a_ms += s.idle_a_ms;
@@ -2021,6 +2079,7 @@ struct HudBreakdown {
     float eop_pf = 0.0f;
     float native_buf_pct = 0.0f, avg_native_buf_pct = 0.0f;
     float native_tex_pct = 0.0f, avg_native_tex_pct = 0.0f;
+    float native_stream_pct = 0.0f, avg_native_stream_pct = 0.0f;
     float desc_saved_pct = 0.0f, avg_desc_saved_pct = 0.0f;
     // Live GPU hardware sensors (NVML / sysfs hwmon)
     bool has_gpu_sensors = false;
@@ -2769,6 +2828,7 @@ void UpdateHudBreakdown(HudBreakdown& h) {
     static std::uint64_t last_faults = 0, last_eop = 0;
     static std::uint64_t last_native_hits = 0, last_native_misses = 0;
     static std::uint64_t last_native_tex_hits = 0, last_native_tex_misses = 0;
+    static std::uint64_t last_native_stream_draws = 0, last_legacy_stream_draws = 0;
     static std::uint64_t last_desc_saved = 0, last_desc_total = 0;
     static std::uint64_t last_hw_busy_ns = 0, last_hw_gap_ns = 0, last_hw_inter_gap_ns = 0,
                          last_hw_frames = 0;
@@ -2823,6 +2883,8 @@ void UpdateHudBreakdown(HudBreakdown& h) {
         last_native_misses = BbStats::native_buf_misses.load(std::memory_order_relaxed);
         last_native_tex_hits = BbStats::native_tex_hits.load(std::memory_order_relaxed);
         last_native_tex_misses = BbStats::native_tex_misses.load(std::memory_order_relaxed);
+        last_native_stream_draws = BbStats::native_stream_draws.load(std::memory_order_relaxed);
+        last_legacy_stream_draws = BbStats::legacy_stream_draws.load(std::memory_order_relaxed);
         last_desc_saved = BbStats::desc_push_saved.load(std::memory_order_relaxed);
         last_desc_total = BbStats::desc_push_total.load(std::memory_order_relaxed);
         last_hw_busy_ns = BbStats::hw_gpu_busy_ns.load(std::memory_order_relaxed);
@@ -2910,6 +2972,10 @@ void UpdateHudBreakdown(HudBreakdown& h) {
         BbStats::native_tex_hits.load(std::memory_order_relaxed);
     const std::uint64_t cur_native_tex_misses =
         BbStats::native_tex_misses.load(std::memory_order_relaxed);
+    const std::uint64_t cur_native_stream_draws =
+        BbStats::native_stream_draws.load(std::memory_order_relaxed);
+    const std::uint64_t cur_legacy_stream_draws =
+        BbStats::legacy_stream_draws.load(std::memory_order_relaxed);
     const std::uint64_t cur_desc_saved =
         BbStats::desc_push_saved.load(std::memory_order_relaxed);
     const std::uint64_t cur_desc_total =
@@ -2953,6 +3019,8 @@ void UpdateHudBreakdown(HudBreakdown& h) {
     const std::uint64_t dm = safe_delta(cur_native_misses, last_native_misses);
     const std::uint64_t dth = safe_delta(cur_native_tex_hits, last_native_tex_hits);
     const std::uint64_t dtm = safe_delta(cur_native_tex_misses, last_native_tex_misses);
+    const std::uint64_t dns = safe_delta(cur_native_stream_draws, last_native_stream_draws);
+    const std::uint64_t dls = safe_delta(cur_legacy_stream_draws, last_legacy_stream_draws);
     const std::uint64_t dds = safe_delta(cur_desc_saved, last_desc_saved);
     const std::uint64_t ddt = safe_delta(cur_desc_total, last_desc_total);
 
@@ -2998,6 +3066,7 @@ void UpdateHudBreakdown(HudBreakdown& h) {
     h.eop_pf = float(double(safe_delta(cur_eop, last_eop)) * inv_f);
     h.native_buf_pct = (dh + dm) > 0 ? float(100.0 * double(dh) / double(dh + dm)) : 0.0f;
     h.native_tex_pct = (dth + dtm) > 0 ? float(100.0 * double(dth) / double(dth + dtm)) : 0.0f;
+    h.native_stream_pct = (dns + dls) > 0 ? float(100.0 * double(dns) / double(dns + dls)) : 0.0f;
     h.desc_saved_pct = ddt > 0 ? float(100.0 * double(dds) / double(ddt)) : 0.0f;
 
     const std::uint64_t d_hw_frames = safe_delta(cur_hw_frames, last_hw_frames);
@@ -3288,6 +3357,8 @@ void UpdateHudBreakdown(HudBreakdown& h) {
         s.native_buf_total = dh + dm;
         s.native_tex_hits = dth;
         s.native_tex_total = dth + dtm;
+        s.native_stream_hits = dns;
+        s.native_stream_total = dns + dls;
         s.desc_saved = dds;
         s.desc_total = ddt;
         s.idle_a_ms = double(h.idle_a_ms) * f_weight;
@@ -3365,6 +3436,10 @@ void UpdateHudBreakdown(HudBreakdown& h) {
                                    ? float(100.0 * double(win.sum.native_tex_hits) /
                                            double(win.sum.native_tex_total))
                                    : h.native_tex_pct;
+        h.avg_native_stream_pct = win.sum.native_stream_total > 0
+                                      ? float(100.0 * double(win.sum.native_stream_hits) /
+                                              double(win.sum.native_stream_total))
+                                      : h.native_stream_pct;
         h.avg_desc_saved_pct =
             win.sum.desc_total > 0
                 ? float(100.0 * double(win.sum.desc_saved) / double(win.sum.desc_total))
@@ -3430,6 +3505,7 @@ void UpdateHudBreakdown(HudBreakdown& h) {
         h.avg_faults_ps = h.faults_ps;
         h.avg_native_buf_pct = h.native_buf_pct;
         h.avg_native_tex_pct = h.native_tex_pct;
+        h.avg_native_stream_pct = h.native_stream_pct;
         h.avg_desc_saved_pct = h.desc_saved_pct;
         h.avg_idle_a_ms = h.idle_a_ms;
         h.avg_gnm_wait_ms = h.gnm_wait_ms;
@@ -3608,6 +3684,8 @@ void UpdateHudBreakdown(HudBreakdown& h) {
     last_native_misses = cur_native_misses;
     last_native_tex_hits = cur_native_tex_hits;
     last_native_tex_misses = cur_native_tex_misses;
+    last_native_stream_draws = cur_native_stream_draws;
+    last_legacy_stream_draws = cur_legacy_stream_draws;
     last_desc_saved = cur_desc_saved;
     last_desc_total = cur_desc_total;
     if (d_hw_frames > 0) {
@@ -3687,17 +3765,18 @@ void UpdateHudBreakdown(HudBreakdown& h) {
             std::snprintf(fg_hud_str, sizeof(fg_hud_str), " | FG: %s (paused)",
                           BbSettings::IsDlssFrameGen(fg_eff) ? "DLSS" : "FSR3");
         }
+        const bool ns_on = bb_native_stream::Enabled();
         char hud_buf[4096];
         std::snprintf(
             hud_buf, sizeof(hud_buf),
             "FPS: %.1f (%.2f ms/f) | Avg15s: %.1f FPS (%.2f ms/f, Jit %.2f ms) | Scene: %dx%d -> %dx%d | Cap %d | Up: %s (%s)%s%s%s\n"
             "GPU HW: %.1f W | %d MHz | %d C | DrvBusy %d%% | VRAM Proc %.2f GB (Sys %.2f/%.2f GB)\n"
             "%s"
-            "Counts/f: Draws %.0f (Avg %.0f) | Disp %.0f (Avg %.0f) | Subm %.1f (Avg %.1f) | PipeDrains %.1f | Faults/s %.1f | NativeVkBuf %.1f%% | NativeVkTex %.1f%% | DescSaved %.1f%% | DontCare %llu/%llu\n"
+            "Counts/f: Draws %.0f (Avg %.0f) | Disp %.0f (Avg %.0f) | Subm %.1f (Avg %.1f) | PipeDrains %.1f | Faults/s %.1f | NativeVkBuf %.1f%% | NativeVkTex %.1f%% | NativeStream %.1f%% | DescSaved %.1f%% | DontCare %llu/%llu\n"
             "DirectShaders: reg %llu | manifest %llu/%u | stageA_hits %llu | worker_hits %llu\n"
             "CPU 1. Game Engine: Work %.2f ms (Avg %.2f) | ThreadSync %.2f ms (Avg %.2f) | FpsCapSleep %.2f ms (Avg %.2f) | GnmWait %.2f ms (Avg %.2f)\n"
-            "CPU 2. Stage A (DirectVk RHI): Total %.2f ms (Avg %.2f) -> [%s %.2f | %s %.2f | %s %.2f | %s %.2f | %s %.2f]\n"
-            "CPU 3. Stage B (Vulkan Record): Total %.2f ms (Avg %.2f) -> [3a.Buffers %.2f | 3b.Tex+Desc %.2f | 3c.Pass+Draw+Disp %.2f | 3d.Tasks %.2f | 3e.Packet+Regs %.2f]\n"
+            "%s: Total %.2f ms (Avg %.2f) -> [%s %.2f | %s %.2f | %s %.2f | %s %.2f | %s %.2f]\n"
+            "%s: Total %.2f ms (Avg %.2f) -> [3a.Buffers %.2f | 3b.Tex+Desc %.2f | 3c.Pass+Draw+Disp %.2f | 3d.Tasks %.2f | %s %.2f]\n"
             "PipeXRay/f: Pkts %.0f (Tasks %.0f, Resolve %.0f / %.2f ms, ResWakes %.0f, B_WaitRes %.2f ms) | FastPSO %.1f%% (full %.0f/f, Sig %.2f Flat %.2f Match %.2f) | A_Cull[Tot %.2f Micro %.2f Vsm %.2f Light %.2f Vel %.2f Vfx %.2f] | B_Sub[Unpack %.2f DrawMisc %.2f (OccSort %.2f DrawEmit %.2f) BindBuf %.2f VtxIdx %.2f BindTex %.2f PipeBind %.2f PrepSt %.2f BeginRP %.2f EmitVtx %.2f DynSt %.2f Kick %.2f Mot %.2f]\n"
             "GPU Render Passes: TotalBusy %.2f ms (Avg %.2f) | MidBubble %.2f ms (Avg %.2f) | InterWait %.2f ms (Avg %.2f) | PresentSync %.2f ms (Avg %.2f)\n"
             "  1.Shadow %.2f ms (1a.CSM/Spot %.2f | 1b.VSM/PCF %.2f) | 2.GBuf %.2f ms (2a.World/Chr %.2f | 2b.Foliage %.2f)\n"
@@ -3719,7 +3798,7 @@ void UpdateHudBreakdown(HudBreakdown& h) {
             sys_hw_line,
             h.draws_pf, h.avg_draws_pf, h.dispatches_pf, h.avg_dispatches_pf,
             h.submits_pf, h.avg_submits_pf, h.drains_pf,
-            h.faults_ps, h.native_buf_pct, h.native_tex_pct,
+            h.faults_ps, h.native_buf_pct, h.native_tex_pct, h.native_stream_pct,
             h.desc_saved_pct,
             static_cast<unsigned long long>(BbStats::dont_care_passes.load(std::memory_order_relaxed)),
             static_cast<unsigned long long>(BbStats::total_render_passes.load(std::memory_order_relaxed)),
@@ -3730,15 +3809,21 @@ void UpdateHudBreakdown(HudBreakdown& h) {
             static_cast<unsigned long long>(shd.worker_direct_hits),
             h.game_cpu_work_ms, h.avg_game_cpu_work_ms, h.main_sync_wait_ms, h.avg_main_sync_wait_ms,
             h.fps_cap_sleep_ms, h.avg_fps_cap_sleep_ms, h.gnm_wait_ms, h.avg_gnm_wait_ms,
+            ns_on ? "CPU 2. Native Stream (Cull & Pack)" : "CPU 2. Stage A (DirectVk RHI)",
             h.a_total_ms, h.avg_a_total_ms,
-            h.a_pipelined_breakdown ? "2a.PM4+Regs" : "2a.PM4+FastPSO", h.a_decode_pso_ms,
-            h.a_pipelined_breakdown ? "2b.FastPSO" : "2b.Buf+Vtx+Ring", h.a_buf_ring_ms,
-            h.a_pipelined_breakdown ? "2c.PostDraw" : "2c.Tex+PushDesc", h.a_tex_desc_ms,
+            h.a_pipelined_breakdown ? (ns_on ? "2a.CmdStream" : "2a.PM4+Regs") : "2a.PM4+FastPSO",
+            h.a_decode_pso_ms,
+            h.a_pipelined_breakdown ? (ns_on ? "2b.DirectPso" : "2b.FastPSO") : "2b.Buf+Vtx+Ring",
+            h.a_buf_ring_ms,
+            h.a_pipelined_breakdown ? (ns_on ? "2c.StreamPack" : "2c.PostDraw") : "2c.Tex+PushDesc",
+            h.a_tex_desc_ms,
             h.a_pipelined_breakdown ? "2d.Ring" : "2d.Pass+State+Draw", h.a_state_draw_ms,
-            h.a_pipelined_breakdown ? "2e.Misc+Sync" : "2e.Submit+Sync", h.a_submit_sync_ms,
+            h.a_pipelined_breakdown ? (ns_on ? "2e.Cull+Sync" : "2e.Misc+Sync") : "2e.Submit+Sync",
+            h.a_submit_sync_ms,
+            ns_on ? "CPU 3. Vulkan Record (Native)" : "CPU 3. Stage B (Vulkan Record)",
             h.b_total_ms, h.avg_b_total_ms, h.b_buffers_ms,
             h.b_tex_desc_ms, h.b_state_pass_ms,
-            h.b_tasks_ms, h.b_packet_misc_ms,
+            h.b_tasks_ms, ns_on ? "3e.UI+Bridge" : "3e.Packet+Regs", h.b_packet_misc_ms,
             h.pipe_pkts_pf, h.pipe_tasks_pf, h.resolve_pkts_pf, h.resolve_busy_ms,
             h.resolve_wakes_pf, h.stage_b_wait_res_ms,
             h.fast_pso_hit_pct, h.fast_pso_full_pf,
@@ -4470,10 +4555,20 @@ void FpsCounter() {
         const ImVec4 health_col = (h.faults_ps < 10.0f && h.eop_pf < 5.0f)
                                       ? ImVec4(0.55f, 0.88f, 0.62f, 1.0f)
                                       : ImVec4(1.0f, 0.72f, 0.38f, 1.0f);
-        ImGui::TextColored(health_col,
-                           "RHI: Flt %.0f/s | Disp %.0f | B-Busy %.0f%% | Nat %.0f%% | Dsc %.0f%%",
-                           h.faults_ps, h.dispatches_pf, h.b_busy_pct,
-                           std::min(h.native_buf_pct, h.native_tex_pct), h.desc_saved_pct);
+        if (bb_native_stream::Enabled()) {
+            ImGui::TextColored(
+                health_col,
+                "RHI: Flt %.0f/s | Disp %.0f | B-Busy %.0f%% | Nat %.0f%% | Strm %.0f%% | Dsc %.0f%%",
+                h.faults_ps, h.dispatches_pf, h.b_busy_pct,
+                std::min(h.native_buf_pct, h.native_tex_pct), h.native_stream_pct,
+                h.desc_saved_pct);
+        } else {
+            ImGui::TextColored(
+                health_col,
+                "RHI: Flt %.0f/s | Disp %.0f | B-Busy %.0f%% | Nat %.0f%% | Dsc %.0f%%",
+                h.faults_ps, h.dispatches_pf, h.b_busy_pct,
+                std::min(h.native_buf_pct, h.native_tex_pct), h.desc_saved_pct);
+        }
     }
 
     ImGui::Separator();
@@ -4664,16 +4759,22 @@ void FpsCounter() {
                                        ? (h.avg_fps_cap_sleep_ms + h.avg_gnm_wait_ms)
                                        : (h.avg_gnm_wait_ms + (thread_syncing ? h.avg_main_sync_wait_ms : 0.0f));
         row_cpu(sync_row_label, sync_row_now, sync_row_avg, h.bottleneck_kind == 4, true);
-        row_cpu("CPU 2. Stage A (DirectVk RHI)",
+        const bool ns_hud = bb_native_stream::Enabled();
+        row_cpu(ns_hud ? "CPU 2. Native Stream (Cull & Pack)" : "CPU 2. Stage A (DirectVk RHI)",
                 h.a_total_ms, h.avg_a_total_ms, h.bottleneck_kind == 2);
         const bool stage_b_active = (h.b_total_ms >= 0.02f || h.avg_b_total_ms >= 0.02f);
         if (xray) {
             if (h.a_pipelined_breakdown) {
-                row_cpu_sub("  2a. PM4 Decode & Regs", h.a_decode_pso_ms, h.avg_a_decode_pso_ms);
-                row_cpu_sub("  2b. FastPSO Select", h.a_buf_ring_ms, h.avg_a_buf_ring_ms);
-                row_cpu_sub("  2c. PostDraw & Pack", h.a_tex_desc_ms, h.avg_a_tex_desc_ms);
-                row_cpu_sub("  2d. Ring Consts", h.a_state_draw_ms, h.avg_a_state_draw_ms);
-                row_cpu_sub("  2e. Draw Misc & Sync", h.a_submit_sync_ms, h.avg_a_submit_sync_ms);
+                row_cpu_sub(ns_hud ? "  2a. DirectVk CmdStream" : "  2a. PM4 Decode & Regs",
+                            h.a_decode_pso_ms, h.avg_a_decode_pso_ms);
+                row_cpu_sub(ns_hud ? "  2b. DirectPso Select" : "  2b. FastPSO Select",
+                            h.a_buf_ring_ms, h.avg_a_buf_ring_ms);
+                row_cpu_sub(ns_hud ? "  2c. NativeStream Pack" : "  2c. PostDraw & Pack",
+                            h.a_tex_desc_ms, h.avg_a_tex_desc_ms);
+                row_cpu_sub(ns_hud ? "  2d. ConstantRing" : "  2d. Ring Consts",
+                            h.a_state_draw_ms, h.avg_a_state_draw_ms);
+                row_cpu_sub(ns_hud ? "  2e. Cull, Batch & Sync" : "  2e. Draw Misc & Sync",
+                            h.a_submit_sync_ms, h.avg_a_submit_sync_ms);
             } else {
                 row_cpu_sub("  2a. Cmd Stream, Cull & FastPSO", h.a_decode_pso_ms, h.avg_a_decode_pso_ms);
                 row_cpu_sub("  2b. Buffers, Vtx/Idx & Ring", h.a_buf_ring_ms, h.avg_a_buf_ring_ms);
@@ -4686,14 +4787,15 @@ void FpsCounter() {
                 row_cpu_sub("  2e. Queue Submit & Sync", h.a_submit_sync_ms, h.avg_a_submit_sync_ms);
             }
         }
-        row_cpu("CPU 3. Stage B (Vulkan Record)",
+        row_cpu(ns_hud ? "CPU 3. Vulkan Record (Native)" : "CPU 3. Stage B (Vulkan Record)",
                 h.b_total_ms, h.avg_b_total_ms, h.bottleneck_kind == 3);
         if (xray && stage_b_active) {
             row_cpu_sub("  3a. Buffers, Vtx/Idx & VRAM", h.b_buffers_ms, h.avg_b_buffers_ms);
             row_cpu_sub("  3b. Textures & PushDesc", h.b_tex_desc_ms, h.avg_b_tex_desc_ms);
             row_cpu_sub("  3c. RenderPass, State & Draws", h.b_state_pass_ms, h.avg_b_state_pass_ms);
             row_cpu_sub("  3d. Async Tasks & Copies", h.b_tasks_ms, h.avg_b_tasks_ms);
-            row_cpu_sub("  3e. Pipe Packet & Regs", h.b_packet_misc_ms, h.avg_b_packet_misc_ms);
+            row_cpu_sub(ns_hud ? "  3e. Stream & UI Bridge" : "  3e. Pipe Packet & Regs",
+                        h.b_packet_misc_ms, h.avg_b_packet_misc_ms);
         }
 
         // Full 10-pass + 21-subpass Hardware GPU Render Pass Breakdown

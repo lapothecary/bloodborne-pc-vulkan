@@ -137,48 +137,73 @@ void CGRasterizerCacheGnm_FlushToGfxContext(
 
     void* gfxc = gnmx_ctx_wrapper + 0x10;
     const bool direct_rs = gx_direct_vk::EnabledV2Sub(gx_direct_vk::kV2Sub_RasterState);
-    gx_direct_vk::ContextRegBatch batch;
+    gx_direct_vk::ContextRegBatch batch{/*from_direct_state=*/true};
 
     if (rs != self->bound_rs) {
         const auto* eff_rs = rs ? rs : reinterpret_cast<const CGRasterizerStateObject*>(g_eboot_live_slide + 0x546ca58ULL);
-        if (eff_rs->primitive_setup != self->primitive_setup) {
-            if (direct_rs) {
-                batch.SetPrimitiveSetup(gfxc, eff_rs->primitive_setup);
-            } else {
-                sub_1076b30_setPrimitiveSetup(gfxc, eff_rs->primitive_setup);
-            }
+        const uint32_t rs_id = gx_direct_vk::LookupDirectRasterStateId(eff_rs);
+        const bool emit_rs_authoritative = direct_rs && (rs_id != 0u);
+        if (direct_rs) {
+            gx_direct_vk::EmitSetDirectStateId(gfxc, 0u, rs_id);
+        }
+        if (emit_rs_authoritative) [[likely]] {
             self->primitive_setup = eff_rs->primitive_setup;
-        }
-        if (eff_rs->clip_control != self->clip_control) {
-            if (direct_rs) {
-                batch.SetClipControl(gfxc, eff_rs->clip_control);
-            } else {
-                sub_1076e00_setClipControl(gfxc, eff_rs->clip_control);
-            }
             self->clip_control = eff_rs->clip_control;
-        }
-        float slope_bias = eff_rs->slope_scale_depth_bias;
-        float const_bias = eff_rs->depth_bias;
-        if (!FloatEqualNotNan(const_bias, self->depth_bias) ||
-            !FloatEqualNotNan(slope_bias, self->slope_scale_depth_bias)) {
-            float scaled_bias = const_bias * 16.0f;
-            if (direct_rs) {
-                batch.SetPolygonOffsetFrontBack(gfxc, scaled_bias, slope_bias);
-            } else {
-                sub_1077070_setPolygonOffsetFront(gfxc, scaled_bias, slope_bias);
-                sub_10770e0_setPolygonOffsetBack(gfxc, scaled_bias, slope_bias);
+            self->depth_bias = eff_rs->depth_bias;
+            self->slope_scale_depth_bias = eff_rs->slope_scale_depth_bias;
+            self->depth_bias_clamp = eff_rs->depth_bias_clamp;
+            *reinterpret_cast<uint32_t*>(&self->msaa_enable) =
+                *reinterpret_cast<const uint32_t*>(&eff_rs->msaa_enable);
+        } else {
+            if (eff_rs->primitive_setup != self->primitive_setup) {
+                if (direct_rs) {
+                    batch.SetPrimitiveSetup(gfxc, eff_rs->primitive_setup);
+                } else {
+                    sub_1076b30_setPrimitiveSetup(gfxc, eff_rs->primitive_setup);
+                }
+                self->primitive_setup = eff_rs->primitive_setup;
             }
-            self->depth_bias = const_bias;
-            self->slope_scale_depth_bias = slope_bias;
-        }
-        float clamp_val = eff_rs->depth_bias_clamp;
-        if (!FloatEqualNotNan(clamp_val, self->depth_bias_clamp)) {
-            if (direct_rs) {
-                batch.SetPolygonOffsetClamp(gfxc, clamp_val);
-            } else {
-                sub_1076fa0_setPolygonOffsetClamp(gfxc, clamp_val);
+            if (eff_rs->clip_control != self->clip_control) {
+                if (direct_rs) {
+                    batch.SetClipControl(gfxc, eff_rs->clip_control);
+                } else {
+                    sub_1076e00_setClipControl(gfxc, eff_rs->clip_control);
+                }
+                self->clip_control = eff_rs->clip_control;
             }
-            self->depth_bias_clamp = clamp_val;
+            float slope_bias = eff_rs->slope_scale_depth_bias;
+            float const_bias = eff_rs->depth_bias;
+            if (!FloatEqualNotNan(const_bias, self->depth_bias) ||
+                !FloatEqualNotNan(slope_bias, self->slope_scale_depth_bias)) {
+                float scaled_bias = const_bias * 16.0f;
+                if (direct_rs) {
+                    batch.SetPolygonOffsetFrontBack(gfxc, scaled_bias, slope_bias);
+                } else {
+                    sub_1077070_setPolygonOffsetFront(gfxc, scaled_bias, slope_bias);
+                    sub_10770e0_setPolygonOffsetBack(gfxc, scaled_bias, slope_bias);
+                }
+                self->depth_bias = const_bias;
+                self->slope_scale_depth_bias = slope_bias;
+            }
+            float clamp_val = eff_rs->depth_bias_clamp;
+            if (!FloatEqualNotNan(clamp_val, self->depth_bias_clamp)) {
+                if (direct_rs) {
+                    batch.SetPolygonOffsetClamp(gfxc, clamp_val);
+                } else {
+                    sub_1076fa0_setPolygonOffsetClamp(gfxc, clamp_val);
+                }
+                self->depth_bias_clamp = clamp_val;
+            }
+            uint32_t rs_flags_dword = *reinterpret_cast<const uint32_t*>(&eff_rs->msaa_enable);
+            uint32_t cur_flags_dword = *reinterpret_cast<const uint32_t*>(&self->msaa_enable);
+            if (rs_flags_dword != cur_flags_dword) {
+                if (direct_rs) {
+                    batch.SetAaScissorEnable(gfxc, eff_rs->msaa_enable, eff_rs->scissor_enable);
+                } else {
+                    sub_1077150_setAaScissorEnable(gfxc, eff_rs->msaa_enable, eff_rs->scissor_enable);
+                }
+                *reinterpret_cast<uint32_t*>(&self->msaa_enable) = rs_flags_dword;
+            }
         }
         uint32_t cur_z_fmt = self->z_format;
         uint32_t new_z_fmt = cur_z_fmt;
@@ -193,16 +218,6 @@ void CGRasterizerCacheGnm_FlushToGfxContext(
                 sub_1077000_setPolygonOffsetZead(gfxc, new_z_fmt);
             }
             self->z_format = new_z_fmt;
-        }
-        uint32_t rs_flags_dword = *reinterpret_cast<const uint32_t*>(&eff_rs->msaa_enable);
-        uint32_t cur_flags_dword = *reinterpret_cast<const uint32_t*>(&self->msaa_enable);
-        if (rs_flags_dword != cur_flags_dword) {
-            if (direct_rs) {
-                batch.SetAaScissorEnable(gfxc, eff_rs->msaa_enable, eff_rs->scissor_enable);
-            } else {
-                sub_1077150_setAaScissorEnable(gfxc, eff_rs->msaa_enable, eff_rs->scissor_enable);
-            }
-            *reinterpret_cast<uint32_t*>(&self->msaa_enable) = *reinterpret_cast<const uint32_t*>(&eff_rs->msaa_enable);
         }
         self->bound_rs = rs;
     }
@@ -911,46 +926,57 @@ void CGOutputMergerCacheGnm_FlushBlendAndDepthStencilState(
 
     void* gfxc = gnmx_ctx_wrapper + 0x10;
     const bool direct_bds = gx_direct_vk::EnabledV2Sub(gx_direct_vk::kV2Sub_BlendDsState);
-    gx_direct_vk::ContextRegBatch batch{};
+    gx_direct_vk::ContextRegBatch batch{/*from_direct_state=*/true};
 
     const auto* bs = *reinterpret_cast<const CGBlendStateObject* const*>(pipeline_state + 0x4d0);
     if (bs != self->bound_blend_state) {
         const auto* eff_bs = bs ? bs : reinterpret_cast<const CGBlendStateObject*>(g_eboot_live_slide + 0x546c8f4ULL);
-        uint32_t a2c = eff_bs->alpha_to_coverage_enable;
-        if (a2c != self->alpha_to_coverage) {
-            if (direct_bds) {
-                batch.SetAlphaToMaskControl(gfxc, a2c);
-            } else {
-                uint32_t ox_ctrl = 0;
-                sub_1085600_oxControlInit(&ox_ctrl);
-                sub_1085610_oxControlSetAlphaCov(&ox_ctrl, a2c);
-                sub_1073030_setAlphaToMaskControl(gfxc, ox_ctrl);
-            }
-            self->alpha_to_coverage = a2c;
+        const uint32_t bs_id = gx_direct_vk::LookupDirectBlendStateId(eff_bs);
+        const bool emit_bs_authoritative = direct_bds && (bs_id != 0u);
+        if (direct_bds) {
+            gx_direct_vk::EmitSetDirectStateId(gfxc, 1u, bs_id);
         }
-        uint32_t rt_mask = eff_bs->render_target_channel_mask;
-        if (static_cast<uint64_t>(rt_mask) != self->rt_channel_mask) {
-            if (direct_bds) {
-                batch.SetRenderTargetMask(gfxc, rt_mask);
-            } else {
-                sub_1072fd0_setRenderTargetMask(gfxc, rt_mask);
-            }
-            self->bound_blend_state = reinterpret_cast<const CGBlendStateObject*>(-1ULL);
-            self->rt_channel_mask = rt_mask;
-        }
-        if (!direct_bds) {
-            uint32_t dummy_bc = 0;
-            sub_1084ea0_blendControlInit(&dummy_bc);
-        }
-        for (uint32_t slot = 0; slot < 8u; ++slot) {
-            if (self->blend_control[slot] != eff_bs->blend_control[slot]) {
+        if (emit_bs_authoritative) [[likely]] {
+            self->alpha_to_coverage = eff_bs->alpha_to_coverage_enable;
+            self->rt_channel_mask = eff_bs->render_target_channel_mask;
+            std::memcpy(self->blend_control, eff_bs->blend_control, sizeof(self->blend_control));
+        } else {
+            uint32_t a2c = eff_bs->alpha_to_coverage_enable;
+            if (a2c != self->alpha_to_coverage) {
                 if (direct_bds) {
-                    batch.SetBlendControl(gfxc, slot, eff_bs->blend_control[slot]);
+                    batch.SetAlphaToMaskControl(gfxc, a2c);
                 } else {
-                    sub_1073090_setBlendControl(gfxc, slot, eff_bs->blend_control[slot]);
+                    uint32_t ox_ctrl = 0;
+                    sub_1085600_oxControlInit(&ox_ctrl);
+                    sub_1085610_oxControlSetAlphaCov(&ox_ctrl, a2c);
+                    sub_1073030_setAlphaToMaskControl(gfxc, ox_ctrl);
                 }
-                self->blend_control[slot] = eff_bs->blend_control[slot];
+                self->alpha_to_coverage = a2c;
+            }
+            uint32_t rt_mask = eff_bs->render_target_channel_mask;
+            if (static_cast<uint64_t>(rt_mask) != self->rt_channel_mask) {
+                if (direct_bds) {
+                    batch.SetRenderTargetMask(gfxc, rt_mask);
+                } else {
+                    sub_1072fd0_setRenderTargetMask(gfxc, rt_mask);
+                }
                 self->bound_blend_state = reinterpret_cast<const CGBlendStateObject*>(-1ULL);
+                self->rt_channel_mask = rt_mask;
+            }
+            if (!direct_bds) {
+                uint32_t dummy_bc = 0;
+                sub_1084ea0_blendControlInit(&dummy_bc);
+            }
+            for (uint32_t slot = 0; slot < 8u; ++slot) {
+                if (self->blend_control[slot] != eff_bs->blend_control[slot]) {
+                    if (direct_bds) {
+                        batch.SetBlendControl(gfxc, slot, eff_bs->blend_control[slot]);
+                    } else {
+                        sub_1073090_setBlendControl(gfxc, slot, eff_bs->blend_control[slot]);
+                    }
+                    self->blend_control[slot] = eff_bs->blend_control[slot];
+                    self->bound_blend_state = reinterpret_cast<const CGBlendStateObject*>(-1ULL);
+                }
             }
         }
         self->bound_blend_state = bs;
@@ -977,23 +1003,36 @@ void CGOutputMergerCacheGnm_FlushBlendAndDepthStencilState(
 
     const uint32_t* stencil_op_src = &self->stencil_op_control;
     const auto* ds = *reinterpret_cast<const CGDepthStencilStateObject* const*>(pipeline_state + 0x4d8);
+    bool ds_applied_authoritative = false;
+    bool ds_was_reset = false;
     if (ds != self->bound_ds_state) {
+        ds_was_reset = (self->bound_ds_state == reinterpret_cast<const CGDepthStencilStateObject*>(-1ULL));
         const auto* eff_ds = ds ? ds : reinterpret_cast<const CGDepthStencilStateObject*>(g_eboot_live_slide + 0x546ca1cULL);
-        if (eff_ds->depth_control != self->depth_control) {
-            if (direct_bds) {
-                batch.SetDepthControl(gfxc, eff_ds->depth_control);
-            } else {
-                sub_10733a0_setDepthControl(gfxc, eff_ds->depth_control);
-            }
-            self->depth_control = eff_ds->depth_control;
+        const uint32_t ds_id = gx_direct_vk::LookupDirectDepthStencilStateId(eff_ds);
+        ds_applied_authoritative = direct_bds && (ds_id != 0u);
+        if (direct_bds) {
+            gx_direct_vk::EmitSetDirectStateId(gfxc, 2u, ds_id);
         }
-        if (eff_ds->stencil_control != self->stencil_control) {
-            if (direct_bds) {
-                batch.SetStencil(gfxc, eff_ds->stencil_control);
-            } else {
-                sub_1073400_setStencil(gfxc, eff_ds->stencil_control);
-            }
+        if (ds_applied_authoritative) [[likely]] {
+            self->depth_control = eff_ds->depth_control;
             self->stencil_control = eff_ds->stencil_control;
+        } else {
+            if (eff_ds->depth_control != self->depth_control) {
+                if (direct_bds) {
+                    batch.SetDepthControl(gfxc, eff_ds->depth_control);
+                } else {
+                    sub_10733a0_setDepthControl(gfxc, eff_ds->depth_control);
+                }
+                self->depth_control = eff_ds->depth_control;
+            }
+            if (eff_ds->stencil_control != self->stencil_control) {
+                if (direct_bds) {
+                    batch.SetStencil(gfxc, eff_ds->stencil_control);
+                } else {
+                    sub_1073400_setStencil(gfxc, eff_ds->stencil_control);
+                }
+                self->stencil_control = eff_ds->stencil_control;
+            }
         }
         stencil_op_src = &eff_ds->stencil_op_control;
         self->bound_ds_state = ds;
@@ -1002,10 +1041,13 @@ void CGOutputMergerCacheGnm_FlushBlendAndDepthStencilState(
     uint32_t sref = pipeline_state[0x584];
     uint32_t combined_stencil = ((*stencil_op_src) & 0x00FFFF00u) | sref | (sref << 24);
     if (combined_stencil != self->stencil_op_control) {
-        if (direct_bds) {
-            batch.SetStencilSeparate(gfxc, combined_stencil);
-        } else {
-            sub_1073190_setStencilSeparate(gfxc, combined_stencil);
+        const bool sref_changed = (sref != (self->stencil_op_control & 0xFFu));
+        if (!ds_applied_authoritative || ds_was_reset || sref_changed) {
+            if (direct_bds) {
+                batch.SetStencilSeparate(gfxc, combined_stencil);
+            } else {
+                sub_1073190_setStencilSeparate(gfxc, combined_stencil);
+            }
         }
         self->stencil_op_control = combined_stencil;
     }

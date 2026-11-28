@@ -823,7 +823,9 @@ bool Rasterizer::InspectMtPassTargets(
                             float(db_host_extent.height) / float(db_info.size.height)};
     }
     out.sampler_lod_bias =
-        (out.is_gbuffer && upscaler) ? upscaler->SceneMipBiasMt() : 0.0f;
+        (out.is_gbuffer && upscaler && !BbToggle::Disabled(BbToggle::SceneMipBias))
+            ? upscaler->SceneMipBiasMt()
+            : 0.0f;
     out.frame_jitter =
         (out.is_scene_depth && upscaler) ? upscaler->MtJitterForGuestFrame()
                                          : std::array<float, 2>{0.0f, 0.0f};

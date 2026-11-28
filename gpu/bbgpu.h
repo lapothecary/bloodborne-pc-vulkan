@@ -48,6 +48,9 @@ int bbgpu_mouse_captured(void);
  * thread does it. */
 void bbgpu_mouse_capture(void);
 void bbgpu_mouse_look_enable(int enabled);
+/* Live audio output mode (BbSettings::AudioMode): 0 = Stereo, 1 = Headphones (7.1 HRTF),
+ * 2 = Surround (7.1 / Windows Spatial Sound). Read by src/runtime_audio.c on every period. */
+int bbgpu_audio_mode(void);
 /* A module's look at the window's events first (an SDL_Event and the SDL_Window, on the window
  * thread): nonzero takes the event (the port and the game do not see it). Up to 4. */
 typedef int (*BbGpuEventFilter)(const void *sdl_event, void *sdl_window);

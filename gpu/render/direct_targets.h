@@ -39,6 +39,15 @@ u32 LookupColorTargetUid(const u32* gnm_rt_11dw) noexcept;
 /// Lock-free O(1) L1 lookup of Depth RenderTarget UID at bind time (EmitSetDepthRenderTarget).
 u32 LookupDepthTargetUid(const u32* gnm_dt_13dw) noexcept;
 
+struct RegistryStats {
+    u32 allocated_slots{0};
+    u64 stack_skips{0};
+    u64 wrap_count{0};
+};
+
+/// Diagnostic snapshot of DirectTargets slot utilization & stack-temp rejections.
+RegistryStats GetStats() noexcept;
+
 } // namespace Vulkan::DirectTargets
 
 extern "C" {

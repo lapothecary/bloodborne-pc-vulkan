@@ -33,6 +33,8 @@ class CommandProcessor;
 #include "render/vk_draw_prep.h"
 #include "upscale/vk_temporal_upscaler.h"
 #include "render/pipeline_cache.h"
+#include "render/native_cmd_stream.h"
+#include "render/native_stream_consumer.h"
 #include "render/scheduler.h"
 #include "textures/texture_cache.h"
 
@@ -57,6 +59,7 @@ class VsmShadowMemo;
 class ObjectVelocityCuller;
 class VfxUiBatcher;
 class VkMtDirectRecorder;
+class NativeStreamConsumer;
 struct SceneOcclusionCuller;
 
 class Rasterizer {
@@ -67,6 +70,7 @@ class Rasterizer {
     friend class ObjectVelocityCuller;
     friend class VfxUiBatcher;
     friend class VkMtDirectRecorder;
+    friend class NativeStreamConsumer;
 
 public:
     explicit Rasterizer(const Instance& instance, Scheduler& scheduler, Runtime& runtime,
@@ -706,6 +710,16 @@ private:
     mutable bool last_dyn_feedback_loop = false;
     mutable bool last_dyn_from_stage_b = false;
     u64 pipe_dyn_reg_epoch = 1;
+    u64 pipe_vp_scissor_epoch = 1;
+    u16 pipe_rs_id = 0;
+    u16 pipe_bs_id = 0;
+    u16 pipe_ds_id = 0;
+    mutable u64 last_vp_epoch = 0;
+    mutable u64 last_vp_cmd_epoch = 0;
+    mutable std::array<float, 2> last_vp_target_scale{};
+    mutable std::array<float, 2> last_vp_jitter{};
+    mutable u8 last_vp_ctrl_bits = 0xFFu;
+    mutable bool last_vp_from_stage_b = false;
     u64 begin_memo_hits = 0, begin_memo_misses = 0;
     static constexpr u64 kGdsSliceBytes = 256;
     std::array<VAddr, 16> gds_dword_mirror{};
@@ -783,7 +797,8 @@ private:
     void CollectRingBindings(const Shader::Info& stage, const PreparedDraw* prepared,
                              boost::container::static_vector<RingBinding, Shader::NUM_BUFFERS>& out,
                              const Gcn::ComputeProgram* cs = nullptr,
-                             const BatchedLightStageOverride* st_ovr = nullptr);
+                             const BatchedLightStageOverride* st_ovr = nullptr,
+                             Gcn::Buffer* out_vsharps = nullptr);
     void PrintPipeStats();
     /// The registers of the draw being recorded: stage B's copy there, else Liverpool's.
     const Gcn::Regs& Regs() const;
@@ -805,7 +820,17 @@ private:
     /// `on_helper`: run by the texture binding helper; out-of-date images are not refreshed.
     void BindTextures(const Shader::Info& stage, const PreparedStage* prepared,
                       Shader::Backend::Bindings& binding, u32& write_index, bool& barrier,
-                      bool on_helper = false);
+                      bool on_helper = false, const Gcn::Image* override_sharps = nullptr,
+                      bool bind_samplers = true);
+    void BindNativeTextures(const Shader::Info& stage,
+                            std::span<const bb_native_stream::NativeSrvBinding> srvs,
+                            std::span<const u32> samplers, u32 ta_bc_base,
+                            Shader::Backend::Bindings& binding, u32& write_index, bool& barrier,
+                            u32& out_srv_fast, u32& out_srv_slow, u32& out_smp_fast,
+                            u32& out_smp_slow);
+    void BindNativeSamplers(const Shader::Info& stage, std::span<const u32> samplers,
+                            u32 ta_bc_base, Shader::Backend::Bindings& binding, u32& write_index,
+                            u32& out_smp_fast, u32& out_smp_slow);
     bool BindResources(const Pipeline* pipeline);
     /// The layout transition of an image a shader reads (or writes, `is_storage`); true when
     /// it records a barrier.
@@ -854,6 +879,7 @@ private:
         static constexpr size_t NumWays = 2;
         static constexpr size_t TableSize = NumSets * NumWays;
         u64 key = 0;
+        u64 gen = 0; ///< Stage 4B: monotonic write generation for zero-copy EmitVertexBuffers dedup
         u64 last_use = 0;
         u64 erase_gen = 0;
         u64 exact_gen = 0;
@@ -877,6 +903,7 @@ private:
         std::array<vk::DeviceSize, 16> host_offsets{};
     };
     u64 stage_b_vertex_memo_clock = 0;
+    u64 stage_b_vertex_memo_gen = 0;
     std::unique_ptr<std::array<u64, StageBVertexMemoEntry::TableSize>> stage_b_vertex_memo_keys;
     std::unique_ptr<std::array<StageBVertexMemoEntry, StageBVertexMemoEntry::TableSize>>
         stage_b_vertex_memo;
@@ -923,9 +950,28 @@ private:
     void BindIndexBuffer(u32 index_offset = 0);
     /// bbport: BindVertexBuffers/BindIndexBuffer in two halves: obtaining the buffers
     /// (vertex_binds, index_bind) and recording the binds.
+    struct DirectVertexDrawInfo {
+        VAddr index_va = 0;
+        u32 num_indices = 0;
+        u32 num_instances = 1;
+        u32 first_vertex = 0;
+        u32 first_instance = 0;
+        u32 prim_restart_idx = 0;
+        bool is_indexed = false;
+        bool index16 = true;
+        bool prim_restart = false;
+    };
     void ResolveVertexBuffers(const GraphicsPipeline* pipeline, const PreparedDraw* prepared);
+    void ResolveVertexBuffersDirect(const GraphicsPipeline* pipeline, u32 step0, u32 step1,
+                                    const DirectVertexDrawInfo* direct_info = nullptr);
+    void ResolveVertexBuffersImpl(const GraphicsPipeline* pipeline, const PreparedDraw* prepared,
+                                  u32 step0_reg, u32 step1_reg,
+                                  const DirectVertexDrawInfo* direct_info);
     void EmitVertexBuffers();
     void ResolveIndexBuffer(u32 index_offset);
+    void ResolveIndexBufferDirect(VAddr address, bool index16, u32 num_indices);
+    bool TryAllocateSceneOccQuery(u16 occ_handoff, vk::QueryPool& out_pool,
+                                  u32& out_slot) noexcept;
     void EmitIndexBuffer();
 
     void ResetBindings(bool is_compute);
@@ -1169,6 +1215,8 @@ private:
         VertexInputs<vk::DeviceSize> host_sizes;
         VertexInputs<vk::DeviceSize> host_strides;
         u32 num_buffers = 0;
+        const StageBVertexMemoEntry* memo_hit = nullptr; ///< Stage 4B: zero-copy direct memo hit
+        u64 memo_gen = 0;
     } vertex_binds;
     struct IndexBind {
         vk::Buffer handle;
@@ -1243,8 +1291,31 @@ private:
     alignas(64) std::array<StageAUdMemo, Shader::MaxStageTypes> stage_a_ud_memo{};
     std::array<Gcn::Buffer, Shader::NUM_BUFFERS> stage_a_last_vsharps{};
     u32 stage_a_last_num_vsharps = ~0u;
+    u64 stage_a_last_vsharps_gen = 0u;
     PipeRtMeta stage_a_last_rt_meta{};
     bool stage_a_rt_meta_valid = false;
+    /// Stage 5 / Step 1: Stage-A pass & dynamic-state tracker for emitting compact `NativeDraw`
+    /// (`bb_native_stream`) packets on steady-pass 3D draws without copying `Gcn::Regs` or
+    /// `flattened_ud_buf`.
+    struct NativeStageAPassTrack {
+        bool valid = false;
+        bool has_dyn = false;
+        u32 cb_mask = 0;
+        u32 mrt_mask = 0;
+        u32 color_mode = 0;
+        u32 msaa_samples = 0;
+        bool depth_write = false;
+        bool writes_stencil = false;
+        bool depth_valid = false;
+        bool stencil_valid = false;
+        std::array<u16, Gcn::NUM_COLOR_BUFFERS> cb_uid{};
+        u16 db_uid = 0;
+        u16 last_rs_id = 0;
+        u64 targets_sig = 0;
+        u64 last_dyn_epoch = 0;
+        bb_native_stream::SetDynamicStatePayload last_dyn{};
+    } native_stage_a_pass{};
+    std::unique_ptr<NativeStreamConsumer> native_consumer;
     alignas(64) std::array<std::array<u32, kMaxCachedStageWords>, Shader::MaxStageTypes>
         stage_b_ud_cache{};
     std::array<Gcn::Buffer, Shader::NUM_BUFFERS> stage_b_last_vsharps{};

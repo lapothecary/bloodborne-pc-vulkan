@@ -23,6 +23,13 @@ GX_HOST_IMPORT uint32_t bb_direct_vk_register_depth_target(
 
 GX_HOST_IMPORT uint32_t bb_direct_vk_lookup_color_target_uid(const void* gnm_rt_11dw) noexcept;
 GX_HOST_IMPORT uint32_t bb_direct_vk_lookup_depth_target_uid(const void* gnm_dt_13dw) noexcept;
+GX_HOST_IMPORT uint32_t bb_direct_vk_lookup_raster_state_id(const void* rs_obj) noexcept;
+GX_HOST_IMPORT uint32_t bb_direct_vk_lookup_blend_state_id(const void* bs_obj) noexcept;
+GX_HOST_IMPORT uint32_t bb_direct_vk_lookup_ds_state_id(const void* ds_obj) noexcept;
+GX_HOST_IMPORT uint32_t bb_direct_vk_lookup_ps_usage_id(const void* vs_exports_raw,
+                                                        uint32_t num_vs_exports,
+                                                        const void* ps_inputs_raw,
+                                                        uint32_t num_ps_inputs) noexcept;
 
 GX_HOST_IMPORT void bb_direct_vk_prepare_texture_write(const void* gpu_addr,
                                                        uint64_t byte_size) noexcept;
@@ -278,6 +285,35 @@ inline uint32_t LookupDirectDepthTargetUid(const void* gnm_dt_13dw) noexcept {
         return 0u;
     }
     return bb_direct_vk_lookup_depth_target_uid(gnm_dt_13dw) & 0xFFFu;
+}
+
+inline bool NativeStreamEnabled() noexcept {
+    static const bool enabled = []() -> bool {
+        const char* env = std::getenv("BB_NATIVE_STREAM");
+        return env != nullptr && env[0] == '1';
+    }();
+    return enabled;
+}
+
+inline uint16_t LookupDirectRasterStateId(const void* rs_obj) noexcept {
+    if (!rs_obj || !bb_direct_vk_lookup_raster_state_id) {
+        return 0u;
+    }
+    return static_cast<uint16_t>(bb_direct_vk_lookup_raster_state_id(rs_obj) & 0x3FFu);
+}
+
+inline uint16_t LookupDirectBlendStateId(const void* bs_obj) noexcept {
+    if (!bs_obj || !bb_direct_vk_lookup_blend_state_id) {
+        return 0u;
+    }
+    return static_cast<uint16_t>(bb_direct_vk_lookup_blend_state_id(bs_obj) & 0x3FFu);
+}
+
+inline uint16_t LookupDirectDepthStencilStateId(const void* ds_obj) noexcept {
+    if (!ds_obj || !bb_direct_vk_lookup_ds_state_id) {
+        return 0u;
+    }
+    return static_cast<uint16_t>(bb_direct_vk_lookup_ds_state_id(ds_obj) & 0x3FFu);
 }
 
 inline void SetTSharpBaseAddress(void* tsharp_8dw, const void* gpu_addr) noexcept {
@@ -761,7 +797,81 @@ enum class Op : uint32_t {
     NativePostProcess        = 36u,
     // Phase 2 (v1.2.4): Single-Pass Downsampler (SPD) in LDS for SSR glossy mip pyramid
     GenerateMipsSpd          = 37u,
+    // Stage 3B (Stage A elimination): Direct dense 10-bit Raster/Blend/DS state IDs
+    SetDirectStateIds        = 38u,
 };
+
+// Stage 3C-1 / 4C: Flag bit in `Op::SetStageUserData` `pkt[2]` (`op_word`) proving that this
+// stage's user-data update preserved all shader-specialization-relevant descriptor fields:
+// - Vertex buffer V# tables (checked independently by `want_vsharps` before `SpecWordCheck`),
+// - CBs (`dw2 != 0`, `dw1 & 0xBFFF0000`, `dw3 & 0xC07FFFFF`),
+// - Sampled T# SRVs (valid bit, `dw3[31:28]` type, and exact `(nfmt, dfmt)` or common fast `nfmt`),
+// - Buffer V# SRVs (valid bit, `dw1 & 0xBFFF0000`, `dw3 & 0xC07FFFFF`),
+// - Samplers (`dw0 & 0x00108000`).
+inline constexpr uint32_t kUdFlagSpecInvariant = 1u << 16;
+
+// Stage 4C: Exact mirror of `Vulkan::DirectPso::kExcludedDfmtMaskByNfmt` (compile-time verified
+// via `static_assert` in `tests/test_scene_resolution.cpp`).
+inline constexpr uint64_t kExcludedDfmtMaskByNfmt[16] = {
+    (1ULL << 4) | (1ULL << 11) | (1ULL << 13) | (1ULL << 14), // 0: Unorm (Format32..Format32_32_32_32)
+    0ULL,                                                      // 1: Snorm
+    0ULL,                                                      // 2: Uscaled
+    0ULL,                                                      // 3: Sscaled
+    0ULL,                                                      // 4: Uint
+    0ULL,                                                      // 5: Sint
+    ~0ULL,                                                     // 6: SnormNz
+    (1ULL << 1),                                               // 7: Float (Format8)
+    ~0ULL,                                                     // 8: Reserved
+    (1ULL << 38) | (1ULL << 39) | (1ULL << 40),                // 9: Srgb (BC4/BC5/BC6)
+    0ULL,                                                      // 10: Ubnorm
+    ~0ULL, ~0ULL, ~0ULL, ~0ULL, ~0ULL,                         // 11..15: Reserved
+};
+
+[[gnu::always_inline]] inline bool SrvSharpSpecEquivalent(
+    const uint32_t* old_dw, const uint32_t* new_dw) noexcept
+{
+    const uint32_t o3 = old_dw[3];
+    const uint32_t n3 = new_dw[3];
+    const uint32_t o1 = old_dw[1];
+    const uint32_t n1 = new_dw[1];
+    if (((o3 | n3) & 0x80000000u) != 0u) [[likely]] {
+        // Sampled T# Image (`ImageType` 8..15 sets dw3 bit 31; Buffer V# always has dw3[31:30]==0).
+        if ((o3 & 0xF0000000u) != (n3 & 0xF0000000u)) {
+            return false;
+        }
+        const bool o_valid = (old_dw[0] | (o1 & 0x3Fu)) != 0u;
+        const bool n_valid = (new_dw[0] | (n1 & 0x3Fu)) != 0u;
+        if (o_valid != n_valid) {
+            return false;
+        }
+        if (!o_valid) {
+            return true;
+        }
+        const uint32_t d1 = o1 ^ n1;
+        if ((d1 & 0x3FF00000u) == 0u) [[likely]] {
+            return true;
+        }
+        if ((d1 & 0x3C000000u) != 0u) {
+            return false;
+        }
+        const uint32_t nf = (n1 >> 26) & 0xFu;
+        const uint64_t bad = kExcludedDfmtMaskByNfmt[nf];
+        return ((bad >> ((o1 >> 20) & 0x3Fu)) & 1ULL) == 0ULL &&
+               ((bad >> ((n1 >> 20) & 0x3Fu)) & 1ULL) == 0ULL;
+    }
+    // Buffer SRV V# (`dw3[31] == 0`; bits 29:27 are `mtype`, bits 31:30 are `type == 0` for valid V#).
+    const bool o_valid = (old_dw[2] != 0u) && ((o3 & 0xC0000000u) == 0u);
+    const bool n_valid = (new_dw[2] != 0u) && ((n3 & 0xC0000000u) == 0u);
+    if (o_valid != n_valid) {
+        return false;
+    }
+    if (!o_valid) {
+        return (old_dw[2] == 0u) == (new_dw[2] == 0u) &&
+               ((o3 ^ n3) & 0xC0000000u) == 0u &&
+               ((old_dw[0] | (o1 & 0x3Fu)) == 0u) == ((new_dw[0] | (n1 & 0x3Fu)) == 0u);
+    }
+    return ((o1 ^ n1) & 0xBFFF0000u) == 0u && ((o3 ^ n3) & 0xC07FFFFFu) == 0u;
+}
 
 // Tag stored in `CopyRegion::reserved` / `CopyRecord::reserved` when the C++20 engine itself
 // populated `src_va` via CPU `memcpy` / `MapDynamicBuffer_B` / `StagingPool_Suballocate64K`,
@@ -1414,7 +1524,7 @@ struct StageUserDataBatch {
         SetDwords(dcb_raw, gnm_stage, dst_reg, &val, 1u);
     }
 
-    inline void Flush(void* dcb_raw, uint32_t gnm_stage) noexcept {
+    inline void Flush(void* dcb_raw, uint32_t gnm_stage, bool spec_invariant = false) noexcept {
         if (mask == 0u || !dcb_raw) {
             return;
         }
@@ -1428,14 +1538,21 @@ struct StageUserDataBatch {
         const uint32_t sh_base = static_cast<uint32_t>(kShStageUserDataBase[gnm_stage & 7u]);
         pkt[0] = MakeNopHeader(body_dwords);
         pkt[1] = kNopPayloadTag;
-        pkt[2] = static_cast<uint32_t>(Op::SetStageUserData);
+        pkt[2] = static_cast<uint32_t>(Op::SetStageUserData) |
+                 (spec_invariant ? kUdFlagSpecInvariant : 0u);
         pkt[3] = sh_base | ((mask & 0xFFFFu) << 16);
-        uint32_t out_idx = 4u;
         uint32_t m = mask & 0xFFFFu;
-        while (m != 0u) {
-            const uint32_t bit = static_cast<uint32_t>(__builtin_ctz(m));
-            m &= (m - 1u);
-            pkt[out_idx++] = vals[bit];
+        const uint32_t tz = static_cast<uint32_t>(__builtin_ctz(m));
+        const uint32_t shifted = m >> tz;
+        if ((shifted & (shifted + 1u)) == 0u) [[likely]] {
+            std::memcpy(&pkt[4], &vals[tz], count * sizeof(uint32_t));
+        } else {
+            uint32_t out_idx = 4u;
+            while (m != 0u) {
+                const uint32_t bit = static_cast<uint32_t>(__builtin_ctz(m));
+                m &= (m - 1u);
+                pkt[out_idx++] = vals[bit];
+            }
         }
         mask = 0u;
     }
@@ -1561,6 +1678,7 @@ inline bool IsBundleableStatePacket(const uint32_t* p, uint32_t hdr, uint32_t bw
     case Op::BindLsShader:
         return bw == 6u;
     case Op::SetVgtControl:
+    case Op::SetDirectStateIds:
         return bw == 2u;
     default:
         return false;
@@ -1788,6 +1906,22 @@ inline void GenerateAndEmitPsShaderUsage(
         return;
     }
     const bool direct_ring = DirectRingEnabled();
+    if (direct_ring && num_ps_inputs <= 32u && bb_direct_vk_lookup_ps_usage_id) [[likely]] {
+        const uint32_t usage_id = bb_direct_vk_lookup_ps_usage_id(
+            vs_exports_raw, num_vs_exports, ps_inputs_raw, num_ps_inputs) & 0x3FFu;
+        if (usage_id != 0u) [[likely]] {
+            uint32_t* pkt = ReserveDcbDwords(dcb_raw, 3u);
+            if (!pkt) {
+                return;
+            }
+            pkt[0] = MakeNopHeader(2u);
+            pkt[1] = kNopPayloadTag;
+            pkt[2] = static_cast<uint32_t>(Op::SetDirectStateIds) |
+                     (3u << 16) |
+                     (usage_id << 20);
+            return;
+        }
+    }
     const uint32_t hdr_dwords = direct_ring ? 4u : 2u;
     uint32_t* pkt = ReserveDcbDwords(dcb_raw, hdr_dwords + num_ps_inputs);
     if (!pkt) {
@@ -1850,13 +1984,19 @@ inline uint32_t GnmDt_GetNumSamplesLog2(const void* gnm_dt) noexcept {
 // Context-bank register writes into a single Op::SetContextRegsPacked Direct Vulkan packet.
 struct ContextRegBatch {
     static constexpr uint32_t kMaxPayloadWords = 128u;
+    static constexpr uint32_t kFlagFromDirectState = 0x80000000u;
     uint32_t payload[kMaxPayloadWords];
     uint32_t num_words = 0u;
     uint32_t num_spans = 0u;
     uint32_t last_span_hdr_idx = 0u;
     uint32_t last_end_reg = 0xFFFFFFFFu;
-    ContextRegBatch() noexcept
-        : num_words(0u), num_spans(0u), last_span_hdr_idx(0u), last_end_reg(0xFFFFFFFFu) {}
+    bool from_direct_state = false;
+    explicit ContextRegBatch(bool from_direct_state_ = false) noexcept
+        : num_words(0u),
+          num_spans(0u),
+          last_span_hdr_idx(0u),
+          last_end_reg(0xFFFFFFFFu),
+          from_direct_state(from_direct_state_) {}
 
     inline void Flush(void* dcb_raw) noexcept {
         if (num_spans == 0u || !dcb_raw) {
@@ -1870,7 +2010,9 @@ struct ContextRegBatch {
         if (pkt) {
             pkt[0] = MakeNopHeader(body_dwords);
             pkt[1] = kNopPayloadTag;
-            pkt[2] = static_cast<uint32_t>(Op::SetContextRegsPacked) | (num_spans << 16);
+            pkt[2] = static_cast<uint32_t>(Op::SetContextRegsPacked) |
+                     ((num_spans & 0x7FFFu) << 16) |
+                     (from_direct_state ? kFlagFromDirectState : 0u);
             std::memcpy(pkt + 3u, payload, num_words * sizeof(uint32_t));
         }
         num_words = 0u;
@@ -2449,6 +2591,23 @@ inline void EmitSetVgtControl(void* dcb_raw, uint32_t prim_group_size_minus_one,
     pkt[2] = static_cast<uint32_t>(Op::SetVgtControl) |
              ((prim_group_size_minus_one & 0xFFu) << 16) |
              ((partial_vs_wave_mode & 0x1u) << 24);
+}
+
+// Stage 3B: 3-dword DirectVk packet carrying dense 10-bit DirectStates IDs
+// (`kind`: 0=Raster, 1=Blend, 2=DepthStencil; `state_id`: 0..1023, 0 clears).
+inline void EmitSetDirectStateId(void* dcb_raw, uint32_t kind, uint32_t state_id) noexcept {
+    if (!dcb_raw) {
+        return;
+    }
+    uint32_t* pkt = ReserveDcbDwords(dcb_raw, 3u);
+    if (!pkt) {
+        return;
+    }
+    pkt[0] = MakeNopHeader(2u);
+    pkt[1] = kNopPayloadTag;
+    pkt[2] = static_cast<uint32_t>(Op::SetDirectStateIds) |
+             ((kind & 0xFu) << 16) |
+             ((state_id & 0x3FFu) << 20);
 }
 
 // 1-to-1 single-packet replacement for 0x10756b0 (DrawCommandBuffer::setGsOnChipControl)

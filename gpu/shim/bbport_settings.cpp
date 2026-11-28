@@ -374,6 +374,16 @@ void Set(Values& v, const std::string& key, const std::string& value) {
         v.loading_tips_timer = i != 0;
     } else if (key == "dlss_preset") {
         v.dlss_preset = (i == 0 || i == 5 || i == 6 || (i >= 10 && i <= 13)) ? i : 11;
+    } else if (key == "upscaler_mip_bias" || key == "dlss_mip_offset" || key == "dlss_mip_bias") {
+        std::string lower = value;
+        for (char& ch : lower) {
+            if (ch >= 'A' && ch <= 'Z') ch = char(ch - 'A' + 'a');
+        }
+        if (lower.empty() || lower == "auto") {
+            v.upscaler_mip_bias = Values::UpscalerMipBiasAuto;
+        } else {
+            v.upscaler_mip_bias = QuantizeUpscalerMipBias(f);
+        }
     } else if (key == "texture_quality") {
         v.texture_quality_chosen = true;
         if (value == "very_low" || value == "verylow") {
@@ -404,6 +414,19 @@ void Set(Values& v, const std::string& key, const std::string& value) {
         }
     } else if (key == "anisotropic") {
         v.anisotropic = (i >= 16) ? 16 : (i >= 8) ? 8 : (i >= 4) ? 4 : 0;
+    } else if (key == "audio_mode") {
+        std::string lower = value;
+        for (char& ch : lower) {
+            if (ch >= 'A' && ch <= 'Z') ch = char(ch - 'A' + 'a');
+        }
+        if (lower == "hrtf" || lower == "headphones" || lower == "binaural" || lower == "3d" ||
+            lower == "1") {
+            v.audio_mode = AudioHrtf;
+        } else if (lower == "surround" || lower == "7.1" || lower == "spatial" || lower == "2") {
+            v.audio_mode = AudioSurround;
+        } else {
+            v.audio_mode = AudioStereo;
+        }
     } else if (key == "fps_limit") {
         if (value == "auto" || value == "-1") {
             v.fps_limit_auto = true;
@@ -917,6 +940,9 @@ void Load() {
         {"BB_MOTION_BLUR_OBJECT", "motion_blur_object"}, {"BB_CAMERA_FOLLOW", "camera_follow_mode"},
         {"BB_TEXTURE_QUALITY", "texture_quality"},       {"BB_SHADOW_QUALITY", "shadow_quality"},
         {"BB_LOW_LATENCY", "low_latency"},
+        {"BB_UPSCALER_MIP_BIAS", "upscaler_mip_bias"},
+        {"BB_DLSS_MIP_OFFSET", "upscaler_mip_bias"},
+        {"BB_AUDIO_MODE", "audio_mode"},
     };
     // Native Vulkan 1.3 PostFX is the default base renderer across all profiles (1:1 visual parity
     // with Yebis2, faster & cleaner on GPU). Legacy Yebis2 remains available via BB_NATIVE_POSTFX=0
@@ -1291,9 +1317,16 @@ void Save() {
     put("camera_follow_mode", CameraFollowModeName(v.camera_follow_mode.load()));
     put("loading_tips_timer", flag(v.loading_tips_timer));
     put("dlss_preset", std::to_string(v.dlss_preset.load()));
+    {
+        const float mb = v.upscaler_mip_bias.load();
+        put("upscaler_mip_bias",
+            IsUpscalerMipBiasAuto(mb) ? std::string("auto")
+                                      : fixed(QuantizeUpscalerMipBias(mb), 2));
+    }
     put("texture_quality", std::to_string(std::clamp(v.texture_quality.load(), 0, 3)));
     put("shadow_quality", std::to_string(std::clamp(v.shadow_quality.load(), 0, 4)));
     put("anisotropic", std::to_string(v.anisotropic.load()));
+    put("audio_mode", AudioModeName(v.audio_mode.load()));
     put("fps_limit", v.fps_limit_auto.load() ? std::string("auto") : std::to_string(v.fps_limit.load()));
     put("present_mode", PresentModeKey(v.vsync_mode.load()));
     put("low_latency", LowLatencyModeKey(v.low_latency.load()));

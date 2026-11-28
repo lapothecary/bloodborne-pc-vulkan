@@ -7,7 +7,7 @@ at its start (`Environment:` in the log) and warns about `BB_*` names it does no
 `=1: ...` / `=0: ...` / `=N: ...` say what that value does; `set: ...` means any value
 turns it on (even `0`).
 
-## Settings (98)
+## Settings (101)
 
 What players and the launchers set. The menu, bbport.ini and the launcher write most of them; set one by hand to override them.
 
@@ -15,6 +15,7 @@ What players and the launchers set. The menu, bbport.ini and the launcher write 
 |---|---|
 | `BB_ANISO` | =N: anisotropic filtering of scene textures (default 16) |
 | `BB_ASYNC_PIPELINES` | =0: new pipelines of passes drawn every frame compiled at once instead of skipping a draw for a frame or two |
+| `BB_AUDIO_MODE` | =stereo/hrtf/surround: 7.1 audio output mode (default stereo; hrtf = 48 kHz KEMAR binaural for headphones) |
 | `BB_AUTO_RENDER_RES` | =1: render resolution picked from the measured frame rate |
 | `BB_BBSC` | =1: seamless co-op (BBSC), the launcher's co-op switch |
 | `BB_BBSC_LOCAL_SERVER` | =1 / auto (default) / 0: the BBSC game server on this PC (scripts/bbsc_gameserver) |
@@ -28,6 +29,7 @@ What players and the launchers set. The menu, bbport.ini and the launcher write 
 | `BB_DECK_DESKTOP_INPUT` | =1: keep keyboard and mouse on a Steam Deck in game mode |
 | `BB_DISPLAY` | =N: the monitor to open the window on |
 | `BB_DLSS` | =0: no DLSS even on NVIDIA RTX |
+| `BB_DLSS_MIP_OFFSET` | =auto/-2..0: alias for BB_UPSCALER_MIP_BIAS |
 | `BB_DMEM_EXTRA_MB` | =N (0-2048, default 512): direct memory beyond the PS4's for the port's extras |
 | `BB_DMEM_MB` | =N: the game's direct memory size in MiB (PS4: 5056; raised for high resolutions and large heaps) |
 | `BB_EVDEV_TOUCHPAD` | =0: no DualSense/DualShock touchpad through evdev |
@@ -108,11 +110,12 @@ What players and the launchers set. The menu, bbport.ini and the launcher write 
 | `BB_TRUE_BLACK_HDR` | =1 / 0: True Black / OLED contrast de-haze |
 | `BB_UPNP` | =1: UPnP port forwarding for online play |
 | `BB_UPSCALER` | =none / fsr3 / fsr4 / dlss / ...: the upscaler over the menu's (scripts, A/B) |
+| `BB_UPSCALER_MIP_BIAS` | =auto/-2..0: extra negative G-buffer texture LOD bias under DLSS/FSR (default auto: -1.0 DLSS/FSR 4, -0.5 FSR 3.1) |
 | `BB_UPSCALE_PRESET` | the upscaler quality preset (the menu's) |
 | `BB_USER_NAME` | the PS4 user name (default Hunter) |
 | `BB_WINDOW_MODE` | =fullscreen / borderless / windowed: startup window mode |
 
-## Tuning (286)
+## Tuning (288)
 
 Defaults to change on a machine where they misbehave, workarounds, and switches that turn a fix off for comparison.
 
@@ -124,6 +127,7 @@ Defaults to change on a machine where they misbehave, workarounds, and switches 
 | `BB_ASYNC_PIPELINE_THREADS` | =N: threads compiling pipelines in the background |
 | `BB_ASYNC_SUBMIT` | =0: the presenter submits the frame itself instead of a submit thread |
 | `BB_AUDIO` | =none: no audio device (headless runs) |
+| `BB_AUDIO_GAIN` | =f: master audio gain multiplier 0..8 (default 1.0) |
 | `BB_AUTO_NOHIZ` | =0 (run.sh): no automatic RADV_DEBUG=nohiz on the GPUs that need it |
 | `BB_AVPLAYER_ASYNC_READY` | =1: movie StateReady on the controller thread, as before (crashed at 200+ FPS) |
 | `BB_BDA_DEDICATED_MB` | =N: buffers with GPU addresses get dedicated memory from N MiB |
@@ -297,6 +301,7 @@ Defaults to change on a machine where they misbehave, workarounds, and switches 
 | `BB_MT_MAIN_THREAD` | =1: allow the game's Main thread (worker 0) to compile secondary command buffers alongside GXWorker:1..5 (default 0) |
 | `BB_MT_OCC_CULL` | =1 / 0: worker-thread G-Buffer hardware occlusion culling in secondary command buffers (default 1) |
 | `BB_NATIVE_SHADERS` | =1 / 0: precompiled native SPIR-V shader replacements |
+| `BB_NATIVE_STREAM` | =1 / 0: Stage 5 flat Native Vulkan 1.3 command stream bypassing Gcn::Regs unpack on Stage B (default 1) |
 | `BB_NET_MODULE` | =path: the online module to load (default gpu/libbbnet20.so beside bb-probe) |
 | `BB_NP_COUNTRY` | =code: the online user's country (default us) |
 | `BB_NP_LANGUAGE` | =code: the online user's language (default en) |
@@ -405,7 +410,7 @@ Defaults to change on a machine where they misbehave, workarounds, and switches 
 | `BB_WINDOW_POLL_DELAY` | =1: fall back to legacy 2 ms SDL_Delay window polling instead of event-driven SDL_WaitEventTimeout (default 0) |
 | `BB_WORK_RETIRED` | =0: the recording thread and fences do not wait for retired work |
 
-## Diagnostics (313)
+## Diagnostics (315)
 
 Logs, dumps, traces, probes and experiments, for finding bugs. Most cost frame time; none is meant for playing.
 
@@ -413,6 +418,7 @@ Logs, dumps, traces, probes and experiments, for finding bugs. Most cost frame t
 |---|---|
 | `BB_ARENA_VRAM_ONLY` | =1 (tests): the arena in VRAM only, as NVIDIA's sparse buffers |
 | `BB_AUDIO_DUMP` | =dir: raw converted PCM per audio port |
+| `BB_AUDIO_DUMP_GUEST` | =dir: raw PS4 guest PCM before downmix/HRTF per audio port |
 | `BB_AUDIO_STATS` | set: audio port statistics |
 | `BB_AUDIO_TRACE` | =1: Ajm instance configurations and jobs that fail |
 | `BB_AVPLAYER_TRACE` | =1: the game's movie player calls with results and times |
@@ -595,6 +601,7 @@ Logs, dumps, traces, probes and experiments, for finding bugs. Most cost frame t
 | `BB_NATIVE_SHADER_MIN` | =0..118: lower index bound for native SPIR-V shader bisection |
 | `BB_NATIVE_SHADER_SKIP_MAX` | =0..118: upper index bound to skip in native SPIR-V shader registry |
 | `BB_NATIVE_SHADER_SKIP_MIN` | =0..118: lower index bound to skip in native SPIR-V shader registry |
+| `BB_NATIVE_STREAM_SHADOW` | =1: Stage 5 shadow parity & specSkip verification audit (default 0) |
 | `BB_NATIVE_VK_MASK` | =hex: Native Vulkan resource bitmask (bit 0 = N1 buffers, bit 1 = N2 textures) |
 | `BB_NGX_LOG` | =1 / 2: NVIDIA NGX log into the port's (2: verbose) |
 | `BB_NULL_GPU` | =1: no GPU work at all (tests) |

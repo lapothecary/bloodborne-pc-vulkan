@@ -2106,6 +2106,7 @@ struct MtDecodedPkt {
         case BbCp::DirectVk::Op::BindHsShader:
         case BbCp::DirectVk::Op::BindLsShader:
         case BbCp::DirectVk::Op::SetVgtControl:
+        case BbCp::DirectVk::Op::SetDirectStateIds:
             if (!BbCp::CommandProcessor::ApplyGraphicsRegisterPacket(
                     regs, cur, dummy_csum, dirty, false, &pso_epoch, &dyn_epoch)) {
                 return {};

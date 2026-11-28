@@ -23976,6 +23976,10 @@ __attribute__((weak, visibility("hidden"))) uint32_t bb_direct_vk_register_color
 __attribute__((weak, visibility("hidden"))) uint32_t bb_direct_vk_register_depth_target(const void*, const void*, uint32_t, uint32_t, uint32_t) noexcept { return 0; }
 __attribute__((weak, visibility("hidden"))) uint32_t bb_direct_vk_lookup_color_target_uid(const void*) noexcept { return 0; }
 __attribute__((weak, visibility("hidden"))) uint32_t bb_direct_vk_lookup_depth_target_uid(const void*) noexcept { return 0; }
+__attribute__((weak, visibility("hidden"))) uint32_t bb_direct_vk_lookup_raster_state_id(const void*) noexcept { return 0; }
+__attribute__((weak, visibility("hidden"))) uint32_t bb_direct_vk_lookup_blend_state_id(const void*) noexcept { return 0; }
+__attribute__((weak, visibility("hidden"))) uint32_t bb_direct_vk_lookup_ds_state_id(const void*) noexcept { return 0; }
+__attribute__((weak, visibility("hidden"))) uint32_t bb_direct_vk_lookup_ps_usage_id(const void*, uint32_t, const void*, uint32_t) noexcept { return 0; }
 __attribute__((weak, visibility("hidden"))) void bb_direct_vk_prepare_texture_write(const void*, uint64_t) noexcept {}
 __attribute__((weak, visibility("hidden"))) void bb_direct_vk_unwatch_texture_range(const void*, uint64_t) noexcept {}
 __attribute__((weak, visibility("hidden"))) void bb_direct_vk_retire_gpu_range(const void*, uint64_t) noexcept {}

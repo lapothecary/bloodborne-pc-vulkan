@@ -30,10 +30,13 @@
 #include "common/thread.h"
 #include "core/emulator_settings.h"
 #include "cp/command_processor.h"
+#include "cp/cp_diagnostics.h"
 #include "game_profile.h"
 #include "gcn/decoder.h"
+#include "render/direct_pso.h"
 #include "render/direct_shaders.h"
 #include "render/gcn_to_vk.h"
+#include "render/native_cmd_stream.h"
 #include "render/pipeline_cache.h"
 #include "render/pipeline_store.h"
 #include "render/presenter.h"
@@ -374,14 +377,26 @@ struct PipelineCache::FastSelect {
         const CachedFetch* last_cached_fetch = nullptr;
         bool rt_verified = false;
         bool fast_check_attempted = false;
+        bool fast_check_ready = false;
         u16 fast_check_count = 0;
         u16 fast_check_min_flat = 0;
         u32 fast_check_offset = 0;
+        u8 fast_check_k0 = 0;
+        u8 fast_check_k4 = 0;
+        u8 fast_check_k1 = 0;
+        u8 fast_check_k2 = 0;
         Shader::Backend::Bindings fast_check_start{};
         const Shader::Gcn::FetchShaderData* fast_vs_fetch = nullptr;
         u16 fast_vs_valid_mask = 0;
         u8 fast_vs_attr_count = 0;
+        u8 fast_vs_single_sgpr = 0xFFu;
+        bool fast_vs_no_typed_fmt = false;
         std::array<u32, 16> fast_vs_dw3_exp{};
+        u64 last_verified_ud_epoch = 0;
+        u64 last_verified_spec_epoch = 0;
+        u64 last_verified_inv_epoch = 0;
+        const Shader::Gcn::FetchShaderData* last_verified_fetch = nullptr;
+        Shader::Backend::Bindings last_verified_start{};
         u64 last_flat_hash = 0;
         u32 last_flat_words = 0;
         std::array<u32, 4> last_ud_head{};
@@ -403,6 +418,7 @@ struct PipelineCache::FastSelect {
         u8 num_stages = 0;
         bool motion = false;
         bool motion_possible = false;
+        DirectPso::NativePsoId pso_id = DirectPso::kInvalidPsoId;
         std::array<u32, MaxSigWords> sig{};
         std::array<Stage, MaxStages> stages{};
     };
@@ -412,6 +428,10 @@ struct PipelineCache::FastSelect {
     std::array<u64, TableSize> hot_keys{};
     /// Compact L1D-resident MRU way hint (`512 B`): tries the last-winning way first.
     std::array<u8, NumSets> mru_way{};
+    /// Stage 2A: Compact L1D-resident `(vs, ps, non_shader_epoch)` -> FastSelect bucket cache (`14 KiB`).
+    DirectPso::ShaderPairCache pair_cache{};
+    DirectPso::NativePsoId next_pso_id = 1u;
+    std::array<const GraphicsPipeline*, DirectPso::kMaxNativePsos> pso_by_id{};
     std::vector<SpecWordCheck> fast_checks_pool;
     std::array<Entry, TableSize> entries{};
     std::unordered_map<const u32*, CachedFetch> fetch_map;
@@ -433,6 +453,12 @@ struct PipelineCache::FastSelect {
     bool pending_motion_possible = false;
 
     const GraphicsPipeline* last_vsharps_pipeline = nullptr;
+    u64 last_vsharps_ud_epoch = 0;
+    u64 last_vsharps_inv_epoch = 0;
+    const u32* last_vsharps_vb_base = nullptr;
+    const Stage* last_vsharps_verified_stage = nullptr;
+    const Shader::Gcn::FetchShaderData* last_vsharps_fetch = nullptr;
+    u64 last_vsharps_gen = 0;
     boost::container::static_vector<Gcn::Buffer, Shader::NUM_BUFFERS> last_vsharps;
 
     struct VsMemo {
@@ -491,15 +517,27 @@ struct PipelineCache::MtFastPsoTable {
 void PipelineCache::InvalidateFastSelect() {
     if (fast) {
         fast->hot_keys.fill(0ULL);
-    fast->mru_way.fill(0u);
+        fast->mru_way.fill(0u);
+        fast->pair_cache.Clear();
+        fast->next_pso_id = 1u;
+        fast->pso_by_id.fill(nullptr);
         fast->fast_checks_pool.clear();
         for (auto& e : fast->entries) {
             e.key = 0;
             e.shader_epoch = 0;
             e.pipeline = nullptr;
+            e.pso_id = DirectPso::kInvalidPsoId;
             for (auto& s : e.stages) {
                 s.fast_check_count = 0;
+                s.fast_check_k0 = 0;
+                s.fast_check_k4 = 0;
+                s.fast_check_k1 = 0;
+                s.fast_check_k2 = 0;
                 s.fast_check_attempted = false;
+                s.fast_check_ready = false;
+                s.last_verified_ud_epoch = 0;
+                s.last_verified_spec_epoch = 0;
+                s.last_verified_inv_epoch = 0;
             }
         }
         fast->fetch_map.clear();
@@ -509,6 +547,12 @@ void PipelineCache::InvalidateFastSelect() {
         fast->last_first_match = nullptr;
         fast->last_matching_ways_mask = 0;
         fast->last_vsharps_pipeline = nullptr;
+        fast->last_vsharps_ud_epoch = 0;
+        fast->last_vsharps_inv_epoch = 0;
+        fast->last_vsharps_vb_base = nullptr;
+        fast->last_vsharps_verified_stage = nullptr;
+        fast->last_vsharps_fetch = nullptr;
+        ++fast->last_vsharps_gen;
         fast->last_vsharps.clear();
         fast->vs_memo = {};
     }
@@ -532,12 +576,22 @@ bool PipelineCache::ConsumeFastVsharps(
 }
 
 const boost::container::static_vector<Gcn::Buffer, Shader::NUM_BUFFERS>*
-PipelineCache::PeekFastVsharps(const GraphicsPipeline* pipeline) noexcept {
+PipelineCache::PeekFastVsharps(const GraphicsPipeline* pipeline, u64* out_gen) noexcept {
     if (!fast || !pipeline || fast->last_vsharps_pipeline != pipeline) {
         return nullptr;
     }
     fast->last_vsharps_pipeline = nullptr;
+    if (out_gen) {
+        *out_gen = fast->last_vsharps_gen;
+    }
     return &fast->last_vsharps;
+}
+
+const GraphicsPipeline* PipelineCache::LookupPipelineByPsoId(u16 pso_id) const noexcept {
+    if (!fast || pso_id == DirectPso::kInvalidPsoId || pso_id >= DirectPso::kMaxNativePsos) {
+        return nullptr;
+    }
+    return fast->pso_by_id[pso_id];
 }
 
 PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
@@ -1173,6 +1227,27 @@ u32 BuildFastSelectSig(const Gcn::Regs& regs, const DrawIndirectParams& params,
     }
     return idx;
 }
+
+u64 ComputeDirectRtFmtSig(const Gcn::Regs& regs) noexcept {
+    const auto& db = regs.depth_buffer;
+    const bool db_d = db.DepthValid();
+    const bool db_s = db.StencilValid();
+    u64 h = u64(db_d ? (u32(db.z_info.format) | 0x8u) : 0u) |
+            (u64(db_s ? (u32(db.stencil_info.format) | 0x8u) : 0u) << 4) |
+            (u64((db_d || db_s) ? db.NumSamples() : 1u) << 8) |
+            (u64(bool(regs.color_buffers[Shader::MotionVectors::Output])) << 14);
+    for (u32 cb = 0; cb < Gcn::NUM_COLOR_BUFFERS; ++cb) {
+        u32 word = 0u;
+        if (regs.color_buffers[cb]) {
+            const auto& col_buf = regs.color_buffers[cb];
+            word = (col_buf.info.raw & 0x00023FFCu) |
+                   (u32(col_buf.attrib.num_fragments_log2) << 24) | 0x80000000u;
+        }
+        h = (h * 0x9E3779B97F4A7C15ULL) ^ (u64(word) + (u64(cb) << 32));
+        h ^= (h >> 33);
+    }
+    return h;
+}
 } // namespace
 
 
@@ -1263,6 +1338,20 @@ void PipelineCache::CommitFastSelect(const GraphicsPipeline* pipeline,
     target->last_use = ++f.use_clock;
     target->shader_epoch = DirectShaders::InvalidationEpoch();
     target->pipeline = pipeline;
+    u16 pso_id = pipeline ? pipeline->GetNativePsoId() : DirectPso::kInvalidPsoId;
+    if (pipeline && (pso_id == DirectPso::kInvalidPsoId || pso_id >= DirectPso::kMaxNativePsos ||
+                     f.pso_by_id[pso_id] != pipeline)) {
+        if (f.next_pso_id < DirectPso::kMaxNativePsos) {
+            pso_id = f.next_pso_id++;
+            pipeline->SetNativePsoId(pso_id);
+            f.pso_by_id[pso_id] = pipeline;
+        } else {
+            pso_id = DirectPso::kInvalidPsoId;
+        }
+    }
+    target->pso_id = pso_id;
+    f.pair_cache.Clear();
+    f.last_sig_epoch = 0;
     target->sig_words = static_cast<u16>(sig_len);
     target->num_stages = static_cast<u8>(f.num_pending);
     target->motion = sel.motion;
@@ -1358,6 +1447,10 @@ const GraphicsPipeline* PipelineCache::TryFastSelect(const DrawIndirectParams& p
     f.last_vsharps_pipeline = nullptr;
     const auto& regs = liverpool->regs;
     const u64 cur_sig_epoch = liverpool->pso_sig_epoch;
+    const u64 cur_non_shader_epoch = liverpool->pso_non_shader_epoch;
+    const bool can_cache_flat = liverpool->current_draw_is_direct_vk;
+    const u64 cur_inv_epoch = can_cache_flat ? liverpool->flat_invalidation_epoch : 0ULL;
+    const bool audit = BbCp::Diagnostics::DcbStatsEnabled();
     const VAddr cur_pos_addr = Shader::MotionVectors::positions_address;
     const bool cur_obj_motion = BbSettings::Get().object_motion.load(std::memory_order_relaxed);
     const int cur_upscaler = BbSettings::EffectiveUpscaler();
@@ -1375,43 +1468,120 @@ const GraphicsPipeline* PipelineCache::TryFastSelect(const DrawIndirectParams& p
             set_base = f.last_set_base;
             first_match = f.last_first_match;
             matching_ways_mask = f.last_matching_ways_mask;
-        } else {
-            std::array<u32, FastSelect::MaxSigWords> sig;
-            const u32 sig_len =
-                BuildFastSelectSig(regs, params, instance.IsVertexInputDynamicState(),
-                                   instance.IsTessellationSupported(), sig);
-            if (sig_len == 0) {
-                ++f.not_eligible;
-                return nullptr;
+            if (audit) [[unlikely]] {
+                BbCp::Diagnostics::NoteFastPsoAudit(0u);
             }
-            const u64 sig_key = XXH3_64bits(sig.data(), sig_len * sizeof(u32)) | 1ULL;
-            set_base = ((sig_key >> 1) & (FastSelect::NumSets - 1)) * FastSelect::NumWays;
-
-            const u64* const kptr = &f.hot_keys[set_base];
-            for (u32 w = 0; w < FastSelect::NumWays; ++w) {
-                if (kptr[w] == sig_key) {
-                    auto& cand = f.entries[set_base + w];
-                    if (cand.sig_words == sig_len &&
-                        std::memcmp(cand.sig.data(), sig.data(), sig_len * sizeof(u32)) == 0) {
-                        if (!first_match) {
-                            first_match = &cand;
+        } else {
+            const bool pair_eligible =
+                can_cache_flat && instance.IsVertexInputDynamicState() &&
+                regs.stage_enable.raw == Gcn::ShaderStageEnable::VgtStages::Vs &&
+                params.vertex_sgpr_offset == 0u && params.instance_sgpr_offset == 0u &&
+                regs.num_interp <= 32u;
+            u64 pair_vs = 0;
+            u64 pair_ps = 0;
+            u32 pair_vs_rsrc1 = 0;
+            u32 pair_ps_rsrc1 = 0;
+            u64 pair_env = 0;
+            u64 pair_state_key = cur_non_shader_epoch & ~(1ULL << 63);
+            u32 pair_state_ids = 0u;
+            if (pair_eligible) [[likely]] {
+                pair_vs = regs.vs_program.Address<VAddr>();
+                pair_ps = regs.ps_program.Address<VAddr>();
+                if (pair_vs != 0u && (pair_ps != 0u || regs.num_interp == 0u)) [[likely]] {
+                    auto& ds = liverpool->direct_state;
+                    if (ds.rs_id != 0u && ds.bs_id != 0u) [[likely]] {
+                        if (ds.rt_fmt_dirty != 0u) [[unlikely]] {
+                            ds.rt_fmt_sig = ComputeDirectRtFmtSig(regs);
+                            ds.rt_fmt_dirty = 0u;
                         }
-                        matching_ways_mask |= (1u << w);
+                        const u64 misc = ds.pso_misc_state_epoch;
+                        pair_state_key =
+                            (ds.rt_fmt_sig ^ (misc * 0x9E3779B97F4A7C15ULL)) | (1ULL << 63);
+                        pair_state_ids = (u32(ds.rs_id) & 0x3FFu) |
+                                         ((u32(ds.bs_id) & 0x3FFu) << 10) |
+                                         ((u32(regs.primitive_type) & 0x3Fu) << 20) |
+                                         (static_cast<u32>(misc & 0x3Fu) << 26);
+                    }
+                    pair_vs_rsrc1 = regs.reg_array[0x2C4A];
+                    pair_ps_rsrc1 = regs.reg_array[0x2C0A];
+                    const u32 hi32 = (pair_ps == 0u)
+                                         ? regs.reg_array[0x2C0B]
+                                         : (regs.num_interp ? regs.reg_array[0xA191] : 0u);
+                    const u32 null_ps_mask =
+                        (pair_ps == 0u) ? (regs.color_shader_mask.raw & 0xFu) : 0u;
+                    pair_env = u64(cur_pos_addr != 0) | (u64(cur_obj_motion) << 1) |
+                               (u64(cur_upscaler & 0xFF) << 4) | (u64(null_ps_mask) << 12) |
+                               (u64(regs.num_interp) << 16) | (u64(hi32) << 32);
+                    if (const auto* slot = f.pair_cache.Lookup(
+                            pair_vs, pair_ps, pair_vs_rsrc1, pair_ps_rsrc1, pair_state_key,
+                            pair_env, pair_state_ids)) {
+                        set_base = slot->set_base;
+                        first_match = &f.entries[slot->first_match_idx];
+                        matching_ways_mask = slot->matching_ways_mask;
+                        f.last_sig_epoch = cur_sig_epoch;
+                        f.last_params = params;
+                        f.last_positions_addr = cur_pos_addr;
+                        f.last_obj_motion = cur_obj_motion;
+                        f.last_upscaler = cur_upscaler;
+                        f.last_set_base = set_base;
+                        f.last_first_match = first_match;
+                        f.last_matching_ways_mask = matching_ways_mask;
+                        if (audit) [[unlikely]] {
+                            BbCp::Diagnostics::NoteFastPsoAudit(1u);
+                        }
                     }
                 }
             }
             if (!first_match) {
-                ++f.miss_regs;
-                return nullptr;
+                std::array<u32, FastSelect::MaxSigWords> sig;
+                const u32 sig_len =
+                    BuildFastSelectSig(regs, params, instance.IsVertexInputDynamicState(),
+                                       instance.IsTessellationSupported(), sig);
+                if (sig_len == 0) {
+                    ++f.not_eligible;
+                    return nullptr;
+                }
+                const u64 sig_key = XXH3_64bits(sig.data(), sig_len * sizeof(u32)) | 1ULL;
+                set_base = ((sig_key >> 1) & (FastSelect::NumSets - 1)) * FastSelect::NumWays;
+
+                const u64* const kptr = &f.hot_keys[set_base];
+                u16 first_match_idx = 0;
+                for (u32 w = 0; w < FastSelect::NumWays; ++w) {
+                    if (kptr[w] == sig_key) {
+                        auto& cand = f.entries[set_base + w];
+                        if (cand.sig_words == sig_len &&
+                            std::memcmp(cand.sig.data(), sig.data(), sig_len * sizeof(u32)) == 0) {
+                            if (!first_match) {
+                                first_match = &cand;
+                                first_match_idx = static_cast<u16>(set_base + w);
+                            }
+                            matching_ways_mask |= (1u << w);
+                        }
+                    }
+                }
+                if (!first_match) {
+                    ++f.miss_regs;
+                    return nullptr;
+                }
+                if (pair_eligible && pair_vs != 0u && (pair_ps != 0u || regs.num_interp == 0u))
+                    [[likely]] {
+                    f.pair_cache.Insert(pair_vs, pair_ps, pair_vs_rsrc1, pair_ps_rsrc1,
+                                        pair_state_key, pair_env, static_cast<u32>(set_base),
+                                        first_match_idx, static_cast<u8>(matching_ways_mask),
+                                        first_match->pso_id, pair_state_ids);
+                }
+                f.last_sig_epoch = cur_sig_epoch;
+                f.last_params = params;
+                f.last_positions_addr = cur_pos_addr;
+                f.last_obj_motion = cur_obj_motion;
+                f.last_upscaler = cur_upscaler;
+                f.last_set_base = set_base;
+                f.last_first_match = first_match;
+                f.last_matching_ways_mask = matching_ways_mask;
+                if (audit) [[unlikely]] {
+                    BbCp::Diagnostics::NoteFastPsoAudit(2u);
+                }
             }
-            f.last_sig_epoch = cur_sig_epoch;
-            f.last_params = params;
-            f.last_positions_addr = cur_pos_addr;
-            f.last_obj_motion = cur_obj_motion;
-            f.last_upscaler = cur_upscaler;
-            f.last_set_base = set_base;
-            f.last_first_match = first_match;
-            f.last_matching_ways_mask = matching_ways_mask;
         }
     }
 
@@ -1544,7 +1714,21 @@ const GraphicsPipeline* PipelineCache::TryFastSelect(const DrawIndirectParams& p
             auto& info = st.program->info;
             info.pgm_base = base;
             info.user_data = pgm->user_data;
-            info.RefreshFlatBuf();
+            const u32 hw_idx = static_cast<u32>(st.hw_stage);
+            const u64 cur_ud_epoch =
+                (can_cache_flat && hw_idx < 6u) ? liverpool->stage_ud_epoch[hw_idx] : 0ULL;
+            if (cur_inv_epoch != 0u) [[likely]] {
+                const u32 flat_res = info.RefreshFlatBufCached(cur_ud_epoch, cur_inv_epoch);
+                if (audit) [[unlikely]] {
+                    BbCp::Diagnostics::NoteFastPsoAudit(
+                        flat_res == 0u ? 3u : (flat_res == 1u ? 4u : 5u));
+                }
+            } else {
+                info.RefreshFlatBuf();
+                if (audit) [[unlikely]] {
+                    BbCp::Diagnostics::NoteFastPsoAudit(3u);
+                }
+            }
             if (info.has_fetch_shader) {
                 cur_fetch[i] = lookup_fetch(info, &st);
                 if (!cur_fetch[i]) {
@@ -1644,61 +1828,257 @@ const GraphicsPipeline* PipelineCache::TryFastSelect(const DrawIndirectParams& p
             const u32 ud_words = static_cast<u32>(ud_span.size());
             const u32 flat_words = static_cast<u32>(info.flattened_ud_buf.size());
             const u32* const flat_ptr = info.flattened_ud_buf.data();
+            const u32 hw_idx = static_cast<u32>(st.hw_stage);
+            const u64 cur_ud_epoch =
+                (can_cache_flat && hw_idx < 6u) ? liverpool->stage_ud_epoch[hw_idx] : 0ULL;
+            const u64 cur_spec_epoch =
+                (can_cache_flat && hw_idx < 6u)
+                    ? liverpool->direct_state.stage_spec_epoch[hw_idx]
+                    : 0ULL;
 
-            // Step 2D-3: Ultra-fast compiled `SpecWordCheck` verification (~15 ns vs ~150 ns
-            // `MatchesInPlace`). Every mismatch safely falls through to exact `MatchesInPlace`.
-            if (st.fast_check_count != 0u && !profile.paged_buffers &&
+            // Stage 2A Ultra-Fast Path #0 (~2 ns): If this exact stage's `user_data` SGPRs and
+            // submission invalidation epoch have not changed since this slot already passed
+            // specialization, skip both `want_vsharps` and `SpecWordCheck` completely.
+            if (cur_inv_epoch != 0u && cur_ud_epoch != 0u &&
+                st.hw_stage != HwStage::Local && st.sw_stage != SwStage::TessellationControl &&
+                st.last_verified_ud_epoch == cur_ud_epoch &&
+                st.last_verified_inv_epoch == cur_inv_epoch &&
+                st.last_verified_fetch == way_fetch[i] &&
+                st.last_verified_start == start_binding &&
+                (!want_vsharps ||
+                 (f.last_vsharps_ud_epoch == cur_ud_epoch &&
+                  f.last_vsharps_inv_epoch == cur_inv_epoch &&
+                  f.last_vsharps_fetch == way_fetch[i] &&
+                  f.last_vsharps.size() == way_fetch[i]->attributes.size()))) {
+                if (want_vsharps) {
+                    filled_vsharps = true;
+                }
+                if (audit) [[unlikely]] {
+                    BbCp::Diagnostics::NoteFastPsoAudit(6u);
+                    if (want_vsharps) {
+                        BbCp::Diagnostics::NoteFastPsoAudit(10u);
+                    }
+                }
+                info.AddBindings(binding);
+                continue;
+            }
+
+            // Step 2D-3 + Stage 2A: Ultra-fast compiled `SpecWordCheck` verification (~15 ns vs
+            // ~150 ns `MatchesInPlace`), now with DataFormat-agnostic sampled-image `kind = 4`
+            // checks, zero-resource `bitset.none()` support, and batched single-pointer V# fetch.
+            if (st.fast_check_ready && !profile.paged_buffers &&
                 flat_words >= st.fast_check_min_flat && start_binding == st.fast_check_start)
                 [[likely]] {
                 bool fast_ok = true;
                 if (want_vsharps) {
                     const auto& spec = modules[st.perm_idx].spec;
                     const auto& attrs = way_fetch[i]->attributes;
+                    const bool reuse_cached_vsharps =
+                        cur_inv_epoch != 0u && cur_ud_epoch != 0u &&
+                        f.last_vsharps_ud_epoch == cur_ud_epoch &&
+                        f.last_vsharps_inv_epoch == cur_inv_epoch &&
+                        f.last_vsharps_fetch == way_fetch[i] &&
+                        f.last_vsharps.size() == attrs.size();
                     if (way_fetch[i] == st.fast_vs_fetch && st.fast_vs_attr_count == attrs.size() &&
                         st.fast_vs_attr_count != 0u) [[likely]] {
-                        f.last_vsharps.clear();
                         const u16 vmask = st.fast_vs_valid_mask;
-                        for (size_t a = 0; a < attrs.size(); ++a) {
-                            const auto& desc = attrs[a];
-                            const auto sharp = desc.GetSharpDirect(ud_span);
-                            if (f.last_vsharps.size() < f.last_vsharps.capacity()) {
-                                f.last_vsharps.push_back(sharp);
+                        const bool batched_vb =
+                            st.fast_vs_single_sgpr != 0xFFu && st.fast_vs_no_typed_fmt &&
+                            !Shader::guest_read_hook &&
+                            u32(st.fast_vs_single_sgpr) + 1u < ud_words;
+                        const u32* vb_base = nullptr;
+                        if (batched_vb) [[likely]] {
+                            u64 raw_ptr = 0;
+                            std::memcpy(&raw_ptr, &ud_span[st.fast_vs_single_sgpr],
+                                        sizeof(raw_ptr));
+                            vb_base = reinterpret_cast<const u32*>(raw_ptr & 0xFFFFFFFFFFFFULL);
+                        }
+                        const bool reuse_by_vb_base =
+                            batched_vb && cur_inv_epoch != 0u && vb_base != nullptr &&
+                            f.last_vsharps_vb_base == vb_base &&
+                            f.last_vsharps_inv_epoch == cur_inv_epoch &&
+                            f.last_vsharps_fetch == way_fetch[i] &&
+                            f.last_vsharps.size() == attrs.size();
+                        if (reuse_cached_vsharps || reuse_by_vb_base) {
+                            if (audit) [[unlikely]] {
+                                BbCp::Diagnostics::NoteFastPsoAudit(10u);
                             }
-                            const bool is_valid = static_cast<bool>(sharp);
-                            const bool exp_valid = ((vmask >> a) & 1u) != 0u;
-                            u32 dw3 = 0u;
-                            std::memcpy(&dw3, reinterpret_cast<const u8*>(&sharp) + 12u,
-                                        sizeof(u32));
-                            if (is_valid == exp_valid &&
-                                (!is_valid || (dw3 & 0x007FFFFFu) == st.fast_vs_dw3_exp[a]))
-                                [[likely]] {
-                                continue;
-                            }
-                            // Exact fallback for equivalent `NumberClass` / `RemapSwizzle`:
-                            Shader::VsAttribSpecialization aspec{};
-                            if (is_valid) {
-                                using InstanceIdType = Shader::Gcn::VertexAttribute::InstanceIdType;
-                                if (const auto step_rate = desc.GetStepRate();
-                                    step_rate != InstanceIdType::None) {
-                                    aspec.divisor =
-                                        step_rate == InstanceIdType::OverStepRate0
-                                            ? st.runtime_info.sw.vs.step_rate_0
-                                            : (step_rate == InstanceIdType::OverStepRate1
-                                                   ? st.runtime_info.sw.vs.step_rate_1
-                                                   : 1u);
+                            if (f.last_vsharps_verified_stage != &st) {
+                                for (size_t a = 0; a < attrs.size(); ++a) {
+                                    const auto& sharp = f.last_vsharps[a];
+                                    const bool is_valid = static_cast<bool>(sharp);
+                                    const bool exp_valid = ((vmask >> a) & 1u) != 0u;
+                                    u32 dw3 = 0u;
+                                    std::memcpy(&dw3, reinterpret_cast<const u8*>(&sharp) + 12u,
+                                                sizeof(u32));
+                                    if (is_valid == exp_valid &&
+                                        (!is_valid || (dw3 & 0x007FFFFFu) == st.fast_vs_dw3_exp[a]))
+                                        [[likely]] {
+                                        continue;
+                                    }
+                                    Shader::VsAttribSpecialization aspec{};
+                                    if (is_valid) {
+                                        using InstanceIdType =
+                                            Shader::Gcn::VertexAttribute::InstanceIdType;
+                                        if (const auto step_rate = attrs[a].GetStepRate();
+                                            step_rate != InstanceIdType::None) {
+                                            aspec.divisor =
+                                                step_rate == InstanceIdType::OverStepRate0
+                                                    ? st.runtime_info.sw.vs.step_rate_0
+                                                    : (step_rate == InstanceIdType::OverStepRate1
+                                                           ? st.runtime_info.sw.vs.step_rate_1
+                                                           : 1u);
+                                        }
+                                        aspec.num_class =
+                                            ::Gcn::GetNumberClass(sharp.GetNumberFmt());
+                                        aspec.dst_select = sharp.DstSelect();
+                                    }
+                                    if (spec.vs_attribs[a] != aspec) {
+                                        fast_ok = false;
+                                        break;
+                                    }
                                 }
-                                aspec.num_class = ::Gcn::GetNumberClass(sharp.GetNumberFmt());
-                                aspec.dst_select = sharp.DstSelect();
+                                if (fast_ok) {
+                                    f.last_vsharps_verified_stage = &st;
+                                }
                             }
-                            if (spec.vs_attribs[a] != aspec) {
-                                f.last_vsharps.clear();
-                                fast_ok = false;
-                                break;
+                        } else if (batched_vb && vb_base &&
+                                   attrs.size() <= f.last_vsharps.capacity()) [[likely]] {
+                            // Stage 4C: Hoisted zero-branch batched V# copy + single-accumulator
+                            // specialization check (~3M attrs/s on Stage A).
+                            f.last_vsharps_inv_epoch = 0;
+                            f.last_vsharps_vb_base = nullptr;
+                            f.last_vsharps_verified_stage = nullptr;
+                            ++f.last_vsharps_gen;
+                            const size_t n_attrs = attrs.size();
+                            f.last_vsharps.resize(n_attrs);
+                            if (audit) [[unlikely]] {
+                                BbCp::Diagnostics::NoteFastPsoAudit(11u);
+                            }
+                            Gcn::Buffer* const dst_vs = f.last_vsharps.data();
+                            const auto* const attr_p = attrs.data();
+                            const u32* const exp_dw3 = st.fast_vs_dw3_exp.data();
+                            u32 any_mismatch = 0u;
+                            for (size_t a = 0; a < n_attrs; ++a) {
+                                const auto& desc = attr_p[a];
+                                Gcn::Buffer sharp{};
+                                std::memcpy(&sharp, vb_base + desc.dword_offset,
+                                            sizeof(Gcn::Buffer));
+                                sharp.base_address += desc.inst_offset;
+                                dst_vs[a] = sharp;
+                                const u32 is_valid = static_cast<u32>(static_cast<bool>(sharp));
+                                const u32 exp_valid = (vmask >> a) & 1u;
+                                u32 dw3 = 0u;
+                                std::memcpy(&dw3, reinterpret_cast<const u8*>(&sharp) + 12u,
+                                            sizeof(u32));
+                                any_mismatch |= (is_valid ^ exp_valid) |
+                                                (is_valid ? ((dw3 & 0x007FFFFFu) ^ exp_dw3[a]) : 0u);
+                            }
+                            if (any_mismatch != 0u) [[unlikely]] {
+                                for (size_t a = 0; a < n_attrs; ++a) {
+                                    const auto& sharp = dst_vs[a];
+                                    const bool is_valid = static_cast<bool>(sharp);
+                                    const bool exp_valid = ((vmask >> a) & 1u) != 0u;
+                                    u32 dw3 = 0u;
+                                    std::memcpy(&dw3, reinterpret_cast<const u8*>(&sharp) + 12u,
+                                                sizeof(u32));
+                                    if (is_valid == exp_valid &&
+                                        (!is_valid || (dw3 & 0x007FFFFFu) == exp_dw3[a])) {
+                                        continue;
+                                    }
+                                    Shader::VsAttribSpecialization aspec{};
+                                    if (is_valid) {
+                                        using InstanceIdType =
+                                            Shader::Gcn::VertexAttribute::InstanceIdType;
+                                        if (const auto step_rate = attr_p[a].GetStepRate();
+                                            step_rate != InstanceIdType::None) {
+                                            aspec.divisor =
+                                                step_rate == InstanceIdType::OverStepRate0
+                                                    ? st.runtime_info.sw.vs.step_rate_0
+                                                    : (step_rate == InstanceIdType::OverStepRate1
+                                                           ? st.runtime_info.sw.vs.step_rate_1
+                                                           : 1u);
+                                        }
+                                        aspec.num_class =
+                                            ::Gcn::GetNumberClass(sharp.GetNumberFmt());
+                                        aspec.dst_select = sharp.DstSelect();
+                                    }
+                                    if (spec.vs_attribs[a] != aspec) {
+                                        f.last_vsharps.clear();
+                                        fast_ok = false;
+                                        break;
+                                    }
+                                }
+                            }
+                            if (fast_ok && cur_inv_epoch != 0u && cur_ud_epoch != 0u) {
+                                f.last_vsharps_ud_epoch = cur_ud_epoch;
+                                f.last_vsharps_inv_epoch = cur_inv_epoch;
+                                f.last_vsharps_vb_base = vb_base;
+                                f.last_vsharps_verified_stage = &st;
+                                f.last_vsharps_fetch = way_fetch[i];
+                            }
+                        } else {
+                            f.last_vsharps_inv_epoch = 0;
+                            f.last_vsharps_vb_base = nullptr;
+                            f.last_vsharps_verified_stage = nullptr;
+                            ++f.last_vsharps_gen;
+                            f.last_vsharps.clear();
+                            if (audit) [[unlikely]] {
+                                BbCp::Diagnostics::NoteFastPsoAudit(11u);
+                            }
+                            for (size_t a = 0; a < attrs.size(); ++a) {
+                                const auto& desc = attrs[a];
+                                const auto sharp = desc.GetSharpDirect(ud_span);
+                                if (f.last_vsharps.size() < f.last_vsharps.capacity()) {
+                                    f.last_vsharps.push_back(sharp);
+                                }
+                                const bool is_valid = static_cast<bool>(sharp);
+                                const bool exp_valid = ((vmask >> a) & 1u) != 0u;
+                                u32 dw3 = 0u;
+                                std::memcpy(&dw3, reinterpret_cast<const u8*>(&sharp) + 12u,
+                                            sizeof(u32));
+                                if (is_valid == exp_valid &&
+                                    (!is_valid || (dw3 & 0x007FFFFFu) == st.fast_vs_dw3_exp[a]))
+                                    [[likely]] {
+                                    continue;
+                                }
+                                Shader::VsAttribSpecialization aspec{};
+                                if (is_valid) {
+                                    using InstanceIdType =
+                                        Shader::Gcn::VertexAttribute::InstanceIdType;
+                                    if (const auto step_rate = desc.GetStepRate();
+                                        step_rate != InstanceIdType::None) {
+                                        aspec.divisor =
+                                            step_rate == InstanceIdType::OverStepRate0
+                                                ? st.runtime_info.sw.vs.step_rate_0
+                                                : (step_rate == InstanceIdType::OverStepRate1
+                                                       ? st.runtime_info.sw.vs.step_rate_1
+                                                       : 1u);
+                                    }
+                                    aspec.num_class = ::Gcn::GetNumberClass(sharp.GetNumberFmt());
+                                    aspec.dst_select = sharp.DstSelect();
+                                }
+                                if (spec.vs_attribs[a] != aspec) {
+                                    fast_ok = false;
+                                    break;
+                                }
+                            }
+                            if (fast_ok && cur_inv_epoch != 0u && cur_ud_epoch != 0u &&
+                                f.last_vsharps.size() == attrs.size()) {
+                                f.last_vsharps_ud_epoch = cur_ud_epoch;
+                                f.last_vsharps_inv_epoch = cur_inv_epoch;
+                                f.last_vsharps_vb_base = vb_base;
+                                f.last_vsharps_verified_stage = &st;
+                                f.last_vsharps_fetch = way_fetch[i];
                             }
                         }
                     } else if (spec.vs_attribs.size() != attrs.size()) {
                         fast_ok = false;
                     } else {
+                        f.last_vsharps_inv_epoch = 0;
+                        f.last_vsharps_vb_base = nullptr;
+                        f.last_vsharps_verified_stage = nullptr;
+                        ++f.last_vsharps_gen;
                         f.last_vsharps.clear();
                         for (size_t a = 0; a < attrs.size(); ++a) {
                             const auto& desc = attrs[a];
@@ -1727,32 +2107,72 @@ const GraphicsPipeline* PipelineCache::TryFastSelect(const DrawIndirectParams& p
                                 break;
                             }
                         }
+                        if (fast_ok && cur_inv_epoch != 0u && cur_ud_epoch != 0u &&
+                            f.last_vsharps.size() == attrs.size()) {
+                            f.last_vsharps_ud_epoch = cur_ud_epoch;
+                            f.last_vsharps_inv_epoch = cur_inv_epoch;
+                            f.last_vsharps_fetch = way_fetch[i];
+                        }
                     }
                 }
                 if (fast_ok) {
-                    const auto* const chk = f.fast_checks_pool.data() + st.fast_check_offset;
-                    const u32 cnt = st.fast_check_count;
-                    for (u32 c = 0; c < cnt; ++c) {
-                        const auto& wc = chk[c];
-                        if (wc.kind == 0u) [[likely]] {
-                            if ((flat_ptr[wc.dw_off] & wc.mask) != wc.expected) {
-                                fast_ok = false;
-                                break;
+                    const bool can_skip_spec_checks =
+                        cur_inv_epoch != 0u && cur_spec_epoch != 0u &&
+                        st.hw_stage != HwStage::Local &&
+                        st.sw_stage != SwStage::TessellationControl &&
+                        st.last_verified_spec_epoch == cur_spec_epoch &&
+                        st.last_verified_inv_epoch == cur_inv_epoch &&
+                        st.last_verified_start == start_binding;
+                    const bool verify_spec_skip =
+                        can_skip_spec_checks && bb_native_stream::ShadowVerifyEnabled();
+                    if (!can_skip_spec_checks || verify_spec_skip) {
+                        const auto* p = f.fast_checks_pool.data() + st.fast_check_offset;
+                        const u32 n0 = st.fast_check_k0;
+                        const u32 n4 = st.fast_check_k4;
+                        const u32 n1 = st.fast_check_k1;
+                        const u32 n2 = st.fast_check_k2;
+                        const u32 cnt = st.fast_check_count;
+                        u32 bad = 0u;
+                        for (u32 c = 0u; c < n0; ++c) {
+                            bad |= (flat_ptr[p[c].dw_off] & p[c].mask) ^ p[c].expected;
+                        }
+                        p += n0;
+                        for (u32 c = 0u; c < n4; ++c) {
+                            bad |= DirectPso::FastSampledNfmtMismatchBits(
+                                flat_ptr[p[c].dw_off], p[c].expected, p[c].mask);
+                        }
+                        p += n4;
+                        for (u32 c = 0u; c < n1; ++c) {
+                            bad |= static_cast<u32>(flat_ptr[p[c].dw_off] == 0u);
+                        }
+                        p += n1;
+                        for (u32 c = 0u; c < n2; ++c) {
+                            bad |= static_cast<u32>(
+                                (flat_ptr[p[c].dw_off] | (flat_ptr[p[c].dw_off + 1u] & 0x3Fu)) ==
+                                0u);
+                        }
+                        const u32 n3 = cnt - (n0 + n4 + n1 + n2);
+                        if (n3 != 0u) [[unlikely]] {
+                            p += n2;
+                            for (u32 c = 0u; c < n3; ++c) {
+                                bad |= static_cast<u32>(
+                                    (flat_ptr[p[c].dw_off] | (flat_ptr[p[c].mask] & 0x3Fu)) == 0u);
                             }
-                        } else if (wc.kind == 1u) {
-                            if (flat_ptr[wc.dw_off] == 0u) {
-                                fast_ok = false;
-                                break;
-                            }
-                        } else if (wc.kind == 2u) {
-                            if ((flat_ptr[wc.dw_off] | (flat_ptr[wc.dw_off + 1u] & 0x3Fu)) == 0u) {
-                                fast_ok = false;
-                                break;
-                            }
-                        } else {
-                            if ((flat_ptr[wc.dw_off] | (flat_ptr[wc.mask] & 0x3Fu)) == 0u) {
-                                fast_ok = false;
-                                break;
+                        }
+                        if (bad != 0u) [[unlikely]] {
+                            fast_ok = false;
+                        }
+                        if (verify_spec_skip && !fast_ok) [[unlikely]] {
+                            BbCp::Diagnostics::NoteFastPsoAudit(13u);
+                            static u32 s_spec_skip_warn = 0u;
+                            if (s_spec_skip_warn < 8u) {
+                                ++s_spec_skip_warn;
+                                std::printf("[NativeStream-Parity] SpecSkip mismatch stage=%u "
+                                            "hw=%u pgm=%#llx spec_ep=%llu ud_ep=%llu checks=%u\n",
+                                            i, hw_idx, static_cast<unsigned long long>(st.pgm_base),
+                                            static_cast<unsigned long long>(cur_spec_epoch),
+                                            static_cast<unsigned long long>(cur_ud_epoch), cnt);
+                                std::fflush(stdout);
                             }
                         }
                     }
@@ -1760,10 +2180,25 @@ const GraphicsPipeline* PipelineCache::TryFastSelect(const DrawIndirectParams& p
                         if (want_vsharps) {
                             filled_vsharps = true;
                         }
+                        if (cur_inv_epoch != 0u && cur_ud_epoch != 0u) {
+                            st.last_verified_ud_epoch = cur_ud_epoch;
+                            st.last_verified_spec_epoch = cur_spec_epoch;
+                            st.last_verified_inv_epoch = cur_inv_epoch;
+                            st.last_verified_fetch = way_fetch[i];
+                            st.last_verified_start = start_binding;
+                        }
+                        if (audit) [[unlikely]] {
+                            BbCp::Diagnostics::NoteFastPsoAudit(can_skip_spec_checks ? 12u : 7u);
+                        }
                         info.AddBindings(binding);
                         continue;
                     }
                 }
+                if (audit) [[unlikely]] {
+                    BbCp::Diagnostics::NoteFastPsoAudit(8u);
+                }
+            } else if (audit) [[unlikely]] {
+                BbCp::Diagnostics::NoteFastPsoAudit(9u);
             }
 
             const bool can_memo_flat =
@@ -1789,19 +2224,48 @@ const GraphicsPipeline* PipelineCache::TryFastSelect(const DrawIndirectParams& p
                     if (fetch_ud_ok && st.last_flat_hash != 0ULL &&
                         flat_hash == st.last_flat_hash) {
                         if (want_vsharps) {
+                            f.last_vsharps_inv_epoch = 0;
                             f.last_vsharps = f.vs_memo.vsharps;
+                            if (cur_inv_epoch != 0u && cur_ud_epoch != 0u) {
+                                f.last_vsharps_ud_epoch = cur_ud_epoch;
+                                f.last_vsharps_inv_epoch = cur_inv_epoch;
+                                f.last_vsharps_fetch = way_fetch[i];
+                            }
                             filled_vsharps = true;
+                        }
+                        if (cur_inv_epoch != 0u && cur_ud_epoch != 0u) {
+                            st.last_verified_ud_epoch = cur_ud_epoch;
+                            st.last_verified_spec_epoch = cur_spec_epoch;
+                            st.last_verified_inv_epoch = cur_inv_epoch;
+                            st.last_verified_fetch = way_fetch[i];
+                            st.last_verified_start = start_binding;
                         }
                         info.AddBindings(binding);
                         continue;
                     }
                 }
             }
+            if (want_vsharps) {
+                f.last_vsharps_inv_epoch = 0;
+            }
             if (!modules[st.perm_idx].spec.MatchesInPlace(
                     info, st.runtime_info, profile, binding, way_fetch[i], st.rt_verified,
                     want_vsharps ? &f.last_vsharps : nullptr)) {
                 spec_ok = false;
                 break;
+            }
+            if (want_vsharps && cur_inv_epoch != 0u && cur_ud_epoch != 0u &&
+                f.last_vsharps.size() == way_fetch[i]->attributes.size()) {
+                f.last_vsharps_ud_epoch = cur_ud_epoch;
+                f.last_vsharps_inv_epoch = cur_inv_epoch;
+                f.last_vsharps_fetch = way_fetch[i];
+            }
+            if (cur_inv_epoch != 0u && cur_ud_epoch != 0u) {
+                st.last_verified_ud_epoch = cur_ud_epoch;
+                st.last_verified_spec_epoch = cur_spec_epoch;
+                st.last_verified_inv_epoch = cur_inv_epoch;
+                st.last_verified_fetch = way_fetch[i];
+                st.last_verified_start = start_binding;
             }
             if (!st.fast_check_attempted && !profile.paged_buffers && st.rt_verified &&
                 info.fmasks.empty() && st.hw_stage != HwStage::Local &&
@@ -1810,9 +2274,61 @@ const GraphicsPipeline* PipelineCache::TryFastSelect(const DrawIndirectParams& p
                 f.fast_checks_pool.size() < 65536u) {
                 st.fast_check_attempted = true;
                 const auto& spec = modules[st.perm_idx].spec;
-                if (!spec.bitset.none() && spec.buffers.size() == info.buffers.size() &&
-                    spec.images.size() == info.images.size() &&
-                    spec.samplers.size() == info.samplers.size()) {
+                auto init_fast_vs_attrs = [&]() {
+                    if (want_vsharps && way_fetch[i] &&
+                        way_fetch[i]->attributes.size() == spec.vs_attribs.size() &&
+                        way_fetch[i]->attributes.size() <= st.fast_vs_dw3_exp.size() &&
+                        f.last_vsharps.size() == way_fetch[i]->attributes.size()) {
+                        const auto& attrs = way_fetch[i]->attributes;
+                        u16 vmask = 0u;
+                        u8 common_sgpr = 0xFFu;
+                        bool single_sgpr = !attrs.empty();
+                        bool no_typed = true;
+                        for (size_t a = 0; a < f.last_vsharps.size(); ++a) {
+                            const auto& sh = f.last_vsharps[a];
+                            if (sh) {
+                                vmask |= static_cast<u16>(1u << a);
+                                u32 dw3 = 0u;
+                                std::memcpy(&dw3, reinterpret_cast<const u8*>(&sh) + 12u,
+                                            sizeof(u32));
+                                st.fast_vs_dw3_exp[a] = dw3 & 0x007FFFFFu;
+                            } else {
+                                st.fast_vs_dw3_exp[a] = 0u;
+                            }
+                            const auto& desc = attrs[a];
+                            if (desc.sgpr_base == Shader::IR::NumScalarRegs) {
+                                single_sgpr = false;
+                            } else if (common_sgpr == 0xFFu) {
+                                common_sgpr = static_cast<u8>(desc.sgpr_base);
+                            } else if (common_sgpr != static_cast<u8>(desc.sgpr_base)) {
+                                single_sgpr = false;
+                            }
+                            if (desc.data_format != 0u) {
+                                no_typed = false;
+                            }
+                        }
+                        st.fast_vs_valid_mask = vmask;
+                        st.fast_vs_attr_count = static_cast<u8>(f.last_vsharps.size());
+                        st.fast_vs_fetch = way_fetch[i];
+                        st.fast_vs_single_sgpr = single_sgpr ? common_sgpr : 0xFFu;
+                        st.fast_vs_no_typed_fmt = no_typed;
+                    }
+                };
+                if (spec.bitset.none() && info.buffers.empty() && info.images.empty() &&
+                    info.samplers.empty()) {
+                    st.fast_check_offset = 0u;
+                    st.fast_check_count = 0u;
+                    st.fast_check_k0 = 0u;
+                    st.fast_check_k4 = 0u;
+                    st.fast_check_k1 = 0u;
+                    st.fast_check_k2 = 0u;
+                    st.fast_check_min_flat = 0u;
+                    st.fast_check_start = start_binding;
+                    st.fast_check_ready = true;
+                    init_fast_vs_attrs();
+                } else if (!spec.bitset.none() && spec.buffers.size() == info.buffers.size() &&
+                           spec.images.size() == info.images.size() &&
+                           spec.samplers.size() == info.samplers.size()) {
                     std::array<FastSelect::SpecWordCheck, 192> local_chk{};
                     u32 local_cnt = 0u;
                     u32 max_off = 0u;
@@ -1890,7 +2406,19 @@ const GraphicsPipeline* PipelineCache::TryFastSelect(const DrawIndirectParams& p
                                 ok_compile = false;
                             }
                             if (ok_compile && (sf.load_mask & 2u)) {
-                                push_masked(sf.offsets[1], 0x3FF00000u);
+                                const u32 raw_dw1 =
+                                    (sf.offsets[1] < flat_words) ? flat_ptr[sf.offsets[1]] : 0u;
+                                const auto raw_nfmt =
+                                    static_cast<Gcn::NumberFormat>((raw_dw1 >> 26) & 0xFu);
+                                const auto raw_dfmt =
+                                    static_cast<Gcn::DataFormat>((raw_dw1 >> 20) & 0x3Fu);
+                                if (!desc.is_written && sf.offsets[1] < flat_words &&
+                                    DirectPso::CanUseFastSampledNfmtCheck(raw_nfmt, raw_dfmt)) {
+                                    const u32 nf = static_cast<u32>(raw_nfmt) & 0xFu;
+                                    push_chk(sf.offsets[1], 4u, nf, nf << 26);
+                                } else {
+                                    push_masked(sf.offsets[1], 0x3FF00000u);
+                                }
                             }
                             if (ok_compile && (sf.load_mask & 8u)) {
                                 u32 m3 = 0xF0000000u;
@@ -1920,34 +2448,34 @@ const GraphicsPipeline* PipelineCache::TryFastSelect(const DrawIndirectParams& p
                             push_masked(sf.offsets[0], 0x00108000u);
                         }
                     }
-                    if (ok_compile && local_cnt > 0u && (max_off + 1u) <= 0xFFFFu) {
-                        st.fast_check_offset = static_cast<u32>(f.fast_checks_pool.size());
-                        st.fast_check_count = static_cast<u16>(local_cnt);
-                        st.fast_check_min_flat = static_cast<u16>(max_off + 1u);
-                        st.fast_check_start = start_binding;
-                        f.fast_checks_pool.insert(f.fast_checks_pool.end(), local_chk.begin(),
-                                                  local_chk.begin() + local_cnt);
-                        if (want_vsharps && way_fetch[i] &&
-                            way_fetch[i]->attributes.size() == spec.vs_attribs.size() &&
-                            way_fetch[i]->attributes.size() <= st.fast_vs_dw3_exp.size() &&
-                            f.last_vsharps.size() == way_fetch[i]->attributes.size()) {
-                            u16 vmask = 0u;
-                            for (size_t a = 0; a < f.last_vsharps.size(); ++a) {
-                                const auto& sh = f.last_vsharps[a];
-                                if (sh) {
-                                    vmask |= static_cast<u16>(1u << a);
-                                    u32 dw3 = 0u;
-                                    std::memcpy(&dw3, reinterpret_cast<const u8*>(&sh) + 12u,
-                                                sizeof(u32));
-                                    st.fast_vs_dw3_exp[a] = dw3 & 0x007FFFFFu;
-                                } else {
-                                    st.fast_vs_dw3_exp[a] = 0u;
+                    if (ok_compile && (max_off + 1u) <= 0xFFFFu) {
+                        std::array<FastSelect::SpecWordCheck, 192> sorted_chk{};
+                        u32 out_n = 0u;
+                        auto append_kind = [&](u8 k) noexcept -> u8 {
+                            const u32 before = out_n;
+                            for (u32 idx = 0u; idx < local_cnt; ++idx) {
+                                if (local_chk[idx].kind == k) {
+                                    sorted_chk[out_n++] = local_chk[idx];
                                 }
                             }
-                            st.fast_vs_valid_mask = vmask;
-                            st.fast_vs_attr_count = static_cast<u8>(f.last_vsharps.size());
-                            st.fast_vs_fetch = way_fetch[i];
+                            return static_cast<u8>(out_n - before);
+                        };
+                        st.fast_check_k0 = append_kind(0u);
+                        st.fast_check_k4 = append_kind(4u);
+                        st.fast_check_k1 = append_kind(1u);
+                        st.fast_check_k2 = append_kind(2u);
+                        append_kind(3u);
+                        st.fast_check_offset = static_cast<u32>(f.fast_checks_pool.size());
+                        st.fast_check_count = static_cast<u16>(out_n);
+                        st.fast_check_min_flat =
+                            (out_n > 0u) ? static_cast<u16>(max_off + 1u) : 0u;
+                        st.fast_check_start = start_binding;
+                        st.fast_check_ready = true;
+                        if (out_n > 0u) {
+                            f.fast_checks_pool.insert(f.fast_checks_pool.end(), sorted_chk.begin(),
+                                                      sorted_chk.begin() + out_n);
                         }
+                        init_fast_vs_attrs();
                     }
                 }
             }

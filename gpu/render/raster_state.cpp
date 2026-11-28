@@ -6,6 +6,7 @@
 #include <mutex>
 #include <unordered_map>
 
+#include "render/direct_states.h"
 #include "render/raster_internal.h"
 
 namespace Vulkan {
@@ -88,35 +89,136 @@ void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool
     BB_SECTION(UpdateDynamicState);
     const bool on_stage_b = (stage_regs != nullptr);
     const u64 cur_dyn_epoch = on_stage_b ? pipe_dyn_reg_epoch : liverpool->dyn_reg_epoch;
-    if (!scheduler.GetDynamicState().AnyDirty() &&
+    const u64 cur_cmd_epoch = scheduler.DescriptorStateEpoch();
+    auto& dynamic_state = scheduler.GetDynamicState();
+    if (!dynamic_state.AnyDirty() &&
         last_dyn_from_stage_b == on_stage_b &&
         last_dyn_reg_epoch == cur_dyn_epoch &&
-        last_dyn_cmd_epoch == scheduler.DescriptorStateEpoch() &&
+        last_dyn_cmd_epoch == cur_cmd_epoch &&
         last_dyn_is_indexed == is_indexed &&
         last_dyn_target_scale == target_scale &&
         last_dyn_jitter == draw_jitter &&
         last_dyn_feedback_loop == attachment_feedback_loop) {
         UpdateColorBlendingState(pipeline);
-        if (scheduler.GetDynamicState().AnyDirty()) {
-            scheduler.GetDynamicState().CommitWith(
+        if (dynamic_state.AnyDirty()) {
+            dynamic_state.CommitWith(
                 instance.IsDepthBoundsSupported(), instance.IsDynamicColorWriteMaskSupported(),
                 instance.IsAttachmentFeedbackLoopLayoutSupported(),
                 [&](auto&& command) { scheduler.Record(std::move(command)); });
         }
         return;
     }
-    UpdateViewportScissorState();
-    UpdateDepthStencilState();
-    UpdatePrimitiveState(is_indexed);
+
+    const auto* const crs =
+        (on_stage_b && pipe_rs_id != 0u) ? DirectStates::GetCompiledRasterDyn(pipe_rs_id) : nullptr;
+    const auto* const cds =
+        (on_stage_b && pipe_ds_id != 0u) ? DirectStates::GetCompiledDepthStencilDyn(pipe_ds_id)
+                                         : nullptr;
+    const auto& regs = Regs();
+    const u64 cur_vp_epoch = on_stage_b ? pipe_vp_scissor_epoch : liverpool->dyn_reg_epoch;
+    const u8 cur_vp_ctrl_bits = static_cast<u8>(
+        (crs ? crs->vp_flags
+             : ((regs.clipper_control.clip_disable != 0u ? 1u : 0u) |
+                (regs.clipper_control.clip_space == Gcn::ClipSpace::MinusWToW ? 2u : 0u) |
+                (regs.mode_control.vport_scissor_enable != 0u ? 4u : 0u) |
+                (regs.polygon_control.enable_window_offset != 0u ? 8u : 0u))) |
+        (regs.primitive_type == Gcn::PrimitiveType::RectList ? 16u : 0u));
+    const bool need_vp = dynamic_state.ViewportsDirty() ||
+                         last_vp_from_stage_b != on_stage_b ||
+                         last_vp_epoch != cur_vp_epoch ||
+                         last_vp_cmd_epoch != cur_cmd_epoch ||
+                         last_vp_ctrl_bits != cur_vp_ctrl_bits ||
+                         last_vp_target_scale != target_scale ||
+                         last_vp_jitter != draw_jitter;
+    if (need_vp) {
+        UpdateViewportScissorState();
+        last_vp_from_stage_b = on_stage_b;
+        last_vp_epoch = cur_vp_epoch;
+        last_vp_cmd_epoch = cur_cmd_epoch;
+        last_vp_ctrl_bits = cur_vp_ctrl_bits;
+        last_vp_target_scale = target_scale;
+        last_vp_jitter = draw_jitter;
+    }
+
+    if (cds && crs) [[likely]] {
+        // Stage 4A: O(1) precompiled DirectStates dynamic depth/stencil + rasterizer fast-path
+        // (zero PS4 Gcn::Regs bitfield decode or GcnToVk switch dispatch on 99.9% of 3D draws).
+        const bool depth_test = cds->depth_enable && regs.depth_buffer.DepthValid();
+        dynamic_state.SetDepthTestEnabled(depth_test);
+        if (depth_test) {
+            dynamic_state.SetDepthWriteEnabled(cds->depth_write_enable &&
+                                               !regs.depth_render_control.depth_clear_enable);
+            dynamic_state.SetDepthCompareOp(static_cast<vk::CompareOp>(cds->depth_compare_op_vk));
+        }
+        dynamic_state.SetDepthBoundsTestEnabled(cds->depth_bounds_enable);
+        if (cds->depth_bounds_enable) {
+            dynamic_state.SetDepthBounds(regs.depth_bounds_min, regs.depth_bounds_max);
+        }
+        dynamic_state.SetDepthBiasEnabled(crs->depth_bias_enable);
+        if (crs->depth_bias_enable) {
+            dynamic_state.SetDepthBias(crs->depth_bias_const, crs->depth_bias_clamp,
+                                       crs->depth_bias_slope);
+        }
+        const bool stencil_test = cds->stencil_enable && regs.depth_buffer.StencilValid();
+        dynamic_state.SetStencilTestEnabled(stencil_test);
+        if (stencil_test) {
+            const StencilOps front_ops{
+                .fail_op = static_cast<vk::StencilOp>(cds->front_fail_vk),
+                .pass_op = static_cast<vk::StencilOp>(cds->front_pass_vk),
+                .depth_fail_op = static_cast<vk::StencilOp>(cds->front_zfail_vk),
+                .compare_op = static_cast<vk::CompareOp>(cds->front_cmp_vk),
+            };
+            const StencilOps back_ops{
+                .fail_op = static_cast<vk::StencilOp>(cds->back_fail_vk),
+                .pass_op = static_cast<vk::StencilOp>(cds->back_pass_vk),
+                .depth_fail_op = static_cast<vk::StencilOp>(cds->back_zfail_vk),
+                .compare_op = static_cast<vk::CompareOp>(cds->back_cmp_vk),
+            };
+            dynamic_state.SetStencilOps(front_ops, back_ops);
+            const auto front = regs.stencil_ref_front;
+            const auto back = cds->two_sided ? regs.stencil_ref_back : regs.stencil_ref_front;
+            if ((cds->front_uses_op_val && cds->front_cmp_checks_ref &&
+                 front.stencil_test_val != front.stencil_op_val) ||
+                (cds->back_uses_op_val && cds->two_sided && cds->back_cmp_checks_ref &&
+                 back.stencil_test_val != back.stencil_op_val)) [[unlikely]] {
+                LOG_WARNING(Render_Vulkan, "Stencil test requires test_val while ReplaceOp "
+                                           "requires op_val; the stencil test will use op_val");
+            }
+            dynamic_state.SetStencilReferences(
+                cds->front_uses_op_val ? front.stencil_op_val : front.stencil_test_val,
+                cds->back_uses_op_val ? back.stencil_op_val : back.stencil_test_val);
+            const bool stencil_clear = regs.depth_render_control.stencil_clear_enable;
+            dynamic_state.SetStencilWriteMasks(
+                (stencil_clear || cds->front_all_keep) ? 0U : front.stencil_write_mask,
+                (stencil_clear || cds->back_all_keep) ? 0U : back.stencil_write_mask);
+            dynamic_state.SetStencilCompareMasks(front.stencil_mask, back.stencil_mask);
+        }
+        const auto type = regs.primitive_type;
+        const bool restart = (regs.enable_primitive_restart & 1) != 0 &&
+                             (instance.IsListRestartSupported() || !IsListTopology(type)) &&
+                             (instance.IsPatchListRestartSupported() || !IsPatchListTopology(type));
+        ASSERT_MSG(!is_indexed || !restart || regs.primitive_restart_index == 0xFFFF ||
+                       regs.primitive_restart_index == 0xFFFFFFFF,
+                   "Primitive restart index other than -1 is not supported yet");
+        dynamic_state.SetPrimitiveRestartEnabled(restart);
+        dynamic_state.SetRasterizerDiscardEnabled(crs->rasterizer_discard);
+        dynamic_state.SetCullMode(GcnToVk::IsPrimitiveCulled(type)
+                                      ? static_cast<vk::CullModeFlags>(crs->cull_mode_vk)
+                                      : vk::CullModeFlagBits::eNone);
+        dynamic_state.SetFrontFace(static_cast<vk::FrontFace>(crs->front_face_vk));
+    } else {
+        UpdateDepthStencilState();
+        UpdatePrimitiveState(is_indexed);
+    }
     UpdateRasterizationState();
     UpdateColorBlendingState(pipeline);
-    scheduler.GetDynamicState().CommitWith(
+    dynamic_state.CommitWith(
         instance.IsDepthBoundsSupported(), instance.IsDynamicColorWriteMaskSupported(),
         instance.IsAttachmentFeedbackLoopLayoutSupported(),
         [&](auto&& command) { scheduler.Record(std::move(command)); });
     last_dyn_from_stage_b = on_stage_b;
     last_dyn_reg_epoch = cur_dyn_epoch;
-    last_dyn_cmd_epoch = scheduler.DescriptorStateEpoch();
+    last_dyn_cmd_epoch = cur_cmd_epoch;
     last_dyn_is_indexed = is_indexed;
     last_dyn_target_scale = target_scale;
     last_dyn_jitter = draw_jitter;
@@ -125,7 +227,14 @@ void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool
 
 void Rasterizer::UpdateViewportScissorState() const {
     const auto& regs = Regs();
-    if (regs.polygon_control.enable_window_offset &&
+    const auto* const crs_vp =
+        (stage_regs != nullptr && pipe_rs_id != 0u) ? DirectStates::GetCompiledRasterDyn(pipe_rs_id)
+                                                    : nullptr;
+    const bool enable_win_off =
+        crs_vp ? ((crs_vp->vp_flags & 8u) != 0u) : (regs.polygon_control.enable_window_offset != 0u);
+    const bool vport_scissor_en =
+        crs_vp ? ((crs_vp->vp_flags & 4u) != 0u) : (regs.mode_control.vport_scissor_enable != 0u);
+    if (enable_win_off &&
         (regs.window_offset.window_x_offset != 0 || regs.window_offset.window_y_offset != 0)) {
         LOG_ERROR(Render_Vulkan,
                   "PA_SU_SC_MODE_CNTL.VTX_WINDOW_OFFSET_ENABLE support is not yet implemented.");
@@ -164,7 +273,7 @@ void Rasterizer::UpdateViewportScissorState() const {
         viewports.push_back(viewport);
 
         Gcn::Scissor scissor = combined;
-        if (regs.mode_control.vport_scissor_enable) {
+        if (vport_scissor_en) {
             const auto& own = regs.viewport_scissors[i];
             scissor.top_left_x = std::max(scissor.top_left_x, s16(own.top_left_x));
             scissor.top_left_y = std::max(scissor.top_left_y, s16(own.top_left_y));

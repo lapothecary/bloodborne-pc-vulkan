@@ -183,6 +183,34 @@ int main() {
     assert(std::abs(s.native_bloom_intensity.load() - 0.215f) < 1e-3f &&
            std::abs(s.native_dof_strength.load() - 1.35f) < 1e-2f);
 
+    // Upscaler Mip Bias: Auto default, manual quantization to 0.25 steps, +0.0 normalization, and round-trip.
+    assert(BbSettings::IsUpscalerMipBiasAuto(s.upscaler_mip_bias.load()));
+    assert(std::abs(BbSettings::QuantizeUpscalerMipBias(-0.63f) - (-0.75f)) < 1e-5f);
+    assert(std::abs(BbSettings::QuantizeUpscalerMipBias(-5.0f) - (-2.0f)) < 1e-5f);
+    assert(BbSettings::QuantizeUpscalerMipBias(-0.01f) == 0.0f &&
+           !std::signbit(BbSettings::QuantizeUpscalerMipBias(-0.01f)));
+    s.upscaler_mip_bias = -1.0f;
+    BbSettings::Save();
+    s.upscaler_mip_bias = BbSettings::Values::UpscalerMipBiasAuto;
+    BbSettings::Load();
+    assert(!BbSettings::IsUpscalerMipBiasAuto(s.upscaler_mip_bias.load()) &&
+           std::abs(s.upscaler_mip_bias.load() - (-1.0f)) < 1e-5f);
+    s.upscaler_mip_bias = BbSettings::Values::UpscalerMipBiasAuto;
+    BbSettings::Save();
+    s.upscaler_mip_bias = -0.5f;
+    BbSettings::Load();
+    assert(BbSettings::IsUpscalerMipBiasAuto(s.upscaler_mip_bias.load()));
+
+    // Audio Output Mode (0=Stereo, 1=Headphones 7.1 HRTF, 2=Surround 7.1) round-trip.
+    assert(s.audio_mode.load() == BbSettings::AudioStereo);
+    for (int am : {BbSettings::AudioHrtf, BbSettings::AudioSurround, BbSettings::AudioStereo}) {
+        s.audio_mode = am;
+        BbSettings::Save();
+        s.audio_mode = (am + 1) % BbSettings::AudioModeCount;
+        BbSettings::Load();
+        assert(s.audio_mode.load() == am);
+    }
+
     unlink(path);
     std::puts("PASS: settings save keeps other keys, menu position, menu language, and native CSOptionsData");
 }

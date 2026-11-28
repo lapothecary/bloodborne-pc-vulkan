@@ -244,6 +244,15 @@ struct RegDirty {
     //   gs_max_vert_out, stage_enable, ls_hs_config, vgt_gs_vert_itemsize[0]
     // - mask[1] bits 35..49 (chunks 99..113): [0xA318, 0xA390) = color_buffers[0..7]
     // - mask[1] bit 52 (chunk 116): [0xC248, 0xC250) = num_indices, num_instances
+    // Stage-A-only 8-dword chunks `[0xA190, 0xA1C8)` (bits 50..56): `ps_inputs[0..31]`,
+    // `vs_output_config`, `ps_input_ena/addr`, `num_interp`, `barycentric_control`,
+    // `shader_pos/z/col_format`. Baked into PSO/runtime_info on Stage A; ZERO readers on Stage B.
+    static constexpr u64 kStageBStageAOnlyMask0 = (((1ULL << 7u) - 1ULL) << 50u);
+    /// Stage 4A: Unaliased Stage-B chunks containing viewport/scissor registers
+    /// (`screen_scissor` c1, `window_offset/scissor` c16, `generic/vport_scissors/depths` c18..26,
+    /// `viewports[0..15]` tail c34..45). Aliased c33 (`0xA10F`) and c64 (`0xA206`) are checked
+    /// by exact 1-dword compare on unpack.
+    static constexpr u64 kStageBVpUnaliasedMask0 = 0x00003FFC07FD0002ULL;
     static constexpr u64 kStageBDynIgnoreMask0 = (((1ULL << 14u) - 1ULL) << 50u);
     static constexpr u64 kStageBDynIgnoreMask1 =
         (1ULL << (83u - 64u)) | (((1ULL << 6u) - 1ULL) << (85u - 64u)) |
@@ -255,6 +264,10 @@ struct RegDirty {
     u64 batch_stage_b_mask[2]{~0ULL, ~0ULL}; ///< Stage-A batcher dirty bits (only cleared by batchers)
     bool track_all_blocks = true;
     bool reset = false; ///< CLEAR_STATE: the defaults, then only the blocks marked after it
+    /// Stage 4B: Deferred Stage-B chunks skipped while `DirectStates` IDs carry RS/DS state
+    /// (`c82/c91/c92` for RS, `c33` for DS `0xA10B`). Auto-flushed on any fallback draw (`id == 0`).
+    bool rs_chunks_deferred = false;
+    bool ds_chunks_deferred = false;
 
     [[gnu::always_inline]] void ClearBatchStageBDirty() noexcept {
         batch_stage_b_mask[0] = 0ULL;
@@ -299,6 +312,10 @@ struct RegDirty {
             const u32 hi = (std::min(end, 0xA390u) - 1u - 0xA000u) >> 3;
             SetStageBBitRange(stage_b_mask, lo, hi);
             SetStageBBitRange(batch_stage_b_mask, lo, hi);
+            if (!track_all_blocks) [[likely]] {
+                stage_b_mask[0] &= ~kStageBStageAOnlyMask0;
+                batch_stage_b_mask[0] &= ~kStageBStageAOnlyMask0;
+            }
         } else if (end > 0xC038u && word < 0xC258u) {
             if (end > 0xC038u && word < 0xC040u) {
                 stage_b_mask[1] |= (1ULL << (114u - 64u));

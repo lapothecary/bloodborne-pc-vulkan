@@ -91,11 +91,20 @@ public:
         return is_compute;
     }
 
+    [[nodiscard]] u16 GetNativePsoId() const noexcept {
+        return native_pso_id;
+    }
+
+    void SetNativePsoId(u16 id) const noexcept {
+        native_pso_id = id;
+    }
+
     using DescriptorWrites = std::vector<vk::WriteDescriptorSet>;
     /// Records the push data and the descriptors. `image_infos` and `buffer_infos`: the arrays
     /// the writes point into, if known (their descriptors are then copied for the recording
     /// thread in one piece each).
-    void BindResources(DescriptorWrites& set_writes, const Shader::PushData& push_data,
+    void BindResources(std::span<vk::WriteDescriptorSet> set_writes,
+                       const Shader::PushData& push_data,
                        std::span<const vk::DescriptorImageInfo> image_infos = {},
                        std::span<const vk::DescriptorBufferInfo> buffer_infos = {},
                        bool bulk_known = false) const;
@@ -125,6 +134,7 @@ protected:
     std::array<const Shader::Info*, Shader::MaxStageTypes> stages{};
     bool uses_push_descriptors{};
     bool is_compute;
+    mutable u16 native_pso_id{0};
 };
 
 struct ComputePipelineKey {

@@ -3,6 +3,7 @@
 // binding helper thread.
 
 #include "bbport_button_prompts.h"
+#include "cp/cp_diagnostics.h"
 #include "render/raster_internal.h"
 #include "textures/direct_textures.h"
 #include "../../dantelion_gx/include/gx_direct_vulkan.h"
@@ -301,8 +302,9 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
         }
     }
 
+    // Stage 3C-3: Keep `set_writes` at its high-water mark and slice `[0, set_write_index)`
+    // instead of clearing + value-initializing ~1.3 KiB of `vk::WriteDescriptorSet` every draw.
     set_write_index = 0;
-    set_writes.clear();
     buffer_infos.clear();
     image_infos.clear();
     // bbport: G-buffer passes sample material textures for a scene rendered below the output
@@ -357,7 +359,9 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
                     stage->buffers.size() + stage->images.size() + stage->samplers.size();
             }
         }
-        set_writes.resize(total_descriptors);
+        if (set_writes.size() < total_descriptors) [[unlikely]] {
+            set_writes.resize(total_descriptors);
+        }
         for (const auto* stage : pipeline->GetStages()) {
             if (!stage) {
                 continue;
@@ -371,9 +375,6 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
                 BindTextures(*stage, prepared, binding, set_write_index, needs_barrier);
             }
             uses_dma |= stage->uses_dma;
-        }
-        if (set_write_index != set_writes.size()) [[unlikely]] {
-            set_writes.resize(set_write_index);
         }
     } else {
         // bbport: textures on the helper, buffers here. Without mip arrays every stage's
@@ -398,7 +399,10 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
             const u32 num_buffers = static_cast<u32>(stage->buffers.size());
             const u32 num_descriptors =
                 num_buffers + static_cast<u32>(stage->images.size() + stage->samplers.size());
-            set_writes.resize(set_writes.size() + num_descriptors);
+            const size_t needed = static_cast<size_t>(set_write_index) + num_descriptors;
+            if (set_writes.size() < needed) [[unlikely]] {
+                set_writes.resize(needed);
+            }
             stage->PushUd(binding, push_data);
             const PreparedStage* prepared = FindPreparedStage(*stage);
             buffer_stages[task.count] = {stage, prepared, binding, set_write_index};
@@ -449,6 +453,8 @@ namespace {
 struct StageBVtxIdxDedup {
     const Scheduler* sched = nullptr;
     u64 vtx_epoch = 0;
+    const void* last_vtx_memo = nullptr;
+    u64 last_vtx_memo_gen = 0;
     VertexInputs<vk::VertexInputBindingDescription2EXT> bindings;
     VertexInputs<vk::VertexInputAttributeDescription2EXT> attributes;
     VertexInputs<vk::Buffer> buffers;
@@ -512,74 +518,82 @@ void Rasterizer::EmitVertexBuffers() {
     // each: ~3 KiB copied per draw).
     auto& v = vertex_binds;
     const bool dynamic_input = instance.IsVertexInputDynamicState();
+    const auto* const memo = v.memo_hit;
     const u32 num_buffers = v.num_buffers;
+    const auto* const bind_ptr = memo ? memo->bindings.data() : v.bindings.data();
+    const u32 bind_cnt = memo ? memo->count : static_cast<u32>(v.bindings.size());
+    const auto* const attr_ptr = memo ? memo->attributes.data() : v.attributes.data();
+    const u32 attr_cnt = memo ? memo->count : static_cast<u32>(v.attributes.size());
+    const auto* const buf_ptr = memo ? memo->host_buffers.data() : v.host_buffers.data();
+    const auto* const off_ptr = memo ? memo->host_offsets.data() : v.host_offsets.data();
     if (dynamic_input && StageBFastBind()) {
         auto& d = GetVtxIdxDedup(scheduler.ActiveReorderBucket());
         const u64 cur_epoch = scheduler.DescriptorStateEpoch();
         const bool same_epoch = (d.sched == &scheduler && d.vtx_epoch == cur_epoch);
+        if (same_epoch && memo != nullptr && d.last_vtx_memo == memo &&
+            d.last_vtx_memo_gen == v.memo_gen) {
+            return;
+        }
         const bool same_layout =
-            same_epoch && d.bindings.size() == v.bindings.size() &&
-            d.attributes.size() == v.attributes.size() &&
-            (v.bindings.empty() ||
-             std::memcmp(d.bindings.data(), v.bindings.data(),
-                         v.bindings.size() * sizeof(v.bindings[0])) == 0) &&
-            (v.attributes.empty() ||
-             std::memcmp(d.attributes.data(), v.attributes.data(),
-                         v.attributes.size() * sizeof(v.attributes[0])) == 0);
+            same_epoch && d.bindings.size() == bind_cnt && d.attributes.size() == attr_cnt &&
+            (bind_cnt == 0u ||
+             std::memcmp(d.bindings.data(), bind_ptr, bind_cnt * sizeof(bind_ptr[0])) == 0) &&
+            (attr_cnt == 0u ||
+             std::memcmp(d.attributes.data(), attr_ptr, attr_cnt * sizeof(attr_ptr[0])) == 0);
         const bool same_buffers =
             same_epoch && d.buffers.size() == num_buffers &&
-            (num_buffers == 0 ||
-             (std::memcmp(d.buffers.data(), v.host_buffers.data(),
-                          num_buffers * sizeof(vk::Buffer)) == 0 &&
-              std::memcmp(d.offsets.data(), v.host_offsets.data(),
-                          num_buffers * sizeof(vk::DeviceSize)) == 0));
+            (num_buffers == 0u ||
+             (std::memcmp(d.buffers.data(), buf_ptr, num_buffers * sizeof(vk::Buffer)) == 0 &&
+              std::memcmp(d.offsets.data(), off_ptr, num_buffers * sizeof(vk::DeviceSize)) == 0));
         if (same_layout && same_buffers) {
+            d.last_vtx_memo = memo;
+            d.last_vtx_memo_gen = v.memo_gen;
             return;
         }
         d.sched = &scheduler;
         d.vtx_epoch = cur_epoch;
+        d.last_vtx_memo = memo;
+        d.last_vtx_memo_gen = v.memo_gen;
         if (!same_buffers) {
-            d.buffers.assign(v.host_buffers.begin(), v.host_buffers.begin() + num_buffers);
-            d.offsets.assign(v.host_offsets.begin(), v.host_offsets.begin() + num_buffers);
+            d.buffers.assign(buf_ptr, buf_ptr + num_buffers);
+            d.offsets.assign(off_ptr, off_ptr + num_buffers);
         }
         if (same_layout) {
-            if (num_buffers == 0) {
+            if (num_buffers == 0u) {
                 return;
             }
             scheduler.ReserveRecordData(
                 num_buffers * (sizeof(vk::Buffer) + sizeof(vk::DeviceSize)) + 64);
-            const auto buffers = scheduler.RecordData(
-                std::span<const vk::Buffer>{v.host_buffers.data(), num_buffers});
-            const auto offsets = scheduler.RecordData(
-                std::span<const vk::DeviceSize>{v.host_offsets.data(), num_buffers});
+            const auto buffers =
+                scheduler.RecordData(std::span<const vk::Buffer>{buf_ptr, num_buffers});
+            const auto offsets =
+                scheduler.RecordData(std::span<const vk::DeviceSize>{off_ptr, num_buffers});
             scheduler.Record([num_buffers, buffers, offsets](vk::CommandBuffer cmdbuf) {
                 cmdbuf.bindVertexBuffers(0, num_buffers, buffers.data(), offsets.data());
             });
             return;
         }
-        d.bindings.assign(v.bindings.begin(), v.bindings.end());
-        d.attributes.assign(v.attributes.begin(), v.attributes.end());
+        d.bindings.assign(bind_ptr, bind_ptr + bind_cnt);
+        d.attributes.assign(attr_ptr, attr_ptr + attr_cnt);
     }
     scheduler.ReserveRecordData(
-        v.bindings.size() * sizeof(v.bindings[0]) + v.attributes.size() * sizeof(v.attributes[0]) +
+        bind_cnt * sizeof(bind_ptr[0]) + attr_cnt * sizeof(attr_ptr[0]) +
         num_buffers * (sizeof(vk::Buffer) + 3 * sizeof(vk::DeviceSize)) + 128);
     if (dynamic_input) {
         const auto bindings = scheduler.RecordData(
-            std::span<const vk::VertexInputBindingDescription2EXT>{v.bindings.data(),
-                                                                   v.bindings.size()});
+            std::span<const vk::VertexInputBindingDescription2EXT>{bind_ptr, bind_cnt});
         const auto attributes = scheduler.RecordData(
-            std::span<const vk::VertexInputAttributeDescription2EXT>{v.attributes.data(),
-                                                                     v.attributes.size()});
-        if (num_buffers == 0) {
+            std::span<const vk::VertexInputAttributeDescription2EXT>{attr_ptr, attr_cnt});
+        if (num_buffers == 0u) {
             scheduler.Record([bindings, attributes](vk::CommandBuffer cmdbuf) {
                 cmdbuf.setVertexInputEXT(bindings, attributes);
             });
             return;
         }
         const auto buffers =
-            scheduler.RecordData(std::span<const vk::Buffer>{v.host_buffers.data(), num_buffers});
-        const auto offsets = scheduler.RecordData(
-            std::span<const vk::DeviceSize>{v.host_offsets.data(), num_buffers});
+            scheduler.RecordData(std::span<const vk::Buffer>{buf_ptr, num_buffers});
+        const auto offsets =
+            scheduler.RecordData(std::span<const vk::DeviceSize>{off_ptr, num_buffers});
         if (StageBFastBind()) {
             scheduler.Record(
                 [bindings, attributes, num_buffers, buffers, offsets](vk::CommandBuffer cmdbuf) {
@@ -609,8 +623,22 @@ void Rasterizer::EmitVertexBuffers() {
     });
 }
 
+void Rasterizer::ResolveVertexBuffersDirect(const GraphicsPipeline* pipeline, u32 step0, u32 step1,
+                                            const DirectVertexDrawInfo* direct_info) {
+    ResolveVertexBuffersImpl(pipeline, nullptr, step0, step1, direct_info);
+}
+
 void Rasterizer::ResolveVertexBuffers(const GraphicsPipeline* pipeline,
                                       const PreparedDraw* prepared) {
+    const auto& regs = Regs();
+    ResolveVertexBuffersImpl(pipeline, prepared, regs.vgt_instance_step_rate_0,
+                             regs.vgt_instance_step_rate_1, nullptr);
+}
+
+void Rasterizer::ResolveVertexBuffersImpl(const GraphicsPipeline* pipeline,
+                                          const PreparedDraw* prepared, u32 step0_reg,
+                                          u32 step1_reg,
+                                          const DirectVertexDrawInfo* direct_info) {
     BB_SECTION(ResolveVertexBuffers);
     if (direct_buffers.NeedsProcessEvents(scheduler.IsRendering())) [[unlikely]] {
         direct_buffers.ProcessEvents(memory);
@@ -618,6 +646,8 @@ void Rasterizer::ResolveVertexBuffers(const GraphicsPipeline* pipeline,
     const auto& regs = Regs();
     auto& v = vertex_binds;
     v.num_buffers = 0;
+    v.memo_hit = nullptr;
+    v.memo_gen = 0;
     v.host_buffers.clear();
     v.host_offsets.clear();
     v.host_sizes.clear();
@@ -634,8 +664,7 @@ void Rasterizer::ResolveVertexBuffers(const GraphicsPipeline* pipeline,
         packet_vsharps[0].base_address >= kConstRingVertexBase) {
         const bool dynamic_input = instance.IsVertexInputDynamicState();
         pipeline->GetVertexInputs(attributes, bindings, divisors, guest_buffers,
-                                  regs.vgt_instance_step_rate_0, regs.vgt_instance_step_rate_1,
-                                  packet_vsharps);
+                                  step0_reg, step1_reg, packet_vsharps);
         const vk::Buffer ring_handle = constant_ring->Handle();
         const u64 ring_cap = ConstantRing::Capacity;
         for (const auto& buffer : guest_buffers) {
@@ -680,8 +709,8 @@ void Rasterizer::ResolveVertexBuffers(const GraphicsPipeline* pipeline,
             stage_b_vertex_memo_keys->fill(0ULL);
         }
         const u32 cnt = static_cast<u32>(memo_vsharps.size());
-        const u32 step0 = regs.vgt_instance_step_rate_0;
-        const u32 step1 = regs.vgt_instance_step_rate_1;
+        const u32 step0 = step0_reg;
+        const u32 step1 = step1_reg;
         const u32 cur_frame = BbStats::frame_number.load(std::memory_order_relaxed);
         const u64 cur_erase_gen = direct_buffers.EraseGeneration();
         const u64 cur_exact_gen = VideoCore::DirectBuffers::ExactBufferTopologyGen();
@@ -720,8 +749,6 @@ void Rasterizer::ResolveVertexBuffers(const GraphicsPipeline* pipeline,
                 std::memcmp(cand.vsharps.data(), memo_vsharps.data(),
                             cnt * sizeof(Gcn::Buffer)) == 0) {
                 cand.last_use = ++stage_b_vertex_memo_clock;
-                attributes.assign(cand.attributes.begin(), cand.attributes.begin() + cnt);
-                bindings.assign(cand.bindings.begin(), cand.bindings.begin() + cnt);
                 static const bool trace_shader = std::getenv("BB_TRACE_SHADER") != nullptr;
                 if (cand.resolved_direct_valid && !cand.has_transient_cue && StageBFastBind() &&
                     !VideoCore::BufferCache::LayerPagedActive() && !InPlaceReads::Enabled() &&
@@ -735,10 +762,10 @@ void Rasterizer::ResolveVertexBuffers(const GraphicsPipeline* pipeline,
                         }
                     }
                     if (!uav_dirty) [[likely]] {
-                        v.host_buffers.assign(cand.host_buffers.begin(),
-                                              cand.host_buffers.begin() + cnt);
-                        v.host_offsets.assign(cand.host_offsets.begin(),
-                                              cand.host_offsets.begin() + cnt);
+                        // Stage 4B: Zero-copy direct memo hit — EmitVertexBuffers reads directly
+                        // from `cand` and skips 4x memcmp via `(memo_hit, memo_gen)`.
+                        v.memo_hit = &cand;
+                        v.memo_gen = cand.gen;
                         v.num_buffers = cnt;
                         if (motion_draw) {
                             motion_geometry = cand.buffers_hash;
@@ -748,6 +775,8 @@ void Rasterizer::ResolveVertexBuffers(const GraphicsPipeline* pipeline,
                         return;
                     }
                 }
+                attributes.assign(cand.attributes.begin(), cand.attributes.begin() + cnt);
+                bindings.assign(cand.bindings.begin(), cand.bindings.begin() + cnt);
                 guest_buffers.assign(cand.vsharps.begin(), cand.vsharps.begin() + cnt);
                 memo_hit_slot = &cand;
                 break;
@@ -784,6 +813,7 @@ void Rasterizer::ResolveVertexBuffers(const GraphicsPipeline* pipeline,
                     }
                 }
                 slot.key = memo_key;
+                slot.gen = ++stage_b_vertex_memo_gen;
                 slot.last_use = ++stage_b_vertex_memo_clock;
                 slot.erase_gen = cur_erase_gen;
                 slot.exact_gen = cur_exact_gen;
@@ -819,8 +849,7 @@ void Rasterizer::ResolveVertexBuffers(const GraphicsPipeline* pipeline,
         }
     } else {
         pipeline->GetVertexInputs(attributes, bindings, divisors, guest_buffers,
-                                  regs.vgt_instance_step_rate_0, regs.vgt_instance_step_rate_1,
-                                  packet_vsharps);
+                                  step0_reg, step1_reg, packet_vsharps);
         if (BbCeStats::Enabled() && !packet_vsharps.empty()) {
             // What reading the V# tables here would have given instead (the old path).
             static u64 compared = 0, differed = 0;
@@ -964,7 +993,8 @@ void Rasterizer::ResolveVertexBuffers(const GraphicsPipeline* pipeline,
             }
         }
     }
-    const bool is_direct_draw = (pipeline != nullptr && draw_inputs.pipeline == pipeline);
+    const bool is_direct_draw =
+        (pipeline != nullptr && (direct_info != nullptr || draw_inputs.pipeline == pipeline));
     bool draw_bounds_computed = false;
     bool have_vtx_bound = false;
     u64 draw_vertex_end = 0;
@@ -979,32 +1009,43 @@ void Rasterizer::ResolveVertexBuffers(const GraphicsPipeline* pipeline,
         }
         if (!draw_bounds_computed) {
             draw_bounds_computed = true;
-            const auto& vs = pipeline->GetStage(Shader::SwStage::Vertex);
-            draw_vertex_off = regs.index_offset;
-            draw_instance_off = 0;
-            if (fetch) {
-                const auto ud = vs.UserData();
-                if (draw_vertex_off == 0 && fetch->vertex_offset_sgpr != -1 &&
-                    static_cast<u32>(fetch->vertex_offset_sgpr) < ud.size()) {
-                    draw_vertex_off = ud[fetch->vertex_offset_sgpr];
-                }
-                if (fetch->instance_offset_sgpr != -1 &&
-                    static_cast<u32>(fetch->instance_offset_sgpr) < ud.size()) {
-                    draw_instance_off = ud[fetch->instance_offset_sgpr];
+            const bool is_idx = direct_info ? direct_info->is_indexed : draw_inputs.is_indexed;
+            const u32 num_idx = direct_info ? direct_info->num_indices : regs.num_indices;
+            if (direct_info) {
+                draw_vertex_off = direct_info->first_vertex;
+                draw_instance_off = direct_info->first_instance;
+            } else {
+                const auto& vs = pipeline->GetStage(Shader::SwStage::Vertex);
+                draw_vertex_off = regs.index_offset;
+                draw_instance_off = 0;
+                if (fetch) {
+                    const auto ud = vs.UserData();
+                    if (draw_vertex_off == 0 && fetch->vertex_offset_sgpr != -1 &&
+                        static_cast<u32>(fetch->vertex_offset_sgpr) < ud.size()) {
+                        draw_vertex_off = ud[fetch->vertex_offset_sgpr];
+                    }
+                    if (fetch->instance_offset_sgpr != -1 &&
+                        static_cast<u32>(fetch->instance_offset_sgpr) < ud.size()) {
+                        draw_instance_off = ud[fetch->instance_offset_sgpr];
+                    }
                 }
             }
-            if (!draw_inputs.is_indexed) {
-                draw_vertex_end = u64(draw_vertex_off) + u64(regs.num_indices);
+            if (!is_idx) {
+                draw_vertex_end = u64(draw_vertex_off) + u64(num_idx);
                 have_vtx_bound = true;
-            } else if (regs.num_indices == 0) {
+            } else if (num_idx == 0) {
                 draw_vertex_end = 0;
                 have_vtx_bound = true;
-            } else if (regs.num_indices <= 65536u) {
-                const bool index16 = regs.index_buffer_type.index_type == Gcn::IndexType::Index16;
+            } else if (num_idx <= 65536u) {
+                const bool index16 =
+                    direct_info ? direct_info->index16
+                                : (regs.index_buffer_type.index_type == Gcn::IndexType::Index16);
                 const u32 index_size = index16 ? sizeof(u16) : sizeof(u32);
-                const VAddr ib_addr = regs.index_base_address.Address<VAddr>() +
-                                      u64(draw_inputs.index_offset) * index_size;
-                const u64 ib_bytes = u64(regs.num_indices) * index_size;
+                const VAddr ib_addr =
+                    direct_info ? direct_info->index_va
+                                : (regs.index_base_address.Address<VAddr>() +
+                                   u64(draw_inputs.index_offset) * index_size);
+                const u64 ib_bytes = u64(num_idx) * index_size;
                 if (ib_addr != 0 &&
                     !(HasPendingHleCopies() &&
                       PendingHleCopiesConflict(ib_addr, ib_bytes, false))) {
@@ -1020,14 +1061,17 @@ void Rasterizer::ResolveVertexBuffers(const GraphicsPipeline* pipeline,
                         }
                     }
                     if (ib_ptr) {
-                        const bool prim_restart = regs.enable_primitive_restart != 0;
+                        const bool prim_restart = direct_info
+                                                      ? direct_info->prim_restart
+                                                      : (regs.enable_primitive_restart != 0);
+                        const u32 raw_restart_idx = direct_info ? direct_info->prim_restart_idx
+                                                                : regs.primitive_restart_index;
                         const s64 v_off = static_cast<s64>(static_cast<s32>(draw_vertex_off));
                         s64 max_v = -1;
                         if (index16) {
-                            const u16 restart_val =
-                                static_cast<u16>(regs.primitive_restart_index & 0xFFFFu);
+                            const u16 restart_val = static_cast<u16>(raw_restart_idx & 0xFFFFu);
                             const auto* idx16 = reinterpret_cast<const u16*>(ib_ptr);
-                            for (u32 n = 0; n < regs.num_indices; ++n) {
+                            for (u32 n = 0; n < num_idx; ++n) {
                                 const u16 idx = idx16[n];
                                 if (prim_restart && idx == restart_val) {
                                     continue;
@@ -1038,9 +1082,9 @@ void Rasterizer::ResolveVertexBuffers(const GraphicsPipeline* pipeline,
                                 }
                             }
                         } else {
-                            const u32 restart_val = regs.primitive_restart_index;
+                            const u32 restart_val = raw_restart_idx;
                             const auto* idx32 = reinterpret_cast<const u32*>(ib_ptr);
-                            for (u32 n = 0; n < regs.num_indices; ++n) {
+                            for (u32 n = 0; n < num_idx; ++n) {
                                 const u32 idx = idx32[n];
                                 if (prim_restart && idx == restart_val) {
                                     continue;
@@ -1060,7 +1104,8 @@ void Rasterizer::ResolveVertexBuffers(const GraphicsPipeline* pipeline,
         if (!have_vtx_bound) {
             return cur_size;
         }
-        const u32 num_inst = regs.num_instances.NumInstances();
+        const u32 num_inst =
+            direct_info ? direct_info->num_instances : regs.num_instances.NumInstances();
         const size_t stream_cnt = std::min(guest_buffers.size(), bindings.size());
         u64 needed = min_span;
         for (size_t k = 0; k < stream_cnt; ++k) {
@@ -1260,6 +1305,7 @@ void Rasterizer::ResolveVertexBuffers(const GraphicsPipeline* pipeline,
     if (all_ranges_clean_direct && v.num_buffers == memo_fill_slot->count && v.num_buffers <= 16) {
         std::copy_n(v.host_buffers.begin(), v.num_buffers, memo_fill_slot->host_buffers.begin());
         std::copy_n(v.host_offsets.begin(), v.num_buffers, memo_fill_slot->host_offsets.begin());
+        memo_fill_slot->gen = ++stage_b_vertex_memo_gen;
         memo_fill_slot->resolved_direct_valid = true;
     }
 }
@@ -1291,15 +1337,20 @@ void Rasterizer::EmitIndexBuffer() {
 }
 
 void Rasterizer::ResolveIndexBuffer(u32 index_offset) {
-    BB_SECTION(ResolveIndexBuffer);
-    if (direct_buffers.NeedsProcessEvents(scheduler.IsRendering())) [[unlikely]] {
-        direct_buffers.ProcessEvents(memory);
-    }
     const auto& regs = Regs();
     const bool index16 = regs.index_buffer_type.index_type == Gcn::IndexType::Index16;
     const u32 index_size = index16 ? sizeof(u16) : sizeof(u32);
     const VAddr address = regs.index_base_address.Address<VAddr>() + u64(index_offset) * index_size;
-    const u32 size = regs.num_indices * index_size;
+    ResolveIndexBufferDirect(address, index16, regs.num_indices);
+}
+
+void Rasterizer::ResolveIndexBufferDirect(VAddr address, bool index16, u32 num_indices) {
+    BB_SECTION(ResolveIndexBuffer);
+    if (direct_buffers.NeedsProcessEvents(scheduler.IsRendering())) [[unlikely]] {
+        direct_buffers.ProcessEvents(memory);
+    }
+    const u32 index_size = index16 ? sizeof(u16) : sizeof(u32);
+    const u32 size = num_indices * index_size;
     if (HasPendingHleCopies() && PendingHleCopiesConflict(address, size, false)) {
         FlushPendingHleCopies(*this);
     }
@@ -1652,15 +1703,22 @@ void Rasterizer::BindGuestBuffer(const Shader::BufferResource& desc, const Gcn::
     const VideoCore::Buffer* buffer = nullptr;
     u64 offset = 0;
     u64 size = vsharp.GetSize();
+    const bool buf_audit = BbCp::Diagnostics::DcbStatsEnabled();
     if (in_cue && !desc.is_written && !desc.is_formatted && !HasPendingHleCopies()) [[likely]] {
         const u64 raw_sz = vsharp.GetSize();
         const u64 clamped_mem_size =
             (address + raw_sz <= cue_end) ? raw_sz : memory->ClampRangeSize(address, raw_sz);
         size = VideoCore::DirectBuffers::ClampTransientCueReadSize(address, clamped_mem_size);
+        if (buf_audit) [[unlikely]] {
+            BbCp::Diagnostics::NoteStageBBufAudit(2u, size);
+        }
         std::tie(buffer, offset) = buffer_cache.ObtainBuffer(address, size, false, false);
     } else if (can_try_direct_read && !HasPendingHleCopies()) {
         std::tie(buffer, offset) = direct_buffers.TryResolveReadClamped(address, size);
         is_direct_buf = (buffer != nullptr);
+        if (buf_audit && is_direct_buf) [[unlikely]] {
+            BbCp::Diagnostics::NoteStageBBufAudit(3u, size);
+        }
         if (!buffer) {
             const u64 clamped_mem_size = memory->ClampRangeSize(address, vsharp.GetSize());
             if (clamped_mem_size != vsharp.GetSize()) {
@@ -1668,6 +1726,9 @@ void Rasterizer::BindGuestBuffer(const Shader::BufferResource& desc, const Gcn::
                           clamped_mem_size, stage.pgm_hash);
             }
             size = VideoCore::DirectBuffers::ClampNativeGpuReadSize(address, clamped_mem_size, false);
+            if (buf_audit) [[unlikely]] {
+                BbCp::Diagnostics::NoteStageBBufAudit(4u, size);
+            }
             std::tie(buffer, offset) =
                 buffer_cache.ObtainBuffer(address, size, false, desc.is_formatted);
         }
@@ -1680,6 +1741,9 @@ void Rasterizer::BindGuestBuffer(const Shader::BufferResource& desc, const Gcn::
         size = VideoCore::DirectBuffers::ClampNativeGpuReadSize(
             address, clamped_mem_size, desc.is_written);
         if (HasPendingHleCopies() && PendingHleCopiesConflict(address, size, desc.is_written)) {
+            if (buf_audit) [[unlikely]] {
+                BbCp::Diagnostics::NoteStageBBufAudit(7u, size);
+            }
             FlushPendingHleCopies(*this);
         }
         if (desc.is_written) {
@@ -1700,8 +1764,14 @@ void Rasterizer::BindGuestBuffer(const Shader::BufferResource& desc, const Gcn::
         } else if (can_try_direct_read) {
             std::tie(buffer, offset) = direct_buffers.TryResolveReadClamped(address, size);
             is_direct_buf = (buffer != nullptr);
+            if (buf_audit && is_direct_buf) [[unlikely]] {
+                BbCp::Diagnostics::NoteStageBBufAudit(3u, size);
+            }
         }
         if (!buffer) {
+            if (buf_audit) [[unlikely]] {
+                BbCp::Diagnostics::NoteStageBBufAudit(desc.is_written ? 6u : 5u, size);
+            }
             std::tie(buffer, offset) =
                 buffer_cache.ObtainBuffer(address, size, desc.is_written, desc.is_formatted);
         }
@@ -1784,6 +1854,11 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                 const auto& candidate = ring_stage->bindings[ring_cursor++];
                 if (candidate.offset < RingNotCopied) {
                     ring = &candidate;
+                    if (BbCp::Diagnostics::DcbStatsEnabled()) [[unlikely]] {
+                        BbCp::Diagnostics::NoteStageBBufAudit(0u, candidate.size);
+                    }
+                } else if (BbCp::Diagnostics::DcbStatsEnabled()) [[unlikely]] {
+                    BbCp::Diagnostics::NoteStageBBufAudit(1u, candidate.size);
                 }
             }
         }

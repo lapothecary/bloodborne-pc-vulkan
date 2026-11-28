@@ -3,12 +3,14 @@
 // (dirty registers, user data, constants) and stage B (draw recording thread) records it.
 
 #include "render/raster_internal.h"
+#include "render/direct_states.h"
 #include "render/vk_light_tile_batch.h"
 #include "render/vk_vsm_shadow_memo.h"
 #include "render/vk_vsm_blur_batcher.h"
 #include "render/vk_obj_vel_cull.h"
 #include "render/vk_vfx_ui_batch.h"
 #include "buffers/direct_buffers.h"
+#include "textures/direct_textures.h"
 #include "cp/cp_tasks.h"
 #include "../../dantelion_gx/include/gx_direct_vulkan.h"
 
@@ -40,12 +42,165 @@ inline bool StageAFastConst() noexcept {
 // DrawPacket, u16 block indices, u32 block words (RegDirty::BlockWords each), then per stage a
 // PacketStage with its user data and flattened user data, then (verification) the full file.
 namespace {
-enum class PacketKind : u32 { Draw, Task, Dispatch, Special, Indirect, IndirectDispatch };
+enum class PacketKind : u32 { Draw, Task, Dispatch, Special, Indirect, IndirectDispatch, NativeDraw };
 struct TaskPacket {
     PacketKind kind;
     u32 size;
     Rasterizer::OrderedTask task;
 };
+/// Stage 5 / Step 1: Compact 32-byte wrapper carrying a flat `bb_native_stream` binary draw chunk
+/// (`SetPipelineState` -> delta `SetDynamicState` -> `SetVertexBuffers` -> `BindStageResources`* ->
+/// `DrawIndexed`/`DrawAuto`) directly from Stage A to Stage B's `NativeStreamConsumer`.
+struct NativeDrawPacket {
+    PacketKind kind;
+    u16 occ_handoff;
+    u16 stream_dwords;
+    u32 worker; ///< Resolve worker that stamped `kNativeRingPending` CBs (~0u = none)
+    u32 pad0;
+    u64 ring_end;
+    u64 worker_ring_end;
+};
+static_assert(sizeof(NativeDrawPacket) == 32u, "NativeDrawPacket must be 32 bytes");
+
+inline bool IsSpecialStageBInterceptPs(u64 ps_hash) noexcept {
+    return ps_hash == 0x000000000f61fd27ULL || // VSM Blur Compute Batcher
+           ps_hash == 0x0000000011ffdfb5ULL || // Bilateral Shadow Blur Compute HLE
+           ps_hash == 0x0000000038d65b32ULL || // Display Gamma LUT1D PassFusion
+           ps_hash == 0x00000000abf92450ULL || // Dead Yebis2 MotionBlurDilateVelocity skip
+           ps_hash == 0x0000000032e47788ULL;   // SSGI & Fire Heat Haze HDR capture
+}
+
+inline bb_native_stream::SetDynamicStatePayload ExtractNativeDynamicState(
+    const Gcn::Regs& regs, u16 rs_id) noexcept {
+    bb_native_stream::SetDynamicStatePayload d{};
+    const auto* crs = DirectStates::GetCompiledRasterDyn(rs_id);
+    const auto& ctl = regs.viewport_control;
+    const auto& vp = regs.viewports[0];
+    d.vp_xscale = ctl.xscale_enable ? vp.xscale : 1.0f;
+    d.vp_xoffset = ctl.xoffset_enable ? vp.xoffset : 0.0f;
+    d.vp_yscale = ctl.yscale_enable ? vp.yscale : 1.0f;
+    d.vp_yoffset = ctl.yoffset_enable ? vp.yoffset : 0.0f;
+    const float zoffset = ctl.zoffset_enable ? vp.zoffset : 0.0f;
+    const float zscale = ctl.zscale_enable ? vp.zscale : 1.0f;
+    const bool minus_w_to_w = crs ? ((crs->vp_flags & 2u) != 0u)
+                                  : (regs.clipper_control.clip_space == Gcn::ClipSpace::MinusWToW);
+    d.vp_zmin = minus_w_to_w ? (zoffset - zscale) : zoffset;
+    d.vp_zmax = zoffset + zscale;
+
+    const bool offset = !regs.window_scissor.window_offset_disable;
+    const s16 off_x = offset ? regs.window_offset.window_x_offset : 0;
+    const s16 off_y = offset ? regs.window_offset.window_y_offset : 0;
+    Gcn::Scissor sc{};
+    sc.top_left_x = std::max({regs.screen_scissor.top_left_x,
+                              s16(regs.window_scissor.top_left_x + off_x),
+                              s16(regs.generic_scissor.top_left_x + off_x)});
+    sc.top_left_y = std::max({regs.screen_scissor.top_left_y,
+                              s16(regs.window_scissor.top_left_y + off_y),
+                              s16(regs.generic_scissor.top_left_y + off_y)});
+    sc.bottom_right_x = std::min({regs.screen_scissor.bottom_right_x,
+                                  s16(regs.window_scissor.bottom_right_x + off_x),
+                                  s16(regs.generic_scissor.bottom_right_x + off_x)});
+    sc.bottom_right_y = std::min({regs.screen_scissor.bottom_right_y,
+                                  s16(regs.window_scissor.bottom_right_y + off_y),
+                                  s16(regs.generic_scissor.bottom_right_y + off_y)});
+    const bool vport_sc_en = crs ? ((crs->vp_flags & 4u) != 0u)
+                                 : (regs.mode_control.vport_scissor_enable != 0u);
+    if (vport_sc_en) {
+        const auto& own = regs.viewport_scissors[0];
+        sc.top_left_x = std::max(sc.top_left_x, s16(own.top_left_x));
+        sc.top_left_y = std::max(sc.top_left_y, s16(own.top_left_y));
+        sc.bottom_right_x = std::min(Gcn::Scissor::Clamp(sc.bottom_right_x), own.bottom_right_x);
+        sc.bottom_right_y = std::min(Gcn::Scissor::Clamp(sc.bottom_right_y), own.bottom_right_y);
+    }
+    const u32 sc_w = sc.GetWidth();
+    const u32 sc_h = sc.GetHeight();
+    d.sc_left = sc.top_left_x;
+    d.sc_top = sc.top_left_y;
+    d.sc_right = static_cast<int16_t>(std::min<s32>(s32(sc.top_left_x) + s32(sc_w), 32767));
+    d.sc_bottom = static_cast<int16_t>(std::min<s32>(s32(sc.top_left_y) + s32(sc_h), 32767));
+
+    for (u32 i = 0; i < 4u; ++i) {
+        d.blend_rgba[i] = regs.blend_constants[i];
+    }
+    d.depth_bias_const = regs.poly_offset.front_offset;
+    d.depth_bias_slope = regs.poly_offset.front_scale;
+    d.depth_bias_clamp = regs.poly_offset.depth_bias;
+    d.depth_bounds_min = regs.depth_bounds_min;
+    d.depth_bounds_max = regs.depth_bounds_max;
+    d.stencil_ref_front = regs.reg_array[0xA10C];
+    d.stencil_ref_back = regs.reg_array[0xA10D];
+    d.line_width = regs.line_control.Width();
+    d.ta_bc_base = regs.ta_bc_base.base_addr;
+    return d;
+}
+
+inline void InternStateIdsFromRegs(const Gcn::Regs& regs, u16& rs_id, u16& bs_id,
+                                   u16& ds_id) noexcept {
+    if (rs_id == 0u) {
+        DirectStates::RasterStateDesc rs{};
+        rs.primitive_setup = regs.reg_array[0xA204] & 0x0F7FE03Fu;
+        rs.clip_control = regs.reg_array[0xA205] & 0x00393FFFu;
+        rs.slope_scale_depth_bias_bits = regs.reg_array[0xA2E1];
+        rs.depth_bias_clamp_bits = regs.reg_array[0xA2DF];
+        float db = 0.0f;
+        std::memcpy(&db, &regs.reg_array[0xA2E0], sizeof(float));
+        db *= (1.0f / 16.0f);
+        std::memcpy(&rs.depth_bias_bits, &db, sizeof(u32));
+        rs.msaa_enable = static_cast<u8>(regs.reg_array[0xA292] & 1u);
+        rs.scissor_enable = static_cast<u8>((regs.reg_array[0xA292] >> 1) & 1u);
+        rs_id = DirectStates::InternRasterStateDesc(rs);
+    }
+    if (bs_id == 0u) {
+        DirectStates::BlendStateDesc bs{};
+        bs.render_target_channel_mask = regs.reg_array[0xA08E];
+        for (u32 s = 0; s < 8u; ++s) {
+            bs.blend_control[s] = regs.reg_array[0xA1E0 + s] & 0xFFFF1FFFu;
+        }
+        bs.alpha_to_coverage_enable = static_cast<u8>(regs.reg_array[0xA2DC] & 1u);
+        bs_id = DirectStates::InternBlendStateDesc(bs);
+    }
+    if (ds_id == 0u) {
+        DirectStates::DepthStencilStateDesc ds{};
+        ds.depth_control = regs.reg_array[0xA200] & 0xC07007FFu;
+        ds.stencil_control = regs.reg_array[0xA10B] & 0x00FFFFFFu;
+        ds.stencil_op_control = regs.reg_array[0xA10C] & 0x00FFFF00u;
+        ds_id = DirectStates::InternDepthStencilStateDesc(ds);
+    }
+}
+
+inline u64 ComputeNativeTargetsSig(const Gcn::Regs& regs, const Gcn::CbDbExtent* cb_ext,
+                                   const u16* cb_uid, Gcn::CbDbExtent db_ext, u16 db_uid,
+                                   u8 active_cb_mask, bool want_depth,
+                                   bool want_cb0_hint) noexcept {
+    u64 h = u64(active_cb_mask) | (u64(want_depth ? 1u : 0u) << 8) |
+            (u64(want_cb0_hint ? 1u : 0u) << 9);
+    u8 m = active_cb_mask;
+    while (m != 0u) {
+        const u32 c = static_cast<u32>(std::countr_zero(m));
+        m &= static_cast<u8>(m - 1u);
+        if (cb_uid[c] == 0u) {
+            const auto& cb = regs.color_buffers[c];
+            u32 view_raw = 0u;
+            std::memcpy(&view_raw, &cb.view, sizeof(u32));
+            const u64 mix = (u64(cb.base_address) << 32) ^ u64(cb.info.raw) ^
+                            (u64(cb_ext[c].raw) << 17) ^ u64(view_raw);
+            h = (h ^ mix) * 0x9E3779B97F4A7C15ULL;
+        }
+    }
+    if (want_cb0_hint) {
+        h = (h ^ regs.color_buffers[0].Address()) * 0x94D049BB133111EBULL;
+    }
+    if (want_depth && db_uid == 0u) {
+        u32 zinfo_raw = 0u;
+        u32 dview_raw = 0u;
+        std::memcpy(&zinfo_raw, &regs.depth_buffer.z_info, sizeof(u32));
+        std::memcpy(&dview_raw, &regs.depth_view, sizeof(u32));
+        const u64 mix = (u64(regs.depth_buffer.z_read_base) << 32) ^ u64(zinfo_raw) ^
+                        (u64(db_ext.raw) << 17) ^ u64(dview_raw);
+        h = (h ^ mix) * 0xBF58476D1CE4E5B9ULL;
+    }
+    return h;
+}
 struct DrawPacket {
     static constexpr u8 kHasRtMeta = 0x20u;
     static constexpr u8 kReusePrevVsharps = 0x40u;
@@ -67,7 +222,12 @@ struct DrawPacket {
     u32 worker; ///< the resolve worker that copied constants for it (~0u: none)
     u64 ring_end; ///< constant ring position after this packet's copies
     u64 worker_ring_end; ///< the same in that worker's ring
+    u16 rs_id; ///< Stage 4A: DirectStates RasterStateId (0 = legacy Gcn::Regs fallback)
+    u16 bs_id; ///< Stage 4A: DirectStates BlendStateId (0 = legacy Gcn::Regs fallback)
+    u16 ds_id; ///< Stage 4A: DirectStates DepthStencilStateId (0 = legacy Gcn::Regs fallback)
+    u16 pad_ds;
 };
+static_assert(sizeof(DrawPacket) % 8u == 0u, "DrawPacket must remain 8-byte aligned");
 struct PacketStage {
     static constexpr u32 kSharedUdFlat = 1u;
     static constexpr u32 kReusePrevStageUd = 2u;
@@ -265,10 +425,20 @@ void Rasterizer::DrainDrawPipe(u32 reason, u32 line, const char* function) {
     static const bool stats = std::getenv("BB_FRAME_STATS") != nullptr;
     if (!stats) {
         draw_pipe->Drain(reason);
+        native_stage_a_pass.valid = false;
+        native_stage_a_pass.has_dyn = false;
+        if (native_consumer) {
+            native_consumer->InvalidatePass();
+        }
         return;
     }
     const u64 before = draw_pipe->drain_cycles;
     draw_pipe->Drain(reason);
+    native_stage_a_pass.valid = false;
+    native_stage_a_pass.has_dyn = false;
+    if (native_consumer) {
+        native_consumer->InvalidatePass();
+    }
     if (const u64 waited = draw_pipe->drain_cycles - before) {
         drain_sites[function][line] += waited;
     }
@@ -653,7 +823,8 @@ bool Rasterizer::PendingWriteOverlaps(VAddr address, u64 size) {
 void Rasterizer::CollectRingBindings(const Shader::Info& stage, const PreparedDraw* prepared,
                            boost::container::static_vector<RingBinding, Shader::NUM_BUFFERS>& out,
                            const Gcn::ComputeProgram* cs,
-                           const BatchedLightStageOverride* st_ovr) {
+                           const BatchedLightStageOverride* st_ovr,
+                           Gcn::Buffer* out_vsharps) {
     if (stage.buffers.empty()) {
         return;
     }
@@ -786,6 +957,9 @@ void Rasterizer::CollectRingBindings(const Shader::Info& stage, const PreparedDr
         const Gcn::Buffer vsharp = prepared_stage
                                        ? prepared_stage->buffer_sharps[index]
                                        : desc.GetSharpDirect(stage_flat, stage_pgm_base);
+        if (out_vsharps) {
+            out_vsharps[index] = vsharp;
+        }
         const VAddr address = vsharp.base_address;
         if (address == 0) {
             continue;
@@ -1100,13 +1274,757 @@ void Rasterizer::PostDraw(const Pipeline* pipeline, const PreparedDraw* used_pre
             memo.info = nullptr;
         }
         stage_a_last_num_vsharps = ~0u;
+        stage_a_last_vsharps_gen = 0u;
         stage_a_rt_meta_valid = false;
+        native_stage_a_pass.valid = false;
+        native_stage_a_pass.has_dyn = false;
+        dirty.rs_chunks_deferred = false;
+        dirty.ds_chunks_deferred = false;
         dirty.Clear();
         pipe_synced = true;
     }
     const u32 interval = VerifyInterval();
     const bool verify = interval && (draw_pipe->packets % interval) == 0;
     const bool compact_desc = DrawDescEnabled() && interval == 0u;
+    const bool use_direct_state_ids = !batch_override && !cs && !dirty.reset;
+    const u16 pkt_rs_id = use_direct_state_ids ? liverpool->direct_state.rs_id : 0u;
+    const u16 pkt_bs_id = use_direct_state_ids ? liverpool->direct_state.bs_id : 0u;
+    const u16 pkt_ds_id = use_direct_state_ids ? liverpool->direct_state.ds_id : 0u;
+
+    // Stage 5 / Steps P1+P2 (99.5%+ NativeStream): Emit compact `PacketKind::NativeDraw`
+    // (`bb_native_stream`) directly for ALL 3D draws, pass transitions (`CmdOp::BeginRenderPass`),
+    // `LightTileBatcher`/`VfxUiBatcher` flushes (`batch_override`), and Scaleform UI Raw PM4
+    // (via lock-free `DirectStates::Intern*Desc` + on-demand T#/S# interning) — leaving only the
+    // ~0.3% PC-port HLE intercept shaders and rare `DrawIndirect` on the legacy `DrawPacket` bridge!
+    if (bb_native_stream::Enabled() && !cs) [[likely]] {
+        const bool log_rej = BbCp::Diagnostics::DcbStatsEnabled() && native_consumer != nullptr;
+        auto note_rej = [&](NativeStageAReject reason) noexcept {
+            if (log_rej) [[unlikely]] {
+                native_consumer->NoteStageAReject(reason);
+            }
+        };
+        if (verify || indirect || pipeline == nullptr || FrameCapture::Active() ||
+            Breadcrumbs::Enabled() || DynCheck::Enabled() || BbCeStats::Enabled() ||
+            (occlusion && occlusion->Events() != 0)) {
+            note_rej(NativeStageAReject::PreGate);
+        } else {
+            const auto* gpipe = static_cast<const GraphicsPipeline*>(pipeline);
+            const u16 pso_id = gpipe->GetNativePsoId();
+            const auto& regs = liverpool->regs;
+            const auto& gkey = gpipe->GetGraphicsKey();
+            const auto* ps_st = gpipe->GetStages()[u32(Shader::SwStage::Fragment)];
+            const u64 ps_hash = ps_st ? ps_st->pgm_hash : 0ull;
+            u16 n_rs_id = pkt_rs_id;
+            u16 n_bs_id = pkt_bs_id;
+            u16 n_ds_id = pkt_ds_id;
+            if (n_rs_id == 0u || n_bs_id == 0u || n_ds_id == 0u) [[unlikely]] {
+                InternStateIdsFromRegs(regs, n_rs_id, n_bs_id, n_ds_id);
+            }
+            const auto cur_cmode = regs.color_control.mode;
+            bool pass_ok = true;
+            if (pso_id == 0u || n_rs_id == 0u || n_bs_id == 0u || n_ds_id == 0u) {
+                note_rej(NativeStageAReject::PreGate);
+                pass_ok = false;
+            } else if (IsSpecialStageBInterceptPs(ps_hash)) {
+                note_rej(NativeStageAReject::SpecialPs);
+                pass_ok = false;
+            } else if ((!regs.IsClipDisabled() && regs.viewports[0].xscale == 0.0f) ||
+                       regs.viewports[1].xscale != 0.0f ||
+                       regs.clipper_control.user_clip_plane_enable != 0u) {
+                note_rej(NativeStageAReject::ViewportClip);
+                pass_ok = false;
+            } else if (cur_cmode != Gcn::ColorControl::OperationMode::Normal &&
+                       cur_cmode != Gcn::ColorControl::OperationMode::Disable) {
+                note_rej(NativeStageAReject::PassChange);
+                pass_ok = false;
+            }
+
+            if (pass_ok) [[likely]] {
+                const bool skip_cb_bind = (cur_cmode == Gcn::ColorControl::OperationMode::Disable);
+                const s32 num_cb_slots = std::bit_width(gkey.mrt_mask);
+                u8 active_cb_mask = 0u;
+                if (!skip_cb_bind) {
+                    for (s32 cb = 0; cb < num_cb_slots; ++cb) {
+                        if ((gkey.mrt_mask & (1u << cb)) != 0u && regs.color_buffers[cb] &&
+                            regs.color_target_mask.GetMask(cb) != 0u) {
+                            active_cb_mask |= static_cast<u8>(1u << cb);
+                        }
+                    }
+                }
+                const bool want_depth =
+                    (regs.depth_control.depth_enable && regs.depth_buffer.DepthValid()) ||
+                    (regs.depth_control.stencil_enable && regs.depth_buffer.StencilValid());
+                const bool want_cb0_hint =
+                    (active_cb_mask == 0u) && want_depth && bool(regs.color_buffers[0]);
+                const u64 cur_targets_sig = ComputeNativeTargetsSig(
+                    regs, liverpool->last_cb_extent.data(), liverpool->last_cb_uid.data(),
+                    liverpool->last_db_extent, liverpool->last_db_uid, active_cb_mask, want_depth,
+                    want_cb0_hint);
+                const bool is_clear_draw =
+                    regs.depth_render_control.depth_clear_enable ||
+                    regs.depth_render_control.stencil_clear_enable;
+                const u32 cur_cb_mask = regs.color_target_mask.raw & regs.color_shader_mask.raw;
+                const u32 cur_msaa = u32(regs.aa_config.msaa_num_samples);
+                const bool cur_dwrite = bool(regs.depth_control.depth_write_enable);
+                const bool cur_wsten = regs.WritesStencil();
+                const bool cur_dvalid = regs.depth_buffer.DepthValid();
+                const bool cur_svalid = regs.depth_buffer.StencilValid();
+                const bool need_begin_pass =
+                    !native_stage_a_pass.valid || is_clear_draw ||
+                    cur_cb_mask != native_stage_a_pass.cb_mask ||
+                    gkey.mrt_mask != native_stage_a_pass.mrt_mask ||
+                    u32(cur_cmode) != native_stage_a_pass.color_mode ||
+                    cur_msaa != native_stage_a_pass.msaa_samples ||
+                    cur_dwrite != native_stage_a_pass.depth_write ||
+                    cur_wsten != native_stage_a_pass.writes_stencil ||
+                    cur_dvalid != native_stage_a_pass.depth_valid ||
+                    cur_svalid != native_stage_a_pass.stencil_valid ||
+                    liverpool->last_cb_uid != native_stage_a_pass.cb_uid ||
+                    liverpool->last_db_uid != native_stage_a_pass.db_uid ||
+                    cur_targets_sig != native_stage_a_pass.targets_sig;
+
+                const auto n_stages = gpipe->GetStages();
+                const BatchedLightStageOverride* vs_ovr = nullptr;
+                bool stages_native_ok = true;
+                u32 scan_slot = 0u;
+                for (const auto* stage : n_stages) {
+                    if (!stage) {
+                        continue;
+                    }
+                    const auto* st_ovr =
+                        (batch_override && scan_slot < batch_override->stages.size())
+                            ? &batch_override->stages[scan_slot]
+                            : nullptr;
+                    ++scan_slot;
+                    if (stage->sw_stage == Shader::SwStage::Vertex) {
+                        vs_ovr = st_ovr;
+                    }
+                    if (stage->uses_dma || stage->images.size() > TextureSet::MaxImages ||
+                        stage->samplers.size() > 16u || stage->buffers.size() > Shader::NUM_BUFFERS) {
+                        note_rej(NativeStageAReject::StageMeta);
+                        stages_native_ok = false;
+                        break;
+                    }
+                    const std::span<const u32> st_flat =
+                        st_ovr ? st_ovr->flattened_ud_buf
+                               : std::span<const u32>{stage->flattened_ud_buf};
+                    bool need_flat = !stage->images.empty() || !stage->samplers.empty();
+                    for (const auto& bdesc : stage->buffers) {
+                        if (bdesc.is_written) {
+                            note_rej(NativeStageAReject::SpecialBuf);
+                            stages_native_ok = false;
+                            break;
+                        }
+                        if (bdesc.IsSpecial()) {
+                            if (bdesc.buffer_type == Shader::BufferType::Flatbuf) {
+                                need_flat = true;
+                            } else if (bdesc.buffer_type != Shader::BufferType::ClipPlanes &&
+                                       bdesc.buffer_type != Shader::BufferType::BdaPagetable &&
+                                       bdesc.buffer_type != Shader::BufferType::FaultBuffer) {
+                                note_rej(NativeStageAReject::SpecialBuf);
+                                stages_native_ok = false;
+                                break;
+                            }
+                        } else {
+                            need_flat = true;
+                        }
+                    }
+                    if (!stages_native_ok) {
+                        break;
+                    }
+                    if (need_flat && st_flat.empty()) {
+                        note_rej(NativeStageAReject::StageMeta);
+                        stages_native_ok = false;
+                        break;
+                    }
+                    for (const auto& idesc : stage->images) {
+                        const auto& sf = idesc.sharp_fetch;
+                        if (idesc.is_written ||
+                            idesc.mip_fallback_mode != Shader::MipStorageFallbackMode::None ||
+                            idesc.is_r128 || idesc.post_op != Shader::SharpFetchPostOp::None ||
+                            sf.load_mask != 0xFFu || sf.offsets[0] == Shader::UNKNOWN_LOCATION ||
+                            sf.offsets[1] == Shader::UNKNOWN_LOCATION ||
+                            sf.offsets[7] == Shader::UNKNOWN_LOCATION) {
+                            note_rej(NativeStageAReject::SrvMeta);
+                            stages_native_ok = false;
+                            break;
+                        }
+                    }
+                    if (!stages_native_ok) {
+                        break;
+                    }
+                    for (const auto& sdesc : stage->samplers) {
+                        const auto& sf = sdesc.sharp_fetch;
+                        if ((sf.load_mask & 8u) == 0u || sf.offsets[3] == Shader::UNKNOWN_LOCATION) {
+                            note_rej(NativeStageAReject::SmpTag);
+                            stages_native_ok = false;
+                            break;
+                        }
+                    }
+                    if (!stages_native_ok) {
+                        break;
+                    }
+                }
+
+                if (stages_native_ok) [[likely]] {
+                std::array<u32, 2048> n_buf;
+                bb_native_stream::NativeStreamWriter nw(n_buf.data(), u32(n_buf.size()));
+                bool n_ok = true;
+
+                // 1. SetPipelineState
+                bb_native_stream::SetPipelineStatePayload pp{};
+                pp.raster_id = n_rs_id;
+                pp.blend_id = n_bs_id;
+                pp.ds_id = n_ds_id;
+                pp.pso_id = pso_id;
+                pp.prim_type = static_cast<u8>(regs.primitive_type);
+                pp.stage_enable = static_cast<u8>(regs.stage_enable.raw);
+                pp.pad = static_cast<u8>((cur_dvalid ? 1u : 0u) | (cur_svalid ? 2u : 0u));
+                n_ok &= nw.Emit(bb_native_stream::CmdOp::SetPipelineState, 0u, pp);
+
+                // 2. Delta SetDynamicState (1-cycle epoch fast-skip when regs & rs_id unchanged)
+                const u64 cur_dyn_epoch = liverpool->dyn_reg_epoch;
+                const bool dyn_fast_skip =
+                    !need_begin_pass && native_stage_a_pass.has_dyn &&
+                    native_stage_a_pass.last_dyn_epoch == cur_dyn_epoch &&
+                    native_stage_a_pass.last_rs_id == n_rs_id;
+                bb_native_stream::SetDynamicStatePayload cur_dyn{};
+                u8 dflags = 0u;
+                if (!dyn_fast_skip) {
+                    cur_dyn = ExtractNativeDynamicState(regs, n_rs_id);
+                    if (need_begin_pass || !native_stage_a_pass.has_dyn) {
+                        dflags = 0xFFu;
+                    } else {
+                        const auto& prev = native_stage_a_pass.last_dyn;
+                        if (std::memcmp(&cur_dyn.vp_xscale, &prev.vp_xscale, 6u * sizeof(float)) !=
+                            0) {
+                            dflags |= bb_native_stream::kDynFlagViewport;
+                        }
+                        if (cur_dyn.sc_left != prev.sc_left || cur_dyn.sc_top != prev.sc_top ||
+                            cur_dyn.sc_right != prev.sc_right ||
+                            cur_dyn.sc_bottom != prev.sc_bottom) {
+                            dflags |= bb_native_stream::kDynFlagScissor;
+                        }
+                        if (std::memcmp(cur_dyn.blend_rgba, prev.blend_rgba,
+                                        sizeof(cur_dyn.blend_rgba)) != 0) {
+                            dflags |= bb_native_stream::kDynFlagBlendColor;
+                        }
+                        if (cur_dyn.stencil_ref_front != prev.stencil_ref_front ||
+                            cur_dyn.stencil_ref_back != prev.stencil_ref_back) {
+                            dflags |= bb_native_stream::kDynFlagStencilRef;
+                        }
+                        if (std::memcmp(&cur_dyn.depth_bias_const, &prev.depth_bias_const,
+                                        3u * sizeof(float)) != 0) {
+                            dflags |= bb_native_stream::kDynFlagDepthBias;
+                        }
+                        if (std::memcmp(&cur_dyn.depth_bounds_min, &prev.depth_bounds_min,
+                                        2u * sizeof(float)) != 0) {
+                            dflags |= bb_native_stream::kDynFlagDepthBounds;
+                        }
+                        if (cur_dyn.line_width != prev.line_width) {
+                            dflags |= bb_native_stream::kDynFlagLineWidth;
+                        }
+                        if (cur_dyn.ta_bc_base != prev.ta_bc_base) {
+                            dflags |= bb_native_stream::kDynFlagBorderColor;
+                        }
+                    }
+                    if (dflags != 0u) {
+                        n_ok &= nw.Emit(bb_native_stream::CmdOp::SetDynamicState, dflags, cur_dyn);
+                    }
+                }
+
+                // 2b. Optional BeginRenderPass (only ~5% of draws: pass start / target transition)
+                if (need_begin_pass) [[unlikely]] {
+                    const u32 num_act_cb = static_cast<u32>(std::popcount(active_cb_mask));
+                    const u16 rp_pay_dw = static_cast<u16>(
+                        (sizeof(bb_native_stream::BeginRenderPassHeader) / sizeof(u32)) +
+                        num_act_cb * 16u + (want_cb0_hint ? 16u : 0u) + (want_depth ? 9u : 0u));
+                    const u8 rp_flags =
+                        static_cast<u8>((want_depth ? bb_native_stream::kPassFlagHasDepth : 0u) |
+                                        (want_cb0_hint ? bb_native_stream::kPassFlagHasCb0Hint : 0u));
+                    if (u32* rout = nw.Reserve(bb_native_stream::CmdOp::BeginRenderPass, rp_flags,
+                                               rp_pay_dw)) {
+                        bb_native_stream::BeginRenderPassHeader ph{};
+                        for (u32 c = 0; c < Gcn::NUM_COLOR_BUFFERS; ++c) {
+                            ph.cb_uid[c] = liverpool->last_cb_uid[c];
+                        }
+                        ph.db_uid = liverpool->last_db_uid;
+                        ph.active_cb_mask = active_cb_mask;
+                        ph.pass_flags = static_cast<u8>(
+                            (regs.depth_render_control.depth_clear_enable ? 1u : 0u) |
+                            (regs.depth_render_control.stencil_clear_enable ? 2u : 0u));
+                        std::memcpy(&ph.color_control, &regs.color_control, sizeof(u32));
+                        ph.color_target_mask = regs.color_target_mask.raw;
+                        ph.color_shader_mask = regs.color_shader_mask.raw;
+                        std::memcpy(&ph.blend_control0, &regs.blend_control[0], sizeof(u32));
+                        std::memcpy(&ph.depth_control, &regs.depth_control, sizeof(u32));
+                        std::memcpy(&ph.stencil_control, &regs.stencil_control, sizeof(u32));
+                        ph.stencil_ref_front = regs.reg_array[0xA10C];
+                        ph.stencil_ref_back = regs.reg_array[0xA10D];
+                        std::memcpy(&ph.depth_render_control, &regs.depth_render_control, sizeof(u32));
+                        std::memcpy(&ph.depth_render_override, &regs.depth_render_override, sizeof(u32));
+                        std::memcpy(&ph.depth_clear, &regs.depth_clear, sizeof(u32));
+                        std::memcpy(&ph.stencil_clear, &regs.stencil_clear, sizeof(u32));
+                        std::memcpy(&ph.depth_view, &regs.depth_view, sizeof(u32));
+                        std::memcpy(&ph.depth_htile_data_base, &regs.depth_htile_data_base, sizeof(u32));
+                        std::memcpy(&ph.aa_config, &regs.aa_config, sizeof(u32));
+                        std::memcpy(&ph.clipper_control, &regs.clipper_control, sizeof(u32));
+                        std::memcpy(&ph.mode_control, &regs.mode_control, sizeof(u32));
+                        std::memcpy(&ph.viewport_control, &regs.viewport_control, sizeof(u32));
+                        std::memcpy(ph.screen_scissor, &regs.screen_scissor, sizeof(ph.screen_scissor));
+                        std::memcpy(ph.window_scissor, &regs.window_scissor, sizeof(ph.window_scissor));
+                        std::memcpy(ph.viewport_scissor0, &regs.viewport_scissors[0],
+                                    sizeof(ph.viewport_scissor0));
+                        std::memcpy(ph.viewport0, &regs.viewports[0], sizeof(ph.viewport0));
+                        ph.num_indices = regs.num_indices;
+                        std::memcpy(&ph.num_instances, &regs.num_instances, sizeof(u32));
+                        std::memcpy(rout, &ph, sizeof(ph));
+                        u32* tp = rout + (sizeof(ph) / sizeof(u32));
+                        for (u32 c = 0; c < Gcn::NUM_COLOR_BUFFERS; ++c) {
+                            if ((active_cb_mask & (1u << c)) != 0u) {
+                                std::memcpy(tp, &regs.color_buffers[c], sizeof(Gcn::ColorBuffer));
+                                tp += 15u;
+                                *tp++ = liverpool->last_cb_extent[c].raw;
+                            }
+                        }
+                        if (want_cb0_hint) {
+                            std::memcpy(tp, &regs.color_buffers[0], sizeof(Gcn::ColorBuffer));
+                            tp += 15u;
+                            *tp++ = liverpool->last_cb_extent[0].raw;
+                        }
+                        if (want_depth) {
+                            std::memcpy(tp, &regs.depth_buffer, sizeof(Gcn::DepthBuffer));
+                            tp += 8u;
+                            *tp++ = liverpool->last_db_extent.raw;
+                        }
+                    } else {
+                        n_ok = false;
+                    }
+                }
+
+                // 3. SetVertexBuffers (+ NotePendingRead when ConstRam active)
+                static const bool n1_native_post_n =
+                    gx_direct_vk::EnabledNativeVk(gx_direct_vk::kN1_NativeBuffers);
+                static const bool no_stream_constram_n = std::getenv("BB_EXP_NO_STREAM") != nullptr;
+                const bool fast_native_skip_n = n1_native_post_n && FastNonCeRamSkip();
+                const bool has_any_constram_n =
+                    buffer_cache.IsConstRamRange(0, (1ULL << 40) - 1);
+                auto note_n_read = [&](VAddr r_addr, u64 r_size) {
+                    if (FastNonCeRamSkip() &&
+                        (!has_any_constram_n || !buffer_cache.IsConstRamRange(r_addr, r_size))) {
+                        return;
+                    }
+                    const bool sync_stream =
+                        !no_stream_constram_n && r_size != 0 &&
+                        r_size <= VideoCore::BufferCache::CONSTRAM_STREAM_THRESHOLD &&
+                        !VideoCore::ConstantsInPlace() && has_any_constram_n &&
+                        buffer_cache.IsConstRamRange(r_addr, r_size) &&
+                        !buffer_cache.IsRegionGpuModified(r_addr, r_size) &&
+                        !PendingWriteOverlaps(r_addr, r_size);
+                    NotePendingRead(r_addr, r_size, !sync_stream);
+                };
+
+                boost::container::static_vector<Gcn::Buffer, Shader::NUM_BUFFERS> n_vsharps;
+                const boost::container::static_vector<Gcn::Buffer, Shader::NUM_BUFFERS>*
+                    active_n_vs = &n_vsharps;
+                const auto& fetch = gpipe->GetFetchShader();
+                const auto& vs_stage = gpipe->GetStage(Shader::SwStage::Vertex);
+                u64 fast_vs_gen = 0u;
+                if (batch_override) {
+                    n_vsharps.assign(batch_override->vsharps.begin(), batch_override->vsharps.end());
+                    if (batch_override->note_guest_vb_ib_reads &&
+                        (!fast_native_skip_n || has_any_constram_n)) {
+                        for (const auto& buf : n_vsharps) {
+                            if (buf.base_address != 0 && buf.GetSize() > 0 &&
+                                buf.base_address < kConstRingVertexBase &&
+                                !(fast_native_skip_n &&
+                                  VideoCore::DirectBuffers::IsNativeOwnedAddress(
+                                      buf.base_address))) {
+                                note_n_read(buf.base_address,
+                                            VideoCore::DirectBuffers::ClampNativeGpuReadSize(
+                                                buf.base_address, buf.GetSize()));
+                            }
+                        }
+                    }
+                } else if (fetch && fetch->attributes.size() <= n_vsharps.capacity()) {
+                    const auto* fast_vs = pipeline_cache.PeekFastVsharps(gpipe, &fast_vs_gen);
+                    if (fast_vs && fast_vs->size() == fetch->attributes.size()) {
+                        active_n_vs = fast_vs;
+                    } else {
+                        fast_vs_gen = 0u;
+                        const auto vs_ud = vs_stage.UserData();
+                        for (const auto& attrib : fetch->attributes) {
+                            n_vsharps.push_back(attrib.GetSharpDirect(vs_ud));
+                        }
+                    }
+                    if (!fast_native_skip_n || has_any_constram_n) {
+                        for (const auto& buf : *active_n_vs) {
+                            if (buf.base_address != 0 && buf.GetSize() > 0 &&
+                                !(fast_native_skip_n &&
+                                  VideoCore::DirectBuffers::IsNativeOwnedAddress(
+                                      buf.base_address))) {
+                                note_n_read(buf.base_address,
+                                            VideoCore::DirectBuffers::ClampNativeGpuReadSize(
+                                                buf.base_address, buf.GetSize()));
+                            }
+                        }
+                    }
+                }
+                const bool idx16 = regs.index_buffer_type.index_type == Gcn::IndexType::Index16;
+                const u32 idx_sz = idx16 ? 2u : 4u;
+                const VAddr idx_va =
+                    is_indexed
+                        ? (regs.index_base_address.Address<VAddr>() + u64(index_offset) * idx_sz)
+                        : 0u;
+                if (is_indexed && (!batch_override || batch_override->note_guest_vb_ib_reads) &&
+                    (!fast_native_skip_n || has_any_constram_n) &&
+                    !(fast_native_skip_n &&
+                      VideoCore::DirectBuffers::IsNativeOwnedAddress(idx_va))) {
+                    note_n_read(idx_va, u64(regs.num_indices) * idx_sz);
+                }
+
+                const u32 n_vsc = static_cast<u32>(active_n_vs->size());
+                const bool can_cache_n_vs = n_vsc > 0u && n_vsc <= stage_a_last_vsharps.size();
+                const bool gen_hit_n_vs =
+                    can_cache_n_vs && fast_vs_gen != 0u && fast_vs_gen == stage_a_last_vsharps_gen &&
+                    stage_a_last_num_vsharps == n_vsc;
+                const bool reuse_n_vs =
+                    gen_hit_n_vs ||
+                    (can_cache_n_vs && stage_a_last_num_vsharps == n_vsc &&
+                     std::memcmp(active_n_vs->data(), stage_a_last_vsharps.data(),
+                                 n_vsc * sizeof(Gcn::Buffer)) == 0);
+
+                const u8 vb_flags = static_cast<u8>(
+                    (is_indexed ? bb_native_stream::kVbFlagIndexed : 0u) |
+                    ((is_indexed && !idx16) ? bb_native_stream::kVbFlagIndex32 : 0u) |
+                    (((regs.enable_primitive_restart & 1u) != 0u)
+                         ? bb_native_stream::kVbFlagPrimRestart
+                         : 0u) |
+                    (reuse_n_vs ? bb_native_stream::kVbFlagReuseVsharps : 0u));
+                const u16 vb_pay_dw = static_cast<u16>(6u + (reuse_n_vs ? 0u : (n_vsc * 4u)));
+                if (u32* vout = nw.Reserve(bb_native_stream::CmdOp::SetVertexBuffers, vb_flags,
+                                           vb_pay_dw)) {
+                    bb_native_stream::SetVertexBuffersHeader vh{};
+                    vh.index_va = idx_va;
+                    vh.prim_restart_idx = regs.primitive_restart_index;
+                    vh.step_rate_0 = regs.vgt_instance_step_rate_0;
+                    vh.step_rate_1 = regs.vgt_instance_step_rate_1;
+                    vh.num_vbs = static_cast<u16>(n_vsc);
+                    std::memcpy(vout, &vh, sizeof(vh));
+                    if (!reuse_n_vs && n_vsc > 0u) {
+                        std::memcpy(vout + 6u, active_n_vs->data(), n_vsc * sizeof(Gcn::Buffer));
+                    }
+                } else {
+                    n_ok = false;
+                }
+
+                // 4. BindStageResources (one per active stage in exact `GetStages()` order)
+                bool n_resolve = false;
+                boost::container::static_vector<RingBinding, Shader::NUM_BUFFERS> n_ring;
+                std::array<Gcn::Buffer, Shader::NUM_BUFFERS> stage_vsharps;
+                u32 emit_slot = 0u;
+                for (const auto* stage : n_stages) {
+                    if (!stage) {
+                        continue;
+                    }
+                    const auto* st_ovr =
+                        (batch_override && emit_slot < batch_override->stages.size())
+                            ? &batch_override->stages[emit_slot]
+                            : nullptr;
+                    ++emit_slot;
+                    if (!n_ok) {
+                        continue;
+                    }
+                    n_ring.clear();
+                    bool have_stage_vsharps = false;
+                    if (st_ovr && !st_ovr->collect_ring_bindings) {
+                        n_ring.assign(st_ovr->ring_bindings.begin(), st_ovr->ring_bindings.end());
+                    } else if (constant_ring && !BbToggle::Disabled(BbToggle::ConstantRing)) {
+                        CollectRingBindings(*stage, used_prepared, n_ring, nullptr, st_ovr,
+                                            stage_vsharps.data());
+                        have_stage_vsharps = true;
+                    } else {
+                        untracked_reads_packet = draw_pipe->NextPacket();
+                    }
+                    const u32 ud_m = stage->ud_mask.mask;
+                    const u32 num_ud = static_cast<u32>(std::popcount(ud_m));
+                    const u32 num_srvs = static_cast<u32>(stage->images.size());
+                    const u32 num_smps = static_cast<u32>(stage->samplers.size());
+                    const u32 num_cbs = static_cast<u32>(stage->buffers.size());
+                    const u16 b_dw = static_cast<u16>(1u + num_ud + num_srvs * 3u + num_smps +
+                                                      num_cbs * 6u);
+                    u32* bout = nw.Reserve(bb_native_stream::CmdOp::BindStageResources,
+                                           static_cast<u8>(num_ud), b_dw);
+                    if (!bout) {
+                        n_ok = false;
+                        break;
+                    }
+                    bb_native_stream::BindStageResourcesHeader bh{
+                        static_cast<u8>(stage->hw_stage),
+                        static_cast<u8>(num_srvs),
+                        static_cast<u8>(num_smps),
+                        static_cast<u8>(num_cbs),
+                    };
+                    std::memcpy(bout, &bh, sizeof(bh));
+                    bout += 1u;
+
+                    if (num_ud != 0u) {
+                        const auto ud = st_ovr ? st_ovr->user_data : stage->UserData();
+                        u32 m = ud_m;
+                        while (m) {
+                            const u32 bit = static_cast<u32>(std::countr_zero(m));
+                            m &= (m - 1u);
+                            *bout++ = ud[bit];
+                        }
+                    }
+
+                    const std::span<const u32> st_flat =
+                        st_ovr ? st_ovr->flattened_ud_buf
+                               : std::span<const u32>{stage->flattened_ud_buf};
+                    const u32* const flat = st_flat.data();
+                    for (u32 i = 0; i < num_srvs; ++i) {
+                        const auto& idesc = stage->images[i];
+                        const auto& sf = idesc.sharp_fetch;
+                        u32 dw7 = flat[sf.offsets[7]];
+                        if ((dw7 >> 24) != VideoCore::DirectTextures::kSrvTagMagic ||
+                            (dw7 & 0xFFFFu) == 0u) [[unlikely]] {
+                            // Scaleform UI / raw PM4 untagged T#: intern lock-free on a stack copy.
+                            const Gcn::Image raw_t = idesc.GetSharpDirect(flat);
+                            u32 tmp_t[8];
+                            std::memcpy(tmp_t, &raw_t, sizeof(tmp_t));
+                            if (VideoCore::DirectTextures::RegisterNativeSrv(tmp_t, 0u, false) !=
+                                0u) {
+                                dw7 = tmp_t[7];
+                            } else {
+                                note_rej(NativeStageAReject::SrvTag);
+                                n_ok = false;
+                                break;
+                            }
+                        }
+                        const bb_native_stream::NativeSrvBinding sb{
+                            dw7, flat[sf.offsets[0]], flat[sf.offsets[1]]};
+                        std::memcpy(bout, &sb, sizeof(sb));
+                        bout += 3u;
+                    }
+                    if (!n_ok) {
+                        break;
+                    }
+                    for (u32 s = 0; s < num_smps; ++s) {
+                        const auto& sdesc = stage->samplers[s];
+                        const auto& sf = sdesc.sharp_fetch;
+                        const u32 dw3 = flat[sf.offsets[3]];
+                        u16 uid = 0u;
+                        if (((dw3 >> 24) & 0x3Fu) == VideoCore::DirectTextures::kSamplerTagMagic &&
+                            ((dw3 >> 12) & 0xFFFu) != 0u) [[likely]] {
+                            uid = static_cast<u16>((dw3 >> 12) & 0xFFFu);
+                        } else {
+                            // Scaleform UI / raw PM4 untagged S#: intern lock-free on a stack copy.
+                            const Gcn::Sampler raw_s = sdesc.GetSharpDirect(flat);
+                            u32 tmp_s[4];
+                            std::memcpy(tmp_s, &raw_s, sizeof(tmp_s));
+                            uid = VideoCore::DirectTextures::RegisterNativeSampler(tmp_s);
+                            if (uid == 0u) {
+                                note_rej(NativeStageAReject::SmpTag);
+                                n_ok = false;
+                                break;
+                            }
+                        }
+                        *bout++ = (s << 16) | u32(uid);
+                    }
+                    if (!n_ok) {
+                        break;
+                    }
+
+                    u32 r_cur = 0u;
+                    const VAddr pgm_base = st_ovr ? st_ovr->pgm_base : stage->pgm_base;
+                    const u64 ring_align = std::max<u64>(instance.StorageMinAlignment(),
+                                                         instance.UniformMinAlignment());
+                    const bool is_vs_motion =
+                        (gkey.motion_vectors != 0u && stage->sw_stage == Shader::SwStage::Vertex);
+                    for (u32 b = 0; b < num_cbs; ++b) {
+                        while (r_cur < n_ring.size() && n_ring[r_cur].index < b) {
+                            ++r_cur;
+                        }
+                        const RingBinding* hit_rb = nullptr;
+                        if (r_cur < n_ring.size() && n_ring[r_cur].index == b) {
+                            hit_rb = &n_ring[r_cur++];
+                        }
+                        const auto& desc = stage->buffers[b];
+                        bb_native_stream::NativeConstBinding cb{};
+                        cb.slot = static_cast<u16>(b);
+                        if (desc.buffer_type == Shader::BufferType::ClipPlanes) {
+                            cb.ring_offset = bb_native_stream::kNativeRingNotCopied;
+                            cb.ring_id = 0xFFu;
+                            cb.flags = bb_native_stream::kNativeCbFlagSpecialNull;
+                        } else if (desc.buffer_type == Shader::BufferType::BdaPagetable ||
+                                   desc.buffer_type == Shader::BufferType::FaultBuffer) {
+                            cb.ring_offset = bb_native_stream::kNativeRingNotCopied;
+                            cb.ring_id = 0xFFu;
+                            cb.flags = bb_native_stream::kNativeCbFlagSpecialBind;
+                        } else if (desc.buffer_type == Shader::BufferType::Flatbuf) {
+                            if (hit_rb && hit_rb->offset < RingNotCopied &&
+                                hit_rb->offset != RingPending) {
+                                cb.gpu_va = 0u;
+                                cb.byte_size = hit_rb->size;
+                                cb.ring_offset = static_cast<u32>(hit_rb->offset);
+                                cb.ring_id = static_cast<u8>(hit_rb->ring);
+                                cb.flags = bb_native_stream::kNativeCbFlagRing;
+                            } else if (constant_ring) {
+                                const u32 flat_bytes =
+                                    static_cast<u32>(st_flat.size() * sizeof(u32));
+                                const auto off = constant_ring->Allocate(flat_bytes, ring_align);
+                                if (!off) [[unlikely]] {
+                                    n_ok = false;
+                                    break;
+                                }
+                                std::memcpy(constant_ring->Data(*off), flat, flat_bytes);
+                                constant_ring->Flush(*off, flat_bytes);
+                                cb.gpu_va = 0u;
+                                cb.byte_size = flat_bytes;
+                                cb.ring_offset = static_cast<u32>(*off);
+                                cb.ring_id = 0u;
+                                cb.flags = bb_native_stream::kNativeCbFlagRing;
+                            } else {
+                                n_ok = false;
+                                break;
+                            }
+                        } else if (hit_rb) {
+                            cb.gpu_va = hit_rb->address;
+                            cb.byte_size = hit_rb->size;
+                            if (hit_rb->offset == RingPending) {
+                                cb.ring_offset = bb_native_stream::kNativeRingPending;
+                                cb.ring_id = 0u;
+                                n_resolve = true;
+                            } else if (hit_rb->offset == RingNotCopied) {
+                                cb.ring_offset = bb_native_stream::kNativeRingNotCopied;
+                                cb.ring_id = 0xFFu;
+                            } else {
+                                cb.ring_offset = static_cast<u32>(hit_rb->offset);
+                                cb.ring_id = static_cast<u8>(hit_rb->ring);
+                            }
+                            cb.flags = bb_native_stream::kNativeCbFlagRing;
+                            if (is_vs_motion &&
+                                Motion::ClassifyBuffer(hit_rb->size) != Motion::BufferRole::Other) {
+                                const auto vsharp = have_stage_vsharps
+                                                        ? stage_vsharps[b]
+                                                        : desc.GetSharpDirect(flat, pgm_base);
+                                if (vsharp.Valid() && vsharp.GetStride() == 16u) {
+                                    cb.flags |= bb_native_stream::kNativeCbFlagStride16;
+                                }
+                            }
+                        } else {
+                            const auto vsharp = have_stage_vsharps
+                                                    ? stage_vsharps[b]
+                                                    : desc.GetSharpDirect(flat, pgm_base);
+                            cb.gpu_va = vsharp.base_address;
+                            cb.byte_size = vsharp.GetSize();
+                            cb.ring_offset = bb_native_stream::kNativeRingNotCopied;
+                            cb.ring_id = 0xFFu;
+                            cb.flags = desc.is_formatted ? bb_native_stream::kNativeCbFlagFormatted
+                                                         : 0u;
+                            if (is_vs_motion && vsharp.Valid() && vsharp.GetStride() == 16u) {
+                                cb.flags |= bb_native_stream::kNativeCbFlagStride16;
+                            }
+                        }
+                        std::memcpy(bout, &cb, sizeof(cb));
+                        bout += 6u;
+                    }
+                }
+
+                // 5. DrawIndexed / DrawAuto
+                u32 vtx_off = regs.index_offset;
+                u32 inst_off = 0u;
+                if (fetch) {
+                    const auto vs_ud = vs_ovr ? vs_ovr->user_data : vs_stage.UserData();
+                    if (vtx_off == 0u && fetch->vertex_offset_sgpr != -1) {
+                        vtx_off = vs_ud[fetch->vertex_offset_sgpr];
+                    }
+                    if (fetch->instance_offset_sgpr != -1) {
+                        inst_off = vs_ud[fetch->instance_offset_sgpr];
+                    }
+                }
+                if (is_indexed) {
+                    const bb_native_stream::DrawIndexedPayload dp{
+                        regs.num_indices,
+                        regs.num_instances.NumInstances(),
+                        0u,
+                        static_cast<int32_t>(vtx_off),
+                        inst_off,
+                    };
+                    n_ok &= nw.Emit(bb_native_stream::CmdOp::DrawIndexed, 0u, dp);
+                } else {
+                    const bb_native_stream::DrawAutoPayload dp{
+                        regs.num_indices,
+                        regs.num_instances.NumInstances(),
+                        vtx_off,
+                        inst_off,
+                    };
+                    n_ok &= nw.Emit(bb_native_stream::CmdOp::DrawAuto, 0u, dp);
+                }
+
+                if (n_ok) [[likely]] {
+                    if (can_cache_n_vs && !reuse_n_vs) {
+                        std::memcpy(stage_a_last_vsharps.data(), active_n_vs->data(),
+                                    n_vsc * sizeof(Gcn::Buffer));
+                        stage_a_last_num_vsharps = n_vsc;
+                        stage_a_last_vsharps_gen = fast_vs_gen;
+                    } else if (can_cache_n_vs && reuse_n_vs && fast_vs_gen != 0u) {
+                        stage_a_last_vsharps_gen = fast_vs_gen;
+                    } else if (!can_cache_n_vs && n_vsc > 0u) {
+                        stage_a_last_num_vsharps = ~0u;
+                        stage_a_last_vsharps_gen = 0u;
+                    }
+                    if (!is_clear_draw) {
+                        native_stage_a_pass.valid = true;
+                        if (!dyn_fast_skip) {
+                            native_stage_a_pass.last_dyn = cur_dyn;
+                            native_stage_a_pass.last_dyn_epoch = cur_dyn_epoch;
+                            native_stage_a_pass.last_rs_id = n_rs_id;
+                        }
+                        native_stage_a_pass.has_dyn = true;
+                        native_stage_a_pass.cb_mask = cur_cb_mask;
+                        native_stage_a_pass.mrt_mask = gkey.mrt_mask;
+                        native_stage_a_pass.color_mode = u32(cur_cmode);
+                        native_stage_a_pass.msaa_samples = cur_msaa;
+                        native_stage_a_pass.depth_write = cur_dwrite;
+                        native_stage_a_pass.writes_stencil = cur_wsten;
+                        native_stage_a_pass.depth_valid = cur_dvalid;
+                        native_stage_a_pass.stencil_valid = cur_svalid;
+                        native_stage_a_pass.cb_uid = liverpool->last_cb_uid;
+                        native_stage_a_pass.db_uid = liverpool->last_db_uid;
+                        native_stage_a_pass.targets_sig = cur_targets_sig;
+                    } else {
+                        native_stage_a_pass.valid = false;
+                        native_stage_a_pass.has_dyn = false;
+                    }
+                    const u32 stream_dw = nw.SizeDwords();
+                    const u32 total_bytes =
+                        sizeof(NativeDrawPacket) + AlignPacket(stream_dw * sizeof(u32));
+                    u8* nout = draw_pipe->Begin(total_bytes);
+                    *reinterpret_cast<NativeDrawPacket*>(nout) = NativeDrawPacket{
+                        .kind = PacketKind::NativeDraw,
+                        .occ_handoff = occ_handoff,
+                        .stream_dwords = static_cast<u16>(stream_dw),
+                        .worker = ~0u,
+                        .pad0 = 0u,
+                        .ring_end = constant_ring ? constant_ring->Position() : 0u,
+                        .worker_ring_end = 0u,
+                    };
+                    std::memcpy(nout + sizeof(NativeDrawPacket), nw.Data(),
+                                stream_dw * sizeof(u32));
+                    draw_pipe->Commit(total_bytes, n_resolve);
+                    PrintPipeStats();
+                    return;
+                }
+                note_rej(NativeStageAReject::StreamFail);
+            }
+            }
+        }
+    }
+    if (dirty.reset) {
+        dirty.rs_chunks_deferred = false;
+        dirty.ds_chunks_deferred = false;
+    }
     std::array<u16, Gcn::RegDirty::NumBlocks> blocks;
     u32 num_blocks = 0;
     u64 sb_mask0 = 0ULL;
@@ -1114,6 +2032,16 @@ void Rasterizer::PostDraw(const Pipeline* pipeline, const PreparedDraw* used_pre
     if (compact_desc) {
         sb_mask0 = dirty.stage_b_mask[0];
         sb_mask1 = dirty.stage_b_mask[1];
+        // Stage 4B: Auto-flush deferred RS/DS Gcn::Regs chunks before any fallback draw (`id == 0`)
+        // so Scaleform Raw PM4 and batched flushes always see exact `pipe_regs`.
+        if (pkt_rs_id == 0u && dirty.rs_chunks_deferred) [[unlikely]] {
+            sb_mask1 |= (1ULL << (82u - 64u)) | (1ULL << (91u - 64u)) | (1ULL << (92u - 64u));
+            dirty.rs_chunks_deferred = false;
+        }
+        if (pkt_ds_id == 0u && dirty.ds_chunks_deferred) [[unlikely]] {
+            sb_mask0 |= (1ULL << 33u);
+            dirty.ds_chunks_deferred = false;
+        }
         num_blocks = static_cast<u32>(std::popcount(sb_mask0) + std::popcount(sb_mask1));
     } else {
         dirty.ForEachBlock([&](size_t block) { blocks[num_blocks++] = static_cast<u16>(block); });
@@ -1439,8 +2367,10 @@ void Rasterizer::PostDraw(const Pipeline* pipeline, const PreparedDraw* used_pre
         std::memcpy(stage_a_last_vsharps.data(), active_vsharps->data(),
                     vsc * sizeof(Gcn::Buffer));
         stage_a_last_num_vsharps = vsc;
+        stage_a_last_vsharps_gen = 0u;
     } else if (!can_cache_vs && vsc > 0u) {
         stage_a_last_num_vsharps = ~0u;
+        stage_a_last_vsharps_gen = 0u;
     }
     if (!reuse_vsharps) {
         size += AlignPacket(vsc * u32(sizeof(Gcn::Buffer)));
@@ -1491,6 +2421,10 @@ void Rasterizer::PostDraw(const Pipeline* pipeline, const PreparedDraw* used_pre
     packet.num_vsharps = vsc;
     packet.worker = ~0u;
     packet.worker_ring_end = 0;
+    packet.rs_id = pkt_rs_id;
+    packet.bs_id = pkt_bs_id;
+    packet.ds_id = pkt_ds_id;
+    packet.pad_ds = 0u;
     out += sizeof(DrawPacket);
     if (compact_desc) {
         u64 m0 = sb_mask0;
@@ -1591,6 +2525,10 @@ void Rasterizer::PostDraw(const Pipeline* pipeline, const PreparedDraw* used_pre
         std::memcpy(out, &liverpool->regs, sizeof(Gcn::Regs));
         out += sizeof(Gcn::Regs);
     }
+    // Stage 5 / Step P1: Always invalidate `native_stage_a_pass` after any legacy HLE `DrawPacket`
+    // (~0.3% of draws) so the next `NativeDraw` cleanly re-syncs pass state via `BeginRenderPass`.
+    native_stage_a_pass.valid = false;
+    native_stage_a_pass.has_dyn = false;
     dirty.Clear();
     draw_pipe->Commit(static_cast<u32>(out - start), resolve);
     PrintPipeStats();
@@ -1643,6 +2581,20 @@ bool Rasterizer::RunInOrder(OrderedTask task, const void* data, u32 size, u64 to
     u8* out = draw_pipe->Begin(total);
     *reinterpret_cast<TaskPacket*>(out) = {PacketKind::Task, size, task};
     std::memcpy(out + sizeof(TaskPacket), data, size);
+    // Stage 5 / Step 2: Non-rendering label/copy/write tasks never change pass attachments
+    // (`cb_descs`/`db_desc`/`begin_memo.state`); keep `native_stage_a_pass.valid` armed and only
+    // reset `has_dyn` so the next `NativeDraw` re-emits fresh dynamic state if the pass re-begins.
+    const bool is_pass_preserving_task =
+        task == &BbCp::Tasks::DirectVkCopyBatchTask ||
+        task == &BbCp::Tasks::DirectVkReleaseLabelsBatchTask ||
+        task == &BbCp::Tasks::DirectVkReleaseU32LabelsBatchTask ||
+        task == &BbCp::Tasks::DirectVkTimestampQueryTask ||
+        task == &BbCp::Tasks::EventWriteEopTask ||
+        task == &BbCp::Tasks::WriteDataTask;
+    if (!is_pass_preserving_task) {
+        native_stage_a_pass.valid = false;
+    }
+    native_stage_a_pass.has_dyn = false;
     draw_pipe->Commit(total);
     return true;
 }
@@ -1732,9 +2684,21 @@ void Rasterizer::RunDrawPacket(void* context, const u8* data, u32 size) {
                 self.FlushVsmBlurCopyBacks();
             }
         }
+        const auto flush_ring_stamps = [&]() {
+            if (self.native_consumer) {
+                self.native_consumer->InvalidatePass();
+            }
+            if (self.constant_ring) {
+                self.constant_ring->FlushIfTickAdvanced();
+            }
+            for (auto& wr : self.worker_rings) {
+                wr->FlushIfTickAdvanced();
+            }
+        };
         if (BbSections::Enabled()) {
             const u64 t0 = __rdtsc();
             task.task(self, data + sizeof(TaskPacket));
+            flush_ring_stamps();
             void* fn = reinterpret_cast<void*>(task.task);
             for (std::size_t k = 0; k < TaskKinds; ++k) {
                 if (task_kinds[k] == fn || !task_kinds[k]) {
@@ -1747,6 +2711,7 @@ void Rasterizer::RunDrawPacket(void* context, const u8* data, u32 size) {
             return;
         }
         task.task(self, data + sizeof(TaskPacket));
+        flush_ring_stamps();
         return;
     }
     if (!self.pending_buf_copies.empty()) [[unlikely]] {
@@ -1755,12 +2720,32 @@ void Rasterizer::RunDrawPacket(void* context, const u8* data, u32 size) {
     if (!self.pending_tex_copies.empty()) [[unlikely]] {
         self.FlushPendingTextureRegionCopies();
     }
+    if (*reinterpret_cast<const PacketKind*>(data) == PacketKind::NativeDraw) {
+        const auto& npkt = *reinterpret_cast<const NativeDrawPacket*>(data);
+        const u32* stream = reinterpret_cast<const u32*>(data + sizeof(NativeDrawPacket));
+        self.native_consumer->ExecuteDrawStream(self, stream, npkt.stream_dwords,
+                                                npkt.occ_handoff);
+        self.packet_vsharps = {};
+        if (self.constant_ring) {
+            self.constant_ring->Stamp(npkt.ring_end);
+        }
+        for (u32 w = 0; w < self.worker_rings.size(); ++w) {
+            if (npkt.worker == w) {
+                self.worker_rings[w]->Stamp(npkt.worker_ring_end);
+            } else {
+                self.worker_rings[w]->FlushIfTickAdvanced();
+            }
+        }
+        return;
+    }
     const auto& packet = *reinterpret_cast<const DrawPacket*>(data);
     const u8* in = data + sizeof(DrawPacket);
     auto& regs = self.pipe_regs;
     const bool compact_desc = (packet.regs_reset & DrawPacket::kCompactStageBDesc) != 0u;
     const bool dyn_regs_touched =
         (packet.regs_reset & 1u) != 0u ||
+        packet.rs_id != self.pipe_rs_id ||
+        packet.ds_id != self.pipe_ds_id ||
         (compact_desc
              ? (((packet.stage_b_mask[0] & ~Gcn::RegDirty::kStageBDynIgnoreMask0) |
                  (packet.stage_b_mask[1] & ~Gcn::RegDirty::kStageBDynIgnoreMask1)) != 0ULL)
@@ -1768,6 +2753,16 @@ void Rasterizer::RunDrawPacket(void* context, const u8* data, u32 size) {
     if (dyn_regs_touched) {
         ++self.pipe_dyn_reg_epoch;
     }
+    bool vp_touched = (packet.regs_reset & 1u) != 0u ||
+                      (compact_desc ? ((packet.stage_b_mask[0] &
+                                        Gcn::RegDirty::kStageBVpUnaliasedMask0) != 0ULL)
+                                    : (packet.num_blocks != 0u));
+    const bool check_c33_vp =
+        !vp_touched && compact_desc && ((packet.stage_b_mask[0] & (1ULL << 33u)) != 0ULL);
+    const bool check_c64_vp =
+        !vp_touched && compact_desc && ((packet.stage_b_mask[1] & 1ULL) != 0ULL);
+    const u32 prev_vp0_xscale = check_c33_vp ? regs.reg_array[0xA10Fu] : 0u;
+    const u32 prev_vte_ctrl = check_c64_vp ? regs.reg_array[0xA206u] : 0u;
     if (packet.regs_reset & 1u) {
         if (compact_desc) {
             regs.SetStageBDefaults();
@@ -1801,6 +2796,13 @@ void Rasterizer::RunDrawPacket(void* context, const u8* data, u32 size) {
             in += Gcn::RegDirty::BlockWords * sizeof(u32);
         }
     }
+    if (vp_touched || (check_c33_vp && regs.reg_array[0xA10Fu] != prev_vp0_xscale) ||
+        (check_c64_vp && regs.reg_array[0xA206u] != prev_vte_ctrl)) {
+        ++self.pipe_vp_scissor_epoch;
+    }
+    self.pipe_rs_id = packet.rs_id;
+    self.pipe_bs_id = packet.bs_id;
+    self.pipe_ds_id = packet.ds_id;
     ASSERT(packet.num_stages <= Shader::Info::MaxUdSnapshots);
     for (u32 i = 0; i < packet.num_stages; ++i) {
         const auto& stage = *reinterpret_cast<const PacketStage*>(in);
@@ -1947,27 +2949,27 @@ void Rasterizer::RunDrawPacket(void* context, const u8* data, u32 size) {
                         packet.is_indexed, packet.index_offset, packet.occ_handoff,
                         packet.gbuf_bucket);
     }
+    if (self.native_consumer) {
+        self.native_consumer->OnLegacyDraw(packet.kind == PacketKind::Draw);
+    }
     Shader::Info::num_ud_snapshots = 0;
     self.num_ring_stages = 0;
     self.packet_vsharps = {};
     if (self.constant_ring) {
         self.constant_ring->Stamp(packet.ring_end);
     }
-    if (packet.worker != ~0u) {
-        self.worker_rings[packet.worker]->Stamp(packet.worker_ring_end);
+    for (u32 w = 0; w < self.worker_rings.size(); ++w) {
+        if (packet.worker == w) {
+            self.worker_rings[w]->Stamp(packet.worker_ring_end);
+        } else {
+            self.worker_rings[w]->FlushIfTickAdvanced();
+        }
     }
 }
 
 void Rasterizer::ResolvePacket(void* context, u8* data, u32, u64 number, u32 worker) {
     auto& self = *static_cast<Rasterizer*>(context);
-    auto& packet = *reinterpret_cast<DrawPacket*>(data);
-    u8* in = data + sizeof(DrawPacket);
-    if (packet.regs_reset & DrawPacket::kCompactStageBDesc) {
-        in += packet.num_blocks * (Gcn::RegDirty::StageBChunkWords * sizeof(u32));
-    } else {
-        in += AlignPacket(packet.num_blocks * sizeof(u16));
-        in += packet.num_blocks * Gcn::RegDirty::BlockWords * sizeof(u32);
-    }
+    const bool is_native_draw = (*reinterpret_cast<const PacketKind*>(data) == PacketKind::NativeDraw);
     auto& ring = *self.worker_rings[worker];
     const u64 alignment = std::max<u64>(self.instance.StorageMinAlignment(),
                                         self.instance.UniformMinAlignment());
@@ -2000,8 +3002,9 @@ void Rasterizer::ResolvePacket(void* context, u8* data, u32, u64 number, u32 wor
                 ((key_addr >> 5) ^ (size << 3) ^ (key_addr >> 16)) & (kResolveMemoSize - 1);
             auto& memo = tls_memo[slot];
             const u64 cur_pos = ring.Position();
+            const u64 max_memo_age = std::min<u64>(24ull << 20, ConstantRing::Capacity / 2);
             if (memo.frame == cur_frame && memo.key_addr == key_addr && memo.size == size &&
-                memo.hash == h && cur_pos - memo.ring_pos < (24ull << 20)) {
+                memo.hash == h && cur_pos - memo.ring_pos < max_memo_age) {
                 binding.offset = memo.offset;
                 binding.ring = 1 + worker;
                 used_ring_out = true;
@@ -2009,6 +3012,9 @@ void Rasterizer::ResolvePacket(void* context, u8* data, u32, u64 number, u32 wor
             }
             const auto offset = ring.Allocate(size, alignment);
             if (!offset) {
+                if (BbCp::Diagnostics::DcbStatsEnabled()) [[unlikely]] {
+                    BbCp::Diagnostics::NoteStageBBufAudit(8u, size);
+                }
                 binding.offset = RingNotCopied;
                 return false;
             }
@@ -2033,6 +3039,9 @@ void Rasterizer::ResolvePacket(void* context, u8* data, u32, u64 number, u32 wor
             used_ring_out = true;
             return true;
         }
+        if (BbCp::Diagnostics::DcbStatsEnabled()) [[unlikely]] {
+            BbCp::Diagnostics::NoteStageBBufAudit(8u, size);
+        }
         binding.offset = RingNotCopied;
         return false;
     };
@@ -2042,6 +3051,114 @@ void Rasterizer::ResolvePacket(void* context, u8* data, u32, u64 number, u32 wor
     VideoCore::DirectBuffers::GetTransientCueHeapBounds(cue_base, cue_end);
     const bool cue_gpu_modified = VideoCore::DirectBuffers::IsCueHeapEverGpuModified();
     bool used_ring = false;
+
+    if (is_native_draw) {
+        auto& npkt = *reinterpret_cast<NativeDrawPacket*>(data);
+        u32* stream = reinterpret_cast<u32*>(data + sizeof(NativeDrawPacket));
+        const u32 total_dw = npkt.stream_dwords;
+        u32 pos = 0u;
+        while (pos < total_dw) {
+            bb_native_stream::CmdHeader hdr{};
+            std::memcpy(&hdr, stream + pos, sizeof(hdr));
+            if (hdr.size_dwords == 0u || pos + hdr.size_dwords > total_dw) [[unlikely]] {
+                break;
+            }
+            if (static_cast<bb_native_stream::CmdOp>(hdr.op) ==
+                bb_native_stream::CmdOp::BindStageResources) {
+                bb_native_stream::BindStageResourcesHeader bh{};
+                std::memcpy(&bh, stream + pos + 1u, sizeof(bh));
+                const u32 cb_off =
+                    pos + 2u + u32(hdr.flags) + u32(bh.num_srvs) * 3u + u32(bh.num_samplers);
+                for (u32 j = 0; j < bh.num_cbs; ++j) {
+                    u32* cb_words = stream + cb_off + j * 6u;
+                    bb_native_stream::NativeConstBinding cb{};
+                    std::memcpy(&cb, cb_words, sizeof(cb));
+                    if (cb.ring_offset != bb_native_stream::kNativeRingPending) {
+                        continue;
+                    }
+                    const VAddr address = cb.gpu_va;
+                    const u64 sz = cb.byte_size;
+                    RingBinding tmp{};
+                    tmp.address = address;
+                    tmp.size = cb.byte_size;
+                    tmp.offset = RingPending;
+                    bool copied_ok = false;
+                    if (fast_cue_resolve && !cue_gpu_modified && address >= cue_base &&
+                        address < cue_end && (cue_end - address) >= sz) {
+                        copied_ok = copy_memoized(address, reinterpret_cast<const void*>(address),
+                                                  sz, tmp, used_ring);
+                    } else {
+                        static const bool n1_native_buf =
+                            gx_direct_vk::EnabledNativeVk(gx_direct_vk::kN1_NativeBuffers);
+                        if (n1_native_buf &&
+                            (VideoCore::DirectBuffers::IsNativeOwnedAddress(address) ||
+                             VideoCore::DirectBuffers::OverlapsNativeOwnedRange(address, sz))) {
+                            tmp.offset = RingNotCopied;
+                        } else if (!self.buffer_cache.IsRegionGpuModified(address, sz) &&
+                                   !self.PendingWriteOverlaps(address, sz) &&
+                                   !VideoCore::BufferCache::LayerMirrored(address, sz)) {
+                            uintptr_t mapped_end = 0;
+                            if (fast_cue_resolve && StageAFastConst() &&
+                                BbLookupMappedEnd(address, mapped_end) &&
+                                sz <= (mapped_end - address)) {
+                                copied_ok = copy_memoized(
+                                    address, reinterpret_cast<const void*>(address), sz, tmp,
+                                    used_ring);
+                            } else if (const auto offset = ring.Allocate(sz, alignment)) {
+                                self.memory->CopySparseMemory(address, ring.Data(*offset), sz);
+                                ring.Flush(*offset, sz);
+                                tmp.offset = *offset;
+                                tmp.ring = 1 + worker;
+                                used_ring = true;
+                                copied_ok = true;
+                            } else {
+                                if (BbCp::Diagnostics::DcbStatsEnabled()) [[unlikely]] {
+                                    BbCp::Diagnostics::NoteStageBBufAudit(8u, sz);
+                                }
+                                tmp.offset = RingNotCopied;
+                            }
+                        } else {
+                            tmp.offset = RingNotCopied;
+                        }
+                        if (!copied_ok && (!FastNonCeRamSkip() ||
+                                           self.buffer_cache.IsConstRamRange(address, sz))) {
+                            self.pending_reads.NoteTables(address, sz, number, false,
+                                                          self.draw_pipe->ConsumedPackets());
+                            static const bool guest_in_place = VideoCore::GuestInPlace();
+                            if (guest_in_place) [[unlikely]] {
+                                self.pending_gpu_reads.NoteTables(
+                                    address, sz, number, false,
+                                    self.gpu_retired_packet.load(std::memory_order_relaxed));
+                            }
+                        }
+                    }
+                    if (tmp.offset < RingNotCopied) {
+                        cb.ring_offset = static_cast<u32>(tmp.offset);
+                        cb.ring_id = static_cast<u8>(tmp.ring);
+                    } else {
+                        cb.ring_offset = bb_native_stream::kNativeRingNotCopied;
+                        cb.ring_id = 0xFFu;
+                    }
+                    std::memcpy(cb_words, &cb, sizeof(cb));
+                }
+            }
+            pos += hdr.size_dwords;
+        }
+        if (used_ring) {
+            npkt.worker = worker;
+            npkt.worker_ring_end = ring.Position();
+        }
+        return;
+    }
+
+    auto& packet = *reinterpret_cast<DrawPacket*>(data);
+    u8* in = data + sizeof(DrawPacket);
+    if (packet.regs_reset & DrawPacket::kCompactStageBDesc) {
+        in += packet.num_blocks * (Gcn::RegDirty::StageBChunkWords * sizeof(u32));
+    } else {
+        in += AlignPacket(packet.num_blocks * sizeof(u16));
+        in += packet.num_blocks * Gcn::RegDirty::BlockWords * sizeof(u32);
+    }
     for (u32 i = 0; i < packet.num_stages; ++i) {
         const auto& stage = *reinterpret_cast<const PacketStage*>(in);
         in += sizeof(PacketStage);
@@ -2067,6 +3184,9 @@ void Rasterizer::ResolvePacket(void* context, u8* data, u32, u64 number, u32 wor
                     copy_memoized(reinterpret_cast<VAddr>(stage.info) | 1ULL, stage_flat, size,
                                   binding, used_ring);
                 } else {
+                    if (BbCp::Diagnostics::DcbStatsEnabled()) [[unlikely]] {
+                        BbCp::Diagnostics::NoteStageBBufAudit(8u, size);
+                    }
                     binding.offset = RingNotCopied;
                 }
                 continue;
@@ -2106,6 +3226,9 @@ void Rasterizer::ResolvePacket(void* context, u8* data, u32, u64 number, u32 wor
                     used_ring = true;
                     copied_ok = true;
                 } else {
+                    if (BbCp::Diagnostics::DcbStatsEnabled()) [[unlikely]] {
+                        BbCp::Diagnostics::NoteStageBBufAudit(8u, size);
+                    }
                     binding.offset = RingNotCopied;
                 }
             } else {

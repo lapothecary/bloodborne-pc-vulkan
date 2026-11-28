@@ -153,6 +153,18 @@ u16 UnpackAndCleanSampler(Gcn::Sampler& ssharp) noexcept {
     return static_cast<u16>(uid);
 }
 
+bool ReadNativeSamplerByUid(u16 uid, Gcn::Sampler& out_clean_ssharp) noexcept {
+    if (uid == 0u || uid >= kMaxNativeSamplers) {
+        return false;
+    }
+    const auto& s = g_sampler_slots[uid];
+    if (s.state.load(std::memory_order_acquire) != 2u) {
+        return false;
+    }
+    std::memcpy(&out_clean_ssharp, s.clean_qw, sizeof(out_clean_ssharp));
+    return true;
+}
+
 u16 RegisterNativeSrv(void* tsharp_8dw, u32 resource_id, bool is_immutable) noexcept {
     if (!tsharp_8dw) {
         return 0;
@@ -254,6 +266,35 @@ u16 UnpackAndCleanSrv(Gcn::Image& tsharp, u8& out_gen8) noexcept {
     }
     out_gen8 = tag_gen;
     return static_cast<u16>(uid);
+}
+
+bool ReadNativeSrvByUid(u16 uid, u8 expected_gen8, Gcn::Image& out_clean_tsharp) noexcept {
+    if (uid == 0u || uid >= kMaxNativeSrvs || expected_gen8 == 0u) {
+        return false;
+    }
+    const auto& s = g_srv_slots[uid];
+    for (u32 tries = 0; tries < 4u; ++tries) {
+        const u32 seq1 = s.seq.load(std::memory_order_acquire);
+        if (seq1 == 0u || (seq1 & 1u) != 0u) {
+            continue;
+        }
+        const u8 slot_gen = s.gen8;
+        u64 raw[4];
+        raw[0] = s.clean_qw[0];
+        raw[1] = s.clean_qw[1];
+        raw[2] = s.clean_qw[2];
+        raw[3] = s.clean_qw[3];
+        std::atomic_thread_fence(std::memory_order_acquire);
+        const u32 seq2 = s.seq.load(std::memory_order_relaxed);
+        if (seq1 == seq2) {
+            if (slot_gen != expected_gen8) {
+                return false;
+            }
+            std::memcpy(&out_clean_tsharp, raw, sizeof(out_clean_tsharp));
+            return true;
+        }
+    }
+    return false;
 }
 
 u16 ImmutableRoEpoch16() noexcept {

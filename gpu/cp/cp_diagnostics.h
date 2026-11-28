@@ -27,6 +27,13 @@ bool DcbStatsEnabled();
 void ScanDcb(std::span<const u32> dcb, int depth);
 /// WAIT_REG_MEM outcomes: 0 display buffer label, 1 pending fence, 2 met at once, 3 waited.
 void NoteWait(int outcome, double ms = 0);
+/// Stage 0 Stage-A elimination audit (active only when BB_DCB_STATS=1).
+void NoteDrawAudit(bool is_direct_vk, u32 op_code, u64 vs_addr, u64 ps_addr, u32 mrt_mask,
+                   u32 rt0_w, u32 rt0_h, u16 cb0_uid, u16 db_uid, u64 pso_state_sig);
+/// Stage B BindBuffers breakdown (active only when BB_DCB_STATS=1).
+void NoteStageBBufAudit(u32 kind, u64 bytes) noexcept;
+/// Stage 2A FastPSO breakdown (active only when BB_DCB_STATS=1).
+void NoteFastPsoAudit(u32 kind) noexcept;
 
 /// A packet that cannot be decoded: where, in which buffer, what surrounds it.
 void ReportBadPacket(uintptr_t base, std::size_t dwords, const u32* at, u64 seq, int depth,

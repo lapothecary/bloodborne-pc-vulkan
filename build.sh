@@ -98,5 +98,7 @@ if [[ ${1:-} == --test ]]; then
     out/online-test
     "$CC" -std=c11 -D_GNU_SOURCE -O2 -g -Wall -Wextra -Werror -I. -Isrc tests/test_content.c src/runtime_content.c -o out/content-test
     out/content-test
+    "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -I. -Isrc tests/test_audio_hrtf.c src/runtime_audio_hrtf.c -lm -o out/audio-hrtf-test
+    out/audio-hrtf-test
 fi
 # Release v1.1.1

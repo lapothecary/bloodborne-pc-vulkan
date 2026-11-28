@@ -35,6 +35,7 @@
 namespace Vulkan {
 class Rasterizer;
 class DrawPreparation;
+class NativeStreamShadow;
 } // namespace Vulkan
 
 namespace BbVideoOut {
@@ -131,6 +132,35 @@ public:
     };
     Common::SlotVector<AscQueueInfo> asc_queues{};
 
+    /// Stage 3B / 3C-1: Direct dense 10-bit Raster/Blend/DS state IDs, exact RT format signature,
+    /// and per-HW-stage spec-affecting user-data epoch (`stage_spec_epoch[0..5]`) tracked
+    /// alongside `Gcn::Regs` for lossless state-keyed PSO lookup, CB-only `SpecWordCheck` bypass,
+    /// and `NativeCmdStream`.
+    struct DirectStateTrack {
+        u16 rs_id = 0;
+        u16 bs_id = 0;
+        u16 ds_id = 0;
+        u16 ps_usage_id = 0;
+        u16 rt_fmt_dirty = 1;
+        u64 rt_fmt_sig = 0;
+        u64 pso_misc_state_epoch = 1;
+        /// Monotonic per-HW-stage (0=PS..5=LS) epoch incremented ONLY when user_data or shader
+        /// bindings may affect `SpecWordCheck` (not bumped by `kUdFlagSpecInvariant` CB-only updates).
+        std::array<u64, 6> stage_spec_epoch{1, 1, 1, 1, 1, 1};
+
+        void ResetAll() noexcept {
+            rs_id = 0;
+            bs_id = 0;
+            ds_id = 0;
+            ps_usage_id = 0;
+            rt_fmt_dirty = 1;
+            ++pso_misc_state_epoch;
+            for (u64& ep : stage_spec_epoch) {
+                ++ep;
+            }
+        }
+    };
+
     /// The register-writing packets' effect on `regs` (shared with the draw preparation workers,
     /// which replay the stream): the blocks written go to `dirty`, the packet into `checksum`
     /// (equal checksums at a draw mean equal register files). Returns true when the packet is a
@@ -139,14 +169,21 @@ public:
                                             RegDirty* dirty = nullptr,
                                             bool compute_checksum = true,
                                             u64* pso_sig_epoch = nullptr,
-                                            u64* dyn_reg_epoch = nullptr);
+                                            u64* dyn_reg_epoch = nullptr,
+                                            u64* pso_non_shader_epoch = nullptr,
+                                            u64* stage_ud_epoch = nullptr,
+                                            u64* flat_invalidation_epoch = nullptr,
+                                            DirectStateTrack* direct_state = nullptr);
     static bool InitGnmDefaultRegs(Regs& regs, u32 gen = 3u, RegDirty* dirty = nullptr,
                                    bool track_all = false, u64* pso_sig_epoch = nullptr,
                                    u64* dyn_reg_epoch = nullptr) noexcept;
     static bool ApplyDrawBundleRegs(Regs& regs, RegDirty* dirty, bool track_all, u32 op_word,
                                     const u32* body, u32 body_words,
                                     u64* pso_sig_epoch = nullptr,
-                                    u64* dyn_reg_epoch = nullptr) noexcept;
+                                    u64* dyn_reg_epoch = nullptr,
+                                    u64* pso_non_shader_epoch = nullptr,
+                                    u64* stage_ud_epoch = nullptr,
+                                    DirectStateTrack* direct_state = nullptr) noexcept;
     static u64 HashRegisterPacket(u64 checksum, const u32* words, u32 count);
 
     Regs regs{};
@@ -156,6 +193,8 @@ public:
     /// V3.1: Direct pre-registered RenderTarget / DepthTarget 12-bit UIDs (0 = unregistered).
     std::array<u16, Gcn::NUM_COLOR_BUFFERS> last_cb_uid{};
     u16 last_db_uid{};
+    /// Stage 3B: Direct state IDs & RT format signature tracked in lockstep with `regs`.
+    DirectStateTrack direct_state{};
     /// Register blocks written since the last draw handed to the draw recording thread.
     RegDirty pipe_dirty;
     /// Running checksum of graphics-register packets (ApplyGraphicsRegisterPacket).
@@ -164,6 +203,22 @@ public:
     u64 pso_sig_epoch = 1;
     /// Monotonic epoch incremented when any context/uconfig register affecting DynamicState changes.
     u64 dyn_reg_epoch = 1;
+    /// Stage 2A: Monotonic epoch incremented on PSO-affecting state changes OTHER than full
+    /// DirectVk BindVsShader / BindPsShader / GenerateAndEmitPsShaderUsage.
+    u64 pso_non_shader_epoch = 1;
+    /// Stage 2A: Per-HW-stage (0=PS..5=LS) monotonic epoch incremented when user_data SGPRs change.
+    std::array<u64, 6> stage_ud_epoch{1, 1, 1, 1, 1, 1};
+    /// Stage 2A: Invalidated on submission start, ClearState, InitHwState, DMA/Copy/WriteData,
+    /// ExecuteSecondaryCmds, and Raw PM4 register writes / draws.
+    u64 flat_invalidation_epoch = 1;
+    /// Stage 2A: True when the active draw originated from DirectVk (`dantelion_gx`).
+    bool current_draw_is_direct_vk = false;
+    /// Stage 3B-1: Lazily allocated NativeCmdStream shadow producer & Gcn::Regs parity verifier
+    /// (`nullptr` when `BB_NATIVE_STREAM=0`, zero overhead on default path).
+    std::unique_ptr<Vulkan::NativeStreamShadow> native_stream_shadow;
+
+    void OnStageADraw(bool is_direct_vk, u32 op_code, u32 start_index = 0u,
+                      const u32* raw_pkt = nullptr, u32 raw_dwords = 0u) noexcept;
 
 private:
     struct Level {

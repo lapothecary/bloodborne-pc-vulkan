@@ -8,6 +8,9 @@
 #include <deque>
 #include <mutex>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 #include <sys/uio.h>
 #include <unistd.h>
@@ -18,9 +21,12 @@
 #include "bbport_write_log.h"
 #include "bbport_gnm_hooks.h"
 #include "core/emulator_settings.h"
+#include "buffers/direct_buffers.h"
 #include "cp/cp_diagnostics.h"
 #include "cp/cp_packets.h"
 #include "cp/cp_pm4.h"
+#include "render/direct_states.h"
+#include "render/direct_targets.h"
 
 template <>
 struct magic_enum::customize::enum_range<BbCp::Op> {
@@ -124,10 +130,98 @@ struct DcbStats {
     // Dwords by opcode, and the port's Direct Vulkan NOP payloads by DirectVk::Op (count, dwords):
     // what share of the stream is still raw PS4 register/PM4 traffic.
     u64 op_dwords[256]{}, direct_ops[64]{}, direct_dwords[64]{};
+    // Stage 0 Stage-A elimination audit: DirectVk vs Raw PM4 draw source, UID coverage & PSO churn.
+    u64 audit_direct_draws = 0, audit_raw_draws = 0;
+    u64 audit_direct_by_op[64]{}, audit_raw_by_op[256]{};
+    u64 audit_cb_uid_hits = 0, audit_db_uid_hits = 0, audit_any_uid_hits = 0;
+    u64 audit_shader_changes = 0, audit_pso_changes = 0;
+    u64 audit_last_vs = ~0ULL, audit_last_ps = ~0ULL, audit_last_pso = ~0ULL;
+    std::unordered_set<u64> audit_unique_shaders;
+    std::unordered_set<u64> audit_unique_psos;
+    struct RawDrawKey {
+        u64 vs_addr;
+        u64 ps_addr;
+        u32 op_code;
+        u32 mrt_mask;
+        u16 rt0_w;
+        u16 rt0_h;
+        u16 cb0_uid;
+        u16 db_uid;
+        bool operator==(const RawDrawKey&) const = default;
+    };
+    struct RawDrawKeyHash {
+        size_t operator()(const RawDrawKey& k) const noexcept {
+            u64 h = k.vs_addr ^ (k.ps_addr * 0x9e3779b97f4a7c15ULL);
+            h ^= (u64(k.op_code) << 32) ^ (u64(k.mrt_mask) << 16) ^ u64(k.rt0_w) ^
+                 (u64(k.rt0_h) << 48);
+            h ^= (u64(k.cb0_uid) << 8) ^ (u64(k.db_uid) << 24);
+            h ^= h >> 33;
+            h *= 0xff51afd7ed558ccdULL;
+            h ^= h >> 33;
+            return size_t(h);
+        }
+    };
+    std::unordered_map<RawDrawKey, u64, RawDrawKeyHash> audit_raw_sigs;
     double wait_ms = 0;
     std::chrono::steady_clock::time_point window = std::chrono::steady_clock::now();
 };
 DcbStats stats;
+
+// Atomic counters written from Stage B (bb:DrawRec) / Resolve0 and drained by Stage A every 5s when BB_DCB_STATS=1.
+// kind: 0=ring_hit, 1=ring_not_copied, 2=cue_obtain, 3=direct_hit, 4=direct_miss_obtain,
+//       5=other_obtain_ro, 6=other_obtain_rw, 7=hle_flush, 8=ring_alloc_fail
+std::array<std::atomic<u64>, 9> g_sb_buf_counts{};
+std::atomic<u64> g_sb_cue_obtain_bytes{0};
+std::atomic<u64> g_sb_other_obtain_bytes{0};
+// Stage 2A / 3C-1 FastPSO breakdown (Stage A only — plain non-atomic counters, zero LOCK XADD).
+// kind: 0=sigEpochHit, 1=sigPairHit, 2=sigFullBuild, 3=flatRun, 4=flatSkipEpoch, 5=flatSkipMem,
+//       6=matchUdSkip, 7=matchFastOk, 8=matchFastMiss, 9=matchNoCompile, 10=vsharpEpochSkip,
+//       11=vsharpBatched, 12=matchSpecSkip, 13=matchSpecSkipErr
+std::array<u64, 14> g_fast_pso_counts{};
+
+const char* DirectVkOpShortName(u32 op) {
+    switch (DirectVk::Op(op)) {
+    case DirectVk::Op::CopyBufferBatch: return "CopyBufBatch";
+    case DirectVk::Op::FillBuffer: return "FillBuf";
+    case DirectVk::Op::ClearColorImage: return "ClearColor";
+    case DirectVk::Op::CopyTextureRegion: return "CopyTex";
+    case DirectVk::Op::DecompressDepth: return "DecompDepth";
+    case DirectVk::Op::EliminateFastClear: return "ElimFastClr";
+    case DirectVk::Op::ResolveColor: return "ResolveCol";
+    case DirectVk::Op::UploadTextureSubresource: return "UploadTex";
+    case DirectVk::Op::ClearDepthStencil: return "ClearDS";
+    case DirectVk::Op::SetIndexState: return "SetIdxState";
+    case DirectVk::Op::DrawIndexed: return "DrawIdx";
+    case DirectVk::Op::DrawIndexAddr: return "DrawIdxAddr";
+    case DirectVk::Op::DrawAuto: return "DrawAuto";
+    case DirectVk::Op::DrawIndirect: return "DrawIndir";
+    case DirectVk::Op::DispatchDirect: return "DispDirect";
+    case DirectVk::Op::DispatchIndirect: return "DispIndir";
+    case DirectVk::Op::SetStageUserData: return "SetUserData";
+    case DirectVk::Op::SetContextRegsPacked: return "SetCtxPacked";
+    case DirectVk::Op::SetRenderTarget: return "SetRT";
+    case DirectVk::Op::SetDepthRenderTarget: return "SetDB";
+    case DirectVk::Op::ReleaseLabelsBatch: return "RelLabels";
+    case DirectVk::Op::OcclusionQuery: return "OccQuery";
+    case DirectVk::Op::ReleaseU32LabelsBatch: return "RelU32Labels";
+    case DirectVk::Op::TimestampQuery: return "TsQuery";
+    case DirectVk::Op::BindVsShader: return "BindVS";
+    case DirectVk::Op::BindPsShader: return "BindPS";
+    case DirectVk::Op::BindCsShader: return "BindCS";
+    case DirectVk::Op::BindEsShader: return "BindES";
+    case DirectVk::Op::BindGsShader: return "BindGS";
+    case DirectVk::Op::BindHsShader: return "BindHS";
+    case DirectVk::Op::BindLsShader: return "BindLS";
+    case DirectVk::Op::InitDefaultHardwareState: return "InitHwState";
+    case DirectVk::Op::SetVgtControl: return "SetVgt";
+    case DirectVk::Op::DrawBundle: return "DrawBundle";
+    case DirectVk::Op::ExecuteSecondaryCmds: return "ExecSec";
+    case DirectVk::Op::NativePostProcess: return "NativePostFX";
+    case DirectVk::Op::GenerateMipsSpd: return "GenMipsSpd";
+    case DirectVk::Op::SetDirectStateIds: return "SetDirState";
+    default: return "Op?";
+    }
+}
 
 bool IsDraw(Op op) {
     switch (op) {
@@ -155,6 +249,68 @@ bool DcbStatsEnabled() {
 void NoteWait(int outcome, double ms) {
     ++stats.wait_outcome[outcome];
     stats.wait_ms += ms;
+}
+
+void NoteStageBBufAudit(u32 kind, u64 bytes) noexcept {
+    if (kind < g_sb_buf_counts.size()) {
+        g_sb_buf_counts[kind].fetch_add(1u, std::memory_order_relaxed);
+    }
+    if (kind == 2u) {
+        g_sb_cue_obtain_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    } else if (kind == 4u || kind == 5u || kind == 6u) {
+        g_sb_other_obtain_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    }
+}
+
+void NoteFastPsoAudit(u32 kind) noexcept {
+    if (kind < g_fast_pso_counts.size()) {
+        ++g_fast_pso_counts[kind];
+    }
+}
+
+void NoteDrawAudit(bool is_direct_vk, u32 op_code, u64 vs_addr, u64 ps_addr, u32 mrt_mask,
+                   u32 rt0_w, u32 rt0_h, u16 cb0_uid, u16 db_uid, u64 pso_state_sig) {
+    auto& st = stats;
+    if (is_direct_vk) {
+        ++st.audit_direct_draws;
+        ++st.audit_direct_by_op[op_code & 63u];
+    } else {
+        ++st.audit_raw_draws;
+        ++st.audit_raw_by_op[op_code & 255u];
+        if (st.audit_raw_sigs.size() < 512u) {
+            const DcbStats::RawDrawKey key{
+                vs_addr, ps_addr, op_code, mrt_mask,
+                static_cast<u16>(std::min<u32>(rt0_w, 65535u)),
+                static_cast<u16>(std::min<u32>(rt0_h, 65535u)), cb0_uid, db_uid};
+            ++st.audit_raw_sigs[key];
+        }
+    }
+    if (cb0_uid != 0u) {
+        ++st.audit_cb_uid_hits;
+    }
+    if (db_uid != 0u) {
+        ++st.audit_db_uid_hits;
+    }
+    if (cb0_uid != 0u || db_uid != 0u) {
+        ++st.audit_any_uid_hits;
+    }
+    const u64 sh_key = (vs_addr * 0x9e3779b97f4a7c15ULL) ^ (ps_addr + 0xbf58476d1ce4e5b9ULL);
+    const u64 pso_key = sh_key ^ (pso_state_sig * 0x94d049bb133111ebULL);
+    if (vs_addr != st.audit_last_vs || ps_addr != st.audit_last_ps) {
+        ++st.audit_shader_changes;
+        st.audit_last_vs = vs_addr;
+        st.audit_last_ps = ps_addr;
+    }
+    if (pso_key != st.audit_last_pso) {
+        ++st.audit_pso_changes;
+        st.audit_last_pso = pso_key;
+    }
+    if (st.audit_unique_shaders.size() < 4096u) {
+        st.audit_unique_shaders.insert(sh_key);
+    }
+    if (st.audit_unique_psos.size() < 8192u) {
+        st.audit_unique_psos.insert(pso_key);
+    }
 }
 
 void ScanDcb(std::span<const u32> dcb, int depth) {
@@ -285,6 +441,131 @@ void ScanDcb(std::span<const u32> dcb, int depth) {
                 "%.0f (%.2f ms/s)\n",
                 st.wait_outcome[0] / secs, st.wait_outcome[1] / secs, st.wait_outcome[2] / secs,
                 st.wait_outcome[3] / secs, st.wait_ms / secs);
+
+    // Stage 0 Stage-A elimination audit summary
+    {
+        u64 total_pkts = 0, total_dw = 0, dvk_pkts = 0, dvk_dw = 0;
+        for (u32 op = 0; op < 256; ++op) {
+            total_pkts += st.opcodes[op];
+            total_dw += st.op_dwords[op];
+        }
+        for (u32 op = 0; op < 64; ++op) {
+            dvk_pkts += st.direct_ops[op];
+            dvk_dw += st.direct_dwords[op];
+        }
+        const u64 raw_pkts = total_pkts >= dvk_pkts ? (total_pkts - dvk_pkts) : 0;
+        const u64 raw_dw = total_dw >= dvk_dw ? (total_dw - dvk_dw) : 0;
+        const u64 tot_draws = st.audit_direct_draws + st.audit_raw_draws;
+        const double inv_draws = tot_draws > 0 ? (100.0 / double(tot_draws)) : 0.0;
+        std::printf(
+            "[StageA-Audit] Stream: DirectVk %.1f%% pkts (%.0f/s) / %.1f%% dw (%.0f kdw/s) | "
+            "RawPM4 %.1f%% pkts (%.0f/s) / %.1f%% dw (%.0f kdw/s)\n",
+            total_pkts ? 100.0 * dvk_pkts / total_pkts : 0.0, dvk_pkts / secs,
+            total_dw ? 100.0 * dvk_dw / total_dw : 0.0, dvk_dw / secs / 1000.0,
+            total_pkts ? 100.0 * raw_pkts / total_pkts : 0.0, raw_pkts / secs,
+            total_dw ? 100.0 * raw_dw / total_dw : 0.0, raw_dw / secs / 1000.0);
+        const auto dt_stats = Vulkan::DirectTargets::GetStats();
+        const auto ds_stats = Vulkan::DirectStates::GetStats();
+        std::printf(
+            "[StageA-Audit] Draws: DirectVk %.0f/s (%.2f%%) vs RawPM4 %.0f/s (%.2f%%) | "
+            "RT-UID coverage: any=%.1f%% cb0=%.1f%% db=%.1f%% (slots=%u stackSkips=%llu wraps=%llu) | "
+            "DirectStates(rs=%u bs=%u ds=%u psU=%u) | "
+            "PSO locality: uniqSh=%zu uniqPSO=%zu, shChg=%.1f%% psoChg=%.1f%%\n",
+            st.audit_direct_draws / secs, st.audit_direct_draws * inv_draws,
+            st.audit_raw_draws / secs, st.audit_raw_draws * inv_draws,
+            st.audit_any_uid_hits * inv_draws, st.audit_cb_uid_hits * inv_draws,
+            st.audit_db_uid_hits * inv_draws, dt_stats.allocated_slots,
+            (unsigned long long)dt_stats.stack_skips, (unsigned long long)dt_stats.wrap_count,
+            ds_stats.raster_unique, ds_stats.blend_unique, ds_stats.ds_unique,
+            ds_stats.ps_usage_unique,
+            st.audit_unique_shaders.size(),
+            st.audit_unique_psos.size(), st.audit_shader_changes * inv_draws,
+            st.audit_pso_changes * inv_draws);
+        std::string dline;
+        for (u32 op = 0; op < 64; ++op) {
+            if (st.audit_direct_by_op[op]) {
+                dline += fmt::format(" {}:{:.0f}/s", DirectVkOpShortName(op),
+                                     st.audit_direct_by_op[op] / secs);
+            }
+        }
+        if (!dline.empty()) {
+            std::printf("[StageA-Audit] DirectVk Draws:%s\n", dline.c_str());
+        }
+        if (st.audit_raw_draws > 0) {
+            std::string rline;
+            for (u32 op = 0; op < 256; ++op) {
+                if (st.audit_raw_by_op[op]) {
+                    rline += fmt::format(" {}:{:.0f}/s", OpName(op),
+                                         st.audit_raw_by_op[op] / secs);
+                }
+            }
+            std::printf("[StageA-Audit] RawPM4 Draws:%s\n", rline.c_str());
+            std::vector<std::pair<DcbStats::RawDrawKey, u64>> top(st.audit_raw_sigs.begin(),
+                                                                  st.audit_raw_sigs.end());
+            std::sort(top.begin(), top.end(),
+                      [](const auto& a, const auto& b) { return a.second > b.second; });
+            const size_t show = std::min<size_t>(top.size(), 12u);
+            for (size_t i = 0; i < show; ++i) {
+                const auto& [k, cnt] = top[i];
+                std::printf(
+                    "  [RawDraw #%zu] %.1f/s (%.2f%%) op=%s vs=%#llx ps=%#llx mrt=%#x "
+                    "rt=%ux%u cbUid=%u dbUid=%u\n",
+                    i + 1, cnt / secs, cnt * inv_draws, OpName(k.op_code).c_str(),
+                    (unsigned long long)k.vs_addr, (unsigned long long)k.ps_addr, k.mrt_mask,
+                    k.rt0_w, k.rt0_h, k.cb0_uid, k.db_uid);
+            }
+        } else {
+            std::printf("[StageA-Audit] RawPM4 Draws: ZERO (100.00%% DirectVk!)\n");
+        }
+        {
+            const u64 ring_hit = g_sb_buf_counts[0].exchange(0, std::memory_order_relaxed);
+            const u64 ring_nc = g_sb_buf_counts[1].exchange(0, std::memory_order_relaxed);
+            const u64 cue_obt = g_sb_buf_counts[2].exchange(0, std::memory_order_relaxed);
+            const u64 dir_hit = g_sb_buf_counts[3].exchange(0, std::memory_order_relaxed);
+            const u64 dir_miss = g_sb_buf_counts[4].exchange(0, std::memory_order_relaxed);
+            const u64 oth_ro = g_sb_buf_counts[5].exchange(0, std::memory_order_relaxed);
+            const u64 oth_rw = g_sb_buf_counts[6].exchange(0, std::memory_order_relaxed);
+            const u64 hle_fl = g_sb_buf_counts[7].exchange(0, std::memory_order_relaxed);
+            const u64 r_fail = g_sb_buf_counts[8].exchange(0, std::memory_order_relaxed);
+            const u64 cue_b = g_sb_cue_obtain_bytes.exchange(0, std::memory_order_relaxed);
+            const u64 oth_b = g_sb_other_obtain_bytes.exchange(0, std::memory_order_relaxed);
+            std::printf(
+                "[StageB-BufAudit] ringHit=%.0f/s ringNotCopied=%.0f/s ringAllocFail=%.0f/s | "
+                "cueObtain=%.0f/s (%.1f MiB/s) directHit=%.0f/s directMissObt=%.0f/s "
+                "otherRO=%.0f/s otherRW=%.0f/s (%.1f MiB/s) hleFlush=%.0f/s | cueGpuMod=%d\n",
+                ring_hit / secs, ring_nc / secs, r_fail / secs, cue_obt / secs,
+                cue_b / secs / (1024.0 * 1024.0), dir_hit / secs, dir_miss / secs, oth_ro / secs,
+                oth_rw / secs, oth_b / secs / (1024.0 * 1024.0), hle_fl / secs,
+                int(VideoCore::DirectBuffers::IsCueHeapEverGpuModified()));
+            const u64 p0 = g_fast_pso_counts[0];
+            const u64 p1 = g_fast_pso_counts[1];
+            const u64 p2 = g_fast_pso_counts[2];
+            const u64 p3 = g_fast_pso_counts[3];
+            const u64 p4 = g_fast_pso_counts[4];
+            const u64 p5 = g_fast_pso_counts[5];
+            const u64 p6 = g_fast_pso_counts[6];
+            const u64 p7 = g_fast_pso_counts[7];
+            const u64 p8 = g_fast_pso_counts[8];
+            const u64 p9 = g_fast_pso_counts[9];
+            const u64 p10 = g_fast_pso_counts[10];
+            const u64 p11 = g_fast_pso_counts[11];
+            const u64 p12 = g_fast_pso_counts[12];
+            const u64 p13 = g_fast_pso_counts[13];
+            g_fast_pso_counts.fill(0u);
+            if ((p0 + p1 + p2) > 0u) {
+                std::printf(
+                    "[FastPSO-Audit] Sig(epoch=%.0f/s pair=%.0f/s full=%.0f/s) | "
+                    "Flat(skipEp=%.0f/s skipMem=%.0f/s run=%.0f/s) | "
+                    "Match(udSkip=%.0f/s specSkip=%.0f/s fastOk=%.0f/s fastMiss=%.0f/s "
+                    "noComp=%.0f/s specErr=%llu) | "
+                    "V#(skip=%.0f/s batch=%.0f/s)\n",
+                    p0 / secs, p1 / secs, p2 / secs, p4 / secs, p5 / secs, p3 / secs, p6 / secs,
+                    p12 / secs, p7 / secs, p8 / secs, p9 / secs,
+                    static_cast<unsigned long long>(p13), p10 / secs, p11 / secs);
+            }
+        }
+        std::fflush(stdout);
+    }
     st = DcbStats{};
 }
 

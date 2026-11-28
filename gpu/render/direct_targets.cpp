@@ -36,6 +36,9 @@ struct LookupBucket {
 struct RegistryState {
     std::mutex write_mutex;
     u32 next_cursor{0};
+    std::atomic<u32> allocated_slots{0};
+    std::atomic<u64> stack_skips{0};
+    std::atomic<u64> wrap_count{0};
     std::array<SlotStorage, kMaxTargets> slots{};
     std::array<LookupBucket, kLookupBuckets> color_lookup{};
     std::array<LookupBucket, kLookupBuckets> depth_lookup{};
@@ -44,6 +47,16 @@ struct RegistryState {
 RegistryState& State() noexcept {
     static RegistryState state{};
     return state;
+}
+
+/// Reject temporary stack-allocated RenderTarget/DepthRenderTarget structs (e.g.
+/// CGOutputMergerCacheGnm_Decompress*TextureMips) so they never burn or wrap persistent UID slots.
+inline bool IsCurrentThreadStackPtr(const void* ptr) noexcept {
+    alignas(16) const u8 stack_anchor = 0;
+    const uintptr_t p = reinterpret_cast<uintptr_t>(ptr);
+    const uintptr_t sp = reinterpret_cast<uintptr_t>(&stack_anchor);
+    const uintptr_t diff = (p >= sp) ? (p - sp) : (sp - p);
+    return diff < (64u << 10);
 }
 
 inline u64 PackPtrAndUid(const void* ptr, u32 uid) noexcept {
@@ -85,7 +98,16 @@ inline bool MatchesDepthRegs(const SlotStorage& slot, const u32* dt) noexcept {
 }
 
 u32 AllocateNextUid(RegistryState& st) noexcept {
-    const u32 idx = (st.next_cursor++ % (kMaxTargets - 1u)) + 1u;
+    const u32 cursor = st.next_cursor++;
+    if (cursor < (kMaxTargets - 1u)) {
+        st.allocated_slots.store(cursor + 1u, std::memory_order_relaxed);
+    } else {
+        st.allocated_slots.store(kMaxTargets - 1u, std::memory_order_relaxed);
+        if ((cursor % (kMaxTargets - 1u)) == 0u) {
+            st.wrap_count.fetch_add(1u, std::memory_order_relaxed);
+        }
+    }
+    const u32 idx = (cursor % (kMaxTargets - 1u)) + 1u;
     return idx;
 }
 
@@ -136,7 +158,7 @@ bool ReadTargetSlot(u32 uid, TargetSnapshot& out) noexcept {
     return false;
 }
 
-u32 LookupColorTargetUid(const u32* gnm_rt_11dw) noexcept {
+u32 LookupColorTargetUidFast(const u32* gnm_rt_11dw) noexcept {
     if (!gnm_rt_11dw || gnm_rt_11dw[0] == 0u) {
         return 0u;
     }
@@ -170,7 +192,7 @@ u32 LookupColorTargetUid(const u32* gnm_rt_11dw) noexcept {
     return check_way(bucket.way1.load(std::memory_order_acquire));
 }
 
-u32 LookupDepthTargetUid(const u32* gnm_dt_13dw) noexcept {
+u32 LookupDepthTargetUidFast(const u32* gnm_dt_13dw) noexcept {
     if (!gnm_dt_13dw || (gnm_dt_13dw[2] == 0u && gnm_dt_13dw[3] == 0u)) {
         return 0u;
     }
@@ -204,12 +226,33 @@ u32 LookupDepthTargetUid(const u32* gnm_dt_13dw) noexcept {
     return check_way(bucket.way1.load(std::memory_order_acquire));
 }
 
+u32 LookupColorTargetUid(const u32* gnm_rt_11dw) noexcept {
+    if (const u32 uid = LookupColorTargetUidFast(gnm_rt_11dw)) [[likely]] {
+        return uid;
+    }
+    // GXDevice_CreateRenderTargetView (0x21667a0) builds RenderTarget on a stack local before
+    // memcpy'ing it into the persistent heap RTV+0x10; lazily register the true heap pointer on
+    // first bind so all subsequent binds hit the lock-free L1 table in O(1).
+    return RegisterColorTarget(gnm_rt_11dw, nullptr, 0u, 0u, 1u);
+}
+
+u32 LookupDepthTargetUid(const u32* gnm_dt_13dw) noexcept {
+    if (const u32 uid = LookupDepthTargetUidFast(gnm_dt_13dw)) [[likely]] {
+        return uid;
+    }
+    return RegisterDepthTarget(gnm_dt_13dw, nullptr, 0u, 0u, 1u);
+}
+
 u32 RegisterColorTarget(const u32* gnm_rt_11dw, const u32* parent_tsharp_8dw,
                         u32 mip_level, u32 first_slice, u32 slice_count) noexcept {
     if (!gnm_rt_11dw || gnm_rt_11dw[0] == 0u) {
         return 0u;
     }
-    if (const u32 existing = LookupColorTargetUid(gnm_rt_11dw)) {
+    if (IsCurrentThreadStackPtr(gnm_rt_11dw)) {
+        State().stack_skips.fetch_add(1u, std::memory_order_relaxed);
+        return 0u;
+    }
+    if (const u32 existing = LookupColorTargetUidFast(gnm_rt_11dw)) {
         if (!parent_tsharp_8dw || State().slots[existing].has_parent_tsharp != 0u) {
             return existing;
         }
@@ -261,7 +304,11 @@ u32 RegisterDepthTarget(const u32* gnm_dt_13dw, const u32* parent_tsharp_8dw,
     if (!gnm_dt_13dw || (gnm_dt_13dw[2] == 0u && gnm_dt_13dw[3] == 0u)) {
         return 0u;
     }
-    if (const u32 existing = LookupDepthTargetUid(gnm_dt_13dw)) {
+    if (IsCurrentThreadStackPtr(gnm_dt_13dw)) {
+        State().stack_skips.fetch_add(1u, std::memory_order_relaxed);
+        return 0u;
+    }
+    if (const u32 existing = LookupDepthTargetUidFast(gnm_dt_13dw)) {
         if (!parent_tsharp_8dw || State().slots[existing].has_parent_tsharp != 0u) {
             return existing;
         }
@@ -304,6 +351,15 @@ u32 RegisterDepthTarget(const u32* gnm_dt_13dw, const u32* parent_tsharp_8dw,
     slot.seq.store(odd_seq + 1u, std::memory_order_release);
     PublishLookup(bucket, PackPtrAndUid(gnm_dt_13dw, uid));
     return uid;
+}
+
+RegistryStats GetStats() noexcept {
+    const auto& st = State();
+    return RegistryStats{
+        .allocated_slots = st.allocated_slots.load(std::memory_order_relaxed),
+        .stack_skips = st.stack_skips.load(std::memory_order_relaxed),
+        .wrap_count = st.wrap_count.load(std::memory_order_relaxed),
+    };
 }
 
 } // namespace Vulkan::DirectTargets
