@@ -1,4 +1,8 @@
-# Bloodborne PC Vulkan (Windows & Linux)
+<p align="center">
+  <a href="https://github.com/lapothecary/bloodborne-pc-vulkan/releases/latest">
+    <img src="docs/assets/banner.png" alt="Bloodborne on Vulkan — Windows &amp; Linux" width="100%"/>
+  </a>
+</p>
 
 <p align="center">
   <a href="https://github.com/lapothecary/bloodborne-pc-vulkan/releases/latest"><b>📦 Download Latest Release</b></a> •
